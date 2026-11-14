@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +18,11 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -521,5 +527,107 @@ func TestParseCacheStartupSwitch(t *testing.T) {
 		if runErr == nil || strings.Contains(runErr.Error(), "DOKITOOL_PARSE_CACHE") {
 			t.Fatalf("valid DOKITOOL_PARSE_CACHE=%q should reach listener bind (expected address-in-use error), got %v", valid, runErr)
 		}
+	}
+}
+
+type fakeExecutor func(context.Context, fetch.Request) (fetch.Response, error)
+
+func (f fakeExecutor) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	return f(ctx, req)
+}
+
+func TestPreparePublicMediaMultiRoutePlatforms(t *testing.T) {
+	const now int64 = 1793448000
+	registry, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	xhsHTML := `<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{"6a7e74de0000000033033075":{"note":{"noteId":"6a7e74de0000000033033075","type":"video","title":"XHS HTTP transcode","video":{"media":{"stream":{"h264":[{"masterUrl":"http://sns-v11.rednotecdn.com/stream/only.mp4?sig=a%2Bb","backupUrls":["http://sns-v27.rednotecdn.com/stream/only.mp4?sig=a%2Bb"],"width":720,"height":1280}]}}}}}}}}</script>`
+	xhsAdapter := xiaohongshu.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(xhsHTML)}, nil
+	}))
+
+	ksTarget := "https://c.kuaishou.com/fw/photo/3xngkmw8vacriqu"
+	ksHTML := `<script>window.INIT_STATE = {"tusjoh-a":{"photo":{"photoType":"VIDEO","caption":"KS routes","mainMvUrls":[{"url":"https://v1.kwaicdn.com/ks1.mp4"},{"url":"https://v23-3.kwaicdn.com/ks2.mp4"}]}}};</script>`
+	ksAdapter := kuaishou.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if req.Method == http.MethodHead {
+			return fetch.Response{StatusCode: http.StatusOK, URL: ksTarget}, nil
+		}
+		return fetch.Response{StatusCode: http.StatusOK, URL: ksTarget, Body: []byte(ksHTML)}, nil
+	}))
+
+	ppxHTML := `<script>{"ppxItemDetail":{"item":{"item_id_str":"7385813877985909043","content":"PPX routes","video":{"video_high":{"width":720,"height":1280,"url_list":[{"url":"https://v6-cdn-tos.ppxvod.com/` + strings.Repeat("a", 32) + `/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1"},{"url":"https://v26-cdn-tos.ppxvod.com/` + strings.Repeat("b", 32) + `/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1"}]}}}}}</script>`
+	ppxAdapter := pipixia.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(ppxHTML)}, nil
+	}))
+
+	h, err := api.New(registry, map[string]api.Adapter{
+		"xiaohongshu": xhsAdapter,
+		"kuaishou":    ksAdapter,
+		"pipixia":     ppxAdapter,
+	}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia(strings.Repeat("x", 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checks := []struct {
+		platform  string
+		sourceURL string
+		wantURLs  []string
+	}{
+		{
+			platform:  "xiaohongshu",
+			sourceURL: "https://www.xiaohongshu.com/explore/6a7e74de0000000033033075",
+			wantURLs:  []string{"https://sns-v11.rednotecdn.com/stream/only.mp4?sig=a%2Bb", "https://sns-v27.rednotecdn.com/stream/only.mp4?sig=a%2Bb"},
+		},
+		{
+			platform:  "kuaishou",
+			sourceURL: "https://www.kuaishou.com/short-video/3xngkmw8vacriqu",
+			wantURLs:  []string{"https://v1.kwaicdn.com/ks1.mp4", "https://v23-3.kwaicdn.com/ks2.mp4"},
+		},
+		{
+			platform:  "pipixia",
+			sourceURL: "https://h5.pipix.com/item/7385813877985909043",
+			wantURLs: []string{
+				"https://v6-cdn-tos.ppxvod.com/" + strings.Repeat("a", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1",
+				"https://v26-cdn-tos.ppxvod.com/" + strings.Repeat("b", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1",
+			},
+		},
+	}
+
+	for _, tc := range checks {
+		t.Run(tc.platform, func(t *testing.T) {
+			q := url.Values{"schema_version": {"1.0"}, "url": {tc.sourceURL}}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("GET /api/parse (%s) status=%d body=%s", tc.platform, w.Code, w.Body.String())
+			}
+			out, err := unified.Decode(w.Body.Bytes())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := unified.ValidateEnvelopeAt(out, now); err != nil {
+				t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+			}
+			item := unified.Map(unified.Slice(unified.Map(out["data"])["items"])[0])
+			if gotDefault := unified.Str(unified.Map(item["default"])["url"]); gotDefault != tc.wantURLs[0] {
+				t.Fatalf("default.url = %q, want %q", gotDefault, tc.wantURLs[0])
+			}
+			sources := unified.Slice(unified.Map(unified.Map(unified.Slice(item["variants"])[0])["delivery"])["sources"])
+			if len(sources) != len(tc.wantURLs) {
+				t.Fatalf("sources len = %d, want %d", len(sources), len(tc.wantURLs))
+			}
+			for i, want := range tc.wantURLs {
+				src := unified.Map(sources[i])
+				if got := unified.Str(src["url"]); got != want {
+					t.Fatalf("source[%d].url = %q, want %q", i, got, want)
+				}
+				if got := unified.Str(src["browser_fetch"]); got != "allowed" {
+					t.Fatalf("source[%d].browser_fetch = %q, want allowed", i, got)
+				}
+			}
+		})
 	}
 }

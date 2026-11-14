@@ -44,13 +44,18 @@ import (
 func preparePublicMedia(key string) api.PublicMedia {
 	weibo := weiboplatform.PreparePublic(key)
 	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
-		if platform == "douyin" {
+		switch platform {
+		case "douyin":
 			return douyin.PreparePublic(ctx, platform, payload, now)
-		}
-		if platform == "xiaohongshu" {
+		case "xiaohongshu":
 			return xiaohongshu.PreparePublic(ctx, platform, payload, now)
+		case "kuaishou":
+			return kuaishou.PreparePublic(ctx, platform, payload, now)
+		case "pipixia":
+			return pipixia.PreparePublic(ctx, platform, payload, now)
+		default:
+			return weibo(ctx, platform, payload, now)
 		}
-		return weibo(ctx, platform, payload, now)
 	}
 }
 

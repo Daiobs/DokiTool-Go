@@ -793,3 +793,129 @@ test('#107: post-header timeout partial read uses post-header elapsedMs while pr
   assert.equal(obsReset.bytesPerSecond, 0);
   assert.equal(result2.primary.id, 's-zero-body-timeout');
 });
+
+test('#107: HTTP 206 with CORS-hidden Content-Range (null) ranks routes and skips 403, while malformed exposed Content-Range is rejected', async () => {
+  function hiddenContentRange206(size, delayPerChunkMs = 0, extraHeaders = {}) {
+    let sent = 0;
+    const chunkSize = 64 * 1024;
+    const body = new ReadableStream({
+      async pull(controller) {
+        if (sent >= size) {
+          controller.close();
+          return;
+        }
+        if (delayPerChunkMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, delayPerChunkMs));
+        }
+        const n = Math.min(chunkSize, size - sent);
+        const bytes = new Uint8Array(n);
+        bytes[3] = 0x18;
+        sent += n;
+        controller.enqueue(bytes);
+      },
+    });
+    return new Response(body, {
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(size),
+        ...extraHeaders,
+      },
+    });
+  }
+
+  const sources = [
+    { id: 's-qc-403', url: 'https://sns-video-qc.xhscdn.com/v.mp4', browser_fetch: 'allowed' },
+    { id: 's-qn-slow', url: 'https://sns-video-qn.xhscdn.com/v.mp4', browser_fetch: 'allowed' },
+    { id: 's-al-fast', url: 'https://sns-video-al.xhscdn.com/v.mp4', browser_fetch: 'allowed' },
+    { id: 's-bd-fourth', url: 'https://sns-video-bd.xhscdn.com/v.mp4', browser_fetch: 'allowed' },
+  ];
+
+  const result = await routeProbe.probeAndOrderSources(
+    sources,
+    {},
+    new AbortController().signal,
+    {
+      fetchImpl: async url => {
+        if (url.includes('sns-video-qc')) {
+          return new Response('Forbidden', { status: 403, headers: { 'content-type': 'application/xml' } });
+        }
+        if (url.includes('sns-video-qn')) {
+          return hiddenContentRange206(512 * 1024, 14);
+        }
+        if (url.includes('sns-video-al')) {
+          return hiddenContentRange206(512 * 1024, 1);
+        }
+        throw new Error(`unexpected probe for ${url}`);
+      },
+    },
+  );
+
+  assert.equal(result.didProbe, true);
+  assert.equal(result.observations[0].ok, false);
+  assert.equal(result.observations[1].ok, true);
+  assert.equal(result.observations[1].bytesRead, 512 * 1024);
+  assert.equal(result.observations[2].ok, true);
+  assert.equal(result.observations[2].bytesRead, 512 * 1024);
+  assert.equal(result.primary.id, 's-al-fast');
+  assert.deepEqual(
+    result.orderedSources.map(s => s.id),
+    ['s-al-fast', 's-qn-slow', 's-qc-403', 's-bd-fourth'],
+  );
+
+  // Exposed but non-zero-start or malformed Content-Range on 206 must still be rejected
+  const badRangeResult = await routeProbe.probeAndOrderSources(
+    [
+      { id: 's-bad-offset', url: 'https://kw1.example.test/v.mp4', browser_fetch: 'allowed' },
+      { id: 's-bad-syntax', url: 'https://kw2.example.test/v.mp4', browser_fetch: 'allowed' },
+      { id: 's-valid-hidden', url: 'https://txmov2.a.kwimgs.com/v.mp4', browser_fetch: 'allowed' },
+    ],
+    {},
+    new AbortController().signal,
+    {
+      fetchImpl: async url => {
+        if (url.includes('kw1.example.test')) {
+          return hiddenContentRange206(512 * 1024, 1, { 'content-range': 'bytes 1024-525311/2103281' });
+        }
+        if (url.includes('kw2.example.test')) {
+          return hiddenContentRange206(512 * 1024, 1, { 'content-range': 'invalid-range' });
+        }
+        return hiddenContentRange206(512 * 1024, 2);
+      },
+    },
+  );
+
+  assert.equal(badRangeResult.observations[0].ok, false);
+  assert.equal(badRangeResult.observations[1].ok, false);
+  assert.equal(badRangeResult.observations[2].ok, true);
+  assert.equal(badRangeResult.primary.id, 's-valid-hidden');
+
+  // live_photo pair members skip probeFileTarget so single saves match pair-ZIP first-source selection
+  let liveCalls = 0;
+  const liveSources = [
+    { id: 'live-first', url: 'https://sns-v28.rednotecdn.com/live.mp4', browser_fetch: 'allowed' },
+    { id: 'live-backup', url: 'https://sns-v11.rednotecdn.com/live.mp4', browser_fetch: 'allowed' },
+  ];
+  const liveTarget = {
+    source: liveSources[0],
+    url: liveSources[0].url,
+    routes: liveSources.map(s => s.url),
+    variant: { delivery: { kind: 'file', sources: liveSources } },
+  };
+  const liveResult = await routeProbe.default(
+    liveTarget,
+    { type: 'live_photo' },
+    'xiaohongshu',
+    {},
+    new AbortController().signal,
+    undefined,
+    {
+      fetchImpl: async () => {
+        liveCalls++;
+        return hiddenContentRange206(512 * 1024, 1);
+      },
+    },
+  );
+  assert.equal(liveCalls, 0);
+  assert.equal(liveResult, liveTarget);
+});

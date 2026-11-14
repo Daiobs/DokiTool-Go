@@ -265,3 +265,100 @@ func adaptLegacy(legacy unified.Object, source string, now int64) unified.Object
 	}
 	return unified.FinalizeData(data, now)
 }
+
+// AllowedBrowserFetchURL reports whether raw is a direct HTTPS Kuaishou CDN
+// media URL (*.kwaicdn.com, *.kwimgs.com, or *.yximgs.com) verified to support
+// credential-free, Referer-free browser CORS Range reads.
+func AllowedBrowserFetchURL(raw string) bool {
+	if len(raw) < 8 || len(raw) > 8192 || strings.Contains(raw, "#") || unified.MediaURL(raw) != raw {
+		return false
+	}
+	for _, r := range raw {
+		if r <= 0x20 || r == 0x7f || r == '\\' {
+			return false
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || u.Scheme != "https" || strings.HasSuffix(u.Host, ":") || (u.Port() != "" && u.Port() != "443") {
+		return false
+	}
+	for _, b := range []byte(u.Host) {
+		if b > 127 {
+			return false
+		}
+	}
+	host := strings.ToLower(u.Hostname())
+	return hasCDNSubdomain(host, ".kwaicdn.com") || hasCDNSubdomain(host, ".kwimgs.com") || hasCDNSubdomain(host, ".yximgs.com")
+}
+
+func hasCDNSubdomain(host, suffix string) bool {
+	if !strings.HasSuffix(host, suffix) || len(host) <= len(suffix) {
+		return false
+	}
+	prefix := host[:len(host)-len(suffix)]
+	for _, label := range strings.Split(prefix, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// PreparePublic annotates direct HTTPS Kuaishou CDN sources with
+// browser_fetch="allowed" at the public API boundary while preserving frozen
+// PHP baseline parser outputs.
+func PreparePublic(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
+	if platform != "kuaishou" || payload["code"] != "OK" {
+		return payload, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := unified.Clone(payload)
+	data := unified.Map(result["data"])
+	for _, rawItem := range unified.Slice(data["items"]) {
+		item := unified.Map(rawItem)
+		for _, rawVariant := range unified.Slice(item["variants"]) {
+			markDeliveryBrowserFetch(unified.Map(unified.Map(rawVariant)["delivery"]))
+		}
+	}
+	for _, rawAttachment := range unified.Slice(data["attachments"]) {
+		resource := unified.Map(unified.Map(rawAttachment)["resource"])
+		markDeliveryBrowserFetch(unified.Map(resource["delivery"]))
+	}
+	return result, nil
+}
+
+func markDeliveryBrowserFetch(delivery unified.Object) {
+	if delivery == nil {
+		return
+	}
+	switch unified.Str(delivery["kind"]) {
+	case "file":
+		for _, rawSource := range unified.Slice(delivery["sources"]) {
+			source := unified.Map(rawSource)
+			if source == nil {
+				continue
+			}
+			if source["access"] != nil && source["access"] != "direct" {
+				continue
+			}
+			if source["browser_fetch"] != nil && source["browser_fetch"] != "unknown" {
+				continue
+			}
+			if AllowedBrowserFetchURL(unified.Str(source["url"])) {
+				source["browser_fetch"] = "allowed"
+			}
+		}
+	case "pair", "mux":
+		for _, rawResource := range unified.Slice(delivery["resources"]) {
+			markDeliveryBrowserFetch(unified.Map(unified.Map(rawResource)["delivery"]))
+		}
+	}
+}

@@ -305,3 +305,99 @@ func TestPipixiaTransportPartialKeysStayDistinct(t *testing.T) {
 		}
 	}
 }
+
+func TestAllowedBrowserFetchURL(t *testing.T) {
+	allowed := []string{
+		"https://v3-cdn-tos.ppxvod.com/" + strings.Repeat("a", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/FileObjectA/?a=1319",
+		"https://v6-cdn-tos.ppxvod.com/" + strings.Repeat("b", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/FileObjectA/?a=1319",
+		"https://v26-cdn-tos.ppxvod.com/" + strings.Repeat("c", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/FileObjectA/?a=1319",
+		"https://p3-ppx-sign.byteimg.com/tos-cn-i-ppx/image.webp~tplv-ppx-q75.image",
+		"https://p6-ppx-sign.byteimg.com/tos-cn-i-ppx/image.webp~tplv-ppx-q75.image",
+		"https://p9-ppx-sign.byteimg.com/tos-cn-i-ppx/image.webp~tplv-ppx-q75.image",
+		"https://V26-CDN-TOS.PPXVOD.COM:443/video.mp4",
+	}
+	for _, raw := range allowed {
+		if !AllowedBrowserFetchURL(raw) {
+			t.Fatalf("expected %q to allow browser_fetch", raw)
+		}
+	}
+
+	rejected := []string{
+		"http://v26-cdn-tos.ppxvod.com/video.mp4",
+		"http://p3-ppx-sign.byteimg.com/image.webp",
+		"https://ppxvod.com/video.mp4",
+		"https://byteimg.com/image.webp",
+		"https://.ppxvod.com/video.mp4",
+		"https://h5.pipix.com/item/7385813877985909043",
+		"https://aweme.snssdk.com/aweme/v1/play/?video_id=123",
+		"https://v26-cdn-tos.ppxvod.com:8443/video.mp4",
+		"https://user@v26-cdn-tos.ppxvod.com/video.mp4",
+		"https://v26-cdn-tos.ppxvod.com/video.mp4#frag",
+		"https://media.example/video.mp4",
+		"",
+	}
+	for _, raw := range rejected {
+		if AllowedBrowserFetchURL(raw) {
+			t.Fatalf("expected %q not to allow browser_fetch", raw)
+		}
+	}
+}
+
+func TestPreparePublicMarksPipixiaCDNSources(t *testing.T) {
+	const now int64 = 1793556100
+	urls := append(
+		transportSources(ppxOldTransportQuery, "a", "b"),
+		"https://mirror.example/unverified.mp4",
+	)
+	payload := representationPayload(t, urls)
+	before := unified.Clone(payload)
+
+	out, err := PreparePublic(context.Background(), "pipixia", payload, now)
+	if err != nil {
+		t.Fatalf("PreparePublic failed: %v", err)
+	}
+	if !reflect.DeepEqual(payload, before) {
+		t.Fatal("input envelope mutated in place")
+	}
+	if err := unified.ValidateEnvelopeAt(out, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+
+	// representationPayload puts all 3 URLs into one video_high url_list: ppxvod hosts get allowed, mirror.example stays unset.
+	variants := unified.Slice(representationItem(out)["variants"])
+	if len(variants) != 1 {
+		t.Fatalf("expected 1 variant, got %d", len(variants))
+	}
+	sources := unified.Slice(unified.Map(unified.Map(variants[0])["delivery"])["sources"])
+	wantFetch := []string{"allowed", "allowed", ""}
+	if len(sources) != len(wantFetch) {
+		t.Fatalf("expected %d sources, got %d", len(wantFetch), len(sources))
+	}
+	for i, want := range wantFetch {
+		if got := unified.Str(unified.Map(sources[i])["browser_fetch"]); got != want {
+			t.Fatalf("source[%d] (%s) browser_fetch=%q, want %q", i, unified.Str(unified.Map(sources[i])["url"]), got, want)
+		}
+	}
+
+	// Explicit blocked value is preserved; unknown is promoted when host is verified.
+	synthetic := unified.Clone(payload)
+	synSources := unified.Slice(unified.Map(representationVariant(t, synthetic)["delivery"])["sources"])
+	unified.Map(synSources[0])["browser_fetch"] = "blocked"
+	unified.Map(synSources[1])["browser_fetch"] = "unknown"
+	synOut, err := PreparePublic(context.Background(), "pipixia", synthetic, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSyn := unified.Slice(unified.Map(representationVariant(t, synOut)["delivery"])["sources"])
+	if got := unified.Str(unified.Map(gotSyn[0])["browser_fetch"]); got != "blocked" {
+		t.Fatalf("blocked overwritten: %q", got)
+	}
+	if got := unified.Str(unified.Map(gotSyn[1])["browser_fetch"]); got != "allowed" {
+		t.Fatalf("unknown not promoted: %q", got)
+	}
+
+	other, err := PreparePublic(context.Background(), "douyin", payload, now)
+	if err != nil || !reflect.DeepEqual(other, before) {
+		t.Fatal("non-pipixia payload changed")
+	}
+}

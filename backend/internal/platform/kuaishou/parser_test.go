@@ -515,3 +515,111 @@ func TestOversizedInjectedPageRemainsRejected(t *testing.T) {
 		t.Fatalf("oversized metadata was parsed: calls=%d payload=%v err=%v", calls, payload, err)
 	}
 }
+
+func TestAllowedBrowserFetchURL(t *testing.T) {
+	allowed := []string{
+		"https://v1.kwaicdn.com/upic/2026/11/14/01/video.mp4?pkey=abc",
+		"https://v23-3.kwaicdn.com/upic/2026/11/14/01/video.mp4?pkey=abc",
+		"https://v2-zj-shun.kwaicdn.com/upic/2026/11/14/01/video.mp4?Aecs=1",
+		"https://txmov2.a.kwimgs.com/upic/2026/11/14/01/video.mp4",
+		"https://tymov2.a.kwimgs.com/upic/2026/11/14/01/video.mp4",
+		"https://hw.a.yximgs.com/upic/2026/11/14/01/audio.m4a",
+		"https://p2.a.yximgs.com/upic/2026/11/14/01/image.webp",
+		"https://V23-3.KWAICDN.COM:443/upic/video.mp4",
+	}
+	for _, raw := range allowed {
+		if !AllowedBrowserFetchURL(raw) {
+			t.Fatalf("expected %q to allow browser_fetch", raw)
+		}
+	}
+
+	rejected := []string{
+		"http://tx2.a.yximgs.com/ufile/atlas/img.webp",
+		"http://txmov2.a.kwimgs.com/ufile/atlas/music.m4a",
+		"http://v1.kwaicdn.com/upic/video.mp4",
+		"https://kwaicdn.com/upic/video.mp4",
+		"https://kwimgs.com/upic/video.mp4",
+		"https://yximgs.com/upic/video.mp4",
+		"https://.kwaicdn.com/upic/video.mp4",
+		"https://www.kuaishou.com/short-video/3xngkmw8vacriqu",
+		"https://c.kuaishou.com/fw/photo/3xngkmw8vacriqu",
+		"https://m.gifshow.com/fw/photo/3xngkmw8vacriqu",
+		"https://sample.m.chenzhongtech.com/fw/photo/3xngkmw8vacriqu",
+		"https://v1.kwaicdn.com:8443/upic/video.mp4",
+		"https://user@v1.kwaicdn.com/upic/video.mp4",
+		"https://v1.kwaicdn.com/upic/video.mp4#frag",
+		"https://media.example.test/kuaishou.mp4",
+		"",
+	}
+	for _, raw := range rejected {
+		if AllowedBrowserFetchURL(raw) {
+			t.Fatalf("expected %q not to allow browser_fetch", raw)
+		}
+	}
+}
+
+func TestPreparePublicMarksKuaishouCDNSources(t *testing.T) {
+	const (
+		now    int64 = 1793361600
+		target       = "https://c.kuaishou.com/fw/photo/3xngkmw8vacriqu"
+		html         = `<script>window.INIT_STATE = {"tusjoh-a":{"photo":{"photoType":"VIDEO","caption":"multi route","music":{"name":"bgm","audioUrls":[{"url":"https://hw.a.yximgs.com/bgm.m4a"}]},"mainMvUrls":[{"url":"https://v1.kwaicdn.com/main1.mp4"},{"url":"https://v23-3.kwaicdn.com/main2.mp4"},{"url":"https://txmov2.a.kwimgs.com/main3.mp4"},{"url":"http://txmov2.a.kwimgs.com/plain-http.mp4"},{"url":"https://media.example.test/unverified.mp4"}]}}};</script>`
+	)
+	parser := New(executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if req.Method == http.MethodHead {
+			return fetch.Response{StatusCode: 200, URL: target}, nil
+		}
+		return fetch.Response{StatusCode: 200, URL: target, Body: []byte(html)}, nil
+	}))
+	parsed, err := parser.Parse(context.Background(), "https://www.kuaishou.com/short-video/3xngkmw8vacriqu", now)
+	if err != nil || parsed["code"] != "OK" {
+		t.Fatalf("Parse failed: code=%v err=%v", parsed["code"], err)
+	}
+	before := unified.Clone(parsed)
+	out, err := PreparePublic(context.Background(), "kuaishou", parsed, now)
+	if err != nil {
+		t.Fatalf("PreparePublic failed: %v", err)
+	}
+	if !unified.Equal(parsed, before) {
+		t.Fatal("input envelope mutated in place")
+	}
+	if err := unified.ValidateEnvelopeAt(out, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+
+	sources := unified.Slice(unified.Map(unified.Map(unified.Slice(unified.Map(unified.Slice(unified.Map(out["data"])["items"])[0])["variants"])[0])["delivery"])["sources"])
+	wantFetch := []string{"allowed", "allowed", "allowed", "", ""}
+	if len(sources) != len(wantFetch) {
+		t.Fatalf("expected %d sources, got %d", len(wantFetch), len(sources))
+	}
+	for i, want := range wantFetch {
+		if got := unified.Str(unified.Map(sources[i])["browser_fetch"]); got != want {
+			t.Fatalf("source[%d] (%s) browser_fetch=%q, want %q", i, unified.Str(unified.Map(sources[i])["url"]), got, want)
+		}
+	}
+	attSources := unified.Slice(unified.Map(unified.Map(unified.Map(unified.Slice(unified.Map(out["data"])["attachments"])[0])["resource"])["delivery"])["sources"])
+	if got := unified.Str(unified.Map(attSources[0])["browser_fetch"]); got != "allowed" {
+		t.Fatalf("attachment source browser_fetch=%q, want allowed", got)
+	}
+
+	// Explicit blocked or relay sources must never be overwritten.
+	synthetic := unified.Clone(parsed)
+	synSources := unified.Slice(unified.Map(unified.Map(unified.Slice(unified.Map(unified.Slice(unified.Map(synthetic["data"])["items"])[0])["variants"])[0])["delivery"])["sources"])
+	unified.Map(synSources[0])["browser_fetch"] = "blocked"
+	unified.Map(synSources[1])["browser_fetch"] = "unknown"
+	synOut, err := PreparePublic(context.Background(), "kuaishou", synthetic, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSyn := unified.Slice(unified.Map(unified.Map(unified.Slice(unified.Map(unified.Slice(unified.Map(synOut["data"])["items"])[0])["variants"])[0])["delivery"])["sources"])
+	if got := unified.Str(unified.Map(gotSyn[0])["browser_fetch"]); got != "blocked" {
+		t.Fatalf("blocked overwritten: %q", got)
+	}
+	if got := unified.Str(unified.Map(gotSyn[1])["browser_fetch"]); got != "allowed" {
+		t.Fatalf("unknown not upgraded to allowed: %q", got)
+	}
+
+	other, err := PreparePublic(context.Background(), "douyin", parsed, now)
+	if err != nil || !unified.Equal(other, before) {
+		t.Fatal("non-kuaishou payload changed")
+	}
+}

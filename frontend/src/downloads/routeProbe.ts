@@ -180,9 +180,14 @@ async function probeSingleSource(
     throwIfAborted(signal);
     transferStartedAt = nowFn();
 
+    // Many media CDNs (e.g. Xiaohongshu *.xhscdn.com/*.rednotecdn.com, Kuaishou *.kwaicdn.com/*.kwimgs.com)
+    // return HTTP 206 with Access-Control-Allow-Origin: * without listing Content-Range in
+    // Access-Control-Expose-Headers, so browser CORS filtering hides Content-Range (null).
+    const contentRange = response.headers.get("content-range");
     const validStatus =
       response.status === 206
-        ? response.headers.has("content-range")
+        ? contentRange === null ||
+          /^bytes\s+0-\d+\/(?:\d+|\*)$/i.test(contentRange)
         : response.status === 200;
     const contentType = response.headers.get("content-type") || "";
     if (
@@ -413,6 +418,12 @@ export async function probeFileTarget<
   options: RouteProbeOptions = {},
 ): Promise<T> {
   throwIfAborted(signal);
+  // Pair resources (live_photo motion/cover) keep single-save source selection
+  // aligned with pair-ZIP archiving (first available source, retaining backups
+  // in target.routes only on transport failure).
+  if (item.type === "live_photo") {
+    return target;
+  }
   if (
     item.type === "video" &&
     (platform === "pipigx" || platform === "zuiyou") &&
