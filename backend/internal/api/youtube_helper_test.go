@@ -168,12 +168,13 @@ func TestYouTubeHelperRoutesEnabledAndParseAdmission(t *testing.T) {
 		t.Fatalf("oversized finalize body status = %d, want 400", rec.Code)
 	}
 
-	// Parse admission pool enforcement:
-	// 1) Cold cache (HasCachedContext() == false): GET /api/youtube/context consumes a Parse token,
-	//    so an immediate POST /api/youtube/finalize with ClientBurst=1 hits 429.
+	// SlowParse admission pool enforcement:
+	// 1) Cold cache (HasCachedContext() == false): GET /api/youtube/context consumes a SlowParse token,
+	//    so an immediate POST /api/youtube/finalize with SlowParse.ClientBurst=1 hits 429,
+	//    while Fast Pool (Parse) remains completely untouched.
 	cfg := DefaultAdmissionConfig()
-	cfg.Parse.ClientBurst = 1
-	cfg.Parse.ClientRPS = 0.1
+	cfg.SlowParse.ClientBurst = 1
+	cfg.SlowParse.ClientRPS = 0.1
 	entry, err := WithAdmissionConfig(h, nil, "direct", "", cfg)
 	if err != nil {
 		t.Fatal(err)

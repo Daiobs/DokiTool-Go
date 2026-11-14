@@ -39,11 +39,16 @@ func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
 	if gateLeases(e) != 2 {
 		t.Fatal("both tasks did not acquire separate fixed ports")
 	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer waitCancel()
 	start := time.Now()
-	_, err = x.Extract(context.Background(), "https://x.example/3")
-	var busy *Error
-	if !errors.As(err, &busy) || !busy.LocalBusy || busy.RetryAfter != 1 || time.Since(start) > time.Second {
-		t.Fatalf("third request did not fail promptly with T1 busy: %v", err)
+	_, err = x.Extract(waitCtx, "https://x.example/3")
+	var timedOut *Error
+	if !errors.As(err, &timedOut) || timedOut.Code != CodeUpstreamTimeout || time.Since(start) < 60*time.Millisecond || time.Since(start) > time.Second {
+		t.Fatalf("third request did not wait on shared semaphore until deadline: %v", err)
+	}
+	if gateLeases(e) != 2 {
+		t.Fatalf("waiting request mutated fixed gate port leases: got %d", gateLeases(e))
 	}
 	cancel()
 	done := make(chan struct{})

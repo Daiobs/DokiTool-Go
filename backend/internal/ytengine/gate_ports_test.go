@@ -89,6 +89,16 @@ func TestGatePortConfiguration(t *testing.T) {
 	if err == nil {
 		t.Fatal("port pool must match actual shared semaphore capacity")
 	}
+	for _, n := range []int{6, MaxConcurrency} {
+		poolPorts := make([]int, n)
+		for i := range poolPorts {
+			poolPorts[i] = 19100 + i
+		}
+		okEng, okErr := New(Config{BinaryPath: bin, AllowedHashes: hashes, MaxConcurrency: n, GatePorts: poolPorts})
+		if okErr != nil || !okEng.Enabled() {
+			t.Fatalf("expected GatePorts of size %d to succeed, got err=%v", n, okErr)
+		}
+	}
 }
 
 func TestGateFixedPoolNoFallbackAndReclaims(t *testing.T) {

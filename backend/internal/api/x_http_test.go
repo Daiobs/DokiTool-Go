@@ -298,12 +298,13 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 		t.Fatal(err)
 	}
 	admCfg := DefaultAdmissionConfig()
+	admCfg.SlowParse.QueueWait = 80 * time.Millisecond
 	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, admCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 1. Occupy the 2 shared yt-dlp execution slots from 2 distinct client IPs.
+	// 1. Occupy the 2 shared SlowParse / yt-dlp execution slots from 2 distinct client IPs.
 	var inFlightWG sync.WaitGroup
 	inFlightCodes := make([]int, 2)
 	inFlightDone := make(chan int, 2)
@@ -343,42 +344,61 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 		}
 	}
 
-	// 2. Send 8 additional yt-dlp requests across distinct client IPs while the 2 slots are full.
-	// They must return 429 RATE_LIMITED ("本地解析引擎繁忙，请稍后重试") immediately without occupying the 8-slot parse pool.
+	// 2. Send 8 concurrent yt-dlp requests across distinct client IPs while the 2 SlowParse slots are full.
+	// They queue in SlowParse up to SlowQueueWait (80ms) and time out with 429 RATE_LIMITED + retry_after_seconds >= 1,
+	// without spawning extra yt-dlp subprocesses or touching the Fast Pool.
+	var slowBusyWG sync.WaitGroup
+	slowBusyStart := time.Now()
 	for i := 0; i < 8; i++ {
-		clientIP := fmt.Sprintf("198.51.100.%d", 10+i)
-		req := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.instagram.com/reel/C123456/"), clientIP)
-		w := call(entry, req)
-		if w.Code != http.StatusTooManyRequests {
-			t.Fatalf("expected 429 when yt-dlp slots full, got %d: %s", w.Code, w.Body.String())
-		}
-		if w.Header().Get("Retry-After") != "1" {
-			t.Fatalf("expected Retry-After: 1 header on local busy response, got %q", w.Header().Get("Retry-After"))
-		}
-		env, err := unified.Decode(w.Body.Bytes())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
-			t.Fatalf("busy response failed unified schema validation: %v", err)
-		}
-		errObj := unified.Map(env["error"])
-		if unified.Str(env["code"]) != "RATE_LIMITED" ||
-			unified.Str(errObj["message"]) != "本地解析引擎繁忙，请稍后重试" ||
-			errObj["retryable"] != true {
-			t.Fatalf("unexpected busy error payload: %v", env)
-		}
+		slowBusyWG.Add(1)
+		go func(idx int) {
+			defer slowBusyWG.Done()
+			clientIP := fmt.Sprintf("198.51.100.%d", 10+idx)
+			req := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(fmt.Sprintf("https://www.instagram.com/reel/C12345%d/", idx)), clientIP)
+			w := call(entry, req)
+			if w.Code != http.StatusTooManyRequests {
+				t.Errorf("expected 429 when SlowParse queue times out, got %d: %s", w.Code, w.Body.String())
+				return
+			}
+			if w.Header().Get("Retry-After") != "1" {
+				t.Errorf("expected Retry-After: 1 header on SlowParse timeout response, got %q", w.Header().Get("Retry-After"))
+				return
+			}
+			env, decErr := unified.Decode(w.Body.Bytes())
+			if decErr != nil {
+				t.Errorf("decode error: %v", decErr)
+				return
+			}
+			if valErr := unified.ValidateEnvelopeAt(env, now); valErr != nil {
+				t.Errorf("busy response failed unified schema validation: %v", valErr)
+				return
+			}
+			errObj := unified.Map(env["error"])
+			retrySec, hasRetry := unified.Numeric(errObj["retry_after_seconds"])
+			if unified.Str(env["code"]) != "RATE_LIMITED" || errObj["retryable"] != true || !hasRetry || retrySec < 1 {
+				t.Errorf("unexpected SlowParse queue timeout error payload: %v", env)
+			}
+		}(i)
 	}
 
-	// 3. While the 2 yt-dlp slots are STILL occupied, legacy platform (douyin) requests from multiple client IPs
-	// must enter the global /api/parse pool and succeed with 200 OK.
+	// 3. While the 2 SlowParse/yt-dlp slots AND the 8 queued slow waiters are active,
+	// Fast Pool (douyin) requests from multiple client IPs succeed IMMEDIATELY with 200 OK (zero interference).
 	for i := 0; i < 6; i++ {
 		clientIP := fmt.Sprintf("198.51.100.%d", 30+i)
+		tFast := time.Now()
 		req := edgeRequest("/api/parse?schema_version=1.0&url=https://www.douyin.com/video/123", clientIP)
 		w := call(entry, req)
 		if w.Code != http.StatusOK {
-			t.Fatalf("legacy douyin request blocked while yt-dlp was full (client %s): status=%d body=%s", clientIP, w.Code, w.Body.String())
+			t.Fatalf("fast-pool douyin request blocked while SlowParse was full (client %s): status=%d body=%s", clientIP, w.Code, w.Body.String())
 		}
+		if fastElapsed := time.Since(tFast); fastElapsed > 50*time.Millisecond {
+			t.Fatalf("fast-pool douyin request delayed by SlowParse queue: %s", fastElapsed)
+		}
+	}
+
+	slowBusyWG.Wait()
+	if slowElapsed := time.Since(slowBusyStart); slowElapsed < 60*time.Millisecond {
+		t.Fatalf("expected SlowParse requests to wait in queue (~80ms) before 429, took %s", slowElapsed)
 	}
 
 	// Verify only 2 yt-dlp subprocesses were spawned during the entire busy window.
@@ -386,13 +406,24 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 		t.Fatalf("expected only 2 spawned subprocesses, got %d", got)
 	}
 
-	// 4. Release the 2 in-flight yt-dlp subprocesses and verify they complete cleanly.
+	// 4. Queue one more SlowParse request and release the 2 in-flight subprocesses within SlowQueueWait;
+	// verify the queued slow request wakes up, spawns the 3rd subprocess, and returns 200 OK!
+	queuedSlowDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://x.com/UltimaShadowX/status/1577719286659006499"), "198.51.100.45")
+		queuedSlowDone <- call(entry, req)
+	}()
+	time.Sleep(15 * time.Millisecond)
+
 	if err := os.WriteFile(releaseFile, []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	inFlightWG.Wait()
 	if inFlightCodes[0] != http.StatusOK {
 		t.Fatalf("expected first in-flight X request to return 200 OK after release, got %d", inFlightCodes[0])
+	}
+	if wQueued := <-queuedSlowDone; wQueued.Code != http.StatusOK {
+		t.Fatalf("expected queued SlowParse X request to wake and return 200 OK, got %d: %s", wQueued.Code, wQueued.Body.String())
 	}
 
 	// 5. Subsequent X request after slots are freed (and short cache TTL expires) succeeds with 200 OK.
@@ -402,8 +433,8 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 	if wAfter.Code != http.StatusOK {
 		t.Fatalf("expected X request after slot release to return 200 OK, got %d: %s", wAfter.Code, wAfter.Body.String())
 	}
-	if got := countInvocationMarkers(t, invDir); got != 3 {
-		t.Fatalf("expected 3 total spawned subprocesses after slot release, got %d", got)
+	if got := countInvocationMarkers(t, invDir); got != 4 {
+		t.Fatalf("expected 4 total spawned subprocesses (2 initial + 1 queued + 1 post-TTL), got %d", got)
 	}
 }
 

@@ -32,8 +32,13 @@ import (
 const PinnedVersion = "2026.10.26"
 
 const (
-	defaultMaxConcurrency      = 2
-	maxAllowedConcurrency      = 8
+	// DefaultConcurrency is the default shared yt-dlp subprocess limit.
+	DefaultConcurrency = 2
+	// MaxConcurrency caps DOKITOOL_YTDLP_CONCURRENCY on a 6C / 13G host.
+	MaxConcurrency = 24
+
+	defaultMaxConcurrency      = DefaultConcurrency
+	maxAllowedConcurrency      = MaxConcurrency
 	defaultStaleTempMaxAge     = 2 * time.Hour
 	defaultStartupCheckTimeout = 5 * time.Second
 	defaultExtractTimeout      = 25 * time.Second
@@ -632,14 +637,8 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 	select {
 	case e.sem <- struct{}{}:
 		defer release()
-	default:
-		return nil, &Error{
-			Code:       CodeRateLimited,
-			Message:    "本地解析引擎繁忙，请稍后重试",
-			Retryable:  true,
-			RetryAfter: 1,
-			LocalBusy:  true,
-		}
+	case <-ctx.Done():
+		return nil, classifyContextErr(ctx.Err())
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, classifyContextErr(err)

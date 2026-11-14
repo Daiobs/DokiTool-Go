@@ -390,18 +390,29 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 		t.Fatalf("expected both semaphore slots to be occupied, got %d", len(baseEng.sem))
 	}
 
-	// 3rd concurrent request while 2 slots are occupied must return immediately with LocalBusy
-	// without spawning a 3rd yt-dlp subprocess.
-	startBusy := time.Now()
-	_, busyErr := igEng.Extract(context.Background(), "https://www.instagram.com/reel/C123456/")
-	busyElapsed := time.Since(startBusy)
-	if busyElapsed > 200*time.Millisecond {
-		t.Fatalf("expected immediate non-blocking busy return, took %s", busyElapsed)
+	// 3a. A 3rd concurrent request with a short deadline waits on the full 2-slot
+	// semaphore without spawning a 3rd yt-dlp subprocess, then exits on ctx.Done().
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancelWait()
+	startWait := time.Now()
+	_, waitErr := igEng.Extract(waitCtx, "https://www.instagram.com/reel/C123456/")
+	waitElapsed := time.Since(startWait)
+	if waitElapsed < 60*time.Millisecond || waitElapsed > time.Second {
+		t.Fatalf("expected semaphore wait to respect 80ms ctx deadline, took %s", waitElapsed)
 	}
 	var engineErr *Error
-	if !errors.As(busyErr, &engineErr) || engineErr.Code != CodeRateLimited || !engineErr.Retryable || !engineErr.LocalBusy || engineErr.RetryAfter != 1 || engineErr.Message != "本地解析引擎繁忙，请稍后重试" {
-		t.Fatalf("expected LocalBusy RATE_LIMITED error, got %#v (%v)", engineErr, busyErr)
+	if !errors.As(waitErr, &engineErr) || engineErr.Code != CodeUpstreamTimeout || !engineErr.Retryable {
+		t.Fatalf("expected UPSTREAM_TIMEOUT after semaphore wait deadline, got %#v (%v)", engineErr, waitErr)
 	}
+
+	// 3b. A queued 3rd concurrent request with a live context waits on e.sem without
+	// spawning a 3rd subprocess until one of the 2 active extractions finishes.
+	queuedDone := make(chan error, 1)
+	go func() {
+		_, err := igEng.Extract(context.Background(), "https://www.instagram.com/reel/C123456/")
+		queuedDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
 
 	countBytes, err := os.ReadFile(countFile)
 	if err != nil {
@@ -411,7 +422,7 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 		t.Fatalf("expected exactly 2 spawned subprocesses while full, got %d (%q)", len(lines), string(countBytes))
 	}
 
-	// Release the 2 running subprocesses.
+	// Release the 2 running subprocesses; the queued 3rd request must acquire a freed slot and succeed.
 	if err := os.WriteFile(releaseFile, []byte("ok"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -421,8 +432,18 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 			t.Fatalf("in-flight call %d failed: %v", i, e)
 		}
 	}
+	if queuedErr := <-queuedDone; queuedErr != nil {
+		t.Fatalf("queued 3rd call failed after slot release: %v", queuedErr)
+	}
 	if len(baseEng.sem) != 0 {
 		t.Fatalf("expected semaphore to be empty after completion, got %d", len(baseEng.sem))
+	}
+	countBytes, err = os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read invocation log after release: %v", err)
+	}
+	if lines := strings.Split(strings.TrimSpace(string(countBytes)), "\n"); len(lines) != 3 {
+		t.Fatalf("expected 3 total spawned subprocesses after queued request ran, got %d", len(lines))
 	}
 
 	// Subsequent request after slots release must succeed cleanly.
@@ -431,6 +452,36 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 	}
 	if len(baseEng.sem) != 0 {
 		t.Fatalf("expected semaphore to be empty after subsequent call, got %d", len(baseEng.sem))
+	}
+
+	// Verify relaxed concurrency bounds (1..MaxConcurrency=24) for 6C / 13G host.
+	for _, validN := range []int{1, 6, 16, MaxConcurrency} {
+		okEng, okErr := New(Config{
+			BinaryPath:     binPath,
+			AllowedHashes:  hashes,
+			MaxConcurrency: validN,
+		})
+		if okErr != nil || !okEng.Enabled() || cap(okEng.sem) != validN {
+			t.Fatalf("expected MaxConcurrency=%d to succeed, got enabled=%v cap=%d err=%v", validN, okEng != nil && okEng.Enabled(), cap(okEng.sem), okErr)
+		}
+	}
+	if badEng, badErr := New(Config{
+		BinaryPath:     binPath,
+		AllowedHashes:  hashes,
+		MaxConcurrency: MaxConcurrency + 1,
+	}); badErr == nil || badEng.Enabled() {
+		t.Fatalf("expected MaxConcurrency=%d to fail bounds check", MaxConcurrency+1)
+	}
+	for _, badRaw := range []string{"0", "-1", "25", "secret-invalid"} {
+		badEng, badErr := NewFromEnv(func(k string) string {
+			if k == "DOKITOOL_YTDLP_CONCURRENCY" {
+				return badRaw
+			}
+			return ""
+		}, nil)
+		if badErr == nil || badEng.Enabled() || strings.Contains(badErr.Error(), "secret-invalid") {
+			t.Fatalf("expected invalid DOKITOOL_YTDLP_CONCURRENCY=%q to fail safely, got %v", badRaw, badErr)
+		}
 	}
 }
 

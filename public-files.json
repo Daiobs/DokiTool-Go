@@ -32,6 +32,8 @@
     "backend/cmd/dokitool/main.go",
     "backend/cmd/dokitool/main_test.go",
     "backend/cmd/dokitool/xhs_public_integration_test.go",
+    "backend/cmd/loadtest/main.go",
+    "backend/cmd/loadtest/main_test.go",
     "backend/cmd/shanghai-resolver/main.go",
     "backend/cmd/shanghai-resolver/main_test.go",
     "backend/config/embed.go",

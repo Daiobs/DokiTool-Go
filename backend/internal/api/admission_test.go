@@ -4,13 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -20,8 +26,30 @@ const testEdgeKey = "synthetic-test-key-32-bytes-not-a-deployment-key"
 // Keep the historical policy as an explicit fixture, not the production default.
 func legacyAdmissionConfig() AdmissionConfig {
 	c := DefaultAdmissionConfig()
-	c.Parse = PoolConfig{4, 12.0 / 60, 8, 1, 1, 2}
-	c.Relay = PoolConfig{12, 1, 24, 2, 2, 2}
+	c.Parse = PoolConfig{
+		ClientBurst:       4,
+		ClientRPS:         12.0 / 60,
+		GlobalBurst:       8,
+		GlobalRPS:         1,
+		ClientConcurrency: 1,
+		GlobalConcurrency: 2,
+	}
+	c.SlowParse = PoolConfig{
+		ClientBurst:       4,
+		ClientRPS:         12.0 / 60,
+		GlobalBurst:       8,
+		GlobalRPS:         1,
+		ClientConcurrency: 1,
+		GlobalConcurrency: 2,
+	}
+	c.Relay = PoolConfig{
+		ClientBurst:       12,
+		ClientRPS:         1,
+		GlobalBurst:       24,
+		GlobalRPS:         2,
+		ClientConcurrency: 2,
+		GlobalConcurrency: 2,
+	}
 	c.MaxClients = 1024
 	return c
 }
@@ -367,5 +395,354 @@ func TestPullControlIngressIsolation(t *testing.T) {
 	cancel()
 	if code := <-done; code != 204 {
 		t.Fatalf("claim: %d", code)
+	}
+}
+
+func TestFastAndSlowPoolClassificationAndIsolation(t *testing.T) {
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []unified.Object{catalog.XPlatform(), catalog.YouTubePlatform(), catalog.InstagramPlatform()} {
+		if err := c.Register(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	specs, err := ytgeneric.ParseSitesEnv("facebook,tumblr,dailymotion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range specs {
+		if err := c.Register(spec.CatalogEntry()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	okAdapter := AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+		return makeSyntheticEnvelope(c.PlatformForURL(src), src, now, ""), nil
+	})
+	adapters := make(map[string]Adapter)
+	for _, id := range []string{
+		"douyin", "bilibili", "toutiao", "kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu",
+		"x", "youtube", "instagram", "facebook", "tumblr", "dailymotion",
+	} {
+		adapters[id] = okAdapter
+	}
+	h, err := NewWithCacheConfig(c, adapters, func() time.Time { return time.Unix(1793448000, 0) }, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	cfg.SlowParse.GlobalConcurrency = 1
+	cfg.SlowParse.QueueWait = 0
+	cfg.SlowParse.QueueSize = 0
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	// Saturate the single SlowParse slot directly.
+	relSlow, retry := adm.slow.acquire(netip.MustParseAddr("198.51.100.250"), time.Now())
+	if retry != 0 {
+		t.Fatal(retry)
+	}
+	defer relSlow()
+
+	// All 6 yt-dlp slow platforms hit 429 on SlowParse when saturated.
+	slowURLs := []string{
+		"https://x.com/user/status/123456",
+		"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		"https://www.instagram.com/reel/C123456/",
+		"https://www.facebook.com/watch/?v=123456",
+		"https://demo.tumblr.com/post/123456",
+		"https://www.dailymotion.com/video/x8t9abc",
+	}
+	for i, u := range slowURLs {
+		ip := fmt.Sprintf("198.51.100.%d", i+1)
+		w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(u), ip))
+		if w.Code != http.StatusTooManyRequests {
+			t.Fatalf("expected slow URL %s to use SlowParse and hit 429, got %d", u, w.Code)
+		}
+	}
+
+	// Pure-Go platforms, legacy routes, and malformed/unsupported /api/parse inputs
+	// route to Fast Pool (Parse) and never get blocked by SlowParse saturation!
+	fastURLs := []string{
+		"https://www.douyin.com/video/123",
+		"https://www.bilibili.com/video/BV1xx411c7mD",
+		"https://www.toutiao.com/video/123/",
+		"https://www.kuaishou.com/short-video/3x123",
+		"https://h5.pipix.com/item/123",
+		"https://h5.pipigx.com/pp/post/123",
+		"https://share.xiaochuankeji.cn/hybrid/share/post?pid=123",
+		"https://www.xiaohongshu.com/explore/123",
+	}
+	for i, u := range fastURLs {
+		ip := fmt.Sprintf("203.0.113.%d", i+1)
+		w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(u), ip))
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected fast URL %s to succeed on Fast Pool while SlowParse full, got %d: %s", u, w.Code, w.Body.String())
+		}
+	}
+	for i, bad := range []string{
+		"/api/parse?schema_version=1.0",
+		"/api/parse?schema_version=1.0&url=not-a-url",
+		"/api/parse?schema_version=1.0&url=https://unsupported.example.com/v/1",
+		"/api/parse?schema_version=1.0&url[]=https://x.com/user/status/123",
+		"/api/douyin",
+	} {
+		ip := fmt.Sprintf("203.0.113.%d", 100+i)
+		w := call(entry, edgeRequest(bad, ip))
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("malformed/legacy request %q must use Fast Pool, not SlowParse (got 429)", bad)
+		}
+	}
+}
+
+func TestBoundedWaitQueueWakeupTimeoutOverflowAndPerIPGuard(t *testing.T) {
+	holdSlot := make(chan struct{})
+	slot1Entered := make(chan struct{})
+	var orderMu sync.Mutex
+	var executionOrder []string
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tag := r.URL.Query().Get("tag")
+		orderMu.Lock()
+		executionOrder = append(executionOrder, tag)
+		orderMu.Unlock()
+		if tag == "holder" {
+			close(slot1Entered)
+			<-holdSlot
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse = PoolConfig{
+		ClientBurst:       4,
+		ClientRPS:         1,
+		GlobalBurst:       32,
+		GlobalRPS:         20,
+		ClientConcurrency: 1,
+		GlobalConcurrency: 1,
+		QueueWait:         120 * time.Millisecond,
+		QueueSize:         2,
+	}
+	entry, err := WithAdmissionConfig(next, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	// 1. Holder occupies the single GlobalConcurrency=1 slot.
+	var holderWG sync.WaitGroup
+	holderWG.Add(1)
+	go func() {
+		defer holderWG.Done()
+		if w := call(entry, edgeRequest("/api/parse?tag=holder", "192.0.2.1")); w.Code != http.StatusOK {
+			t.Errorf("holder status=%d", w.Code)
+		}
+	}()
+	<-slot1Entered
+
+	// 2. Queue 2 distinct clients (fills QueueSize=2 in FIFO order: q1 then q2).
+	q1Done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		q1Done <- call(entry, edgeRequest("/api/parse?tag=q1", "192.0.2.2"))
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		adm.public.mu.Lock()
+		qLen := adm.public.waiters.Len()
+		adm.public.mu.Unlock()
+		if qLen == 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Same IP ("192.0.2.2") sending a 2nd concurrent request while queued must be rejected immediately!
+	tSame := time.Now()
+	wSame := call(entry, edgeRequest("/api/parse?tag=same-ip", "192.0.2.2"))
+	if wSame.Code != http.StatusTooManyRequests || time.Since(tSame) > 40*time.Millisecond {
+		t.Fatalf("same-IP concurrent request while queued must fail immediately with 429, got code=%d elapsed=%s", wSame.Code, time.Since(tSame))
+	}
+
+	q2Done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		q2Done <- call(entry, edgeRequest("/api/parse?tag=q2", "192.0.2.3"))
+	}()
+	for time.Now().Before(deadline) {
+		adm.public.mu.Lock()
+		qLen := adm.public.waiters.Len()
+		adm.public.mu.Unlock()
+		if qLen == 2 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// 3. Queue overflow (3rd waiter when QueueSize=2) rejects immediately without waiting QueueWait.
+	tOverflow := time.Now()
+	wOverflow := call(entry, edgeRequest("/api/parse?tag=overflow", "192.0.2.4"))
+	if wOverflow.Code != http.StatusTooManyRequests || wOverflow.Header().Get("Retry-After") != "1" || time.Since(tOverflow) > 40*time.Millisecond {
+		t.Fatalf("overflow request must reject immediately with 429 Retry-After:1, got code=%d elapsed=%s", wOverflow.Code, time.Since(tOverflow))
+	}
+
+	// 4. Release holder within QueueWait -> q1 and q2 wake in FIFO order and both return 200 OK.
+	close(holdSlot)
+	holderWG.Wait()
+	if w1 := <-q1Done; w1.Code != http.StatusOK {
+		t.Fatalf("q1 expected 200 OK after wakeup, got %d", w1.Code)
+	}
+	if w2 := <-q2Done; w2.Code != http.StatusOK {
+		t.Fatalf("q2 expected 200 OK after wakeup, got %d", w2.Code)
+	}
+	orderMu.Lock()
+	gotOrder := strings.Join(executionOrder, ",")
+	orderMu.Unlock()
+	if gotOrder != "holder,q1,q2" {
+		t.Fatalf("expected FIFO execution order holder,q1,q2, got %q", gotOrder)
+	}
+
+	// 5. Queue timeout returns 429 RATE_LIMITED with Retry-After and retry_after_seconds >= 1, freeing client & queue slots.
+	relBlock, retry := adm.public.acquire(netip.MustParseAddr("192.0.2.50"), time.Now())
+	if retry != 0 {
+		t.Fatal(retry)
+	}
+	tTimeout := time.Now()
+	wTimeout := call(entry, edgeRequest("/api/parse?tag=timeout", "192.0.2.51"))
+	elapsedTimeout := time.Since(tTimeout)
+	if wTimeout.Code != http.StatusTooManyRequests || wTimeout.Header().Get("Retry-After") != "1" || elapsedTimeout < 90*time.Millisecond {
+		t.Fatalf("expected queue timeout 429 after ~120ms, got code=%d retry=%q elapsed=%s", wTimeout.Code, wTimeout.Header().Get("Retry-After"), elapsedTimeout)
+	}
+	var errPayload map[string]any
+	if err := json.Unmarshal(wTimeout.Body.Bytes(), &errPayload); err != nil {
+		t.Fatal(err)
+	}
+	errMap, _ := errPayload["error"].(map[string]any)
+	if errPayload["code"] != "RATE_LIMITED" || errMap["retry_after_seconds"] != float64(1) {
+		t.Fatalf("unexpected queue timeout error payload: %v", errPayload)
+	}
+	relBlock()
+
+	adm.public.mu.Lock()
+	defer adm.public.mu.Unlock()
+	if adm.public.active != 0 || adm.public.waiters.Len() != 0 {
+		t.Fatalf("pool leaked state after timeout: active=%d waiters=%d", adm.public.active, adm.public.waiters.Len())
+	}
+	for ip, st := range adm.public.clients {
+		if st.active != 0 {
+			t.Fatalf("client %s leaked active=%d", ip, st.active)
+		}
+	}
+}
+
+func TestWaitQueueContextCancellationAndRaceZeroSlotLeaks(t *testing.T) {
+	var handlerHits atomic.Int64
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerHits.Add(1)
+		time.Sleep(12 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse = PoolConfig{
+		ClientBurst:       10,
+		ClientRPS:         100,
+		GlobalBurst:       500,
+		GlobalRPS:         500,
+		ClientConcurrency: 1,
+		GlobalConcurrency: 3,
+		QueueWait:         40 * time.Millisecond,
+		QueueSize:         16,
+	}
+	entry, err := WithAdmissionConfig(next, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	// 1. Explicit cancellation while queued frees client & queue slot immediately without invoking next.
+	var releases []func()
+	for i := 0; i < 3; i++ {
+		rel, retry := adm.public.acquire(netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i+1)), time.Now())
+		if retry != 0 {
+			t.Fatal(retry)
+		}
+		releases = append(releases, rel)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelDone := make(chan struct{})
+	go func() {
+		defer close(cancelDone)
+		req := edgeRequest("/api/parse", "198.51.100.99").WithContext(ctx)
+		call(entry, req)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		adm.public.mu.Lock()
+		qLen := adm.public.waiters.Len()
+		adm.public.mu.Unlock()
+		if qLen == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-cancelDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("canceled queued request did not exit promptly")
+	}
+	if handlerHits.Load() != 0 {
+		t.Fatalf("canceled queued request reached handler: hits=%d", handlerHits.Load())
+	}
+	for _, rel := range releases {
+		rel()
+	}
+
+	// 2. High-contention concurrent acquire + release + timeout + random ctx cancellation under -race.
+	var wg sync.WaitGroup
+	for i := 0; i < 120; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ip := fmt.Sprintf("203.0.113.%d", (idx%200)+1)
+			req := edgeRequest("/api/parse", ip)
+			switch idx % 4 {
+			case 0:
+				rctx, rcancel := context.WithTimeout(context.Background(), time.Duration(idx%18)*time.Millisecond)
+				defer rcancel()
+				req = req.WithContext(rctx)
+			case 1:
+				rctx, rcancel := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(time.Duration(idx%15) * time.Millisecond)
+					rcancel()
+				}()
+				req = req.WithContext(rctx)
+			}
+			call(entry, req)
+		}(i)
+	}
+	wg.Wait()
+
+	adm.public.mu.Lock()
+	defer adm.public.mu.Unlock()
+	if adm.public.active != 0 {
+		t.Fatalf("global active slot leak after concurrent race: got %d, want 0", adm.public.active)
+	}
+	if adm.public.waiters.Len() != 0 {
+		t.Fatalf("waiters queue not empty after concurrent race: got %d", adm.public.waiters.Len())
+	}
+	if adm.public.idle.Len() != len(adm.public.clients) {
+		t.Fatalf("idle LRU count (%d) != client map size (%d)", adm.public.idle.Len(), len(adm.public.clients))
+	}
+	for ip, st := range adm.public.clients {
+		if st.active != 0 || st.idleElem == nil {
+			t.Fatalf("client %s corrupted state: active=%d idleElem=%v", ip, st.active, st.idleElem)
+		}
 	}
 }

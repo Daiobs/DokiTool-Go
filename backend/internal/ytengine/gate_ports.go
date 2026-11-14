@@ -44,7 +44,7 @@ func newGatePortPool(ports []int, concurrency int) (*gatePortPool, error) {
 		return nil, nil
 	}
 	if len(ports) > maxAllowedConcurrency || len(ports) != concurrency {
-		return nil, errors.New("DOKITOOL_YTDLP_GATE_PORTS count must equal shared concurrency (1-8)")
+		return nil, fmt.Errorf("DOKITOOL_YTDLP_GATE_PORTS count must equal shared concurrency (1-%d)", maxAllowedConcurrency)
 	}
 	p := &gatePortPool{ports: append([]int(nil), ports...), used: make(map[int]bool)}
 	seen := make(map[int]bool)

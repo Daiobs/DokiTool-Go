@@ -1,6 +1,8 @@
 package api
 
 import (
+	"container/list"
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"math"
@@ -47,6 +49,15 @@ func classify(path string) route {
 	}
 }
 
+func isSlowParsePlatform(platform string) bool {
+	switch platform {
+	case "x", "youtube", "instagram", "facebook", "tumblr", "dailymotion":
+		return true
+	default:
+		return false
+	}
+}
+
 const clientHeader = "X-DokiTool-Client-IP"
 const edgeHeader = "X-DokiTool-Edge-Key"
 
@@ -74,18 +85,24 @@ func WithAdmissionConfig(next, pullControl http.Handler, mode, edgeKey string, c
 	default:
 		return nil, fmt.Errorf("client-identity must be direct or caddy")
 	}
-	return &admission{next: next, pullControl: pullControl, edgeKey: edgeKey, now: time.Now,
-		public:  newConfiguredPool(config.Parse, config.MaxClients),
-		catalog: newConfiguredPool(config.Catalog, config.MaxClients),
-		reports: newConfiguredPool(config.Reports, config.MaxClients),
-		relay:   newConfiguredPool(config.Relay, config.MaxClients)}, nil
+	return &admission{
+		next:        next,
+		pullControl: pullControl,
+		edgeKey:     edgeKey,
+		now:         time.Now,
+		public:      newConfiguredPool(config.Parse, config.MaxClients),
+		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
+		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
+		reports:     newConfiguredPool(config.Reports, config.MaxClients),
+		relay:       newConfiguredPool(config.Relay, config.MaxClients),
+	}, nil
 }
 
 type admission struct {
-	next, pullControl               http.Handler
-	edgeKey                         string
-	now                             func() time.Time
-	public, catalog, relay, reports *pool
+	next, pullControl                     http.Handler
+	edgeKey                               string
+	now                                   func() time.Time
+	public, slow, catalog, relay, reports *pool
 }
 
 func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -114,15 +131,11 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rejectAdmission(w, r, kind, http.StatusServiceUnavailable, 30)
 		return
 	}
-	budget := a.public
-	if kind == media {
-		budget = a.relay
-	} else if kind == telemetry {
-		budget = a.reports
-	} else if kind == catalogRoute || (kind == youtubeHelper && r.Method == http.MethodGet && path == "/api/youtube/context" && a.hasCachedYouTubeContext()) {
-		budget = a.catalog
+	budget := a.selectPool(r, kind, path)
+	release, retry, canceled := budget.acquireContext(r.Context(), client, a.now())
+	if canceled {
+		return
 	}
-	release, retry := budget.acquire(client, a.now())
 	if retry > 0 {
 		rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 		return
@@ -131,9 +144,40 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.next.ServeHTTP(w, r)
 }
 
+func (a *admission) selectPool(r *http.Request, kind route, path string) *pool {
+	switch kind {
+	case media:
+		return a.relay
+	case telemetry:
+		return a.reports
+	case catalogRoute:
+		return a.catalog
+	case youtubeHelper:
+		if r.Method == http.MethodGet && path == "/api/youtube/context" && a.hasCachedYouTubeContext() {
+			return a.catalog
+		}
+		return a.slow
+	case parser:
+		if r.Method == http.MethodGet && isSlowParsePlatform(a.parsePlatform(r.URL.RawQuery)) {
+			return a.slow
+		}
+		return a.public
+	default:
+		return a.public
+	}
+}
+
 func (a *admission) hasCachedYouTubeContext() bool {
 	checker, ok := a.next.(interface{ HasCachedYouTubeContext() bool })
 	return ok && checker.HasCachedYouTubeContext()
+}
+
+func (a *admission) parsePlatform(rawQuery string) string {
+	classifier, ok := a.next.(interface{ ParsePlatform(string) string })
+	if !ok {
+		return ""
+	}
+	return classifier.ParsePlatform(rawQuery)
 }
 
 func (a *admission) client(r *http.Request) netip.Addr {
@@ -181,74 +225,203 @@ func (b bucket) available(now time.Time, burst, rate float64) float64 {
 
 type clientState struct {
 	bucket
-	active int
+	ip       netip.Addr
+	active   int
+	idleElem *list.Element
+}
+
+type poolWaiter struct {
+	elem    *list.Element
+	granted chan struct{}
 }
 
 // Only the short accounting transaction is serialized. No lock is held
-// during parsing, upstream reads or writes to the client.
+// during parsing, upstream reads, queue waits, or writes to the client.
 type pool struct {
 	mu                                               sync.Mutex
 	clientBurst, clientRate, globalBurst, globalRate float64
 	clientSlots, globalSlots, maxClients, active     int
+	queueWait                                        time.Duration
+	queueSize                                        int
 	global                                           bucket
 	clients                                          map[netip.Addr]*clientState
+	idle                                             list.List
+	waiters                                          list.List
 }
 
 func newConfiguredPool(c PoolConfig, maxClients int) *pool {
-	return newPool(c.ClientBurst, c.ClientRPS, c.GlobalBurst, c.GlobalRPS,
+	p := newPool(c.ClientBurst, c.ClientRPS, c.GlobalBurst, c.GlobalRPS,
 		c.ClientConcurrency, c.GlobalConcurrency, maxClients)
+	p.queueWait = c.QueueWait
+	p.queueSize = c.QueueSize
+	return p
 }
 
 func newPool(clientBurst, clientRate, globalBurst, globalRate float64, clientSlots, globalSlots, maxClients int) *pool {
-	return &pool{clientBurst: clientBurst, clientRate: clientRate, globalBurst: globalBurst,
-		globalRate: globalRate, clientSlots: clientSlots, globalSlots: globalSlots,
-		maxClients: maxClients, clients: make(map[netip.Addr]*clientState)}
+	return &pool{
+		clientBurst: clientBurst,
+		clientRate:  clientRate,
+		globalBurst: globalBurst,
+		globalRate:  globalRate,
+		clientSlots: clientSlots,
+		globalSlots: globalSlots,
+		maxClients:  maxClients,
+		clients:     make(map[netip.Addr]*clientState),
+	}
 }
 
 func (p *pool) acquire(ip netip.Addr, now time.Time) (release func(), retrySeconds int) {
+	release, retry, _ := p.acquireContext(context.Background(), ip, now)
+	return release, retry
+}
+
+func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time) (release func(), retrySeconds int, canceled bool) {
+	if ctx.Err() != nil {
+		return nil, 0, true
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	// Concurrent arrivals can obtain the lock in a different order than
 	// their timestamps; never credit the same interval twice.
 	if now.Before(p.global.at) {
 		now = p.global.at
 	}
 	c := p.clients[ip]
-	if c == nil {
-		if len(p.clients) >= p.maxClients {
-			for ip, state := range p.clients {
-				if state.active == 0 && state.available(now, p.clientBurst, p.clientRate) >= p.clientBurst {
-					delete(p.clients, ip)
-				}
-			}
-			if len(p.clients) >= p.maxClients {
-				return nil, 60
-			}
-		}
-		c = new(clientState)
+	if c == nil && len(p.clients) >= p.maxClients && p.idle.Front() == nil {
+		p.mu.Unlock()
+		return nil, 60, false
 	}
-	local := c.available(now, p.clientBurst, p.clientRate)
+	local := p.clientBurst
+	if c != nil {
+		local = c.available(now, p.clientBurst, p.clientRate)
+	}
 	global := p.global.available(now, p.globalBurst, p.globalRate)
 	if local < 1 || global < 1 {
-		return nil, int(math.Ceil(max(1, (1-local)/p.clientRate, (1-global)/p.globalRate)))
+		if c != nil && c.idleElem != nil {
+			p.idle.MoveToBack(c.idleElem)
+		}
+		p.mu.Unlock()
+		return nil, int(math.Ceil(max(1, (1-local)/p.clientRate, (1-global)/p.globalRate))), false
 	}
-	if c.active >= p.clientSlots || p.active >= p.globalSlots {
-		return nil, 1
+	if c != nil && c.active >= p.clientSlots {
+		p.mu.Unlock()
+		return nil, 1, false
+	}
+
+	canQueue := p.queueWait > 0 && p.queueSize > 0 && p.waiters.Len() < p.queueSize
+	if p.active >= p.globalSlots && !canQueue {
+		if c != nil && c.idleElem != nil {
+			p.idle.MoveToBack(c.idleElem)
+		}
+		p.mu.Unlock()
+		return nil, 1, false
+	}
+
+	if c == nil {
+		for len(p.clients) >= p.maxClients {
+			front := p.idle.Front()
+			if front == nil {
+				p.mu.Unlock()
+				return nil, 60, false
+			}
+			victim := p.idle.Remove(front).(*clientState)
+			victim.idleElem = nil
+			delete(p.clients, victim.ip)
+		}
+		c = &clientState{ip: ip}
+		p.clients[ip] = c
+	}
+	if c.idleElem != nil {
+		p.idle.Remove(c.idleElem)
+		c.idleElem = nil
 	}
 	c.bucket = bucket{tokens: local - 1, at: now}
 	p.global = bucket{tokens: global - 1, at: now}
 	c.active++
-	p.active++
-	p.clients[ip] = c
+
+	if p.active < p.globalSlots {
+		p.active++
+		p.mu.Unlock()
+		return p.makeRelease(c), 0, false
+	}
+
+	w := &poolWaiter{granted: make(chan struct{}, 1)}
+	w.elem = p.waiters.PushBack(w)
+	waitDur := p.queueWait
+	p.mu.Unlock()
+
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	select {
+	case <-w.granted:
+		if ctx.Err() != nil {
+			p.releaseSlot(c)
+			return nil, 0, true
+		}
+		return p.makeRelease(c), 0, false
+
+	case <-ctx.Done():
+		p.mu.Lock()
+		if w.elem != nil {
+			p.waiters.Remove(w.elem)
+			w.elem = nil
+			c.active--
+			if c.active == 0 && p.clients[c.ip] == c {
+				c.idleElem = p.idle.PushBack(c)
+			}
+			p.mu.Unlock()
+			return nil, 0, true
+		}
+		p.mu.Unlock()
+		<-w.granted
+		p.releaseSlot(c)
+		return nil, 0, true
+
+	case <-timer.C:
+		p.mu.Lock()
+		if w.elem != nil {
+			p.waiters.Remove(w.elem)
+			w.elem = nil
+			c.active--
+			if c.active == 0 && p.clients[c.ip] == c {
+				c.idleElem = p.idle.PushBack(c)
+			}
+			p.mu.Unlock()
+			return nil, 1, false
+		}
+		p.mu.Unlock()
+		<-w.granted
+		if ctx.Err() != nil {
+			p.releaseSlot(c)
+			return nil, 0, true
+		}
+		return p.makeRelease(c), 0, false
+	}
+}
+
+func (p *pool) makeRelease(c *clientState) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			p.mu.Lock()
-			c.active--
-			p.active--
-			p.mu.Unlock()
+			p.releaseSlot(c)
 		})
-	}, 0
+	}
+}
+
+func (p *pool) releaseSlot(c *clientState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c.active--
+	if c.active == 0 && p.clients[c.ip] == c {
+		c.idleElem = p.idle.PushBack(c)
+	}
+	if front := p.waiters.Front(); front != nil {
+		w := p.waiters.Remove(front).(*poolWaiter)
+		w.elem = nil
+		w.granted <- struct{}{}
+		return
+	}
+	p.active--
 }
 
 func rejectAdmission(w http.ResponseWriter, r *http.Request, kind route, status, retry int) {

@@ -104,6 +104,19 @@ func (h *Handler) HasCachedYouTubeContext() bool {
 	return false
 }
 
+// ParsePlatform reports the registered catalog platform matched by a scalar url
+// query parameter, or "" when the URL is missing, malformed, or unsupported.
+func (h *Handler) ParsePlatform(rawQuery string) string {
+	if h == nil || h.catalog == nil {
+		return ""
+	}
+	input, scalar := queryValue(rawQuery, "url")
+	if !scalar || input == "" {
+		return ""
+	}
+	return h.catalog.PlatformForURL(InputURL(input))
+}
+
 var shareURL = regexp.MustCompile(`(?i)https?://[^\s"'<>\p{Han}\x{2014}\x{2018}-\x{201D}\x{2026}\x{203B}\x{3000}-\x{303F}\x{FE10}-\x{FE1F}\x{FE30}-\x{FE6F}\x{FF00}-\x{FFEF}]+`)
 
 func InputURL(input string) string {
