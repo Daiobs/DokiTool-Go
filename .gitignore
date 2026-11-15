@@ -349,6 +349,7 @@
 !/backend/internal/api/handler.go
 !/backend/internal/api/handler_test.go
 !/backend/internal/api/kuaishou_http_test.go
+!/backend/internal/api/owner_channel_test.go
 !/backend/internal/api/pipigx_http_test.go
 !/backend/internal/api/pipixia_http_test.go
 !/backend/internal/api/tbvideo_outcome.go

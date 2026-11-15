@@ -24,6 +24,10 @@ func TestParseConfigBoundsValidation(t *testing.T) {
 		{"-cache", "invalid"},
 		{"-ytdlp-concurrency", "25"},
 		{"-shanghai-workers", "99"},
+		{"-owner-ratio", "-0.2"},
+		{"-owner-ratio", "1.2"},
+		{"-owner-concurrency", "-1"},
+		{"-owner-concurrency", "33"},
 		{"-rps", "0"},
 		{"-rps", "9999"},
 		{"extra-arg"},
@@ -58,15 +62,15 @@ func TestLoopbackClientRejectsExternalAddresses(t *testing.T) {
 }
 
 func TestLoadtestProfilesSmokeLoopbackOnly(t *testing.T) {
-	for _, profile := range []string{"baseline", "current"} {
+	for _, profile := range []string{"baseline", "current", "pre-pr5", "post-pr5"} {
 		var out bytes.Buffer
 		err := run([]string{
 			"-profile", profile,
-			"-rps", "40",
-			"-duration", "350ms",
-			"-fast-latency", "8ms",
-			"-slow-latency", "25ms",
-			"-shanghai-latency", "8ms",
+			"-rps", "60",
+			"-duration", "400ms",
+			"-fast-latency", "5ms",
+			"-slow-latency", "15ms",
+			"-shanghai-latency", "5ms",
 			"-json",
 		}, &out)
 		if err != nil {
@@ -80,14 +84,25 @@ func TestLoadtestProfilesSmokeLoopbackOnly(t *testing.T) {
 			t.Fatalf("expected 1 tier result, got %d", len(results))
 		}
 		r := results[0]
-		if r.Overall.Requests < 8 {
-			t.Fatalf("expected at least 8 requests in smoke run for %s, got %d", profile, r.Overall.Requests)
+		if r.Overall.Requests < 12 {
+			t.Fatalf("expected at least 12 requests in smoke run for %s, got %d", profile, r.Overall.Requests)
 		}
 		if r.Overall.OtherErr != 0 {
 			t.Fatalf("expected zero non-429 errors for %s, got %d", profile, r.Overall.OtherErr)
 		}
 		if profile == "current" && r.ShanghaiHits == 0 {
 			t.Fatalf("expected Shanghai PullBroker hits > 0 in current smoke run, got 0")
+		}
+		if profile == "post-pr5" {
+			if r.OwnerAgent.OK == 0 || r.Anonymous.OK == 0 {
+				t.Fatalf("expected both owner and anonymous 200 OKs in post-pr5 smoke run, got owner=%d anon=%d", r.OwnerAgent.OK, r.Anonymous.OK)
+			}
+			if r.WeiboOwnerDirect == 0 || r.WeiboAnonRelay == 0 {
+				t.Fatalf("expected Weibo owner direct > 0 and anon relay > 0 in post-pr5, got direct=%d relay=%d", r.WeiboOwnerDirect, r.WeiboAnonRelay)
+			}
+		}
+		if profile == "pre-pr5" && r.WeiboOwnerDirect != 0 {
+			t.Fatalf("expected zero Weibo direct URLs in pre-pr5, got %d", r.WeiboOwnerDirect)
 		}
 	}
 }

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +23,7 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
+	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -629,5 +633,194 @@ func TestPreparePublicMediaMultiRoutePlatforms(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func randomHexToken(t *testing.T, bytesLen int) string {
+	t.Helper()
+	buf := make([]byte, bytesLen)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(buf)
+}
+
+func TestOwnerChannelStartupValidationAndNoSecretLeak(t *testing.T) {
+	canaryShort := randomHexToken(t, 12) // 24 chars (< 32)
+	canaryLong := randomHexToken(t, 260) // 520 chars (> 512)
+	canaryShared := randomHexToken(t, 24)
+	canaryValid := randomHexToken(t, 24)
+	canaryBadInt := randomHexToken(t, 10)
+
+	var logBuf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevOut)
+
+	badEnvCases := []struct {
+		name      string
+		env       map[string]string
+		wantSub   string
+		forbidSub string
+	}{
+		{
+			name:      "short-owner-token",
+			env:       map[string]string{"DOKITOOL_OWNER_TOKEN": canaryShort},
+			wantSub:   "DOKITOOL_OWNER_TOKEN",
+			forbidSub: canaryShort[:12],
+		},
+		{
+			name:      "overlong-owner-token",
+			env:       map[string]string{"DOKITOOL_OWNER_TOKEN": canaryLong},
+			wantSub:   "DOKITOOL_OWNER_TOKEN",
+			forbidSub: canaryLong[:12],
+		},
+		{
+			name:      "whitespace-owner-token",
+			env:       map[string]string{"DOKITOOL_OWNER_TOKEN": " " + canaryValid},
+			wantSub:   "DOKITOOL_OWNER_TOKEN",
+			forbidSub: canaryValid[:12],
+		},
+		{
+			name: "shared-with-ingress-key",
+			env: map[string]string{
+				"DOKITOOL_OWNER_TOKEN": canaryShared,
+				"SNAP_INGRESS_KEY":     canaryShared,
+			},
+			wantSub:   "DOKITOOL_OWNER_TOKEN requires a dedicated credential",
+			forbidSub: canaryShared[:12],
+		},
+		{
+			name: "shared-with-media-signing-key",
+			env: map[string]string{
+				"DOKITOOL_OWNER_TOKEN":   canaryShared,
+				"SNAP_MEDIA_SIGNING_KEY": canaryShared,
+			},
+			wantSub:   "DOKITOOL_OWNER_TOKEN requires a dedicated credential",
+			forbidSub: canaryShared[:12],
+		},
+		{
+			name: "shared-with-shanghai-pull-token",
+			env: map[string]string{
+				"DOKITOOL_OWNER_TOKEN":         canaryShared,
+				"DOKITOOL_SHANGHAI_MODE":       "pull",
+				"DOKITOOL_SHANGHAI_PULL_TOKEN": canaryShared,
+			},
+			wantSub:   "dedicated",
+			forbidSub: canaryShared[:12],
+		},
+		{
+			name:      "concurrency-zero",
+			env:       map[string]string{"DOKITOOL_OWNER_CONCURRENCY": "0"},
+			wantSub:   "DOKITOOL_OWNER_CONCURRENCY",
+			forbidSub: canaryBadInt,
+		},
+		{
+			name:      "concurrency-above-32",
+			env:       map[string]string{"DOKITOOL_OWNER_CONCURRENCY": "33"},
+			wantSub:   "DOKITOOL_OWNER_CONCURRENCY",
+			forbidSub: canaryBadInt,
+		},
+		{
+			name:      "concurrency-non-integer",
+			env:       map[string]string{"DOKITOOL_OWNER_CONCURRENCY": canaryBadInt},
+			wantSub:   "DOKITOOL_OWNER_CONCURRENCY",
+			forbidSub: canaryBadInt,
+		},
+	}
+
+	for _, tc := range badEnvCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{
+				"DOKITOOL_OWNER_TOKEN",
+				"DOKITOOL_OWNER_CONCURRENCY",
+				"SNAP_INGRESS_KEY",
+				"SNAP_MEDIA_SIGNING_KEY",
+				"DOKITOOL_SHANGHAI_MODE",
+				"DOKITOOL_SHANGHAI_PULL_TOKEN",
+			} {
+				t.Setenv(k, tc.env[k])
+			}
+			occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+			occupied.Close()
+			if runErr == nil || !strings.Contains(runErr.Error(), tc.wantSub) {
+				t.Fatalf("expected startup error containing %q before listener bind, got %v", tc.wantSub, runErr)
+			}
+			if tc.forbidSub != "" && strings.Contains(runErr.Error(), tc.forbidSub) {
+				t.Fatalf("startup error leaked secret/raw value: %v", runErr)
+			}
+		})
+	}
+
+	// Valid DOKITOOL_OWNER_TOKEN + DOKITOOL_OWNER_CONCURRENCY reaches listener bind and never logs the token.
+	t.Setenv("DOKITOOL_OWNER_TOKEN", canaryValid)
+	t.Setenv("DOKITOOL_OWNER_CONCURRENCY", "16")
+	t.Setenv("SNAP_INGRESS_KEY", "")
+	t.Setenv("SNAP_MEDIA_SIGNING_KEY", "")
+	t.Setenv("DOKITOOL_SHANGHAI_MODE", "")
+	t.Setenv("DOKITOOL_SHANGHAI_PULL_TOKEN", "")
+
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+	occupied.Close()
+	if runErr == nil || strings.Contains(runErr.Error(), "DOKITOOL_OWNER") {
+		t.Fatalf("valid owner configuration failed before bind: %v", runErr)
+	}
+	if strings.Contains(logBuf.String(), canaryValid[:12]) || strings.Contains(runErr.Error(), canaryValid[:12]) {
+		t.Fatalf("startup log or bind error leaked DOKITOOL_OWNER_TOKEN: log=%q err=%v", logBuf.String(), runErr)
+	}
+}
+
+func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
+	const now int64 = 1730000000
+	const srcURL = "https://weibo.com/1234567890/AbC"
+	const cdnURL = "https://f.video.weibocdn.com/full.mp4?size=1080"
+	const body = `{"idstr":"1234567890","text_raw":"t","page_info":{"media_info":{"mp4_hd_url":"https://f.video.weibocdn.com/full.mp4?size=1080","video_title":"v","duration":16}},"user":{"screen_name":"u","idstr":"1"}}`
+
+	mediaKey := randomHexToken(t, 32)
+	ownerToken := randomHexToken(t, 24)
+	registry, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb := weiboplatform.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(body)}, nil
+	}))
+	h, err := api.New(registry, map[string]api.Adapter{"weibo": wb}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia(mediaKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := api.NewOwnerAuth(ownerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := api.WithAdmissionWithOwner(h, nil, "direct", "", api.DefaultAdmissionConfig(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := url.Values{"schema_version": {"1.0"}, "url": {srcURL}}
+	ownerReq := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
+	ownerReq.RemoteAddr = "127.0.0.1:40001"
+	ownerReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	wOwner := httptest.NewRecorder()
+	entry.ServeHTTP(wOwner, ownerReq)
+	if wOwner.Code != http.StatusOK || !strings.Contains(wOwner.Body.String(), cdnURL) || strings.Contains(wOwner.Body.String(), "/api/media/weibo?ticket=") {
+		t.Fatalf("owner Weibo response did not return direct CDN URL without relay: code=%d body=%s", wOwner.Code, wOwner.Body.String())
+	}
+
+	anonReq := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
+	anonReq.RemoteAddr = "127.0.0.1:40002"
+	wAnon := httptest.NewRecorder()
+	entry.ServeHTTP(wAnon, anonReq)
+	if wAnon.Code != http.StatusOK || strings.Contains(wAnon.Body.String(), cdnURL) || !strings.Contains(wAnon.Body.String(), "/api/media/weibo?ticket=") {
+		t.Fatalf("anonymous Weibo response did not return signed relay URL: code=%d body=%s", wAnon.Code, wAnon.Body.String())
 	}
 }

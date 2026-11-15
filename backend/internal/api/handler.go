@@ -227,7 +227,7 @@ func send(w http.ResponseWriter, status int, payload unified.Object) {
 func contractErrorForStatus(status int, message string) unified.Object {
 	code := "UPSTREAM_INVALID_RESPONSE"
 	switch status {
-	case 400, 404, 405, 409, 410:
+	case 400, 401, 404, 405, 409, 410:
 		code = "INVALID_INPUT"
 	case 403:
 		code = "UPSTREAM_BLOCKED"

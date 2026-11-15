@@ -8,6 +8,48 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
+// PreparePublicWithOwner dispatches authenticated owner requests to PrepareOwner
+// (direct provider URLs without relay ticket minting) while keeping anonymous
+// visitor requests on PreparePublic's signed media-relay boundary.
+func PreparePublicWithOwner(key string, isOwner func(context.Context) bool) func(context.Context, string, unified.Object, int64) (unified.Object, error) {
+	public := PreparePublic(key)
+	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
+		if isOwner != nil && isOwner(ctx) {
+			return PrepareOwner(ctx, platform, payload, now)
+		}
+		return public(ctx, platform, payload, now)
+	}
+}
+
+// PrepareOwner validates fixed-provider Weibo video URLs and reselects defaults
+// without minting signed /api/media/weibo relay tickets.
+func PrepareOwner(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
+	if platform != "weibo" || payload["code"] != "OK" {
+		return payload, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := unified.Clone(payload)
+	recognized := 0
+	items := unified.Slice(unified.Map(result["data"])["items"])
+	for index, rawItem := range items {
+		item := unified.Map(rawItem)
+		for _, rawVariant := range unified.Slice(item["variants"]) {
+			variant := unified.Map(rawVariant)
+			if variant["state"] != nil && variant["state"] != "ready" {
+				continue
+			}
+			prepareOwnerDeliverySources(unified.Map(variant["delivery"]), &recognized)
+		}
+		items[index] = unified.SelectDefault(item, now)
+	}
+	if recognized == 0 {
+		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "微博暂未提供本站支持的视频源，请稍后重试", true), nil
+	}
+	return result, nil
+}
+
 // PreparePublic signs only fixed-provider sources without altering identity,
 // source order or the full candidate inventory. PublicView remains shared.
 func PreparePublic(key string) func(context.Context, string, unified.Object, int64) (unified.Object, error) {
@@ -101,4 +143,43 @@ func signSource(source unified.Object, key string, now int64, recognized *int) {
 	source["url"] = ticket
 	source["access"] = "relay"
 	source["expires_at"] = time.Unix(expiry, 0).UTC().Format(time.RFC3339)
+}
+
+func prepareOwnerDeliverySources(delivery unified.Object, recognized *int) {
+	if delivery == nil {
+		return
+	}
+	for _, value := range unified.Slice(delivery["sources"]) {
+		prepareOwnerSource(unified.Map(value), recognized)
+	}
+	if init := unified.Map(delivery["init"]); init != nil {
+		for _, value := range unified.Slice(init["sources"]) {
+			prepareOwnerSource(unified.Map(value), recognized)
+		}
+	}
+	for _, rawPiece := range unified.Slice(delivery["pieces"]) {
+		for _, value := range unified.Slice(unified.Map(rawPiece)["sources"]) {
+			prepareOwnerSource(unified.Map(value), recognized)
+		}
+	}
+	for _, rawResource := range unified.Slice(delivery["resources"]) {
+		prepareOwnerDeliverySources(unified.Map(unified.Map(rawResource)["delivery"]), recognized)
+	}
+}
+
+func prepareOwnerSource(source unified.Object, recognized *int) {
+	if source == nil {
+		return
+	}
+	raw := unified.Str(source["url"])
+	if !media.AllowedURL(raw) {
+		source["availability"] = "unavailable"
+		return
+	}
+	*recognized = *recognized + 1
+	if previous, ok := source["expires_at"]; ok && previous != nil {
+		if _, err := time.Parse(time.RFC3339Nano, unified.Str(previous)); err != nil {
+			source["availability"] = "unavailable"
+		}
+	}
 }

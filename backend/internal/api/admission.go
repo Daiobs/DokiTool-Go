@@ -60,6 +60,20 @@ func isSlowParsePlatform(platform string) bool {
 
 const clientHeader = "X-DokiTool-Client-IP"
 const edgeHeader = "X-DokiTool-Edge-Key"
+const serverWriteWindow = 50 * time.Second
+
+type ownerContextKey struct{}
+
+// WithOwnerRequest marks a request context as authenticated via DOKITOOL_OWNER_TOKEN.
+func WithOwnerRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ownerContextKey{}, true)
+}
+
+// IsOwnerRequest reports whether ctx belongs to an authenticated owner request.
+func IsOwnerRequest(ctx context.Context) bool {
+	ok, _ := ctx.Value(ownerContextKey{}).(bool)
+	return ok
+}
 
 // WithAdmission wraps the production HTTP entry point. All limits are local
 // to one serving instance; the pools share neither clients nor leases.
@@ -70,6 +84,12 @@ func WithAdmission(next, pullControl http.Handler, mode, edgeKey string) (http.H
 // WithAdmissionConfig preserves trusted client identity while giving each route
 // its own independently tunable visitor and service budgets.
 func WithAdmissionConfig(next, pullControl http.Handler, mode, edgeKey string, config AdmissionConfig) (http.Handler, error) {
+	return WithAdmissionWithOwner(next, pullControl, mode, edgeKey, config, OwnerAuth{})
+}
+
+// WithAdmissionWithOwner configures admission control with an optional owner
+// bearer channel backed by its own dedicated concurrency pool and wait queue.
+func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string, config AdmissionConfig, owner OwnerAuth) (http.Handler, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -89,20 +109,24 @@ func WithAdmissionConfig(next, pullControl http.Handler, mode, edgeKey string, c
 		next:        next,
 		pullControl: pullControl,
 		edgeKey:     edgeKey,
+		ownerAuth:   owner,
 		now:         time.Now,
 		public:      newConfiguredPool(config.Parse, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
 		relay:       newConfiguredPool(config.Relay, config.MaxClients),
+		owner:       newOwnerPool(config.OwnerConcurrency, config.OwnerQueueWait, config.OwnerQueueSize),
 	}, nil
 }
 
 type admission struct {
 	next, pullControl                     http.Handler
 	edgeKey                               string
+	ownerAuth                             OwnerAuth
 	now                                   func() time.Time
 	public, slow, catalog, relay, reports *pool
+	owner                                 *ownerPool
 }
 
 func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +154,39 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !client.IsValid() {
 		rejectAdmission(w, r, kind, http.StatusServiceUnavailable, 30)
 		return
+	}
+	authValues := r.Header.Values("Authorization")
+	r.Header.Del("Authorization")
+	if len(authValues) > 0 {
+		if !a.ownerAuth.verifyHeader(authValues) {
+			retry := a.public.chargeClient(client, a.now())
+			if retry > 0 {
+				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
+				return
+			}
+			rejectUnauthorized(w, r, kind)
+			return
+		}
+		r = r.WithContext(WithOwnerRequest(r.Context()))
+		if kind != media && kind != telemetry {
+			if a.owner.queueWait > 0 {
+				_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(a.owner.queueWait + serverWriteWindow))
+			}
+			release, retry, canceled := a.owner.acquireContext(r.Context())
+			if canceled {
+				return
+			}
+			if retry > 0 {
+				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
+				return
+			}
+			defer release()
+			if a.owner.queueWait > 0 {
+				_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
+			}
+			a.next.ServeHTTP(w, r)
+			return
+		}
 	}
 	budget := a.selectPool(r, kind, path)
 	release, retry, canceled := budget.acquireContext(r.Context(), client, a.now())
@@ -422,6 +479,165 @@ func (p *pool) releaseSlot(c *clientState) {
 		return
 	}
 	p.active--
+}
+
+// chargeClient deducts one token from the visitor's per-IP abuse budget without
+// consuming global service tokens or concurrency leases. Failed authentication
+// attempts therefore throttle the caller IP without starving other visitors.
+func (p *pool) chargeClient(ip netip.Addr, now time.Time) (retrySeconds int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if now.Before(p.global.at) {
+		now = p.global.at
+	}
+	c := p.clients[ip]
+	if c != nil && now.Before(c.bucket.at) {
+		now = c.bucket.at
+	}
+	if c == nil && len(p.clients) >= p.maxClients && p.idle.Front() == nil {
+		return 60
+	}
+	local := p.clientBurst
+	if c != nil {
+		local = c.available(now, p.clientBurst, p.clientRate)
+	}
+	if local < 1 {
+		if c != nil && c.idleElem != nil {
+			p.idle.MoveToBack(c.idleElem)
+		}
+		return int(math.Ceil(max(1, (1-local)/p.clientRate)))
+	}
+	if c == nil {
+		for len(p.clients) >= p.maxClients {
+			front := p.idle.Front()
+			if front == nil {
+				return 60
+			}
+			victim := p.idle.Remove(front).(*clientState)
+			victim.idleElem = nil
+			delete(p.clients, victim.ip)
+		}
+		c = &clientState{ip: ip}
+		p.clients[ip] = c
+		c.idleElem = p.idle.PushBack(c)
+	} else if c.idleElem != nil {
+		p.idle.MoveToBack(c.idleElem)
+	}
+	c.bucket = bucket{tokens: local - 1, at: now}
+	return 0
+}
+
+type ownerPool struct {
+	mu        sync.Mutex
+	slots     int
+	active    int
+	queueWait time.Duration
+	queueSize int
+	waiters   list.List
+}
+
+func newOwnerPool(slots int, queueWait time.Duration, queueSize int) *ownerPool {
+	return &ownerPool{
+		slots:     slots,
+		queueWait: queueWait,
+		queueSize: queueSize,
+	}
+}
+
+func (p *ownerPool) acquireContext(ctx context.Context) (release func(), retrySeconds int, canceled bool) {
+	if ctx.Err() != nil {
+		return nil, 0, true
+	}
+	p.mu.Lock()
+	if p.active < p.slots {
+		p.active++
+		p.mu.Unlock()
+		return p.makeRelease(), 0, false
+	}
+	if p.queueWait <= 0 || p.queueSize <= 0 || p.waiters.Len() >= p.queueSize {
+		p.mu.Unlock()
+		return nil, 1, false
+	}
+	w := &poolWaiter{granted: make(chan struct{}, 1)}
+	w.elem = p.waiters.PushBack(w)
+	waitDur := p.queueWait
+	p.mu.Unlock()
+
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+
+	select {
+	case <-w.granted:
+		if ctx.Err() != nil {
+			p.releaseSlot()
+			return nil, 0, true
+		}
+		return p.makeRelease(), 0, false
+
+	case <-ctx.Done():
+		p.mu.Lock()
+		if w.elem != nil {
+			p.waiters.Remove(w.elem)
+			w.elem = nil
+			p.mu.Unlock()
+			return nil, 0, true
+		}
+		p.mu.Unlock()
+		<-w.granted
+		p.releaseSlot()
+		return nil, 0, true
+
+	case <-timer.C:
+		p.mu.Lock()
+		if w.elem != nil {
+			p.waiters.Remove(w.elem)
+			w.elem = nil
+			p.mu.Unlock()
+			return nil, 1, false
+		}
+		p.mu.Unlock()
+		<-w.granted
+		if ctx.Err() != nil {
+			p.releaseSlot()
+			return nil, 0, true
+		}
+		return p.makeRelease(), 0, false
+	}
+}
+
+func (p *ownerPool) makeRelease() func() {
+	var once sync.Once
+	return func() {
+		once.Do(p.releaseSlot)
+	}
+}
+
+func (p *ownerPool) releaseSlot() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if front := p.waiters.Front(); front != nil {
+		w := p.waiters.Remove(front).(*poolWaiter)
+		w.elem = nil
+		w.granted <- struct{}{}
+		return
+	}
+	p.active--
+}
+
+func rejectUnauthorized(w http.ResponseWriter, r *http.Request, kind route) {
+	const message = "认证凭据无效"
+	payload := unified.Object{"code": http.StatusUnauthorized, "msg": message, "data": nil}
+	if kind == parser || kind == catalogRoute || kind == youtubeHelper {
+		payload = contractErrorForStatus(http.StatusUnauthorized, message)
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	send(w, http.StatusUnauthorized, payload)
 }
 
 func rejectAdmission(w http.ResponseWriter, r *http.Request, kind route, status, retry int) {

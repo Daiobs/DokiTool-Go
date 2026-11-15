@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,7 +43,7 @@ import (
 
 // preparePublicMedia keeps platform-specific transformations at the public boundary.
 func preparePublicMedia(key string) api.PublicMedia {
-	weibo := weiboplatform.PreparePublic(key)
+	weibo := weiboplatform.PreparePublicWithOwner(key, api.IsOwnerRequest)
 	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
 		switch platform {
 		case "douyin":
@@ -178,7 +179,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	entry, err := api.WithAdmissionConfig(handler, control, *clientIdentity, os.Getenv("SNAP_INGRESS_KEY"), limits)
+	ownerAuth, err := loadOwnerAuth(os.Getenv)
+	if err != nil {
+		return err
+	}
+	entry, err := api.WithAdmissionWithOwner(handler, control, *clientIdentity, os.Getenv("SNAP_INGRESS_KEY"), limits, ownerAuth)
 	if err != nil {
 		return err
 	}
@@ -226,8 +231,8 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 			return nil, nil, errors.New("remove DOKITOOL_SHANGHAI_ENDPOINT before enabling pull mode")
 		}
 		token := getenv("DOKITOOL_SHANGHAI_PULL_TOKEN")
-		for _, key := range []string{"SNAP_INGRESS_KEY", "SNAP_MEDIA_SIGNING_KEY", "DOKITOOL_SHANGHAI_TOKEN"} {
-			if token != "" && token == getenv(key) {
+		for _, key := range []string{"SNAP_INGRESS_KEY", "SNAP_MEDIA_SIGNING_KEY", "DOKITOOL_SHANGHAI_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
+			if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(getenv(key))) == 1 {
 				return nil, nil, errors.New("pull mode requires a dedicated control credential")
 			}
 		}
@@ -239,6 +244,26 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 	default:
 		return nil, nil, errors.New("DOKITOOL_SHANGHAI_MODE must be off, direct or pull")
 	}
+}
+
+func loadOwnerAuth(getenv func(string) string) (api.OwnerAuth, error) {
+	auth, err := api.LoadOwnerAuth(getenv)
+	if err != nil || !auth.Enabled() {
+		return auth, err
+	}
+	ownerToken := getenv("DOKITOOL_OWNER_TOKEN")
+	for _, key := range []string{
+		"SNAP_INGRESS_KEY",
+		"SNAP_MEDIA_SIGNING_KEY",
+		"DOKITOOL_SHANGHAI_TOKEN",
+		"DOKITOOL_SHANGHAI_PULL_TOKEN",
+	} {
+		other := getenv(key)
+		if other != "" && subtle.ConstantTimeCompare([]byte(ownerToken), []byte(other)) == 1 {
+			return api.OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN requires a dedicated credential")
+		}
+	}
+	return auth, nil
 }
 
 func newXHSExecutor(mode string) (fetch.Executor, error) {

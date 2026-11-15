@@ -31,6 +31,8 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -49,6 +51,8 @@ type config struct {
 	cacheMode        string
 	ytdlpConcurrency int
 	shanghaiWorkers  int
+	ownerRatio       float64
+	ownerConcurrency int
 	bearerEnv        string
 	jsonOutput       bool
 }
@@ -75,6 +79,10 @@ type tierResult struct {
 	Overall          classSummary `json:"overall"`
 	Fast             classSummary `json:"fast_and_shanghai"`
 	Slow             classSummary `json:"slow_ytdlp"`
+	OwnerAgent       classSummary `json:"owner_agent"`
+	Anonymous        classSummary `json:"anonymous_visitors"`
+	WeiboOwnerDirect int64        `json:"weibo_owner_direct_ok"`
+	WeiboAnonRelay   int64        `json:"weibo_anon_relay_ok"`
 	PeakHeapAllocMiB float64      `json:"peak_heap_alloc_mib"`
 	PeakSysMiB       float64      `json:"peak_sys_mib"`
 	PeakGoroutines   int          `json:"peak_goroutines"`
@@ -96,7 +104,7 @@ func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("loadtest", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	profile := fs.String("profile", "current", "preset profile: current (post-PR4), baseline (pre-PR4), or pre-102")
+	profile := fs.String("profile", "current", "preset profile: current (post-PR4), baseline (pre-PR4), pre-102, pre-pr5, or post-pr5")
 	rpsRaw := fs.String("rps", "5,25,60,120", "comma-separated target req/s tiers")
 	duration := fs.Duration("duration", 120*time.Second, "duration per RPS tier")
 	fastLatency := fs.Duration("fast-latency", 500*time.Millisecond, "simulated pure-Go upstream parse latency")
@@ -108,6 +116,8 @@ func parseConfig(args []string) (config, error) {
 	cacheMode := fs.String("cache", "auto", "parse cache mode: auto, on, or off")
 	ytdlpConc := fs.Int("ytdlp-concurrency", 0, "override yt-dlp concurrency (0 = profile default)")
 	shWorkers := fs.Int("shanghai-workers", 0, "override Shanghai pull worker count (0 = profile default)")
+	ownerRatio := fs.Float64("owner-ratio", -1, "fraction of single-IP batch agent requests in [0,1] (-1 = profile default)")
+	ownerConc := fs.Int("owner-concurrency", 0, "override DOKITOOL_OWNER_CONCURRENCY (0 = profile default 8)")
 	bearerEnv := fs.String("bearer-env", "", "optional env var name holding a Bearer token to attach on requests")
 	jsonOut := fs.Bool("json", false, "emit JSON results to stdout")
 
@@ -118,9 +128,9 @@ func parseConfig(args []string) (config, error) {
 		return config{}, errors.New("unexpected positional arguments")
 	}
 	switch *profile {
-	case "current", "baseline", "pre-102":
+	case "current", "baseline", "pre-102", "pre-pr5", "post-pr5":
 	default:
-		return config{}, errors.New("profile must be current, baseline, or pre-102")
+		return config{}, errors.New("profile must be current, baseline, pre-102, pre-pr5, or post-pr5")
 	}
 	if *duration <= 0 || *duration > 30*time.Minute {
 		return config{}, errors.New("duration must be between 1ms and 30m")
@@ -130,6 +140,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if math.IsNaN(*hotRatio) || *hotRatio < 0 || *hotRatio > 1 {
 		return config{}, errors.New("hot-ratio must be between 0 and 1")
+	}
+	if math.IsNaN(*ownerRatio) || (*ownerRatio != -1 && (*ownerRatio < 0 || *ownerRatio > 1)) {
+		return config{}, errors.New("owner-ratio must be -1 or between 0 and 1")
 	}
 	if *hotURLs < 8 || *hotURLs > 65536 {
 		return config{}, errors.New("hot-urls must be between 8 and 65536")
@@ -148,6 +161,9 @@ func parseConfig(args []string) (config, error) {
 	if *shWorkers < 0 || *shWorkers > shresolver.MaxPullWorkers {
 		return config{}, fmt.Errorf("shanghai-workers must be between 0 and %d", shresolver.MaxPullWorkers)
 	}
+	if *ownerConc < 0 || *ownerConc > api.MaxOwnerConcurrency {
+		return config{}, fmt.Errorf("owner-concurrency must be between 0 and %d", api.MaxOwnerConcurrency)
+	}
 
 	var tiers []float64
 	for _, part := range strings.Split(*rpsRaw, ",") {
@@ -165,6 +181,15 @@ func parseConfig(args []string) (config, error) {
 		return config{}, errors.New("at least one rps tier is required")
 	}
 
+	effOwnerRatio := *ownerRatio
+	if effOwnerRatio < 0 {
+		if *profile == "pre-pr5" || *profile == "post-pr5" {
+			effOwnerRatio = 0.5
+		} else {
+			effOwnerRatio = 0
+		}
+	}
+
 	return config{
 		profile:          *profile,
 		rpsList:          tiers,
@@ -178,6 +203,8 @@ func parseConfig(args []string) (config, error) {
 		cacheMode:        *cacheMode,
 		ytdlpConcurrency: *ytdlpConc,
 		shanghaiWorkers:  *shWorkers,
+		ownerRatio:       effOwnerRatio,
+		ownerConcurrency: *ownerConc,
 		bearerEnv:        *bearerEnv,
 		jsonOutput:       *jsonOut,
 	}, nil
@@ -341,10 +368,11 @@ func syntheticEnvelope(platform, sourceURL string, now int64, itemIDs ...string)
 }
 
 type requestSpec struct {
-	route  string
-	rawURL string
-	itemID string
-	isSlow bool
+	route   string
+	rawURL  string
+	itemID  string
+	isSlow  bool
+	isWeibo bool
 }
 
 func buildRequestSpec(slot int, workNum uint64) requestSpec {
@@ -398,6 +426,45 @@ func buildRequestSpec(slot int, workNum uint64) requestSpec {
 			isSlow: true,
 		}
 	}
+}
+
+func buildPR5RequestSpec(slot int, workNum uint64) requestSpec {
+	// Interleaved 20-slot deterministic cycle including Weibo relay/direct verification:
+	//   9 slots  (45%): Fast pure-Go platforms (bilibili parse + resolve, weibo, kuaishou, xiaohongshu, toutiao)
+	//   6 slots  (30%): Douyin + Shanghai PullBroker channel
+	//   5 slots  (25%): Slow yt-dlp platforms (x, instagram)
+	switch slot % 20 {
+	case 2, 12:
+		return requestSpec{
+			route:   "/api/parse",
+			rawURL:  fmt.Sprintf("https://weibo.com/1234567890/%d", 5000000000000000+workNum),
+			isWeibo: true,
+		}
+	case 6:
+		return requestSpec{
+			route:  "/api/parse",
+			rawURL: fmt.Sprintf("https://www.kuaishou.com/short-video/3xload%d", workNum),
+		}
+	default:
+		return buildRequestSpec(slot, workNum)
+	}
+}
+
+type loopbackWeiboExecutor struct {
+	fetchUpstream func(ctx context.Context, path string) error
+	body          []byte
+}
+
+func (e loopbackWeiboExecutor) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	if err := e.fetchUpstream(ctx, "/upstream/fast?platform=weibo"); err != nil {
+		return fetch.Response{}, err
+	}
+	return fetch.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       e.body,
+		URL:        req.URL,
+	}, nil
 }
 
 func clientIPForIndex(idx uint64, totalClients int) string {
@@ -511,11 +578,21 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	if err != nil {
 		return tierResult{}, err
 	}
+	mediaSigningKey, err := randomHex(32)
+	if err != nil {
+		return tierResult{}, err
+	}
+	runtimeOwnerToken, err := randomHex(32)
+	if err != nil {
+		return tierResult{}, err
+	}
 
 	var fastUpstreamCalls atomic.Int64
 	var slowUpstreamCalls atomic.Int64
 	var shanghaiHits atomic.Int64
 	var shanghaiMisses atomic.Int64
+	var weiboOwnerDirect atomic.Int64
+	var weiboAnonRelay atomic.Int64
 
 	// 1. Start local 127.0.0.1 fake upstream server.
 	upstreamMux := http.NewServeMux()
@@ -594,7 +671,7 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		limits.Parse.GlobalBurst = 20
 		limits.Parse.QueueWait = 0
 		limits.Parse.QueueSize = 0
-	case "current":
+	case "current", "pre-pr5", "post-pr5":
 		if ytdlpConc == 0 {
 			ytdlpConc = 6
 		}
@@ -604,6 +681,11 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		waitOnYTDLP = true
 		limits.SlowParse.GlobalConcurrency = ytdlpConc
 	}
+	if cfg.ownerConcurrency > 0 {
+		limits.OwnerConcurrency = cfg.ownerConcurrency
+	}
+	enableOwnerChannel := cfg.profile == "post-pr5"
+	isPR5Mix := cfg.profile == "pre-pr5" || cfg.profile == "post-pr5" || cfg.ownerRatio > 0
 
 	if cfg.cacheMode == "on" {
 		cacheDisabled = false
@@ -705,9 +787,16 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		})
 	}
 
+	const syntheticWeiboJSON = `{"idstr":"1234567890","text_raw":"loadtest","page_info":{"media_info":{"mp4_hd_url":"https://f.video.weibocdn.com/loadtest.mp4?size=1080","video_title":"loadtest","duration":16}},"user":{"screen_name":"loadtest","idstr":"1"}}`
+	weiboAdapter := weiboplatform.New(loopbackWeiboExecutor{
+		fetchUpstream: fetchFakeUpstream,
+		body:          []byte(syntheticWeiboJSON),
+	})
+
 	adapters := map[string]api.Adapter{
 		"douyin":      douyinAdapter,
 		"bilibili":    fastAdapter("bilibili", "part-1", "part-2"),
+		"weibo":       weiboAdapter,
 		"toutiao":     fastAdapter("toutiao"),
 		"kuaishou":    fastAdapter("kuaishou"),
 		"pipixia":     fastAdapter("pipixia"),
@@ -722,7 +811,14 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		"dailymotion": slowAdapter("dailymotion"),
 	}
 
-	handler, err := api.NewWithCacheConfig(cat, adapters, time.Now, nil, cacheCfg)
+	var publicMedia api.PublicMedia
+	if enableOwnerChannel {
+		publicMedia = weiboplatform.PreparePublicWithOwner(mediaSigningKey, api.IsOwnerRequest)
+	} else {
+		publicMedia = weiboplatform.PreparePublic(mediaSigningKey)
+	}
+
+	handler, err := api.NewWithCacheConfig(cat, adapters, time.Now, publicMedia, cacheCfg)
 	if err != nil {
 		return tierResult{}, err
 	}
@@ -732,7 +828,14 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		// Wrap handler in a plain HandlerFunc to exercise pre-PR4 single-pool routing.
 		next = http.HandlerFunc(handler.ServeHTTP)
 	}
-	entry, err := api.WithAdmissionConfig(next, broker, "caddy", edgeKey, limits)
+	var ownerAuth api.OwnerAuth
+	if enableOwnerChannel {
+		ownerAuth, err = api.NewOwnerAuth(runtimeOwnerToken)
+		if err != nil {
+			return tierResult{}, err
+		}
+	}
+	entry, err := api.WithAdmissionWithOwner(next, broker, "caddy", edgeKey, limits, ownerAuth)
 	if err != nil {
 		return tierResult{}, err
 	}
@@ -811,16 +914,21 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	}()
 
 	// 6. Open-loop Poisson/paced load generator.
-	loadClient := newLoopbackClient(1024, 20*time.Second)
+	clientTimeout := 20 * time.Second
+	if enableOwnerChannel {
+		clientTimeout = limits.OwnerQueueWait + 55*time.Second
+	}
+	loadClient := newLoopbackClient(1024, clientTimeout)
 	bearerValue := ""
 	if cfg.bearerEnv != "" {
 		bearerValue = strings.TrimSpace(os.Getenv(cfg.bearerEnv))
 	}
 
 	type obs struct {
-		status int
-		latMS  float64
-		isSlow bool
+		status  int
+		latMS   float64
+		isSlow  bool
+		isOwner bool
 	}
 	expectedTotal := int(math.Ceil(targetRPS*cfg.duration.Seconds())) + 64
 	var obsMu sync.Mutex
@@ -838,7 +946,11 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	}
 
 	var seq uint64
+	var ownerSeq uint64
+	var anonSeq uint64
+	var ownerAcc float64
 	var coldCounter uint64 = 100_000
+	const ownerAgentIP = "198.18.255.250"
 	nextSend := startTime
 	for {
 		now := time.Now()
@@ -853,9 +965,27 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		}
 		nextSend = nextSend.Add(interval)
 
-		idx := seq
 		seq++
-		slot := int(idx % 100)
+		isOwnerReq := false
+		if cfg.ownerRatio > 0 {
+			ownerAcc += cfg.ownerRatio
+			if ownerAcc+1e-9 >= 1.0 {
+				ownerAcc -= 1.0
+				isOwnerReq = true
+			}
+		}
+		var slot int
+		var clientIP string
+		if isOwnerReq {
+			slot = int(ownerSeq % 100)
+			ownerSeq++
+			clientIP = ownerAgentIP
+		} else {
+			slot = int(anonSeq % 100)
+			clientIP = clientIPForIndex(anonSeq, cfg.clients)
+			anonSeq++
+		}
+
 		var workNum uint64
 		if rng.Float64() < cfg.hotRatio {
 			workNum = zipf.Uint64() + 1
@@ -863,11 +993,15 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 			coldCounter++
 			workNum = coldCounter
 		}
-		spec := buildRequestSpec(slot, workNum)
-		clientIP := clientIPForIndex(idx, cfg.clients)
+		var spec requestSpec
+		if isPR5Mix {
+			spec = buildPR5RequestSpec(slot, workNum)
+		} else {
+			spec = buildRequestSpec(slot, workNum)
+		}
 
 		reqWG.Add(1)
-		go func(sp requestSpec, ip string) {
+		go func(sp requestSpec, ip string, ownerCall bool) {
 			defer reqWG.Done()
 			t0 := time.Now()
 			target := apiBase + sp.route + "?schema_version=1.0&url=" + url.QueryEscape(sp.rawURL)
@@ -880,21 +1014,33 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 			}
 			req.Header.Set("X-DokiTool-Edge-Key", edgeKey)
 			req.Header.Set("X-DokiTool-Client-IP", ip)
-			if bearerValue != "" {
+			if ownerCall && enableOwnerChannel {
+				req.Header.Set("Authorization", "Bearer "+runtimeOwnerToken)
+			} else if bearerValue != "" {
 				req.Header.Set("Authorization", "Bearer "+bearerValue)
 			}
 			resp, err := loadClient.Do(req)
 			status := 0
 			if err == nil && resp != nil {
 				status = resp.StatusCode
-				_, _ = io.Copy(io.Discard, resp.Body)
+				if sp.isWeibo && status == http.StatusOK {
+					b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+					bodyStr := string(b)
+					if strings.Contains(bodyStr, "/api/media/weibo?ticket=") {
+						weiboAnonRelay.Add(1)
+					} else if strings.Contains(bodyStr, "https://f.video.weibocdn.com/") {
+						weiboOwnerDirect.Add(1)
+					}
+				} else {
+					_, _ = io.Copy(io.Discard, resp.Body)
+				}
 				resp.Body.Close()
 			}
 			lat := float64(time.Since(t0).Microseconds()) / 1000.0
 			obsMu.Lock()
-			records = append(records, obs{status: status, latMS: lat, isSlow: sp.isSlow})
+			records = append(records, obs{status: status, latMS: lat, isSlow: sp.isSlow, isOwner: ownerCall})
 			obsMu.Unlock()
-		}(spec, clientIP)
+		}(spec, clientIP, isOwnerReq)
 	}
 
 	sendElapsed := time.Since(startTime).Seconds()
@@ -956,6 +1102,10 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		Overall:          summarize(func(obs) bool { return true }),
 		Fast:             summarize(func(o obs) bool { return !o.isSlow }),
 		Slow:             summarize(func(o obs) bool { return o.isSlow }),
+		OwnerAgent:       summarize(func(o obs) bool { return o.isOwner }),
+		Anonymous:        summarize(func(o obs) bool { return !o.isOwner }),
+		WeiboOwnerDirect: weiboOwnerDirect.Load(),
+		WeiboAnonRelay:   weiboAnonRelay.Load(),
 		PeakHeapAllocMiB: float64(atomic.LoadUint64(&peakHeap)) / (1024 * 1024),
 		PeakSysMiB:       float64(atomic.LoadUint64(&peakSys)) / (1024 * 1024),
 		PeakGoroutines:   int(peakGoroutines.Load()),
@@ -982,8 +1132,31 @@ func percentileSorted(sorted []float64, p float64) float64 {
 }
 
 func printMarkdownReport(out io.Writer, cfg config, results []tierResult) {
-	fmt.Fprintf(out, "### Profile: `%s` (duration=%s, fast=%s, slow=%s, shanghai=%s, hot=%.0f%%, clients=%d)\n\n",
-		cfg.profile, cfg.duration, cfg.fastLatency, cfg.slowLatency, cfg.shanghaiLatency, cfg.hotRatio*100, cfg.clients)
+	fmt.Fprintf(out, "### Profile: `%s` (duration=%s, fast=%s, slow=%s, shanghai=%s, hot=%.0f%%, clients=%d, owner_ratio=%.0f%%)\n\n",
+		cfg.profile, cfg.duration, cfg.fastLatency, cfg.slowLatency, cfg.shanghaiLatency, cfg.hotRatio*100, cfg.clients, cfg.ownerRatio*100)
+	if cfg.ownerRatio > 0 {
+		fmt.Fprintln(out, "| Target RPS | Send RPS | Total Reqs | Overall 200 % | 429 % | Other Err % | All p50 / p95 (ms) | 200-OK p50 / p95 (ms) | Owner Agent 200 % (OK p95) | Anonymous 200 % (OK p95) | Weibo Direct / Relay | Peak Heap / Sys (MiB) | Peak / End Goroutines |")
+		fmt.Fprintln(out, "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+		for _, r := range results {
+			fmt.Fprintf(out, "| %.0f | %.1f | %d | %.2f%% | %.2f%% | %.2f%% | %.1f / %.1f | %.1f / %.1f | %.2f%% (%.1fms) | %.2f%% (%.1fms) | %d / %d | %.2f / %.2f | %d / %d |\n",
+				r.TargetRPS,
+				r.AchievedRPS,
+				r.Overall.Requests,
+				r.Overall.OKPct,
+				r.Overall.R429Pct,
+				r.Overall.OtherPct,
+				r.Overall.P50MS, r.Overall.P95MS,
+				r.Overall.OKP50MS, r.Overall.OKP95MS,
+				r.OwnerAgent.OKPct, r.OwnerAgent.OKP95MS,
+				r.Anonymous.OKPct, r.Anonymous.OKP95MS,
+				r.WeiboOwnerDirect, r.WeiboAnonRelay,
+				r.PeakHeapAllocMiB, r.PeakSysMiB,
+				r.PeakGoroutines,
+				r.EndGoroutines,
+			)
+		}
+		return
+	}
 	fmt.Fprintln(out, "| Target RPS | Send RPS | Total Reqs | 200 OK % | 429 % | Other Err % | All p50 / p95 (ms) | 200-OK p50 / p95 (ms) | Fast 200 % (OK p95) | Slow 200 % (OK p95) | Peak Heap / Sys (MiB) | Peak / End Goroutines |")
 	fmt.Fprintln(out, "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
 	for _, r := range results {

@@ -1,6 +1,9 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -21,7 +24,97 @@ const (
 	MaxSlowParseQueueWait     = 30 * time.Second
 	MaxSlowParseQueueSize     = 1024
 	MaxSlowParseConcurrency   = 64
+
+	MinOwnerTokenBytes      = 32
+	MaxOwnerTokenBytes      = 512
+	MaxOwnerAuthHeaderBytes = 1024
+
+	DefaultOwnerConcurrency = 8
+	MaxOwnerConcurrency     = 32
+	DefaultOwnerQueueWait   = 60 * time.Second
+	MaxOwnerQueueWait       = 120 * time.Second
+	DefaultOwnerQueueSize   = 256
+	MaxOwnerQueueSize       = 4096
 )
+
+// OwnerAuth stores only the precomputed SHA-256 digest of DOKITOOL_OWNER_TOKEN
+// so neither the plaintext token nor its length remains in long-lived structs
+// or accidental formatting output.
+type OwnerAuth struct {
+	enabled bool
+	digest  [32]byte
+}
+
+// NewOwnerAuth validates a candidate DOKITOOL_OWNER_TOKEN value.
+// An empty string disables the owner channel; any non-empty value must be
+// 32–512 printable ASCII characters without whitespace or control bytes.
+func NewOwnerAuth(token string) (OwnerAuth, error) {
+	if token == "" {
+		return OwnerAuth{}, nil
+	}
+	if len(token) < MinOwnerTokenBytes || len(token) > MaxOwnerTokenBytes {
+		return OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN must be empty or 32–512 printable ASCII characters without whitespace")
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < 33 || token[i] > 126 {
+			return OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN must be empty or 32–512 printable ASCII characters without whitespace")
+		}
+	}
+	return OwnerAuth{
+		enabled: true,
+		digest:  sha256.Sum256([]byte(token)),
+	}, nil
+}
+
+// LoadOwnerAuth loads and validates DOKITOOL_OWNER_TOKEN before server startup.
+func LoadOwnerAuth(getenv func(string) string) (OwnerAuth, error) {
+	if getenv == nil {
+		return OwnerAuth{}, errors.New("missing owner authentication reader")
+	}
+	return NewOwnerAuth(getenv("DOKITOOL_OWNER_TOKEN"))
+}
+
+// Enabled reports whether the owner channel is active.
+func (o OwnerAuth) Enabled() bool {
+	return o.enabled
+}
+
+func (o OwnerAuth) String() string {
+	if o.enabled {
+		return "OwnerAuth{enabled:true}"
+	}
+	return "OwnerAuth{enabled:false}"
+}
+
+func (o OwnerAuth) GoString() string {
+	return o.String()
+}
+
+func (o OwnerAuth) verifyHeader(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	raw := values[0]
+	if len(raw) > MaxOwnerAuthHeaderBytes {
+		return false
+	}
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(raw, bearerPrefix) {
+		return false
+	}
+	candidate := raw[len(bearerPrefix):]
+	if candidate == "" {
+		return false
+	}
+	for i := 0; i < len(candidate); i++ {
+		if candidate[i] < 33 || candidate[i] > 126 {
+			return false
+		}
+	}
+	sum := sha256.Sum256([]byte(candidate))
+	match := subtle.ConstantTimeCompare(sum[:], o.digest[:]) == 1
+	return o.enabled && match
+}
 
 // PoolConfig separates a visitor's abuse budget from the service capacity.
 // Rates are tokens per second. These are process-local limits, not cluster quotas.
@@ -37,12 +130,15 @@ type PoolConfig struct {
 }
 
 type AdmissionConfig struct {
-	Parse      PoolConfig
-	SlowParse  PoolConfig
-	Catalog    PoolConfig
-	Relay      PoolConfig
-	Reports    PoolConfig
-	MaxClients int
+	Parse            PoolConfig
+	SlowParse        PoolConfig
+	Catalog          PoolConfig
+	Relay            PoolConfig
+	Reports          PoolConfig
+	MaxClients       int
+	OwnerConcurrency int
+	OwnerQueueWait   time.Duration
+	OwnerQueueSize   int
 }
 
 // DefaultAdmissionConfig splits pure-Go fast platforms from yt-dlp slow platforms
@@ -93,7 +189,10 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			ClientConcurrency: 2,
 			GlobalConcurrency: 16,
 		},
-		MaxClients: 4096,
+		MaxClients:       4096,
+		OwnerConcurrency: DefaultOwnerConcurrency,
+		OwnerQueueWait:   DefaultOwnerQueueWait,
+		OwnerQueueSize:   DefaultOwnerQueueSize,
 	}
 }
 
@@ -141,6 +240,15 @@ func (c AdmissionConfig) Validate() error {
 	}
 	if c.MaxClients < 1 || c.MaxClients > 65536 {
 		return fmt.Errorf("DOKITOOL_ADMISSION_MAX_CLIENTS must be between 1 and 65536")
+	}
+	if c.OwnerConcurrency < 1 || c.OwnerConcurrency > MaxOwnerConcurrency {
+		return fmt.Errorf("DOKITOOL_OWNER_CONCURRENCY must be an integer between 1 and %d", MaxOwnerConcurrency)
+	}
+	if c.OwnerQueueWait < 0 || c.OwnerQueueWait > MaxOwnerQueueWait {
+		return fmt.Errorf("DOKITOOL_OWNER_QUEUE_WAIT must be between 0s and %s", MaxOwnerQueueWait)
+	}
+	if c.OwnerQueueSize < 0 || c.OwnerQueueSize > MaxOwnerQueueSize {
+		return fmt.Errorf("DOKITOOL_OWNER_QUEUE_SIZE must be between 0 and %d", MaxOwnerQueueSize)
 	}
 	return nil
 }
@@ -238,6 +346,31 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 			return AdmissionConfig{}, fmt.Errorf("DOKITOOL_ADMISSION_MAX_CLIENTS must be a positive integer")
 		}
 		c.MaxClients = value
+	}
+	if raw := strings.TrimSpace(getenv("DOKITOOL_OWNER_CONCURRENCY")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > MaxOwnerConcurrency {
+			return AdmissionConfig{}, fmt.Errorf("DOKITOOL_OWNER_CONCURRENCY must be an integer between 1 and %d", MaxOwnerConcurrency)
+		}
+		c.OwnerConcurrency = value
+	}
+	if raw := strings.TrimSpace(getenv("DOKITOOL_OWNER_QUEUE_WAIT")); raw != "" {
+		var wait time.Duration
+		if raw != "0" {
+			parsed, err := time.ParseDuration(raw)
+			if err != nil || parsed < 0 || parsed > MaxOwnerQueueWait {
+				return AdmissionConfig{}, fmt.Errorf("DOKITOOL_OWNER_QUEUE_WAIT must be a duration between 0s and %s", MaxOwnerQueueWait)
+			}
+			wait = parsed
+		}
+		c.OwnerQueueWait = wait
+	}
+	if raw := strings.TrimSpace(getenv("DOKITOOL_OWNER_QUEUE_SIZE")); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size < 0 || size > MaxOwnerQueueSize {
+			return AdmissionConfig{}, fmt.Errorf("DOKITOOL_OWNER_QUEUE_SIZE must be an integer between 0 and %d", MaxOwnerQueueSize)
+		}
+		c.OwnerQueueSize = size
 	}
 	return c, c.Validate()
 }
