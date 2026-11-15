@@ -15,9 +15,18 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
-type Parser struct{ executor fetch.Executor }
+type Parser struct {
+	executor fetch.Executor
+	shanghai ShanghaiResolver
+}
 
 func New(executor fetch.Executor) *Parser { return &Parser{executor: executor} }
+
+// NewWithShanghai constructs a Bilibili parser that queries Shanghai in parallel
+// for domestic *.bilivideo.com routes while keeping Japan's tier list authoritative.
+func NewWithShanghai(executor fetch.Executor, shanghai ShanghaiResolver) *Parser {
+	return &Parser{executor: executor, shanghai: shanghai}
+}
 
 var partNumber = regexp.MustCompile(`^[1-9][0-9]{0,5}$`)
 var videoID = regexp.MustCompile(`^BV[a-zA-Z0-9]{10}$`)
@@ -25,7 +34,8 @@ var videoPath = regexp.MustCompile(`/video/(BV[a-zA-Z0-9]{10})(?:/|$)`)
 var videoMeta = regexp.MustCompile(`(?i)<meta\s+[^>]*itemprop="url"\s+[^>]*content="https://www\.bilibili\.com/video/(BV[a-zA-Z0-9]{10})/?"[^>]*>`)
 
 func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Object, error) {
-	legacy, err := p.parseLegacy(ctx, input)
+	legacy, shCall, err := p.parseLegacyWithShanghai(ctx, input)
+	defer shCall.abort()
 	if err != nil {
 		return nil, err
 	}
@@ -38,46 +48,70 @@ func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Ob
 	if code != 200 || raw == nil {
 		return legacyError(code, unified.Str(legacy["msg"])), nil
 	}
-	data := adapt(raw, input, now)
+	var shPlay *ShanghaiPlay
+	var finish func(bool)
+	if shCall != nil {
+		shPlay, finish = shCall.await(ctx)
+		if err := ctx.Err(); err != nil {
+			if finish != nil {
+				finish(false)
+			}
+			return nil, err
+		}
+	}
+	data, matched := adaptWithShanghai(raw, input, now, shPlay)
+	if finish != nil {
+		finish(matched)
+	}
 	if len(unified.Slice(data["items"])) == 0 {
 		return unified.ContractError("NO_MEDIA", "作品未提供可用媒体", false), nil
 	}
-	return unified.FinalizeData(data, now), nil
+	envelope := unified.FinalizeData(data, now)
+	if p != nil && p.shanghai != nil {
+		annotateBilibiliData(unified.Map(envelope["data"]), now)
+	}
+	return envelope, nil
 }
 
 // parseLegacy retains the private parser boundary for frozen PHP comparison.
 // Its bounded context is shared by redirects, the page fallback and both APIs.
 func (p *Parser) parseLegacy(parent context.Context, source string) (object, error) {
+	out, shCall, err := p.parseLegacyWithShanghai(parent, source)
+	shCall.abort()
+	return out, err
+}
+
+func (p *Parser) parseLegacyWithShanghai(parent context.Context, source string) (object, *shanghaiCall, error) {
 	if err := parent.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ctx, cancel := context.WithTimeout(parent, 35*time.Second)
 	defer cancel()
 	rawURL := cleanURL(source)
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Hostname() == "" {
-		return legacyFailure(-1, "视频链接不正确"), nil
+		return legacyFailure(-1, "视频链接不正确"), nil, nil
 	}
 	if p == nil || p.executor == nil {
-		return nil, fmt.Errorf("bilibili request executor is not configured")
+		return nil, nil, fmt.Errorf("bilibili request executor is not configured")
 	}
 	if strings.EqualFold(u.Hostname(), "b23.tv") {
 		response, requestErr := p.executor.Do(ctx, shareRequest(rawURL))
 		if err := parent.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if requestErr != nil || response.URL == "" {
-			return legacyFailure(502, "B站短链接解析失败，请重试或使用完整视频链接"), nil
+			return legacyFailure(502, "B站短链接解析失败，请重试或使用完整视频链接"), nil, nil
 		}
 		rawURL = redirectTarget(rawURL, response.URL)
 		u, err = url.Parse(rawURL)
 	}
 	if err != nil || u == nil || !allowedVideoURL(rawURL) || !strings.HasPrefix(u.EscapedPath(), "/video/") {
-		return legacyFailure(-1, "好像不是视频链接"), nil
+		return legacyFailure(-1, "好像不是视频链接"), nil, nil
 	}
 	part, present, scalar := queryPart(u.RawQuery)
 	if present && (!scalar || !partNumber.MatchString(part)) {
-		return legacyFailure(400, "分P序号无效"), nil
+		return legacyFailure(400, "分P序号无效"), nil, nil
 	}
 	requested := int64(1)
 	if present {
@@ -94,7 +128,7 @@ func (p *Parser) parseLegacy(parent context.Context, source string) (object, err
 		}
 		response, requestErr := p.executor.Do(ctx, pageRequest(rawURL, timeout))
 		if err := parent.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if requestErr == nil {
 			if match := videoMeta.FindSubmatch(response.Body); match != nil {
@@ -103,14 +137,14 @@ func (p *Parser) parseLegacy(parent context.Context, source string) (object, err
 		}
 	}
 	if bvid == "" {
-		return legacyFailure(404, "获取视频ID失败"), nil
+		return legacyFailure(404, "获取视频ID失败"), nil, nil
 	}
 	view := p.apiRequest(ctx, viewRequest(bvid, remaining(ctx, 20*time.Second)))
 	if err := parent.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !strictInteger(view["code"], 0) || !phpArray(view["data"]) {
-		return failure(view, "视频信息"), nil
+		return failure(view, "视频信息"), nil, nil
 	}
 	detail := unified.Map(view["data"])
 	var selected object
@@ -122,13 +156,20 @@ func (p *Parser) parseLegacy(parent context.Context, source string) (object, err
 		}
 	}
 	if len(selected) == 0 || !truthy(selected["cid"]) {
-		return legacyFailure(404, "请求的分P不存在"), nil
+		return legacyFailure(404, "请求的分P不存在"), nil, nil
+	}
+	var shCall *shanghaiCall
+	if p.shanghai != nil {
+		if cidInt, ok := parsePositiveCID(selected["cid"]); ok && ValidBVID(bvid) {
+			shCall = startShanghaiCall(parent, p.shanghai, bvid, cidInt)
+		}
 	}
 	play := p.apiRequest(ctx, playRequest(bvid, selected["cid"], remaining(ctx, 20*time.Second)))
 	if err := parent.Err(); err != nil {
-		return nil, err
+		shCall.abort()
+		return nil, nil, err
 	}
-	return buildResponse(detail, bvid, requested, selected, play), nil
+	return buildResponse(detail, bvid, requested, selected, play), shCall, nil
 }
 
 func buildResponse(detail object, bvid string, requested int64, selected, play object) object {

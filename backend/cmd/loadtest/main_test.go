@@ -90,8 +90,8 @@ func TestLoadtestProfilesSmokeLoopbackOnly(t *testing.T) {
 		if r.Overall.OtherErr != 0 {
 			t.Fatalf("expected zero non-429 errors for %s, got %d", profile, r.Overall.OtherErr)
 		}
-		if profile == "current" && r.ShanghaiHits == 0 {
-			t.Fatalf("expected Shanghai PullBroker hits > 0 in current smoke run, got 0")
+		if profile == "current" && (r.ShanghaiHits == 0 || r.ShanghaiBilibiliHits == 0) {
+			t.Fatalf("expected Shanghai PullBroker total and Bilibili hits > 0 in current smoke run, got total=%d bilibili=%d", r.ShanghaiHits, r.ShanghaiBilibiliHits)
 		}
 		if profile == "post-pr5" {
 			if r.OwnerAgent.OK == 0 || r.Anonymous.OK == 0 {

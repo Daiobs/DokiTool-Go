@@ -48,6 +48,10 @@ const (
 	chAnonIdx  = 0
 	chOwnerIdx = 1
 	numCh      = 2
+
+	platDouyinIdx   = 0
+	platBilibiliIdx = 1
+	numPlat         = 2
 )
 
 func channelIndex(channel string) int {
@@ -85,7 +89,13 @@ type ChannelBreakdown struct {
 	Owner     ChannelStatsSnapshot `json:"owner"`
 }
 
-// StatsSnapshot reports live gauges and cumulative counters for the Shanghai Douyin channel.
+// PlatformBreakdown separates Shanghai resolution metrics by platform (Douyin vs Bilibili).
+type PlatformBreakdown struct {
+	Douyin   ChannelStatsSnapshot `json:"douyin"`
+	Bilibili ChannelStatsSnapshot `json:"bilibili"`
+}
+
+// StatsSnapshot reports live gauges and cumulative counters for the Shanghai domestic exit channel.
 type StatsSnapshot struct {
 	Enabled        bool                 `json:"enabled"`
 	Mode           string               `json:"mode"`
@@ -94,6 +104,7 @@ type StatsSnapshot struct {
 	PendingTasks   int                  `json:"pending_tasks"`
 	Total          ChannelStatsSnapshot `json:"total"`
 	ByChannel      ChannelBreakdown     `json:"by_channel"`
+	ByPlatform     PlatformBreakdown    `json:"by_platform"`
 }
 
 // StatsProvider is implemented by Shanghai resolvers (*PullBroker and *Client)
@@ -127,14 +138,11 @@ func (c *channelCounters) snapshot() ChannelStatsSnapshot {
 }
 
 type shanghaiCounters struct {
-	channels [numCh]channelCounters
+	channels  [numCh]channelCounters
+	platforms [numPlat]channelCounters
 }
 
-func (s *shanghaiCounters) recordQueueWait(chIdx int, d time.Duration, outcome queueOutcome) {
-	if d < 0 {
-		d = 0
-	}
-	c := &s.channels[chIdx]
+func recordCounterQueueWait(c *channelCounters, d time.Duration, outcome queueOutcome) {
 	c.queueWaits.Add(1)
 	switch outcome {
 	case queueOutcomeGranted:
@@ -152,10 +160,19 @@ func (s *shanghaiCounters) recordQueueWait(chIdx int, d time.Duration, outcome q
 	}
 }
 
-func (s *shanghaiCounters) recordResolveOutcome(parent context.Context, err error) {
+func (s *shanghaiCounters) recordQueueWait(chIdx, platIdx int, d time.Duration, outcome queueOutcome) {
+	if d < 0 {
+		d = 0
+	}
+	recordCounterQueueWait(&s.channels[chIdx], d, outcome)
+	recordCounterQueueWait(&s.platforms[platIdx], d, outcome)
+}
+
+func (s *shanghaiCounters) recordResolveOutcome(parent context.Context, platIdx int, err error) {
 	chIdx := channelIndex(ChannelFromContext(parent))
 	if err == nil {
 		s.channels[chIdx].hits.Add(1)
+		s.platforms[platIdx].hits.Add(1)
 		return
 	}
 	if errors.Is(err, douyin.ErrProtocolV1) {
@@ -163,9 +180,18 @@ func (s *shanghaiCounters) recordResolveOutcome(parent context.Context, err erro
 	}
 	if parent != nil && parent.Err() != nil {
 		s.channels[chIdx].canceled.Add(1)
+		s.platforms[platIdx].canceled.Add(1)
 		return
 	}
 	s.channels[chIdx].fallbacks.Add(1)
+	s.platforms[platIdx].fallbacks.Add(1)
+}
+
+func (s *shanghaiCounters) platformBreakdown() PlatformBreakdown {
+	return PlatformBreakdown{
+		Douyin:   s.platforms[platDouyinIdx].snapshot(),
+		Bilibili: s.platforms[platBilibiliIdx].snapshot(),
+	}
 }
 
 func (s *shanghaiCounters) snapshot(mode string, waitingWorkers, queuedTasks, pendingTasks int) StatsSnapshot {
@@ -181,6 +207,7 @@ func (s *shanghaiCounters) snapshot(mode string, waitingWorkers, queuedTasks, pe
 			Anonymous: anon,
 			Owner:     owner,
 		},
+		ByPlatform: s.platformBreakdown(),
 		Total: ChannelStatsSnapshot{
 			Hits:             anon.Hits + owner.Hits,
 			Fallbacks:        anon.Fallbacks + owner.Fallbacks,

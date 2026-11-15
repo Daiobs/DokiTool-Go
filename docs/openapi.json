@@ -2764,6 +2764,22 @@
           }
         }
       },
+      "ShanghaiPlatformBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "douyin",
+          "bilibili"
+        ],
+        "properties": {
+          "douyin": {
+            "$ref": "#/components/schemas/ShanghaiChannelStats"
+          },
+          "bilibili": {
+            "$ref": "#/components/schemas/ShanghaiChannelStats"
+          }
+        }
+      },
       "ShanghaiStatsSnapshot": {
         "type": "object",
         "additionalProperties": false,
@@ -2774,7 +2790,8 @@
           "queued_tasks",
           "pending_tasks",
           "total",
-          "by_channel"
+          "by_channel",
+          "by_platform"
         ],
         "properties": {
           "enabled": {
@@ -2796,18 +2813,21 @@
           "queued_tasks": {
             "type": "integer",
             "minimum": 0,
-            "description": "Unclaimed Douyin tasks currently waiting in the pull broker."
+            "description": "Unclaimed Douyin or Bilibili tasks currently waiting in the pull broker."
           },
           "pending_tasks": {
             "type": "integer",
             "minimum": 0,
-            "description": "Claimed Douyin tasks currently in flight on Shanghai workers."
+            "description": "Claimed Douyin or Bilibili tasks currently in flight on Shanghai workers."
           },
           "total": {
             "$ref": "#/components/schemas/ShanghaiChannelStats"
           },
           "by_channel": {
             "$ref": "#/components/schemas/ShanghaiChannelBreakdown"
+          },
+          "by_platform": {
+            "$ref": "#/components/schemas/ShanghaiPlatformBreakdown"
           }
         }
       },

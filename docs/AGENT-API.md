@@ -450,6 +450,18 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
             "queue_waits": 4, "queue_granted": 4, "queue_timeouts": 2,
             "queue_wait_ms_total": 720, "queue_wait_ms_max": 300
           }
+        },
+        "by_platform": {
+          "douyin": {
+            "hits": 68, "fallbacks": 2, "canceled": 0,
+            "queue_waits": 4, "queue_granted": 4, "queue_timeouts": 2,
+            "queue_wait_ms_total": 720, "queue_wait_ms_max": 300
+          },
+          "bilibili": {
+            "hits": 2, "fallbacks": 0, "canceled": 0,
+            "queue_waits": 0, "queue_granted": 0, "queue_timeouts": 0,
+            "queue_wait_ms_total": 0, "queue_wait_ms_max": 0
+          }
         }
       },
       "parse_latency_ms": {
@@ -485,7 +497,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 - **核心统计字段说明**：
   - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 15 个内置平台 ID 加 `"unknown"`（共 16 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`。
   - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数。
-  - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数。
+  - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数。
   - 直方图（`HistogramSnapshot`）：`buckets` 键集合固定为 `<=10`、`<=50`、`<=100`、`<=250`、`<=500`、`<=1000`、`<=2500`、`<=5000`、`<=10000`、`<=30000`、`+Inf`（单位毫秒，采用 Prometheus 风格的**累积上界桶**，单调不减且 `buckets["+Inf"] == count`）。
 
 ---
@@ -594,9 +606,9 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 | 目标平台类型 | 后端执行路径与共享资源约束 | 推荐客户端解析并发 |
 | --- | --- | --- |
-| **抖音（`douyin`）** | 纯 Go 解析；若开启上海 `pull` 模式，上海 `shanghai-resolver` 默认运行 `3` 个出站 worker。当全部上海 worker 忙碌时，主后端最多等待 **`300ms`**，未获认领即无阻塞回退主后端本地解析（仍返回可用直链，但可能少国内 `*.douyinvod.com` 候选）。 | 追求最高吞吐：**`<= 8`**；<br>追求最高上海国内线路命中率：**`<= 3`**（或配合调高 `shanghai-resolver -workers`）。 |
+| **抖音（`douyin`）、哔哩哔哩（`bilibili`）** | 纯 Go 解析；若开启上海 `pull` 模式，上海 `shanghai-resolver` 默认运行 `3` 个出站 worker。当全部上海 worker 忙碌时，主后端最多等待 **`300ms`**，未获认领或超时即无阻塞回退日本主后端解析结果（仍返回可用直链，但可能少国内 `*.douyinvod.com` 或 `cn-*.bilivideo.com` 候选）。 | 追求最高吞吐：**`<= 8`**；<br>追求最高上海国内线路命中率：**`<= 3`**（或配合调高 `shanghai-resolver -workers`）。 |
 | **X（`x`）常规图文与视频推文** | 默认优先走纯 Go 官方 Syndication 快路径（无需拉起 `yt-dlp` 子进程）；仅在 Syndication 未命中或需回退时才请求 `yt-dlp` 槽位。 | **`4–8`**（若大批链接含需回退的复杂推文，建议降至 **`1–2`**）。 |
-| **快手、小红书、哔哩哔哩、皮皮虾等纯 Go 平台** | 纯 Go 无状态抓取与探测，无子进程开销。 | **`4–8`**（建议不超过 `DOKITOOL_OWNER_CONCURRENCY`）。 |
+| **快手、小红书、皮皮虾等纯 Go 平台** | 纯 Go 无状态抓取与探测，无子进程开销。 | **`4–8`**（建议不超过 `DOKITOOL_OWNER_CONCURRENCY`）。 |
 | **Instagram、Facebook、Tumblr、Dailymotion** | 每次未命中缓存的解析均需申请全局共享的 `DOKITOOL_YTDLP_CONCURRENCY` 子进程信号量（默认 `2`，可配置范围 `1..24`）。 | **`<= 1–2`**（默认配置下建议 `1`，留出余量避免长时间占满全部提取器槽位）。 |
 
 > **提示**：解析与 CDN 媒体文件下载可以流水线解耦——例如保持 `4` 个并发协程调用 `/api/parse`，拿到直链后立即交给 `4–8` 个独立的 CDN 下载协程流式落盘。

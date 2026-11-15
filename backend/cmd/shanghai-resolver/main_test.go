@@ -1,13 +1,24 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 )
 
 func randomTestToken(t *testing.T) string {
@@ -93,5 +104,52 @@ func TestWorkersFlagBoundsAndStartupExitCode(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "public address") {
 			t.Fatalf("run(%v) did not pass -workers validation into worker setup: %v", args, err)
 		}
+	}
+}
+
+type fakeUpstreamExecutor func(context.Context, fetch.Request) (fetch.Response, error)
+
+func (f fakeUpstreamExecutor) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	return f(ctx, req)
+}
+
+func TestHandlerWithDetailSupportsBilibiliAndRejectsInvalidTasks(t *testing.T) {
+	token := randomTestToken(t)
+	exec := fakeUpstreamExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if !bilibili.AllowedAPIURL(req.URL) || req.Header.Get("Cookie") != "" {
+			t.Fatalf("unexpected outbound request from shanghai-resolver: %s", req.URL)
+		}
+		return fetch.Response{
+			StatusCode: http.StatusOK,
+			Body:       []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=4102444800&upsig=dom","backup_url":["http://cn-insecure.bilivideo.com/drop.mp4?deadline=4102444800","https://evilbilivideo.com/drop.mp4?deadline=4102444800"]}]}}`),
+		}, nil
+	})
+	p := probe.New(exec, douyin.AllowedMediaURL).WithTimeout(shresolver.ProbeTimeout)
+	h, err := shresolver.NewHandlerWithDetail(token, exec, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, shresolver.Path, bytes.NewBufferString(`{"protocol":2,"task_type":"bilibili","bvid":"BV1234567890","cid":101}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Bilibili handler status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got bilibili.ShanghaiPlay
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.BVID != "BV1234567890" || got.CID != 101 || len(got.DURLPieces) != 1 || len(got.DURLPieces[0].URLs) != 1 {
+		t.Fatalf("unexpected ShanghaiPlay response: %+v", got)
+	}
+
+	badReq := httptest.NewRequest(http.MethodPost, shresolver.Path, bytes.NewBufferString(`{"protocol":2,"task_type":"bilibili","bvid":"BVabcdefghij","cid":101}`))
+	badReq.Header.Set("Authorization", "Bearer "+token)
+	badRec := httptest.NewRecorder()
+	h.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid BVID status = %d, want 400", badRec.Code)
 	}
 }

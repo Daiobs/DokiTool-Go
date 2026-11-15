@@ -32,6 +32,7 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
@@ -72,25 +73,28 @@ type classSummary struct {
 }
 
 type tierResult struct {
-	Profile          string       `json:"profile"`
-	TargetRPS        float64      `json:"target_rps"`
-	AchievedRPS      float64      `json:"achieved_rps"`
-	DurationSec      float64      `json:"duration_sec"`
-	Overall          classSummary `json:"overall"`
-	Fast             classSummary `json:"fast_and_shanghai"`
-	Slow             classSummary `json:"slow_ytdlp"`
-	OwnerAgent       classSummary `json:"owner_agent"`
-	Anonymous        classSummary `json:"anonymous_visitors"`
-	WeiboOwnerDirect int64        `json:"weibo_owner_direct_ok"`
-	WeiboAnonRelay   int64        `json:"weibo_anon_relay_ok"`
-	PeakHeapAllocMiB float64      `json:"peak_heap_alloc_mib"`
-	PeakSysMiB       float64      `json:"peak_sys_mib"`
-	PeakGoroutines   int          `json:"peak_goroutines"`
-	EndGoroutines    int          `json:"end_goroutines"`
-	FastUpstreams    int64        `json:"fast_upstream_calls"`
-	SlowUpstreams    int64        `json:"slow_upstream_calls"`
-	ShanghaiHits     int64        `json:"shanghai_resolved_hits"`
-	ShanghaiMisses   int64        `json:"shanghai_fallback_misses"`
+	Profile                string       `json:"profile"`
+	TargetRPS              float64      `json:"target_rps"`
+	AchievedRPS            float64      `json:"achieved_rps"`
+	DurationSec            float64      `json:"duration_sec"`
+	Overall                classSummary `json:"overall"`
+	Fast                   classSummary `json:"fast_and_shanghai"`
+	Slow                   classSummary `json:"slow_ytdlp"`
+	OwnerAgent             classSummary `json:"owner_agent"`
+	Anonymous              classSummary `json:"anonymous_visitors"`
+	WeiboOwnerDirect       int64        `json:"weibo_owner_direct_ok"`
+	WeiboAnonRelay         int64        `json:"weibo_anon_relay_ok"`
+	PeakHeapAllocMiB       float64      `json:"peak_heap_alloc_mib"`
+	PeakSysMiB             float64      `json:"peak_sys_mib"`
+	PeakGoroutines         int          `json:"peak_goroutines"`
+	EndGoroutines          int          `json:"end_goroutines"`
+	FastUpstreams          int64        `json:"fast_upstream_calls"`
+	SlowUpstreams          int64        `json:"slow_upstream_calls"`
+	ShanghaiHits           int64        `json:"shanghai_resolved_hits"`
+	ShanghaiMisses         int64        `json:"shanghai_fallback_misses"`
+	ShanghaiDouyinHits     int64        `json:"shanghai_douyin_hits"`
+	ShanghaiBilibiliHits   int64        `json:"shanghai_bilibili_hits"`
+	ShanghaiBilibiliMisses int64        `json:"shanghai_bilibili_fallback_misses"`
 }
 
 func main() {
@@ -367,6 +371,57 @@ func syntheticEnvelope(platform, sourceURL string, now int64, itemIDs ...string)
 	}
 }
 
+func syntheticBilibiliEnvelope(sourceURL string, now int64, shPlay *bilibili.ShanghaiPlay, itemIDs ...string) unified.Object {
+	if len(itemIDs) == 0 {
+		itemIDs = []string{"part-1"}
+	}
+	dl := now + 7200
+	items := make(unified.Array, 0, len(itemIDs))
+	for i, id := range itemIDs {
+		jpURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/%d/%d-1-80.mp4?deadline=%d", i+1, i+1, dl)
+		var rawSources unified.Array
+		if shPlay != nil && len(shPlay.DURLPieces) > 0 {
+			for _, u := range shPlay.DURLPieces[0].URLs {
+				rawSources = append(rawSources, u)
+			}
+		}
+		rawSources = append(rawSources, jpURL)
+		srcs := unified.Sources(rawSources, now)
+		items = append(items, unified.Object{
+			"id":          id,
+			"index":       i + 1,
+			"type":        "video",
+			"source_url":  sourceURL,
+			"resolve_url": unified.ResolveURL(sourceURL, id),
+			"variants": unified.Array{
+				unified.Object{
+					"id": "v-" + id,
+					"metadata": unified.Object{
+						"container": "mp4",
+						"extension": "mp4",
+						"mime_type": "video/mp4",
+						"width":     1920,
+						"height":    1080,
+						"has_audio": true,
+						"evidence":  "upstream",
+					},
+					"delivery": unified.Object{
+						"kind":    "file",
+						"sources": srcs,
+					},
+				},
+			},
+		})
+	}
+	return unified.FinalizeData(unified.Object{
+		"platform":        "bilibili",
+		"source_url":      sourceURL,
+		"refresh_url":     "/api/parse?schema_version=1.0&url=" + unified.RFC3986Query(sourceURL),
+		"default_item_id": itemIDs[0],
+		"items":           items,
+	}, now)
+}
+
 type requestSpec struct {
 	route   string
 	rawURL  string
@@ -493,6 +548,7 @@ func runShanghaiWorkerLoop(
 		claimReq.Header.Set("Authorization", "Bearer "+pullToken)
 		claimReq.Header.Set("Content-Type", "application/json")
 		claimReq.Header.Set(shresolver.ProtocolHeader, "2")
+		claimReq.Header.Set(shresolver.TasksHeader, "douyin,bilibili")
 
 		resp, err := client.Do(claimReq)
 		if err != nil {
@@ -519,7 +575,11 @@ func runShanghaiWorkerLoop(
 		}
 
 		// Simulate Shanghai domestic upstream resolution over 127.0.0.1.
-		upReq, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamBaseURL+"/upstream/shanghai?aweme_id="+url.QueryEscape(job.AwemeID), nil)
+		shQuery := "aweme_id=" + url.QueryEscape(job.AwemeID)
+		if job.TaskType == shresolver.TaskBilibili {
+			shQuery = "task=bilibili&bvid=" + url.QueryEscape(job.BVID) + "&cid=" + strconv.FormatInt(job.CID, 10)
+		}
+		upReq, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamBaseURL+"/upstream/shanghai?"+shQuery, nil)
 		if err != nil {
 			return
 		}
@@ -531,13 +591,27 @@ func runShanghaiWorkerLoop(
 
 		resultRaw := json.RawMessage("null")
 		if upErr == nil && upResp != nil && upResp.StatusCode == http.StatusOK {
-			work := shresolver.WorkResponse{
-				Protocol: shresolver.ProtocolV2,
-				AwemeID:  job.AwemeID,
-				VideoID:  "v0200fg10000" + job.AwemeID,
-			}
-			if encoded, err := json.Marshal(work); err == nil {
-				resultRaw = encoded
+			if job.TaskType == shresolver.TaskBilibili {
+				dl := time.Now().Unix() + 7200
+				shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/%d/%d-1-80.mp4?deadline=%d", job.CID, job.CID, dl)
+				play := bilibili.ShanghaiPlay{
+					BVID:        job.BVID,
+					CID:         job.CID,
+					DURLQuality: 80,
+					DURLPieces:  []bilibili.ShanghaiDURLPiece{{URLs: []string{shURL}}},
+				}
+				if encoded, err := json.Marshal(play); err == nil {
+					resultRaw = encoded
+				}
+			} else {
+				work := shresolver.WorkResponse{
+					Protocol: shresolver.ProtocolV2,
+					AwemeID:  job.AwemeID,
+					VideoID:  "v0200fg10000" + job.AwemeID,
+				}
+				if encoded, err := json.Marshal(work); err == nil {
+					resultRaw = encoded
+				}
 			}
 		}
 
@@ -591,6 +665,9 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	var slowUpstreamCalls atomic.Int64
 	var shanghaiHits atomic.Int64
 	var shanghaiMisses atomic.Int64
+	var shanghaiDouyinHits atomic.Int64
+	var shanghaiBilibiliHits atomic.Int64
+	var shanghaiBilibiliMisses atomic.Int64
 	var weiboOwnerDirect atomic.Int64
 	var weiboAnonRelay atomic.Int64
 
@@ -707,6 +784,9 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	if err != nil {
 		return tierResult{}, err
 	}
+	broker.WithLookupNetIP(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	})
 
 	adapterClient := newLoopbackClient(256, 30*time.Second)
 	ytdlpSem := make(chan struct{}, ytdlpConc)
@@ -755,10 +835,46 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		}
 		if err := <-shDone; err == nil {
 			shanghaiHits.Add(1)
+			shanghaiDouyinHits.Add(1)
 		} else {
 			shanghaiMisses.Add(1)
 		}
 		return syntheticEnvelope("douyin", source, now, "aweme-"+awemeID), nil
+	})
+
+	bilibiliAdapter := api.AdapterFunc(func(ctx context.Context, source string, now int64) (unified.Object, error) {
+		bvid := "BV1xx411c100"
+		if u, err := url.Parse(source); err == nil {
+			if seg := strings.TrimPrefix(u.Path, "/video/"); len(seg) >= 12 && bilibili.ValidBVID(seg[:12]) {
+				bvid = seg[:12]
+			}
+		}
+		const cid int64 = 1001
+		type biliSHRes struct {
+			play *bilibili.ShanghaiPlay
+			err  error
+		}
+		shDone := make(chan biliSHRes, 1)
+		go func() {
+			play, err := broker.ResolveBilibili(ctx, bvid, cid)
+			shDone <- biliSHRes{play: play, err: err}
+		}()
+		if err := fetchFakeUpstream(ctx, "/upstream/fast?platform=bilibili"); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return unified.ContractError("UPSTREAM_TIMEOUT", "上游请求超时", true), nil
+			}
+			return nil, err
+		}
+		res := <-shDone
+		env := syntheticBilibiliEnvelope(source, now, res.play, "part-1", "part-2")
+		if res.err == nil && res.play != nil && res.play.HasAnyRoute() {
+			shanghaiHits.Add(1)
+			shanghaiBilibiliHits.Add(1)
+		} else {
+			shanghaiMisses.Add(1)
+			shanghaiBilibiliMisses.Add(1)
+		}
+		return env, nil
 	})
 
 	slowAdapter := func(platform string) api.Adapter {
@@ -795,7 +911,7 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 
 	adapters := map[string]api.Adapter{
 		"douyin":      douyinAdapter,
-		"bilibili":    fastAdapter("bilibili", "part-1", "part-2"),
+		"bilibili":    bilibiliAdapter,
 		"weibo":       weiboAdapter,
 		"toutiao":     fastAdapter("toutiao"),
 		"kuaishou":    fastAdapter("kuaishou"),
@@ -811,17 +927,24 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		"dailymotion": slowAdapter("dailymotion"),
 	}
 
-	var publicMedia api.PublicMedia
+	var weiboMedia api.PublicMedia
 	if enableOwnerChannel {
-		publicMedia = weiboplatform.PreparePublicWithOwner(mediaSigningKey, api.IsOwnerRequest)
+		weiboMedia = weiboplatform.PreparePublicWithOwner(mediaSigningKey, api.IsOwnerRequest)
 	} else {
-		publicMedia = weiboplatform.PreparePublic(mediaSigningKey)
+		weiboMedia = weiboplatform.PreparePublic(mediaSigningKey)
+	}
+	publicMedia := func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
+		if platform == "bilibili" {
+			return bilibili.PreparePublic(ctx, platform, payload, now)
+		}
+		return weiboMedia(ctx, platform, payload, now)
 	}
 
 	handler, err := api.NewWithCacheConfig(cat, adapters, time.Now, publicMedia, cacheCfg)
 	if err != nil {
 		return tierResult{}, err
 	}
+	handler.Stats().SetShanghaiSource(broker)
 
 	var next http.Handler = handler
 	if singleSharedPool {
@@ -1095,25 +1218,28 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	}
 
 	return tierResult{
-		Profile:          cfg.profile,
-		TargetRPS:        targetRPS,
-		AchievedRPS:      float64(len(records)) / sendElapsed,
-		DurationSec:      elapsed,
-		Overall:          summarize(func(obs) bool { return true }),
-		Fast:             summarize(func(o obs) bool { return !o.isSlow }),
-		Slow:             summarize(func(o obs) bool { return o.isSlow }),
-		OwnerAgent:       summarize(func(o obs) bool { return o.isOwner }),
-		Anonymous:        summarize(func(o obs) bool { return !o.isOwner }),
-		WeiboOwnerDirect: weiboOwnerDirect.Load(),
-		WeiboAnonRelay:   weiboAnonRelay.Load(),
-		PeakHeapAllocMiB: float64(atomic.LoadUint64(&peakHeap)) / (1024 * 1024),
-		PeakSysMiB:       float64(atomic.LoadUint64(&peakSys)) / (1024 * 1024),
-		PeakGoroutines:   int(peakGoroutines.Load()),
-		EndGoroutines:    endGoroutines,
-		FastUpstreams:    fastUpstreamCalls.Load(),
-		SlowUpstreams:    slowUpstreamCalls.Load(),
-		ShanghaiHits:     shanghaiHits.Load(),
-		ShanghaiMisses:   shanghaiMisses.Load(),
+		Profile:                cfg.profile,
+		TargetRPS:              targetRPS,
+		AchievedRPS:            float64(len(records)) / sendElapsed,
+		DurationSec:            elapsed,
+		Overall:                summarize(func(obs) bool { return true }),
+		Fast:                   summarize(func(o obs) bool { return !o.isSlow }),
+		Slow:                   summarize(func(o obs) bool { return o.isSlow }),
+		OwnerAgent:             summarize(func(o obs) bool { return o.isOwner }),
+		Anonymous:              summarize(func(o obs) bool { return !o.isOwner }),
+		WeiboOwnerDirect:       weiboOwnerDirect.Load(),
+		WeiboAnonRelay:         weiboAnonRelay.Load(),
+		PeakHeapAllocMiB:       float64(atomic.LoadUint64(&peakHeap)) / (1024 * 1024),
+		PeakSysMiB:             float64(atomic.LoadUint64(&peakSys)) / (1024 * 1024),
+		PeakGoroutines:         int(peakGoroutines.Load()),
+		EndGoroutines:          endGoroutines,
+		FastUpstreams:          fastUpstreamCalls.Load(),
+		SlowUpstreams:          slowUpstreamCalls.Load(),
+		ShanghaiHits:           shanghaiHits.Load(),
+		ShanghaiMisses:         shanghaiMisses.Load(),
+		ShanghaiDouyinHits:     shanghaiDouyinHits.Load(),
+		ShanghaiBilibiliHits:   shanghaiBilibiliHits.Load(),
+		ShanghaiBilibiliMisses: shanghaiBilibiliMisses.Load(),
 	}, nil
 }
 

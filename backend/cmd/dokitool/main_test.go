@@ -899,7 +899,7 @@ func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
 		t.Fatalf("GET /api/stats status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `"mode":"pull"`) || !strings.Contains(body, `"concurrency_limit":2`) {
-		t.Fatalf("expected pull shanghai mode and ytdlp concurrency_limit=2 in /api/stats, got %s", body)
+	if !strings.Contains(body, `"mode":"pull"`) || !strings.Contains(body, `"concurrency_limit":2`) || !strings.Contains(body, `"by_platform":{"douyin":`) || !strings.Contains(body, `"bilibili":`) {
+		t.Fatalf("expected pull shanghai mode, by_platform.{douyin,bilibili}, and ytdlp concurrency_limit=2 in /api/stats, got %s", body)
 	}
 }

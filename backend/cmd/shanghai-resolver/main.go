@@ -30,7 +30,7 @@ func run(args []string) error {
 	listen := flags.String("listen", "127.0.0.1:9083", "explicit loopback address behind HTTPS ingress")
 	cert := flags.String("tls-cert", "", "PEM certificate chain for native HTTPS")
 	key := flags.String("tls-key", "", "PEM private key for native HTTPS")
-	origin := flags.String("pull-origin", "", "Japan HTTPS origin for outbound original lookup")
+	origin := flags.String("pull-origin", "", "Japan HTTPS origin for outbound Shanghai task leases")
 	workers := flags.Int("workers", shresolver.DefaultPullWorkers, "concurrent pull worker loops (1-8)")
 	if err := flags.Parse(args); err != nil {
 		return err

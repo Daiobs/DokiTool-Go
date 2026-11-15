@@ -355,6 +355,7 @@
 !/backend/internal/api/admission_capacity_test.go
 !/backend/internal/api/admission_config.go
 !/backend/internal/api/admission_test.go
+!/backend/internal/api/bilibili_shanghai_test.go
 !/backend/internal/api/bilibili_test.go
 !/backend/internal/api/cache.go
 !/backend/internal/api/cache_test.go
@@ -419,6 +420,7 @@
 !/backend/internal/probe/probe.go
 !/backend/internal/probe/probe_test.go
 /backend/internal/shresolver/*
+!/backend/internal/shresolver/bilibili_test.go
 !/backend/internal/shresolver/client.go
 !/backend/internal/shresolver/client_test.go
 !/backend/internal/shresolver/interop_test.go
@@ -608,9 +610,12 @@
 !/backend/internal/platform/bilibili/helpers.go
 !/backend/internal/platform/bilibili/parser.go
 !/backend/internal/platform/bilibili/parser_test.go
+!/backend/internal/platform/bilibili/public_media.go
 !/backend/internal/platform/bilibili/renewal.go
 !/backend/internal/platform/bilibili/renewal_test.go
 !/backend/internal/platform/bilibili/request.go
+!/backend/internal/platform/bilibili/shanghai.go
+!/backend/internal/platform/bilibili/shanghai_test.go
 !/backend/internal/platform/bilibili/testdata/
 /backend/internal/platform/douyin/*
 !/backend/internal/platform/douyin/audio_urls.go

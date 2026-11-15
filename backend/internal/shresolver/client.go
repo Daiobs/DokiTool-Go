@@ -14,9 +14,11 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -73,11 +75,27 @@ func NewClient(endpoint, token string, executor fetch.Executor) (*Client, error)
 	return c, nil
 }
 
+// WithLookupNetIP overrides host DNS validation for isolated tests and loopback harnesses.
+func (c *Client) WithLookupNetIP(fn func(context.Context, string, string) ([]netip.Addr, error)) *Client {
+	if c != nil && fn != nil {
+		c.lookup = fn
+	}
+	return c
+}
+
+// WithClock overrides wall-clock evaluation for deterministic expiry tests.
+func (c *Client) WithClock(now func() time.Time) *Client {
+	if c != nil && now != nil {
+		c.now = now
+	}
+	return c
+}
+
 // The resolve request and DNS verification of both answers share one deadline.
 // No credentials, full media bytes or arbitrary fetch target cross this boundary.
 func (c *Client) ResolveOriginal(parent context.Context, videoID string) (rows []unified.Object, err error) {
 	defer func() {
-		c.stats.recordResolveOutcome(parent, err)
+		c.stats.recordResolveOutcome(parent, platDouyinIdx, err)
 	}()
 	if err = parent.Err(); err != nil {
 		return nil, err
@@ -105,7 +123,7 @@ func (c *Client) ResolveOriginal(parent context.Context, videoID string) (rows [
 // caller can fall back to ResolveOriginal.
 func (c *Client) ResolveWork(parent context.Context, awemeID string) (work *douyin.ShanghaiWork, err error) {
 	defer func() {
-		c.stats.recordResolveOutcome(parent, err)
+		c.stats.recordResolveOutcome(parent, platDouyinIdx, err)
 	}()
 	if err = parent.Err(); err != nil {
 		return nil, err
@@ -133,12 +151,81 @@ func (c *Client) ResolveWork(parent context.Context, awemeID string) (work *douy
 	return c.validateWorkResponse(ctx, awemeID, payload)
 }
 
+// ResolveBilibili requests domestic Bilibili stream observations for (bvid, cid)
+// within BilibiliTimeout and immediately commits a hit outcome on success.
+func (c *Client) ResolveBilibili(parent context.Context, bvid string, cid int64) (*bilibili.ShanghaiPlay, error) {
+	play, finish, err := c.ResolveBilibiliPending(parent, bvid, cid)
+	if err != nil {
+		return nil, err
+	}
+	if finish != nil {
+		finish(true)
+	}
+	return play, nil
+}
+
+// ResolveBilibiliPending requests domestic Bilibili stream observations within
+// BilibiliTimeout, deferring hit vs fallback classification until finish(matched)
+// is called so quality-tier mismatches with Japan are counted as fallbacks monotonically.
+func (c *Client) ResolveBilibiliPending(parent context.Context, bvid string, cid int64) (play *bilibili.ShanghaiPlay, finish func(bool), err error) {
+	defer func() {
+		if err != nil {
+			c.stats.recordResolveOutcome(parent, platBilibiliIdx, err)
+		}
+	}()
+	if err = parent.Err(); err != nil {
+		return nil, nil, err
+	}
+	if !bilibili.ValidBVID(bvid) || !bilibili.ValidCID(cid) {
+		return nil, nil, errUnavailable
+	}
+	ctx, cancel := context.WithTimeout(parent, BilibiliTimeout)
+	defer cancel()
+	body, _ := json.Marshal(struct {
+		Protocol int    `json:"protocol"`
+		TaskType string `json:"task_type"`
+		BVID     string `json:"bvid"`
+		CID      int64  `json:"cid"`
+	}{Protocol: ProtocolV2, TaskType: TaskBilibili, BVID: bvid, CID: cid})
+	headers := http.Header{"Authorization": {"Bearer " + c.token}, "Content-Type": {"application/json"}, "Accept": {"application/json"}}
+	payload, status, err := c.request(ctx, body, headers, BilibiliTimeout)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err != nil || status != http.StatusOK {
+		return nil, nil, errUnavailable
+	}
+	play, err = c.validateBilibiliResponse(ctx, bvid, cid, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	var once sync.Once
+	finish = func(matched bool) {
+		once.Do(func() {
+			if matched {
+				c.stats.recordResolveOutcome(parent, platBilibiliIdx, nil)
+			} else {
+				c.stats.recordResolveOutcome(parent, platBilibiliIdx, errUnavailable)
+			}
+		})
+	}
+	return play, finish, nil
+}
+
 // ShanghaiStatsSnapshot returns a point-in-time snapshot of direct-mode Shanghai resolution counters.
 func (c *Client) ShanghaiStatsSnapshot() StatsSnapshot {
 	if c == nil {
 		return StatsSnapshot{Mode: "off"}
 	}
 	return c.stats.snapshot("direct", 0, 0, 0)
+}
+
+// PlatformStatsSnapshot returns per-platform (Douyin vs Bilibili) resolution counters.
+func (c *Client) PlatformStatsSnapshot() PlatformBreakdown {
+	if c == nil {
+		return PlatformBreakdown{}
+	}
+	return c.stats.platformBreakdown()
 }
 
 func (c responseValidator) validateResponse(ctx context.Context, videoID string, payload []byte) ([]unified.Object, error) {
@@ -250,6 +337,141 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 		Candidates: candidates,
 		Renditions: renditions,
 	}, nil
+}
+
+func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid string, cid int64, payload []byte) (*bilibili.ShanghaiPlay, error) {
+	if len(payload) == 0 || len(payload) > maxResponseBytes || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
+		return nil, errUnavailable
+	}
+	d := json.NewDecoder(bytes.NewReader(payload))
+	d.DisallowUnknownFields()
+	var result bilibili.ShanghaiPlay
+	if d.Decode(&result) != nil || d.Decode(&struct{}{}) != io.EOF {
+		return nil, errUnavailable
+	}
+	if result.BVID != bvid || result.CID != cid || !bilibili.ValidBVID(result.BVID) || !bilibili.ValidCID(result.CID) ||
+		len(result.DURLPieces) > bilibili.MaxShanghaiDURLPieces ||
+		len(result.DashVideo) > bilibili.MaxShanghaiDashTracks ||
+		len(result.DashAudio) > bilibili.MaxShanghaiDashTracks ||
+		(len(result.DURLPieces) == 0 && result.DURLQuality != 0) ||
+		(len(result.DURLPieces) > 0 && result.DURLQuality <= 0) {
+		return nil, errUnavailable
+	}
+
+	now := c.now().Unix()
+	dnsOK := map[string]bool{}
+	filterURLs := func(urls []string) ([]string, error) {
+		if len(urls) > bilibili.MaxShanghaiTrackURLs {
+			return nil, errUnavailable
+		}
+		var kept []string
+		seen := map[string]bool{}
+		for _, raw := range urls {
+			if seen[raw] || !bilibili.AllowedBrowserFetchURL(raw) {
+				continue
+			}
+			exp, ok := bilibili.MediaURLDeadline(raw)
+			if !ok || exp <= now {
+				continue
+			}
+			u, err := url.Parse(raw)
+			if err != nil {
+				continue
+			}
+			host := strings.ToLower(u.Hostname())
+			publicHost, checked := dnsOK[host]
+			if !checked {
+				publicHost, err = c.checkPublicHost(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				dnsOK[host] = publicHost
+			}
+			if !publicHost {
+				continue
+			}
+			seen[raw] = true
+			kept = append(kept, raw)
+		}
+		return kept, nil
+	}
+
+	out := &bilibili.ShanghaiPlay{
+		BVID: bvid,
+		CID:  cid,
+	}
+	if len(result.DURLPieces) > 0 {
+		pieces := make([]bilibili.ShanghaiDURLPiece, 0, len(result.DURLPieces))
+		allOK := true
+		for _, piece := range result.DURLPieces {
+			kept, err := filterURLs(piece.URLs)
+			if err != nil {
+				return nil, err
+			}
+			if len(kept) == 0 {
+				allOK = false
+				break
+			}
+			pieces = append(pieces, bilibili.ShanghaiDURLPiece{URLs: kept})
+		}
+		if allOK && len(pieces) == len(result.DURLPieces) {
+			out.DURLQuality = result.DURLQuality
+			out.DURLPieces = pieces
+		}
+	}
+
+	filterTracks := func(tracks []bilibili.ShanghaiDashTrack) ([]bilibili.ShanghaiDashTrack, error) {
+		var keptTracks []bilibili.ShanghaiDashTrack
+		for _, tr := range tracks {
+			if tr.ID <= 0 || tr.CodecID < 0 || !validWireCodecs(tr.Codecs) {
+				return nil, errUnavailable
+			}
+			kept, err := filterURLs(tr.URLs)
+			if err != nil {
+				return nil, err
+			}
+			if len(kept) == 0 {
+				continue
+			}
+			keptTracks = append(keptTracks, bilibili.ShanghaiDashTrack{
+				ID:      tr.ID,
+				CodecID: tr.CodecID,
+				Codecs:  tr.Codecs,
+				URLs:    kept,
+			})
+		}
+		return keptTracks, nil
+	}
+
+	var err error
+	if out.DashVideo, err = filterTracks(result.DashVideo); err != nil {
+		return nil, err
+	}
+	if out.DashAudio, err = filterTracks(result.DashAudio); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !out.HasAnyRoute() {
+		return nil, errUnavailable
+	}
+	return out, nil
+}
+
+func validWireCodecs(s string) bool {
+	if s == "" {
+		return true
+	}
+	if s == "0" || len(s) > 64 || strings.TrimSpace(s) != s {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func (c responseValidator) checkPublicHost(ctx context.Context, host string) (bool, error) {

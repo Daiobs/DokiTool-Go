@@ -699,6 +699,13 @@ func TestStatsCacheSingleflightShanghaiAndAdmissionQueues(t *testing.T) {
 		snap.Shanghai.ByChannel.Anonymous.QueueWaitMSTotal < 250 {
 		t.Fatalf("unexpected anonymous shanghai stats: %+v", snap.Shanghai.ByChannel.Anonymous)
 	}
+	if snap.Shanghai.ByPlatform.Douyin.Hits != 2 ||
+		snap.Shanghai.ByPlatform.Douyin.Fallbacks != 1 ||
+		snap.Shanghai.ByPlatform.Douyin.QueueWaits != 2 ||
+		snap.Shanghai.ByPlatform.Bilibili.Hits != 0 ||
+		snap.Shanghai.ByPlatform.Bilibili.Fallbacks != 0 {
+		t.Fatalf("unexpected by_platform shanghai stats: %+v", snap.Shanghai.ByPlatform)
+	}
 
 	if snap.Admission.Fast.Granted != 1 || snap.Admission.Fast.Canceled != 1 || snap.Admission.Fast.Full != 1 || snap.Admission.Fast.Waited != 2 {
 		t.Fatalf("unexpected fast pool stats: %+v", snap.Admission.Fast)

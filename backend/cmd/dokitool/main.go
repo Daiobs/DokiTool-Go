@@ -48,6 +48,8 @@ func preparePublicMedia(key string) api.PublicMedia {
 		switch platform {
 		case "douyin":
 			return douyin.PreparePublic(ctx, platform, payload, now)
+		case "bilibili":
+			return bilibili.PreparePublic(ctx, platform, payload, now)
 		case "xiaohongshu":
 			return xiaohongshu.PreparePublic(ctx, platform, payload, now)
 		case "kuaishou":
@@ -140,8 +142,12 @@ func run(args []string) error {
 		return err
 	}
 	douyinParser := douyin.New(executor, japan)
+	bilibiliParser := bilibili.New(executor)
 	if shanghai != nil {
 		douyinParser = douyin.NewWithOriginalResolver(executor, japan.WithFingerprint(), shanghai)
+		if biliShanghai, ok := shanghai.(bilibili.ShanghaiResolver); ok {
+			bilibiliParser = bilibili.NewWithShanghai(executor, biliShanghai)
+		}
 	}
 	pipigxSave, err := enableTBVideo("DOKITOOL_TBVIDEO_REWRITE_PIPIGX")
 	if err != nil {
@@ -153,7 +159,7 @@ func run(args []string) error {
 	}
 	adapters := map[string]api.Adapter{
 		"douyin":      douyinParser,
-		"bilibili":    bilibili.New(executor),
+		"bilibili":    bilibiliParser,
 		"weibo":       weiboplatform.New(executor),
 		"toutiao":     toutiao.New(executor),
 		"kuaishou":    kuaishou.New(executor),

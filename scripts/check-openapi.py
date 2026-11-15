@@ -340,6 +340,11 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         "ShanghaiStatsSnapshot.mode enum must be ['off', 'direct', 'pull']",
     )
     require(
+        comp_schemas["ShanghaiPlatformBreakdown"]["required"] == ["douyin", "bilibili"]
+        and "by_platform" in comp_schemas["ShanghaiStatsSnapshot"]["required"],
+        "ShanghaiStatsSnapshot must require by_platform.{douyin,bilibili}",
+    )
+    require(
         comp_schemas["StatsSnapshot"]["required"] == [
             "started_at", "generated_at", "uptime_seconds",
             "requests", "cache", "admission", "ytdlp", "shanghai", "parse_latency_ms",
@@ -465,6 +470,7 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
                 "enabled": True, "mode": "pull", "waiting_workers": 3, "queued_tasks": 0, "pending_tasks": 0,
                 "total": zero_sh,
                 "by_channel": {"anonymous": zero_sh, "owner": zero_sh},
+                "by_platform": {"douyin": zero_sh, "bilibili": zero_sh},
             },
             "parse_latency_ms": {
                 "total": zero_hist,

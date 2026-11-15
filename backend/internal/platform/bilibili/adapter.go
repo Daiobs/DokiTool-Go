@@ -9,6 +9,11 @@ import (
 )
 
 func adapt(raw object, sourceURL string, now int64) object {
+	data, _ := adaptWithShanghai(raw, sourceURL, now, nil)
+	return data
+}
+
+func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *ShanghaiPlay) (object, bool) {
 	raw = unified.Clone(raw)
 	raw["author"] = pick(raw["user"], object{})
 	data := unified.WorkMetadata("bilibili", raw, sourceURL)
@@ -17,6 +22,7 @@ func adapt(raw object, sourceURL string, now int64) object {
 	data["content_id"] = bvid
 	items, partIDs := array{}, array{}
 	known := map[string]bool{}
+	matchedShanghai := false
 	for i, value := range unified.Slice(child(raw, "extra", "pages")) {
 		page := unified.Map(value)
 		number := intValue(pick(page["page"], i+1))
@@ -30,13 +36,16 @@ func adapt(raw object, sourceURL string, now int64) object {
 			item["duration_ms"] = int64(unified.PHPRound(duration*1000, 0))
 		}
 		if number == current {
-			variants := variants(raw, bvid, number, page["cid"], now)
-			if len(variants) == 0 {
+			vars, matched := variantsWithShanghai(raw, bvid, number, page["cid"], now, shPlay)
+			if len(vars) == 0 {
 				delete(item, "resolve_url")
 				item["state"] = "unavailable"
 				item["error"] = object{"code": "CONTENT_UNAVAILABLE", "message": "当前分P未提供完整媒体描述"}
 			} else {
-				item["variants"] = variants
+				item["variants"] = vars
+				if matched {
+					matchedShanghai = true
+				}
 			}
 		} else {
 			item["state"] = "deferred"
@@ -84,19 +93,31 @@ func adapt(raw object, sourceURL string, now int64) object {
 		}
 	}
 	data["items"], data["groups"] = items, groups
-	return data
+	return data, matchedShanghai
 }
 
 func variants(raw object, bvid string, page int64, cid any, now int64) array {
+	out, _ := variantsWithShanghai(raw, bvid, page, cid, now, nil)
+	return out
+}
+
+func variantsWithShanghai(raw object, bvid string, page int64, cid any, now int64, shPlay *ShanghaiPlay) (array, bool) {
+	if shPlay != nil {
+		if cidInt, ok := parsePositiveCID(cid); !ok || shPlay.BVID != bvid || shPlay.CID != cidInt {
+			shPlay = nil
+		}
+	}
 	if raw["private_error"] != nil {
-		return array{}
+		return array{}, false
 	}
 	play := unified.Map(raw["private_play"])
 	if len(play) == 0 {
 		sources := append(array{object{"url": raw["url"]}}, unified.Slice(raw["video_backup"])...)
-		return unified.FileVariants(array{object{"url": raw["url"], "sources": sources, "label": pick(raw["quality"], "规格未知")}}, now)
+		return unified.FileVariants(array{object{"url": raw["url"], "sources": sources, "label": pick(raw["quality"], "规格未知")}}, now), false
 	}
 	result := array{}
+	matchedAny := false
+	jpQuality := intValue(play["quality"])
 	durl := unified.Slice(play["durl"])
 	if len(durl) == 1 {
 		part := unified.Map(durl[0])
@@ -105,11 +126,39 @@ func variants(raw object, bvid string, page int64, cid any, now int64) array {
 		// PHP array union keeps the first fact: part before play, video before audio.
 		union(candidate, unified.VideoFacts(part), unified.VideoFacts(play), unified.AudioFacts(part), unified.AudioFacts(play))
 		result = unified.FileVariants(array{candidate}, now)
+		if shPlay != nil && jpQuality > 0 && shPlay.DURLQuality == jpQuality && len(shPlay.DURLPieces) == 1 && len(result) == 1 {
+			shURLs := filterShanghaiURLsAt(shPlay.DURLPieces[0].URLs, now)
+			if len(shURLs) > 0 {
+				delivery := unified.Map(unified.Map(result[0])["delivery"])
+				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+					delivery["sources"] = merged
+					matchedAny = true
+				}
+			}
+		}
 	} else if len(durl) > 1 {
+		shPiecesMatch := shPlay != nil && jpQuality > 0 && shPlay.DURLQuality == jpQuality && len(shPlay.DURLPieces) == len(durl)
+		shFilteredPieces := make([][]string, len(durl))
+		if shPiecesMatch {
+			for i := range durl {
+				shFilteredPieces[i] = filterShanghaiURLsAt(shPlay.DURLPieces[i].URLs, now)
+				if len(shFilteredPieces[i]) == 0 {
+					shPiecesMatch = false
+					break
+				}
+			}
+		}
 		pieces := array{}
 		for i, value := range durl {
 			part := unified.Map(value)
-			piece := object{"index": i + 1, "sources": unified.Sources(partSources(part), now)}
+			jpPieceSources := unified.Sources(partSources(part), now)
+			if shPiecesMatch {
+				if merged, ok := prependShanghaiSources(shFilteredPieces[i], jpPieceSources, now); ok {
+					jpPieceSources = merged
+					matchedAny = true
+				}
+			}
+			piece := object{"index": i + 1, "sources": jpPieceSources}
 			if length, ok := unified.Numeric(part["length"]); ok && length > 0 {
 				piece["duration_ms"] = intValue(part["length"])
 			}
@@ -117,14 +166,42 @@ func variants(raw object, bvid string, page int64, cid any, now int64) array {
 		}
 		result = append(result, object{"id": "segments", "delivery": object{"kind": "segments", "pieces": pieces, "join": "remux", "output": output()}})
 	}
-	audioOptions := array{}
+
+	type dashAudioOption struct {
+		resource object
+		digest   string
+		matched  bool
+	}
+	audioOptions := make([]dashAudioOption, 0)
 	for _, value := range unified.Slice(child(play, "dash", "audio")) {
-		if resource := track(unified.Map(value), "audio", now); resource != nil {
-			audioOptions = append(audioOptions, resource)
+		rawAudio := unified.Map(value)
+		resource := track(rawAudio, "audio", now)
+		if resource == nil {
+			continue
 		}
+		audioDigest := digest(unified.PHPIdentityJSON(unified.ResourceIdentity(resource), false))
+		audioMatched := false
+		if shPlay != nil {
+			var shURLs []string
+			for _, shTrack := range shPlay.DashAudio {
+				if dashTrackMatch(shTrack, rawAudio) {
+					shURLs = append(shURLs, shTrack.URLs...)
+				}
+			}
+			shURLs = filterShanghaiURLsAt(shURLs, now)
+			if len(shURLs) > 0 {
+				delivery := unified.Map(resource["delivery"])
+				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+					delivery["sources"] = merged
+					audioMatched = true
+				}
+			}
+		}
+		audioOptions = append(audioOptions, dashAudioOption{resource: resource, digest: audioDigest, matched: audioMatched})
 	}
 	for _, value := range unified.Slice(child(play, "dash", "video")) {
-		video := track(unified.Map(value), "video", now)
+		rawVideo := unified.Map(value)
+		video := track(rawVideo, "video", now)
 		if video == nil {
 			continue
 		}
@@ -133,17 +210,36 @@ func variants(raw object, bvid string, page int64, cid any, now int64) array {
 			result = append(result, object{"id": variantID, "state": "deferred", "reason": object{"code": "MISSING_AUDIO_TRACK", "message": "未取得可确认的完整音视频组合，暂不可下载"}})
 			continue
 		}
-		for _, value := range audioOptions {
-			audio := unified.Map(value)
-			id := variantID + "-" + digest(unified.PHPIdentityJSON(unified.ResourceIdentity(audio), false))
-			variant := object{"id": id, "delivery": object{"kind": "mux", "resources": array{unified.Clone(video), unified.Clone(audio)}, "output": output()}}
+		videoMatched := false
+		if shPlay != nil {
+			var shURLs []string
+			for _, shTrack := range shPlay.DashVideo {
+				if dashTrackMatch(shTrack, rawVideo) {
+					shURLs = append(shURLs, shTrack.URLs...)
+				}
+			}
+			shURLs = filterShanghaiURLsAt(shURLs, now)
+			if len(shURLs) > 0 {
+				delivery := unified.Map(video["delivery"])
+				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+					delivery["sources"] = merged
+					videoMatched = true
+				}
+			}
+		}
+		for _, audio := range audioOptions {
+			id := variantID + "-" + audio.digest
+			variant := object{"id": id, "delivery": object{"kind": "mux", "resources": array{unified.Clone(video), unified.Clone(audio.resource)}, "output": output()}}
 			if video["metadata"] != nil {
 				variant["metadata"] = unified.CloneValue(video["metadata"])
 			}
 			result = append(result, variant)
+			if videoMatched || audio.matched {
+				matchedAny = true
+			}
 		}
 	}
-	return result
+	return result, matchedAny
 }
 
 func partSources(part object) array {

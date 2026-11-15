@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 )
 
@@ -34,26 +35,27 @@ var errPullAuth = errors.New("Shanghai pull credential rejected")
 // to MinPullWorkers..MaxPullWorkers). Only the pinned Japanese control endpoints
 // receive its bearer. Detail lookups and media probes use separate transports.
 type PullWorker struct {
-	origin  string
-	token   string
-	workers int
-	control fetch.Executor
-	detail  fetch.Executor
-	probe   originalProbe
+	origin   string
+	token    string
+	workers  int
+	control  fetch.Executor
+	detail   fetch.Executor
+	bilibili fetch.Executor
+	probe    originalProbe
 }
 
 func NewPullWorker(origin, token string, control fetch.Executor, p originalProbe) (*PullWorker, error) {
-	return newPullWorker(origin, token, control, nil, p)
+	return newPullWorker(origin, token, control, nil, nil, p)
 }
 
 func NewPullWorkerWithDetail(origin, token string, control, detail fetch.Executor, p originalProbe) (*PullWorker, error) {
 	if detail == nil {
 		return nil, errors.New("invalid Shanghai pull configuration")
 	}
-	return newPullWorker(origin, token, control, detail, p)
+	return newPullWorker(origin, token, control, detail, detail, p)
 }
 
-func newPullWorker(origin, token string, control, detail fetch.Executor, p originalProbe) (*PullWorker, error) {
+func newPullWorker(origin, token string, control, detail, bilibiliExec fetch.Executor, p originalProbe) (*PullWorker, error) {
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
 		(u.EscapedPath() != "" && u.EscapedPath() != "/") || u.RawQuery != "" || u.ForceQuery || strings.Contains(origin, "#") ||
@@ -64,13 +66,23 @@ func newPullWorker(origin, token string, control, detail fetch.Executor, p origi
 		return nil, errors.New("pull origin requires a public address")
 	}
 	return &PullWorker{
-		origin:  "https://" + u.Host,
-		token:   token,
-		workers: DefaultPullWorkers,
-		control: control,
-		detail:  detail,
-		probe:   p,
+		origin:   "https://" + u.Host,
+		token:    token,
+		workers:  DefaultPullWorkers,
+		control:  control,
+		detail:   detail,
+		bilibili: wrapBilibiliExecutor(bilibiliExec),
+		probe:    p,
 	}, nil
+}
+
+// WithBilibili overrides the Bilibili API executor on w (nil disables Bilibili task advertisement).
+func (w *PullWorker) WithBilibili(exec fetch.Executor) *PullWorker {
+	if w == nil {
+		return nil
+	}
+	w.bilibili = wrapBilibiliExecutor(exec)
+	return w
 }
 
 // WithWorkers configures the number of concurrent pull lease loops within
@@ -83,11 +95,26 @@ func (w *PullWorker) WithWorkers(n int) (*PullWorker, error) {
 	return w, nil
 }
 
+func (w *PullWorker) supportedTasksHeader() string {
+	if w.bilibili == nil {
+		return ""
+	}
+	if w.detail != nil {
+		return TaskDouyin + "," + TaskBilibili
+	}
+	return TaskBilibili
+}
+
 func (w *PullWorker) post(ctx context.Context, path string, body []byte, timeout time.Duration) (fetch.Response, error) {
 	target := w.origin + path
 	h := http.Header{"Authorization": {"Bearer " + w.token}, "Content-Type": {"application/json"}}
-	if path == ClaimPath && w.detail != nil {
-		h.Set(ProtocolHeader, "2")
+	if path == ClaimPath {
+		if w.detail != nil || w.bilibili != nil {
+			h.Set(ProtocolHeader, "2")
+		}
+		if tasks := w.supportedTasksHeader(); tasks != "" {
+			h.Set(TasksHeader, tasks)
+		}
 	}
 	resp, err := w.control.Do(ctx, fetch.Request{URL: target, Method: http.MethodPost, Body: body, Header: h,
 		Policy: fetch.Policy{Purpose: "douyin-original-pull", Timeout: timeout, MaxBytes: 1024, MaxHeaderBytes: 8192,
@@ -129,11 +156,20 @@ func (w *PullWorker) runOnce(ctx context.Context) (bool, error) {
 	}
 	switch job.Protocol {
 	case 0:
-		if job.AwemeID != "" || !ValidVideoID(job.VideoID) {
+		if job.TaskType != "" || job.AwemeID != "" || job.BVID != "" || job.CID != 0 || !ValidVideoID(job.VideoID) {
 			return false, errUnavailable
 		}
 	case ProtocolV2:
-		if w.detail == nil || job.VideoID != "" || !douyin.ValidAwemeID(job.AwemeID) {
+		switch job.TaskType {
+		case "", TaskDouyin:
+			if w.detail == nil || job.VideoID != "" || job.BVID != "" || job.CID != 0 || !douyin.ValidAwemeID(job.AwemeID) {
+				return false, errUnavailable
+			}
+		case TaskBilibili:
+			if w.bilibili == nil || job.VideoID != "" || job.AwemeID != "" || !bilibili.ValidBVID(job.BVID) || !bilibili.ValidCID(job.CID) {
+				return false, errUnavailable
+			}
+		default:
 			return false, errUnavailable
 		}
 	default:
@@ -174,6 +210,33 @@ func (w *PullWorker) runOnce(ctx context.Context) (bool, error) {
 		}
 		return true, nil
 	case ProtocolV2:
+		if job.TaskType == TaskBilibili {
+			leaseBudget = min(remaining, BilibiliTimeout)
+			lease, cancel := context.WithTimeout(ctx, leaseBudget)
+			defer cancel()
+			out, playErr := resolveBilibili(lease, w.bilibili, job.BVID, job.CID)
+			if err := lease.Err(); err != nil {
+				return true, err
+			}
+			if playErr == nil && out != nil && out.HasAnyRoute() {
+				raw, err := json.Marshal(out)
+				if err == nil && len(raw) <= maxResponseBytes {
+					msg.Result = raw
+				}
+			}
+			body, err := json.Marshal(msg)
+			if err != nil {
+				return true, err
+			}
+			ack, err := w.post(lease, ResultPath, body, BilibiliTimeout)
+			if err != nil {
+				return true, err
+			}
+			if ack.StatusCode != http.StatusNoContent && ack.StatusCode != http.StatusConflict {
+				return true, errUnavailable
+			}
+			return true, nil
+		}
 		leaseBudget = min(remaining, WorkTimeout)
 		lease, cancel := context.WithTimeout(ctx, leaseBudget)
 		defer cancel()

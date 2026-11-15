@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
@@ -22,6 +23,10 @@ const (
 	Path           = "/v1/douyin/original"
 	ProtocolV2     = 2
 	ProtocolHeader = "X-DokiTool-Shanghai-Protocol"
+	TasksHeader    = "X-DokiTool-Shanghai-Tasks"
+
+	TaskDouyin   = "douyin"
+	TaskBilibili = "bilibili"
 
 	// ProbeTimeout bounds a standalone v1 two-dispatch original MP4 probe.
 	// In v2, resolveWork applies the tighter WorkResolveTimeout sub-budget so
@@ -41,6 +46,19 @@ const (
 	// 2s cross-border claim/result margin), keeping worst-case parse + Japan
 	// fallback original probe (~0.7-1.0s) within ~10s.
 	WorkTimeout = 9 * time.Second
+
+	// BilibiliResolveTimeout bounds Shanghai's single non-redirecting JSON GET to
+	// api.bilibili.com/x/player/playurl (~50-250ms domestic RTT, zero media byte probing).
+	BilibiliResolveTimeout = bilibili.ShanghaiPlayTimeout
+
+	// bilibiliResultReserve keeps lease headroom before DeadlineMS so Shanghai can
+	// return a result or failure receipt over cross-border HTTPS before lease expiry.
+	bilibiliResultReserve = 400 * time.Millisecond
+
+	// BilibiliTimeout bounds Japan's total wait for Shanghai Bilibili resolution:
+	// up to 300ms broker queue wait when all Bilibili-capable workers are busy +
+	// ~100-200ms cross-border claim/result RTT + 2.5s domestic playurl budget.
+	BilibiliTimeout = 3 * time.Second
 )
 
 var videoIDPattern = regexp.MustCompile(`^v[0-9a-zA-Z]{10,127}$`)
@@ -72,10 +90,39 @@ type originalProbe interface {
 	Originals(context.Context, string) ([]unified.Object, error)
 }
 
+type strictBilibiliExecutor struct {
+	exec fetch.Executor
+}
+
+func (s strictBilibiliExecutor) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	if s.exec == nil || req.Method != http.MethodGet || req.Policy.FollowRedirects || len(req.Body) != 0 || !bilibili.AllowedAPIURL(req.URL) {
+		return fetch.Response{}, fetch.ErrPolicy
+	}
+	for k := range req.Header {
+		if strings.EqualFold(k, "Cookie") {
+			return fetch.Response{}, fetch.ErrPolicy
+		}
+	}
+	req.Policy.AllowedURL = bilibili.AllowedAPIURL
+	req.Policy.FollowRedirects = false
+	return s.exec.Do(ctx, req)
+}
+
+func wrapBilibiliExecutor(exec fetch.Executor) fetch.Executor {
+	if exec == nil {
+		return nil
+	}
+	if _, ok := exec.(strictBilibiliExecutor); ok {
+		return exec
+	}
+	return strictBilibiliExecutor{exec: exec}
+}
+
 type server struct {
-	token  string
-	detail fetch.Executor
-	probe  originalProbe
+	token    string
+	detail   fetch.Executor
+	bilibili fetch.Executor
+	probe    originalProbe
 }
 
 // NewHandler authorizes the legacy v1 video_id metadata-only endpoint; the
@@ -87,12 +134,30 @@ func NewHandler(token string, p originalProbe) (http.Handler, error) {
 	return &server{token: token, probe: p}, nil
 }
 
-// NewHandlerWithDetail authorizes both v1 (video_id) and v2 (aweme_id) requests.
+// NewHandlerWithDetail authorizes v1 (video_id) and v2 (Douyin aweme_id + Bilibili bvid/cid) requests.
 func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) (http.Handler, error) {
 	if !ValidToken(token) || detail == nil || p == nil {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
-	return &server{token: token, detail: detail, probe: p}, nil
+	return &server{
+		token:    token,
+		detail:   detail,
+		bilibili: wrapBilibiliExecutor(detail),
+		probe:    p,
+	}, nil
+}
+
+// NewHandlerWithExecutors authorizes v1/v2 requests with explicit Douyin detail and Bilibili executors.
+func NewHandlerWithExecutors(token string, detail, bilibiliExec fetch.Executor, p originalProbe) (http.Handler, error) {
+	if !ValidToken(token) || p == nil || (detail == nil && bilibiliExec == nil) {
+		return nil, errors.New("missing or invalid Shanghai resolver configuration")
+	}
+	return &server{
+		token:    token,
+		detail:   detail,
+		bilibili: wrapBilibiliExecutor(bilibiliExec),
+		probe:    p,
+	}, nil
 }
 
 func ValidToken(token string) bool {
@@ -125,8 +190,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Protocol int    `json:"protocol"`
+		TaskType string `json:"task_type"`
 		VideoID  string `json:"video_id"`
 		AwemeID  string `json:"aweme_id"`
+		BVID     string `json:"bvid"`
+		CID      int64  `json:"cid"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512))
 	decoder.DisallowUnknownFields()
@@ -136,7 +204,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Protocol {
 	case 0:
-		if req.AwemeID != "" || !ValidVideoID(req.VideoID) {
+		if req.TaskType != "" || req.AwemeID != "" || req.BVID != "" || req.CID != 0 || !ValidVideoID(req.VideoID) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -148,20 +216,64 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
 	case ProtocolV2:
-		if s.detail == nil || req.VideoID != "" || !douyin.ValidAwemeID(req.AwemeID) {
+		switch req.TaskType {
+		case "", TaskDouyin:
+			if s.detail == nil || req.VideoID != "" || req.BVID != "" || req.CID != 0 || !douyin.ValidAwemeID(req.AwemeID) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			out, err := resolveWork(r.Context(), s.detail, s.probe, req.AwemeID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+		case TaskBilibili:
+			if req.VideoID != "" || req.AwemeID != "" || !bilibili.ValidBVID(req.BVID) || !bilibili.ValidCID(req.CID) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if s.bilibili == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			out, err := resolveBilibili(r.Context(), s.bilibili, req.BVID, req.CID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+		default:
 			w.WriteHeader(http.StatusBadRequest)
-			return
 		}
-		out, err := resolveWork(r.Context(), s.detail, s.probe, req.AwemeID)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
 	default:
 		w.WriteHeader(http.StatusBadRequest)
 	}
+}
+
+func resolveBilibili(ctx context.Context, bilibiliExec fetch.Executor, bvid string, cid int64) (*bilibili.ShanghaiPlay, error) {
+	if bilibiliExec == nil {
+		return nil, errUnavailable
+	}
+	playBudget := BilibiliResolveTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.DeadlineExceeded
+		}
+		reserve := min(bilibiliResultReserve, remaining/3)
+		if capped := remaining - reserve; capped < playBudget {
+			playBudget = capped
+		}
+	}
+	playCtx, cancel := context.WithTimeout(ctx, playBudget)
+	defer cancel()
+	return bilibili.FetchShanghaiPlay(playCtx, wrapBilibiliExecutor(bilibiliExec), bvid, cid)
 }
 
 func resolveWork(ctx context.Context, detailExec fetch.Executor, p originalProbe, awemeID string) (WorkResponse, error) {

@@ -32,13 +32,19 @@ func allowedURL(raw string) bool {
 	return u.Scheme == "https" && (u.Port() == "" || u.Port() == "443") || u.Scheme == "http" && (u.Port() == "" || u.Port() == "80")
 }
 
-func allowedAPIURL(raw string) bool {
+// AllowedAPIURL reports whether raw targets one of the two fixed official
+// Bilibili JSON endpoints (/x/web-interface/view or /x/player/playurl) over
+// HTTPS without userinfo, fragment, or non-443 port.
+func AllowedAPIURL(raw string) bool {
 	if strings.Contains(raw, "#") || !allowedURL(raw) {
 		return false
 	}
 	u, err := url.Parse(raw)
-	return err == nil && u.Scheme == "https" && u.Hostname() == "api.bilibili.com" && (u.EscapedPath() == "/x/web-interface/view" || u.EscapedPath() == "/x/player/playurl")
+	return err == nil && u.Scheme == "https" && strings.EqualFold(u.Hostname(), "api.bilibili.com") &&
+		(u.EscapedPath() == "/x/web-interface/view" || u.EscapedPath() == "/x/player/playurl")
 }
+
+func allowedAPIURL(raw string) bool { return AllowedAPIURL(raw) }
 
 func shareRequest(raw string) fetch.Request {
 	return fetch.Request{URL: raw, Method: http.MethodHead, Header: http.Header{"User-Agent": {""}},
