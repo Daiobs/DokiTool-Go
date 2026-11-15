@@ -1,0 +1,132 @@
+{
+  "schema_version": "1.0",
+  "expected_platforms": [
+    "douyin",
+    "kuaishou",
+    "bilibili",
+    "xiaohongshu",
+    "toutiao",
+    "weibo",
+    "pipixia",
+    "pipigx",
+    "zuiyou",
+    "x",
+    "youtube",
+    "instagram",
+    "facebook",
+    "tumblr",
+    "dailymotion"
+  ],
+  "cache_sample_key": "kuaishou",
+  "x_fast_path_key": "x",
+  "douyin_domestic_key": "douyin",
+  "direct_marker_platforms": {
+    "douyin": {
+      "sample_key": "douyin",
+      "expected_allowed_suffixes": [
+        ".douyinvod.com",
+        ".zjcdn.com"
+      ],
+      "require_all_direct_https": false
+    },
+    "xiaohongshu": {
+      "sample_key": "xiaohongshu",
+      "expected_allowed_suffixes": [
+        ".xhscdn.com",
+        ".rednotecdn.com"
+      ],
+      "require_all_direct_https": true
+    },
+    "kuaishou": {
+      "sample_key": "kuaishou",
+      "expected_allowed_suffixes": [
+        ".kwaicdn.com",
+        ".kwimgs.com",
+        ".yximgs.com"
+      ],
+      "require_all_direct_https": false
+    },
+    "pipixia": {
+      "sample_key": "pipixia",
+      "expected_allowed_suffixes": [
+        ".ppxvod.com",
+        ".byteimg.com"
+      ],
+      "require_all_direct_https": false
+    }
+  },
+  "platforms": {
+    "douyin": {
+      "url": "https://www.douyin.com/jingxuan?modal_id=7704056737233449610",
+      "pool": "parse"
+    },
+    "kuaishou": {
+      "url": "https://www.kuaishou.com/short-video/3xngkmw8vacriqu",
+      "pool": "parse"
+    },
+    "bilibili": {
+      "url": "https://www.bilibili.com/video/BV1uv411q7Mv",
+      "pool": "parse"
+    },
+    "xiaohongshu": {
+      "url": "http://xhslink.com/o/ATlAvhS71F8",
+      "pool": "parse"
+    },
+    "toutiao": {
+      "url": "https://www.toutiao.com/video/7501991960077500979/",
+      "pool": "parse"
+    },
+    "weibo": {
+      "url": "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
+      "pool": "parse"
+    },
+    "pipixia": {
+      "url": "https://h5.pipix.com/item/7385813877985909043",
+      "pool": "parse"
+    },
+    "pipigx": {
+      "url": "https://h5.pipigx.com/pp/post/860538173891?pid=860538173891&mid=165822485",
+      "pool": "parse"
+    },
+    "zuiyou": {
+      "url": "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
+      "pool": "parse"
+    },
+    "x": {
+      "url": "https://x.com/i/status/1575560063510810624",
+      "pool": "slow_parse"
+    },
+    "youtube": {
+      "url": "https://www.youtube.com/watch?v=I9JvDaciaFk",
+      "pool": "slow_parse"
+    },
+    "instagram": {
+      "url": "https://www.instagram.com/p/CTApqC8BGWd/",
+      "pool": "slow_parse"
+    },
+    "facebook": {
+      "url": "https://www.facebook.com/watch/?v=401590806345712",
+      "pool": "slow_parse"
+    },
+    "tumblr": {
+      "url": "https://maskofthedragon.tumblr.com/post/626907179849564160/mona-talking-in-english",
+      "pool": "slow_parse"
+    },
+    "dailymotion": {
+      "url": "https://www.dailymotion.com/video/xbvrf7u",
+      "pool": "slow_parse"
+    }
+  },
+  "rate_limit": {
+    "pool": "slow_parse",
+    "idle_refill_seconds": 21.0,
+    "urls": [
+      "https://x.com/i/status/1575560063510810624",
+      "https://x.com/i/status/1577719286659006464",
+      "https://x.com/i/status/1577855540407197696",
+      "https://x.com/i/status/894001459754180609/photo/1",
+      "https://x.com/i/status/1790637656616943991",
+      "https://x.com/i/status/2119994769057132696"
+    ]
+  }
+}

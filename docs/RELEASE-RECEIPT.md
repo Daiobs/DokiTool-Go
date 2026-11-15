@@ -1,0 +1,260 @@
+# 发布检查与回执模板（`RELEASE-RECEIPT`）
+
+本文档固定生产发布（及预演验证）的**服务端核对清单**、**自动化生产冒烟脚本调用方式**、**Mac 无头浏览器复测清单**与**最小回执模板**。后续发布 Issue 直接引用本文档对应章节编号即可，无需每次重写检查步骤。
+
+> [!IMPORTANT]
+> **公开仓库脱敏与张贴原则**
+> 1. **严禁泄露敏感信息与本机隐私**：仓库与 Issue 公开可见，回执中**禁止出现**任何服务器 IP（IPv4/IPv6）、SSH 用户名/主机名/端口、安全组规则、`DOKITOOL_*` / `SNAP_*` 环境变量值或密钥文件哈希、`xsec_token`、微博中转 `ticket`、完整带签名的媒体 CDN URL（仅保留去重后的媒体域名，如 `v26-cold.douyinvod.com`），以及**执行机器的本机计算机名（hostname）、本地系统用户名与完整本地路径**（一律使用 `<WORK_DIR>` 等占位符）。
+> 2. **原始输出按需张贴**：**原始命令输出只在某一步不通过（`FAIL`）时贴，并且只贴失败的那一步（脱敏后张贴）**。所有通过（`PASS`）步骤只填结论表与关键摘要（SHA-256、属主权限、计数、耗时、重试次数）。
+
+---
+
+## 1. 最小发布回执模板（复制到发布 Issue 评论）
+
+````markdown
+## 发布回执 — `<RELEASE_TAG>` (`<SHORT_SHA>`)
+
+### 1.1 目标版本与窗口
+- **目标 Commit SHA**: `<40-char-commit-sha>`
+- **目标 Tree SHA**: `<40-char-tree-sha>`
+- **构建产物标签 (`release_tag`)**: `build-<short-sha>`（`release-manifest.json` SHA-256: `<manifest-sha256>`）
+- **执行时间窗口 (UTC)**: `YYYY-MM-DDTHH:MM:SSZ` ~ `YYYY-MM-DDTHH:MM:SSZ`
+- **本次变更范围**: `日本主站 A: [是/否] | 上海节点 B: [是/否] | 前端静态产物: [是/否] | Mac 浏览器复测 D: [是/否]`
+
+### 1.2 步骤结论表
+
+#### A. 日本主站（`dokitool-go.service` + Caddy + 静态站点）
+| 步骤 | 检查内容（参见 `docs/RELEASE-RECEIPT.md` §2.1） | 结论 | 关键核对摘要（无敏感信息） |
+| --- | --- | --- | --- |
+| A1 | 切换前现场保存（旧 PID、旧二进制/drop-in/`snap.caddy` SHA-256、环境变量名、前端软链） | `PASS` | 旧 `exe` SHA-256: `<prev-exe-sha256>`；`snap.caddy` SHA-256: `<caddy-sha256>` |
+| A2 | 构建产物与 `version`/`catalog` 校验、追加上一版 `/assets/*` 哈希 chunk 与 Caddy `@api` 白名单核对 | `PASS` | 产物匹配 `release-manifest.json`；旧 `/assets/*` 已不覆盖并入；`@api` 白名单已核对 |
+| A3 | 排空停机、端口释放确认、drop-in（字母前缀字典序且保留既有启动参数）/ 前端软链原子切换与启动 | `PASS` | 旧进程退出且监听端口释放后启动新实例 |
+| A4 | 切换后 `/proc/$PID/exe`、保留旧 `/assets/*` (`200`) / 缺失 chunk (`404`)、journal 预检及 `/api/stats` (`401`) / `/api/statsx` (`404`) 核对 | `PASS` | 新 `exe` SHA-256: `<new-exe-sha256>`；预检 0 错误；旧 chunk `200`、缺失 chunk `404`；`/api/stats`->`401`、`/api/statsx`->`404` |
+| A5 | 自动化生产冒烟 `scripts/prod-smoke/smoke.py`（见 §1.4） | `PASS` | `PASS=<n>, FAIL=0, SKIP=<k>` |
+
+#### B. 上海解析节点（`dokitool-sh-pull.service`，未涉及时整表标 `SKIP`）
+| 步骤 | 检查内容（参见 `docs/RELEASE-RECEIPT.md` §2.2） | 结论 | 关键核对摘要（无敏感信息） |
+| --- | --- | --- | --- |
+| B1 | 切换前现场保存（状态、启动参数、旧 `exe`/drop-in SHA-256、内存基线） | `PASS` / `SKIP` | 旧 `exe` SHA-256: `<prev-sh-sha256>`；`pull` 模式运行正常 |
+| B2 | `shanghai-resolver` 产物 SHA-256 校验与落盘 | `PASS` / `SKIP` | 匹配 `release-manifest.json` |
+| B3 | 切换重启、`/proc/$PID/exe` SHA-256 与 `pull` 通道就绪核对 | `PASS` / `SKIP` | 新 `exe` SHA-256: `<new-sh-sha256>`；长轮询已连接 |
+| B4 | 停启回退与恢复抽查（按发布单要求执行或 `SKIP`） | `PASS` / `SKIP` | 停机回退无 `500`，恢复后返回 `*.douyinvod.com` |
+| B5 | 切换 5 分钟后内存观察（`VmRSS` 与 `free -m`） | `PASS` / `SKIP` | `VmRSS=<n> MiB`，`free -m available=<n> MiB` |
+
+#### D. Mac 无头浏览器复测（未涉及时标 `SKIP`，涉及时按 §3 填写）
+- **执行环境**: `macOS <ver> | Chrome <ver> (--headless=new --no-first-run --no-default-browser-check) | Tampermonkey <ver> (userscript diff: 0)`
+- **网络与下载采集**: `国内平台直连 / 海外平台代理分流（不含 IP） | CDP Browser.setDownloadBehavior | https://snap.dokitool.com/?debug=1`
+
+| 编号 | 复测场景（参见 `docs/RELEASE-RECEIPT.md` §3.2） | 结论 | 媒体域名（仅域名） | 耗时 / 速率 / 落盘校验摘要 |
+| --- | --- | --- | --- | --- |
+| D1 | 抖音 4K 多线路择优 + 20s 测速 + 取消下载 | `PASS` / `SKIP` | `*.douyinvod.com` | 选中 HTTPS 国内源，20s 均速 `<x> MiB/s`，取消立即中断 |
+| D2 | 小红书原画 `403` 自动跳过 + 非原画全量 `https://` | `PASS` / `SKIP` | `*.xhscdn.com`, `*.rednotecdn.com` | 原画 `403` 自动回退，`0` 个 `http://` 链接 |
+| D3 | 快手 & 皮皮虾线路探测与浏览器直连下载 | `PASS` / `SKIP` | `*.kwimgs.com`, `*.ppxvod.com` | 直连落盘成功，`ftyp` MP4 头有效 |
+| D4 | 9 图图集打包 ZIP 耗时与图像解码校验 | `PASS` / `SKIP` | `<cdn-host>` | ZIP 含 `9/9` 图，全部解码通过，耗时 `<x>s` |
+| D5 | X 720p 音轨完整性 + 4 图图集 ZIP | `PASS` / `SKIP` | `video.twimg.com`, `pbs.twimg.com` | 720p 含音视频双轨，4 图 ZIP 解码通过 |
+| D6 | YouTube 1080p 助手合并 + B 站多 P ZIP + 抖音实况图 | `PASS` / `SKIP` | `*.googlevideo.com`, `*.bilivideo.com`, `*.douyinvod.com` | 1080p 合并有声、多 P ZIP 与实况配对正常 |
+
+### 1.3 新增/变更配置 Drop-in（密钥已脱敏）与 SHA-256
+- Drop-in SHA-256 清单：
+  - `/etc/systemd/system/dokitool-go.service.d/<NEW_DROPIN>.conf`: `<sha256>`
+- 新增非机密配置内容（如含机密值一律写 `<REDACTED>`；务必对照 A1 `systemctl show -p ExecStart` 原样保留线上全部既有运行参数，如 `-xhs-page-transport`、`-x-tombstone-fallback`、`-sh-resolver-mode` 等，切勿直接覆盖丢参）：
+```ini
+[Service]
+ExecStart=
+ExecStart=<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool serve -listen 127.0.0.1:<LISTEN_PORT> -client-identity caddy <KEEP_EXISTING_FLAGS>
+```
+
+### 1.4 生产冒烟脚本输出（`scripts/prod-smoke/smoke.py`）
+<!-- 直接粘贴 smoke.py 生成的 Markdown 表与 JSON 块 -->
+
+### 1.5 可直接执行的回滚命令
+```bash
+# 日本主站回滚至上一稳定版本 <PREV_SHA>（参见 docs/go-migration/rollback.md）
+# 1) 移除本次新增的高序号 ExecStart drop-in，daemon-reload 后确认生效定义恢复为 <PREV_SHA>
+sudo rm -f /etc/systemd/system/dokitool-go.service.d/<NEW_DROPIN>.conf
+sudo systemctl daemon-reload
+systemctl show dokitool-go.service -p ExecStart,DropInPaths
+# 2) 停机排空，确认本地监听端口释放后重新启动，并核对运行二进制 SHA-256 与 version
+sudo systemctl stop dokitool-go.service
+! ss -tln | awk -v port=":<LISTEN_PORT>$" '$4 ~ port {found=1} END {exit !found}'
+sudo systemctl start dokitool-go.service
+PID="$(systemctl show -p MainPID --value dokitool-go.service)"
+sudo sha256sum "/proc/${PID}/exe"
+"<RELEASES_ROOT>/<PREV_SHA>/bin/dokitool" version
+# 3) 若涉及静态前端回退（如切换期间已有浏览器加载过失败版本首页，可先不覆盖保留其新增哈希 chunk）：
+#    cp -n "<RELEASES_ROOT>/<FAILED_SHA>/frontend/dist/assets/"* "<RELEASES_ROOT>/<PREV_SHA>/frontend/dist/assets/"
+ln -sfn "<RELEASES_ROOT>/<PREV_SHA>/frontend/dist" "<FRONTEND_SYMLINK>.tmp"
+mv -T "<FRONTEND_SYMLINK>.tmp" "<FRONTEND_SYMLINK>"
+```
+
+### 1.6 失败步骤原始输出（全部 `PASS` 时填“无”）
+无
+````
+
+---
+
+## 2. 固定服务端核对命令清单
+
+以下命令统一使用占位符（如 `<RELEASES_ROOT>`、`<TARGET_SHA>`、`<PREV_SHA>`、`<FRONTEND_SYMLINK>`、`<LISTEN_PORT>`、`$PID`），在各自目标主机本地终端执行，不在文档或回执中记录任何主机地址与密钥明文。
+
+> [!WARNING]
+> **systemd Drop-in 字典序与 Caddy `@api` 路径白名单规则**
+> 1. **Drop-in 字典序**：systemd 按 ASCII 字典序依次加载 `/etc/systemd/system/<unit>.service.d/*.conf`，同名指令由**排在最后**的文件生效。`100-binary.conf` 的字典序排在 `99-binary.conf` **之前**（`'1' < '9'`），会被 `99-binary.conf` 覆盖而不生效！当目录内已存在 `99-*.conf` 时，新增覆盖片段必须使用字母前缀（如 `a01-binary.conf`、`a02-owner.conf`），并在 `daemon-reload` 后先用 `systemctl show -p ExecStart,DropInPaths` 确认最终生效值。
+> 2. **Caddy `@api` 路径白名单**：线上 `/etc/caddy/snap.caddy` 对后端路由采用显式 `@api path ...` 白名单，未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 `404`。**凡是新增 `/api/*` 接口路径的发布，必须同步备份并更新 `/etc/caddy/snap.caddy` 的 `@api` 列表**，校验通过后再重载 Caddy。
+
+### 2.1 日本主站（`dokitool-go.service` + Caddy + 静态目录）
+
+#### A1. 切换前现场保存
+```bash
+systemctl show dokitool-go.service -p ActiveState,SubState,MainPID,ExecStart,FragmentPath,DropInPaths
+PID="$(systemctl show -p MainPID --value dokitool-go.service)"
+sudo sha256sum "/proc/${PID}/exe"
+sudo tr '\0' ' ' < "/proc/${PID}/cmdline"; echo
+sudo sha256sum /etc/systemd/system/dokitool-go.service.d/*.conf /etc/caddy/snap.caddy
+# 仅核对环境变量名称，严禁打印变量值；若存在密钥文件仅用 stat 核对属主权限（如 600 root:root），严禁 cat
+sudo tr '\0' '\n' < "/proc/${PID}/environ" | awk -F= '/^(DOKITOOL_|SNAP_)/ {print $1}' | sort
+readlink -f "<FRONTEND_SYMLINK>"
+ss -tln | awk -v port=":<LISTEN_PORT>$" '$4 ~ port {print $1, $4}'
+```
+
+#### A2–A3. 产物校验、Caddy 白名单核对、追加哈希静态资源与原子切换
+```bash
+# 1) 对照 release-manifest.json 校验新版本不可变目录二进制与前端产物 SHA-256，并核对 version / catalog
+sha256sum "<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool"
+"<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool" version
+"<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool" catalog >/dev/null
+
+# 2) 若本次新增了 /api/* 路由：备份 /etc/caddy/snap.caddy，更新 @api path 白名单后校验并重载 Caddy
+#    sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+#    sudo sha256sum /etc/caddy/snap.caddy
+
+# 3) 若本次包含前端变更：确认 npm run build 产出的 index.html、downloads/*、helper/dokitool-youtube.user.js 摘要与清单一致；
+#    将上一活动版本的 /assets/* 带哈希 chunk 不覆盖并入新版本目录（防止已打开旧页面的浏览器按需懒加载旧 chunk 时遇到 404），随后原子替换静态软链：
+cp -n "<RELEASES_ROOT>/<PREV_SHA>/frontend/dist/assets/"* "<RELEASES_ROOT>/<TARGET_SHA>/frontend/dist/assets/"
+ln -sfn "<RELEASES_ROOT>/<TARGET_SHA>/frontend/dist" "<FRONTEND_SYMLINK>.tmp"
+mv -T "<FRONTEND_SYMLINK>.tmp" "<FRONTEND_SYMLINK>"
+
+# 4) 写入新 drop-in（注意字母前缀字典序如 a01-binary.conf，并完整保留 A1 中的既有运行参数），daemon-reload 后先核对生效的 ExecStart
+sudo systemctl daemon-reload
+systemctl show dokitool-go.service -p ExecStart,DropInPaths
+
+# 5) 停机排空并确认旧进程退出、本地监听端口完全释放后再启动新实例
+sudo systemctl stop dokitool-go.service
+! ss -tln | awk -v port=":<LISTEN_PORT>$" '$4 ~ port {found=1} END {exit !found}'
+sudo systemctl start dokitool-go.service
+```
+
+#### A4. 切换后核对（含保留旧 chunk 与不读取令牌前提下的网关/鉴权边界校验）
+```bash
+systemctl show dokitool-go.service -p ActiveState,SubState,MainPID,ExecStart,DropInPaths
+PID="$(systemctl show -p MainPID --value dokitool-go.service)"
+sudo sha256sum "/proc/${PID}/exe"
+"<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool" version
+sudo tr '\0' ' ' < "/proc/${PID}/cmdline"; echo
+# 仅核对环境变量名（例如用 grep -c '^DOKITOOL_OWNER_TOKEN$' 核对计数，绝不输出值）
+sudo tr '\0' '\n' < "/proc/${PID}/environ" | awk -F= '/^(DOKITOOL_|SNAP_)/ {print $1}' | sort
+# 若启用了 /etc/dokitool-go/owner.env，仅用 stat 确认属主权限为 600 root:root，严禁 cat
+sudo test ! -e /etc/dokitool-go/owner.env || sudo stat -c '%a %U:%G' /etc/dokitool-go/owner.env
+# 核对启动预检日志包含 yt-dlp shared engine verified 与 youtube helper runtime verified，且无 preflight failed / FATAL / panic
+sudo journalctl -u dokitool-go.service -b --since "5 min ago" --no-pager | grep -Ei "verified|preflight|fatal|panic|error" || true
+# 静态哈希 chunk 保留与缺失兜底核对（涉及前端变更时）：
+#   - 至少一个保留的上一版 /assets/<PREV_CHUNK> 返回 200
+#   - 不存在的 /assets/__nonexistent__.js 返回 404（不回退 SPA HTML）
+curl -sS -o /dev/null -w "retained_prev_asset=%{http_code}\n" "https://snap.dokitool.com/assets/<PREV_CHUNK>"
+curl -sS -o /dev/null -w "missing_asset=%{http_code}\n" "https://snap.dokitool.com/assets/__nonexistent__.js"
+# 公网网关白名单与鉴权边界核对（零凭据只读请求）：
+#   - /api/stats?schema_version=1.0 不带头应返回 401（证明 Caddy @api 已放行且 Go 鉴权生效）
+#   - 未列入白名单的 /api/statsx 应返回 404（证明 Caddy /api/* 兜底拦截生效）
+curl -sS -o /dev/null -w "stats_no_auth=%{http_code}\n" "https://snap.dokitool.com/api/stats?schema_version=1.0"
+curl -sS -o /dev/null -w "unlisted_api=%{http_code}\n" "https://snap.dokitool.com/api/statsx"
+```
+
+#### A5. 运行生产冒烟脚本（在本地机器执行）
+```bash
+python3 scripts/prod-smoke/smoke.py \
+  --base-url https://snap.dokitool.com \
+  --manifest "<WORK_DIR>/release-manifest.json" \
+  --md-out "<WORK_DIR>/smoke-summary.md" \
+  --json-out "<WORK_DIR>/smoke-report.json"
+```
+
+---
+
+### 2.2 上海解析节点（`dokitool-sh-pull.service`）
+
+#### B1. 切换前现场保存
+```bash
+systemctl show dokitool-sh-pull.service -p ActiveState,SubState,MainPID,ExecStart,DropInPaths
+PID="$(systemctl show -p MainPID --value dokitool-sh-pull.service)"
+sudo sha256sum "/proc/${PID}/exe"
+# 核对 -pull-origin 等启动参数（鉴权 token 必须走 EnvironmentFile/drop-in，不得出现在 cmdline）
+sudo tr '\0' ' ' < "/proc/${PID}/cmdline"; echo
+# 仅计算 drop-in SHA-256，严禁 cat 打印含 token 的配置文件内容
+sudo sha256sum /etc/systemd/system/dokitool-sh-pull.service.d/*.conf
+awk '/VmRSS|VmHWM/ {print}' "/proc/${PID}/status"
+free -m
+```
+
+#### B2–B5. 产物校验、切换生效、回退抽查与 5 分钟内存观察
+```bash
+# B2: 校验 shanghai-resolver 二进制 SHA-256 与 version
+sha256sum "<RELEASES_ROOT>/<TARGET_SHA>/bin/shanghai-resolver"
+"<RELEASES_ROOT>/<TARGET_SHA>/bin/shanghai-resolver" version
+
+# B3: 更新高序号 drop-in（保留既有启动参数）后 daemon-reload、核对 ExecStart 并重启
+sudo systemctl daemon-reload
+systemctl show dokitool-sh-pull.service -p ExecStart,DropInPaths
+sudo systemctl restart dokitool-sh-pull.service
+PID="$(systemctl show -p MainPID --value dokitool-sh-pull.service)"
+sudo sha256sum "/proc/${PID}/exe"
+sudo tr '\0' ' ' < "/proc/${PID}/cmdline"; echo
+
+# B4（按发布单要求选做）: 停启回退演练
+#   1) sudo systemctl stop dokitool-sh-pull.service -> 验证主站抖音解析优雅降级（无 500）
+#   2) sudo systemctl start dokitool-sh-pull.service -> 间隔 >= 10s 运行:
+#      python3 scripts/prod-smoke/smoke.py --only douyin_domestic
+
+# B5: 持续运行 5 分钟后复核内存占用
+awk '/VmRSS|VmHWM/ {print}' "/proc/${PID}/status"
+free -m
+```
+
+#### 上海侧标准回滚命令
+```bash
+sudo rm -f /etc/systemd/system/dokitool-sh-pull.service.d/<NEW_DROPIN>.conf
+sudo systemctl daemon-reload
+systemctl show dokitool-sh-pull.service -p ExecStart,DropInPaths
+sudo systemctl restart dokitool-sh-pull.service
+PID="$(systemctl show -p MainPID --value dokitool-sh-pull.service)"
+sudo sha256sum "/proc/${PID}/exe"
+"<RELEASES_ROOT>/<PREV_SHA>/bin/shanghai-resolver" version
+```
+
+---
+
+## 3. Mac 无头浏览器复测清单（Section D）
+
+当发布改动涉及前端交互、浏览器直连选路、打包下载或油猴脚本协议时，在 macOS 环境针对 **Chrome + Tampermonkey** 执行端到端复测。
+
+### 3.1 强制运行与环境记录规范
+
+1. **强制无头静默运行**：所有本地或自动化浏览器验证一律携带 `--headless=new --no-first-run --no-default-browser-check`（Playwright / Puppeteer 保持 `headless: true`），严禁弹出前台浏览器窗口或抢占焦点；脚本结束（含 `finally` 分支）必须彻底销毁无头浏览器子进程与临时目录。
+2. **下载与调试入口**：
+   - 通过 CDP `Browser.setDownloadBehavior` 将下载落盘定向到独立临时目录，核对文件字节数、容器魔数（如 MP4 `ftyp`、ZIP `PK\x03\x04`）及图像可解码性。
+   - 页面入口统一使用 `https://snap.dokitool.com/?debug=1` 采集选路与探测信息；若本地验证对油猴脚本临时追加了 `@match` 规则，必须在回执元信息中写明与正式 `dokitool-youtube.user.js` 的 diff（生产域名验证保持 `0 diff`）。
+3. **头部必填元信息**（脱敏）：
+   - 执行者标识、UTC 起止时间、macOS 版本与 Chrome 版本号；
+   - 启动参数确认（`--headless=new --no-first-run --no-default-browser-check`）；
+   - 国内平台直连 / 海外平台代理分流模式说明（**禁止填写任何真实出口 IP**）；
+   - CDP 下载目录策略与目标入口 `https://snap.dokitool.com/?debug=1`。
+
+### 3.2 标准复测项（D1–D6）
+
+| 编号 | 复测项 | 通过判定标准 |
+| --- | --- | --- |
+| **D1** | 抖音 4K 多线路择优 + 20 秒测速 + 取消下载 | 自动选中可用 `https://*.douyinvod.com` 线路，记录前 20s 实际下载均速；点击取消后请求立即中止且无损坏成品残留 |
+| **D2** | 小红书原画 `403` 自动跳过 + 非原画全量 `https://` | 当原画入口探测返回 `403`/不可用时自动跳过并交付可用规格；全部图片与视频源 `100%` 为 `https://`（`0` 个 `http://`） |
+| **D3** | 快手 & 皮皮虾线路探测与直连下载 | `browser_fetch: "allowed"` 生效，前端直连 CDN 下载完整落盘，MP4 文件头校验通过 |
+| **D4** | 9 图图集打包 ZIP 耗时与图像解码 | 9 图并发拉取生成 `.zip` 成功，ZIP 内含完整 9 个文件且逐张解码宽高 `> 0`，记录总耗时 |
+| **D5** | X 720p 音轨检查 + 4 图图集 ZIP | X 720p `video.twimg.com` MP4 同时含视频轨与音频轨（非无声视频轨）；4 图推文打包 `.zip` 全部图片解码通过 |
+| **D6** | YouTube 1080p 助手合并 + B 站多 P ZIP + 抖音实况图 | 油猴脚本完成 YouTube 1080p 音视频合并落盘（含音视频轨）；B 站多 P 选集打包 ZIP 成功；抖音 Live Photo 图+视频配对下载正常 |

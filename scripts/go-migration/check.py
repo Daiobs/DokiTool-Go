@@ -87,6 +87,7 @@ def main():
     parser.add_argument("--frontend", action="store_true", help="Check all actual Go outputs and the existing four Douyin plus four Weibo renewal tests (requires frontend npm dependencies)")
     parser.add_argument("--node", default="node", help="Node executable for --frontend")
     args = parser.parse_args()
+    run([sys.executable, "-B", "-X", "utf8", str(ROOT / "scripts/prod-smoke/test_smoke.py")])
     provenance, douyin_provenance, integer_provenance = legacy_provenance(args.check_php_source)
     verify = [sys.executable, "-X", "utf8", str(ROOT / "scripts/go-migration/verify-php-25beaee.py")]
     if args.check_php_source:
