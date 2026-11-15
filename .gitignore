@@ -352,6 +352,8 @@
 !/backend/internal/api/owner_channel_test.go
 !/backend/internal/api/pipigx_http_test.go
 !/backend/internal/api/pipixia_http_test.go
+!/backend/internal/api/stats.go
+!/backend/internal/api/stats_test.go
 !/backend/internal/api/tbvideo_outcome.go
 !/backend/internal/api/tbvideo_outcome_test.go
 !/backend/internal/api/toutiao_http_test.go
@@ -413,6 +415,7 @@
 !/backend/internal/shresolver/pull_worker_test.go
 !/backend/internal/shresolver/server.go
 !/backend/internal/shresolver/server_test.go
+!/backend/internal/shresolver/stats.go
 /backend/internal/testsupport/*
 !/backend/internal/testsupport/publicoracle/
 /backend/internal/unified/*
@@ -451,6 +454,8 @@
 !/backend/internal/ytengine/gate_ports_test.go
 !/backend/internal/ytengine/proc_other.go
 !/backend/internal/ytengine/proc_unix.go
+!/backend/internal/ytengine/stats.go
+!/backend/internal/ytengine/stats_test.go
 !/backend/internal/ytengine/types.go
 /backend/testdata/php-25beaee/*
 !/backend/testdata/php-25beaee/README.md

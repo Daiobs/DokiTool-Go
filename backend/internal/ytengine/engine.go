@@ -106,6 +106,7 @@ type Engine struct {
 	proxyURL            string
 	envPath             string
 	gatePorts           *gatePortPool
+	slotStats           *slotStats
 	extractors          []string
 }
 
@@ -275,6 +276,7 @@ func NewDisabled(reason string) *Engine {
 	return &Engine{
 		enabled:       false,
 		disableReason: reason,
+		slotStats:     newSlotStats(),
 	}
 }
 
@@ -430,6 +432,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	return &Engine{
 		gatePorts:           gatePorts,
+		slotStats:           newSlotStats(),
 		enabled:             true,
 		binaryPath:          absPath,
 		binarySHA256:        digest,
@@ -634,14 +637,47 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 			<-e.sem
 		})
 	}
+	chIdx := channelIndex(ChannelFromContext(ctx))
 	select {
 	case e.sem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, classifyContextErr(err)
+		}
+		if e.slotStats != nil {
+			e.slotStats.recordUncontendedAcquire(chIdx)
+		}
 		defer release()
-	case <-ctx.Done():
-		return nil, classifyContextErr(ctx.Err())
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, classifyContextErr(err)
+	default:
+		waitStart := time.Now()
+		if e.slotStats != nil {
+			e.slotStats.incWaiting(chIdx)
+		}
+		select {
+		case e.sem <- struct{}{}:
+			waitDur := time.Since(waitStart)
+			if e.slotStats != nil {
+				e.slotStats.decWaiting(chIdx)
+			}
+			if err := ctx.Err(); err != nil {
+				release()
+				if e.slotStats != nil {
+					e.slotStats.recordContendedWait(chIdx, waitDur, true)
+				}
+				return nil, classifyContextErr(err)
+			}
+			if e.slotStats != nil {
+				e.slotStats.recordContendedWait(chIdx, waitDur, false)
+			}
+			defer release()
+		case <-ctx.Done():
+			waitDur := time.Since(waitStart)
+			if e.slotStats != nil {
+				e.slotStats.decWaiting(chIdx)
+				e.slotStats.recordContendedWait(chIdx, waitDur, true)
+			}
+			return nil, classifyContextErr(ctx.Err())
+		}
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, e.timeout)

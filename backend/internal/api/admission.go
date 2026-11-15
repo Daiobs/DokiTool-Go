@@ -11,10 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
 type route uint8
@@ -27,6 +29,7 @@ const (
 	telemetry
 	media
 	youtubeHelper
+	statsRoute
 )
 
 // Match the same exact escaped paths for admission and dispatch.
@@ -38,6 +41,8 @@ func classify(path string) route {
 		return youtubeHelper
 	case "/api/platforms":
 		return catalogRoute
+	case "/api/stats":
+		return statsRoute
 	case "/api/short_videos", "/api/douyin", "/api/ksjx", "/api/bilibili", "/api/xhsjx", "/api/toutiao":
 		return legacy
 	case tbvideoOutcomePath:
@@ -64,9 +69,13 @@ const serverWriteWindow = 50 * time.Second
 
 type ownerContextKey struct{}
 
-// WithOwnerRequest marks a request context as authenticated via DOKITOOL_OWNER_TOKEN.
+// WithOwnerRequest marks a request context as authenticated via DOKITOOL_OWNER_TOKEN
+// and propagates the "owner" channel identity to shared downstream subsystems.
 func WithOwnerRequest(ctx context.Context) context.Context {
-	return context.WithValue(ctx, ownerContextKey{}, true)
+	ctx = context.WithValue(ctx, ownerContextKey{}, true)
+	ctx = ytengine.WithChannel(ctx, ytengine.ChannelOwner)
+	ctx = shresolver.WithChannel(ctx, shresolver.ChannelOwner)
+	return ctx
 }
 
 // IsOwnerRequest reports whether ctx belongs to an authenticated owner request.
@@ -105,19 +114,28 @@ func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string
 	default:
 		return nil, fmt.Errorf("client-identity must be direct or caddy")
 	}
-	return &admission{
+	var st *Stats
+	if sp, ok := next.(interface{ Stats() *Stats }); ok && sp.Stats() != nil {
+		st = sp.Stats()
+	} else {
+		st = NewStats(nil)
+	}
+	adm := &admission{
 		next:        next,
 		pullControl: pullControl,
 		edgeKey:     edgeKey,
 		ownerAuth:   owner,
 		now:         time.Now,
+		stats:       st,
 		public:      newConfiguredPool(config.Parse, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
 		relay:       newConfiguredPool(config.Relay, config.MaxClients),
 		owner:       newOwnerPool(config.OwnerConcurrency, config.OwnerQueueWait, config.OwnerQueueSize),
-	}, nil
+	}
+	st.setAdmissionSource(adm)
+	return adm, nil
 }
 
 type admission struct {
@@ -125,11 +143,13 @@ type admission struct {
 	edgeKey                               string
 	ownerAuth                             OwnerAuth
 	now                                   func() time.Time
+	stats                                 *Stats
 	public, slow, catalog, relay, reports *pool
 	owner                                 *ownerPool
 }
 
 func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	wallStart := time.Now()
 	path := r.URL.EscapedPath()
 	kind := classify(path)
 	client := a.client(r)
@@ -152,17 +172,40 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !client.IsValid() {
+		if kind == parser {
+			a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "SERVICE_NOT_CONFIGURED", ChannelAnonymous, time.Since(wallStart))
+		}
 		rejectAdmission(w, r, kind, http.StatusServiceUnavailable, 30)
 		return
 	}
 	authValues := r.Header.Values("Authorization")
 	r.Header.Del("Authorization")
-	if len(authValues) > 0 {
-		if !a.ownerAuth.verifyHeader(authValues) {
+	if kind == statsRoute {
+		if len(authValues) == 0 || !a.ownerAuth.verifyHeader(authValues) {
 			retry := a.public.chargeClient(client, a.now())
 			if retry > 0 {
 				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 				return
+			}
+			rejectUnauthorized(w, r, kind)
+			return
+		}
+		r = r.WithContext(WithOwnerRequest(r.Context()))
+		a.next.ServeHTTP(w, r)
+		return
+	}
+	if len(authValues) > 0 {
+		if !a.ownerAuth.verifyHeader(authValues) {
+			retry := a.public.chargeClient(client, a.now())
+			if retry > 0 {
+				if kind == parser {
+					a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
+				}
+				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
+				return
+			}
+			if kind == parser {
+				a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), OutcomeUnauthorized, ChannelAnonymous, time.Since(wallStart))
 			}
 			rejectUnauthorized(w, r, kind)
 			return
@@ -177,12 +220,18 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if retry > 0 {
+				if kind == parser {
+					a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
+				}
 				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 				return
 			}
 			defer release()
 			if a.owner.queueWait > 0 {
 				_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
+			}
+			if kind == parser {
+				r = r.WithContext(withParseWallStart(r.Context(), wallStart))
 			}
 			a.next.ServeHTTP(w, r)
 			return
@@ -194,10 +243,16 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if retry > 0 {
+		if kind == parser {
+			a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
+		}
 		rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 		return
 	}
 	defer release()
+	if kind == parser {
+		r = r.WithContext(withParseWallStart(r.Context(), wallStart))
+	}
 	a.next.ServeHTTP(w, r)
 }
 
@@ -292,6 +347,64 @@ type poolWaiter struct {
 	granted chan struct{}
 }
 
+type admQueueOutcome uint8
+
+const (
+	admQueueGranted admQueueOutcome = iota
+	admQueueTimeout
+	admQueueCanceled
+)
+
+type poolQueueCounters struct {
+	granted   atomic.Uint64
+	timeout   atomic.Uint64
+	full      atomic.Uint64
+	canceled  atomic.Uint64
+	waitNsSum atomic.Uint64
+	waitNsMax atomic.Uint64
+}
+
+func (q *poolQueueCounters) recordWait(d time.Duration, out admQueueOutcome) {
+	if d < 0 {
+		d = 0
+	}
+	switch out {
+	case admQueueGranted:
+		q.granted.Add(1)
+	case admQueueTimeout:
+		q.timeout.Add(1)
+	case admQueueCanceled:
+		q.canceled.Add(1)
+	}
+	ns := uint64(d.Nanoseconds())
+	q.waitNsSum.Add(ns)
+	for {
+		cur := q.waitNsMax.Load()
+		if ns <= cur || q.waitNsMax.CompareAndSwap(cur, ns) {
+			break
+		}
+	}
+}
+
+func (q *poolQueueCounters) snapshot(active, queued, concLimit, queueLimit int) AdmissionPoolSnapshot {
+	granted := q.granted.Load()
+	timeout := q.timeout.Load()
+	canceled := q.canceled.Load()
+	return AdmissionPoolSnapshot{
+		Active:           active,
+		Queued:           queued,
+		ConcurrencyLimit: concLimit,
+		QueueLimit:       queueLimit,
+		Waited:           granted + timeout + canceled,
+		Granted:          granted,
+		Timeout:          timeout,
+		Full:             q.full.Load(),
+		Canceled:         canceled,
+		WaitMSTotal:      q.waitNsSum.Load() / 1_000_000,
+		WaitMSMax:        q.waitNsMax.Load() / 1_000_000,
+	}
+}
+
 // Only the short accounting transaction is serialized. No lock is held
 // during parsing, upstream reads, queue waits, or writes to the client.
 type pool struct {
@@ -304,6 +417,7 @@ type pool struct {
 	clients                                          map[netip.Addr]*clientState
 	idle                                             list.List
 	waiters                                          list.List
+	queueStats                                       poolQueueCounters
 }
 
 func newConfiguredPool(c PoolConfig, maxClients int) *pool {
@@ -369,6 +483,7 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 		if c != nil && c.idleElem != nil {
 			p.idle.MoveToBack(c.idleElem)
 		}
+		p.queueStats.full.Add(1)
 		p.mu.Unlock()
 		return nil, 1, false
 	}
@@ -406,18 +521,23 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 	waitDur := p.queueWait
 	p.mu.Unlock()
 
+	waitStart := time.Now()
 	timer := time.NewTimer(waitDur)
 	defer timer.Stop()
 
 	select {
 	case <-w.granted:
+		elapsed := time.Since(waitStart)
 		if ctx.Err() != nil {
 			p.releaseSlot(c)
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
+		p.queueStats.recordWait(elapsed, admQueueGranted)
 		return p.makeRelease(c), 0, false
 
 	case <-ctx.Done():
+		elapsed := time.Since(waitStart)
 		p.mu.Lock()
 		if w.elem != nil {
 			p.waiters.Remove(w.elem)
@@ -427,14 +547,17 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 				c.idleElem = p.idle.PushBack(c)
 			}
 			p.mu.Unlock()
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
 		p.mu.Unlock()
 		<-w.granted
 		p.releaseSlot(c)
+		p.queueStats.recordWait(time.Since(waitStart), admQueueCanceled)
 		return nil, 0, true
 
 	case <-timer.C:
+		elapsed := time.Since(waitStart)
 		p.mu.Lock()
 		if w.elem != nil {
 			p.waiters.Remove(w.elem)
@@ -444,14 +567,18 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 				c.idleElem = p.idle.PushBack(c)
 			}
 			p.mu.Unlock()
+			p.queueStats.recordWait(elapsed, admQueueTimeout)
 			return nil, 1, false
 		}
 		p.mu.Unlock()
 		<-w.granted
+		elapsed = time.Since(waitStart)
 		if ctx.Err() != nil {
 			p.releaseSlot(c)
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
+		p.queueStats.recordWait(elapsed, admQueueGranted)
 		return p.makeRelease(c), 0, false
 	}
 }
@@ -528,12 +655,13 @@ func (p *pool) chargeClient(ip netip.Addr, now time.Time) (retrySeconds int) {
 }
 
 type ownerPool struct {
-	mu        sync.Mutex
-	slots     int
-	active    int
-	queueWait time.Duration
-	queueSize int
-	waiters   list.List
+	mu         sync.Mutex
+	slots      int
+	active     int
+	queueWait  time.Duration
+	queueSize  int
+	waiters    list.List
+	queueStats poolQueueCounters
 }
 
 func newOwnerPool(slots int, queueWait time.Duration, queueSize int) *ownerPool {
@@ -555,6 +683,7 @@ func (p *ownerPool) acquireContext(ctx context.Context) (release func(), retrySe
 		return p.makeRelease(), 0, false
 	}
 	if p.queueWait <= 0 || p.queueSize <= 0 || p.waiters.Len() >= p.queueSize {
+		p.queueStats.full.Add(1)
 		p.mu.Unlock()
 		return nil, 1, false
 	}
@@ -563,44 +692,56 @@ func (p *ownerPool) acquireContext(ctx context.Context) (release func(), retrySe
 	waitDur := p.queueWait
 	p.mu.Unlock()
 
+	waitStart := time.Now()
 	timer := time.NewTimer(waitDur)
 	defer timer.Stop()
 
 	select {
 	case <-w.granted:
+		elapsed := time.Since(waitStart)
 		if ctx.Err() != nil {
 			p.releaseSlot()
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
+		p.queueStats.recordWait(elapsed, admQueueGranted)
 		return p.makeRelease(), 0, false
 
 	case <-ctx.Done():
+		elapsed := time.Since(waitStart)
 		p.mu.Lock()
 		if w.elem != nil {
 			p.waiters.Remove(w.elem)
 			w.elem = nil
 			p.mu.Unlock()
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
 		p.mu.Unlock()
 		<-w.granted
 		p.releaseSlot()
+		p.queueStats.recordWait(time.Since(waitStart), admQueueCanceled)
 		return nil, 0, true
 
 	case <-timer.C:
+		elapsed := time.Since(waitStart)
 		p.mu.Lock()
 		if w.elem != nil {
 			p.waiters.Remove(w.elem)
 			w.elem = nil
 			p.mu.Unlock()
+			p.queueStats.recordWait(elapsed, admQueueTimeout)
 			return nil, 1, false
 		}
 		p.mu.Unlock()
 		<-w.granted
+		elapsed = time.Since(waitStart)
 		if ctx.Err() != nil {
 			p.releaseSlot()
+			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
+		p.queueStats.recordWait(elapsed, admQueueGranted)
 		return p.makeRelease(), 0, false
 	}
 }
@@ -624,10 +765,47 @@ func (p *ownerPool) releaseSlot() {
 	p.active--
 }
 
+func (p *pool) statsSnapshot() AdmissionPoolSnapshot {
+	if p == nil {
+		return AdmissionPoolSnapshot{}
+	}
+	p.mu.Lock()
+	active := p.active
+	queued := p.waiters.Len()
+	concLimit := p.globalSlots
+	queueLimit := p.queueSize
+	p.mu.Unlock()
+	return p.queueStats.snapshot(active, queued, concLimit, queueLimit)
+}
+
+func (p *ownerPool) statsSnapshot() AdmissionPoolSnapshot {
+	if p == nil {
+		return AdmissionPoolSnapshot{}
+	}
+	p.mu.Lock()
+	active := p.active
+	queued := p.waiters.Len()
+	concLimit := p.slots
+	queueLimit := p.queueSize
+	p.mu.Unlock()
+	return p.queueStats.snapshot(active, queued, concLimit, queueLimit)
+}
+
+func (a *admission) statsSnapshot() AdmissionStatsSnapshot {
+	if a == nil {
+		return AdmissionStatsSnapshot{}
+	}
+	return AdmissionStatsSnapshot{
+		Fast:  a.public.statsSnapshot(),
+		Slow:  a.slow.statsSnapshot(),
+		Owner: a.owner.statsSnapshot(),
+	}
+}
+
 func rejectUnauthorized(w http.ResponseWriter, r *http.Request, kind route) {
 	const message = "认证凭据无效"
 	payload := unified.Object{"code": http.StatusUnauthorized, "msg": message, "data": nil}
-	if kind == parser || kind == catalogRoute || kind == youtubeHelper {
+	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == statsRoute {
 		payload = contractErrorForStatus(http.StatusUnauthorized, message)
 	}
 	if r.Method == http.MethodHead {
@@ -651,7 +829,7 @@ func rejectAdmission(w http.ResponseWriter, r *http.Request, kind route, status,
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	payload := unified.Object{"code": status, "msg": message, "data": nil}
-	if kind == parser || kind == catalogRoute || kind == youtubeHelper {
+	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == statsRoute {
 		payload = unified.ContractError(code, message, status == 429)
 		if status == 429 {
 			unified.Map(payload["error"])["retry_after_seconds"] = retry

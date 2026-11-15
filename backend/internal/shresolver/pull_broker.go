@@ -88,6 +88,7 @@ type PullBroker struct {
 	waiting                 []*pullWaiter
 	queue                   []*pullQueueEntry
 	pending                 map[string]*pullTask
+	stats                   shanghaiCounters
 }
 
 func NewPullBroker(token string) (*PullBroker, error) {
@@ -184,26 +185,37 @@ func (b *PullBroker) acquireTask(ctx context.Context, protocol int, videoID, awe
 	b.queue = append(b.queue, entry)
 	b.mu.Unlock()
 
+	chIdx := channelIndex(ChannelFromContext(ctx))
+	waitStart := time.Now()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 
 	select {
 	case out := <-entry.ready:
+		waitDur := time.Since(waitStart)
 		if err := ctx.Err(); err != nil {
 			if out.task != nil {
 				b.mu.Lock()
 				delete(b.pending, out.task.job.TaskID)
 				b.mu.Unlock()
 			}
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeCanceled)
 			return nil, err
+		}
+		if out.task != nil {
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeGranted)
+		} else {
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeOther)
 		}
 		return out.task, out.err
 	case <-ctx.Done():
+		waitDur := time.Since(waitStart)
 		b.mu.Lock()
 		if !entry.done {
 			entry.done = true
 			b.queue = slices.DeleteFunc(b.queue, func(v *pullQueueEntry) bool { return v == entry })
 			b.mu.Unlock()
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeCanceled)
 			return nil, ctx.Err()
 		}
 		b.mu.Unlock()
@@ -213,13 +225,16 @@ func (b *PullBroker) acquireTask(ctx context.Context, protocol int, videoID, awe
 			delete(b.pending, out.task.job.TaskID)
 			b.mu.Unlock()
 		}
+		b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeCanceled)
 		return nil, ctx.Err()
 	case <-timer.C:
+		waitDur := time.Since(waitStart)
 		b.mu.Lock()
 		if !entry.done {
 			entry.done = true
 			b.queue = slices.DeleteFunc(b.queue, func(v *pullQueueEntry) bool { return v == entry })
 			b.mu.Unlock()
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeTimeout)
 			return nil, errUnavailable
 		}
 		b.mu.Unlock()
@@ -230,14 +245,23 @@ func (b *PullBroker) acquireTask(ctx context.Context, protocol int, videoID, awe
 				delete(b.pending, out.task.job.TaskID)
 				b.mu.Unlock()
 			}
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeCanceled)
 			return nil, err
+		}
+		if out.task != nil {
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeGranted)
+		} else {
+			b.stats.recordQueueWait(chIdx, waitDur, queueOutcomeOther)
 		}
 		return out.task, out.err
 	}
 }
 
-func (b *PullBroker) ResolveOriginal(parent context.Context, videoID string) ([]unified.Object, error) {
-	if err := parent.Err(); err != nil {
+func (b *PullBroker) ResolveOriginal(parent context.Context, videoID string) (rows []unified.Object, err error) {
+	defer func() {
+		b.stats.recordResolveOutcome(parent, err)
+	}()
+	if err = parent.Err(); err != nil {
 		return nil, err
 	}
 	if !ValidVideoID(videoID) {
@@ -265,8 +289,11 @@ func (b *PullBroker) ResolveOriginal(parent context.Context, videoID string) ([]
 	}
 }
 
-func (b *PullBroker) ResolveWork(parent context.Context, awemeID string) (*douyin.ShanghaiWork, error) {
-	if err := parent.Err(); err != nil {
+func (b *PullBroker) ResolveWork(parent context.Context, awemeID string) (work *douyin.ShanghaiWork, err error) {
+	defer func() {
+		b.stats.recordResolveOutcome(parent, err)
+	}()
+	if err = parent.Err(); err != nil {
 		return nil, err
 	}
 	if !douyin.ValidAwemeID(awemeID) {
@@ -292,6 +319,29 @@ func (b *PullBroker) ResolveWork(parent context.Context, awemeID string) (*douyi
 		}
 		return b.validateWorkResponse(ctx, awemeID, data)
 	}
+}
+
+// ShanghaiStatsSnapshot returns a point-in-time snapshot of PullBroker gauges and per-channel resolution counters.
+func (b *PullBroker) ShanghaiStatsSnapshot() StatsSnapshot {
+	if b == nil {
+		return StatsSnapshot{Mode: "off"}
+	}
+	b.mu.Lock()
+	waitingWorkers := 0
+	for _, w := range b.waiting {
+		if w.ctx.Err() == nil {
+			waitingWorkers++
+		}
+	}
+	queuedTasks := 0
+	for _, e := range b.queue {
+		if !e.done {
+			queuedTasks++
+		}
+	}
+	pendingTasks := len(b.pending)
+	b.mu.Unlock()
+	return b.stats.snapshot("pull", waitingWorkers, queuedTasks, pendingTasks)
 }
 
 func (b *PullBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {

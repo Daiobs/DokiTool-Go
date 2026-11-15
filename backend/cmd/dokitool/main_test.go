@@ -26,6 +26,7 @@ import (
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
@@ -822,5 +823,83 @@ func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
 	entry.ServeHTTP(wAnon, anonReq)
 	if wAnon.Code != http.StatusOK || strings.Contains(wAnon.Body.String(), cdnURL) || !strings.Contains(wAnon.Body.String(), "/api/media/weibo?ticket=") {
 		t.Fatalf("anonymous Weibo response did not return signed relay URL: code=%d body=%s", wAnon.Code, wAnon.Body.String())
+	}
+}
+
+func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
+	if api.DefaultStatsLogInterval != 5*time.Minute {
+		t.Fatalf("DefaultStatsLogInterval = %v, want 5m", api.DefaultStatsLogInterval)
+	}
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "yt-dlp")
+	payload := []byte("#!/bin/sh\necho '{}'\n")
+	if err := os.WriteFile(fakeBin, payload, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	hexSum := hex.EncodeToString(sum[:])
+
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums20261026[hexSum]
+	ytengine.OfficialSHA256Sums20261026[hexSum] = "yt-dlp-stats-wire-test"
+	defer func() {
+		if hadOrig {
+			ytengine.OfficialSHA256Sums20261026[hexSum] = origAsset
+		} else {
+			delete(ytengine.OfficialSHA256Sums20261026, hexSum)
+		}
+	}()
+
+	ownerToken := randomHexToken(t, 24)
+	pullToken := randomHexToken(t, 24)
+	env := map[string]string{
+		"DOKITOOL_OWNER_TOKEN":         ownerToken,
+		"DOKITOOL_SHANGHAI_MODE":       "pull",
+		"DOKITOOL_SHANGHAI_PULL_TOKEN": pullToken,
+		"DOKITOOL_YTDLP_X_ENABLED":     "true",
+		"DOKITOOL_YTDLP_BINARY":        fakeBin,
+	}
+	getenv := func(k string) string { return env[k] }
+
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shanghai, control, err := configureShanghai(fetch.New(), getenv)
+	if err != nil || shanghai == nil || control == nil {
+		t.Fatalf("configureShanghai failed: resolver=%v control=%v err=%v", shanghai, control, err)
+	}
+	adapters := map[string]api.Adapter{}
+	ytEng, err := configureYTDLPWithEngine(c, adapters, fetch.New(), x.TombstoneFallbackOff, getenv)
+	if err != nil || ytEng == nil || !ytEng.Enabled() {
+		t.Fatalf("configureYTDLPWithEngine failed: eng=%v err=%v", ytEng, err)
+	}
+	h, err := api.NewWithCacheConfig(c, adapters, time.Now, nil, api.DefaultCacheConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Stats().SetYTDLPEngine(ytEng)
+	if sp, ok := shanghai.(shresolver.StatsProvider); ok {
+		h.Stats().SetShanghaiSource(sp)
+	}
+	ownerAuth, err := loadOwnerAuth(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := api.WithAdmissionWithOwner(h, control, "direct", "", api.DefaultAdmissionConfig(), ownerAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+	req.RemoteAddr = "127.0.0.1:40100"
+	req.Header.Set("Authorization", "Bearer "+ownerToken)
+	rec := httptest.NewRecorder()
+	entry.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/stats status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"mode":"pull"`) || !strings.Contains(body, `"concurrency_limit":2`) {
+		t.Fatalf("expected pull shanghai mode and ytdlp concurrency_limit=2 in /api/stats, got %s", body)
 	}
 }

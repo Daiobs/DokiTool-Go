@@ -131,6 +131,7 @@ type cacheKey struct {
 
 type cachedResponse struct {
 	status     int
+	code       string
 	body       []byte
 	retryAfter string
 }
@@ -257,6 +258,15 @@ func (c *parseCache) stats() (entries int, totalBytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lru.Len(), c.totalBytes
+}
+
+func (c *parseCache) configSnapshot() (enabled bool, entries int, totalBytes int64, maxEntries int, maxBytes int64) {
+	if c == nil {
+		return false, 0, 0, 0, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.cfg.Disabled, c.lru.Len(), c.totalBytes, c.cfg.MaxEntries, c.cfg.MaxBytes
 }
 
 // normalizeCacheURL canonicalizes HTTP-equivalent URL syntax and known domain

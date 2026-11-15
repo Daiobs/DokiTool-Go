@@ -162,12 +162,19 @@ func run(args []string) error {
 		"zuiyou":      zuiyou.NewWithTBVideo(executor, zuiyouSave),
 		"xiaohongshu": xiaohongshu.New(xhsExecutor),
 	}
-	if err := configureYTDLPWithOptions(c, adapters, executor, *xTombstoneFallback, os.Getenv); err != nil {
+	ytEngine, err := configureYTDLPWithEngine(c, adapters, executor, *xTombstoneFallback, os.Getenv)
+	if err != nil {
 		return err
 	}
 	handler, err := api.NewWithCacheConfig(c, adapters, time.Now, preparePublicMedia(os.Getenv("SNAP_MEDIA_SIGNING_KEY")), cacheCfg)
 	if err != nil {
 		return err
+	}
+	if ytEngine != nil {
+		handler.Stats().SetYTDLPEngine(ytEngine)
+	}
+	if sp, ok := shanghai.(shresolver.StatsProvider); ok {
+		handler.Stats().SetShanghaiSource(sp)
 	}
 	if err := configureYouTubeHelper(c, handler, executor, os.Getenv); err != nil {
 		return err
@@ -190,6 +197,8 @@ func run(args []string) error {
 	server := &http.Server{Addr: *listen, Handler: entry, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stopStatsLog := handler.Stats().StartPeriodicLog(ctx, api.DefaultStatsLogInterval, log.Printf)
+	defer stopStatsLog()
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	log.Printf("DokiTool Go API %s listening on %s; admission=%+v", version, *listen, limits)
@@ -308,8 +317,13 @@ func configureYTDLPX(c *catalog.Catalog, adapters map[string]api.Adapter, execut
 }
 
 func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapter, executor fetch.Executor, xTombstoneFallback string, getenv func(string) string) error {
+	_, err := configureYTDLPWithEngine(c, adapters, executor, xTombstoneFallback, getenv)
+	return err
+}
+
+func configureYTDLPWithEngine(c *catalog.Catalog, adapters map[string]api.Adapter, executor fetch.Executor, xTombstoneFallback string, getenv func(string) string) (*ytengine.Engine, error) {
 	if err := x.ValidateTombstoneFallback(xTombstoneFallback); err != nil {
-		return err
+		return nil, err
 	}
 	parseSwitch := func(key string) (bool, error) {
 		raw := getenv(key)
@@ -325,61 +339,61 @@ func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapt
 
 	xEnabled, err := parseSwitch("DOKITOOL_YTDLP_X_ENABLED")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ytEnabled, err := parseSwitch("DOKITOOL_YTDLP_YOUTUBE_ENABLED")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	igEnabled, err := parseSwitch("DOKITOOL_YTDLP_INSTAGRAM_ENABLED")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	genericSites, err := ytgeneric.ParseSitesEnv(getenv("DOKITOOL_YTDLP_SITES"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !xEnabled && !ytEnabled && !igEnabled && len(genericSites) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	baseEngine, err := ytengine.NewFromEnv(getenv, nil)
 	if err != nil || !baseEngine.Enabled() {
 		log.Printf("dokitool: yt-dlp engine preflight failed (platforms not registered in catalog): %v", err)
-		return nil
+		return nil, nil
 	}
 	log.Printf("dokitool: yt-dlp shared engine verified (version=%s, asset=%s, sha256=%s)", ytengine.PinnedVersion, baseEngine.BinaryAsset(), baseEngine.BinarySHA256())
 
 	if xEnabled {
 		if err := c.Register(catalog.XPlatform()); err != nil {
-			return err
+			return nil, err
 		}
 		xEngine := newXEngine(baseEngine)
 		xParser, err := x.NewWithSizeProber(xEngine, x.NewSizeProber(executor)).
 			WithFetcher(executor).
 			WithTombstoneFallback(xTombstoneFallback)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		adapters["x"] = xParser
 	}
 	if ytEnabled {
 		if err := c.Register(catalog.YouTubePlatform()); err != nil {
-			return err
+			return nil, err
 		}
 		ytEngine := baseEngine.WithTargetPolicy(youtube.AllowedTargetURL, youtube.AllowedOutboundHost)
 		adapters["youtube"] = youtube.NewWithSizeProber(ytEngine, ytengine.NewSizeProber(executor, youtube.AllowedMediaURL))
 	}
 	if igEnabled {
 		if err := c.Register(catalog.InstagramPlatform()); err != nil {
-			return err
+			return nil, err
 		}
 		igEngine := baseEngine.WithTargetPolicy(instagram.AllowedTargetURL, instagram.AllowedOutboundHost)
 		adapters["instagram"] = instagram.NewWithSizeProber(igEngine, ytengine.NewSizeProber(executor, instagram.AllowedMediaURL)).WithFetcher(executor)
 	}
 	for _, spec := range genericSites {
 		if err := c.Register(spec.CatalogEntry()); err != nil {
-			return err
+			return nil, err
 		}
 		policyParser := ytgeneric.NewWithResolver(spec, nil, nil, net.DefaultResolver)
 		siteEngine := baseEngine.
@@ -391,7 +405,7 @@ func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapt
 		}
 		adapters[spec.PlatformID] = ytgeneric.NewWithResolver(spec, siteEngine, prober, net.DefaultResolver)
 	}
-	return nil
+	return baseEngine, nil
 }
 
 func newXEngine(baseEngine *ytengine.Engine) *ytengine.Engine {

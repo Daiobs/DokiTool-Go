@@ -36,6 +36,7 @@ type Client struct {
 	token    string
 	executor fetch.Executor
 	local    *http.Client
+	stats    shanghaiCounters
 }
 
 // Both delivery modes validate untrusted wire observations before they reach the formatter.
@@ -74,8 +75,11 @@ func NewClient(endpoint, token string, executor fetch.Executor) (*Client, error)
 
 // The resolve request and DNS verification of both answers share one deadline.
 // No credentials, full media bytes or arbitrary fetch target cross this boundary.
-func (c *Client) ResolveOriginal(parent context.Context, videoID string) ([]unified.Object, error) {
-	if err := parent.Err(); err != nil {
+func (c *Client) ResolveOriginal(parent context.Context, videoID string) (rows []unified.Object, err error) {
+	defer func() {
+		c.stats.recordResolveOutcome(parent, err)
+	}()
+	if err = parent.Err(); err != nil {
 		return nil, err
 	}
 	if !ValidVideoID(videoID) {
@@ -99,8 +103,11 @@ func (c *Client) ResolveOriginal(parent context.Context, videoID string) ([]unif
 // for awemeID within WorkTimeout. If the remote endpoint speaks only v1 and
 // rejects the v2 request with HTTP 400, ErrProtocolV1 is returned so the
 // caller can fall back to ResolveOriginal.
-func (c *Client) ResolveWork(parent context.Context, awemeID string) (*douyin.ShanghaiWork, error) {
-	if err := parent.Err(); err != nil {
+func (c *Client) ResolveWork(parent context.Context, awemeID string) (work *douyin.ShanghaiWork, err error) {
+	defer func() {
+		c.stats.recordResolveOutcome(parent, err)
+	}()
+	if err = parent.Err(); err != nil {
 		return nil, err
 	}
 	if !douyin.ValidAwemeID(awemeID) {
@@ -124,6 +131,14 @@ func (c *Client) ResolveWork(parent context.Context, awemeID string) (*douyin.Sh
 		return nil, errUnavailable
 	}
 	return c.validateWorkResponse(ctx, awemeID, payload)
+}
+
+// ShanghaiStatsSnapshot returns a point-in-time snapshot of direct-mode Shanghai resolution counters.
+func (c *Client) ShanghaiStatsSnapshot() StatsSnapshot {
+	if c == nil {
+		return StatsSnapshot{Mode: "off"}
+	}
+	return c.stats.snapshot("direct", 0, 0, 0)
 }
 
 func (c responseValidator) validateResponse(ctx context.Context, videoID string, payload []byte) ([]unified.Object, error) {

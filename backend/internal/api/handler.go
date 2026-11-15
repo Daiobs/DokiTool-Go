@@ -46,6 +46,7 @@ type Handler struct {
 	weiboRelay    http.Handler
 	youtubeHelper YouTubeHelper
 	cache         *parseCache
+	stats         *Stats
 	panicLogf     func(string, ...any)
 }
 
@@ -74,14 +75,25 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 	if now == nil {
 		now = time.Now
 	}
+	stats := NewStats(nil)
+	stats.setCacheSource(cache)
 	return &Handler{
 		catalog:     c,
 		adapters:    registered,
 		now:         now,
 		publicMedia: media,
 		cache:       cache,
+		stats:       stats,
 		panicLogf:   log.Printf,
 	}, nil
+}
+
+// Stats returns the handler's bounded-cardinality in-process telemetry collector.
+func (h *Handler) Stats() *Stats {
+	if h == nil {
+		return nil
+	}
+	return h.stats
 }
 
 // SetWeiboRelay registers a binary-only handler before server startup.
@@ -196,15 +208,16 @@ var internalEncodeErrorBody = []byte(`{"schema_version":"1.0","code":"INTERNAL_E
 func encodeResponse(status int, payload unified.Object) (cachedResponse, bool) {
 	body, err := unified.Encode(payload)
 	if err != nil {
-		return cachedResponse{status: 500, body: internalEncodeErrorBody}, false
+		return cachedResponse{status: 500, code: "INTERNAL_ERROR", body: internalEncodeErrorBody}, false
 	}
+	code := NormalizeOutcomeCode(unified.Str(payload["code"]))
 	retryAfter := ""
 	if unified.Str(payload["code"]) != "OK" {
 		if seconds, ok := unified.Numeric(unified.Map(payload["error"])["retry_after_seconds"]); ok && seconds >= 1 {
 			retryAfter = strconv.FormatInt(int64(seconds), 10)
 		}
 	}
-	return cachedResponse{status: status, body: body, retryAfter: retryAfter}, true
+	return cachedResponse{status: status, code: code, body: body, retryAfter: retryAfter}, true
 }
 
 func writeResponse(w http.ResponseWriter, res cachedResponse) {
@@ -249,7 +262,11 @@ func sendError(w http.ResponseWriter, status int, message string) {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
-	switch classify(path) {
+	kind := classify(path)
+	switch kind {
+	case statsRoute:
+		h.serveStats(w, r)
+		return
 	case telemetry:
 		receiveTBVideoOutcome(w, r, tbvideoLogger)
 		return
@@ -271,13 +288,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 404, "接口不存在")
 		return
 	}
+	isParse := kind == parser
+	var wallStart time.Time
+	var channel string
+	if isParse {
+		wallStart = parseWallStartFromContext(r.Context(), nil)
+		channel = ChannelFromContext(r.Context())
+	}
 	if r.Method != http.MethodGet {
+		if isParse {
+			h.stats.RecordParse(h.ParsePlatform(r.URL.RawQuery), "INVALID_INPUT", channel, time.Since(wallStart))
+		}
 		w.Header().Set("Allow", "GET")
 		sendError(w, 405, "仅支持 GET 请求")
 		return
 	}
 	version, scalar := queryValue(r.URL.RawQuery, "schema_version")
 	if !scalar || version != unified.SchemaVersion {
+		if isParse {
+			h.stats.RecordParse(h.ParsePlatform(r.URL.RawQuery), "INVALID_INPUT", channel, time.Since(wallStart))
+		}
 		sendError(w, 409, "接口版本已更新，请等待当前下载结束后刷新页面")
 		return
 	}
@@ -294,24 +324,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requested, requestedScalar = "all", true
 	}
 	if !scalar || source == "" || !requestedScalar || !h.catalog.ValidInputURL(source) {
+		h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
 		sendError(w, 400, "请输入对应平台的有效分享链接")
 		return
 	}
 	if platform == "" || (requested != "all" && !h.catalog.Has(requested)) {
+		h.stats.RecordParse(platform, "UNSUPPORTED_PLATFORM", channel, time.Since(wallStart))
 		send(w, 400, unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false))
 		return
 	}
 	if requested != "all" && requested != platform {
+		h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
 		sendError(w, 400, "链接与所选平台不匹配，请切换对应平台或选择自动识别")
 		return
 	}
 	itemID, scalarID := queryValue(r.URL.RawQuery, "item_id")
 	if path == "/api/resolve" && (!scalarID || itemID == "" || len(itemID) > 256) {
+		h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
 		sendError(w, 400, "缺少有效的媒体条目标识")
 		return
 	}
 	adapter := h.adapters[platform]
 	if adapter == nil {
+		h.stats.RecordParse(platform, "SERVICE_NOT_CONFIGURED", channel, time.Since(wallStart))
 		sendError(w, 503, "解析服务未配置完成")
 		return
 	}
@@ -322,9 +357,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resolveItemID = itemID
 	}
 	if h.cache == nil || h.cache.cfg.Disabled || !cacheableRequest(platform, source) {
+		h.stats.recordCacheUncacheable(channel)
 		ctx, cancel := context.WithTimeout(r.Context(), parseTimeout)
 		defer cancel()
 		res, _, _ := h.executeParse(ctx, path, platform, source, resolveItemID, debugView, h.now())
+		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
@@ -335,7 +372,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		itemID:   resolveItemID,
 		debug:    debugView,
 	}
-	h.serveCachedParse(w, r, key, path, platform, source, resolveItemID, debugView)
+	h.serveCachedParse(w, r, key, path, platform, source, resolveItemID, debugView, channel, wallStart)
 }
 
 func (h *Handler) serveCachedParse(
@@ -344,10 +381,14 @@ func (h *Handler) serveCachedParse(
 	key cacheKey,
 	path, platform, source, itemID string,
 	debug bool,
+	channel string,
+	wallStart time.Time,
 ) {
 	h.cache.mu.Lock()
 	if res, ok := h.cache.getLocked(key, h.now()); ok {
 		h.cache.mu.Unlock()
+		h.stats.recordCacheHit(channel)
+		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
@@ -365,14 +406,17 @@ func (h *Handler) serveCachedParse(
 		}
 		h.cache.inflight[key] = call
 		h.cache.mu.Unlock()
+		h.stats.recordCacheMiss(channel)
 		go h.runSingleflight(execCtx, execCancel, key, call, path, platform, source, itemID, debug)
 	} else {
 		call.waiters++
 		h.cache.mu.Unlock()
+		h.stats.recordSingleflightShared(channel)
 	}
 
 	select {
 	case <-call.done:
+		h.stats.RecordParse(platform, call.res.code, channel, time.Since(wallStart))
 		writeResponse(w, call.res)
 	case <-r.Context().Done():
 		h.cache.onWaiterCanceled(key, call)
