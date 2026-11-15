@@ -182,6 +182,7 @@ def main():
         independent = reported_check([sys.executable, str(ROOT / "scripts/validate-unified-schema.py"),
                                       str(outputs), "--output", str(schema_report)], schema_report)
         run([sys.executable, "-B", "-X", "utf8", str(ROOT / "scripts/test-unified-schema.py")])
+        openapi_check = json.loads(run([sys.executable, "-B", "-X", "utf8", str(ROOT / "scripts/check-openapi.py"), "--require-jsonschema"]))
         passed = [event for event in events if event.get("Action") == "pass" and "Test" in event]
         by_package = collections.defaultdict(set)
         for event in passed:
@@ -207,6 +208,7 @@ def main():
             "independent_responses": {"total": independent["total"], "passed": independent["passed"],
                                       "failures": [{"id": labels[entry["index"]], "reason": entry["reason"]}
                                                    for entry in independent["checks"] if not entry["passed"]]},
+            "openapi_contract": openapi_check,
         }
         for name in ("kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu", "xiaohongshu_wire"):
             result[f"php_{name}_baseline"] = platform_provenance[name]

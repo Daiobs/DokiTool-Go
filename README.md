@@ -59,6 +59,9 @@ go run ./cmd/dokitool serve
 ## 文档索引
 
 - [docs/API.md](docs/API.md)：统一媒体 v1 接口契约、错误码（含 `UNSUPPORTED_PLATFORM`、`UPSTREAM_BLOCKED`、`NO_MEDIA`、`429` 退避）与 YouTube Helper 接口
+- [docs/AGENT-API.md](docs/AGENT-API.md)：面向个人脚本与自动化 Agent 的私有通道认证、接口参考、错误码处置及并发/缓存说明
+- [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md)：Agent 批量下载流水线、多线路切换、断点续传最佳实践与零依赖示例脚本说明
+- [docs/openapi.json](docs/openapi.json)：统一媒体 v1 与个人 Agent 通道的 OpenAPI `3.1.0` 规范文件
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：`dokitool` 与 `shanghai-resolver` 全部命令行启动参数及环境变量说明
 - [docs/DOWNLOADS.md](docs/DOWNLOADS.md)：浏览器流式下载、多线路测速、ZIP 打包上限、调试开关与应用内置浏览器提示说明
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：生产发布流程（发布 Issue → 干净构建 → 清单核验 → systemd drop-in 与软链原子切换 → 冒烟与复测）

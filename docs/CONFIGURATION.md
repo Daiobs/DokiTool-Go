@@ -37,6 +37,7 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `-pull-origin` | 出站拉取模式下连接主后端领取抖音任务与回传结果的 HTTPS 源站地址（与入站监听类参数互斥） | 否 |
+| `-workers` | 出站拉取模式下并发运行的抖音任务认领与原画探测工作协程数量（仅在指定 `-pull-origin` 时生效） | 否 |
 | `-listen` | 历史入站直连模式下的本地监听地址与端口 | 否 |
 | `-tls-cert` | 历史入站直连 HTTPS 模式下的服务端证书链文件路径 | 否 |
 | `-tls-key` | 历史入站直连 HTTPS 模式下的服务端私钥文件路径 | 是 |
@@ -47,7 +48,7 @@
 
 ### 1. 密钥与鉴权凭据
 
-源码定义：`backend/cmd/dokitool/main.go`、`backend/cmd/shanghai-resolver/main.go`、`backend/internal/api/admission.go`
+源码定义：`backend/cmd/dokitool/main.go`、`backend/cmd/shanghai-resolver/main.go`、`backend/internal/api/admission.go`、`backend/internal/api/admission_config.go`
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
@@ -55,15 +56,17 @@
 | `SNAP_INGRESS_KEY` | 前置反向代理转发客户端真实地址时用于认证边缘请求头的共享密钥 | 是 |
 | `DOKITOOL_SHANGHAI_PULL_TOKEN` | 上海拉取模式下任务认领与结果回传内部路由专用的独立 Bearer 鉴权令牌（不得与其他密钥相同） | 是 |
 | `DOKITOOL_SHANGHAI_TOKEN` | 历史上海入站直连模式下的请求 Bearer 鉴权令牌 | 是 |
+| `DOKITOOL_OWNER_TOKEN` | 个人 Agent 专用通道及只读统计接口（`/api/stats`）的私有 Bearer 鉴权令牌（留空时关闭该通道；启用时须为独立凭据且不得与其他密钥相同） | 是 |
 
-### 2. 抖音上海通道与平台启用开关
+### 2. 抖音上海通道、解析缓存与平台启用开关
 
-源码定义：`backend/cmd/dokitool/main.go`、`backend/internal/platform/ytgeneric/sites.go`
+源码定义：`backend/cmd/dokitool/main.go`、`backend/internal/api/cache.go`、`backend/internal/platform/ytgeneric/sites.go`
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_SHANGHAI_MODE` | 控制主后端抖音上海解析通道的工作模式（禁用、历史直连模式或出站拉取模式） | 否 |
 | `DOKITOOL_SHANGHAI_ENDPOINT` | 历史上海直连模式下主后端请求的远端解析端点地址（拉取模式下必须留空） | 否 |
+| `DOKITOOL_PARSE_CACHE` | 控制主后端是否启用 `/api/parse` 与 `/api/resolve` 进程内短时结果缓存及同键并发请求合并 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
@@ -97,12 +100,25 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_ADMISSION_MAX_CLIENTS` | 指定每个准入限流池内跟踪的独立客户端状态表容量上限 | 否 |
-| `DOKITOOL_PARSE_CLIENT_BURST` | 解析池（覆盖解析、按需单集解析及未命中缓存的 YouTube 助手接口）单客户端令牌桶突发容量 | 否 |
-| `DOKITOOL_PARSE_CLIENT_RPS` | 解析池单客户端每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_PARSE_CLIENT_CONCURRENCY` | 解析池单客户端允许同时在途的最大请求数 | 否 |
-| `DOKITOOL_PARSE_GLOBAL_BURST` | 解析池全局令牌桶突发容量 | 否 |
-| `DOKITOOL_PARSE_GLOBAL_RPS` | 解析池全局每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_PARSE_GLOBAL_CONCURRENCY` | 解析池全局允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_CLIENT_BURST` | 快解析池（覆盖纯 Go 国内平台解析与按需单集解析）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_CLIENT_RPS` | 快解析池单客户端每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_CLIENT_CONCURRENCY` | 快解析池单客户端允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_GLOBAL_BURST` | 快解析池全局令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_GLOBAL_RPS` | 快解析池全局每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_GLOBAL_CONCURRENCY` | 快解析池全局允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_QUEUE_WAIT` | 快解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
+| `DOKITOOL_PARSE_QUEUE_SIZE` | 快解析池 FIFO 等待队列的最大容量上限 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_BURST` | 慢解析池（覆盖海外提取器平台及未命中缓存的 YouTube 助手接口）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_RPS` | 慢解析池单客户端每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY` | 慢解析池单客户端允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_BURST` | 慢解析池全局令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_RPS` | 慢解析池全局每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY` | 慢解析池全局允许同时在途的最大请求数（未显式设置时跟随 `DOKITOOL_YTDLP_CONCURRENCY`） | 否 |
+| `DOKITOOL_PARSE_SLOW_QUEUE_WAIT` | 慢解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
+| `DOKITOOL_PARSE_SLOW_QUEUE_SIZE` | 慢解析池 FIFO 等待队列的最大容量上限 | 否 |
+| `DOKITOOL_OWNER_CONCURRENCY` | 个人 Agent 独立通道允许同时在途的最大并发请求数 | 否 |
+| `DOKITOOL_OWNER_QUEUE_WAIT` | 个人 Agent 独立通道在并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
+| `DOKITOOL_OWNER_QUEUE_SIZE` | 个人 Agent 独立通道 FIFO 等待队列的最大容量上限 | 否 |
 | `DOKITOOL_CATALOG_CLIENT_BURST` | 目录池（覆盖平台目录及命中缓存的 YouTube 上下文接口）单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_CATALOG_CLIENT_RPS` | 目录池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_CATALOG_CLIENT_CONCURRENCY` | 目录池单客户端允许同时在途的最大请求数 | 否 |

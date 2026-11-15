@@ -1,0 +1,2918 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "DokiTool Unified Media & Personal Agent API",
+    "summary": "Unified Media v1 (schema_version=1.0) parsing, lazy item resolution, platform catalog, and owner telemetry API.",
+    "description": "Machine-readable contract for DokiTool's public Unified Media v1 endpoints and Personal Agent Channel (authenticated exclusively via `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`). Never pass the owner token in query parameters: query-parameter tokens are ignored without error on `/api/parse`, `/api/resolve`, and `/api/platforms` (treating the request as an anonymous visitor while leaking the secret into access logs and shell history), and rejected on `/api/stats`. Never forward `Authorization` or `Cookie` headers to third-party media CDNs.",
+    "version": "1.0.0",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://snap.dokitool.com",
+      "description": "Public DokiTool deployment (replace with your own origin when self-hosting)"
+    }
+  ],
+  "paths": {
+    "/api/platforms": {
+      "get": {
+        "operationId": "listPlatforms",
+        "summary": "List enabled media platforms and capabilities",
+        "description": "Returns the active platform catalog for this server instance.",
+        "security": [
+          {},
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SchemaVersionRequired"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Enabled platform catalog.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogSuccess"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestFailure"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedFailure"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowedFailure"
+          },
+          "409": {
+            "$ref": "#/components/responses/SchemaVersionConflictFailure"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitedFailure"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalErrorFailure"
+          }
+        }
+      }
+    },
+    "/api/parse": {
+      "get": {
+        "operationId": "parseMedia",
+        "summary": "Parse a share URL or share text into Unified Media v1 items",
+        "description": "Extracts normalized media items, variants, and direct CDN delivery sources for a supported public post. When authenticated with `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`, requests use the isolated owner concurrency pool with FIFO queueing instead of the anonymous per-IP rate limiter. Tokens passed in query parameters (e.g. `?token=...`) are ignored without error and processed as anonymous visitor requests.",
+        "security": [
+          {},
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SchemaVersionRequired"
+          },
+          {
+            "$ref": "#/components/parameters/ShareUrl"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformFilter"
+          },
+          {
+            "$ref": "#/components/parameters/DebugFlag"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Normalized Unified Media v1 response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestFailure"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedFailure"
+          },
+          "403": {
+            "$ref": "#/components/responses/UpstreamBlockedFailure"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundFailure"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowedFailure"
+          },
+          "409": {
+            "$ref": "#/components/responses/SchemaVersionConflictFailure"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitedFailure"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalErrorFailure"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGatewayFailure"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailableFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeoutFailure"
+          }
+        }
+      }
+    },
+    "/api/resolve": {
+      "get": {
+        "operationId": "resolveDeferredItem",
+        "summary": "Lazily resolve a deferred multipart item (e.g. Bilibili P2..Pn)",
+        "description": "Resolves a specific `deferred` item using the exact `resolve_url` parameters (`url`, `item_id`, `platform`) returned by `/api/parse`.",
+        "security": [
+          {},
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SchemaVersionRequired"
+          },
+          {
+            "$ref": "#/components/parameters/ShareUrl"
+          },
+          {
+            "$ref": "#/components/parameters/ItemId"
+          },
+          {
+            "$ref": "#/components/parameters/PlatformFilter"
+          },
+          {
+            "$ref": "#/components/parameters/DebugFlag"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Normalized Unified Media v1 response with the target item resolved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Success"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestFailure"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedFailure"
+          },
+          "403": {
+            "$ref": "#/components/responses/UpstreamBlockedFailure"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundFailure"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowedFailure"
+          },
+          "409": {
+            "$ref": "#/components/responses/SchemaVersionConflictFailure"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitedFailure"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalErrorFailure"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGatewayFailure"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailableFailure"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeoutFailure"
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "operationId": "getStats",
+        "summary": "Read in-process aggregate runtime telemetry snapshot (owner token required)",
+        "description": "Returns bounded-cardinality aggregate request, cache, admission queue, yt-dlp slot, Shanghai resolver, and parse latency metrics. Strictly requires `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`; authenticated calls do not consume an owner concurrency slot or increment parse request counters, and any unrecognized query parameter or trailing bare `?` returns HTTP 400 (`INVALID_INPUT`).",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SchemaVersionOptional"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "In-process aggregate runtime telemetry snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsSuccess"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestFailure"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedFailure"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowedFailure"
+          },
+          "409": {
+            "$ref": "#/components/responses/SchemaVersionConflictFailure"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitedFailure"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalErrorFailure"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Personal Agent Channel bearer token read from environment variable `DOKITOOL_OWNER_TOKEN` (32-512 printable non-whitespace ASCII bytes; total `Authorization` header <= 1024 bytes). Invalid, malformed, duplicate, or oversized headers—or requests when `DOKITOOL_OWNER_TOKEN` is unset—return HTTP 401 (`code: \"INVALID_INPUT\"`) and consume the anonymous per-IP burst bucket (`Burst=4`, `0.2/s`), turning repeated failures into HTTP 429 (`code: \"RATE_LIMITED\"`). Tokens in query parameters (e.g. `?token=...`) are never accepted: on `/api/parse`, `/api/resolve`, and `/api/platforms` they are ignored without error and processed as anonymous visitor requests (while exposing the secret in logs and shell history); only `/api/stats` rejects extra query parameters with HTTP 400 (`INVALID_INPUT`) once authenticated."
+      }
+    },
+    "headers": {
+      "RetryAfter": {
+        "description": "Positive integer seconds to wait before retrying.",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "AllowGet": {
+        "description": "Allowed HTTP methods (`GET`).",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "parameters": {
+      "SchemaVersionRequired": {
+        "name": "schema_version",
+        "in": "query",
+        "required": true,
+        "description": "Contract version (`1.0`). Missing, array-valued (`schema_version[]=`), or mismatched values return HTTP 409 (`INVALID_INPUT`).",
+        "schema": {
+          "type": "string",
+          "const": "1.0"
+        }
+      },
+      "SchemaVersionOptional": {
+        "name": "schema_version",
+        "in": "query",
+        "required": false,
+        "description": "Optional contract version (`1.0`). Omitting returns v1.0; any other value returns HTTP 409 (`INVALID_INPUT`).",
+        "schema": {
+          "type": "string",
+          "const": "1.0"
+        }
+      },
+      "ShareUrl": {
+        "name": "url",
+        "in": "query",
+        "required": true,
+        "description": "Share URL or share text containing an http(s) URL (<= 8192 bytes; <= 2048 bytes on yt-dlp platforms).",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        }
+      },
+      "PlatformFilter": {
+        "name": "platform",
+        "in": "query",
+        "required": false,
+        "description": "Optional expected platform ID (`all` or omitted for automatic detection).",
+        "schema": {
+          "$ref": "#/components/schemas/PlatformQuery"
+        }
+      },
+      "ItemId": {
+        "name": "item_id",
+        "in": "query",
+        "required": true,
+        "description": "Opaque deferred item identifier from `item.resolve_url` (1..256 printable non-whitespace ASCII bytes).",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[!-~]+$"
+        }
+      },
+      "DebugFlag": {
+        "name": "debug",
+        "in": "query",
+        "required": false,
+        "description": "Set to `1` to include diagnostic normalized variants prior to default product folding.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "1"
+          ]
+        }
+      }
+    },
+    "responses": {
+      "BadRequestFailure": {
+        "description": "Invalid input parameter, unknown query parameter on `/api/stats`, or unsupported platform (`INVALID_INPUT` / `UNSUPPORTED_PLATFORM`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "UnauthorizedFailure": {
+        "description": "Invalid, malformed, duplicate, or oversized (> 1024 B) `Authorization` header, missing header on `/api/stats`, or `DOKITOOL_OWNER_TOKEN` disabled on server. Always returns JSON `code: \"INVALID_INPUT\"` (`error.code: \"INVALID_INPUT\"`) and deducts 1 token from the anonymous per-IP burst bucket (`Burst=4`, recovery `0.2/s`), turning repeated failures into HTTP 429.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/UnauthorizedErrorResponse"
+            }
+          }
+        }
+      },
+      "UpstreamBlockedFailure": {
+        "description": "Target post requires login, age verification, or was blocked by upstream access control (`UPSTREAM_BLOCKED`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "NotFoundFailure": {
+        "description": "Post contains no supported media (`NO_MEDIA`) or content/item does not exist (`CONTENT_UNAVAILABLE`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "MethodNotAllowedFailure": {
+        "description": "HTTP method not permitted (`INVALID_INPUT`).",
+        "headers": {
+          "Allow": {
+            "$ref": "#/components/headers/AllowGet"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "SchemaVersionConflictFailure": {
+        "description": "Missing, array-valued, or unsupported `schema_version` (`INVALID_INPUT`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "RateLimitedFailure": {
+        "description": "Rate limit or admission queue timeout/capacity exceeded (`RATE_LIMITED`). Respect `Retry-After` / `error.retry_after_seconds`.",
+        "headers": {
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RateLimitedErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalErrorFailure": {
+        "description": "Unexpected internal server error (`INTERNAL_ERROR`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "BadGatewayFailure": {
+        "description": "Upstream service unavailable (`UPSTREAM_UNAVAILABLE`) or returned unexpected structure (`UPSTREAM_INVALID_RESPONSE`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "ServiceUnavailableFailure": {
+        "description": "Platform adapter or required backend component is not configured (`SERVICE_NOT_CONFIGURED`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      },
+      "GatewayTimeoutFailure": {
+        "description": "Upstream platform timed out within the server parse budget (`UPSTREAM_TIMEOUT`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Failure"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "APIError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "INVALID_INPUT",
+              "UNSUPPORTED_PLATFORM",
+              "NO_MEDIA",
+              "CONTENT_UNAVAILABLE",
+              "UPSTREAM_INVALID_RESPONSE",
+              "UPSTREAM_UNAVAILABLE",
+              "UPSTREAM_TIMEOUT",
+              "UPSTREAM_BLOCKED",
+              "RATE_LIMITED",
+              "SERVICE_NOT_CONFIGURED",
+              "INTERNAL_ERROR"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "retry_after_seconds": {
+            "minimum": 0,
+            "title": "Retry After Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "APIError",
+        "type": "object"
+      },
+      "Attachment": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "background_audio",
+              "subtitle"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "resource": {
+            "$ref": "#/components/schemas/Resource"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "language": {
+            "title": "Language",
+            "type": "string"
+          },
+          "author": {
+            "$ref": "#/components/schemas/Author"
+          },
+          "cover": {
+            "$ref": "#/components/schemas/Source"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "resource"
+        ],
+        "title": "Attachment",
+        "type": "object"
+      },
+      "Author": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "url": {
+            "format": "uri",
+            "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+            "title": "Url",
+            "type": "string"
+          },
+          "avatar": {
+            "$ref": "#/components/schemas/Source"
+          }
+        },
+        "title": "Author",
+        "type": "object"
+      },
+      "ByteRange": {
+        "additionalProperties": false,
+        "properties": {
+          "start": {
+            "minimum": 0,
+            "title": "Start",
+            "type": "integer"
+          },
+          "end_inclusive": {
+            "minimum": 0,
+            "title": "End Inclusive",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end_inclusive"
+        ],
+        "title": "ByteRange",
+        "type": "object"
+      },
+      "Chunk": {
+        "additionalProperties": false,
+        "properties": {
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          },
+          "byte_range": {
+            "$ref": "#/components/schemas/ByteRange"
+          }
+        },
+        "required": [
+          "sources"
+        ],
+        "title": "Chunk",
+        "type": "object"
+      },
+      "Count": {
+        "additionalProperties": false,
+        "properties": {
+          "value": {
+            "minimum": 0,
+            "title": "Value",
+            "type": "integer"
+          },
+          "state": {
+            "default": "known",
+            "enum": [
+              "known",
+              "unverified"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "Count",
+        "type": "object"
+      },
+      "Default": {
+        "additionalProperties": false,
+        "properties": {
+          "variant_id": {
+            "minLength": 1,
+            "title": "Variant Id",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "format": "uri",
+                "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+                "type": "string"
+              },
+              {
+                "pattern": "^/api/[^\\s]*$",
+                "type": "string"
+              }
+            ],
+            "title": "Url"
+          },
+          "source_id": {
+            "minLength": 1,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "access": {
+            "default": "direct",
+            "enum": [
+              "direct",
+              "relay"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant_id",
+          "url"
+        ],
+        "title": "Default",
+        "type": "object"
+      },
+      "DeferredItem": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "video",
+              "image",
+              "live_photo",
+              "audio"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "index": {
+            "exclusiveMinimum": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "source_url": {
+            "format": "uri",
+            "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "cover": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "default": {
+            "type": "null",
+            "title": "Default"
+          },
+          "state": {
+            "const": "deferred",
+            "title": "State",
+            "type": "string"
+          },
+          "resolve_url": {
+            "pattern": "^/api/[^\\s]*$",
+            "title": "Resolve Url",
+            "type": "string"
+          },
+          "default_unavailable_reason": {
+            "const": "needs_resolve",
+            "title": "Default Unavailable Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "default",
+          "state",
+          "resolve_url",
+          "default_unavailable_reason"
+        ],
+        "title": "DeferredItem",
+        "type": "object"
+      },
+      "Failure": {
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": "1.0",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "code": {
+            "enum": [
+              "INVALID_INPUT",
+              "UNSUPPORTED_PLATFORM",
+              "NO_MEDIA",
+              "CONTENT_UNAVAILABLE",
+              "UPSTREAM_INVALID_RESPONSE",
+              "UPSTREAM_UNAVAILABLE",
+              "UPSTREAM_TIMEOUT",
+              "UPSTREAM_BLOCKED",
+              "RATE_LIMITED",
+              "SERVICE_NOT_CONFIGURED",
+              "INTERNAL_ERROR"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "error": {
+            "$ref": "#/components/schemas/APIError"
+          },
+          "request_id": {
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            },
+            "minItems": 1,
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema_version",
+          "code",
+          "error"
+        ],
+        "title": "Failure",
+        "type": "object"
+      },
+      "FileDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "file",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "sources"
+        ],
+        "title": "FileDelivery",
+        "type": "object"
+      },
+      "Group": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "album",
+              "multipart",
+              "collection"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "item_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "total_count": {
+            "exclusiveMinimum": 0,
+            "title": "Total Count",
+            "type": "integer"
+          },
+          "complete": {
+            "default": false,
+            "title": "Complete",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "item_ids"
+        ],
+        "title": "Group",
+        "type": "object"
+      },
+      "HigherQuality": {
+        "additionalProperties": false,
+        "properties": {
+          "variant_id": {
+            "minLength": 1,
+            "title": "Variant Id",
+            "type": "string"
+          },
+          "requires": {
+            "items": {
+              "enum": [
+                "hls",
+                "dash",
+                "segment_remux",
+                "segment_byte_concat",
+                "mux",
+                "pair"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Requires",
+            "type": "array"
+          }
+        },
+        "required": [
+          "variant_id",
+          "requires"
+        ],
+        "title": "HigherQuality",
+        "type": "object"
+      },
+      "ManifestDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "hls",
+              "dash"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          },
+          "scope": {
+            "enum": [
+              "single",
+              "adaptive"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/ManifestSelection"
+          },
+          "output": {
+            "$ref": "#/components/schemas/Output"
+          }
+        },
+        "required": [
+          "kind",
+          "sources",
+          "scope"
+        ],
+        "title": "ManifestDelivery",
+        "type": "object"
+      },
+      "ManifestSelection": {
+        "additionalProperties": false,
+        "properties": {
+          "video_representation_id": {
+            "minLength": 1,
+            "title": "Video Representation Id",
+            "type": "string"
+          },
+          "audio_representation_id": {
+            "minLength": 1,
+            "title": "Audio Representation Id",
+            "type": "string"
+          },
+          "audio_group_id": {
+            "minLength": 1,
+            "title": "Audio Group Id",
+            "type": "string"
+          }
+        },
+        "title": "ManifestSelection",
+        "type": "object"
+      },
+      "MediaMetadata": {
+        "additionalProperties": false,
+        "properties": {
+          "width": {
+            "exclusiveMinimum": 0,
+            "title": "Width",
+            "type": "integer"
+          },
+          "height": {
+            "exclusiveMinimum": 0,
+            "title": "Height",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "fps": {
+            "exclusiveMinimum": 0,
+            "title": "Fps",
+            "type": "number"
+          },
+          "hdr_type": {
+            "type": "string",
+            "enum": [
+              "sdr",
+              "hdr10",
+              "hdr10_plus",
+              "hlg",
+              "dolby_vision",
+              "hdr_unknown"
+            ],
+            "description": "Omitted means unknown. hdr_unknown confirms HDR without a known type; it cannot prove coverage."
+          },
+          "bitrate_bps": {
+            "exclusiveMinimum": 0,
+            "title": "Bitrate Bps",
+            "type": "integer"
+          },
+          "video_bitrate_bps": {
+            "exclusiveMinimum": 0,
+            "title": "Video Bitrate Bps",
+            "type": "integer"
+          },
+          "audio_bitrate_bps": {
+            "exclusiveMinimum": 0,
+            "title": "Audio Bitrate Bps",
+            "type": "integer"
+          },
+          "has_audio": {
+            "title": "Has Audio",
+            "type": "boolean"
+          },
+          "video_codec": {
+            "minLength": 1,
+            "title": "Video Codec",
+            "type": "string"
+          },
+          "audio_codec": {
+            "minLength": 1,
+            "title": "Audio Codec",
+            "type": "string"
+          },
+          "audio_language": {
+            "minLength": 1,
+            "title": "Audio Language",
+            "type": "string"
+          },
+          "audio_language_role": {
+            "type": "string",
+            "enum": [
+              "main",
+              "alternate"
+            ],
+            "description": "Explicit upstream language role; requires audio_language. A track ID or non-default bitrate is not language evidence."
+          },
+          "audio_channels": {
+            "exclusiveMinimum": 0,
+            "title": "Audio Channels",
+            "type": "integer"
+          },
+          "sample_rate_hz": {
+            "exclusiveMinimum": 0,
+            "title": "Sample Rate Hz",
+            "type": "integer"
+          },
+          "container": {
+            "minLength": 1,
+            "title": "Container",
+            "type": "string"
+          },
+          "extension": {
+            "pattern": "^[a-z0-9]+$",
+            "title": "Extension",
+            "type": "string"
+          },
+          "mime_type": {
+            "pattern": "^[a-z0-9.+-]+/[a-z0-9.+-]+$",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "evidence": {
+            "default": "unknown",
+            "enum": [
+              "probe",
+              "upstream",
+              "mixed",
+              "unknown"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "field_conflicts": {
+            "type": "object",
+            "minProperties": 1,
+            "description": "Contradictory trusted observations for one media identity. The same field must be absent from scalar metadata; these observations cannot prove capability coverage.",
+            "propertyNames": {
+              "enum": [
+                "width",
+                "height",
+                "duration_ms",
+                "fps",
+                "hdr_type",
+                "bitrate_bps",
+                "video_bitrate_bps",
+                "audio_bitrate_bps",
+                "has_audio",
+                "video_codec",
+                "audio_codec",
+                "audio_language",
+                "audio_language_role",
+                "audio_channels",
+                "sample_rate_hz",
+                "container",
+                "extension",
+                "mime_type"
+              ]
+            },
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "value",
+                  "evidence"
+                ],
+                "properties": {
+                  "value": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ]
+                  },
+                  "evidence": {
+                    "type": "string",
+                    "enum": [
+                      "probe",
+                      "upstream"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "field_evidence": {
+            "additionalProperties": {
+              "enum": [
+                "probe",
+                "upstream"
+              ],
+              "type": "string"
+            },
+            "minProperties": 1,
+            "title": "Field Evidence",
+            "type": "object"
+          }
+        },
+        "title": "MediaMetadata",
+        "type": "object"
+      },
+      "MuxDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "mux",
+            "title": "Kind",
+            "type": "string"
+          },
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/Resource"
+            },
+            "minItems": 2,
+            "title": "Resources",
+            "type": "array"
+          },
+          "output": {
+            "$ref": "#/components/schemas/Output"
+          }
+        },
+        "required": [
+          "kind",
+          "resources",
+          "output"
+        ],
+        "title": "MuxDelivery",
+        "type": "object"
+      },
+      "Output": {
+        "additionalProperties": false,
+        "properties": {
+          "container": {
+            "minLength": 1,
+            "title": "Container",
+            "type": "string"
+          },
+          "extension": {
+            "pattern": "^[a-z0-9]+$",
+            "title": "Extension",
+            "type": "string"
+          },
+          "mime_type": {
+            "pattern": "^[a-z0-9.+-]+/[a-z0-9.+-]+$",
+            "title": "Mime Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container",
+          "extension"
+        ],
+        "title": "Output",
+        "type": "object"
+      },
+      "PairDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "pair",
+            "title": "Kind",
+            "type": "string"
+          },
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/Resource"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "title": "Resources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "resources"
+        ],
+        "title": "PairDelivery",
+        "type": "object"
+      },
+      "ParsedData": {
+        "additionalProperties": false,
+        "properties": {
+          "platform": {
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "title": "Platform",
+            "type": "string"
+          },
+          "content_id": {
+            "minLength": 1,
+            "title": "Content Id",
+            "type": "string"
+          },
+          "source_url": {
+            "format": "uri",
+            "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ReadyItem"
+                },
+                {
+                  "$ref": "#/components/schemas/DeferredItem"
+                },
+                {
+                  "$ref": "#/components/schemas/UnavailableItem"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "default_item_id": {
+            "minLength": 1,
+            "title": "Default Item Id",
+            "type": "string"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "refresh_url": {
+            "pattern": "^/api/[^\\s]*$",
+            "title": "Refresh Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "author": {
+            "$ref": "#/components/schemas/Author"
+          },
+          "cover": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "published_at": {
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+            "title": "Published At",
+            "type": "string"
+          },
+          "statistics": {
+            "$ref": "#/components/schemas/Statistics"
+          },
+          "tags": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Tags",
+            "type": "array"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/Group"
+            },
+            "minItems": 1,
+            "title": "Groups",
+            "type": "array"
+          },
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            },
+            "minItems": 1,
+            "title": "Attachments",
+            "type": "array"
+          },
+          "extra": {
+            "additionalProperties": true,
+            "minProperties": 1,
+            "title": "Extra",
+            "type": "object"
+          }
+        },
+        "required": [
+          "platform",
+          "items"
+        ],
+        "title": "ParsedData",
+        "type": "object"
+      },
+      "Piece": {
+        "additionalProperties": false,
+        "properties": {
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "minItems": 1,
+            "title": "Sources",
+            "type": "array"
+          },
+          "byte_range": {
+            "$ref": "#/components/schemas/ByteRange"
+          },
+          "index": {
+            "exclusiveMinimum": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sources",
+          "index"
+        ],
+        "title": "Piece",
+        "type": "object"
+      },
+      "ReadyItem": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "video",
+              "image",
+              "live_photo",
+              "audio"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "index": {
+            "exclusiveMinimum": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "source_url": {
+            "format": "uri",
+            "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "cover": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "default": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Default"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "const": "ready",
+            "default": "ready",
+            "title": "State",
+            "type": "string"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/Variant"
+            },
+            "minItems": 1,
+            "title": "Variants",
+            "type": "array"
+          },
+          "resolve_url": {
+            "pattern": "^/api/[^\\s]*$",
+            "title": "Resolve Url",
+            "type": "string"
+          },
+          "default_unavailable_reason": {
+            "enum": [
+              "processing_required",
+              "needs_resolve",
+              "needs_refresh",
+              "unavailable"
+            ],
+            "title": "Default Unavailable Reason",
+            "type": "string"
+          },
+          "higher_quality_variants": {
+            "items": {
+              "$ref": "#/components/schemas/HigherQuality"
+            },
+            "minItems": 1,
+            "title": "Higher Quality Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "default",
+          "variants"
+        ],
+        "title": "ReadyItem",
+        "type": "object"
+      },
+      "Resource": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "media",
+              "muxed",
+              "video",
+              "audio",
+              "image",
+              "motion",
+              "subtitle"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/MediaMetadata"
+          },
+          "delivery": {
+            "discriminator": {
+              "mapping": {
+                "dash": "#/components/schemas/ManifestDelivery",
+                "file": "#/components/schemas/FileDelivery",
+                "hls": "#/components/schemas/ManifestDelivery",
+                "segments": "#/components/schemas/SegmentDelivery"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FileDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/ManifestDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/SegmentDelivery"
+              }
+            ],
+            "title": "Delivery"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "delivery"
+        ],
+        "title": "Resource",
+        "type": "object"
+      },
+      "SegmentDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "segments",
+            "title": "Kind",
+            "type": "string"
+          },
+          "init": {
+            "$ref": "#/components/schemas/Chunk"
+          },
+          "pieces": {
+            "items": {
+              "$ref": "#/components/schemas/Piece"
+            },
+            "minItems": 1,
+            "title": "Pieces",
+            "type": "array"
+          },
+          "join": {
+            "enum": [
+              "byte_concat",
+              "remux"
+            ],
+            "title": "Join",
+            "type": "string"
+          },
+          "join_evidence": {
+            "default": "unknown",
+            "enum": [
+              "validated_fragment_layout",
+              "unknown"
+            ],
+            "title": "Join Evidence",
+            "type": "string"
+          },
+          "output": {
+            "$ref": "#/components/schemas/Output"
+          }
+        },
+        "required": [
+          "kind",
+          "pieces",
+          "join"
+        ],
+        "title": "SegmentDelivery",
+        "type": "object"
+      },
+      "Source": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "format": "uri",
+                "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+                "type": "string"
+              },
+              {
+                "pattern": "^/api/[^\\s]*$",
+                "type": "string"
+              }
+            ],
+            "title": "Url"
+          },
+          "fallback_urls": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Bounded alternate credential URLs for the same logical source and HTTPS origin; primary remains authoritative."
+          },
+          "access": {
+            "default": "direct",
+            "enum": [
+              "direct",
+              "relay"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "size_bytes": {
+            "exclusiveMinimum": 0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "browser_fetch": {
+            "default": "unknown",
+            "enum": [
+              "unknown",
+              "allowed",
+              "blocked"
+            ],
+            "title": "Browser Fetch",
+            "type": "string"
+          },
+          "availability": {
+            "default": "unknown",
+            "enum": [
+              "unknown",
+              "available",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "Source",
+        "type": "object"
+      },
+      "Statistics": {
+        "additionalProperties": false,
+        "properties": {
+          "plays": {
+            "$ref": "#/components/schemas/Count"
+          },
+          "views": {
+            "$ref": "#/components/schemas/Count"
+          },
+          "likes": {
+            "$ref": "#/components/schemas/Count"
+          },
+          "comments": {
+            "$ref": "#/components/schemas/Count"
+          },
+          "shares": {
+            "$ref": "#/components/schemas/Count"
+          },
+          "saves": {
+            "$ref": "#/components/schemas/Count"
+          }
+        },
+        "title": "Statistics",
+        "type": "object"
+      },
+      "Success": {
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "const": "1.0",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "code": {
+            "const": "OK",
+            "title": "Code",
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ParsedData"
+          },
+          "request_id": {
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            },
+            "minItems": 1,
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema_version",
+          "code",
+          "data"
+        ],
+        "title": "Success",
+        "type": "object"
+      },
+      "UnavailableItem": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "video",
+              "image",
+              "live_photo",
+              "audio"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "index": {
+            "exclusiveMinimum": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "source_url": {
+            "format": "uri",
+            "pattern": "^(?i:https?)://[^\\s/?#]+(?:[^\\s]*)$",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "cover": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "duration_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "default": {
+            "type": "null",
+            "title": "Default"
+          },
+          "state": {
+            "const": "unavailable",
+            "title": "State",
+            "type": "string"
+          },
+          "default_unavailable_reason": {
+            "const": "unavailable",
+            "title": "Default Unavailable Reason",
+            "type": "string"
+          },
+          "error": {
+            "$ref": "#/components/schemas/APIError"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "default",
+          "state",
+          "default_unavailable_reason",
+          "error"
+        ],
+        "title": "UnavailableItem",
+        "type": "object"
+      },
+      "Warning": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "item_id": {
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "Warning",
+        "type": "object"
+      },
+      "ReadyVariant": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "provenance": {
+            "enum": [
+              "original_endpoint",
+              "transcode",
+              "unknown"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/MediaMetadata"
+          },
+          "delivery": {
+            "discriminator": {
+              "mapping": {
+                "dash": "#/components/schemas/ManifestDelivery",
+                "file": "#/components/schemas/FileDelivery",
+                "hls": "#/components/schemas/ManifestDelivery",
+                "mux": "#/components/schemas/MuxDelivery",
+                "pair": "#/components/schemas/PairDelivery",
+                "segments": "#/components/schemas/SegmentDelivery"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FileDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/ManifestDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/SegmentDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/MuxDelivery"
+              },
+              {
+                "$ref": "#/components/schemas/PairDelivery"
+              }
+            ],
+            "title": "Delivery"
+          },
+          "state": {
+            "const": "ready",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "delivery"
+        ],
+        "title": "ReadyVariant",
+        "type": "object"
+      },
+      "DeferredVariant": {
+        "type": "object",
+        "title": "DeferredVariant",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "const": "deferred"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "provenance": {
+            "enum": [
+              "original_endpoint",
+              "transcode",
+              "unknown"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "reason": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "reason"
+        ]
+      },
+      "Variant": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadyVariant"
+          },
+          {
+            "$ref": "#/components/schemas/DeferredVariant"
+          }
+        ]
+      },
+      "PlatformQuery": {
+        "type": "string",
+        "enum": [
+          "all",
+          "douyin",
+          "kuaishou",
+          "bilibili",
+          "xiaohongshu",
+          "toutiao",
+          "weibo",
+          "pipixia",
+          "pipigx",
+          "zuiyou",
+          "x",
+          "youtube",
+          "instagram",
+          "facebook",
+          "tumblr",
+          "dailymotion"
+        ],
+        "description": "Optional target platform ID from /api/platforms, or 'all' for automatic domain detection."
+      },
+      "UnauthorizedError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "INVALID_INPUT",
+            "description": "HTTP 401 always carries wire error code INVALID_INPUT."
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        }
+      },
+      "UnauthorizedErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "code",
+          "error"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "1.0"
+          },
+          "code": {
+            "type": "string",
+            "const": "INVALID_INPUT"
+          },
+          "error": {
+            "$ref": "#/components/schemas/UnauthorizedError"
+          }
+        }
+      },
+      "RateLimitedError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "retryable",
+          "retry_after_seconds"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "RATE_LIMITED"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": true
+          },
+          "retry_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Positive integer backoff window in seconds matching the Retry-After HTTP header."
+          }
+        }
+      },
+      "RateLimitedErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "code",
+          "error"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "1.0"
+          },
+          "code": {
+            "type": "string",
+            "const": "RATE_LIMITED"
+          },
+          "error": {
+            "$ref": "#/components/schemas/RateLimitedError"
+          }
+        }
+      },
+      "PlatformCapability": {
+        "type": "string",
+        "enum": [
+          "video",
+          "image",
+          "live_photo",
+          "audio",
+          "multipart",
+          "collection"
+        ]
+      },
+      "PlatformEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "site_url",
+          "capabilities"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9_-]+$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "site_url": {
+            "type": "string",
+            "format": "uri",
+            "minLength": 1
+          },
+          "icon": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional public asset path for the platform icon."
+          },
+          "capabilities": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/PlatformCapability"
+            }
+          }
+        }
+      },
+      "PlatformCatalogData": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "platforms"
+        ],
+        "properties": {
+          "platforms": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformEntry"
+            }
+          }
+        }
+      },
+      "CatalogSuccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "code",
+          "data"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "1.0"
+          },
+          "code": {
+            "type": "string",
+            "const": "OK"
+          },
+          "data": {
+            "$ref": "#/components/schemas/PlatformCatalogData"
+          }
+        }
+      },
+      "StatsChannel": {
+        "type": "string",
+        "enum": [
+          "anonymous",
+          "owner"
+        ]
+      },
+      "StatsPlatform": {
+        "type": "string",
+        "enum": [
+          "douyin",
+          "bilibili",
+          "weibo",
+          "toutiao",
+          "kuaishou",
+          "pipixia",
+          "pipigx",
+          "zuiyou",
+          "xiaohongshu",
+          "x",
+          "youtube",
+          "instagram",
+          "facebook",
+          "tumblr",
+          "dailymotion",
+          "unknown"
+        ]
+      },
+      "StatsOutcomeCode": {
+        "type": "string",
+        "enum": [
+          "OK",
+          "INVALID_INPUT",
+          "UNSUPPORTED_PLATFORM",
+          "NO_MEDIA",
+          "CONTENT_UNAVAILABLE",
+          "UPSTREAM_INVALID_RESPONSE",
+          "UPSTREAM_UNAVAILABLE",
+          "UPSTREAM_TIMEOUT",
+          "UPSTREAM_BLOCKED",
+          "RATE_LIMITED",
+          "SERVICE_NOT_CONFIGURED",
+          "INTERNAL_ERROR",
+          "UNAUTHORIZED"
+        ]
+      },
+      "PlatformOutcomeCount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "platform",
+          "code",
+          "channel",
+          "count"
+        ],
+        "properties": {
+          "platform": {
+            "$ref": "#/components/schemas/StatsPlatform"
+          },
+          "code": {
+            "$ref": "#/components/schemas/StatsOutcomeCode"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/StatsChannel"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Non-zero cumulative request count for this (platform, code, channel) cell."
+          }
+        }
+      },
+      "RequestChannelBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anonymous",
+          "owner"
+        ],
+        "properties": {
+          "anonymous": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative parse/resolve requests without owner token."
+          },
+          "owner": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative parse/resolve requests authenticated via DOKITOOL_OWNER_TOKEN."
+          }
+        }
+      },
+      "RequestStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "total",
+          "by_channel",
+          "by_platform_code_channel"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total parse/resolve requests across all channels."
+          },
+          "by_channel": {
+            "$ref": "#/components/schemas/RequestChannelBreakdown"
+          },
+          "by_platform_code_channel": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformOutcomeCount"
+            },
+            "description": "Non-zero cells sorted deterministically by (platform, code, channel)."
+          }
+        }
+      },
+      "CacheChannelCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hits",
+          "misses",
+          "singleflight_shared",
+          "uncacheable"
+        ],
+        "properties": {
+          "hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Direct LRU response cache hits."
+          },
+          "misses": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cache misses that executed an upstream parse/resolve."
+          },
+          "singleflight_shared": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Concurrent requests coalesced onto an in-flight parse/resolve."
+          },
+          "uncacheable": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests bypassing cache and singleflight (e.g. weibo, youtube, oversized input)."
+          }
+        }
+      },
+      "CacheChannelBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anonymous",
+          "owner"
+        ],
+        "properties": {
+          "anonymous": {
+            "$ref": "#/components/schemas/CacheChannelCounts"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/CacheChannelCounts"
+          }
+        }
+      },
+      "CacheStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "entries",
+          "bytes",
+          "max_entries",
+          "max_bytes",
+          "total",
+          "by_channel"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "entries": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Current live LRU entry count."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Current live serialized key+body byte usage."
+          },
+          "max_entries": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured maximum LRU entry count."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured maximum LRU byte capacity."
+          },
+          "total": {
+            "$ref": "#/components/schemas/CacheChannelCounts"
+          },
+          "by_channel": {
+            "$ref": "#/components/schemas/CacheChannelBreakdown"
+          }
+        }
+      },
+      "AdmissionPoolSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "active",
+          "queued",
+          "concurrency_limit",
+          "queue_limit",
+          "waited",
+          "granted",
+          "timeout",
+          "full",
+          "canceled",
+          "wait_ms_total",
+          "wait_ms_max"
+        ],
+        "properties": {
+          "active": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently holding an execution slot in this pool."
+          },
+          "queued": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently waiting in this pool's FIFO queue."
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured concurrency slot limit for this pool."
+          },
+          "queue_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured FIFO queue capacity for this pool."
+          },
+          "waited": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests that entered the FIFO wait queue."
+          },
+          "granted": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests that acquired a slot before timeout."
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests rejected with 429 after queue_wait expired."
+          },
+          "full": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests rejected immediately with 429 because the queue was full (or disabled)."
+          },
+          "canceled": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests canceled by caller disconnect."
+          },
+          "wait_ms_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative milliseconds spent waiting in queue by granted/timed-out requests."
+          },
+          "wait_ms_max": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum observed single-request queue wait in milliseconds."
+          }
+        }
+      },
+      "AdmissionStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fast",
+          "slow",
+          "owner"
+        ],
+        "properties": {
+          "fast": {
+            "$ref": "#/components/schemas/AdmissionPoolSnapshot"
+          },
+          "slow": {
+            "$ref": "#/components/schemas/AdmissionPoolSnapshot"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/AdmissionPoolSnapshot"
+          }
+        }
+      },
+      "HistogramBuckets": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "<=10",
+          "<=50",
+          "<=100",
+          "<=250",
+          "<=500",
+          "<=1000",
+          "<=2500",
+          "<=5000",
+          "<=10000",
+          "<=30000",
+          "+Inf"
+        ],
+        "properties": {
+          "<=10": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 10 ms."
+          },
+          "<=50": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 50 ms."
+          },
+          "<=100": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 100 ms."
+          },
+          "<=250": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 250 ms."
+          },
+          "<=500": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 500 ms."
+          },
+          "<=1000": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 1000 ms."
+          },
+          "<=2500": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 2500 ms."
+          },
+          "<=5000": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 5000 ms."
+          },
+          "<=10000": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 10000 ms."
+          },
+          "<=30000": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative observations <= 30000 ms."
+          },
+          "+Inf": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total cumulative observations (+Inf == count)."
+          }
+        }
+      },
+      "HistogramSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "count",
+          "sum_ms",
+          "max_ms",
+          "buckets"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total observed samples."
+          },
+          "sum_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Sum of observed durations in milliseconds."
+          },
+          "max_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum observed duration in milliseconds."
+          },
+          "buckets": {
+            "$ref": "#/components/schemas/HistogramBuckets"
+          }
+        }
+      },
+      "YTDLPChannelSlotStats": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "acquired_count",
+          "wait_count",
+          "canceled_count",
+          "wait_ms_total",
+          "wait_ms_max",
+          "wait_ms"
+        ],
+        "properties": {
+          "acquired_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative yt-dlp subprocess slots acquired."
+          },
+          "wait_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative acquisitions that contended and waited for a busy slot."
+          },
+          "canceled_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative slot waits canceled before acquisition."
+          },
+          "wait_ms_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative contended slot wait time in milliseconds."
+          },
+          "wait_ms_max": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum contended slot wait time in milliseconds."
+          },
+          "wait_ms": {
+            "$ref": "#/components/schemas/HistogramSnapshot"
+          }
+        }
+      },
+      "YTDLPChannelBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anonymous",
+          "owner"
+        ],
+        "properties": {
+          "anonymous": {
+            "$ref": "#/components/schemas/YTDLPChannelSlotStats"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/YTDLPChannelSlotStats"
+          }
+        }
+      },
+      "YTDLPStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "active",
+          "waiting",
+          "concurrency_limit",
+          "total",
+          "by_channel"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "active": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Currently running yt-dlp subprocesses."
+          },
+          "waiting": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Callers currently waiting for a yt-dlp subprocess slot."
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured DOKITOOL_YTDLP_CONCURRENCY limit."
+          },
+          "total": {
+            "$ref": "#/components/schemas/YTDLPChannelSlotStats"
+          },
+          "by_channel": {
+            "$ref": "#/components/schemas/YTDLPChannelBreakdown"
+          }
+        }
+      },
+      "ShanghaiChannelStats": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hits",
+          "fallbacks",
+          "canceled",
+          "queue_waits",
+          "queue_granted",
+          "queue_timeouts",
+          "queue_wait_ms_total",
+          "queue_wait_ms_max"
+        ],
+        "properties": {
+          "hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Successful Shanghai domestic Douyin resolutions."
+          },
+          "fallbacks": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Douyin parses that fell back to local backend resolution."
+          },
+          "canceled": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Shanghai tasks canceled due to caller disconnect."
+          },
+          "queue_waits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tasks that waited in the 300ms pull broker queue."
+          },
+          "queue_granted": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Queued tasks claimed by a Shanghai worker within budget."
+          },
+          "queue_timeouts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Queued tasks that timed out of the 300ms broker wait and fell back."
+          },
+          "queue_wait_ms_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative broker queue wait milliseconds."
+          },
+          "queue_wait_ms_max": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum broker queue wait milliseconds."
+          }
+        }
+      },
+      "ShanghaiChannelBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anonymous",
+          "owner"
+        ],
+        "properties": {
+          "anonymous": {
+            "$ref": "#/components/schemas/ShanghaiChannelStats"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/ShanghaiChannelStats"
+          }
+        }
+      },
+      "ShanghaiStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "mode",
+          "waiting_workers",
+          "queued_tasks",
+          "pending_tasks",
+          "total",
+          "by_channel"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "direct",
+              "pull"
+            ]
+          },
+          "waiting_workers": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Idle shanghai-resolver pull workers currently long-polling for work."
+          },
+          "queued_tasks": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Unclaimed Douyin tasks currently waiting in the pull broker."
+          },
+          "pending_tasks": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Claimed Douyin tasks currently in flight on Shanghai workers."
+          },
+          "total": {
+            "$ref": "#/components/schemas/ShanghaiChannelStats"
+          },
+          "by_channel": {
+            "$ref": "#/components/schemas/ShanghaiChannelBreakdown"
+          }
+        }
+      },
+      "LatencyChannelBreakdown": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "anonymous",
+          "owner"
+        ],
+        "properties": {
+          "anonymous": {
+            "$ref": "#/components/schemas/HistogramSnapshot"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/HistogramSnapshot"
+          }
+        }
+      },
+      "LatencyStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "total",
+          "by_channel"
+        ],
+        "properties": {
+          "total": {
+            "$ref": "#/components/schemas/HistogramSnapshot"
+          },
+          "by_channel": {
+            "$ref": "#/components/schemas/LatencyChannelBreakdown"
+          }
+        }
+      },
+      "StatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "started_at",
+          "generated_at",
+          "uptime_seconds",
+          "requests",
+          "cache",
+          "admission",
+          "ytdlp",
+          "shanghai",
+          "parse_latency_ms"
+        ],
+        "properties": {
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "uptime_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Process uptime in whole seconds."
+          },
+          "requests": {
+            "$ref": "#/components/schemas/RequestStatsSnapshot"
+          },
+          "cache": {
+            "$ref": "#/components/schemas/CacheStatsSnapshot"
+          },
+          "admission": {
+            "$ref": "#/components/schemas/AdmissionStatsSnapshot"
+          },
+          "ytdlp": {
+            "$ref": "#/components/schemas/YTDLPStatsSnapshot"
+          },
+          "shanghai": {
+            "$ref": "#/components/schemas/ShanghaiStatsSnapshot"
+          },
+          "parse_latency_ms": {
+            "$ref": "#/components/schemas/LatencyStatsSnapshot"
+          }
+        }
+      },
+      "StatsSuccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "code",
+          "data"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "1.0"
+          },
+          "code": {
+            "type": "string",
+            "const": "OK"
+          },
+          "data": {
+            "$ref": "#/components/schemas/StatsSnapshot"
+          }
+        }
+      }
+    }
+  }
+}

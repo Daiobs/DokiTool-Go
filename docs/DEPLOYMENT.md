@@ -14,7 +14,7 @@
 
 ### 1. 发布 Issue 与只读预检
 
-1. 新建专用**发布 Issue**，写明目标完整 40 位提交 SHA、包含的已合并 PR、是否涉及配置或辅助服务变更、冒烟检查项以及回退预案。
+1. 新建专用**发布 Issue**，写明目标完整 40 位提交 SHA、包含的已合并 PR、是否涉及配置或辅助服务变更（**新增接口路径时必须同时修改 Caddy 白名单**）、冒烟检查项以及回退预案。
 2. 确认目标提交在 GitHub Actions 的代码门禁与发布构建工作流（`.github/workflows/release-build.yml`）均已通过，取得对应的 `release-manifest.json` 清单摘要。
 3. 在目标环境执行只读预检：记录当前生效的 `dokitool-go.service` `ExecStart` 与 drop-in 列表、当前静态目录软链指向的目标版本目录，以及磁盘可用空间。
 
@@ -84,7 +84,8 @@ Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下
 
 前后端统一围绕 `schema_version=1.0` 契约协同发布：
 
-- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
+- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（需个人通道令牌）、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
+- **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 对后端接口使用逐条显式路径白名单（`@api path ...`，流式中转 `/api/media/weibo` 单独前置匹配），未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
 - 已退役的旧 `/api/short_videos`、`/api/douyin` 等兼容路径固定返回 JSON 版本提示错误（`410`），不得回退为 SPA HTML。接口契约与 Schema 校验规则详见 [API.md](API.md) 与 [schema/unified-v1/README.md](schema/unified-v1/README.md)。
 
 ---
