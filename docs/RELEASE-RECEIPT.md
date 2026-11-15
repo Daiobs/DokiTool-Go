@@ -170,6 +170,7 @@ curl -sS -o /dev/null -w "unlisted_api=%{http_code}\n" "https://snap.dokitool.co
 ```
 
 #### A5. 运行生产冒烟脚本（在本地机器执行）
+默认开启前端哈希（传 `--manifest` 时）、平台列表、缓存、X 快路径、抖音国内源、直连标记、15 平台回归与接口边界 `api_boundary`（在全部解析检查之后自动核对无头 `GET /api/stats?schema_version=1.0` -> `401` JSON 与随机未白名单 `GET /api/<random>` -> `404` JSON）：
 ```bash
 python3 scripts/prod-smoke/smoke.py \
   --base-url https://snap.dokitool.com \

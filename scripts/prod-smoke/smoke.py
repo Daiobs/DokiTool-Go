@@ -19,6 +19,7 @@ import ipaddress
 import json
 from pathlib import Path
 import re
+import secrets
 import sys
 import time
 from typing import Any, Callable, Iterable
@@ -35,6 +36,14 @@ DEFAULT_RETRY_INTERVAL = 10.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT_SECONDS = 50.0
 
+PARSE_GROUPS: tuple[str, ...] = (
+    "cache",
+    "x_fast_path",
+    "douyin_domestic",
+    "direct_markers",
+    "all_platforms",
+)
+
 DEFAULT_GROUPS: tuple[str, ...] = (
     "frontend_hashes",
     "platforms",
@@ -43,6 +52,7 @@ DEFAULT_GROUPS: tuple[str, ...] = (
     "douyin_domestic",
     "direct_markers",
     "all_platforms",
+    "api_boundary",
 )
 ALL_GROUPS: tuple[str, ...] = DEFAULT_GROUPS + ("rate_limit",)
 
@@ -1150,6 +1160,165 @@ class SmokeRunner:
             )
         return results
 
+    def _validate_boundary_error_response(
+        self,
+        *,
+        check_id: str,
+        resp: RawHttpResponse,
+        expected_status: int,
+        expected_code: str,
+        pass_note: str,
+    ) -> CheckResult:
+        if resp.status != expected_status:
+            http_status, actual_code = self._extract_status_code(resp)
+            reported_code = actual_code if actual_code != "OK" else f"HTTP_{resp.status}"
+            return CheckResult(
+                id=check_id,
+                group="api_boundary",
+                status="FAIL",
+                http_status=http_status,
+                code=reported_code,
+                elapsed_ms=resp.elapsed_ms,
+                retry_count=0,
+                note=f"expected HTTP {expected_status}, got HTTP {resp.status} (code={sanitize_text(actual_code)})",
+            )
+
+        raw_ct = str(resp.headers.get("content-type") or "").strip()
+        media_type = raw_ct.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            ct_display = sanitize_text(raw_ct) or "<missing>"
+            return CheckResult(
+                id=check_id,
+                group="api_boundary",
+                status="FAIL",
+                http_status=resp.status,
+                code="NON_JSON_RESPONSE",
+                elapsed_ms=resp.elapsed_ms,
+                retry_count=0,
+                note=f"expected Content-Type application/json on HTTP {expected_status}, got {ct_display}",
+            )
+
+        try:
+            payload = resp.json_object()
+        except ValueError as exc:
+            return CheckResult(
+                id=check_id,
+                group="api_boundary",
+                status="FAIL",
+                http_status=resp.status,
+                code="NON_JSON_RESPONSE",
+                elapsed_ms=resp.elapsed_ms,
+                retry_count=0,
+                note=f"HTTP {expected_status} body is not a valid JSON object: {sanitize_text(str(exc))}",
+            )
+
+        err_obj = payload.get("error")
+        err_msg = err_obj.get("message") if isinstance(err_obj, dict) else None
+        if (
+            payload.get("schema_version") != SCHEMA_VERSION
+            or payload.get("code") != expected_code
+            or not isinstance(err_obj, dict)
+            or err_obj.get("code") != expected_code
+            or not isinstance(err_msg, str)
+            or not err_msg.strip()
+        ):
+            sv = sanitize_text(str(payload.get("schema_version")))
+            cd = sanitize_text(str(payload.get("code")))
+            return CheckResult(
+                id=check_id,
+                group="api_boundary",
+                status="FAIL",
+                http_status=resp.status,
+                code="CONTRACT_MISMATCH",
+                elapsed_ms=resp.elapsed_ms,
+                retry_count=0,
+                note=(
+                    f"unexpected HTTP {expected_status} error envelope "
+                    f"(schema_version={sv!r}, code={cd!r})"
+                ),
+            )
+
+        return CheckResult(
+            id=check_id,
+            group="api_boundary",
+            status="PASS",
+            http_status=expected_status,
+            code=expected_code,
+            elapsed_ms=resp.elapsed_ms,
+            retry_count=0,
+            note=pass_note,
+        )
+
+    def check_api_boundary(self) -> list[CheckResult]:
+        results: list[CheckResult] = []
+
+        # 1. GET /api/stats?schema_version=1.0 without Authorization -> 401 JSON.
+        #    Does NOT count toward /api/parse's 8s pacing interval (last_parse_ts),
+        #    but charges 1 anonymous visitor token on the backend 'parse' pool.
+        stats_id = "api_boundary:stats_unauth_401"
+        try:
+            try:
+                stats_resp = self.client.get_raw(
+                    f"/api/stats?schema_version={SCHEMA_VERSION}",
+                    accept="application/json",
+                )
+            finally:
+                self.client.last_pool_ts["parse"] = self.client.clock.now()
+            results.append(
+                self._validate_boundary_error_response(
+                    check_id=stats_id,
+                    resp=stats_resp,
+                    expected_status=401,
+                    expected_code="INVALID_INPUT",
+                    pass_note="GET /api/stats without Authorization rejected with 401 application/json",
+                )
+            )
+        except SmokeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            results.append(
+                CheckResult(
+                    id=stats_id,
+                    group="api_boundary",
+                    status="FAIL",
+                    code="NETWORK_ERROR",
+                    note=sanitize_text(str(exc)),
+                )
+            )
+
+        # 2. GET /api/<random_name> not in Caddy's @api whitelist -> 404 JSON.
+        #    Does NOT count toward /api/parse's 8s pacing interval.
+        unlisted_id = "api_boundary:unlisted_api_404"
+        random_segment = f"smoke-unlisted-{secrets.token_hex(6)}"
+        try:
+            unlisted_resp = self.client.get_raw(
+                f"/api/{random_segment}",
+                accept="application/json",
+            )
+            results.append(
+                self._validate_boundary_error_response(
+                    check_id=unlisted_id,
+                    resp=unlisted_resp,
+                    expected_status=404,
+                    expected_code="INVALID_INPUT",
+                    pass_note="unlisted /api/<random> rejected with 404 application/json",
+                )
+            )
+        except SmokeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            results.append(
+                CheckResult(
+                    id=unlisted_id,
+                    group="api_boundary",
+                    status="FAIL",
+                    code="NETWORK_ERROR",
+                    note=sanitize_text(str(exc)),
+                )
+            )
+
+        return results
+
     def check_rate_limit(self) -> CheckResult:
         rl_cfg = self.samples.get("rate_limit", {})
         pool = str(rl_cfg.get("pool") or "slow_parse")
@@ -1238,7 +1407,7 @@ class SmokeRunner:
 
     def run(self) -> dict[str, Any]:
         only_set = set(self.only_groups)
-        active_order = self.only_groups if self.only_groups else list(ALL_GROUPS)
+        active_order = [g for g in ALL_GROUPS if g in only_set] if only_set else list(ALL_GROUPS)
         results: list[CheckResult] = []
 
         for group in active_order:
@@ -1269,6 +1438,8 @@ class SmokeRunner:
                 results.extend(self.check_direct_markers())
             elif group == "all_platforms":
                 results.extend(self.check_all_platforms())
+            elif group == "api_boundary":
+                results.extend(self.check_api_boundary())
             elif group == "rate_limit":
                 if not self.enable_rate_limit:
                     if group in only_set:

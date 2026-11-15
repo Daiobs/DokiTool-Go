@@ -10,6 +10,7 @@
    - 常规 `/api/parse` 请求之间强制间隔 **`>= 8.0s`**，单次运行不会误触匿名访客限流（`ClientBurst=4, ClientRPS=0.2`）。
    - 涉及第三方平台的解析检查失败时，自动间隔 **`10.0s`** 重试，最多 **`3` 次尝试**（首次通过记 `retry_count=0`，第 2 次通过记 `1`，第 3 次通过或 3 次均失败记 `2`）。
    - 同一轮运行内，若多个检查组共享同一公开样本 URL 且前序已拿到合法的 `200 OK` 响应，后续派生断言会优先复用该响应以节省上游配额（`cache` 组除外，`cache` 始终实际发送 2 次间隔 `>= 8.0s` 的独立请求比对原始字节 SHA-256 与 `generated_at`）。
+   - `api_boundary` 接口边界检查组（无头请求 `GET /api/stats?schema_version=1.0` 与随机未白名单路径 `GET /api/<random>`）不计入 `/api/parse` 的 `8.0s` 间隔；因未鉴权 `/api/stats` 会消耗本机 `1` 次匿名访客限流额度，该组固定排在**所有 `/api/parse` 解析检查组之后**（且在可选突发限流检查 `rate_limit` 之前）执行。
 4. **严格输出脱敏**：输出的 Markdown 结论表与 JSON 报告仅保留去重后的**媒体域名（`media_hostnames`）**，程序化擦除并校验输出中不包含完整媒体 URL、查询参数/签名、`xsec_token`、中转 `ticket` 或任何 IPv4/IPv6 地址。
 
 ## 检查组（Check Groups）
@@ -20,9 +21,10 @@
 | `platforms` | 开启 | `GET /api/platforms?schema_version=1.0` 返回 `200 OK`，`data.platforms` 长度为 `15` 且 15 个平台 ID 完整匹配 |
 | `cache` | 开启 | 对缓存样本连续发起 2 次间隔 `>= 8.0s` 的 `/api/parse`，校验两次响应原始字节 SHA-256 与 `generated_at` 完全一致 |
 | `x_fast_path` | 开启 | 校验 X 视频样本返回 `200 OK` 且包含 `https://video.twimg.com` MP4 `file` 直链规格 |
-| `direct_markers` | 开启 | 校验 `douyin`、`xiaohongshu`（同时要求全部媒体源 `100%` 为 `https://`，`0` 个 `http://`）、`kuaishou`、`pipixia` 已验证 HTTPS CDN 源带 `browser_fetch: "allowed"` |
 | `douyin_domestic` | 开启 | 校验抖音样本媒体域名包含 `*.douyinvod.com`（确认上海 `pull` 解析通道生效） |
+| `direct_markers` | 开启 | 校验 `douyin`、`xiaohongshu`（同时要求全部媒体源 `100%` 为 `https://`，`0` 个 `http://`）、`kuaishou`、`pipixia` 已验证 HTTPS CDN 源带 `browser_fetch: "allowed"` |
 | `all_platforms` | 开启 | 校验全部 15 个支持平台均返回合法的 `200 OK` 统一协议响应与可用媒体源 |
+| `api_boundary` | 开启（排在全部解析检查之后） | 校验接口鉴权与网关白名单边界（不触发 `/api/parse` 8s 间隔）：① `GET /api/stats?schema_version=1.0` 不带头返回 `401` JSON（`code: "INVALID_INPUT"`）；② 随机未白名单路径 `GET /api/<random>` 返回 `404` JSON（`code: "INVALID_INPUT"`，拒绝 HTML/纯文本兜底） |
 | `rate_limit` | **默认关闭**（需传 `--enable-rate-limit`） | 在最后阶段先等待限流桶补满，再连续快速发送 6 个不同 URL 的 `/api/parse`，校验前序 `200 OK`、超额返回 `429 RATE_LIMITED` 且 `retry_after_seconds > 0` |
 
 ## 常用命令（macOS / Windows 通用）
@@ -38,9 +40,9 @@ python3 scripts/prod-smoke/smoke.py \
 # Windows PowerShell 等价命令：
 # py -3 scripts/prod-smoke/smoke.py --base-url https://snap.dokitool.com --manifest C:\temp\release-manifest.json
 
-# 2. 只跑指定检查组（例如仅验证平台列表、缓存与直连标记）
+# 2. 只跑指定检查组（例如仅验证平台列表与接口边界，不发起 /api/parse）
 python3 scripts/prod-smoke/smoke.py \
-  --only platforms,cache,direct_markers
+  --only platforms,api_boundary
 
 # 3. 临时替换单个过期样本（例如替换小红书公开样本链接，输出会自动脱敏参数）
 python3 scripts/prod-smoke/smoke.py \

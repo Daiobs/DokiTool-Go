@@ -166,6 +166,8 @@ class FakeDokiServer:
         self.parse_Requests: list[dict] = []
         self.all_requests: list[dict] = []
         self.custom_parse_handler = None
+        self.custom_stats_handler = None
+        self.custom_unlisted_api_handler = None
         self.redirect_on_platforms = False
 
         outer = self
@@ -225,6 +227,58 @@ class FakeDokiServer:
                     self.send_header("Set-Cookie", "parse_cookie=forbidden; Path=/")
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+
+                if parsed.path == "/api/stats":
+                    if outer.custom_stats_handler is not None:
+                        status, content_type, raw_body = outer.custom_stats_handler(rec)
+                    else:
+                        status = 401
+                        content_type = "application/json; charset=utf-8"
+                        raw_body = json.dumps(
+                            {
+                                "schema_version": "1.0",
+                                "code": "INVALID_INPUT",
+                                "error": {
+                                    "code": "INVALID_INPUT",
+                                    "message": "认证凭据无效",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    self.send_response(status)
+                    if content_type is not None:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Set-Cookie", "stats_cookie=forbidden; Path=/")
+                    self.end_headers()
+                    self.wfile.write(raw_body)
+                    return
+
+                if parsed.path.startswith("/api/"):
+                    if outer.custom_unlisted_api_handler is not None:
+                        status, content_type, raw_body = outer.custom_unlisted_api_handler(rec)
+                    else:
+                        status = 404
+                        content_type = "application/json; charset=utf-8"
+                        raw_body = json.dumps(
+                            {
+                                "schema_version": "1.0",
+                                "code": "INVALID_INPUT",
+                                "error": {
+                                    "code": "INVALID_INPUT",
+                                    "message": "接口不存在",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    self.send_response(status)
+                    if content_type is not None:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Set-Cookie", "api404_cookie=forbidden; Path=/")
+                    self.end_headers()
+                    self.wfile.write(raw_body)
                     return
 
                 rel = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
@@ -350,14 +404,48 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(report["summary"]["fail"], 0)
             # rate_limit is SKIP by default
             self.assertEqual(report["summary"]["skip"], 1)
-            # 1 frontend + 1 platforms + 1 cache + 1 x + 1 dy_dom + 4 dm + 15 platforms = 24 PASS
-            self.assertEqual(report["summary"]["pass"], 24)
+            # 1 frontend + 1 platforms + 1 cache + 1 x + 1 dy_dom + 4 dm + 15 platforms + 2 api_boundary = 26 PASS
+            self.assertEqual(report["summary"]["pass"], 26)
+
+            # Verify api_boundary runs strictly AFTER all parse check groups and BEFORE rate_limit
+            groups_in_order = [c["group"] for c in report["checks"]]
+            api_boundary_indices = [
+                i for i, g in enumerate(groups_in_order) if g == "api_boundary"
+            ]
+            self.assertEqual(len(api_boundary_indices), 2)
+            last_parse_group_idx = max(
+                i for i, g in enumerate(groups_in_order) if g in smoke.PARSE_GROUPS
+            )
+            rate_limit_idx = groups_in_order.index("rate_limit")
+            self.assertGreater(min(api_boundary_indices), last_parse_group_idx)
+            self.assertLess(max(api_boundary_indices), rate_limit_idx)
+
+            by_id = {c["id"]: c for c in report["checks"]}
+            self.assertEqual(by_id["api_boundary:stats_unauth_401"]["status"], "PASS")
+            self.assertEqual(by_id["api_boundary:stats_unauth_401"]["http_status"], 401)
+            self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "PASS")
+            self.assertEqual(by_id["api_boundary:unlisted_api_404"]["http_status"], 404)
 
             # Verify >= 8.0s pacing across all /api/parse calls (16 total: 2 cache + 14 unique platforms)
             self.assertEqual(len(srv.parse_Requests), 16)
             timestamps = [r["timestamp"] for r in srv.parse_Requests]
             for prev_ts, next_ts in zip(timestamps, timestamps[1:]):
                 self.assertGreaterEqual(next_ts - prev_ts, 8.0)
+
+            # Verify api_boundary requests ran after the last /api/parse without any 8s pacing sleep
+            last_parse_ts = srv.parse_Requests[-1]["timestamp"]
+            stats_reqs = [r for r in srv.all_requests if r["path"] == "/api/stats"]
+            unlisted_reqs = [
+                r for r in srv.all_requests if r["path"].startswith("/api/smoke-unlisted-")
+            ]
+            self.assertEqual(len(stats_reqs), 1)
+            self.assertEqual(stats_reqs[0]["query"], {"schema_version": "1.0"})
+            self.assertEqual(len(unlisted_reqs), 1)
+            self.assertGreater(stats_reqs[0]["timestamp"], last_parse_ts)
+            self.assertLess(stats_reqs[0]["timestamp"] - last_parse_ts, 1.0)
+            self.assertLess(
+                unlisted_reqs[0]["timestamp"] - stats_reqs[0]["timestamp"], 1.0
+            )
 
             # Verify zero Cookie / Authorization headers even though server sent Set-Cookie on every response
             for req in srv.all_requests:
@@ -684,8 +772,33 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(len(srv.parse_Requests), 0)
             by_id = {c["id"]: c["status"] for c in rep["checks"]}
             self.assertEqual(by_id["platforms"], "PASS")
+            self.assertEqual(by_id["api_boundary:stats_unauth_401"], "PASS")
+            self.assertEqual(by_id["api_boundary:unlisted_api_404"], "PASS")
             self.assertEqual(by_id["cache"], "SKIP")
             self.assertEqual(by_id["all_platforms"], "SKIP")
+
+            # Also verify --skip api_boundary marks api_boundary as SKIP without sending /api/stats
+            srv.all_requests.clear()
+            rc_skip_ab, out_skip_ab, _ = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "platforms,api_boundary",
+                    "--skip",
+                    "api_boundary",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_skip_ab, 0)
+            by_id_ab = {c["id"]: c["status"] for c in json.loads(out_skip_ab)["checks"]}
+            self.assertEqual(by_id_ab["platforms"], "PASS")
+            self.assertEqual(by_id_ab["api_boundary"], "SKIP")
+            self.assertEqual(
+                [r for r in srv.all_requests if r["path"] != "/api/platforms"], []
+            )
 
             rc_bad, _, err_bad = self._run_cli(
                 ["--base-url", srv.base_url, "--only", "nonexistent_group"],
@@ -849,6 +962,246 @@ class ProdSmokeUnitTests(unittest.TestCase):
             by_id2 = {c["id"]: c for c in json.loads(out2)["checks"]}
             self.assertEqual(by_id2["direct_markers:douyin"]["status"], "FAIL")
             self.assertIn("missing browser_fetch='allowed'", by_id2["direct_markers:douyin"]["note"])
+
+    def test_api_boundary_ordering_and_zero_parse_pacing(self) -> None:
+        # 1. Static group constants enforce default-enabled ordering after all parse groups and before rate_limit
+        self.assertIn("api_boundary", smoke.DEFAULT_GROUPS)
+        ab_idx = smoke.ALL_GROUPS.index("api_boundary")
+        rl_idx = smoke.ALL_GROUPS.index("rate_limit")
+        self.assertLess(ab_idx, rl_idx)
+        for parse_group in smoke.PARSE_GROUPS:
+            self.assertLess(smoke.ALL_GROUPS.index(parse_group), ab_idx)
+        self.assertLess(smoke.ALL_GROUPS.index("platforms"), ab_idx)
+
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            # 2. Running douyin_domestic (1 /api/parse) + api_boundary triggers ZERO 8s pacing sleeps
+            rc1, out1, err1 = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "douyin_domestic,api_boundary",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc1, 0, msg=err1 or out1)
+            self.assertEqual(clock.sleeps, [])
+            self.assertEqual(len(srv.parse_Requests), 1)
+            unlisted_paths_1 = [
+                r["path"]
+                for r in srv.all_requests
+                if r["path"].startswith("/api/smoke-unlisted-")
+            ]
+            self.assertEqual(len(unlisted_paths_1), 1)
+
+            # 3. Second run generates a fresh random unlisted /api/<random> path and still sends 0 auth headers
+            srv.all_requests.clear()
+            rc2, out2, err2 = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "api_boundary", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc2, 0, msg=err2 or out2)
+            self.assertEqual(clock.sleeps, [])
+            unlisted_paths_2 = [
+                r["path"]
+                for r in srv.all_requests
+                if r["path"].startswith("/api/smoke-unlisted-")
+            ]
+            self.assertEqual(len(unlisted_paths_2), 1)
+            self.assertNotEqual(unlisted_paths_1[0], unlisted_paths_2[0])
+            for req in srv.all_requests:
+                self.assertNotIn("authorization", req["headers"])
+                self.assertNotIn("cookie", req["headers"])
+
+            # 4. Even if --only passes rate_limit,api_boundary,x_fast_path out of order,
+            #    execution is canonical: x_fast_path -> api_boundary -> rate_limit
+            srv.all_requests.clear()
+            burst_count = {"n": 0}
+
+            def burst_handler(_sample_url: str, _rec: dict):
+                burst_count["n"] += 1
+                if burst_count["n"] <= 5:
+                    return 200, make_envelope("x")
+                return 429, {
+                    "schema_version": "1.0",
+                    "code": "RATE_LIMITED",
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "请求过于频繁",
+                        "retry_after_seconds": 5,
+                    },
+                }
+
+            srv.custom_parse_handler = burst_handler
+            rc3, out3, err3 = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "rate_limit,api_boundary,x_fast_path",
+                    "--enable-rate-limit",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc3, 0, msg=err3 or out3)
+            rep3 = json.loads(out3)
+            self.assertEqual(
+                [c["id"] for c in rep3["checks"]],
+                [
+                    "x_fast_path",
+                    "api_boundary:stats_unauth_401",
+                    "api_boundary:unlisted_api_404",
+                    "rate_limit",
+                ],
+            )
+            # Wire order: 1st parse (x_fast_path) -> /api/stats -> /api/smoke-unlisted-* -> 6 burst parses
+            wire_paths = [r["path"] for r in srv.all_requests]
+            self.assertEqual(wire_paths[0], "/api/parse")
+            self.assertEqual(wire_paths[1], "/api/stats")
+            self.assertTrue(wire_paths[2].startswith("/api/smoke-unlisted-"))
+            self.assertEqual(wire_paths[3:], ["/api/parse"] * 6)
+
+    def test_api_boundary_failure_paths(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            stats_failures = [
+                (
+                    "stats_200_open",
+                    200,
+                    "application/json; charset=utf-8",
+                    b'{"schema_version":"1.0","code":"OK","data":{}}',
+                    200,
+                ),
+                (
+                    "stats_404_missing_caddy_whitelist",
+                    404,
+                    "application/json; charset=utf-8",
+                    b'{"schema_version":"1.0","code":"INVALID_INPUT","error":{"code":"INVALID_INPUT","message":"not found"}}',
+                    404,
+                ),
+                (
+                    "stats_401_plain_text",
+                    401,
+                    "text/plain; charset=utf-8",
+                    b"Unauthorized",
+                    401,
+                ),
+                (
+                    "stats_401_html",
+                    401,
+                    "text/html; charset=utf-8",
+                    b"<html><body>401 Unauthorized</body></html>",
+                    401,
+                ),
+                (
+                    "stats_401_invalid_json_body",
+                    401,
+                    "application/json",
+                    b"not valid json",
+                    401,
+                ),
+                (
+                    "stats_401_bad_envelope",
+                    401,
+                    "application/json",
+                    b'{"error":"unauthorized"}',
+                    401,
+                ),
+            ]
+            for label, st_code, ct, body, expected_http in stats_failures:
+                with self.subTest(stats_case=label):
+                    srv.custom_stats_handler = lambda _r, s=st_code, c=ct, b=body: (s, c, b)
+                    srv.custom_unlisted_api_handler = None
+                    rc, out, _ = self._run_cli(
+                        ["--base-url", srv.base_url, "--only", "api_boundary", "--format", "json"],
+                        clock,
+                    )
+                    self.assertEqual(rc, 1)
+                    by_id = {c["id"]: c for c in json.loads(out)["checks"]}
+                    self.assertEqual(by_id["api_boundary:stats_unauth_401"]["status"], "FAIL")
+                    self.assertEqual(
+                        by_id["api_boundary:stats_unauth_401"]["http_status"], expected_http
+                    )
+                    self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "PASS")
+
+            unlisted_failures = [
+                (
+                    "unlisted_200_spa_html_leak",
+                    200,
+                    "text/html; charset=utf-8",
+                    b"<!doctype html><title>SPA</title>",
+                    200,
+                ),
+                (
+                    "unlisted_200_json",
+                    200,
+                    "application/json; charset=utf-8",
+                    b'{"schema_version":"1.0","code":"OK","data":{}}',
+                    200,
+                ),
+                (
+                    "unlisted_404_plain_text",
+                    404,
+                    "text/plain; charset=utf-8",
+                    b"404 page not found\n",
+                    404,
+                ),
+                (
+                    "unlisted_404_html",
+                    404,
+                    "text/html; charset=utf-8",
+                    b"<html><body>404 Not Found</body></html>",
+                    404,
+                ),
+                (
+                    "unlisted_404_missing_content_type",
+                    404,
+                    None,
+                    b'{"schema_version":"1.0","code":"INVALID_INPUT","error":{"code":"INVALID_INPUT","message":"no ct"}}',
+                    404,
+                ),
+                (
+                    "unlisted_404_invalid_json_body",
+                    404,
+                    "application/json; charset=utf-8",
+                    b"<html>404 disguised as json</html>",
+                    404,
+                ),
+                (
+                    "unlisted_404_non_object_json",
+                    404,
+                    "application/json; charset=utf-8",
+                    b'["not","an","object"]',
+                    404,
+                ),
+                (
+                    "unlisted_404_bad_envelope",
+                    404,
+                    "application/json; charset=utf-8",
+                    b'{"schema_version":"1.0","code":"OK"}',
+                    404,
+                ),
+            ]
+            for label, st_code, ct, body, expected_http in unlisted_failures:
+                with self.subTest(unlisted_case=label):
+                    srv.custom_stats_handler = None
+                    srv.custom_unlisted_api_handler = lambda _r, s=st_code, c=ct, b=body: (s, c, b)
+                    rc, out, _ = self._run_cli(
+                        ["--base-url", srv.base_url, "--only", "api_boundary", "--format", "json"],
+                        clock,
+                    )
+                    self.assertEqual(rc, 1)
+                    by_id = {c["id"]: c for c in json.loads(out)["checks"]}
+                    self.assertEqual(by_id["api_boundary:stats_unauth_401"]["status"], "PASS")
+                    self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "FAIL")
+                    self.assertEqual(
+                        by_id["api_boundary:unlisted_api_404"]["http_status"], expected_http
+                    )
 
 
 if __name__ == "__main__":
