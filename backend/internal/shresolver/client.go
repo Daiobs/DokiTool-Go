@@ -39,8 +39,8 @@ type Client struct {
 	token           string
 	bilibiliEnabled atomic.Bool
 	executor        fetch.Executor
-	local    *http.Client
-	stats    shanghaiCounters
+	local           *http.Client
+	stats           shanghaiCounters
 }
 
 // Both delivery modes validate untrusted wire observations before they reach the formatter.
