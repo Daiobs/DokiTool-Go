@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
@@ -34,9 +35,10 @@ var errUnavailable = errors.New("Shanghai original address unavailable")
 
 type Client struct {
 	responseValidator
-	endpoint string
-	token    string
-	executor fetch.Executor
+	endpoint        string
+	token           string
+	bilibiliEnabled atomic.Bool
+	executor        fetch.Executor
 	local    *http.Client
 	stats    shanghaiCounters
 }
@@ -89,6 +91,19 @@ func (c *Client) WithClock(now func() time.Time) *Client {
 		c.now = now
 	}
 	return c
+}
+
+// WithBilibili configures whether Japan sends Bilibili tasks to the direct Shanghai endpoint (disabled by default).
+func (c *Client) WithBilibili(enabled bool) *Client {
+	if c != nil {
+		c.bilibiliEnabled.Store(enabled)
+	}
+	return c
+}
+
+// BilibiliEnabled reports whether Bilibili Shanghai resolution is enabled on c.
+func (c *Client) BilibiliEnabled() bool {
+	return c != nil && c.bilibiliEnabled.Load()
 }
 
 // The resolve request and DNS verification of both answers share one deadline.
@@ -168,6 +183,9 @@ func (c *Client) ResolveBilibili(parent context.Context, bvid string, cid int64)
 // BilibiliTimeout, deferring hit vs fallback classification until finish(matched)
 // is called so quality-tier mismatches with Japan are counted as fallbacks monotonically.
 func (c *Client) ResolveBilibiliPending(parent context.Context, bvid string, cid int64) (play *bilibili.ShanghaiPlay, finish func(bool), err error) {
+	if !c.BilibiliEnabled() {
+		return nil, nil, errUnavailable
+	}
 	defer func() {
 		if err != nil {
 			c.stats.recordResolveOutcome(parent, platBilibiliIdx, err)

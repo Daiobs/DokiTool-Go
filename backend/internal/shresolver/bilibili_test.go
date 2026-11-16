@@ -362,6 +362,7 @@ func TestBilibiliRollingUpgradeFourWayInterop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		newBroker.WithBilibili(true)
 		newBroker.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
 			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
 		}
@@ -439,6 +440,7 @@ func TestBilibiliRollingUpgradeFourWayInterop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		c.WithBilibili(true)
 		pool := x509.NewCertPool()
 		pool.AddCert(srv.Certificate())
 		c.local.Transport.(*http.Transport).TLSClientConfig.RootCAs = pool
@@ -537,6 +539,7 @@ func TestBilibiliUntrustedWireValidationDNSDedupAndQueueWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	broker.WithBilibili(true)
 	broker.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
 	}
@@ -602,4 +605,132 @@ func TestBilibiliUntrustedWireValidationDNSDedupAndQueueWait(t *testing.T) {
 
 	wCancel()
 	<-wDone
+}
+
+func TestBilibiliDefaultDisabledOnPullBrokerAndClient(t *testing.T) {
+	const origin = "https://japan.example.org"
+	var shBiliCalls atomic.Int32
+	var shDouyinCalls atomic.Int32
+	shOriginalProbe := resolverFunc(func(_ context.Context, u string) ([]unified.Object, error) {
+		if u != douyin.OriginalPlayURL(wireVideo) {
+			return nil, fmt.Errorf("unexpected original dispatcher %q", u)
+		}
+		return []unified.Object{deliveryRow("v26-cold.douyinvod.com", "objectA", "a")}, nil
+	})
+	shExec := resolveExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "douyin-detail":
+			shDouyinCalls.Add(1)
+			return fetch.Response{StatusCode: 200, Body: interopDetailBody("v26-web.douyinvod.com", "v11-weba.douyinvod.com")}, nil
+		case "bilibili-play":
+			shBiliCalls.Add(1)
+			return fetch.Response{StatusCode: 200, Body: sampleBilibiliPlayBody(time.Now().Add(2 * time.Hour).Unix())}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+		}
+	})
+
+	t.Run("pull-broker-default-disabled", func(t *testing.T) {
+		broker, err := NewPullBroker(wireToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if broker.BilibiliEnabled() {
+			t.Fatal("NewPullBroker must keep Bilibili disabled by default")
+		}
+		broker.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		}
+		srv := httptest.NewTLSServer(broker)
+		defer srv.Close()
+
+		worker, err := NewPullWorkerWithDetail(origin, wireToken, controlTransportForTLS(srv, origin), shExec, shOriginalProbe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := worker.WithWorkers(1); err != nil {
+			t.Fatal(err)
+		}
+		wCtx, wCancel := context.WithCancel(t.Context())
+		defer wCancel()
+		wDone := make(chan error, 1)
+		go func() { wDone <- worker.Run(wCtx) }()
+		waitForPullCount(t, broker, 1)
+
+		if _, err := broker.ResolveBilibili(t.Context(), biliTestBVID, biliTestCID); !errors.Is(err, errUnavailable) {
+			t.Fatalf("expected errUnavailable when Bilibili is disabled on PullBroker, got %v", err)
+		}
+		if shBiliCalls.Load() != 0 {
+			t.Fatalf("expected 0 Shanghai Bilibili calls when disabled, got %d", shBiliCalls.Load())
+		}
+
+		// Unsolicited Bilibili result callback must be rejected with 400 when disabled.
+		unsolicitedBody := `{"protocol":2,"task_type":"bilibili","task_id":"0123456789abcdef0123456789abcdef","attempt_id":"fedcba9876543210fedcba9876543210","bvid":"BV1234567890","cid":101,"deadline_ms":4102444800000,"result":null}`
+		resReq := httptest.NewRequest(http.MethodPost, ResultPath, strings.NewReader(unsolicitedBody))
+		resReq.Header.Set("Authorization", "Bearer "+wireToken)
+		rec := httptest.NewRecorder()
+		broker.ServeHTTP(rec, resReq)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("unsolicited Bilibili result status = %d, want 400", rec.Code)
+		}
+
+		// Douyin on the exact same broker & upgraded worker continues to hit Shanghai!
+		work, err := broker.ResolveWork(t.Context(), interopAwemeID)
+		if err != nil || work == nil || len(work.Renditions) != 2 {
+			t.Fatalf("Douyin ResolveWork failed while Bilibili disabled: work=%+v err=%v", work, err)
+		}
+		if shDouyinCalls.Load() != 1 || shBiliCalls.Load() != 0 {
+			t.Fatalf("unexpected upstream call counts: douyin=%d bilibili=%d", shDouyinCalls.Load(), shBiliCalls.Load())
+		}
+		plat := broker.PlatformStatsSnapshot()
+		if plat.Bilibili.Hits != 0 || plat.Bilibili.Fallbacks != 0 || plat.Bilibili.QueueWaits != 0 {
+			t.Fatalf("disabled Bilibili must leave bilibili stats at 0, got %+v", plat.Bilibili)
+		}
+		if plat.Douyin.Hits != 1 || plat.Douyin.Fallbacks != 0 {
+			t.Fatalf("expected Douyin hits=1 fallbacks=0, got %+v", plat.Douyin)
+		}
+
+		wCancel()
+		<-wDone
+	})
+
+	t.Run("direct-client-default-disabled", func(t *testing.T) {
+		shDouyinCalls.Store(0)
+		shBiliCalls.Store(0)
+		newHandler, err := NewHandlerWithDetail(wireToken, shExec, shOriginalProbe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewTLSServer(newHandler)
+		defer srv.Close()
+
+		c, err := NewClient(srv.URL+Path, wireToken, fetch.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.BilibiliEnabled() {
+			t.Fatal("NewClient must keep Bilibili disabled by default")
+		}
+		pool := x509.NewCertPool()
+		pool.AddCert(srv.Certificate())
+		c.local.Transport.(*http.Transport).TLSClientConfig.RootCAs = pool
+		c.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		}
+
+		if _, err := c.ResolveBilibili(t.Context(), biliTestBVID, biliTestCID); !errors.Is(err, errUnavailable) {
+			t.Fatalf("expected errUnavailable when Bilibili is disabled on Client, got %v", err)
+		}
+		if shBiliCalls.Load() != 0 {
+			t.Fatalf("expected 0 Shanghai Bilibili calls in direct mode when disabled, got %d", shBiliCalls.Load())
+		}
+		work, err := c.ResolveWork(t.Context(), interopAwemeID)
+		if err != nil || work == nil || len(work.Renditions) != 2 {
+			t.Fatalf("Douyin ResolveWork failed on Client while Bilibili disabled: work=%+v err=%v", work, err)
+		}
+		plat := c.PlatformStatsSnapshot()
+		if plat.Bilibili.Hits != 0 || plat.Bilibili.Fallbacks != 0 || plat.Douyin.Hits != 1 {
+			t.Fatalf("unexpected direct platform stats with Bilibili disabled: %+v", plat)
+		}
+	})
 }

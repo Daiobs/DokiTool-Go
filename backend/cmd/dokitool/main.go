@@ -141,14 +141,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	douyinParser := douyin.New(executor, japan)
-	bilibiliParser := bilibili.New(executor)
-	if shanghai != nil {
-		douyinParser = douyin.NewWithOriginalResolver(executor, japan.WithFingerprint(), shanghai)
-		if biliShanghai, ok := shanghai.(bilibili.ShanghaiResolver); ok {
-			bilibiliParser = bilibili.NewWithShanghai(executor, biliShanghai)
-		}
-	}
+	douyinParser, bilibiliParser := newShanghaiParsers(executor, japan, shanghai)
 	pipigxSave, err := enableTBVideo("DOKITOOL_TBVIDEO_REWRITE_PIPIGX")
 	if err != nil {
 		return err
@@ -221,8 +214,39 @@ func run(args []string) error {
 	}
 }
 
+func parseShanghaiBilibili(getenv func(string) string) (bool, error) {
+	raw := getenv("DOKITOOL_SHANGHAI_BILIBILI")
+	if raw == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("DOKITOOL_SHANGHAI_BILIBILI must be a boolean")
+	}
+	return enabled, nil
+}
+
+func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai douyin.OriginalResolver) (*douyin.Parser, *bilibili.Parser) {
+	douyinParser := douyin.New(executor, japan)
+	bilibiliParser := bilibili.New(executor)
+	if shanghai != nil {
+		douyinParser = douyin.NewWithOriginalResolver(executor, japan.WithFingerprint(), shanghai)
+		if biliShanghai, ok := shanghai.(bilibili.ShanghaiResolver); ok {
+			if sw, hasSwitch := shanghai.(interface{ BilibiliEnabled() bool }); !hasSwitch || sw.BilibiliEnabled() {
+				bilibiliParser = bilibili.NewWithShanghai(executor, biliShanghai)
+			}
+		}
+	}
+	return douyinParser, bilibiliParser
+}
+
 // An existing #27 endpoint remains opt-in for direct mode. Pull never invokes that endpoint.
+// Bilibili resolution via Shanghai defaults to disabled unless DOKITOOL_SHANGHAI_BILIBILI is true.
 func configureShanghai(executor fetch.Executor, getenv func(string) string) (douyin.OriginalResolver, http.Handler, error) {
+	bilibiliEnabled, err := parseShanghaiBilibili(getenv)
+	if err != nil {
+		return nil, nil, err
+	}
 	mode, endpoint := getenv("DOKITOOL_SHANGHAI_MODE"), getenv("DOKITOOL_SHANGHAI_ENDPOINT")
 	switch mode {
 	case "off":
@@ -240,6 +264,7 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 			}
 			return nil, nil, err
 		}
+		client.WithBilibili(bilibiliEnabled)
 		return client, nil, nil
 	case "pull":
 		if endpoint != "" {
@@ -255,6 +280,7 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 		if err != nil {
 			return nil, nil, err
 		}
+		broker.WithBilibili(bilibiliEnabled)
 		return broker, broker, nil
 	default:
 		return nil, nil, errors.New("DOKITOOL_SHANGHAI_MODE must be off, direct or pull")

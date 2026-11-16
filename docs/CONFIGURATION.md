@@ -64,8 +64,9 @@
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
-| `DOKITOOL_SHANGHAI_MODE` | 控制主后端抖音上海解析通道的工作模式（禁用、历史直连模式或出站拉取模式） | 否 |
+| `DOKITOOL_SHANGHAI_MODE` | 控制主后端上海解析通道的工作模式（禁用、历史直连模式或出站拉取模式） | 否 |
 | `DOKITOOL_SHANGHAI_ENDPOINT` | 历史上海直连模式下主后端请求的远端解析端点地址（拉取模式下必须留空） | 否 |
+| `DOKITOOL_SHANGHAI_BILIBILI` | 控制主后端在启用上海解析通道时是否开启哔哩哔哩国内线路并行解析与合并 | 否 |
 | `DOKITOOL_PARSE_CACHE` | 控制主后端是否启用 `/api/parse` 与 `/api/resolve` 进程内短时结果缓存及同键并发请求合并 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
