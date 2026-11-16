@@ -129,6 +129,12 @@ export function sourceAvailable(source: Source, now = Date.now()): boolean {
     (!source.expires_at || Date.parse(source.expires_at) > now)
   );
 }
+export function availableSources(
+  sources: Source[],
+  now = Date.now(),
+): Source[] {
+  return sources.filter((source) => sourceAvailable(source, now));
+}
 export function requiredCapabilities(delivery: Delivery): Capability[] {
   if (delivery.kind === "file") return [];
   if (delivery.kind === "hls" || delivery.kind === "dash")
@@ -169,6 +175,22 @@ export function sourceRoutes(source: Source, context: TargetContext = {}): strin
     const route = sourceUrl({url: raw}, context);
     if (new URL(route).origin !== base.origin || routes.includes(route)) fail("来源凭据候选跨主机或重复");
     routes.push(route);
+  }
+  return routes;
+}
+export function deliveryRoutes(
+  sources: Source[],
+  context: TargetContext = {},
+): string[] {
+  const seen = new Set<string>();
+  const routes: string[] = [];
+  for (const source of availableSources(sources, context.now)) {
+    for (const route of sourceRoutes(source, context)) {
+      if (!seen.has(route)) {
+        seen.add(route);
+        routes.push(route);
+      }
+    }
   }
   return routes;
 }

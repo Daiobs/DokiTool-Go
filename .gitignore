@@ -243,6 +243,7 @@
 !/frontend/src/types/
 !/frontend/src/utils/
 /frontend/tests/*
+!/frontend/tests/archive-route-fallback.test.mjs
 !/frontend/tests/download-bridge.test.mjs
 !/frontend/tests/download-manager.test.mjs
 !/frontend/tests/download-panel.test.mjs

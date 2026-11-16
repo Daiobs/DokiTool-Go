@@ -555,6 +555,7 @@
     "frontend/src/utils/youtubeHelperCore.js",
     "frontend/src/utils/youtubeHelperEntry.js",
     "frontend/tailwind.config.js",
+    "frontend/tests/archive-route-fallback.test.mjs",
     "frontend/tests/download-bridge.test.mjs",
     "frontend/tests/download-manager.test.mjs",
     "frontend/tests/download-panel.test.mjs",
