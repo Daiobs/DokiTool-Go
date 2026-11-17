@@ -40,4 +40,4 @@ DokiTool 将 PHP 后端和 Vue 3/Vite 前端整合为一个独立维护的项目
 
 本项目不设置定时镜像任务，不自动拉取并覆盖上游文件，也不因上游出现新提交而自动发布。需要采用的新变化通过明确的改动范围、代码审查和验证进入本仓库。
 
-GitHub Actions 每天北京时间 09:00 检查两上游的提交、Release 和标签，有变化时通过专用 Issue 通知。此任务只检测，不自动采用代码或部署；观察状态与本文件描述的已采用版本分开维护。运行方式、通知和调度限制见 [每日更新检查](UPSTREAM-WATCH.md)。
+本文件与 `UPSTREAM.json`（及历史初始快照 `.github/upstream-watch-baseline.json`）保留早期 PHP 后端与 Vue 前端的来源归属与许可记录。进入 `DokiTool-Go` 阶段后，GitHub Actions 每日定时任务改为检查 Go 期锁定的上游运行时（`yt-dlp/yt-dlp` 与 `denoland/deno`）正式版 Release 变化并通过专用 Issue 通知；此任务同样只检测不自动采用代码或部署，运行方式、通知和安全边界见 [上游运行时版本每日检查](UPSTREAM-WATCH.md)。
