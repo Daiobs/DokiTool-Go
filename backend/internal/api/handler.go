@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,15 +40,16 @@ type YouTubeHelper interface {
 }
 
 type Handler struct {
-	catalog       *catalog.Catalog
-	adapters      map[string]Adapter
-	now           func() time.Time
-	publicMedia   PublicMedia
-	weiboRelay    http.Handler
-	youtubeHelper YouTubeHelper
-	cache         *parseCache
-	stats         *Stats
-	panicLogf     func(string, ...any)
+	catalog             *catalog.Catalog
+	adapters            map[string]Adapter
+	now                 func() time.Time
+	publicMedia         PublicMedia
+	weiboRelay          http.Handler
+	youtubeHelper       YouTubeHelper
+	finalizeReadTimeout time.Duration
+	cache               *parseCache
+	stats               *Stats
+	panicLogf           func(string, ...any)
 }
 
 func New(c *catalog.Catalog, adapters map[string]Adapter, now func() time.Time, media PublicMedia) (*Handler, error) {
@@ -78,13 +80,14 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 	stats := NewStats(nil)
 	stats.setCacheSource(cache)
 	return &Handler{
-		catalog:     c,
-		adapters:    registered,
-		now:         now,
-		publicMedia: media,
-		cache:       cache,
-		stats:       stats,
-		panicLogf:   log.Printf,
+		catalog:             c,
+		adapters:            registered,
+		now:                 now,
+		publicMedia:         media,
+		finalizeReadTimeout: defaultYouTubeFinalizeReadTimeout,
+		cache:               cache,
+		stats:               stats,
+		panicLogf:           log.Printf,
 	}, nil
 }
 
@@ -360,7 +363,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.stats.recordCacheUncacheable(channel)
 		ctx, cancel := context.WithTimeout(r.Context(), parseTimeout)
 		defer cancel()
-		res, _, _ := h.executeParse(ctx, path, platform, source, resolveItemID, debugView, h.now())
+		res := h.runUncachedParse(ctx, path, platform, source, resolveItemID, debugView)
 		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
@@ -423,6 +426,38 @@ func (h *Handler) serveCachedParse(
 	}
 }
 
+func (h *Handler) internalErrorResponse() cachedResponse {
+	res, _ := encodeResponse(http.StatusInternalServerError, contractErrorForStatus(http.StatusInternalServerError, "解析服务内部错误"))
+	return res
+}
+
+func (h *Handler) logRecoveredParsePanic(platform string, p any) {
+	logf := log.Printf
+	if h != nil && h.panicLogf != nil {
+		logf = h.panicLogf
+	}
+	logf("dokitool: parse panic recovered: platform=%s panic_type=%T", platform, p)
+}
+
+func (h *Handler) runUncachedParse(
+	ctx context.Context,
+	path, platform, source, itemID string,
+	debug bool,
+) (res cachedResponse) {
+	var completed bool
+	defer func() {
+		if p := recover(); p != nil {
+			h.logRecoveredParsePanic(platform, p)
+			res = h.internalErrorResponse()
+		} else if !completed {
+			res = h.internalErrorResponse()
+		}
+	}()
+	res, _, _ = h.executeParse(ctx, path, platform, source, itemID, debug, h.now())
+	completed = true
+	return res
+}
+
 func (h *Handler) runSingleflight(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -440,15 +475,11 @@ func (h *Handler) runSingleflight(
 	)
 	defer func() {
 		if p := recover(); p != nil {
-			res, _ = encodeResponse(http.StatusInternalServerError, contractErrorForStatus(http.StatusInternalServerError, "解析服务内部错误"))
+			res = h.internalErrorResponse()
 			cacheable = false
-			logf := h.panicLogf
-			if logf == nil {
-				logf = log.Printf
-			}
-			logf("dokitool: parse panic recovered: platform=%s panic_type=%T", platform, p)
+			h.logRecoveredParsePanic(platform, p)
 		} else if !completed {
-			res, _ = encodeResponse(http.StatusInternalServerError, contractErrorForStatus(http.StatusInternalServerError, "解析服务内部错误"))
+			res = h.internalErrorResponse()
 			cacheable = false
 		}
 
@@ -482,7 +513,15 @@ func (h *Handler) executeParse(
 	path, platform, source, itemID string,
 	debug bool,
 	nowTime time.Time,
-) (cachedResponse, unified.Object, bool) {
+) (res cachedResponse, retPayload unified.Object, retOK bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			h.logRecoveredParsePanic(platform, p)
+			res = h.internalErrorResponse()
+			retPayload = nil
+			retOK = false
+		}
+	}()
 	adapter := h.adapters[platform]
 	now := nowTime.Unix()
 	errorResult := func(status int, message string) (cachedResponse, unified.Object, bool) {
@@ -557,7 +596,17 @@ func queryPresent(raw, name string) bool {
 	return false
 }
 
-const maxYouTubeFinalizeBodyBytes = 512 << 10
+const (
+	maxYouTubeFinalizeBodyBytes       = 512 << 10
+	defaultYouTubeFinalizeReadTimeout = 5 * time.Second
+)
+
+func (h *Handler) youtubeFinalizeReadTimeout() time.Duration {
+	if h != nil && h.finalizeReadTimeout > 0 {
+		return h.finalizeReadTimeout
+	}
+	return defaultYouTubeFinalizeReadTimeout
+}
 
 func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 	if h.youtubeHelper == nil {
@@ -592,19 +641,43 @@ func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Body == nil {
+			if r.ProtoMajor == 1 {
+				r.Close = true
+				w.Header().Set("Connection", "close")
+			}
 			sendError(w, 400, "请求体不能为空")
 			return
 		}
-		defer r.Body.Close()
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxYouTubeFinalizeBodyBytes+1))
+		controller := http.NewResponseController(w)
+		_ = controller.SetReadDeadline(time.Now().Add(h.youtubeFinalizeReadTimeout()))
+		limitedBody := http.MaxBytesReader(w, r.Body, maxYouTubeFinalizeBodyBytes)
+		body, err := io.ReadAll(limitedBody)
 		if err != nil {
+			if r.ProtoMajor == 1 {
+				r.Close = true
+				w.Header().Set("Connection", "close")
+			}
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				sendError(w, 400, "请求体超出 512 KiB 限制")
+			} else {
+				sendError(w, 400, "读取请求体失败")
+			}
+			if r.ProtoMajor == 1 {
+				_ = controller.SetReadDeadline(time.Now())
+			}
+			_ = limitedBody.Close()
+			return
+		}
+		if err := limitedBody.Close(); err != nil {
+			if r.ProtoMajor == 1 {
+				r.Close = true
+				w.Header().Set("Connection", "close")
+			}
 			sendError(w, 400, "读取请求体失败")
 			return
 		}
-		if len(body) > maxYouTubeFinalizeBodyBytes {
-			sendError(w, 400, "请求体超出 512 KiB 限制")
-			return
-		}
+		_ = controller.SetReadDeadline(time.Time{})
 		debug, _ := queryValue(r.URL.RawQuery, "debug")
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()

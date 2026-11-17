@@ -87,6 +87,7 @@ type shanghaiCall struct {
 	done   chan struct{}
 	mu     sync.Mutex
 	play   *ShanghaiPlay
+	cancel context.CancelFunc
 	finish func(bool)
 	err    error
 	closed bool
@@ -99,15 +100,29 @@ func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid s
 	call := &shanghaiCall{done: make(chan struct{})}
 	go func() {
 		defer close(call.done)
+		ctx, cancel := context.WithCancel(parent)
+		keepCtxAlive := false
+		defer func() {
+			if !keepCtxAlive {
+				cancel()
+			}
+		}()
+		call.mu.Lock()
+		if call.closed {
+			call.mu.Unlock()
+			return
+		}
+		call.cancel = cancel
+		call.mu.Unlock()
 		var (
 			play   *ShanghaiPlay
 			finish func(bool)
 			err    error
 		)
 		if pending, ok := resolver.(shanghaiPendingResolver); ok {
-			play, finish, err = pending.ResolveBilibiliPending(parent, bvid, cid)
+			play, finish, err = pending.ResolveBilibiliPending(ctx, bvid, cid)
 		} else {
-			play, err = resolver.ResolveBilibili(parent, bvid, cid)
+			play, err = resolver.ResolveBilibili(ctx, bvid, cid)
 		}
 		call.mu.Lock()
 		if call.closed {
@@ -116,6 +131,17 @@ func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid s
 				finish(false)
 			}
 			return
+		}
+		if finish != nil && err == nil && play != nil {
+			rawFinish := finish
+			var finishOnce sync.Once
+			finish = func(matched bool) {
+				finishOnce.Do(func() {
+					rawFinish(matched)
+					cancel()
+				})
+			}
+			keepCtxAlive = true
 		}
 		call.play = play
 		call.finish = finish
@@ -163,10 +189,15 @@ func (c *shanghaiCall) abort() {
 		return
 	}
 	c.mu.Lock()
+	cancel := c.cancel
 	fn := c.finish
+	c.cancel = nil
 	c.finish = nil
 	c.closed = true
 	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if fn != nil {
 		fn(false)
 	}

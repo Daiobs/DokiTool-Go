@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -186,40 +188,51 @@ func (p *Parser) verifyPublicHost(ctx context.Context, host string) bool {
 	return true
 }
 
-// AllowedMediaURL checks whether a media/thumbnail URL belongs to spec.MediaHostSuffix.
-func (p *Parser) AllowedMediaURL(raw string) bool {
+const defaultMediaDNSTimeout = 5 * time.Second
+
+func (p *Parser) matchMediaHost(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.User != nil || u.Opaque != "" {
-		return false
+		return "", false
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return false
+		return "", false
 	}
 	if port := u.Port(); port != "" {
 		n, err := strconv.Atoi(port)
 		if err != nil || (scheme == "https" && n != 443) || (scheme == "http" && n != 80) {
-			return false
+			return "", false
 		}
 	}
 	host := strings.ToLower(u.Hostname())
 	if host == "" || net.ParseIP(host) != nil {
-		return false
+		return "", false
 	}
 	if p == nil || len(p.spec.MediaHostSuffix) == 0 {
-		return false
+		return "", false
 	}
-	matched := false
 	for _, suffix := range p.spec.MediaHostSuffix {
 		if hostMatchesRule(host, suffix) {
-			matched = true
-			break
+			return host, true
 		}
 	}
-	if !matched {
+	return "", false
+}
+
+// AllowedMediaURL checks whether a media/thumbnail URL belongs to spec.MediaHostSuffix
+// and resolves solely to public IP addresses within a bounded timeout.
+func (p *Parser) AllowedMediaURL(raw string) bool {
+	host, ok := p.matchMediaHost(raw)
+	if !ok {
 		return false
 	}
-	return p.verifyPublicHost(context.Background(), host)
+	if p.resolver == nil {
+		return true
+	}
+	lookupCtx, cancel := context.WithTimeout(context.Background(), defaultMediaDNSTimeout)
+	defer cancel()
+	return p.verifyPublicHost(lookupCtx, host)
 }
 
 func parseSafeHTTPURL(raw string) (*url.URL, bool) {
@@ -349,8 +362,67 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	if p == nil || p.engine == nil || !p.engine.Enabled() {
 		return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
 	}
+	type hostLookup struct {
+		done chan struct{}
+		ok   bool
+	}
+	var (
+		hostMu    sync.Mutex
+		hostCache = make(map[string]*hostLookup)
+	)
+	checkPublicHost := func(host string) bool {
+		if p == nil || p.resolver == nil {
+			return true
+		}
+		cleanHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+		if cleanHost == "" || net.ParseIP(cleanHost) != nil {
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		hostMu.Lock()
+		entry, exists := hostCache[cleanHost]
+		if !exists {
+			entry = &hostLookup{done: make(chan struct{})}
+			hostCache[cleanHost] = entry
+			hostMu.Unlock()
+
+			lookupCtx, cancel := context.WithTimeout(ctx, defaultMediaDNSTimeout)
+			ok := p.verifyPublicHost(lookupCtx, cleanHost)
+			cancel()
+			if ctx.Err() != nil {
+				hostMu.Lock()
+				delete(hostCache, cleanHost)
+				hostMu.Unlock()
+				close(entry.done)
+				return false
+			}
+			entry.ok = ok
+			close(entry.done)
+			return ok
+		}
+		hostMu.Unlock()
+
+		select {
+		case <-entry.done:
+			if ctx.Err() != nil {
+				return false
+			}
+			return entry.ok
+		case <-ctx.Done():
+			return false
+		}
+	}
+
 	parsedURL, err := url.Parse(cleanURL)
-	if err != nil || !p.verifyPublicHost(ctx, parsedURL.Hostname()) {
+	if err != nil || !checkPublicHost(parsedURL.Hostname()) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if errors.Is(ctxErr, context.Canceled) {
+				return nil, ctxErr
+			}
+			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+		}
 		return unified.ContractError("UPSTREAM_BLOCKED", "目标地址解析到受限网络，已拒绝访问", false), nil
 	}
 	if p.spec.PlatformID == "facebook" && isFacebookLoginPath(parsedURL.EscapedPath()) {
@@ -382,17 +454,38 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 		contentID = hex.EncodeToString(sum[:])[:16]
 	}
 
+	allowedMediaURL := func(raw string) bool {
+		host, ok := p.matchMediaHost(raw)
+		if !ok {
+			return false
+		}
+		return checkPublicHost(host)
+	}
+
 	opts := ytengine.AdaptOptions{
 		PlatformID:                   p.spec.PlatformID,
 		ContentID:                    contentID,
 		SourceURL:                    source,
 		MaxEntries:                   p.spec.MaxEntries,
-		AllowedMediaURL:              p.AllowedMediaURL,
+		AllowedMediaURL:              allowedMediaURL,
 		EnableDASHMux:                p.spec.EnableDASHMux,
 		EnableHLS:                    p.spec.EnableHLS,
 		AllowCodecLessProgressiveMP4: p.spec.AllowCodecLessProgressiveMP4,
 		SingleStreamHLSOnly:          p.spec.SingleStreamHLSOnly,
 	}
 	ytengine.PopulateMissingMP4Sizes(ctx, info, p.sizeProber, opts)
-	return ytengine.AdaptInfo(info, opts, now), nil
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+	}
+	adapted := ytengine.AdaptInfo(info, opts, now)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+	}
+	return adapted, nil
 }

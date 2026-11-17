@@ -60,10 +60,11 @@ type pullWaiter struct {
 }
 
 type pullTask struct {
-	job      PullJob
-	ctx      context.Context
-	result   chan json.RawMessage
-	received bool
+	job        PullJob
+	deadlineMS int64
+	ctx        context.Context
+	result     chan json.RawMessage
+	received   bool
 }
 
 type pullQueueOutcome struct {
@@ -181,6 +182,10 @@ func (b *PullBroker) newPullTaskLocked(ctx context.Context, protocol int, taskTy
 	var ids [32]byte
 	rand.Read(ids[:])
 	deadline, _ := ctx.Deadline()
+	deadlineMS := deadline.UnixMilli()
+	if b.now != nil {
+		deadlineMS = b.currentTime().Add(time.Until(deadline)).UnixMilli()
+	}
 	job := PullJob{
 		TaskID:     hex.EncodeToString(ids[:16]),
 		AttemptID:  hex.EncodeToString(ids[16:]),
@@ -198,7 +203,7 @@ func (b *PullBroker) newPullTaskLocked(ctx context.Context, protocol int, taskTy
 	default:
 		job.VideoID = videoID
 	}
-	t := &pullTask{job: job, ctx: ctx, result: make(chan json.RawMessage, 1)}
+	t := &pullTask{job: job, deadlineMS: deadlineMS, ctx: ctx, result: make(chan json.RawMessage, 1)}
 	b.pending[job.TaskID] = t
 	return t
 }
@@ -712,7 +717,7 @@ func (b *PullBroker) finish(job PullJob, payload json.RawMessage) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	task := b.pending[job.TaskID]
-	if task == nil || task.received || job != task.job || task.ctx.Err() != nil || time.Now().UnixMilli() >= task.job.DeadlineMS {
+	if task == nil || task.received || job != task.job || task.ctx.Err() != nil || b.currentTime().UnixMilli() >= task.deadlineMS {
 		return false
 	}
 	task.received = true

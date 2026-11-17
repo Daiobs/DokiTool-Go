@@ -7,12 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
@@ -152,4 +155,104 @@ func TestHandlerWithDetailSupportsBilibiliAndRejectsInvalidTasks(t *testing.T) {
 	if badRec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid BVID status = %d, want 400", badRec.Code)
 	}
+}
+
+func TestVersionSubcommandAndStartupLogs(t *testing.T) {
+	// 1. Default version via subprocess (`shanghai-resolver version`) prints version + newline to stdout and exits 0.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWorkersSubprocessHelper$")
+	cmd.Env = append(os.Environ(), "SHANGHAI_RESOLVER_TEST_MAIN_ARGS=version")
+	var subStdout, subStderr bytes.Buffer
+	cmd.Stdout = &subStdout
+	cmd.Stderr = &subStderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("main() with 'version' failed: err=%v stderr=%q", err, subStderr.String())
+	}
+	// go test prints PASS\n after TestWorkersSubprocessHelper returns; prefix must be version + "\n".
+	if !strings.HasPrefix(subStdout.String(), "development\n") {
+		t.Fatalf("subprocess stdout = %q, want prefix %q", subStdout.String(), "development\n")
+	}
+
+	// 2. Custom injected version in runWithContext prints exact version + newline and rejects extra positional args.
+	prevVersion := version
+	version = "4bf1880e66b0c5bd2fad73bf35bb8d29bd254f40"
+	t.Cleanup(func() { version = prevVersion })
+
+	var out bytes.Buffer
+	if err := runWithContext(context.Background(), []string{"version"}, &out); err != nil {
+		t.Fatalf("runWithContext(version) failed: %v", err)
+	}
+	if out.String() != "4bf1880e66b0c5bd2fad73bf35bb8d29bd254f40\n" {
+		t.Fatalf("version output = %q, want %q", out.String(), "4bf1880e66b0c5bd2fad73bf35bb8d29bd254f40\n")
+	}
+	if err := runWithContext(context.Background(), []string{"version", "extra"}, &out); err == nil {
+		t.Fatal("expected extra arg after version to fail")
+	}
+
+	// 3. Startup log in pull mode includes version=<sha> and never logs the pull token.
+	pullToken := randomTestToken(t)
+	t.Setenv("DOKITOOL_SHANGHAI_PULL_TOKEN", pullToken)
+	var pullLogs bytes.Buffer
+	prevLogOut := log.Writer()
+	log.SetOutput(&pullLogs)
+	t.Cleanup(func() { log.SetOutput(prevLogOut) })
+
+	pullCtx, cancelPull := context.WithCancel(context.Background())
+	cancelPull()
+	if err := runWithContext(pullCtx, []string{"-pull-origin=https://japan.example.org", "-workers=4"}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("pull mode with pre-canceled ctx failed: %v", err)
+	}
+	pullLogStr := pullLogs.String()
+	if !strings.Contains(pullLogStr, "version=4bf1880e66b0c5bd2fad73bf35bb8d29bd254f40") || !strings.Contains(pullLogStr, "pull mode") {
+		t.Fatalf("pull startup log missing version or mode: %q", pullLogStr)
+	}
+	if strings.Contains(pullLogStr, pullToken) {
+		t.Fatalf("pull startup log leaked token: %q", pullLogStr)
+	}
+
+	// 4. Startup log in direct mode includes version=<sha> and never logs the inbound token.
+	directToken := randomTestToken(t)
+	t.Setenv("DOKITOOL_SHANGHAI_TOKEN", directToken)
+	var directLogs syncLogBuffer
+	log.SetOutput(&directLogs)
+
+	directCtx, cancelDirect := context.WithCancel(context.Background())
+	directDone := make(chan error, 1)
+	go func() {
+		directDone <- runWithContext(directCtx, []string{"-listen=127.0.0.1:0"}, &bytes.Buffer{})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(directLogs.String(), "direct mode") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancelDirect()
+	if err := <-directDone; err != nil {
+		t.Fatalf("direct mode shutdown returned error: %v", err)
+	}
+	directLogStr := directLogs.String()
+	if !strings.Contains(directLogStr, "version=4bf1880e66b0c5bd2fad73bf35bb8d29bd254f40") || !strings.Contains(directLogStr, "direct mode") {
+		t.Fatalf("direct startup log missing version or mode: %q", directLogStr)
+	}
+	if strings.Contains(directLogStr, directToken) {
+		t.Fatalf("direct startup log leaked token: %q", directLogStr)
+	}
+}
+
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

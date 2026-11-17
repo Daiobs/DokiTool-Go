@@ -1,8 +1,12 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,4 +228,207 @@ func TestYouTubeHelperRoutesEnabledAndParseAdmission(t *testing.T) {
 	if rec5.Code != http.StatusTooManyRequests {
 		t.Fatalf("second finalize after warm context status = %d, want 429", rec5.Code)
 	}
+}
+
+func TestYouTubeFinalizeBodyReadDeadlineOversizedCloseAndSlowSlotRelease(t *testing.T) {
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	h, err := New(c, nil, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.youtubeFinalizeReadTimeout(); got != 5*time.Second {
+		t.Fatalf("default youtubeFinalizeReadTimeout() = %v, want 5s", got)
+	}
+	// Shorten read deadline in unit test so slow-body timeout completes well under 200ms.
+	h.finalizeReadTimeout = 50 * time.Millisecond
+
+	stub := &stubYouTubeHelper{
+		finPayload: unified.Object{
+			"schema_version": "1.0",
+			"code":           "OK",
+			"data": unified.Object{
+				"platform":        "youtube",
+				"content_id":      "I9JvDaciaFk",
+				"source_url":      "https://www.youtube.com/watch?v=I9JvDaciaFk",
+				"default_item_id": "video-1",
+				"items": unified.Array{
+					unified.Object{
+						"id":          "video-1",
+						"type":        "video",
+						"index":       int64(1),
+						"default":     nil,
+						"resolve_url": unified.ResolveURL("https://www.youtube.com/watch?v=I9JvDaciaFk", "video-1"),
+						"variants": unified.Array{
+							unified.Object{
+								"id":    "v-18",
+								"label": "360p",
+								"metadata": unified.Object{
+									"evidence":  "upstream",
+									"has_audio": true,
+									"container": "mp4",
+									"extension": "mp4",
+									"mime_type": "video/mp4",
+								},
+								"delivery": unified.Object{
+									"kind":    "file",
+									"sources": unified.Sources(unified.Array{"https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?itag=18"}, now.Unix()),
+								},
+							},
+						},
+					},
+				},
+				"generated_at": "2026-11-17T12:00:00Z",
+			},
+		},
+		finStatus: http.StatusOK,
+	}
+	h.SetYouTubeHelper(stub)
+
+	// (b-unit) HTTP/1.1 >512 KiB request sets r.Close = true and Connection: close with 400 INVALID_INPUT.
+	overReq := httptest.NewRequest(http.MethodPost, "/api/youtube/finalize?schema_version=1.0", bytes.NewReader(bytes.Repeat([]byte("x"), maxYouTubeFinalizeBodyBytes+1)))
+	overRec := httptest.NewRecorder()
+	h.ServeHTTP(overRec, overReq)
+	if overRec.Code != http.StatusBadRequest || !overReq.Close || overRec.Header().Get("Connection") != "close" {
+		t.Fatalf("HTTP/1.1 oversized finalize: code=%d r.Close=%v Connection=%q", overRec.Code, overReq.Close, overRec.Header().Get("Connection"))
+	}
+	overEnv, decErr := unified.Decode(overRec.Body.Bytes())
+	if decErr != nil || unified.ValidateEnvelopeAt(overEnv, now.Unix()) != nil || unified.Str(overEnv["code"]) != "INVALID_INPUT" {
+		t.Fatalf("unexpected oversized error envelope: err=%v body=%s", decErr, overRec.Body.String())
+	}
+
+	// Real TCP server with single-slot SlowParse admission (no queue) to prove slow-slot release.
+	cfg := DefaultAdmissionConfig()
+	cfg.SlowParse.GlobalConcurrency = 1
+	cfg.SlowParse.ClientConcurrency = 1
+	cfg.SlowParse.QueueWait = 0
+	cfg.SlowParse.QueueSize = 0
+	cfg.SlowParse.ClientBurst = 10
+	cfg.SlowParse.ClientRPS = 10
+	cfg.SlowParse.GlobalBurst = 10
+	cfg.SlowParse.GlobalRPS = 10
+	const edgeKey = testEdgeKey
+	entry, err := WithAdmissionConfig(h, nil, "caddy", edgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	finished := make(chan struct{}, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entry.ServeHTTP(w, r)
+		finished <- struct{}{}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	assertHealthyFinalize := func(clientIP string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/youtube/finalize?schema_version=1.0", strings.NewReader(`{"ok":true}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(edgeHeader, edgeKey)
+		req.Header.Set(clientHeader, clientIP)
+		req.Header.Set("Content-Type", "application/json")
+		client := srv.Client()
+		client.Timeout = time.Second
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("healthy finalize failed: %v", err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("healthy finalize status = %d, want 200", resp.StatusCode)
+		}
+		<-finished
+	}
+
+	// (a) Slow trickling POST /api/youtube/finalize body times out promptly (<200ms) and releases slow slot.
+	slowStart := time.Now()
+	connSlow, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connSlow.Close()
+	_ = connSlow.SetDeadline(time.Now().Add(2 * time.Second))
+	fmt.Fprintf(connSlow, "POST /api/youtube/finalize?schema_version=1.0 HTTP/1.1\r\nHost: test\r\n%s: %s\r\n%s: 198.51.100.20\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{", edgeHeader, edgeKey, clientHeader)
+
+	respSlow, err := http.ReadResponse(bufio.NewReader(connSlow), nil)
+	if err != nil {
+		t.Fatalf("slow finalize read response failed: %v", err)
+	}
+	slowBody, _ := io.ReadAll(respSlow.Body)
+	respSlow.Body.Close()
+	slowElapsed := time.Since(slowStart)
+	if slowElapsed >= 200*time.Millisecond {
+		t.Fatalf("slow finalize took %v, want <200ms", slowElapsed)
+	}
+	if respSlow.StatusCode != http.StatusBadRequest || !respSlow.Close {
+		t.Fatalf("slow finalize status=%d Close=%v body=%s", respSlow.StatusCode, respSlow.Close, string(slowBody))
+	}
+	slowEnv, err := unified.Decode(slowBody)
+	if err != nil || unified.ValidateEnvelopeAt(slowEnv, now.Unix()) != nil || unified.Str(slowEnv["code"]) != "INVALID_INPUT" {
+		t.Fatalf("invalid slow finalize 400 envelope: err=%v body=%s", err, string(slowBody))
+	}
+	select {
+	case <-finished:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("slow finalize handler did not exit and release slow slot promptly")
+	}
+	adm.slow.mu.Lock()
+	slowActiveAfterTimeout := adm.slow.active
+	adm.slow.mu.Unlock()
+	if slowActiveAfterTimeout != 0 {
+		t.Fatalf("slow pool active = %d after timeout, want 0", slowActiveAfterTimeout)
+	}
+	assertHealthyFinalize("198.51.100.21")
+
+	// (b-tcp) >512 KiB HTTP/1.1 body (even with stalled trailing bytes after 512 KiB + 1)
+	// returns 400 INVALID_INPUT with Connection: close and releases the slow slot immediately.
+	h.finalizeReadTimeout = 5 * time.Second
+	overStart := time.Now()
+	connOver, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connOver.Close()
+	_ = connOver.SetDeadline(time.Now().Add(2 * time.Second))
+	declaredLen := maxYouTubeFinalizeBodyBytes + 65536
+	fmt.Fprintf(connOver, "POST /api/youtube/finalize?schema_version=1.0 HTTP/1.1\r\nHost: test\r\n%s: %s\r\n%s: 198.51.100.22\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", edgeHeader, edgeKey, clientHeader, declaredLen)
+	if _, err := connOver.Write(bytes.Repeat([]byte("z"), maxYouTubeFinalizeBodyBytes+1)); err != nil {
+		t.Fatalf("write oversized prefix failed: %v", err)
+	}
+	respOver, err := http.ReadResponse(bufio.NewReader(connOver), nil)
+	if err != nil {
+		t.Fatalf("oversized TCP finalize read response failed: %v", err)
+	}
+	overTCPBody, _ := io.ReadAll(respOver.Body)
+	respOver.Body.Close()
+	if overElapsed := time.Since(overStart); overElapsed >= 500*time.Millisecond {
+		t.Fatalf("oversized TCP finalize stalled draining body (%v), want immediate close", overElapsed)
+	}
+	if respOver.StatusCode != http.StatusBadRequest || !respOver.Close {
+		t.Fatalf("oversized TCP finalize status=%d Close=%v", respOver.StatusCode, respOver.Close)
+	}
+	overTCPEnv, err := unified.Decode(overTCPBody)
+	if err != nil || unified.ValidateEnvelopeAt(overTCPEnv, now.Unix()) != nil || unified.Str(overTCPEnv["code"]) != "INVALID_INPUT" {
+		t.Fatalf("invalid oversized TCP 400 envelope: err=%v body=%s", err, string(overTCPBody))
+	}
+	select {
+	case <-finished:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("oversized finalize handler did not exit and release slow slot promptly")
+	}
+	adm.slow.mu.Lock()
+	slowActiveAfterOver := adm.slow.active
+	adm.slow.mu.Unlock()
+	if slowActiveAfterOver != 0 {
+		t.Fatalf("slow pool active = %d after oversized body, want 0", slowActiveAfterOver)
+	}
+	assertHealthyFinalize("198.51.100.23")
 }

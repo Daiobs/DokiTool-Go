@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
@@ -932,6 +936,276 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 			}
 			if httpCalls != 0 || ytdlpCalls != 0 || dnsCalls != 0 {
 				t.Fatalf("Parse(%q) outbound calls: http=%d ytdlp=%d dns=%d, want 0/0/0", rejectedURL, httpCalls, ytdlpCalls, dnsCalls)
+			}
+		}
+	})
+}
+
+type funcResolver func(ctx context.Context, network, host string) ([]netip.Addr, error)
+
+func (f funcResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return f(ctx, network, host)
+}
+
+func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
+	const now int64 = 1762300800
+	publicAddr := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	fbSpec, ok := LookupSite("facebook")
+	if !ok {
+		t.Fatal("missing facebook spec")
+	}
+
+	// (a) Canceled ctx in Parse(ctx) returns immediately without blocking on a hung DNS resolver
+	//     (both during input host DNS lookup and during media CDN host DNS lookup).
+	t.Run("canceled-ctx-returns-immediately-on-hung-dns", func(t *testing.T) {
+		// Case a1: hung DNS during input host lookup.
+		inputDNSStarted := make(chan struct{})
+		hungInputResolver := funcResolver(func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			select {
+			case <-inputDNSStarted:
+			default:
+				close(inputDNSStarted)
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		pInput := NewWithResolver(fbSpec, &stubExtractor{enabled: true}, nil, hungInputResolver)
+		ctx1, cancel1 := context.WithCancel(context.Background())
+		done1 := make(chan error, 1)
+		go func() {
+			_, err := pInput.Parse(ctx1, "https://www.facebook.com/watch/?v=647537299265662", now)
+			done1 <- err
+		}()
+		<-inputDNSStarted
+		tStart1 := time.Now()
+		cancel1()
+		err1 := <-done1
+		if !errors.Is(err1, context.Canceled) || time.Since(tStart1) >= 200*time.Millisecond {
+			t.Fatalf("canceled input DNS Parse err=%v elapsed=%v, want context.Canceled in <200ms", err1, time.Since(tStart1))
+		}
+
+		// Case a2: hung DNS during media CDN host lookup after Extract returns.
+		mediaDNSStarted := make(chan struct{})
+		hungMediaResolver := funcResolver(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+			if host == "www.facebook.com" {
+				return publicAddr, nil
+			}
+			select {
+			case <-mediaDNSStarted:
+			default:
+				close(mediaDNSStarted)
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		w, h := int64(1280), int64(720)
+		sz := int64(4096000)
+		pMedia := NewWithResolver(fbSpec, &stubExtractor{
+			enabled: true,
+			extract: func(context.Context, string) (*ytengine.Info, error) {
+				return &ytengine.Info{
+					ID:        "647537299265662",
+					Title:     "Hung Media DNS",
+					Thumbnail: "https://scontent-nrt1-2.xx.fbcdn.net/v/thumb.jpg",
+					Formats: []ytengine.Format{
+						{
+							FormatID: "hd",
+							URL:      "https://video-nrt6-1.xx.fbcdn.net/o1/v/t2/f2/m366/hd.mp4",
+							Ext:      "mp4",
+							Protocol: "https",
+							Width:    &w,
+							Height:   &h,
+							Filesize: &sz,
+						},
+					},
+				}, nil
+			},
+		}, nil, hungMediaResolver)
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		done2 := make(chan error, 1)
+		go func() {
+			_, err := pMedia.Parse(ctx2, "https://www.facebook.com/watch/?v=647537299265662", now)
+			done2 <- err
+		}()
+		<-mediaDNSStarted
+		tStart2 := time.Now()
+		cancel2()
+		err2 := <-done2
+		if !errors.Is(err2, context.Canceled) || time.Since(tStart2) >= 200*time.Millisecond {
+			t.Fatalf("canceled media DNS Parse err=%v elapsed=%v, want context.Canceled in <200ms", err2, time.Since(tStart2))
+		}
+	})
+
+	// (b) 15+ formats and thumbnails on the same CDN hostname invoke the DNS resolver ONLY ONCE per Parse.
+	t.Run("per-request-host-cache-deduplicates-18-formats-and-thumbnails", func(t *testing.T) {
+		var (
+			mu         sync.Mutex
+			hostCounts = make(map[string]int)
+			totalCalls atomic.Int32
+		)
+		countingResolver := funcResolver(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				t.Errorf("LookupNetIP(%q) called without context deadline", host)
+			}
+			totalCalls.Add(1)
+			mu.Lock()
+			hostCounts[host]++
+			mu.Unlock()
+			return publicAddr, nil
+		})
+
+		const cdnHost = "video-nrt6-1.xx.fbcdn.net"
+		formats := make([]ytengine.Format, 0, 18)
+		for i := 0; i < 18; i++ {
+			w := int64(640 + i*16)
+			h := int64(360 + i*16)
+			var szPtr *int64
+			if i%2 == 0 {
+				sz := int64(1000000 + i*10000)
+				szPtr = &sz
+			}
+			formats = append(formats, ytengine.Format{
+				FormatID: fmt.Sprintf("f-%d", i),
+				URL:      fmt.Sprintf("https://%s/o1/v/t2/f2/m366/vid_%d.mp4", cdnHost, i),
+				Ext:      "mp4",
+				Protocol: "https",
+				Width:    &w,
+				Height:   &h,
+				VCodec:   "avc1.4d401f",
+				ACodec:   "mp4a.40.2",
+				Filesize: szPtr,
+			})
+		}
+		thumbs := make([]ytengine.Thumbnail, 0, 5)
+		for i := 0; i < 5; i++ {
+			thumbs = append(thumbs, ytengine.Thumbnail{
+				ID:  fmt.Sprintf("th-%d", i),
+				URL: fmt.Sprintf("https://%s/v/t15.5256-10/thumb_%d.jpg", cdnHost, i),
+			})
+		}
+
+		p := NewWithResolver(fbSpec, &stubExtractor{
+			enabled: true,
+			extract: func(context.Context, string) (*ytengine.Info, error) {
+				return &ytengine.Info{
+					ID:         "647537299265662",
+					Title:      "Many Formats Same CDN",
+					Thumbnail:  fmt.Sprintf("https://%s/v/t15.5256-10/main_thumb.jpg", cdnHost),
+					Thumbnails: thumbs,
+					Formats:    formats,
+				}, nil
+			},
+		}, func(_ context.Context, rawURL string) (int64, bool) {
+			return 2048000, true
+		}, countingResolver)
+
+		res, err := p.Parse(context.Background(), "https://www.facebook.com/watch/?v=647537299265662", now)
+		if err != nil || unified.Str(res["code"]) != "OK" {
+			t.Fatalf("Parse failed: res=%v err=%v", res, err)
+		}
+		mu.Lock()
+		cdnCount := hostCounts[cdnHost]
+		fbCount := hostCounts["www.facebook.com"]
+		mu.Unlock()
+		if cdnCount != 1 || fbCount != 1 || totalCalls.Load() != 2 {
+			t.Fatalf("expected exactly 1 DNS lookup for %s and 1 for www.facebook.com (total=2), got cdn=%d fb=%d total=%d", cdnHost, cdnCount, fbCount, totalCalls.Load())
+		}
+	})
+
+	// (c) Private/loopback IP resolution is still rejected even when input host is public
+	//     and formats already carry filesize > 0 (bypassing PopulateMissingMP4Sizes) or thumbnails.
+	t.Run("private-ip-media-and-thumbnails-rejected-even-with-filesize", func(t *testing.T) {
+		spec := SiteSpec{
+			PlatformID:      "vimeo",
+			Name:            "Vimeo",
+			SiteURL:         "https://vimeo.com",
+			InputHosts:      []string{"vimeo.com", ".vimeo.com"},
+			MediaHostSuffix: []string{".vimeocdn.com"},
+		}
+		w, h := int64(1920), int64(1080)
+		sz := int64(12345678)
+
+		for _, privateIP := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1"} {
+			privAddr := []netip.Addr{netip.MustParseAddr(privateIP)}
+			// Case c1: media CDN resolves to private IP with filesize > 0 -> NO_MEDIA.
+			pBlockedMedia := NewWithResolver(spec, &stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return &ytengine.Info{
+						ID:        "999888",
+						Title:     "Private CDN Test",
+						Thumbnail: "https://i.vimeocdn.com/video/thumb.jpg",
+						Formats: []ytengine.Format{
+							{
+								FormatID: "http-1080p",
+								URL:      "https://cdn.vimeocdn.com/exp=1/sample1080.mp4",
+								Ext:      "mp4",
+								Protocol: "https",
+								Width:    &w,
+								Height:   &h,
+								VCodec:   "avc1.640028",
+								ACodec:   "mp4a.40.2",
+								Filesize: &sz,
+							},
+						},
+					}, nil
+				},
+			}, nil, stubResolver{
+				ips: map[string][]netip.Addr{
+					"vimeo.com":        publicAddr,
+					"cdn.vimeocdn.com": privAddr,
+					"i.vimeocdn.com":   privAddr,
+				},
+			})
+			res, err := pBlockedMedia.Parse(context.Background(), "https://vimeo.com/999888", now)
+			if err != nil {
+				t.Fatalf("unexpected error for %s: %v", privateIP, err)
+			}
+			if unified.Str(res["code"]) != "NO_MEDIA" {
+				t.Fatalf("expected NO_MEDIA when filesize>0 format host resolves to %s, got %v", privateIP, res)
+			}
+
+			// Case c2: video CDN is public, but thumbnail CDN resolves to private IP -> cover stripped!
+			pPrivateThumb := NewWithResolver(spec, &stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return &ytengine.Info{
+						ID:        "999889",
+						Title:     "Private Thumb Test",
+						Thumbnail: "https://priv-thumb.vimeocdn.com/video/secret.jpg",
+						Thumbnails: []ytengine.Thumbnail{
+							{ID: "t1", URL: "https://priv-thumb.vimeocdn.com/video/secret2.jpg"},
+						},
+						Formats: []ytengine.Format{
+							{
+								FormatID: "http-1080p",
+								URL:      "https://pub-cdn.vimeocdn.com/exp=1/sample1080.mp4",
+								Ext:      "mp4",
+								Protocol: "https",
+								Width:    &w,
+								Height:   &h,
+								VCodec:   "avc1.640028",
+								ACodec:   "mp4a.40.2",
+								Filesize: &sz,
+							},
+						},
+					}, nil
+				},
+			}, nil, stubResolver{
+				ips: map[string][]netip.Addr{
+					"vimeo.com":               publicAddr,
+					"pub-cdn.vimeocdn.com":    publicAddr,
+					"priv-thumb.vimeocdn.com": privAddr,
+				},
+			})
+			resThumb, err := pPrivateThumb.Parse(context.Background(), "https://vimeo.com/999889", now)
+			if err != nil || unified.Str(resThumb["code"]) != "OK" {
+				t.Fatalf("expected OK with stripped private thumbnail for %s, got res=%v err=%v", privateIP, resThumb, err)
+			}
+			data := unified.Map(resThumb["data"])
+			item := unified.Map(unified.Slice(data["items"])[0])
+			if data["cover_url"] != nil || item["cover_url"] != nil {
+				t.Fatalf("private-IP thumbnail leaked into envelope for %s: data.cover_url=%v item.cover_url=%v", privateIP, data["cover_url"], item["cover_url"])
 			}
 		}
 	})
