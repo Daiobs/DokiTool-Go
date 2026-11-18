@@ -182,10 +182,7 @@ func (b *PullBroker) newPullTaskLocked(ctx context.Context, protocol int, taskTy
 	var ids [32]byte
 	rand.Read(ids[:])
 	deadline, _ := ctx.Deadline()
-	deadlineMS := deadline.UnixMilli()
-	if b.now != nil {
-		deadlineMS = b.currentTime().Add(time.Until(deadline)).UnixMilli()
-	}
+	deadlineMS := b.currentTime().Add(time.Until(deadline)).UnixMilli()
 	job := PullJob{
 		TaskID:     hex.EncodeToString(ids[:16]),
 		AttemptID:  hex.EncodeToString(ids[16:]),

@@ -67,17 +67,27 @@ type Executor interface {
 	Do(context.Context, Request) (Response, error)
 }
 
-type resolver interface {
+// Resolver resolves outbound hostnames to IP addresses for hop-by-hop public-IP checks.
+type Resolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
 }
 type roundTrip func(*http.Request, []netip.Addr, Policy) (*http.Response, error)
 
 type Client struct {
-	resolver  resolver
+	resolver  Resolver
 	transport roundTrip
 }
 
-func New() *Client { return &Client{resolver: net.DefaultResolver, transport: standardRoundTrip} }
+func New() *Client { return NewWithResolver(net.DefaultResolver) }
+
+// NewWithResolver creates a Client using r for hop-by-hop DNS resolution while
+// retaining all URL, PublicIP, pinned-IP dialing, and response-size boundaries.
+func NewWithResolver(r Resolver) *Client {
+	if r == nil {
+		r = net.DefaultResolver
+	}
+	return &Client{resolver: r, transport: standardRoundTrip}
+}
 
 // AllowHosts validates server-side request targets separately from the input
 // platform registry and URLs merely returned to a browser. Suffix entries begin

@@ -343,13 +343,13 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		}
 	}
 
-	fbPolicy := ytgeneric.NewWithResolver(fbSpec, nil, nil, resolver)
+	fbPolicy := ytgeneric.New(fbSpec, nil, nil)
 	fbEng := baseEng.WithTargetPolicy(fbPolicy.AllowedTargetURL, fbPolicy.AllowedOutboundHost).WithExtractors(fbSpec.Extractors...)
-	dmPolicy := ytgeneric.NewWithResolver(dmSpec, nil, nil, resolver)
+	dmPolicy := ytgeneric.New(dmSpec, nil, nil)
 	dmEng := baseEng.WithTargetPolicy(dmPolicy.AllowedTargetURL, dmPolicy.AllowedOutboundHost).WithExtractors(dmSpec.Extractors...)
 
 	adapters := map[string]Adapter{
-		"facebook":    ytgeneric.NewWithResolver(fbSpec, fbEng, ytengine.NewSizeProber(httpExec, fbPolicy.AllowedMediaURL), resolver),
+		"facebook":    ytgeneric.NewWithResolver(fbSpec, fbEng, ytengine.NewSizeProber(httpExec, fbPolicy.MatchMediaURL), resolver),
 		"dailymotion": ytgeneric.NewWithResolver(dmSpec, dmEng, nil, resolver),
 	}
 	h, err := New(c, adapters, func() time.Time { return time.Unix(now, 0) }, nil)

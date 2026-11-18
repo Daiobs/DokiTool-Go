@@ -401,13 +401,13 @@ func configureYTDLPWithEngine(c *catalog.Catalog, adapters map[string]api.Adapte
 		if err := c.Register(spec.CatalogEntry()); err != nil {
 			return nil, err
 		}
-		policyParser := ytgeneric.NewWithResolver(spec, nil, nil, net.DefaultResolver)
+		policyParser := ytgeneric.New(spec, nil, nil)
 		siteEngine := baseEngine.
 			WithTargetPolicy(policyParser.AllowedTargetURL, policyParser.AllowedOutboundHost).
 			WithExtractors(spec.Extractors...)
 		var prober ytengine.SizeProber
 		if !spec.SingleStreamHLSOnly {
-			prober = ytengine.NewSizeProber(executor, policyParser.AllowedMediaURL)
+			prober = ytengine.NewSizeProber(executor, policyParser.MatchMediaURL)
 		}
 		adapters[spec.PlatformID] = ytgeneric.NewWithResolver(spec, siteEngine, prober, net.DefaultResolver)
 	}

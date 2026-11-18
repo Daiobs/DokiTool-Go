@@ -113,16 +113,33 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 	defer ln.Close()
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return serveDirect(ctx, ln, h, *cert, *key)
+}
+
+var shutdownServer = (*http.Server).Shutdown
+
+func directShutdownTimeout(s *http.Server) time.Duration {
+	var shutdownTimeout time.Duration
+	if s != nil {
+		shutdownTimeout = s.WriteTimeout
+	}
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = shresolver.WorkTimeout + 2*time.Second
+	}
+	return shutdownTimeout
+}
+
+func serveDirect(ctx context.Context, ln net.Listener, h http.Handler, cert, key string) error {
 	s := http.Server{Addr: ln.Addr().String(), Handler: h, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 4 * time.Second, WriteTimeout: shresolver.WorkTimeout + 2*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 8 << 10}
 	done := make(chan error, 1)
 	go func() {
-		if *cert != "" {
-			done <- s.ServeTLS(ln, *cert, *key)
+		if cert != "" {
+			done <- s.ServeTLS(ln, cert, key)
 			return
 		}
 		done <- s.Serve(ln)
 	}()
-	log.Printf("shanghai-resolver: starting direct mode (version=%s, listen=%s, tls=%t)", version, ln.Addr().String(), *cert != "")
+	log.Printf("shanghai-resolver: starting direct mode (version=%s, listen=%s, tls=%t)", version, ln.Addr().String(), cert != "")
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -130,8 +147,8 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 		}
 		return err
 	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), directShutdownTimeout(&s))
 		defer cancel()
-		return s.Shutdown(shutdown)
+		return shutdownServer(&s, shutdown)
 	}
 }

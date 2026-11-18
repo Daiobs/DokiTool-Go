@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -255,4 +257,131 @@ func (b *syncLogBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func TestDirectModeGracefulShutdownTimeoutAndDrain(t *testing.T) {
+	// 1. Unit-check directShutdownTimeout: uses s.WriteTimeout when positive, and
+	//    falls back to shresolver.WorkTimeout + 2s (11s) when <= 0 or nil.
+	wantFallback := shresolver.WorkTimeout + 2*time.Second
+	if got := directShutdownTimeout(nil); got != wantFallback {
+		t.Fatalf("directShutdownTimeout(nil) = %v, want %v", got, wantFallback)
+	}
+	for _, nonPos := range []time.Duration{0, -time.Second} {
+		if got := directShutdownTimeout(&http.Server{WriteTimeout: nonPos}); got != wantFallback {
+			t.Fatalf("directShutdownTimeout(WriteTimeout=%v) = %v, want %v", nonPos, got, wantFallback)
+		}
+	}
+	customSrv := &http.Server{WriteTimeout: 14 * time.Second}
+	if got := directShutdownTimeout(customSrv); got != customSrv.WriteTimeout || got < customSrv.WriteTimeout {
+		t.Fatalf("directShutdownTimeout(14s) = %v, want %v", got, customSrv.WriteTimeout)
+	}
+
+	// 2. End-to-end runWithContext in direct mode: verify shutdown context timeout >= s.WriteTimeout
+	//    (covering both 8s v1 ProbeTimeout and 7s v2 WorkResolveTimeout) and exits cleanly.
+	t.Setenv("DOKITOOL_SHANGHAI_TOKEN", randomTestToken(t))
+	prevLogOut := log.Writer()
+	var logs syncLogBuffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prevLogOut) })
+
+	prevShutdown := shutdownServer
+	var (
+		capturedWriteTimeout time.Duration
+		capturedDeadline     time.Time
+		capturedHasDeadline  bool
+	)
+	shutdownServer = func(s *http.Server, ctx context.Context) error {
+		capturedWriteTimeout = s.WriteTimeout
+		capturedDeadline, capturedHasDeadline = ctx.Deadline()
+		return s.Shutdown(ctx)
+	}
+	t.Cleanup(func() { shutdownServer = prevShutdown })
+
+	directCtx, cancelDirect := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithContext(directCtx, []string{"-listen=127.0.0.1:0"}, io.Discard)
+	}()
+
+	waitDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(waitDeadline) {
+		if strings.Contains(logs.String(), "direct mode") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	beforeCancel := time.Now()
+	cancelDirect()
+	if err := <-done; err != nil {
+		t.Fatalf("direct mode runWithContext shutdown failed: %v", err)
+	}
+	if !capturedHasDeadline {
+		t.Fatal("expected direct mode shutdown context to carry a deadline")
+	}
+	if capturedWriteTimeout != wantFallback {
+		t.Fatalf("direct mode WriteTimeout = %v, want %v", capturedWriteTimeout, wantFallback)
+	}
+	// Since context.WithTimeout runs after beforeCancel, capturedDeadline.Sub(beforeCancel) >= shutdownTimeout.
+	observedBudget := capturedDeadline.Sub(beforeCancel)
+	if observedBudget < capturedWriteTimeout {
+		t.Fatalf("direct mode shutdown budget = %v, want >= WriteTimeout (%v)", observedBudget, capturedWriteTimeout)
+	}
+	if capturedWriteTimeout <= shresolver.ProbeTimeout || capturedWriteTimeout <= shresolver.WorkResolveTimeout {
+		t.Fatalf("WriteTimeout (%v) must exceed v1 ProbeTimeout (%v) and v2 WorkResolveTimeout (%v)",
+			capturedWriteTimeout, shresolver.ProbeTimeout, shresolver.WorkResolveTimeout)
+	}
+
+	// 3. Verify serveDirect drains an in-flight request cleanly upon cancellation without truncating it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	inFlightEntered := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(inFlightEntered)
+		<-releaseHandler
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- serveDirect(serveCtx, ln, handler, "", "")
+	}()
+
+	type httpResult struct {
+		status int
+		body   string
+		err    error
+	}
+	reqDone := make(chan httpResult, 1)
+	go func() {
+		resp, reqErr := http.Get("http://" + ln.Addr().String() + shresolver.Path)
+		if reqErr != nil {
+			reqDone <- httpResult{err: reqErr}
+			return
+		}
+		defer resp.Body.Close()
+		b, readErr := io.ReadAll(resp.Body)
+		reqDone <- httpResult{status: resp.StatusCode, body: string(b), err: readErr}
+	}()
+
+	<-inFlightEntered
+	cancelServe()
+	time.Sleep(30 * time.Millisecond)
+	close(releaseHandler)
+
+	res := <-reqDone
+	if res.err != nil || res.status != http.StatusOK || res.body != `{"ok":true}` {
+		t.Fatalf("in-flight request during graceful shutdown failed: %+v", res)
+	}
+	if err := <-serveErrCh; err != nil {
+		t.Fatalf("serveDirect returned error after draining in-flight request: %v", err)
+	}
 }

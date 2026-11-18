@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -782,7 +783,7 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 			httpCalls++
 			t.Fatalf("dai.ly / dailymotion must make ZERO HTTP preflight requests, got %s %s", r.Method, r.URL)
 			return fetch.Response{}, nil
-		}), policyP.AllowedMediaURL)
+		}), policyP.MatchMediaURL)
 		p := NewWithResolver(dmSpec, &stubExtractor{
 			enabled: true,
 			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
@@ -881,7 +882,7 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 			httpCalls++
 			t.Fatalf("fb.watch must make ZERO outbound HTTP requests, got %s %s", req.Method, req.URL)
 			return fetch.Response{}, nil
-		}), policyP.AllowedMediaURL)
+		}), policyP.MatchMediaURL)
 		fbWatchParser := NewWithResolver(fbSpec, &stubExtractor{
 			enabled: true,
 			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
@@ -1206,6 +1207,354 @@ func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
 			item := unified.Map(unified.Slice(data["items"])[0])
 			if data["cover_url"] != nil || item["cover_url"] != nil {
 				t.Fatalf("private-IP thumbnail leaked into envelope for %s: data.cover_url=%v item.cover_url=%v", privateIP, data["cover_url"], item["cover_url"])
+			}
+		}
+	})
+}
+
+func TestMatchMediaURLSyntaxAndZeroDNS(t *testing.T) {
+	fbSpec, ok := LookupSite("facebook")
+	if !ok {
+		t.Fatal("missing facebook spec")
+	}
+
+	var dnsCalls atomic.Int32
+	forbidDNS := funcResolver(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		dnsCalls.Add(1)
+		t.Errorf("MatchMediaURL must never perform DNS lookup, called for %q", host)
+		return nil, errors.New("unexpected dns lookup")
+	})
+
+	p := NewWithResolver(fbSpec, nil, nil, forbidDNS)
+
+	var nilParser *Parser
+	if nilParser.MatchMediaURL("https://video-nrt6-1.xx.fbcdn.net/sample.mp4") {
+		t.Fatal("expected nil *Parser.MatchMediaURL to return false")
+	}
+	emptySuffixParser := NewWithResolver(SiteSpec{PlatformID: "empty"}, nil, nil, forbidDNS)
+	if emptySuffixParser.MatchMediaURL("https://video-nrt6-1.xx.fbcdn.net/sample.mp4") {
+		t.Fatal("expected empty MediaHostSuffix MatchMediaURL to return false")
+	}
+
+	for _, validURL := range []string{
+		"https://video-nrt6-1.xx.fbcdn.net/o1/v/t2/f2/m366/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:443/o1/v/t2/f2/m366/sample.mp4",
+		"http://video-nrt6-1.xx.fbcdn.net/o1/v/t2/f2/m366/sample.mp4",
+		"http://video-nrt6-1.xx.fbcdn.net:80/o1/v/t2/f2/m366/sample.mp4",
+		"HTTPS://SCONTENT-NRT1-2.XX.FBCDN.NET./v/t15.5256-10/thumb.jpg?oe=1",
+	} {
+		if !p.MatchMediaURL(validURL) {
+			t.Fatalf("expected MatchMediaURL(%q) to return true", validURL)
+		}
+	}
+
+	// Synthetic spec whose MediaHostSuffix would string-match IP literals if netip.ParseAddr were skipped.
+	ipRuleParser := NewWithResolver(SiteSpec{
+		PlatformID:      "synthetic-ip",
+		MediaHostSuffix: []string{"127.0.0.1", ".0.0.1", "::1", "fe80::1%lo0"},
+	}, nil, nil, forbidDNS)
+	for _, ipURL := range []string{
+		"https://127.0.0.1/sample.mp4",
+		"https://127.0.0.1./sample.mp4",
+		"https://10.0.0.1/sample.mp4",
+		"https://[::1]/sample.mp4",
+		"https://[fe80::1%25lo0]/sample.mp4",
+		"https://[::ffff:127.0.0.1]/sample.mp4",
+	} {
+		if ipRuleParser.MatchMediaURL(ipURL) {
+			t.Fatalf("expected IP literal URL %q to be rejected even when suffix rule matches", ipURL)
+		}
+	}
+
+	for _, badURL := range []string{
+		"",
+		"ftp://video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"file:///etc/passwd",
+		"javascript:alert(1)",
+		"://video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"https:video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:8443/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:80/sample.mp4",
+		"http://video-nrt6-1.xx.fbcdn.net:443/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:0443/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net:abc/sample.mp4",
+		"https://user:pass@video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"https://user@video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"https://@video-nrt6-1.xx.fbcdn.net/sample.mp4",
+		"https:///sample.mp4",
+		"https://./sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net/a b.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net/a\\b.mp4",
+		"https://127.0.0.1/sample.mp4",
+		"https://[::1]/sample.mp4",
+		"https://[fe80::1%25lo0]/sample.mp4",
+		"https://fbcdn.net/sample.mp4",
+		"https://evilfbcdn.net/sample.mp4",
+		"https://video-nrt6-1.xx.fbcdn.net.evil.com/sample.mp4",
+		"https://www.facebook.com/sample.mp4",
+	} {
+		if p.MatchMediaURL(badURL) {
+			t.Fatalf("expected MatchMediaURL(%q) to return false", badURL)
+		}
+	}
+
+	if got := dnsCalls.Load(); got != 0 {
+		t.Fatalf("MatchMediaURL made %d DNS calls, want 0", got)
+	}
+}
+
+func TestSizeProberRealWiringMatchMediaURLAndSSRF(t *testing.T) {
+	const now int64 = 1762300800
+	publicAddr := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	fbSpec, ok := LookupSite("facebook")
+	if !ok {
+		t.Fatal("missing facebook spec")
+	}
+
+	t.Run("no-uncached-policy-dns-caches-parse-dns-and-aborts-on-ctx-cancel", func(t *testing.T) {
+		var policyDNSCalls atomic.Int32
+		policyParser := NewWithResolver(fbSpec, nil, nil, funcResolver(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			policyDNSCalls.Add(1)
+			t.Errorf("policyParser uncached resolver must NEVER be invoked when wired via MatchMediaURL, got lookup for %q", host)
+			return nil, errors.New("unexpected policy resolver call")
+		}))
+
+		const cdnHost = "video-nrt6-1.xx.fbcdn.net"
+		wantSizes := map[string]int64{}
+		formats := make([]ytengine.Format, 0, 6)
+		for i := 0; i < 6; i++ {
+			w := int64(640 + i*160)
+			h := int64(360 + i*90)
+			u := fmt.Sprintf("https://%s/o1/v/t2/f2/m366/missing_sz_%d.mp4", cdnHost, i)
+			wantSizes[u] = int64(5_000_000 + i*1_000_000)
+			formats = append(formats, ytengine.Format{
+				FormatID: fmt.Sprintf("mp4-%d", i),
+				URL:      u,
+				Ext:      "mp4",
+				Protocol: "https",
+				Width:    &w,
+				Height:   &h,
+				VCodec:   "avc1.4d401f",
+				ACodec:   "mp4a.40.2",
+				Filesize: nil,
+			})
+		}
+
+		var probeHTTPCalls atomic.Int32
+		fetchExec := executorFunc(func(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+			if req.Policy.AllowedURL == nil || !req.Policy.AllowedURL(req.URL) {
+				return fetch.Response{}, fetch.ErrPolicy
+			}
+			probeHTTPCalls.Add(1)
+			total, ok := wantSizes[req.URL]
+			if !ok {
+				return fetch.Response{}, errors.New("unexpected probe URL")
+			}
+			return fetch.Response{
+				StatusCode: http.StatusPartialContent,
+				Header: http.Header{
+					"Content-Type":   {"video/mp4"},
+					"Content-Range":  {fmt.Sprintf("bytes 0-0/%d", total)},
+					"Content-Length": {"1"},
+				},
+				Body: []byte{0x00},
+				URL:  req.URL,
+			}, nil
+		})
+
+		var (
+			dnsMu      sync.Mutex
+			hostCounts = make(map[string]int)
+			totalDNS   atomic.Int32
+		)
+		parseResolver := funcResolver(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				t.Errorf("Parse DNS lookup for %q lacked context deadline", host)
+			}
+			totalDNS.Add(1)
+			dnsMu.Lock()
+			hostCounts[host]++
+			dnsMu.Unlock()
+			return publicAddr, nil
+		})
+
+		prober := ytengine.NewSizeProber(fetchExec, policyParser.MatchMediaURL)
+		adapter := NewWithResolver(fbSpec, &stubExtractor{
+			enabled: true,
+			extract: func(context.Context, string) (*ytengine.Info, error) {
+				return &ytengine.Info{
+					ID:        "647537299265662",
+					Title:     "Missing Filesize Probe Test",
+					Thumbnail: fmt.Sprintf("https://%s/v/t15.5256-10/thumb.jpg", cdnHost),
+					Formats:   formats,
+				}, nil
+			},
+		}, prober, parseResolver)
+
+		res, err := adapter.Parse(context.Background(), "https://www.facebook.com/watch/?v=647537299265662", now)
+		if err != nil || unified.Str(res["code"]) != "OK" {
+			t.Fatalf("Parse failed: res=%v err=%v", res, err)
+		}
+		if err := unified.ValidateEnvelopeAt(res, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		if got := policyDNSCalls.Load(); got != 0 {
+			t.Fatalf("policyParser resolver called %d times, want 0", got)
+		}
+		dnsMu.Lock()
+		fbDNS := hostCounts["www.facebook.com"]
+		cdnDNS := hostCounts[cdnHost]
+		dnsMu.Unlock()
+		if fbDNS != 1 || cdnDNS != 1 || totalDNS.Load() != 2 {
+			t.Fatalf("Parse DNS counts: fb=%d cdn=%d total=%d, want 1/1/2", fbDNS, cdnDNS, totalDNS.Load())
+		}
+		if got := probeHTTPCalls.Load(); got != 6 {
+			t.Fatalf("expected 6 HTTP Range size probes, got %d", got)
+		}
+		pub := unified.PublicView(res, false, now)
+		if err := unified.ValidateEnvelopeAt(pub, now); err != nil {
+			t.Fatalf("PublicView ValidateEnvelopeAt failed: %v", err)
+		}
+		item := unified.Map(unified.Slice(unified.Map(pub["data"])["items"])[0])
+		variants := unified.Slice(item["variants"])
+		if len(variants) != 6 {
+			t.Fatalf("expected 6 variants, got %d", len(variants))
+		}
+		for idx, rawV := range variants {
+			v := unified.Map(rawV)
+			src := unified.Map(unified.Slice(unified.Map(v["delivery"])["sources"])[0])
+			srcURL := unified.Str(src["url"])
+			gotSz, ok := unified.PHPInt(src["size_bytes"])
+			if !ok || gotSz != wantSizes[srcURL] {
+				t.Fatalf("variant[%d] (%s) size_bytes = %v, want %d", idx, srcURL, src["size_bytes"], wantSizes[srcURL])
+			}
+		}
+
+		// Verify prompt abort on caller ctx cancellation when DNS hangs inside real SizeProber
+		// (wired exactly like cmd/dokitool/main.go with New(spec, nil, nil).MatchMediaURL + fetch.NewWithResolver).
+		mainStylePolicy := New(fbSpec, nil, nil)
+		probeDNSStarted := make(chan struct{})
+		hungFetchResolver := funcResolver(func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			select {
+			case <-probeDNSStarted:
+			default:
+				close(probeDNSStarted)
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		realHungProber := ytengine.NewSizeProber(fetch.NewWithResolver(hungFetchResolver), mainStylePolicy.MatchMediaURL)
+		w, h := int64(1280), int64(720)
+		adapterHungProbe := NewWithResolver(fbSpec, &stubExtractor{
+			enabled: true,
+			extract: func(context.Context, string) (*ytengine.Info, error) {
+				return &ytengine.Info{
+					ID:    "647537299265662",
+					Title: "Hung Probe DNS",
+					Formats: []ytengine.Format{
+						{
+							FormatID: "hd",
+							URL:      fmt.Sprintf("https://%s/o1/v/t2/f2/m366/hd.mp4", cdnHost),
+							Ext:      "mp4",
+							Protocol: "https",
+							Width:    &w,
+							Height:   &h,
+							VCodec:   "avc1.4d401f",
+							ACodec:   "mp4a.40.2",
+							Filesize: nil,
+						},
+					},
+				}, nil
+			},
+		}, realHungProber, stubResolver{
+			ips: map[string][]netip.Addr{
+				"www.facebook.com": publicAddr,
+				cdnHost:            publicAddr,
+			},
+		})
+
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			_, pErr := adapterHungProbe.Parse(cancelCtx, "https://www.facebook.com/watch/?v=647537299265662", now)
+			errCh <- pErr
+		}()
+		<-probeDNSStarted
+		tCancel := time.Now()
+		cancel()
+		gotErr := <-errCh
+		if !errors.Is(gotErr, context.Canceled) || time.Since(tCancel) >= 200*time.Millisecond {
+			t.Fatalf("canceled Parse during SizeProber DNS hang: err=%v elapsed=%v, want context.Canceled in <200ms", gotErr, time.Since(tCancel))
+		}
+	})
+
+	t.Run("ssrf-safety-fetch-client-blocks-private-ip-on-whitelisted-media-host", func(t *testing.T) {
+		policyParser := New(fbSpec, nil, nil)
+		const mediaURL = "https://video-nrt6-1.xx.fbcdn.net/o1/v/t2/f2/m366/sample.mp4"
+		if !policyParser.MatchMediaURL(mediaURL) {
+			t.Fatalf("expected %q to pass syntax/whitelist MatchMediaURL", mediaURL)
+		}
+
+		for _, tc := range []struct {
+			name  string
+			addrs []netip.Addr
+		}{
+			{"loopback-v4", []netip.Addr{netip.MustParseAddr("127.0.0.1")}},
+			{"private-10", []netip.Addr{netip.MustParseAddr("10.0.0.1")}},
+			{"link-local-metadata", []netip.Addr{netip.MustParseAddr("169.254.169.254")}},
+			{"loopback-v6", []netip.Addr{netip.MustParseAddr("::1")}},
+			{"mixed-public-and-loopback", []netip.Addr{netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr("127.0.0.1")}},
+		} {
+			var resolverCalls atomic.Int32
+			privResolver := funcResolver(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+				if host == "www.facebook.com" {
+					return publicAddr, nil
+				}
+				resolverCalls.Add(1)
+				return tc.addrs, nil
+			})
+
+			client := fetch.NewWithResolver(privResolver)
+			prober := ytengine.NewSizeProber(client, policyParser.MatchMediaURL)
+
+			if sz, ok := prober(context.Background(), mediaURL); ok || sz != 0 {
+				t.Fatalf("%s: expected SizeProber to block private IP %v via fetch.Client PublicIP check, got sz=%d ok=%v", tc.name, tc.addrs, sz, ok)
+			}
+			if resolverCalls.Load() != 1 {
+				t.Fatalf("%s: expected fetch.Client resolver to be consulted once before rejecting private IP, got %d", tc.name, resolverCalls.Load())
+			}
+
+			// End-to-end Parse with the same real-wiring SizeProber + privResolver rejects media as NO_MEDIA.
+			w, h := int64(1280), int64(720)
+			adapter := NewWithResolver(fbSpec, &stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return &ytengine.Info{
+						ID:    "647537299265662",
+						Title: "Private Media Host",
+						Formats: []ytengine.Format{
+							{
+								FormatID: "hd",
+								URL:      mediaURL,
+								Ext:      "mp4",
+								Protocol: "https",
+								Width:    &w,
+								Height:   &h,
+								VCodec:   "avc1.4d401f",
+								ACodec:   "mp4a.40.2",
+								Filesize: nil,
+							},
+						},
+					}, nil
+				},
+			}, prober, privResolver)
+			res, err := adapter.Parse(context.Background(), "https://www.facebook.com/watch/?v=647537299265662", now)
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.name, err)
+			}
+			if unified.Str(res["code"]) != "NO_MEDIA" {
+				t.Fatalf("%s: expected NO_MEDIA when whitelisted CDN resolves to %v, got %v", tc.name, tc.addrs, res)
 			}
 		}
 	})
