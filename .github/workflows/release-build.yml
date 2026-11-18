@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   build-and-publish:
-    if: github.repository == 'Brilliant666/DokiTool-Go'
+    if: github.repository == 'Daiobs/DokiTool-Go'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
