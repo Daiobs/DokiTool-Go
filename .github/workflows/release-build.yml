@@ -151,6 +151,7 @@ jobs:
           )
           chmod 0755 "$OUT_DIR/dokitool" "$OUT_DIR/shanghai-resolver"
           test "$("$OUT_DIR/dokitool" version)" = "$TARGET_SHA"
+          test "$("$OUT_DIR/shanghai-resolver" version)" = "$TARGET_SHA"
 
           (
             cd frontend

@@ -88,6 +88,10 @@ def main():
     parser.add_argument("--node", default="node", help="Node executable for --frontend")
     args = parser.parse_args()
     run([sys.executable, "-B", "-X", "utf8", str(ROOT / "scripts/prod-smoke/test_smoke.py")])
+    run([sys.executable, "-B", "-X", "utf8", "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])
+    upstream_watch_pins = json.loads(
+        run([sys.executable, "-B", "-X", "utf8", str(ROOT / "scripts/check-upstream-updates.py"), "--check-local-pins"])
+    )
     provenance, douyin_provenance, integer_provenance = legacy_provenance(args.check_php_source)
     verify = [sys.executable, "-X", "utf8", str(ROOT / "scripts/go-migration/verify-php-25beaee.py")]
     if args.check_php_source:
@@ -191,7 +195,7 @@ def main():
         leaves = sum(sum(not any(other.startswith(name+"/") for other in names) for name in names) for names in by_package.values())
         result = {
             "scope": "Offline frozen PHP inputs through actual Go code; no real platform or browser evidence",
-            "passed": independent["total"] == independent["passed"],
+            "passed": independent["total"] == independent["passed"] and bool(upstream_watch_pins.get("passed")),
             "toolchain": run([args.go, "version"], cwd=ROOT / "backend").strip(),
             "php_baseline": provenance,
             "php_douyin_baseline": douyin_provenance,
@@ -210,6 +214,7 @@ def main():
                                       "failures": [{"id": labels[entry["index"]], "reason": entry["reason"]}
                                                    for entry in independent["checks"] if not entry["passed"]]},
             "openapi_contract": openapi_check,
+            "upstream_watch": {"unit_tests": "passed", "local_pins": upstream_watch_pins},
         }
         for name in ("kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu", "xiaohongshu_wire"):
             result[f"php_{name}_baseline"] = platform_provenance[name]

@@ -19,6 +19,9 @@ on:
       - scripts/**
       - docs/schema/**
       - .github/workflows/go-migration.yml
+      - .github/workflows/release-build.yml
+      - .github/workflows/gateway-isolation.yml
+      - .github/workflows/upstream-watch.yml
       - public-files.json
       - .gitignore
 
@@ -278,6 +281,11 @@ jobs:
 
       - name: Test strict public-difference comparison
         run: python3 -B scripts/go-migration/test-public-projection.py
+
+      - name: Verify upstream watch tests and locked binary pins
+        run: |
+          python3 -B -m unittest discover -s scripts/tests -v
+          python3 -B scripts/check-upstream-updates.py --check-local-pins
 
       - name: Verify locked Go dependencies
         working-directory: backend
