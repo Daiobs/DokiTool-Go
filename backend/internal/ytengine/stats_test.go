@@ -2,6 +2,7 @@ package ytengine
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,9 +45,15 @@ cat <<JSON
 JSON
 `
 	binPath, hashes := writeFakeYTDLP(t, script)
+	pubResolver := stubResolver{
+		ips: map[string][]netip.Addr{
+			"x.com": {netip.MustParseAddr("93.184.216.34")},
+		},
+	}
 	baseEng, err := New(Config{
 		BinaryPath:     binPath,
 		AllowedHashes:  hashes,
+		Resolver:       pubResolver,
 		MaxConcurrency: 1,
 		Timeout:        5 * time.Second,
 	})

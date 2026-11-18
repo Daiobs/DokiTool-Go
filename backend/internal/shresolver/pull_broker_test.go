@@ -1008,3 +1008,132 @@ func TestPullShortWaitQueueSkipsWhenShanghaiNeverClaimedOrStale(t *testing.T) {
 		fulfillQueuedV1(t, b, token, busyGapV1At)
 	})
 }
+
+func TestPullBrokerFinishUsesInjectedClock(t *testing.T) {
+	candidatesAt := func(ts time.Time) []Candidate {
+		cands := goodResponse().Candidates
+		out := make([]Candidate, len(cands))
+		copy(out, cands)
+		for i := range out {
+			out[i].ObtainedAt = ts.Unix()
+		}
+		return out
+	}
+	newInjectedBroker := func(t *testing.T, base time.Time) (*PullBroker, string, *atomic.Int64) {
+		t.Helper()
+		token := randomBrokerToken(t)
+		b, err := NewPullBroker(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nowNano atomic.Int64
+		nowNano.Store(base.UnixNano())
+		b.WithClock(func() time.Time { return time.Unix(0, nowNano.Load()) })
+		b.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		}
+		return b, token, &nowNano
+	}
+
+	// 1. Set injected clock in 2020 (far behind real wall-clock time.Now()):
+	//    task.job.DeadlineMS is computed from the 2020 clock, so a finish() using real time.Now()
+	//    would falsely reject the receipt as expired, whereas b.currentTime() accepts it cleanly
+	//    while receive()'s OS socket SetReadDeadline continues using real time.Now().
+	pastBase := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	bPast, tokenPast, nowPast := newInjectedBroker(t, pastBase)
+	primeRecentPullClaim(t, bPast, tokenPast)
+
+	const awemeID1 = "7704056737233449801"
+	donePast := make(chan error, 1)
+	go func() {
+		work, err := bPast.ResolveWork(t.Context(), awemeID1)
+		if err == nil && (work == nil || work.VideoID != wireVideo) {
+			err = errors.New("mismatched work response")
+		}
+		donePast <- err
+	}()
+	waitForQueueCount(t, bPast, 1)
+
+	claimRec := pullV2ClaimRequest(bPast, t.Context(), tokenPast)
+	if claimRec.Code != http.StatusOK {
+		t.Fatalf("past-clock claim status = %d, want 200", claimRec.Code)
+	}
+	var jobPast PullJob
+	if err := json.Unmarshal(claimRec.Body.Bytes(), &jobPast); err != nil {
+		t.Fatal(err)
+	}
+	// Advance injected clock by WorkTimeout - 50ms (still in year 2020 << real time.Now()).
+	justBeforeDeadline := pastBase.Add(WorkTimeout - 50*time.Millisecond)
+	nowPast.Store(justBeforeDeadline.UnixNano())
+
+	srv := httptest.NewServer(bPast)
+	defer srv.Close()
+	rawWorkPast, _ := json.Marshal(WorkResponse{
+		Protocol:   ProtocolV2,
+		AwemeID:    awemeID1,
+		VideoID:    wireVideo,
+		Candidates: candidatesAt(justBeforeDeadline),
+	})
+	rawReceiptPast, _ := json.Marshal(PullResult{PullJob: jobPast, Result: rawWorkPast})
+	reqPast, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+ResultPath, bytes.NewReader(rawReceiptPast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqPast.Header.Set("Authorization", "Bearer "+tokenPast)
+	reqPast.Header.Set("Content-Type", "application/json")
+	respPast, err := srv.Client().Do(reqPast)
+	if err != nil {
+		t.Fatalf("HTTP result POST with 2020 clock failed: %v", err)
+	}
+	respPast.Body.Close()
+	if respPast.StatusCode != http.StatusNoContent {
+		t.Fatalf("finish() with injected 2020 clock < DeadlineMS returned %d, want 204", respPast.StatusCode)
+	}
+	if err := <-donePast; err != nil {
+		t.Fatalf("ResolveWork with 2020 injected clock failed: %v", err)
+	}
+
+	// 2. Set injected clock in 2099 (far ahead of real wall-clock time.Now()), then advance
+	//    injected clock to >= DeadlineMS before receipt: finish() must reject with 409 Conflict
+	//    even though real time.Now() is decades earlier than DeadlineMS.
+	futureBase := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	bFuture, tokenFuture, nowFuture := newInjectedBroker(t, futureBase)
+	primeRecentPullClaim(t, bFuture, tokenFuture)
+
+	const awemeID2 = "7704056737233449802"
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	doneFuture := make(chan error, 1)
+	go func() {
+		_, err := bFuture.ResolveWork(ctx2, awemeID2)
+		doneFuture <- err
+	}()
+	waitForQueueCount(t, bFuture, 1)
+
+	claimFuture := pullV2ClaimRequest(bFuture, t.Context(), tokenFuture)
+	if claimFuture.Code != http.StatusOK {
+		t.Fatalf("future-clock claim status = %d, want 200", claimFuture.Code)
+	}
+	var jobFuture PullJob
+	if err := json.Unmarshal(claimFuture.Body.Bytes(), &jobFuture); err != nil {
+		t.Fatal(err)
+	}
+	// Advance injected clock past WorkTimeout while real time.Now() has barely moved (<5ms)
+	// and task.ctx is still uncanceled: finish() must reject with 409 Conflict via b.currentTime().
+	atDeadline := futureBase.Add(WorkTimeout + 10*time.Millisecond)
+	nowFuture.Store(atDeadline.UnixNano())
+
+	rawWorkFuture, _ := json.Marshal(WorkResponse{
+		Protocol:   ProtocolV2,
+		AwemeID:    awemeID2,
+		VideoID:    wireVideo,
+		Candidates: candidatesAt(atDeadline),
+	})
+	rawReceiptFuture, _ := json.Marshal(PullResult{PullJob: jobFuture, Result: rawWorkFuture})
+	ackFuture := pullTestRequest(bFuture, t.Context(), ResultPath, tokenFuture, rawReceiptFuture)
+	if ackFuture.Code != http.StatusConflict {
+		t.Fatalf("finish() at injected DeadlineMS status = %d, want 409 Conflict", ackFuture.Code)
+	}
+	cancel2()
+	<-doneFuture
+}

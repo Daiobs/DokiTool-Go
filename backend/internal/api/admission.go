@@ -238,6 +238,9 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	budget := a.selectPool(r, kind, path)
+	if budget.queueWait > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget.queueWait + serverWriteWindow))
+	}
 	release, retry, canceled := budget.acquireContext(r.Context(), client, a.now())
 	if canceled {
 		return
@@ -250,6 +253,9 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	if budget.queueWait > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
+	}
 	if kind == parser {
 		r = r.WithContext(withParseWallStart(r.Context(), wallStart))
 	}

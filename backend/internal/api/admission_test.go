@@ -746,3 +746,191 @@ func TestWaitQueueContextCancellationAndRaceZeroSlotLeaks(t *testing.T) {
 		}
 	}
 }
+
+type deadlineRecordingWriter struct {
+	*httptest.ResponseRecorder
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (w *deadlineRecordingWriter) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	w.deadlines = append(w.deadlines, t)
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *deadlineRecordingWriter) snapshot() []time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]time.Time(nil), w.deadlines...)
+}
+
+type stubParseClassifierHandler struct {
+	http.HandlerFunc
+}
+
+func (s stubParseClassifierHandler) ParsePlatform(rawQuery string) string {
+	v, _ := url.ParseQuery(rawQuery)
+	if strings.Contains(v.Get("url"), "x.com") {
+		return "x"
+	}
+	return "douyin"
+}
+
+func TestAnonymousQueuedPoolsExtendAndResetWriteDeadline(t *testing.T) {
+	// 1. Verify exact SetWriteDeadline extension before queue wait and reset upon grant
+	//    on anonymous queued pools (both slow and public), while leaving queueWait==0 pools untouched.
+	cfg := DefaultAdmissionConfig()
+	cfg.SlowParse.GlobalConcurrency = 1
+	cfg.SlowParse.ClientConcurrency = 1
+	cfg.SlowParse.QueueWait = 12 * time.Second
+	cfg.SlowParse.QueueSize = 4
+	cfg.SlowParse.ClientBurst = 10
+	cfg.SlowParse.ClientRPS = 10
+	cfg.SlowParse.GlobalBurst = 10
+	cfg.SlowParse.GlobalRPS = 10
+
+	cfg.Parse.GlobalConcurrency = 1
+	cfg.Parse.ClientConcurrency = 1
+	cfg.Parse.QueueWait = 8 * time.Second
+	cfg.Parse.QueueSize = 4
+	cfg.Parse.ClientBurst = 10
+	cfg.Parse.ClientRPS = 10
+	cfg.Parse.GlobalBurst = 10
+	cfg.Parse.GlobalRPS = 10
+
+	var inHandlerDeadlines []time.Time
+	next := stubParseClassifierHandler{
+		HandlerFunc: func(w http.ResponseWriter, r *http.Request) {
+			if rw, ok := w.(*deadlineRecordingWriter); ok {
+				inHandlerDeadlines = rw.snapshot()
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		},
+	}
+	entry, err := WithAdmissionConfig(next, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	// (a) Slow pool queued request: pre-queue deadline ~ now + 12s + 50s, post-grant reset ~ now + 50s.
+	relSlow, retry := adm.slow.acquire(netip.MustParseAddr("198.51.100.1"), time.Now())
+	if retry != 0 {
+		t.Fatalf("unexpected retry holding slow slot: %d", retry)
+	}
+	slowRW := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
+	slowReq := edgeRequest("/api/parse?schema_version=1.0&url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F1", "198.51.100.2")
+	beforeEnqueue := time.Now()
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		entry.ServeHTTP(slowRW, slowReq)
+	}()
+
+	deadlineWait := time.Now().Add(time.Second)
+	for time.Now().Before(deadlineWait) {
+		adm.slow.mu.Lock()
+		waiting := adm.slow.waiters.Len()
+		adm.slow.mu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	preGrant := slowRW.snapshot()
+	if len(preGrant) != 1 {
+		relSlow()
+		<-slowDone
+		t.Fatalf("expected exactly 1 SetWriteDeadline call before queue wait, got %d (%v)", len(preGrant), preGrant)
+	}
+	minExtended := beforeEnqueue.Add(cfg.SlowParse.QueueWait + serverWriteWindow - 200*time.Millisecond)
+	maxExtended := time.Now().Add(cfg.SlowParse.QueueWait + serverWriteWindow + 200*time.Millisecond)
+	if preGrant[0].Before(minExtended) || preGrant[0].After(maxExtended) {
+		relSlow()
+		<-slowDone
+		t.Fatalf("pre-queue deadline %v outside expected [%v, %v]", preGrant[0], minExtended, maxExtended)
+	}
+
+	beforeGrant := time.Now()
+	relSlow()
+	<-slowDone
+	afterGrant := time.Now()
+	if slowRW.Code != http.StatusOK || len(inHandlerDeadlines) != 2 {
+		t.Fatalf("queued slow request status=%d deadlines=%v, want 200 and 2 deadline updates", slowRW.Code, inHandlerDeadlines)
+	}
+	minReset := beforeGrant.Add(serverWriteWindow - 200*time.Millisecond)
+	maxReset := afterGrant.Add(serverWriteWindow + 200*time.Millisecond)
+	if inHandlerDeadlines[1].Before(minReset) || inHandlerDeadlines[1].After(maxReset) || !inHandlerDeadlines[1].Before(inHandlerDeadlines[0]) {
+		t.Fatalf("post-grant reset deadline %v not reset to serverWriteWindow [%v, %v] (pre-queue=%v)", inHandlerDeadlines[1], minReset, maxReset, inHandlerDeadlines[0])
+	}
+
+	// (b) Public pool queued request: pre-queue deadline ~ now + 8s + 50s, post-grant reset ~ now + 50s.
+	inHandlerDeadlines = nil
+	pubRW := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
+	pubReq := edgeRequest("/api/parse?schema_version=1.0&url=https%3A%2F%2Fwww.douyin.com%2Fvideo%2F1", "198.51.100.3")
+	t0 := time.Now()
+	entry.ServeHTTP(pubRW, pubReq)
+	if pubRW.Code != http.StatusOK || len(inHandlerDeadlines) != 2 {
+		t.Fatalf("public queued pool status=%d deadlines=%v, want 200 and 2 deadline updates", pubRW.Code, inHandlerDeadlines)
+	}
+	if inHandlerDeadlines[0].Sub(inHandlerDeadlines[1]) < cfg.Parse.QueueWait-500*time.Millisecond || inHandlerDeadlines[1].Sub(t0) < serverWriteWindow-500*time.Millisecond {
+		t.Fatalf("unexpected public pool deadlines: %v", inHandlerDeadlines)
+	}
+
+	// (c) Unqueued pools (QueueWait == 0, e.g. catalog and relay) do not call SetWriteDeadline.
+	for _, unqueuedPath := range []string{"/api/platforms?schema_version=1.0", "/api/media/weibo?ticket=abc"} {
+		rw := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
+		entry.ServeHTTP(rw, edgeRequest(unqueuedPath, "198.51.100.4"))
+		if got := rw.snapshot(); len(got) != 0 {
+			t.Fatalf("unqueued path %s unexpectedly called SetWriteDeadline: %v", unqueuedPath, got)
+		}
+	}
+
+	// 2. Real TCP server with tight WriteTimeout (40ms): anonymous queued slow request waiting 85ms
+	//    succeeds because admission extends WriteDeadline across budget.queueWait.
+	tcpCfg := DefaultAdmissionConfig()
+	tcpCfg.SlowParse.GlobalConcurrency = 1
+	tcpCfg.SlowParse.ClientConcurrency = 1
+	tcpCfg.SlowParse.QueueWait = 250 * time.Millisecond
+	tcpCfg.SlowParse.QueueSize = 4
+	tcpEntry, err := WithAdmissionConfig(stubParseClassifierHandler{
+		HandlerFunc: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		},
+	}, nil, "caddy", testEdgeKey, tcpCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpAdm := tcpEntry.(*admission)
+	relHold, holdRetry := tcpAdm.slow.acquire(netip.MustParseAddr("198.51.100.90"), time.Now())
+	if holdRetry != 0 {
+		t.Fatalf("hold slow slot failed: %d", holdRetry)
+	}
+	ts := httptest.NewUnstartedServer(tcpEntry)
+	ts.Config.WriteTimeout = 40 * time.Millisecond
+	ts.Start()
+	defer ts.Close()
+	go func() {
+		time.Sleep(85 * time.Millisecond)
+		relHold()
+	}()
+	tcpReq, err := http.NewRequest(http.MethodGet, ts.URL+"/api/parse?schema_version=1.0&url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F99", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpReq.Header.Set(edgeHeader, testEdgeKey)
+	tcpReq.Header.Set(clientHeader, "198.51.100.91")
+	tcpResp, err := ts.Client().Do(tcpReq)
+	if err != nil {
+		t.Fatalf("queued anonymous slow request over TCP failed (WriteDeadline not extended): %v", err)
+	}
+	tcpBody, _ := io.ReadAll(tcpResp.Body)
+	tcpResp.Body.Close()
+	if tcpResp.StatusCode != http.StatusOK || string(tcpBody) != `{"ok":true}` {
+		t.Fatalf("unexpected TCP response: status=%d body=%q", tcpResp.StatusCode, string(tcpBody))
+	}
+}

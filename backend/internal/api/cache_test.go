@@ -2052,3 +2052,238 @@ func TestBenchmarkLocalFakeUpstreamBeforeAfter(t *testing.T) {
 		}
 	}
 }
+
+func TestUncachedParseAndResolveRecoverPanicsWithoutLeak(t *testing.T) {
+	const (
+		nowSec = int64(1790000000)
+		canary = "SECRET_UNCACHED_CANARY_TOKEN_98765"
+	)
+
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Register(catalog.YouTubePlatform()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Register(catalog.XPlatform()); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		logMu     sync.Mutex
+		panicLogs []string
+	)
+	recordPanicLog := func(format string, args ...any) {
+		logMu.Lock()
+		panicLogs = append(panicLogs, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	assertInternal500 := func(t *testing.T, label string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("%s: status = %d, want 500; body=%s", label, w.Code, w.Body.String())
+		}
+		env, err := unified.Decode(w.Body.Bytes())
+		if err != nil {
+			t.Fatalf("%s: invalid JSON: %v (%s)", label, err, w.Body.String())
+		}
+		if err := unified.ValidateEnvelopeAt(env, nowSec); err != nil {
+			t.Fatalf("%s: ValidateEnvelopeAt failed: %v", label, err)
+		}
+		if unified.Str(env["code"]) != "INTERNAL_ERROR" {
+			t.Fatalf("%s: code = %q, want INTERNAL_ERROR", label, unified.Str(env["code"]))
+		}
+		if strings.Contains(w.Body.String(), canary) {
+			t.Fatalf("%s: response body leaked canary: %s", label, w.Body.String())
+		}
+	}
+
+	// Suite 1: Cache enabled, exercising all uncacheable request classes (weibo, youtube, >2048B URL)
+	// across both /api/parse and /api/resolve (plus publicMedia panic).
+	var weiboMediaPanic atomic.Bool
+	hEnabled, err := NewWithCacheConfig(c, map[string]Adapter{
+		"weibo": AdapterFunc(func(_ context.Context, source string, ts int64) (unified.Object, error) {
+			if weiboMediaPanic.Load() {
+				exp := time.Unix(ts+1800, 0).UTC().Format(time.RFC3339)
+				return makeSyntheticEnvelope("weibo", source, ts, exp, "video-1"), nil
+			}
+			panic("weibo adapter exploded: " + canary + " url=" + source)
+		}),
+		"youtube": AdapterFunc(func(_ context.Context, source string, _ int64) (unified.Object, error) {
+			panic(canaryPanicPayload{detail: canary + ":" + source})
+		}),
+		"x": AdapterFunc(func(_ context.Context, source string, _ int64) (unified.Object, error) {
+			panic("overlong x panic " + canary + " " + source)
+		}),
+	}, func() time.Time { return time.Unix(nowSec, 0) }, func(_ context.Context, platform string, payload unified.Object, _ int64) (unified.Object, error) {
+		if platform == "weibo" && weiboMediaPanic.Load() {
+			panic("publicMedia exploded " + canary)
+		}
+		return payload, nil
+	}, DefaultCacheConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hEnabled.panicLogf = recordPanicLog
+
+	longXURL := "https://x.com/i/status/1800000000000000001?pad=" + strings.Repeat("a", maxYTDLPInputBytes+32) + "&tok=" + canary
+	enabledCases := []struct {
+		name     string
+		route    string
+		rawURL   string
+		itemID   string
+		owner    bool
+		mediaPan bool
+		wantLog  string
+	}{
+		{
+			name:    "weibo-parse-anon",
+			route:   "/api/parse",
+			rawURL:  "https://weibo.com/1234567890/AbCdEfGhI?tok=" + canary,
+			wantLog: "dokitool: parse panic recovered: platform=weibo panic_type=string",
+		},
+		{
+			name:    "weibo-resolve-owner",
+			route:   "/api/resolve",
+			rawURL:  "https://weibo.com/1234567890/AbCdEfGhI?tok=" + canary,
+			itemID:  "video-1",
+			owner:   true,
+			wantLog: "dokitool: parse panic recovered: platform=weibo panic_type=string",
+		},
+		{
+			name:     "weibo-publicMedia-panic",
+			route:    "/api/parse",
+			rawURL:   "https://weibo.com/1234567890/AbCdEfGhI",
+			mediaPan: true,
+			wantLog:  "dokitool: parse panic recovered: platform=weibo panic_type=string",
+		},
+		{
+			name:    "youtube-parse-anon",
+			route:   "/api/parse",
+			rawURL:  "https://www.youtube.com/watch?v=dQw4w9WgXcQ&tok=" + canary,
+			wantLog: "dokitool: parse panic recovered: platform=youtube panic_type=api.canaryPanicPayload",
+		},
+		{
+			name:    "youtube-resolve-anon",
+			route:   "/api/resolve",
+			rawURL:  "https://www.youtube.com/watch?v=dQw4w9WgXcQ&tok=" + canary,
+			itemID:  "video-1",
+			wantLog: "dokitool: parse panic recovered: platform=youtube panic_type=api.canaryPanicPayload",
+		},
+		{
+			name:    "overlong-x-parse",
+			route:   "/api/parse",
+			rawURL:  longXURL,
+			wantLog: "dokitool: parse panic recovered: platform=x panic_type=string",
+		},
+		{
+			name:    "overlong-x-resolve",
+			route:   "/api/resolve",
+			rawURL:  longXURL,
+			itemID:  "part-2",
+			wantLog: "dokitool: parse panic recovered: platform=x panic_type=string",
+		},
+	}
+
+	for _, tc := range enabledCases {
+		weiboMediaPanic.Store(tc.mediaPan)
+		target := tc.route + "?schema_version=1.0&url=" + url.QueryEscape(tc.rawURL)
+		if tc.itemID != "" {
+			target += "&item_id=" + url.QueryEscape(tc.itemID)
+		}
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		if tc.owner {
+			req = req.WithContext(WithOwnerRequest(req.Context()))
+		}
+		rec := httptest.NewRecorder()
+		hEnabled.ServeHTTP(rec, req)
+		assertInternal500(t, tc.name, rec)
+	}
+
+	sumOutcome := func(snap StatsSnapshot, code string) uint64 {
+		var total uint64
+		for _, cell := range snap.Requests.ByPlatformCodeChannel {
+			if cell.Code == code {
+				total += cell.Count
+			}
+		}
+		return total
+	}
+
+	snapEnabled := hEnabled.Stats().Snapshot()
+	if got := snapEnabled.Requests.Total; got != uint64(len(enabledCases)) {
+		t.Fatalf("enabled uncached Requests.Total = %d, want %d", got, len(enabledCases))
+	}
+	if got := sumOutcome(snapEnabled, "INTERNAL_ERROR"); got != uint64(len(enabledCases)) {
+		t.Fatalf("enabled uncached INTERNAL_ERROR count = %d, want %d (%+v)", got, len(enabledCases), snapEnabled.Requests.ByPlatformCodeChannel)
+	}
+	if snapEnabled.Requests.ByChannel.Anonymous != 6 || snapEnabled.Requests.ByChannel.Owner != 1 {
+		t.Fatalf("unexpected channel breakdown: %+v", snapEnabled.Requests.ByChannel)
+	}
+	if snapEnabled.Cache.Total.Uncacheable != uint64(len(enabledCases)) {
+		t.Fatalf("Cache.Total.Uncacheable = %d, want %d", snapEnabled.Cache.Total.Uncacheable, len(enabledCases))
+	}
+	logMu.Lock()
+	enabledLogs := append([]string(nil), panicLogs...)
+	panicLogs = nil
+	logMu.Unlock()
+	if len(enabledLogs) != len(enabledCases) {
+		t.Fatalf("expected %d panic logs on uncacheable cases, got %d: %v", len(enabledCases), len(enabledLogs), enabledLogs)
+	}
+	for i, tc := range enabledCases {
+		trimmed := strings.TrimSuffix(enabledLogs[i], "\n")
+		if trimmed != tc.wantLog {
+			t.Fatalf("%s: log = %q, want %q", tc.name, trimmed, tc.wantLog)
+		}
+		for _, forbidden := range []string{canary, "weibo.com", "youtube.com", "x.com", "exploded", "AbCdEfGhI", "dQw4w9WgXcQ", "1800000000000000001"} {
+			if strings.Contains(enabledLogs[i], forbidden) {
+				t.Fatalf("%s: log leaked %q: %q", tc.name, forbidden, enabledLogs[i])
+			}
+		}
+	}
+
+	// Suite 2: DOKITOOL_PARSE_CACHE=off (CacheConfig{Disabled: true}) across /api/parse and /api/resolve.
+	hDisabled, err := NewWithCacheConfig(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, source string, _ int64) (unified.Object, error) {
+			panic(canaryPanicPayload{detail: canary + ":" + source})
+		}),
+	}, func() time.Time { return time.Unix(nowSec, 0) }, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hDisabled.panicLogf = recordPanicLog
+
+	for _, target := range []string{
+		"/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.douyin.com/video/7300000000000000001?tok="+canary),
+		"/api/resolve?schema_version=1.0&url=" + url.QueryEscape("https://www.douyin.com/video/7300000000000000001?tok="+canary) + "&item_id=video-1",
+	} {
+		rec := httptest.NewRecorder()
+		hDisabled.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		assertInternal500(t, "cache-disabled:"+target, rec)
+	}
+
+	snapDisabled := hDisabled.Stats().Snapshot()
+	if snapDisabled.Requests.Total != 2 || sumOutcome(snapDisabled, "INTERNAL_ERROR") != 2 || snapDisabled.Cache.Total.Uncacheable != 2 {
+		t.Fatalf("unexpected stats on cache-disabled panics: requests=%+v cache=%+v", snapDisabled.Requests, snapDisabled.Cache)
+	}
+
+	logMu.Lock()
+	disabledLogs := append([]string(nil), panicLogs...)
+	logMu.Unlock()
+	if len(disabledLogs) != 2 {
+		t.Fatalf("expected 2 panic logs on cache-disabled handler, got %d: %v", len(disabledLogs), disabledLogs)
+	}
+	for i, line := range disabledLogs {
+		trimmed := strings.TrimSuffix(line, "\n")
+		if trimmed != "dokitool: parse panic recovered: platform=douyin panic_type=api.canaryPanicPayload" {
+			t.Fatalf("disabled log %d = %q", i, trimmed)
+		}
+		for _, forbidden := range []string{canary, "douyin.com", "7300000000000000001", "exploded"} {
+			if strings.Contains(line, forbidden) {
+				t.Fatalf("disabled log %d leaked %q: %q", i, forbidden, line)
+			}
+		}
+	}
+}

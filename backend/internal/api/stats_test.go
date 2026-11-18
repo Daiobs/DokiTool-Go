@@ -751,6 +751,7 @@ JSON
 	baseEng, err := ytengine.New(ytengine.Config{
 		BinaryPath:     binPath,
 		AllowedHashes:  map[string]string{hexSum: "yt-dlp-stats-e2e"},
+		Resolver:       staticPublicResolver{},
 		MaxConcurrency: 1,
 		Timeout:        10 * time.Second,
 	})

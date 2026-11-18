@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 )
 
+var version = "development"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 		log.Fatal(err)
@@ -26,6 +29,20 @@ func main() {
 }
 
 func run(args []string) error {
+	return runWithContext(context.Background(), args, os.Stdout)
+}
+
+func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) error {
+	if len(args) > 0 && args[0] == "version" {
+		if len(args) != 1 {
+			return errors.New("unexpected positional arguments")
+		}
+		if stdout == nil {
+			stdout = os.Stdout
+		}
+		_, err := fmt.Fprintln(stdout, version)
+		return err
+	}
 	flags := flag.NewFlagSet("shanghai-resolver", flag.ContinueOnError)
 	listen := flags.String("listen", "127.0.0.1:9083", "explicit loopback address behind HTTPS ingress")
 	cert := flags.String("tls-cert", "", "PEM certificate chain for native HTTPS")
@@ -53,6 +70,9 @@ func run(args []string) error {
 			serverOpt = true
 		}
 	})
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	if pull {
 		if serverOpt {
 			return errors.New("pull mode does not accept listener or TLS server options")
@@ -64,8 +84,9 @@ func run(args []string) error {
 		if _, err = w.WithWorkers(*workers); err != nil {
 			return err
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		log.Printf("shanghai-resolver: starting pull mode (version=%s, origin=%s, workers=%d)", version, *origin, *workers)
 		if err = w.Run(ctx); errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return nil
 		}
@@ -85,9 +106,49 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	s := http.Server{Addr: *listen, Handler: h, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 4 * time.Second, WriteTimeout: shresolver.WorkTimeout + 2*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 8 << 10}
-	if *cert != "" {
-		return s.ListenAndServeTLS(*cert, *key)
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return err
 	}
-	return s.ListenAndServe()
+	defer ln.Close()
+	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveDirect(ctx, ln, h, *cert, *key)
+}
+
+var shutdownServer = (*http.Server).Shutdown
+
+func directShutdownTimeout(s *http.Server) time.Duration {
+	var shutdownTimeout time.Duration
+	if s != nil {
+		shutdownTimeout = s.WriteTimeout
+	}
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = shresolver.WorkTimeout + 2*time.Second
+	}
+	return shutdownTimeout
+}
+
+func serveDirect(ctx context.Context, ln net.Listener, h http.Handler, cert, key string) error {
+	s := http.Server{Addr: ln.Addr().String(), Handler: h, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 4 * time.Second, WriteTimeout: shresolver.WorkTimeout + 2*time.Second, IdleTimeout: 15 * time.Second, MaxHeaderBytes: 8 << 10}
+	done := make(chan error, 1)
+	go func() {
+		if cert != "" {
+			done <- s.ServeTLS(ln, cert, key)
+			return
+		}
+		done <- s.Serve(ln)
+	}()
+	log.Printf("shanghai-resolver: starting direct mode (version=%s, listen=%s, tls=%t)", version, ln.Addr().String(), cert != "")
+	select {
+	case err := <-done:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), directShutdownTimeout(&s))
+		defer cancel()
+		return shutdownServer(&s, shutdown)
+	}
 }

@@ -2,8 +2,10 @@ package bilibili
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 )
@@ -220,5 +222,90 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 	}
 	if partialGot.DURLQuality != 0 || len(partialGot.DURLPieces) != 0 || len(partialGot.DashVideo) != 1 {
 		t.Fatalf("incomplete multi-segment DURL should be dropped while keeping valid DASH: %+v", partialGot)
+	}
+}
+
+type blockingShanghaiResolver struct {
+	started  chan struct{}
+	canceled chan error
+}
+
+func (r *blockingShanghaiResolver) ResolveBilibili(ctx context.Context, _ string, _ int64) (*ShanghaiPlay, error) {
+	close(r.started)
+	<-ctx.Done()
+	err := ctx.Err()
+	r.canceled <- err
+	return nil, err
+}
+
+type blockingPendingShanghaiResolver struct {
+	started  chan struct{}
+	canceled chan error
+}
+
+func (r *blockingPendingShanghaiResolver) ResolveBilibili(ctx context.Context, bvid string, cid int64) (*ShanghaiPlay, error) {
+	play, _, err := r.ResolveBilibiliPending(ctx, bvid, cid)
+	return play, err
+}
+
+func (r *blockingPendingShanghaiResolver) ResolveBilibiliPending(ctx context.Context, _ string, _ int64) (*ShanghaiPlay, func(bool), error) {
+	close(r.started)
+	<-ctx.Done()
+	err := ctx.Err()
+	r.canceled <- err
+	return nil, nil, err
+}
+
+func TestShanghaiCallAbortCancelsChildContextWithoutCancelingParent(t *testing.T) {
+	parent, cancelParent := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelParent()
+
+	// 1. Standard ShanghaiResolver: abort() immediately cancels in-flight ResolveBilibili ctx.
+	res1 := &blockingShanghaiResolver{
+		started:  make(chan struct{}),
+		canceled: make(chan error, 1),
+	}
+	call1 := startShanghaiCall(parent, res1, "BV1234567890", 101)
+	if call1 == nil {
+		t.Fatal("expected non-nil shanghaiCall")
+	}
+	<-res1.started
+	call1.abort()
+	select {
+	case err := <-res1.canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ResolveBilibili ctx err = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("abort() did not cancel in-flight ResolveBilibili child context promptly")
+	}
+	if parent.Err() != nil {
+		t.Fatalf("abort() unexpectedly canceled parent context: %v", parent.Err())
+	}
+
+	// 2. Pending shanghaiPendingResolver: abort() immediately cancels in-flight ResolveBilibiliPending ctx,
+	//    and repeated abort() calls remain idempotent and race-free.
+	res2 := &blockingPendingShanghaiResolver{
+		started:  make(chan struct{}),
+		canceled: make(chan error, 1),
+	}
+	call2 := startShanghaiCall(parent, res2, "BV1234567890", 101)
+	if call2 == nil {
+		t.Fatal("expected non-nil pending shanghaiCall")
+	}
+	<-res2.started
+	call2.abort()
+	call2.abort()
+	select {
+	case err := <-res2.canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ResolveBilibiliPending ctx err = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("abort() did not cancel in-flight ResolveBilibiliPending child context promptly")
+	}
+	<-call2.done
+	if parent.Err() != nil {
+		t.Fatalf("abort() unexpectedly canceled parent context: %v", parent.Err())
 	}
 }
