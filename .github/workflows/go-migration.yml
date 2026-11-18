@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   bilibili-php-oracle:
-    if: github.repository == 'Brilliant666/DokiTool-Go'
+    if: github.repository == 'Daiobs/DokiTool-Go'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -234,7 +234,7 @@ jobs:
           retention-days: 7
 
   offline-contract:
-    if: github.repository == 'Brilliant666/DokiTool-Go'
+    if: github.repository == 'Daiobs/DokiTool-Go'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -401,7 +401,7 @@ jobs:
           done
 
   xhs-dependency-review:
-    if: github.repository == 'Brilliant666/DokiTool-Go'
+    if: github.repository == 'Daiobs/DokiTool-Go'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

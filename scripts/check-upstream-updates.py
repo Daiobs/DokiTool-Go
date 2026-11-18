@@ -18,8 +18,8 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = 'Brilliant666/DokiTool-Go'
-OWNER = 'Brilliant666'
+TARGET = 'Daiobs/DokiTool-Go'
+OWNER = 'Daiobs'
 UPSTREAMS = ('yt-dlp/yt-dlp', 'denoland/deno')
 BOT = 'github-actions[bot]'
 TITLE = 'DokiTool-Go 上游运行时版本检查'
@@ -878,7 +878,7 @@ def run_check(api, pinned, *, dry_run=False, verify_notification=False, now=None
 
 def environment(env):
     if env.get('GITHUB_REPOSITORY', TARGET) != TARGET or env.get('GITHUB_REPOSITORY_OWNER', OWNER) != OWNER:
-        raise WatchError('This watcher may only run for Brilliant666/DokiTool-Go')
+        raise WatchError('This watcher may only run for Daiobs/DokiTool-Go')
     if env.get('GITHUB_SERVER_URL', 'https://github.com') != 'https://github.com':
         raise WatchError('Only public github.com is supported')
     run_id = env.get('GITHUB_RUN_ID')

@@ -476,7 +476,7 @@ class VersionOrderingTests(unittest.TestCase):
 
         # Malformed or hostile tags degrade gracefully without raising
         for repo, locked, bad_tag in (
-            ('denoland/deno', '2.9.8', 'v2.9.9-@Brilliant666|[evil](https://evil.test)<script>'),
+            ('denoland/deno', '2.9.8', 'v2.9.9-@Daiobs|[evil](https://evil.test)<script>'),
             ('denoland/deno', '2.9.8', 'v2.9'),
             ('yt-dlp/yt-dlp', '2026.10.26', 'v2026.10.26'),
             ('yt-dlp/yt-dlp', '2026.10.26', '2026.10.26.0'),
@@ -503,9 +503,9 @@ class WatchBehaviorTests(unittest.TestCase):
         self.assertTrue(result['issue_created'])
         self.assertTrue(result['notification_posted'])
         method, path, payload = api.writes[0]
-        self.assertEqual((method, path), ('POST', '/repos/Brilliant666/DokiTool-Go/issues'))
+        self.assertEqual((method, path), ('POST', '/repos/Daiobs/DokiTool-Go/issues'))
         self.assertEqual(payload['title'], watch.TITLE)
-        self.assertEqual(payload['assignees'], ['Brilliant666'])
+        self.assertEqual(payload['assignees'], ['Daiobs'])
         self.assertIn('| 组件 | 当前锁定版本 | 上游最新正式版 | 发布时间 | 状态 |', payload['body'])
         self.assertIn('`2026.10.26`', payload['body'])
         self.assertIn('`2.9.8`', payload['body'])
@@ -683,19 +683,19 @@ class WatchBehaviorTests(unittest.TestCase):
             with self.subTest(repo=repo):
                 api = FakeGitHub(self.upstreams, managed_issue(self.seed))
                 api.set_latest_stable(repo, new_rel)
-                result = self.run_watch(api, run_url='https://github.com/Brilliant666/DokiTool-Go/actions/runs/42')
+                result = self.run_watch(api, run_url='https://github.com/Daiobs/DokiTool-Go/actions/runs/42')
                 self.assertTrue(result['changed'])
                 self.assertTrue(result['notification_posted'])
                 self.assertEqual(len(api.writes), 1)
                 method, path, payload = api.writes[0]
-                self.assertEqual((method, path), ('POST', '/repos/Brilliant666/DokiTool-Go/issues/17/comments'))
+                self.assertEqual((method, path), ('POST', '/repos/Daiobs/DokiTool-Go/issues/17/comments'))
                 body = payload['body']
                 self.assertIn(locked_cell, body)
                 self.assertIn(watch.safe_text(new_rel['tag_name']), body)
                 self.assertIn('发现新正式版', body)
                 self.assertIn('正式版新增', body)
                 self.assertIn('SHA-256', body)
-                self.assertIn('https://github.com/Brilliant666/DokiTool-Go/actions/runs/42', body)
+                self.assertIn('https://github.com/Daiobs/DokiTool-Go/actions/runs/42', body)
                 saved = watch.extract_state(body)
                 self.assertEqual(saved['repositories'][repo]['latest_tag'], new_rel['tag_name'])
                 # Subsequent check without further upstream changes is a no-op.
@@ -906,7 +906,7 @@ class WatchBehaviorTests(unittest.TestCase):
         api = FakeGitHub(self.upstreams, managed_issue(self.seed))
         malicious = api_release(
             299,
-            'v2.9.9-@Brilliant666|[evil](https://evil.test)<script>',
+            'v2.9.9-@Daiobs|[evil](https://evil.test)<script>',
             '2026-11-10T00:00:00Z',
             name='Release @all <img src="x" onerror="alert(1)"> `cmd` [hijack](https://evil.test)',
         )
@@ -915,7 +915,7 @@ class WatchBehaviorTests(unittest.TestCase):
         body = api.writes[0][2]['body']
         # Strip the trailing HTML comment state marker before asserting no HTML tags remain in visible body.
         visible = body.split(watch.MARKER)[0]
-        self.assertNotIn('@Brilliant666', visible)
+        self.assertNotIn('@Daiobs', visible)
         self.assertNotIn('@all', visible)
         self.assertNotIn('<script>', visible)
         self.assertNotIn('<img', visible)
@@ -953,11 +953,13 @@ class BoundaryAndSecurityTests(unittest.TestCase):
         opener = Mock()
         api = watch.GitHub('dummy-token', opener=opener)
         paths = [
-            ('PUT', '/repos/Brilliant666/DokiTool-Go/contents/README.md', {}),
+            ('PUT', '/repos/Daiobs/DokiTool-Go/contents/README.md', {}),
             ('POST', '/repos/yt-dlp/yt-dlp/issues', {}),
             ('POST', '/repos/denoland/deno/issues', {}),
-            ('PATCH', '/repos/Brilliant666/DokiTool-Go/issues/17', {'body': 'overwrite'}),
-            ('DELETE', '/repos/Brilliant666/DokiTool-Go/issues/17', None),
+            ('POST', '/repos/Daiobs/DokiTool/issues', {}),
+            ('POST', '/repos/Brilliant666/DokiTool-Go/issues', {}),
+            ('PATCH', '/repos/Daiobs/DokiTool-Go/issues/17', {'body': 'overwrite'}),
+            ('DELETE', '/repos/Daiobs/DokiTool-Go/issues/17', None),
         ]
         for method, path, payload in paths:
             with self.subTest(method=method, path=path):
@@ -967,13 +969,14 @@ class BoundaryAndSecurityTests(unittest.TestCase):
 
     def test_token_is_not_forwarded_to_another_host_path_traversal_or_redirect(self):
         bad_urls = [
-            'http://api.github.com/repos/Brilliant666/DokiTool-Go',
-            'https://api.github.com.evil.test/repos/Brilliant666/DokiTool-Go',
-            'https://user@api.github.com/repos/Brilliant666/DokiTool-Go',
-            'https://api.github.com/repos/Brilliant666/DokiTool',
+            'http://api.github.com/repos/Daiobs/DokiTool-Go',
+            'https://api.github.com.evil.test/repos/Daiobs/DokiTool-Go',
+            'https://user@api.github.com/repos/Daiobs/DokiTool-Go',
+            'https://api.github.com/repos/Daiobs/DokiTool',
+            'https://api.github.com/repos/Brilliant666/DokiTool-Go',
             'https://api.github.com/repos/jiuhunwl/short_videos',
-            'https://api.github.com/repos/Brilliant666/DokiTool-Go/../../other/repo',
-            'https://api.github.com/repos/Brilliant666/DokiTool-Go#fragment',
+            'https://api.github.com/repos/Daiobs/DokiTool-Go/../../other/repo',
+            'https://api.github.com/repos/Daiobs/DokiTool-Go#fragment',
         ]
         for url in bad_urls:
             with self.subTest(url=url), self.assertRaises(watch.WatchError):
@@ -983,11 +986,13 @@ class BoundaryAndSecurityTests(unittest.TestCase):
     def test_environment_is_bound_to_dokitool_go_and_public_github(self):
         self.assertEqual(
             watch.environment({'GITHUB_RUN_ID': '123'}),
-            'https://github.com/Brilliant666/DokiTool-Go/actions/runs/123',
+            'https://github.com/Daiobs/DokiTool-Go/actions/runs/123',
         )
         bad_envs = [
-            {'GITHUB_REPOSITORY': 'Brilliant666/DokiTool'},
+            {'GITHUB_REPOSITORY': 'Daiobs/DokiTool'},
+            {'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go'},
             {'GITHUB_REPOSITORY': 'other/repo'},
+            {'GITHUB_REPOSITORY_OWNER': 'Brilliant666'},
             {'GITHUB_REPOSITORY_OWNER': 'other'},
             {'GITHUB_SERVER_URL': 'https://evil.test'},
             {'GITHUB_RUN_ID': '123/evil'},
@@ -997,7 +1002,7 @@ class BoundaryAndSecurityTests(unittest.TestCase):
                 watch.environment(env)
 
     def test_safe_text_escapes_mentions_markdown_and_html(self):
-        text = watch.safe_text('@Brilliant666\n[click](https://evil.test) <script>alert("x")</script> `code` | col')
+        text = watch.safe_text('@Daiobs\n[click](https://evil.test) <script>alert("x")</script> `code` | col')
         self.assertNotIn('@', text)
         self.assertNotIn('\n', text)
         self.assertNotIn('<script>', text)
@@ -1034,8 +1039,8 @@ class CliEntrypointTests(unittest.TestCase):
             write_synthetic_lock_files(root)
             summary_path = Path(tmp) / 'step-summary.md'
             env = {
-                'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go',
-                'GITHUB_REPOSITORY_OWNER': 'Brilliant666',
+                'GITHUB_REPOSITORY': 'Daiobs/DokiTool-Go',
+                'GITHUB_REPOSITORY_OWNER': 'Daiobs',
                 'GITHUB_SERVER_URL': 'https://github.com',
                 'GITHUB_RUN_ID': '98765',
                 'GITHUB_TOKEN': 'test-token',
@@ -1052,15 +1057,16 @@ class CliEntrypointTests(unittest.TestCase):
             self.assertTrue(parsed['dry_run'])
             summary_md = summary_path.read_text(encoding='utf-8')
             self.assertIn('## DokiTool-Go 上游运行时版本检查', summary_md)
-            self.assertIn('https://github.com/Brilliant666/DokiTool-Go/issues/17', summary_md)
+            self.assertIn('https://github.com/Daiobs/DokiTool-Go/issues/17', summary_md)
 
     def test_cli_exits_nonzero_on_wrong_repository_or_missing_token_offline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_synthetic_lock_files(root)
             for extra_env, expected_err in (
-                ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool'}, 'Brilliant666/DokiTool-Go'),
-                ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go'}, 'GITHUB_TOKEN is required'),
+                ({'GITHUB_REPOSITORY': 'Daiobs/DokiTool'}, 'Daiobs/DokiTool-Go'),
+                ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go'}, 'Daiobs/DokiTool-Go'),
+                ({'GITHUB_REPOSITORY': 'Daiobs/DokiTool-Go'}, 'GITHUB_TOKEN is required'),
             ):
                 with self.subTest(extra_env=extra_env):
                     env = {'PATH': os.environ.get('PATH', ''), **extra_env}
@@ -1129,8 +1135,8 @@ class CliEntrypointTests(unittest.TestCase):
 
                 # 3a) Normal watch mode (initial Issue creation) succeeds (exit 0) and writes "本地配置漂移".
                 env = {
-                    'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go',
-                    'GITHUB_REPOSITORY_OWNER': 'Brilliant666',
+                    'GITHUB_REPOSITORY': 'Daiobs/DokiTool-Go',
+                    'GITHUB_REPOSITORY_OWNER': 'Daiobs',
                     'GITHUB_SERVER_URL': 'https://github.com',
                     'GITHUB_TOKEN': 'test-token',
                 }
@@ -1163,7 +1169,7 @@ class CliEntrypointTests(unittest.TestCase):
                 self.assertTrue(comment_result['changed'])
                 self.assertTrue(comment_result['notification_posted'])
                 self.assertEqual(len(comment_api.writes), 1)
-                self.assertEqual(comment_api.writes[0][1], '/repos/Brilliant666/DokiTool-Go/issues/17/comments')
+                self.assertEqual(comment_api.writes[0][1], '/repos/Daiobs/DokiTool-Go/issues/17/comments')
                 comment_body = comment_api.writes[0][2]['body']
                 self.assertIn('本地配置漂移', comment_body)
                 self.assertIn(expected_fragment, comment_body)
