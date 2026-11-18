@@ -35,7 +35,7 @@ if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 SHORT_SHA="${TARGET_SHA:0:7}"
-REPO="${DOKITOOL_GITHUB_REPO:-Brilliant666/DokiTool-Go}"
+REPO="${DOKITOOL_GITHUB_REPO:-Daiobs/DokiTool-Go}"
 RELEASE_TAG="${DOKITOOL_RELEASE_TAG:-build-${SHORT_SHA}}"
 SIGNER_WORKFLOW="${DOKITOOL_SIGNER_WORKFLOW:-${REPO}/.github/workflows/release-build.yml}"
 SOURCE_REF="${DOKITOOL_SOURCE_REF:-refs/heads/main}"
