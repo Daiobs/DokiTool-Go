@@ -40,4 +40,4 @@ DokiTool 将 PHP 后端和 Vue 3/Vite 前端整合为一个独立维护的项目
 
 本项目不设置定时镜像任务，不自动拉取并覆盖上游文件，也不因上游出现新提交而自动发布。需要采用的新变化通过明确的改动范围、代码审查和验证进入本仓库。
 
-本文件与 `UPSTREAM.json`（及历史初始快照 `.github/upstream-watch-baseline.json`）保留早期 PHP 后端与 Vue 前端的来源归属与许可记录。进入 `DokiTool-Go` 阶段后，GitHub Actions 每日定时任务改为检查 Go 期锁定的上游运行时（`yt-dlp/yt-dlp` 与 `denoland/deno`）正式版 Release 变化并通过专用 Issue 通知；此任务同样只检测不自动采用代码或部署，运行方式、通知和安全边界见 [上游运行时版本每日检查](UPSTREAM-WATCH.md)。
+本文件与 `UPSTREAM.json`（及历史初始快照 `.github/upstream-watch-baseline.json`）保留早期 PHP 后端与 Vue 前端的来源归属与许可记录。进入 `DokiTool-Go` 阶段后，GitHub Actions 每日定时任务改为检查 Go 期锁定的上游运行时（`yt-dlp/yt-dlp` 与 `denoland/deno`）正式版 Release 变化并通过专用 Issue 通知；此任务同样只检测不自动采用代码或部署。升级 `yt-dlp` 或 `Deno` 时，需通过经人工审查的 PR 同步更新全仓 5 处锁定文件（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）中的版本号与官方 SHA-256 摘要；运行方式、跨文件漂移校验、通知和安全边界见 [上游运行时版本每日检查](UPSTREAM-WATCH.md)。

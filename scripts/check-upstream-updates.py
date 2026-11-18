@@ -26,19 +26,54 @@ TITLE = 'DokiTool-Go 上游运行时版本检查'
 SCHEMA_VERSION = 2
 MARKER = '<!-- dokitool-upstream-watch-state:v2:'
 STATE_RE = re.compile(re.escape(MARKER) + r'([A-Za-z0-9+/=]+) -->')
-YTDLP_VERSION_RE = re.compile(r'^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?\Z')
-DENO_VERSION_RE = re.compile(r'^\d+\.\d+\.\d+\Z')
+YTDLP_VERSION_RE = re.compile(r'^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?\Z', re.ASCII)
+DENO_VERSION_RE = re.compile(r'^\d+\.\d+\.\d+\Z', re.ASCII)
+SHA256_HEX_RE = re.compile(r'^[0-9a-f]{64}\Z', re.ASCII)
 YTDLP_SOURCE_REL = Path('backend/internal/ytengine/engine.go')
 DENO_SOURCE_REL = Path('backend/internal/platform/youtube/ejs_sandbox.go')
+RELEASE_BUILD_WORKFLOW_REL = Path('.github/workflows/release-build.yml')
+GATEWAY_ISOLATION_WORKFLOW_REL = Path('.github/workflows/gateway-isolation.yml')
+VALIDATION_REQUIREMENTS_REL = Path('scripts/requirements-validation.txt')
+LOCK_FILES = (
+    YTDLP_SOURCE_REL,
+    DENO_SOURCE_REL,
+    RELEASE_BUILD_WORKFLOW_REL,
+    GATEWAY_ISOLATION_WORKFLOW_REL,
+    VALIDATION_REQUIREMENTS_REL,
+)
 YTDLP_CONST_RE = re.compile(r'^[ \t]*const[ \t]+PinnedVersion[ \t]*=[ \t]*"([^"\r\n]*)"[ \t]*(?://.*)?$', re.MULTILINE)
 DENO_CONST_RE = re.compile(r'^[ \t]*(?:const[ \t]+)?PinnedDenoVersion[ \t]*=[ \t]*"([^"\r\n]*)"[ \t]*(?://.*)?$', re.MULTILINE)
+YTDLP_HASH_MAP_RE = re.compile(r'\bvar[ \t]+OfficialSHA256Sums\w*[ \t]*=[ \t]*map\[string\]string\{([^}]*)\}')
+YTDLP_LINUX_ENTRY_RE = re.compile(r'"([^"\r\n]*)"[ \t]*:[ \t]*"yt-dlp_linux"')
+DENO_HASH_MAP_RE = re.compile(r'\bvar[ \t]+OfficialDenoSHA256Sums\w*[ \t]*=[ \t]*map\[string\]string\{([^}]*)\}')
+DENO_LINUX_ENTRY_RE = re.compile(r'"([^"\r\n]*)"[ \t]*:[ \t]*"deno-x86_64-unknown-linux-gnu"')
+RELEASE_BUILD_DENO_URL_RE = re.compile(
+    r'https://github\.com/denoland/deno/releases/download/([^/\s"\']+)/deno-x86_64-unknown-linux-gnu\.zip'
+)
+RELEASE_BUILD_DENO_ASSERT_RE = re.compile(r'["\']deno ([^"\'\r\n]+?)["\']')
+RELEASE_BUILD_DENO_SHA_RE = re.compile(
+    r'echo[ \t]+["\']?([^\s"\']+)[^\r\n|]*\bdeno/deno\b[^\r\n|]*\|[ \t]*sha256sum\b'
+)
+GATEWAY_YTDLP_URL_RE = re.compile(
+    r'https://github\.com/yt-dlp/yt-dlp/releases/download/([^/\s"\']+)/yt-dlp_linux\b'
+)
+GATEWAY_YTDLP_SHA_RE = re.compile(
+    r'echo[ \t]+["\']?([^\s"\']+)[^\r\n|]*\byt-dlp_linux\b[^\r\n|]*\|[ \t]*sha256sum\b'
+)
 RELEASES_PER_PAGE = 20
 STABLE_RELEASE_WINDOW = 10
 MAX_BODY = 65000
 SHANGHAI = dt.timezone(dt.timedelta(hours=8))
+STATUS_LABELS = {
+    'aligned': '已对齐',
+    'ahead': '发现新正式版',
+    'behind': '上游 latest 低于本地锁定',
+    'unparseable': '版本不一致（需人工核对）',
+}
 UPGRADE_REMINDER = (
-    '升级提醒：升级 `yt-dlp` 或 `Deno` 需通过经人工审查的 PR 同步更新源码及构建工作流中的锁定版本号与官方 SHA-256 校验摘要'
-    '（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`）。'
+    '升级提醒：升级 `yt-dlp` 或 `Deno` 需通过经人工审查的 PR 同步更新源码、工作流与验证依赖中的锁定版本号及官方 SHA-256 校验摘要'
+    '（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、'
+    '`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）。'
     '本检查仅读取 GitHub 公开 Release 元数据并发送 Issue 通知，不下载执行上游产物，也不会自动修改仓库代码或部署。'
     '后续机器人评论携带最新观察状态；关闭此 Issue 不会停用检查。'
 )
@@ -121,6 +156,252 @@ def comparable_version(repo, tag_name):
     return checked
 
 
+def parse_version_tuple(repo, version_text):
+    if not isinstance(version_text, str):
+        return None
+    if repo == 'denoland/deno':
+        if not DENO_VERSION_RE.fullmatch(version_text):
+            return None
+        return tuple(int(part) for part in version_text.split('.'))
+    if repo == 'yt-dlp/yt-dlp':
+        if not YTDLP_VERSION_RE.fullmatch(version_text):
+            return None
+        parts = [int(part) for part in version_text.split('.')]
+        if len(parts) == 3:
+            parts.append(0)
+        return tuple(parts)
+    return None
+
+
+def compare_upstream_version(repo, tag_name, locked_version):
+    try:
+        normalized = comparable_version(repo, tag_name)
+    except WatchError:
+        return 'unparseable'
+    upstream_tuple = parse_version_tuple(repo, normalized)
+    locked_tuple = parse_version_tuple(repo, locked_version)
+    if upstream_tuple is None or locked_tuple is None:
+        return 'unparseable'
+    if upstream_tuple > locked_tuple:
+        return 'ahead'
+    if upstream_tuple < locked_tuple:
+        return 'behind'
+    if normalized != locked_version:
+        return 'unparseable'
+    return 'aligned'
+
+
+def upstream_status_label(repo, tag_name, locked_version, drift=()):
+    status = STATUS_LABELS[compare_upstream_version(repo, tag_name, locked_version)]
+    if drift:
+        return f'{status}（本地配置漂移）'
+    return status
+
+
+def _read_repo_text(path):
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, UnicodeError):
+        return None
+
+
+def _extract_map_sha256(source, map_re, entry_re):
+    blocks = map_re.findall(source)
+    if len(blocks) != 1:
+        return None
+    entries = entry_re.findall(blocks[0])
+    if len(entries) != 1 or not SHA256_HEX_RE.fullmatch(entries[0]):
+        return None
+    return entries[0]
+
+
+def collect_local_pin_drift(root=ROOT, pinned=None):
+    """Inspect all 5 repository lock files and return drift warnings per upstream."""
+    root = Path(root)
+    pinned = load_pinned_versions(root) if pinned is None else validate_pinned_versions(pinned)
+    ytdlp_ver = pinned['yt-dlp/yt-dlp']
+    deno_ver = pinned['denoland/deno']
+    drift = {'yt-dlp/yt-dlp': [], 'denoland/deno': []}
+
+    ytdlp_linux_sha = None
+    engine_text = _read_repo_text(root / YTDLP_SOURCE_REL)
+    if engine_text is None:
+        drift['yt-dlp/yt-dlp'].append(f'无法读取 `{YTDLP_SOURCE_REL.as_posix()}`')
+    else:
+        const_matches = YTDLP_CONST_RE.findall(engine_text)
+        if len(const_matches) != 1:
+            drift['yt-dlp/yt-dlp'].append(f'`{YTDLP_SOURCE_REL.as_posix()}` 缺失或重复定义 `PinnedVersion`')
+        elif const_matches[0] != ytdlp_ver:
+            drift['yt-dlp/yt-dlp'].append(
+                f'`{YTDLP_SOURCE_REL.as_posix()}` 中 `PinnedVersion`（{safe_text(const_matches[0], 80)}）'
+                f'与预期锁定版本 `{ytdlp_ver}` 不一致'
+            )
+        ytdlp_linux_sha = _extract_map_sha256(engine_text, YTDLP_HASH_MAP_RE, YTDLP_LINUX_ENTRY_RE)
+        if ytdlp_linux_sha is None:
+            drift['yt-dlp/yt-dlp'].append(
+                f'`{YTDLP_SOURCE_REL.as_posix()}` 缺失或无法唯一解析 `OfficialSHA256Sums*` 中的 `yt-dlp_linux` SHA-256'
+            )
+
+    deno_linux_sha = None
+    sandbox_text = _read_repo_text(root / DENO_SOURCE_REL)
+    if sandbox_text is None:
+        drift['denoland/deno'].append(f'无法读取 `{DENO_SOURCE_REL.as_posix()}`')
+    else:
+        const_matches = DENO_CONST_RE.findall(sandbox_text)
+        if len(const_matches) != 1:
+            drift['denoland/deno'].append(f'`{DENO_SOURCE_REL.as_posix()}` 缺失或重复定义 `PinnedDenoVersion`')
+        elif const_matches[0] != deno_ver:
+            drift['denoland/deno'].append(
+                f'`{DENO_SOURCE_REL.as_posix()}` 中 `PinnedDenoVersion`（{safe_text(const_matches[0], 80)}）'
+                f'与预期锁定版本 `{deno_ver}` 不一致'
+            )
+        deno_linux_sha = _extract_map_sha256(sandbox_text, DENO_HASH_MAP_RE, DENO_LINUX_ENTRY_RE)
+        if deno_linux_sha is None:
+            drift['denoland/deno'].append(
+                f'`{DENO_SOURCE_REL.as_posix()}` 缺失或无法唯一解析 `OfficialDenoSHA256Sums*` 中的'
+                ' `deno-x86_64-unknown-linux-gnu` SHA-256'
+            )
+
+    release_wf_rel = RELEASE_BUILD_WORKFLOW_REL.as_posix()
+    release_wf_text = _read_repo_text(root / RELEASE_BUILD_WORKFLOW_REL)
+    if release_wf_text is None:
+        drift['denoland/deno'].append(f'无法读取 `{release_wf_rel}`')
+    else:
+        expected_deno_tag = f'v{deno_ver}'
+        url_tags = RELEASE_BUILD_DENO_URL_RE.findall(release_wf_text)
+        if not url_tags:
+            drift['denoland/deno'].append(f'`{release_wf_rel}` 未找到 Deno Linux x86_64 下载地址')
+        else:
+            for found_tag in dict.fromkeys(url_tags):
+                if found_tag != expected_deno_tag:
+                    drift['denoland/deno'].append(
+                        f'`{release_wf_rel}` Deno 下载版本（{safe_text(found_tag, 80)}）'
+                        f'与 Go 锁定版本 `{expected_deno_tag}` 不一致'
+                    )
+        raw_asserts = RELEASE_BUILD_DENO_ASSERT_RE.findall(release_wf_text)
+        normalized_asserts = [item[:-1] if item.endswith(' ') else item for item in raw_asserts]
+        if not normalized_asserts:
+            drift['denoland/deno'].append(f'`{release_wf_rel}` 未找到 `deno <version>` 版本断言')
+        else:
+            for found_ver in dict.fromkeys(normalized_asserts):
+                if found_ver != deno_ver:
+                    drift['denoland/deno'].append(
+                        f'`{release_wf_rel}` Deno 版本断言（deno {safe_text(found_ver, 80)}）'
+                        f'与 Go 锁定版本 `deno {deno_ver}` 不一致'
+                    )
+        sha_matches = RELEASE_BUILD_DENO_SHA_RE.findall(release_wf_text)
+        if len(sha_matches) != 1:
+            drift['denoland/deno'].append(f'`{release_wf_rel}` 缺失或无法唯一解析 Deno Linux x86_64 SHA-256 校验行')
+        else:
+            found_sha = sha_matches[0].lower()
+            if not SHA256_HEX_RE.fullmatch(found_sha):
+                drift['denoland/deno'].append(
+                    f'`{release_wf_rel}` Deno Linux x86_64 SHA-256（{safe_text(sha_matches[0], 80)}）格式非法'
+                )
+            elif deno_linux_sha is not None and found_sha != deno_linux_sha:
+                drift['denoland/deno'].append(
+                    f'`{release_wf_rel}` Deno Linux x86_64 SHA-256（`{found_sha}`）'
+                    f'与 `{DENO_SOURCE_REL.as_posix()}`（`{deno_linux_sha}`）不一致'
+                )
+
+    gateway_wf_rel = GATEWAY_ISOLATION_WORKFLOW_REL.as_posix()
+    gateway_wf_text = _read_repo_text(root / GATEWAY_ISOLATION_WORKFLOW_REL)
+    if gateway_wf_text is None:
+        drift['yt-dlp/yt-dlp'].append(f'无法读取 `{gateway_wf_rel}`')
+    else:
+        url_vers = GATEWAY_YTDLP_URL_RE.findall(gateway_wf_text)
+        if not url_vers:
+            drift['yt-dlp/yt-dlp'].append(f'`{gateway_wf_rel}` 未找到 `yt-dlp_linux` 下载地址')
+        else:
+            for found_ver in dict.fromkeys(url_vers):
+                if found_ver != ytdlp_ver:
+                    drift['yt-dlp/yt-dlp'].append(
+                        f'`{gateway_wf_rel}` yt-dlp 下载版本（{safe_text(found_ver, 80)}）'
+                        f'与 Go 锁定版本 `{ytdlp_ver}` 不一致'
+                    )
+        sha_matches = GATEWAY_YTDLP_SHA_RE.findall(gateway_wf_text)
+        if len(sha_matches) != 1:
+            drift['yt-dlp/yt-dlp'].append(f'`{gateway_wf_rel}` 缺失或无法唯一解析 `yt-dlp_linux` SHA-256 校验行')
+        else:
+            found_sha = sha_matches[0].lower()
+            if not SHA256_HEX_RE.fullmatch(found_sha):
+                drift['yt-dlp/yt-dlp'].append(
+                    f'`{gateway_wf_rel}` yt-dlp_linux SHA-256（{safe_text(sha_matches[0], 80)}）格式非法'
+                )
+            elif ytdlp_linux_sha is not None and found_sha != ytdlp_linux_sha:
+                drift['yt-dlp/yt-dlp'].append(
+                    f'`{gateway_wf_rel}` yt-dlp_linux SHA-256（`{found_sha}`）'
+                    f'与 `{YTDLP_SOURCE_REL.as_posix()}`（`{ytdlp_linux_sha}`）不一致'
+                )
+
+    reqs_rel = VALIDATION_REQUIREMENTS_REL.as_posix()
+    reqs_text = _read_repo_text(root / VALIDATION_REQUIREMENTS_REL)
+    if reqs_text is None:
+        drift['denoland/deno'].append(f'无法读取 `{reqs_rel}`')
+    else:
+        deno_reqs = []
+        for raw_line in reqs_text.splitlines():
+            cleaned = raw_line.split('#', 1)[0].strip()
+            if not cleaned:
+                continue
+            match = re.match(r'^deno(?![A-Za-z0-9_.-])(.*)$', cleaned, re.IGNORECASE)
+            if match:
+                deno_reqs.append((cleaned, match.group(1).strip()))
+        if len(deno_reqs) != 1:
+            drift['denoland/deno'].append(f'`{reqs_rel}` 缺失或重复声明 `deno=={deno_ver}`')
+        else:
+            raw_spec, constraint = deno_reqs[0]
+            exact_match = re.fullmatch(r'==\s*(\S+)', constraint)
+            if exact_match is None:
+                drift['denoland/deno'].append(
+                    f'`{reqs_rel}` Deno 依赖项（{safe_text(raw_spec, 80)}）未使用精确版本锁定 `deno=={deno_ver}`'
+                )
+            elif exact_match.group(1) != deno_ver:
+                drift['denoland/deno'].append(
+                    f'`{reqs_rel}` Deno 锁定版本（deno=={safe_text(exact_match.group(1), 80)}）'
+                    f'与 Go 锁定版本 `deno=={deno_ver}` 不一致'
+                )
+
+    return drift
+
+
+def verify_local_pin_consistency(root=ROOT):
+    """Fail closed with WatchError if any of the 5 local lock files drift out of sync."""
+    pinned = load_pinned_versions(root)
+    drift = collect_local_pin_drift(root, pinned)
+    problems = [f'{repo}: {detail}' for repo in UPSTREAMS for detail in drift[repo]]
+    if problems:
+        raise WatchError('Local pin drift detected: ' + '; '.join(problems))
+    return pinned
+
+
+def normalize_local_drift(local_drift):
+    if local_drift is None:
+        return {repo: [] for repo in UPSTREAMS}
+    if not isinstance(local_drift, dict) or not set(local_drift).issubset(set(UPSTREAMS)):
+        raise WatchError('Invalid local drift mapping')
+    normalized = {}
+    for repo in UPSTREAMS:
+        items = local_drift.get(repo, [])
+        if not isinstance(items, list) or any(not isinstance(x, str) or not (0 < len(x) <= 512) for x in items):
+            raise WatchError('Invalid local drift entries')
+        normalized[repo] = list(items)
+    return normalized
+
+
+def _release_identity(record):
+    return (record['id'], record['tag_name'], record['published_at'])
+
+
+def _snapshot_identity(snapshot):
+    return (
+        snapshot['latest_id'],
+        snapshot['latest_tag'],
+        snapshot['latest_published_at'],
+        [_release_identity(record) for record in snapshot['releases']],
+    )
+
+
 def normalize_release_record(release):
     if not isinstance(release, dict):
         raise WatchError('Invalid release metadata')
@@ -129,9 +410,7 @@ def normalize_release_record(release):
         raise WatchError('Invalid release ID')
     tag_name = checked_text(release.get('tag_name'), 'release tag', 256)
     published_at = checked_text(release.get('published_at'), 'release published timestamp', 64)
-    updated_at = checked_text(release.get('updated_at'), 'release update timestamp', 64)
     parse_timestamp(published_at, 'release published timestamp')
-    parse_timestamp(updated_at, 'release update timestamp')
     raw_name = release.get('name')
     if raw_name is not None and not isinstance(raw_name, str):
         raise WatchError('Invalid release name')
@@ -140,7 +419,6 @@ def normalize_release_record(release):
         'id': ident,
         'tag_name': tag_name,
         'published_at': published_at,
-        'updated_at': updated_at,
     }
     if clean_name and clean_name != tag_name:
         record['name'] = clean_name
@@ -148,7 +426,7 @@ def normalize_release_record(release):
 
 
 def normalize_snapshot(snapshot):
-    """Only stable official release fields enter the fingerprint."""
+    """Only stable official release fields and local drift warnings enter the fingerprint."""
     if not isinstance(snapshot, dict):
         raise WatchError('Invalid repository snapshot')
     latest_id = snapshot.get('latest_id')
@@ -169,11 +447,19 @@ def normalize_snapshot(snapshot):
     latest_entry = by_id.get(latest_id)
     if latest_entry is None or latest_entry['tag_name'] != latest_tag or latest_entry['published_at'] != latest_published_at:
         raise WatchError('Latest release metadata does not match snapshot releases')
+    raw_drift = snapshot.get('local_drift')
+    if raw_drift is None:
+        local_drift = []
+    elif isinstance(raw_drift, list) and all(isinstance(item, str) and 0 < len(item) <= 512 for item in raw_drift):
+        local_drift = list(raw_drift)
+    else:
+        raise WatchError('Invalid local drift record in snapshot')
     return {
         'latest_id': latest_id,
         'latest_tag': latest_tag,
         'latest_published_at': latest_published_at,
         'releases': sorted(by_id.values(), key=lambda x: x['id']),
+        'local_drift': local_drift,
     }
 
 
@@ -294,7 +580,7 @@ class GitHub:
         return result
 
 
-def collect_snapshot(api, repo):
+def collect_snapshot(api, repo, local_drift=()):
     prefix = '/repos/' + repo
     raw_releases = api.get_list(f'{prefix}/releases?per_page={RELEASES_PER_PAGE}')
     latest = api.get(f'{prefix}/releases/latest')
@@ -320,7 +606,7 @@ def collect_snapshot(api, repo):
             raise WatchError('Duplicate release ID in upstream response')
         by_id[record['id']] = record
 
-    if latest_record['id'] in by_id and by_id[latest_record['id']] != latest_record:
+    if latest_record['id'] in by_id and _release_identity(by_id[latest_record['id']]) != _release_identity(latest_record):
         raise WatchError('Inconsistent release metadata between releases list and latest')
     by_id[latest_record['id']] = latest_record
 
@@ -337,6 +623,7 @@ def collect_snapshot(api, repo):
         'latest_tag': latest_record['tag_name'],
         'latest_published_at': latest_record['published_at'],
         'releases': selected,
+        'local_drift': list(local_drift),
     })
 
 
@@ -385,7 +672,7 @@ def describe_changes(repo, pinned_version, old, new):
     if (old['latest_id'], old['latest_tag'], old['latest_published_at']) != (
         new['latest_id'], new['latest_tag'], new['latest_published_at']
     ):
-        status = '已对齐' if comparable_version(repo, new['latest_tag']) == pinned_version else '发现新正式版'
+        status = STATUS_LABELS[compare_upstream_version(repo, new['latest_tag'], pinned_version)]
         lines.append(
             f'最新正式版：{safe_text(old["latest_tag"])} → {safe_text(new["latest_tag"])}'
             f'（当前锁定：`{pinned_version}`；状态：{status}）'
@@ -399,24 +686,34 @@ def describe_changes(repo, pinned_version, old, new):
 
     for ident in sorted(set(before) | set(after)):
         a, b = before.get(ident), after.get(ident)
-        if a == b:
-            continue
-        if a is None:
+        if a is not None and b is not None:
+            if _release_identity(a) == _release_identity(b):
+                continue
+            lines.append(
+                f'正式版变更：{_format_release_label(b)}（ID {ident}；发布时间 {safe_text(b["published_at"])}）'
+            )
+        elif a is None:
             if old_full and _release_sort_key(b) < old_oldest:
                 continue
             lines.append(
                 f'正式版新增：{_format_release_label(b)}（ID {ident}；发布时间 {safe_text(b["published_at"])}）'
             )
-        elif b is None:
+        else:
             if new_full and _release_sort_key(a) < new_oldest:
                 continue
             lines.append(f'正式版撤回或移除：{_format_release_label(a)}（ID {ident}）')
-        else:
-            lines.append(
-                f'正式版变更：{_format_release_label(b)}（ID {ident}；更新时间 {safe_text(b["updated_at"])}）'
-            )
-    if old != new and not lines:
+    if _snapshot_identity(old) != _snapshot_identity(new) and not lines:
         lines.append(f'正式版观察窗口更新：当前最新正式版 {safe_text(new["latest_tag"])}（ID {new["latest_id"]}）')
+
+    old_drift = old.get('local_drift', [])
+    new_drift = new.get('local_drift', [])
+    if new_drift != old_drift:
+        if new_drift:
+            lines.extend(f'本地配置漂移：{detail}' for detail in new_drift)
+        else:
+            lines.append('本地配置漂移已解除：仓库内锁定版本与 SHA-256 校验已恢复一致')
+    elif new_drift and lines:
+        lines.extend(f'本地配置漂移（待修复）：{detail}' for detail in new_drift)
     return lines
 
 
@@ -428,8 +725,7 @@ def make_summary_table(pinned, current):
     for repo in UPSTREAMS:
         snap = current['repositories'][repo]
         locked = pinned[repo]
-        aligned = comparable_version(repo, snap['latest_tag']) == locked
-        status = '已对齐' if aligned else '发现新正式版'
+        status = upstream_status_label(repo, snap['latest_tag'], locked, snap.get('local_drift', ()))
         published = parse_timestamp(snap['latest_published_at'], 'latest release timestamp').astimezone(dt.timezone.utc)
         rows.append(
             f'| [{repo}](https://github.com/{repo}) | `{locked}` | {safe_text(snap["latest_tag"])}'
@@ -443,18 +739,37 @@ def report_initial_divergence(pinned, current):
     for repo in UPSTREAMS:
         snap = current['repositories'][repo]
         locked = pinned[repo]
-        if comparable_version(repo, snap['latest_tag']) != locked:
-            latest_rec = next((r for r in snap['releases'] if r['id'] == snap['latest_id']), None)
-            label = _format_release_label(latest_rec) if latest_rec else safe_text(snap['latest_tag'])
-            lines = [
-                f'### [{repo}](https://github.com/{repo})',
-                '',
-                f'- 首次观察发现上游最新正式版与当前锁定版本不一致：本地锁定 `{locked}`，上游最新正式版 {label}'
-                f'（ID {snap["latest_id"]}；发布时间 {safe_text(snap["latest_published_at"])}）',
-                '',
-                f'[查看上游 Releases](https://github.com/{repo}/releases)',
-            ]
-            sections.append('\n'.join(lines))
+        relation = compare_upstream_version(repo, snap['latest_tag'], locked)
+        drift = snap.get('local_drift', [])
+        if relation == 'aligned' and not drift:
+            continue
+        latest_rec = next((r for r in snap['releases'] if r['id'] == snap['latest_id']), None)
+        label = _format_release_label(latest_rec) if latest_rec else safe_text(snap['latest_tag'])
+        bullets = []
+        if relation == 'ahead':
+            bullets.append(
+                f'- 首次观察发现新正式版：本地锁定 `{locked}`，上游最新正式版 {label}'
+                f'（ID {snap["latest_id"]}；发布时间 {safe_text(snap["latest_published_at"])}；状态：{STATUS_LABELS[relation]}）'
+            )
+        elif relation == 'behind':
+            bullets.append(
+                f'- 首次观察发现上游 latest 低于本地锁定：本地锁定 `{locked}`，上游最新正式版 {label}'
+                f'（ID {snap["latest_id"]}；发布时间 {safe_text(snap["latest_published_at"])}；状态：{STATUS_LABELS[relation]}）'
+            )
+        elif relation == 'unparseable':
+            bullets.append(
+                f'- 首次观察发现上游正式版标签格式异常：本地锁定 `{locked}`，上游最新正式版 {label}'
+                f'（ID {snap["latest_id"]}；发布时间 {safe_text(snap["latest_published_at"])}；状态：{STATUS_LABELS[relation]}）'
+            )
+        bullets.extend(f'- 本地配置漂移：{detail}' for detail in drift)
+        lines = [
+            f'### [{repo}](https://github.com/{repo})',
+            '',
+            *bullets,
+            '',
+            f'[查看上游 Releases](https://github.com/{repo}/releases)',
+        ]
+        sections.append('\n'.join(lines))
     return '\n\n'.join(sections)
 
 
@@ -499,14 +814,18 @@ def make_body(table, change_sections, current, run_url, initial=False):
     return body
 
 
-def run_check(api, pinned, *, dry_run=False, verify_notification=False, now=None, run_url=None):
+def run_check(api, pinned, *, dry_run=False, verify_notification=False, now=None, run_url=None, local_drift=None):
     pinned = validate_pinned_versions(pinned)
+    drift_by_repo = normalize_local_drift(local_drift)
     issue, previous = find_issue(api)
     observed_at = (now or dt.datetime.now(dt.timezone.utc)).isoformat()
     current = normalize_state({
         'schema': SCHEMA_VERSION,
         'observed_at': observed_at,
-        'repositories': {repo: collect_snapshot(api, repo) for repo in UPSTREAMS},
+        'repositories': {
+            repo: collect_snapshot(api, repo, drift_by_repo[repo])
+            for repo in UPSTREAMS
+        },
     })
     table = make_summary_table(pinned, current)
     if previous is None:
@@ -575,12 +894,14 @@ def main():
     args = parser.parse_args()
     run_url = environment(os.environ)
     pinned = load_pinned_versions()
+    local_drift = collect_local_pin_drift(ROOT, pinned)
     result = run_check(
         GitHub(os.environ.get('GITHUB_TOKEN')),
         pinned,
         dry_run=args.dry_run,
         verify_notification=args.verify_notification,
         run_url=run_url,
+        local_drift=local_drift,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')

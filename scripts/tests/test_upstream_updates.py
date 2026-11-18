@@ -1,4 +1,5 @@
 """Offline behavioral and security tests for DokiTool-Go upstream runtime watch."""
+import base64
 import copy
 import datetime as dt
 import importlib.util
@@ -6,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,12 +57,16 @@ def seed_upstream_data():
     }
 
 
-def build_state_from_upstreams(upstreams, observed_at='2026-10-28T01:00:00Z'):
+def build_state_from_upstreams(upstreams, observed_at='2026-10-28T01:00:00Z', local_drift=None):
     fake = FakeGitHub(upstreams)
+    drift_by_repo = watch.normalize_local_drift(local_drift)
     return watch.normalize_state({
         'schema': watch.SCHEMA_VERSION,
         'observed_at': observed_at,
-        'repositories': {repo: watch.collect_snapshot(fake, repo) for repo in watch.UPSTREAMS},
+        'repositories': {
+            repo: watch.collect_snapshot(fake, repo, drift_by_repo[repo])
+            for repo in watch.UPSTREAMS
+        },
     })
 
 
@@ -72,6 +78,13 @@ def managed_issue(state, issue_state='open'):
         'body': 'Monitoring enabled.\n' + watch.state_marker(state),
         'state': issue_state,
     }
+
+
+def clone_lock_files(dest_root):
+    for rel in watch.LOCK_FILES:
+        target = dest_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(watch.ROOT / rel, target)
 
 
 class FakeGitHub:
@@ -143,10 +156,16 @@ class FakeGitHub:
         raise AssertionError('Unexpected mutation')
 
 
-class PinnedVersionExtractionTests(unittest.TestCase):
-    def test_loads_real_repo_pinned_versions(self):
-        pinned = watch.load_pinned_versions()
+class PinnedVersionAndConsistencyTests(unittest.TestCase):
+    def test_loads_real_repo_pinned_versions_and_verifies_all_five_lock_files(self):
+        pinned = watch.verify_local_pin_consistency(watch.ROOT)
         self.assertEqual(pinned, {'yt-dlp/yt-dlp': '2026.10.26', 'denoland/deno': '2.9.8'})
+        self.assertEqual(
+            watch.collect_local_pin_drift(watch.ROOT, pinned),
+            {'yt-dlp/yt-dlp': [], 'denoland/deno': []},
+        )
+        for rel in watch.LOCK_FILES:
+            self.assertIn(rel.as_posix(), watch.UPGRADE_REMINDER)
 
     def test_accepts_ytdlp_patch_version_format(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,6 +206,161 @@ class PinnedVersionExtractionTests(unittest.TestCase):
                 with self.assertRaises(watch.WatchError):
                     watch.load_pinned_versions(root)
 
+    def test_synchronized_upgrade_across_all_five_lock_files_passes(self):
+        new_ytdlp_sha = 'a' * 64
+        new_deno_sha = 'b' * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clone_lock_files(root)
+            for rel in (watch.YTDLP_SOURCE_REL, watch.GATEWAY_ISOLATION_WORKFLOW_REL):
+                path = root / rel
+                text = path.read_text(encoding='utf-8')
+                text = text.replace('2026.10.26', '2026.10.26.1')
+                text = text.replace('767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795', new_ytdlp_sha)
+                path.write_text(text, encoding='utf-8')
+            for rel in (watch.DENO_SOURCE_REL, watch.RELEASE_BUILD_WORKFLOW_REL, watch.VALIDATION_REQUIREMENTS_REL):
+                path = root / rel
+                text = path.read_text(encoding='utf-8')
+                text = text.replace('2.9.8', '2.10.0')
+                text = text.replace('368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7', new_deno_sha)
+                path.write_text(text, encoding='utf-8')
+            self.assertEqual(
+                watch.verify_local_pin_consistency(root),
+                {'yt-dlp/yt-dlp': '2026.10.26.1', 'denoland/deno': '2.10.0'},
+            )
+
+    def test_detects_drift_across_workflows_requirements_and_go_sha_maps(self):
+        wrong_sha = 'f' * 64
+        mutations = [
+            (
+                'release-build-deno-url-version',
+                watch.RELEASE_BUILD_WORKFLOW_REL,
+                lambda s: s.replace('/download/v2.9.8/', '/download/v2.9.7/'),
+                'denoland/deno',
+                '.github/workflows/release-build.yml',
+            ),
+            (
+                'release-build-deno-assert-exact-branch',
+                watch.RELEASE_BUILD_WORKFLOW_REL,
+                lambda s: s.replace('"deno 2.9.8"|', '"deno 2.9.7"|'),
+                'denoland/deno',
+                '.github/workflows/release-build.yml',
+            ),
+            (
+                'release-build-deno-assert-prefix-branch',
+                watch.RELEASE_BUILD_WORKFLOW_REL,
+                lambda s: s.replace('"deno 2.9.8 "', '"deno 2.9.7 "'),
+                'denoland/deno',
+                '.github/workflows/release-build.yml',
+            ),
+            (
+                'release-build-deno-sha256',
+                watch.RELEASE_BUILD_WORKFLOW_REL,
+                lambda s: s.replace('368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7', wrong_sha),
+                'denoland/deno',
+                '.github/workflows/release-build.yml',
+            ),
+            (
+                'gateway-isolation-ytdlp-url-version',
+                watch.GATEWAY_ISOLATION_WORKFLOW_REL,
+                lambda s: s.replace('/download/2026.10.26/', '/download/2026.09.20/'),
+                'yt-dlp/yt-dlp',
+                '.github/workflows/gateway-isolation.yml',
+            ),
+            (
+                'gateway-isolation-ytdlp-sha256',
+                watch.GATEWAY_ISOLATION_WORKFLOW_REL,
+                lambda s: s.replace('767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795', wrong_sha),
+                'yt-dlp/yt-dlp',
+                '.github/workflows/gateway-isolation.yml',
+            ),
+            (
+                'requirements-validation-deno-version',
+                watch.VALIDATION_REQUIREMENTS_REL,
+                lambda s: s.replace('deno==2.9.8', 'deno==2.9.7'),
+                'denoland/deno',
+                'scripts/requirements-validation.txt',
+            ),
+            (
+                'requirements-validation-deno-non-exact',
+                watch.VALIDATION_REQUIREMENTS_REL,
+                lambda s: s.replace('deno==2.9.8', 'deno>=2.9.8'),
+                'denoland/deno',
+                'scripts/requirements-validation.txt',
+            ),
+            (
+                'engine-missing-linux-sha256',
+                watch.YTDLP_SOURCE_REL,
+                lambda s: s.replace('"yt-dlp_linux"', '"yt-dlp_other"'),
+                'yt-dlp/yt-dlp',
+                'backend/internal/ytengine/engine.go',
+            ),
+            (
+                'sandbox-missing-linux-sha256',
+                watch.DENO_SOURCE_REL,
+                lambda s: s.replace('"deno-x86_64-unknown-linux-gnu"', '"deno-other"'),
+                'denoland/deno',
+                'backend/internal/platform/youtube/ejs_sandbox.go',
+            ),
+        ]
+        for label, rel, mutate, target_repo, expected_fragment in mutations:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                clone_lock_files(root)
+                path = root / rel
+                path.write_text(mutate(path.read_text(encoding='utf-8')), encoding='utf-8')
+                drift = watch.collect_local_pin_drift(root)
+                other_repo = 'yt-dlp/yt-dlp' if target_repo == 'denoland/deno' else 'denoland/deno'
+                self.assertTrue(drift[target_repo], f'Expected drift for {label}')
+                self.assertEqual(drift[other_repo], [])
+                self.assertTrue(any(expected_fragment in item for item in drift[target_repo]))
+                with self.assertRaises(watch.WatchError):
+                    watch.verify_local_pin_consistency(root)
+
+
+class VersionOrderingTests(unittest.TestCase):
+    def test_deno_semver_and_ytdlp_calver_ordering_and_hostile_tags(self):
+        # Deno 3-part SemVer
+        self.assertEqual(watch.parse_version_tuple('denoland/deno', '2.9.8'), (2, 9, 8))
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', 'v2.9.8', '2.9.8'), 'aligned')
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', '2.9.8', '2.9.8'), 'aligned')
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', 'v2.9.9', '2.9.8'), 'ahead')
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', 'v2.10.0', '2.9.8'), 'ahead')
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', 'v2.8.9', '2.9.8'), 'behind')
+        self.assertEqual(watch.compare_upstream_version('denoland/deno', 'v2.9.7', '2.9.8'), 'behind')
+        self.assertEqual(watch.upstream_status_label('denoland/deno', 'v2.8.9', '2.9.8'), '上游 latest 低于本地锁定')
+
+        # yt-dlp 3/4-part zero-padded CalVer
+        self.assertEqual(watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.03.04'), (2026, 3, 4, 0))
+        self.assertEqual(watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.10.26'), (2026, 10, 26, 0))
+        self.assertEqual(watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.10.26.1'), (2026, 10, 26, 1))
+        self.assertLess(
+            watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.10.26'),
+            watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.10.26.1'),
+        )
+        self.assertLess(
+            watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.10.26.1'),
+            watch.parse_version_tuple('yt-dlp/yt-dlp', '2026.11.01'),
+        )
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.03.04', '2026.03.04'), 'aligned')
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.03.04.1', '2026.03.04'), 'ahead')
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.10.26.1', '2026.10.26'), 'ahead')
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.10.26.10', '2026.10.26.2'), 'ahead')
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.10.26', '2026.10.26.1'), 'behind')
+        self.assertEqual(watch.compare_upstream_version('yt-dlp/yt-dlp', '2026.09.20', '2026.10.26'), 'behind')
+
+        # Malformed or hostile tags degrade gracefully without raising
+        for repo, locked, bad_tag in (
+            ('denoland/deno', '2.9.8', 'v2.9.9-@Brilliant666|[evil](https://evil.test)<script>'),
+            ('denoland/deno', '2.9.8', 'v2.9'),
+            ('yt-dlp/yt-dlp', '2026.10.26', 'v2026.10.26'),
+            ('yt-dlp/yt-dlp', '2026.10.26', '2026.10.26.0'),
+            ('yt-dlp/yt-dlp', '2026.10.26', '2026-10-26'),
+        ):
+            with self.subTest(repo=repo, bad_tag=bad_tag):
+                self.assertEqual(watch.compare_upstream_version(repo, bad_tag, locked), 'unparseable')
+                self.assertEqual(watch.upstream_status_label(repo, bad_tag, locked), '版本不一致（需人工核对）')
+
 
 class WatchBehaviorTests(unittest.TestCase):
     def setUp(self):
@@ -217,20 +391,40 @@ class WatchBehaviorTests(unittest.TestCase):
         extracted = watch.extract_state(payload['body'])
         self.assertEqual(extracted['schema'], 2)
         self.assertEqual(extracted['repositories'], self.seed['repositories'])
+        for repo in watch.UPSTREAMS:
+            for rec in extracted['repositories'][repo]['releases']:
+                self.assertNotIn('updated_at', rec)
         second = self.run_watch(api)
         self.assertFalse(second['changed'])
         self.assertEqual(len(api.writes), 1)
 
-    def test_first_run_reports_divergence_when_upstream_already_ahead_of_pinned(self):
-        api = FakeGitHub(self.upstreams)
-        api.set_latest_stable('yt-dlp/yt-dlp', api_release(102, '2026.11.01', '2026-11-01T00:00:00Z'))
-        result = self.run_watch(api)
-        self.assertTrue(result['changed'])
-        self.assertTrue(result['issue_created'])
-        body = api.writes[0][2]['body']
-        self.assertIn('发现新正式版', body)
-        self.assertIn('`2026.10.26`', body)
-        self.assertIn(watch.safe_text('2026.11.01'), body)
+    def test_first_run_distinguishes_ahead_behind_and_unparseable_versions(self):
+        # 1) Ahead (yt-dlp 4-part CalVer hotfix 2026.10.26.1 > 2026.10.26)
+        api_ahead = FakeGitHub(self.upstreams)
+        api_ahead.set_latest_stable('yt-dlp/yt-dlp', api_release(102, '2026.10.26.1', '2026-10-26T12:00:00Z'))
+        res_ahead = self.run_watch(api_ahead)
+        self.assertTrue(res_ahead['changed'])
+        body_ahead = api_ahead.writes[0][2]['body']
+        self.assertIn('发现新正式版', body_ahead)
+        self.assertNotIn('上游 latest 低于本地锁定', body_ahead)
+
+        # 2) Behind (Deno older-branch patch v2.8.9 < 2.9.8 without make_latest=false)
+        api_behind = FakeGitHub(self.upstreams)
+        api_behind.set_latest_stable('denoland/deno', api_release(202, 'v2.8.9', '2026-10-27T00:00:00Z'))
+        res_behind = self.run_watch(api_behind)
+        self.assertTrue(res_behind['changed'])
+        body_behind = api_behind.writes[0][2]['body']
+        self.assertIn('上游 latest 低于本地锁定', body_behind)
+        self.assertNotIn('发现新正式版', body_behind)
+
+        # 3) Unparseable tag on first run
+        api_weird = FakeGitHub(self.upstreams)
+        api_weird.set_latest_stable('denoland/deno', api_release(203, 'deno-custom-tag', '2026-10-28T00:00:00Z'))
+        res_weird = self.run_watch(api_weird)
+        self.assertTrue(res_weird['changed'])
+        body_weird = api_weird.writes[0][2]['body']
+        self.assertIn('版本不一致（需人工核对）', body_weird)
+        self.assertNotIn('发现新正式版', body_weird)
 
     def test_unchanged_stable_releases_and_draft_or_canary_prereleases_do_not_notify(self):
         api = FakeGitHub(self.upstreams, managed_issue(self.seed))
@@ -253,6 +447,89 @@ class WatchBehaviorTests(unittest.TestCase):
             self.assertNotIn('/git/ref/heads/', read_path)
             self.assertNotIn('/commits', read_path)
 
+    def test_post_publish_updated_at_and_title_edits_produce_zero_noise(self):
+        api = FakeGitHub(self.upstreams, managed_issue(self.seed))
+        # Simulate post-publish asset upload (updated_at changes) and Release title/notes edit,
+        # including racing between GET /releases?per_page=20 and GET /releases/latest.
+        api.upstreams['denoland/deno']['releases'][0] = api_release(
+            201,
+            'v2.9.8',
+            '2026-10-20T00:00:00Z',
+            updated_at='2026-10-29T00:45:00Z',
+            name='Deno 2.9.8 (Linux binaries uploaded)',
+        )
+        api.upstreams['denoland/deno']['latest'] = api_release(
+            201,
+            'v2.9.8',
+            '2026-10-20T00:00:00Z',
+            updated_at='2026-10-29T00:50:00Z',
+            name='Deno 2.9.8 (All platform binaries uploaded)',
+        )
+        api.upstreams['yt-dlp/yt-dlp']['releases'][1] = api_release(
+            100,
+            '2026.09.20',
+            '2026-09-20T00:00:00Z',
+            updated_at='2026-10-29T00:40:00Z',
+            name='yt-dlp 2026.09.20 (retroactive changelog typo fix)',
+        )
+        result = self.run_watch(api)
+        self.assertNotEqual(
+            self.seed['repositories']['denoland/deno'],
+            watch.collect_snapshot(api, 'denoland/deno'),
+        )
+        self.assertFalse(result['changed'])
+        self.assertFalse(result['notification_posted'])
+        self.assertNotIn('正式版观察窗口更新', result['summary'])
+        self.assertNotIn('正式版变更', result['summary'])
+        self.assertEqual(api.writes, [])
+
+        # Genuine mismatch of tag_name or published_at between /releases and /releases/latest still fails closed.
+        api.upstreams['denoland/deno']['latest'] = api_release(
+            201,
+            'v2.9.8',
+            '2026-10-21T00:00:00Z',
+        )
+        with self.assertRaises(watch.WatchError):
+            self.run_watch(api)
+
+    def test_legacy_v2_state_with_updated_at_and_without_local_drift_is_accepted_without_noise(self):
+        legacy_payload = {
+            'schema': 2,
+            'observed_at': '2026-10-28T01:00:00Z',
+            'repositories': {
+                'yt-dlp/yt-dlp': {
+                    'latest_id': 101,
+                    'latest_tag': '2026.10.26',
+                    'latest_published_at': '2026-10-26T00:00:00Z',
+                    'releases': [
+                        {'id': 100, 'tag_name': '2026.09.20', 'published_at': '2026-09-20T00:00:00Z', 'updated_at': '2026-09-20T01:00:00Z'},
+                        {'id': 101, 'tag_name': '2026.10.26', 'published_at': '2026-10-26T00:00:00Z', 'updated_at': '2026-10-26T01:00:00Z'},
+                    ],
+                },
+                'denoland/deno': {
+                    'latest_id': 201,
+                    'latest_tag': 'v2.9.8',
+                    'latest_published_at': '2026-10-20T00:00:00Z',
+                    'releases': [
+                        {'id': 200, 'tag_name': 'v2.9.7', 'published_at': '2026-10-10T00:00:00Z', 'updated_at': '2026-10-10T01:00:00Z'},
+                        {'id': 201, 'tag_name': 'v2.9.8', 'published_at': '2026-10-20T00:00:00Z', 'updated_at': '2026-10-20T01:00:00Z'},
+                    ],
+                },
+            },
+        }
+        encoded = base64.b64encode(json.dumps(legacy_payload, separators=(',', ':')).encode('utf-8')).decode('ascii')
+        issue = {
+            'number': 17,
+            'title': watch.TITLE,
+            'user': copy.deepcopy(BOT),
+            'body': f'Legacy v2 state.\n{watch.MARKER}{encoded} -->',
+            'state': 'open',
+        }
+        api = FakeGitHub(self.upstreams, issue)
+        result = self.run_watch(api)
+        self.assertFalse(result['changed'])
+        self.assertEqual(api.writes, [])
+
     def test_canary_flood_pushing_20th_item_keeps_10_release_window_stable(self):
         many = seed_upstream_data()
         stable_15 = [
@@ -274,7 +551,7 @@ class WatchBehaviorTests(unittest.TestCase):
 
     def test_new_ytdlp_and_deno_stable_releases_post_comment_and_deduplicate(self):
         cases = [
-            ('yt-dlp/yt-dlp', api_release(105, '2026.11.05', '2026-11-05T02:00:00Z', name='yt-dlp 2026.11.05'), '`2026.10.26`'),
+            ('yt-dlp/yt-dlp', api_release(105, '2026.10.26.1', '2026-10-26T18:00:00Z', name='yt-dlp 2026.10.26.1'), '`2026.10.26`'),
             ('denoland/deno', api_release(205, 'v2.9.9', '2026-11-06T03:00:00Z', name='Deno 2.9.9'), '`2.9.8`'),
         ]
         for repo, new_rel, locked_cell in cases:
@@ -301,17 +578,19 @@ class WatchBehaviorTests(unittest.TestCase):
                 self.assertFalse(second['changed'])
                 self.assertEqual(len(api.writes), 1)
 
-    def test_stable_release_edit_and_retraction_are_reported_once(self):
-        # 1) Release edit (updated_at changes)
+    def test_tag_or_published_at_mutation_and_release_retraction_report_ordered_status_once(self):
+        # 1) Genuine release identity change (published_at changed for same release ID)
         api = FakeGitHub(self.upstreams, managed_issue(self.seed))
-        edited = api_release(201, 'v2.9.8', '2026-10-20T00:00:00Z', updated_at='2026-10-29T00:30:00Z')
-        api.set_latest_stable('denoland/deno', edited)
+        republished = api_release(201, 'v2.9.8', '2026-10-20T06:00:00Z')
+        api.set_latest_stable('denoland/deno', republished)
         res_edit = self.run_watch(api)
         self.assertTrue(res_edit['changed'])
         self.assertIn('正式版变更', res_edit['summary'])
+        self.assertIn('发布时间', res_edit['summary'])
+        self.assertNotIn('更新时间', res_edit['summary'])
         self.assertFalse(self.run_watch(api)['changed'])
 
-        # 2) Release retraction (v2.9.8 yanked back to v2.9.7)
+        # 2) Release retraction (v2.9.8 yanked back to v2.9.7 < 2.9.8)
         api2 = FakeGitHub(self.upstreams, managed_issue(self.seed))
         older = api_release(200, 'v2.9.7', '2026-10-10T00:00:00Z')
         api2.upstreams['denoland/deno']['releases'] = [older]
@@ -319,7 +598,53 @@ class WatchBehaviorTests(unittest.TestCase):
         res_retract = self.run_watch(api2)
         self.assertTrue(res_retract['changed'])
         self.assertIn('正式版撤回或移除', res_retract['summary'])
+        self.assertIn('上游 latest 低于本地锁定', res_retract['summary'])
+        self.assertNotIn('发现新正式版', res_retract['summary'])
         self.assertFalse(self.run_watch(api2)['changed'])
+
+    def test_local_pin_drift_notifies_once_marks_summary_and_reports_resolution(self):
+        drift = {
+            'yt-dlp/yt-dlp': [],
+            'denoland/deno': [
+                '`.github/workflows/release-build.yml` Deno 下载版本（v2\\.9\\.7）与 Go 锁定版本 `v2.9.8` 不一致',
+            ],
+        }
+        # Initial Issue creation when drift already exists on main
+        initial_api = FakeGitHub(self.upstreams)
+        init_res = self.run_watch(initial_api, local_drift=drift)
+        self.assertTrue(init_res['changed'])
+        self.assertTrue(init_res['issue_created'])
+        self.assertIn('已对齐（本地配置漂移）', init_res['summary'])
+        self.assertIn('本地配置漂移：', initial_api.writes[0][2]['body'])
+        self.assertFalse(self.run_watch(initial_api, local_drift=drift)['changed'])
+
+        # Incremental notification when drift appears after clean baseline
+        api = FakeGitHub(self.upstreams, managed_issue(self.seed))
+        first = self.run_watch(api, local_drift=drift)
+        self.assertTrue(first['changed'])
+        self.assertTrue(first['notification_posted'])
+        self.assertIn('已对齐（本地配置漂移）', first['summary'])
+        self.assertIn('本地配置漂移：', first['summary'])
+        self.assertEqual(len(api.writes), 1)
+        saved_drift = watch.extract_state(api.writes[0][2]['body'])
+        self.assertEqual(saved_drift['repositories']['denoland/deno']['local_drift'], drift['denoland/deno'])
+
+        # Same drift on the following day does not spam another comment, while summary still flags drift.
+        second = self.run_watch(api, local_drift=drift)
+        self.assertFalse(second['changed'])
+        self.assertIn('已对齐（本地配置漂移）', second['summary'])
+        self.assertEqual(len(api.writes), 1)
+
+        # Fixing the drift posts a single recovery comment and clears saved local_drift.
+        resolved = self.run_watch(api, local_drift={'yt-dlp/yt-dlp': [], 'denoland/deno': []})
+        self.assertTrue(resolved['changed'])
+        self.assertIn('本地配置漂移已解除', resolved['summary'])
+        self.assertNotIn('已对齐（本地配置漂移）', resolved['summary'])
+        self.assertEqual(len(api.writes), 2)
+        cleared_state = watch.extract_state(api.writes[1][2]['body'])
+        self.assertEqual(cleared_state['repositories']['denoland/deno']['local_drift'], [])
+        self.assertFalse(self.run_watch(api)['changed'])
+        self.assertEqual(len(api.writes), 2)
 
     def test_sliding_window_new_release_does_not_report_aged_out_release_as_retracted(self):
         full = seed_upstream_data()
@@ -452,7 +777,7 @@ class WatchBehaviorTests(unittest.TestCase):
         self.assertFalse(self.run_watch(api)['changed'])
         self.assertEqual(len(api.writes), 1)
 
-    def test_malicious_release_tags_and_names_are_escaped_in_notifications(self):
+    def test_malicious_release_tags_and_names_are_escaped_and_marked_for_manual_review(self):
         api = FakeGitHub(self.upstreams, managed_issue(self.seed))
         malicious = api_release(
             299,
@@ -475,6 +800,8 @@ class WatchBehaviorTests(unittest.TestCase):
         self.assertIn('&lt;img', visible)
         self.assertIn('\\[evil\\]\\(', visible)
         self.assertIn('\\`cmd\\`', visible)
+        self.assertIn('版本不一致（需人工核对）', visible)
+        self.assertNotIn('发现新正式版', visible)
 
 
 class BoundaryAndSecurityTests(unittest.TestCase):
@@ -564,6 +891,10 @@ class BoundaryAndSecurityTests(unittest.TestCase):
         bad['repositories']['yt-dlp/yt-dlp']['latest_id'] = 999999
         with self.assertRaises(watch.WatchError):
             watch.normalize_state(bad)
+        bad_drift = copy.deepcopy(seed)
+        bad_drift['repositories']['denoland/deno']['local_drift'] = 'not-a-list'
+        with self.assertRaises(watch.WatchError):
+            watch.normalize_state(bad_drift)
         with self.assertRaises(watch.WatchError):
             watch.make_body('table', 'x' * watch.MAX_BODY, seed, None)
 
