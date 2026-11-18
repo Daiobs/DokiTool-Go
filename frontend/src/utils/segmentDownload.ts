@@ -14,9 +14,17 @@
  */
 
 import { fetchMediaBlob, probeMediaLength, linkAbortSignals } from "../downloads/buffered";
-import { resourceSource, sourceUrl, type DownloadTarget, type TargetContext } from "./mediaContract";
-import { declaredSegments, fileResource, mediaExtension } from "./mediaDelivery";
-import type { Resource } from "../types/media";
+import {
+  availableSources,
+  resourceSource,
+  sourceAvailable,
+  sourceRoutes,
+  sourceUrl,
+  type DownloadTarget,
+  type TargetContext,
+} from "./mediaContract";
+import { declaredSegments, mediaExtension } from "./mediaDelivery";
+import type { Resource, Source } from "../types/media";
 
 export { declaredSegments };
 export const ARCHIVE_LIMIT_ERROR = "打包总大小超过 500 MB 上限，请分批或单文件下载";
@@ -24,6 +32,8 @@ export const ARCHIVE_LIMIT_ERROR = "打包总大小超过 500 MB 上限，请分
 /** 带可选字节区间的分片描述（HLS BYTERANGE / 普通整文件分片通用） */
 export interface HlsSegment {
   url: string;
+  /** 同一分片的候选备用线路（按优先级去重，首项为 url） */
+  routes?: string[];
   /** Range 起始字节（含）；缺省表示整个文件 */
   start?: number;
   /** 区间字节数；与 start 同时存在时按 Range 抓取 */
@@ -57,9 +67,35 @@ function triggerDownload(blob: Blob, filename: string): void {
   (setTimeout(() => URL.revokeObjectURL(url), 45_000) as { unref?: () => void })?.unref?.();
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  const reason = signal.reason;
+  if (
+    reason instanceof Error ||
+    (typeof DOMException !== "undefined" && reason instanceof DOMException)
+  ) {
+    return reason;
+  }
+  return new DOMException("Aborted", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
+}
+
+function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    Boolean(signal?.aborted) ||
+    (typeof error === "object" &&
+      error !== null &&
+      (error as { name?: unknown }).name === "AbortError")
+  );
+}
+
 /** Retain the existing bounded retry count; cancellation never retries. */
 async function fetchSegmentBlob(
-  url: string,
+  urlOrRoutes: string | string[],
   signal: AbortSignal | undefined,
   onChunk?: (loaded: number, total: number) => void,
   range?: { start: number; length: number },
@@ -67,7 +103,41 @@ async function fetchSegmentBlob(
   maxBytes?: number,
   maxBytesError?: string,
 ): Promise<Blob> {
+  const routes = Array.isArray(urlOrRoutes)
+    ? [...new Set(urlOrRoutes.filter(Boolean))]
+    : [urlOrRoutes];
+  if (!routes.length) throw new Error("分片下载失败");
   let lastError: unknown;
+  if (routes.length > 1) {
+    for (const candidateUrl of routes) {
+      throwIfAborted(signal);
+      try {
+        return await fetchMediaBlob(candidateUrl, {
+          signal,
+          onChunk,
+          range,
+          maxBytes,
+          maxBytesError,
+        });
+      } catch (error) {
+        if (isAbortFailure(error, signal)) {
+          if (signal?.aborted) throw abortReason(signal);
+          throw error;
+        }
+        if (
+          (maxBytesError &&
+            error instanceof Error &&
+            error.message === maxBytesError) ||
+          error instanceof RangeError
+        ) {
+          throw error;
+        }
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("分片下载失败");
+  }
+  const url = routes[0];
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (signal?.aborted) throw signal.reason;
     try { return await fetchMediaBlob(url, { signal, onChunk, range, maxBytes, maxBytesError }); }
@@ -221,7 +291,7 @@ export async function mergeSegments(
     const segment = usable[i];
     const remaining = maxBytes - totalLoaded;
     if (remaining <= 0) throw new Error(maxBytesError || "资源超过允许的读取范围");
-    const part = await fetchSegmentBlob(segment.url, signal, loaded => onProgress?.({
+    const part = await fetchSegmentBlob(segment.routes?.length ? [segment.url, ...segment.routes] : segment.url, signal, loaded => onProgress?.({
       loaded: totalLoaded + loaded, total: totalBytes,
       percent: totalBytes ? Math.min(99, Math.floor((totalLoaded + loaded) / totalBytes * 100)) : Math.floor(i / usable.length * 100),
       segment: i + 1, segmentCount: usable.length,
@@ -269,7 +339,7 @@ export async function appendSegmentsToZip(
   for (let i = 0; i < usable.length; i++) {
     const segment = usable[i];
     const buf = await fetchSegmentBlob(
-      segment.url,
+      segment.routes?.length ? [segment.url, ...segment.routes] : segment.url,
       signal,
       undefined,
       segment.start !== undefined && segment.length !== undefined
@@ -286,6 +356,86 @@ export interface ArchiveEntryItem {
   data: Blob | Uint8Array<ArrayBuffer>;
 }
 
+interface ArchiveRouteCandidate {
+  url: string;
+  expectedSize?: number;
+}
+
+function buildArchiveRouteCandidates(
+  orderedSources: Source[],
+  context: TargetContext,
+): ArchiveRouteCandidate[] {
+  const byUrl = new Map<
+    string,
+    { url: string; expectedSize?: number; conflicted?: boolean }
+  >();
+  for (const source of orderedSources) {
+    const size =
+      typeof source.size_bytes === "number" &&
+      Number.isSafeInteger(source.size_bytes) &&
+      source.size_bytes > 0
+        ? source.size_bytes
+        : undefined;
+    for (const url of sourceRoutes(source, context)) {
+      const existing = byUrl.get(url);
+      if (!existing) {
+        byUrl.set(url, { url, expectedSize: size });
+      } else if (!existing.conflicted && size !== undefined) {
+        if (existing.expectedSize === undefined) {
+          existing.expectedSize = size;
+        } else if (existing.expectedSize !== size) {
+          existing.expectedSize = undefined;
+          existing.conflicted = true;
+        }
+      }
+    }
+  }
+  return [...byUrl.values()].map(({ url, expectedSize }) => ({
+    url,
+    expectedSize,
+  }));
+}
+
+async function fetchArchiveFileWithFallback(
+  candidates: ArchiveRouteCandidate[],
+  signal: AbortSignal,
+  maxBytes: number,
+): Promise<Blob> {
+  throwIfAborted(signal);
+  if (maxBytes <= 0) throw new Error(ARCHIVE_LIMIT_ERROR);
+  if (!candidates.length) throw new Error("资源没有可用来源，请重新解析");
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    throwIfAborted(signal);
+    if ((candidate.expectedSize || 0) > maxBytes) {
+      throw new Error(ARCHIVE_LIMIT_ERROR);
+    }
+    try {
+      return await fetchMediaBlob(candidate.url, {
+        signal,
+        expectedSize: candidate.expectedSize,
+        maxBytes,
+        maxBytesError: ARCHIVE_LIMIT_ERROR,
+      });
+    } catch (error) {
+      if (isAbortFailure(error, signal)) {
+        if (signal.aborted) throw abortReason(signal);
+        throw error;
+      }
+      if (
+        (error instanceof Error && error.message === ARCHIVE_LIMIT_ERROR) ||
+        error instanceof RangeError
+      ) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("没有可用的下载线路");
+}
+
 async function archiveResourceEntry(
   resource: Resource,
   name: string,
@@ -295,14 +445,13 @@ async function archiveResourceEntry(
 ): Promise<ArchiveEntryItem> {
   const delivery = resource.delivery;
   if (delivery.kind === "file") {
-    const target = fileResource(resource, apiContext);
-    if ((target.source.size_bytes || 0) > maxBytes) throw new Error(ARCHIVE_LIMIT_ERROR);
-    const data = await fetchMediaBlob(target.url, {
+    const orderedSources = availableSources(delivery.sources, apiContext.now);
+    const candidates = buildArchiveRouteCandidates(orderedSources, apiContext);
+    const data = await fetchArchiveFileWithFallback(
+      candidates,
       signal,
-      expectedSize: target.source.size_bytes,
       maxBytes,
-      maxBytesError: ARCHIVE_LIMIT_ERROR,
-    });
+    );
     return {
       filename: `${name}.${mediaExtension(resource.metadata, delivery, data.type)}`,
       data,
@@ -310,7 +459,7 @@ async function archiveResourceEntry(
   }
   if (delivery.kind === "hls" || delivery.kind === "segments") {
     const resolvedSegments = await declaredSegments(delivery, apiContext, signal);
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    throwIfAborted(signal);
     return {
       filename: `${name}.${mediaExtension(resource.metadata, delivery)}`,
       data: await mergeSegments(resolvedSegments, {
@@ -331,7 +480,12 @@ export function assertArchiveKnownSizeLimit(
   let upfrontKnown = 0;
   for (const snapTarget of targets) {
     if (snapTarget.kind === "file") {
-      upfrontKnown += snapTarget.source.size_bytes || 0;
+      const primary = sourceAvailable(snapTarget.source, apiContext.now)
+        ? snapTarget.source
+        : snapTarget.variant.delivery.kind === "file"
+          ? availableSources(snapTarget.variant.delivery.sources, apiContext.now)[0]
+          : undefined;
+      upfrontKnown += primary?.size_bytes || 0;
     } else if (snapTarget.kind === "pair" && snapTarget.variant.delivery.kind === "pair") {
       for (const res of snapTarget.variant.delivery.resources) {
         if (res.delivery.kind === "file") {
@@ -353,6 +507,7 @@ export async function collectArchiveTargetEntries(params: {
   currentBytes: number;
 }): Promise<{ entries: ArchiveEntryItem[]; totalBytes: number }> {
   const { itemId, target, base, apiContext, signal, maxArchiveBytes } = params;
+  throwIfAborted(signal);
   let archiveBytes = params.currentBytes;
   const entries: ArchiveEntryItem[] = [];
   const push = (entry: ArchiveEntryItem) => {
@@ -363,15 +518,32 @@ export async function collectArchiveTargetEntries(params: {
   const delivery = target.variant.delivery;
   if (target.kind === "file") {
     const remaining = maxArchiveBytes - archiveBytes;
-    if (remaining <= 0 || (target.source.size_bytes || 0) > remaining) {
+    if (remaining <= 0) {
       throw new Error(ARCHIVE_LIMIT_ERROR);
     }
-    const data = await fetchMediaBlob(target.url, {
+    const available =
+      delivery.kind === "file"
+        ? availableSources(delivery.sources, apiContext.now)
+        : availableSources([target.source], apiContext.now);
+    const primary = sourceAvailable(target.source, apiContext.now)
+      ? target.source
+      : undefined;
+    const orderedSources = primary
+      ? [
+          primary,
+          ...available.filter(
+            (candidate) =>
+              candidate !== primary &&
+              (primary.id === undefined || candidate.id !== primary.id),
+          ),
+        ]
+      : available;
+    const candidates = buildArchiveRouteCandidates(orderedSources, apiContext);
+    const data = await fetchArchiveFileWithFallback(
+      candidates,
       signal,
-      expectedSize: target.source.size_bytes,
-      maxBytes: remaining,
-      maxBytesError: ARCHIVE_LIMIT_ERROR,
-    });
+      remaining,
+    );
     push({
       filename: `${base}.${mediaExtension(target.variant.metadata, delivery.kind === "file" ? delivery : undefined, data.type)}`,
       data,

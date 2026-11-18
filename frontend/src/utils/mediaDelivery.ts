@@ -6,8 +6,8 @@ import type {
   Source,
 } from "../types/media";
 import {
-  sourceAvailable,
-  sourceUrl,
+  availableSources,
+  deliveryRoutes,
   type TargetContext,
 } from "./mediaContract";
 import type { HlsSegment } from "./segmentDownload";
@@ -16,9 +16,7 @@ export function declaredSource(
   sources: Source[],
   context: TargetContext = {},
 ): Source {
-  const source = sources.find((candidate) =>
-    sourceAvailable(candidate, context.now),
-  );
+  const source = availableSources(sources, context.now)[0];
   if (!source) throw new Error("资源没有可用来源，请重新解析");
   return source;
 }
@@ -71,27 +69,27 @@ export async function declaredSegments(
       ...(delivery.init ? [delivery.init] : []),
       ...delivery.pieces,
     ];
-    return chunks.map((chunk) => ({
-      url: sourceUrl(declaredSource(chunk.sources, context), context),
-      ...(chunk.byte_range
-        ? {
-            start: chunk.byte_range.start,
-            length: chunk.byte_range.end_inclusive - chunk.byte_range.start + 1,
-          }
-        : {}),
-    }));
+    return chunks.map((chunk) => {
+      const routes = deliveryRoutes(chunk.sources, context);
+      if (!routes.length) throw new Error("资源没有可用来源，请重新解析");
+      return {
+        url: routes[0],
+        ...(routes.length > 1 ? { routes } : {}),
+        ...(chunk.byte_range
+          ? {
+              start: chunk.byte_range.start,
+              length: chunk.byte_range.end_inclusive - chunk.byte_range.start + 1,
+            }
+          : {}),
+      };
+    });
   }
   if (delivery.kind === "hls") {
     if (delivery.scope !== "single")
       throw new Error("自适应 HLS 需要服务端选定完整清单，当前暂不支持");
     const { resolveHlsSegments } = await import("./segmentDownload");
-    for (const source of delivery.sources.filter((source) =>
-      sourceAvailable(source, context.now),
-    )) {
-      const segments = await resolveHlsSegments(
-        sourceUrl(source, context),
-        signal,
-      );
+    for (const route of deliveryRoutes(delivery.sources, context)) {
+      const segments = await resolveHlsSegments(route, signal);
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       if (
         segments &&
@@ -109,18 +107,13 @@ export async function declaredSegments(
 export function fileResource(resource: Resource, context: TargetContext = {}) {
   if (resource.delivery.kind !== "file")
     throw new Error("该资源需要处理，当前不能作为完整文件下载");
-  const source = declaredSource(resource.delivery.sources, context);
-  const url = sourceUrl(source, context);
+  const available = availableSources(resource.delivery.sources, context.now);
+  const source = available[0];
+  if (!source) throw new Error("资源没有可用来源，请重新解析");
+  const routes = deliveryRoutes(available, context);
   return {
     source,
-    url,
-    routes: [
-      url,
-      ...resource.delivery.sources
-        .filter(
-          (other) => other !== source && sourceAvailable(other, context.now),
-        )
-        .map((other) => sourceUrl(other, context)),
-    ],
+    url: routes[0],
+    routes,
   };
 }
