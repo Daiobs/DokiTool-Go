@@ -24,7 +24,11 @@ func New(executor fetch.Executor) *Parser { return &Parser{executor: executor} }
 
 // NewWithShanghai constructs a Bilibili parser that queries Shanghai in parallel
 // for domestic *.bilivideo.com routes while keeping Japan's tier list authoritative.
+// If shanghai implements BilibiliEnabled() bool and reports false, Shanghai remains disabled.
 func NewWithShanghai(executor fetch.Executor, shanghai ShanghaiResolver) *Parser {
+	if !shanghaiResolverEnabled(shanghai) {
+		shanghai = nil
+	}
 	return &Parser{executor: executor, shanghai: shanghai}
 }
 

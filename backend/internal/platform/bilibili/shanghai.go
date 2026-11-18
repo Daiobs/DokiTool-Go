@@ -83,6 +83,20 @@ type shanghaiPendingResolver interface {
 	ResolveBilibiliPending(ctx context.Context, bvid string, cid int64) (*ShanghaiPlay, func(bool), error)
 }
 
+type shanghaiBilibiliSwitch interface {
+	BilibiliEnabled() bool
+}
+
+func shanghaiResolverEnabled(resolver ShanghaiResolver) bool {
+	if resolver == nil {
+		return false
+	}
+	if sw, ok := resolver.(shanghaiBilibiliSwitch); ok {
+		return sw.BilibiliEnabled()
+	}
+	return true
+}
+
 type shanghaiCall struct {
 	done   chan struct{}
 	mu     sync.Mutex
@@ -93,7 +107,7 @@ type shanghaiCall struct {
 }
 
 func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid string, cid int64) *shanghaiCall {
-	if resolver == nil || !ValidBVID(bvid) || !ValidCID(cid) {
+	if !shanghaiResolverEnabled(resolver) || !ValidBVID(bvid) || !ValidCID(cid) {
 		return nil
 	}
 	call := &shanghaiCall{done: make(chan struct{})}

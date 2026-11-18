@@ -6,26 +6,33 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
@@ -901,5 +908,426 @@ func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, `"mode":"pull"`) || !strings.Contains(body, `"concurrency_limit":2`) || !strings.Contains(body, `"by_platform":{"douyin":`) || !strings.Contains(body, `"bilibili":`) {
 		t.Fatalf("expected pull shanghai mode, by_platform.{douyin,bilibili}, and ytdlp concurrency_limit=2 in /api/stats, got %s", body)
+	}
+}
+
+func TestShanghaiBilibiliSwitchValidation(t *testing.T) {
+	const (
+		address = "https://shanghai.example.org/v1/douyin/original"
+		key     = "development-test-only-32-byte-bearer"
+	)
+
+	validCases := []struct {
+		raw  string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"FALSE", false},
+		{"f", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{"t", true},
+	}
+	for _, tc := range validCases {
+		got, err := parseShanghaiBilibili(func(k string) string {
+			if k == "DOKITOOL_SHANGHAI_BILIBILI" {
+				return tc.raw
+			}
+			return ""
+		})
+		if err != nil || got != tc.want {
+			t.Fatalf("parseShanghaiBilibili(%q) = (%v, %v), want (%v, nil)", tc.raw, got, err, tc.want)
+		}
+
+		// Pull mode wiring check.
+		pullRes, _, err := configureShanghai(fetch.New(), func(k string) string {
+			switch k {
+			case "DOKITOOL_SHANGHAI_MODE":
+				return "pull"
+			case "DOKITOOL_SHANGHAI_PULL_TOKEN":
+				return key
+			case "DOKITOOL_SHANGHAI_BILIBILI":
+				return tc.raw
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatalf("configureShanghai(pull, %q) failed: %v", tc.raw, err)
+		}
+		broker, ok := pullRes.(*shresolver.PullBroker)
+		if !ok || broker == nil || broker.BilibiliEnabled() != tc.want {
+			t.Fatalf("configureShanghai(pull, %q) broker.BilibiliEnabled() = %v, want %v", tc.raw, broker != nil && broker.BilibiliEnabled(), tc.want)
+		}
+
+		// Direct mode wiring check.
+		directRes, _, err := configureShanghai(fetch.New(), func(k string) string {
+			switch k {
+			case "DOKITOOL_SHANGHAI_MODE":
+				return "direct"
+			case "DOKITOOL_SHANGHAI_ENDPOINT":
+				return address
+			case "DOKITOOL_SHANGHAI_TOKEN":
+				return key
+			case "DOKITOOL_SHANGHAI_BILIBILI":
+				return tc.raw
+			default:
+				return ""
+			}
+		})
+		if err != nil {
+			t.Fatalf("configureShanghai(direct, %q) failed: %v", tc.raw, err)
+		}
+		client, ok := directRes.(*shresolver.Client)
+		if !ok || client == nil || client.BilibiliEnabled() != tc.want {
+			t.Fatalf("configureShanghai(direct, %q) client.BilibiliEnabled() = %v, want %v", tc.raw, client != nil && client.BilibiliEnabled(), tc.want)
+		}
+	}
+
+	for _, invalid := range []string{"yes_please", "2", "on", "off", "auto", " true", "true "} {
+		if _, _, err := configureShanghai(fetch.New(), func(k string) string {
+			if k == "DOKITOOL_SHANGHAI_BILIBILI" {
+				return invalid
+			}
+			return ""
+		}); err == nil || !strings.Contains(err.Error(), "DOKITOOL_SHANGHAI_BILIBILI must be a boolean") {
+			t.Fatalf("configureShanghai(%q) err = %v, want DOKITOOL_SHANGHAI_BILIBILI boolean error", invalid, err)
+		}
+
+		t.Setenv("DOKITOOL_SHANGHAI_BILIBILI", invalid)
+		t.Setenv("DOKITOOL_SHANGHAI_MODE", "")
+		occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+		occupied.Close()
+		if runErr == nil || !strings.Contains(runErr.Error(), "DOKITOOL_SHANGHAI_BILIBILI must be a boolean") {
+			t.Fatalf("want DOKITOOL_SHANGHAI_BILIBILI startup error before listener bind for %q, got %v", invalid, runErr)
+		}
+		if strings.Contains(runErr.Error(), invalid) {
+			t.Fatalf("startup error echoed raw invalid env value %q: %v", invalid, runErr)
+		}
+	}
+}
+
+func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
+	const (
+		bvid    = "BV1234567890"
+		cidP1   = int64(5001)
+		cidP2   = int64(5002)
+		awemeID = "7704056737233449610"
+		videoID = "v0200fg10000dbl4sn7og65ijmfp8hm0"
+		objKey  = "/video/tos/cn/tos-cn-v-0015c001-alinc2/oNormal1080"
+		nowUnix = int64(1800000000)
+		dlUnix  = int64(1800007200)
+	)
+	nowTime := time.Unix(nowUnix, 0).UTC()
+	jpDouyinURL := "https://v3-dy-ov.zjcdn.com/" + strings.Repeat("2", 32) + "/6a000001" + objKey + "/?a=6383&mime_type=video_mp4"
+	shDouyinRaw := "https://v26-web.douyinvod.com/" + strings.Repeat("a", 32) + "/6a000001" + objKey + "/?a=6383&mime_type=video_mp4"
+	shDouyinLuna := "https://v26-luna.douyinvod.com/" + strings.Repeat("a", 32) + "/6a000001" + objKey + "/?a=6383&mime_type=video_mp4"
+
+	douyinDetailBody := func(mediaURL string) []byte {
+		doc := map[string]any{
+			"status_code": 0,
+			"aweme_detail": map[string]any{
+				"aweme_id": awemeID,
+				"desc":     "douyin isolation test",
+				"author":   map[string]any{"uid": "u1", "nickname": "author"},
+				"video": map[string]any{
+					"duration":        15000,
+					"cdn_url_expired": dlUnix,
+					"play_addr":       map[string]any{"uri": videoID},
+					"bit_rate": []map[string]any{{
+						"gear_name": "normal_1080_0",
+						"format":    "mp4",
+						"bit_rate":  2107000,
+						"is_h265":   0,
+						"play_addr": map[string]any{
+							"uri":       videoID,
+							"file_hash": "hash1080",
+							"width":     1920,
+							"height":    1080,
+							"data_size": 2135392,
+							"url_list":  []string{mediaURL},
+						},
+					}},
+				},
+			},
+		}
+		b, _ := json.Marshal(doc)
+		return b
+	}
+
+	biliViewBody, _ := json.Marshal(map[string]any{
+		"code": 0,
+		"data": map[string]any{
+			"bvid":    bvid,
+			"title":   "Switch Test",
+			"pic":     "https://i0.hdslb.com/bfs/archive/cover.jpg",
+			"desc":    "desc",
+			"pubdate": 1700000000,
+			"owner":   map[string]any{"name": "tester", "face": "https://i0.hdslb.com/bfs/face/avatar.jpg"},
+			"pages": []map[string]any{
+				{"cid": cidP1, "page": 1, "part": "P1", "duration": 30, "dimension": map[string]any{"width": 1920, "height": 1080, "rotate": 0}},
+				{"cid": cidP2, "page": 2, "part": "P2", "duration": 30, "dimension": map[string]any{"width": 1920, "height": 1080, "rotate": 0}},
+			},
+		},
+	})
+
+	cases := []struct {
+		name        string
+		envVal      string
+		wantEnabled bool
+	}{
+		{"default-unset", "", false},
+		{"explicit-0", "0", false},
+		{"explicit-false", "false", false},
+		{"explicit-1", "1", true},
+		{"explicit-true", "true", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ownerToken := randomHexToken(t, 24)
+			pullToken := randomHexToken(t, 24)
+			mediaKey := randomHexToken(t, 32)
+			env := map[string]string{
+				"DOKITOOL_OWNER_TOKEN":         ownerToken,
+				"DOKITOOL_SHANGHAI_MODE":       "pull",
+				"DOKITOOL_SHANGHAI_PULL_TOKEN": pullToken,
+				"DOKITOOL_SHANGHAI_BILIBILI":   tc.envVal,
+				"SNAP_MEDIA_SIGNING_KEY":       mediaKey,
+			}
+			getenv := func(k string) string { return env[k] }
+
+			var shBiliCalls atomic.Int64
+			var shDouyinCalls atomic.Int64
+
+			jpExec := fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch {
+				case strings.Contains(req.URL, "api.bilibili.com/x/web-interface/view"):
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: biliViewBody}, nil
+				case strings.Contains(req.URL, "api.bilibili.com/x/player/playurl"):
+					u, _ := url.Parse(req.URL)
+					cid := u.Query().Get("cid")
+					jpURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/05/%s/%s-1-80.mp4?deadline=%d", cid, cid, dlUnix)
+					b, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 80,
+							"format":  "mp4720",
+							"durl":    []map[string]any{{"url": jpURL, "size": 2097152, "length": 30000}},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: b}, nil
+				case strings.Contains(req.URL, "api.amemv.com/aweme/v1/aweme/detail/"):
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: douyinDetailBody(jpDouyinURL)}, nil
+				case strings.Contains(req.URL, "aweme.snssdk.com/aweme/v1/play/"):
+					return fetch.Response{StatusCode: 404, URL: req.URL}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected Japan outbound request: %s", req.URL)
+				}
+			})
+
+			shanghai, control, err := configureShanghai(jpExec, getenv)
+			if err != nil {
+				t.Fatalf("configureShanghai failed: %v", err)
+			}
+			broker := shanghai.(*shresolver.PullBroker)
+			broker.WithLookupNetIP(func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			}).WithClock(func() time.Time { return nowTime })
+
+			douyinParser, bilibiliParser := newShanghaiParsers(jpExec, probe.New(jpExec, douyin.AllowedMediaURL), shanghai)
+			c, err := catalog.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := api.NewWithCacheConfig(c, map[string]api.Adapter{
+				"douyin":   douyinParser,
+				"bilibili": bilibiliParser,
+			}, func() time.Time { return nowTime }, preparePublicMedia(mediaKey), api.DefaultCacheConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.Stats().SetShanghaiSource(broker)
+			ownerAuth, err := loadOwnerAuth(getenv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adm := api.DefaultAdmissionConfig()
+			adm.Parse.ClientBurst = 50
+			adm.Parse.ClientRPS = 50
+			entry, err := api.WithAdmissionWithOwner(h, control, "direct", "", adm, ownerAuth)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Start an upgraded Shanghai PullWorker advertising X-DokiTool-Shanghai-Tasks: douyin,bilibili.
+			controlExec := fakeExecutor(func(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+				if err := ctx.Err(); err != nil {
+					return fetch.Response{}, err
+				}
+				var bodyReader io.Reader
+				if len(req.Body) > 0 {
+					bodyReader = bytes.NewReader(req.Body)
+				}
+				httpReq := httptest.NewRequestWithContext(ctx, req.Method, req.URL, bodyReader)
+				httpReq.RemoteAddr = "127.0.0.1:47001"
+				for k, vals := range req.Header {
+					for _, v := range vals {
+						httpReq.Header.Add(k, v)
+					}
+				}
+				rec := httptest.NewRecorder()
+				entry.ServeHTTP(rec, httpReq)
+				return fetch.Response{StatusCode: rec.Code, Header: rec.Header().Clone(), Body: rec.Body.Bytes(), URL: req.URL}, nil
+			})
+			shUpExec := fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-play":
+					shBiliCalls.Add(1)
+					u, _ := url.Parse(req.URL)
+					cid := u.Query().Get("cid")
+					shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/05/%s/%s-1-80.mp4?deadline=%d", cid, cid, dlUnix)
+					b, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{"quality": 80, "durl": []map[string]any{{"url": shURL}}},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: b}, nil
+				case "douyin-detail":
+					shDouyinCalls.Add(1)
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: douyinDetailBody(shDouyinRaw)}, nil
+				default:
+					if strings.Contains(req.URL, "aweme.snssdk.com/aweme/v1/play/") {
+						return fetch.Response{StatusCode: 404, URL: req.URL}, nil
+					}
+					return fetch.Response{}, fmt.Errorf("unexpected Shanghai purpose %q (%s)", req.Policy.Purpose, req.URL)
+				}
+			})
+			worker, err := shresolver.NewPullWorkerWithDetail("https://japan.example", pullToken, controlExec, shUpExec, probe.New(shUpExec, douyin.AllowedMediaURL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, err = worker.WithWorkers(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wCtx, wCancel := context.WithCancel(context.Background())
+			wDone := make(chan struct{})
+			go func() {
+				defer close(wDone)
+				_ = worker.Run(wCtx)
+			}()
+			t.Cleanup(func() {
+				wCancel()
+				<-wDone
+			})
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && broker.ShanghaiStatsSnapshot().WaitingWorkers == 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			doGET := func(target, bearer string) (int, unified.Object) {
+				req := httptest.NewRequest(http.MethodGet, target, nil)
+				req.RemoteAddr = "127.0.0.1:47010"
+				if bearer != "" {
+					req.Header.Set("Authorization", "Bearer "+bearer)
+				}
+				rec := httptest.NewRecorder()
+				entry.ServeHTTP(rec, req)
+				out, decErr := unified.Decode(rec.Body.Bytes())
+				if decErr != nil {
+					t.Fatalf("decode %s failed: %v (body=%s)", target, decErr, rec.Body.String())
+				}
+				return rec.Code, out
+			}
+
+			// 1. Bilibili /api/parse (P1) + /api/resolve (P2)
+			code, parseOut := doGET("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/"+bvid), "")
+			if code != http.StatusOK {
+				t.Fatalf("Bilibili /api/parse status=%d out=%v", code, parseOut)
+			}
+			p1 := unified.Map(unified.Slice(unified.Map(parseOut["data"])["items"])[0])
+			p2 := unified.Map(unified.Slice(unified.Map(parseOut["data"])["items"])[1])
+			p1Sources := unified.Slice(unified.Map(unified.Map(unified.Slice(p1["variants"])[0])["delivery"])["sources"])
+			resolveURL := unified.Str(p2["resolve_url"])
+
+			code, resOut := doGET(resolveURL, "")
+			if code != http.StatusOK {
+				t.Fatalf("Bilibili /api/resolve status=%d out=%v", code, resOut)
+			}
+			resP2 := unified.Map(unified.Slice(unified.Map(resOut["data"])["items"])[1])
+			p2Sources := unified.Slice(unified.Map(unified.Map(unified.Slice(resP2["variants"])[0])["delivery"])["sources"])
+
+			for _, group := range []unified.Array{p1Sources, p2Sources} {
+				for _, rawSrc := range group {
+					src := unified.Map(rawSrc)
+					if unified.Str(src["browser_fetch"]) != "allowed" || unified.Str(src["expires_at"]) == "" {
+						t.Fatalf("expected browser_fetch=allowed and expires_at on Bilibili source, got %v", src)
+					}
+				}
+				if tc.wantEnabled {
+					if len(group) != 2 || !strings.Contains(unified.Str(unified.Map(group[0])["url"]), "cn-sh-fx-01-01.bilivideo.com") ||
+						!strings.Contains(unified.Str(unified.Map(group[1])["url"]), "upos-sz-mirrorcosov.bilivideo.com") {
+						t.Fatalf("enabled mode expected [cn-sh, upos], got %v", group)
+					}
+				} else {
+					if len(group) != 1 || !strings.Contains(unified.Str(unified.Map(group[0])["url"]), "upos-sz-mirrorcosov.bilivideo.com") {
+						t.Fatalf("disabled mode expected Japan-only [upos], got %v", group)
+					}
+				}
+			}
+
+			if tc.wantEnabled {
+				if shBiliCalls.Load() != 2 {
+					t.Fatalf("enabled mode shBiliCalls = %d, want 2", shBiliCalls.Load())
+				}
+			} else {
+				if shBiliCalls.Load() != 0 {
+					t.Fatalf("disabled mode shBiliCalls = %d, want 0", shBiliCalls.Load())
+				}
+			}
+
+			// 2. Douyin /api/parse on the exact same running server & upgraded PullWorker
+			code, dyOut := doGET("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/"+awemeID), "")
+			if code != http.StatusOK {
+				t.Fatalf("Douyin /api/parse status=%d out=%v", code, dyOut)
+			}
+			dyItem := unified.Map(unified.Slice(unified.Map(dyOut["data"])["items"])[0])
+			if gotDefault := unified.Str(unified.Map(dyItem["default"])["url"]); gotDefault != shDouyinLuna {
+				t.Fatalf("Douyin default.url = %q, want Shanghai domestic %q", gotDefault, shDouyinLuna)
+			}
+
+			// 3. Verify /api/stats shanghai.by_platform.{bilibili,douyin}
+			code, statsOut := doGET("/api/stats", ownerToken)
+			if code != http.StatusOK {
+				t.Fatalf("/api/stats status=%d out=%v", code, statsOut)
+			}
+			byPlat := unified.Map(unified.Map(unified.Map(statsOut["data"])["shanghai"])["by_platform"])
+			biliStats := unified.Map(byPlat["bilibili"])
+			dyStats := unified.Map(byPlat["douyin"])
+			biliHits, _ := unified.PHPInt(biliStats["hits"])
+			biliFallbacks, _ := unified.PHPInt(biliStats["fallbacks"])
+			dyHits, _ := unified.PHPInt(dyStats["hits"])
+			dyFallbacks, _ := unified.PHPInt(dyStats["fallbacks"])
+
+			if dyHits != 1 || dyFallbacks != 0 {
+				t.Fatalf("Douyin Shanghai stats = %+v, want hits=1 fallbacks=0", dyStats)
+			}
+			if tc.wantEnabled {
+				if biliHits != 2 || biliFallbacks != 0 {
+					t.Fatalf("enabled Bilibili Shanghai stats = %+v, want hits=2 fallbacks=0", biliStats)
+				}
+			} else {
+				if biliHits != 0 || biliFallbacks != 0 {
+					t.Fatalf("disabled Bilibili Shanghai stats = %+v, want hits=0 fallbacks=0", biliStats)
+				}
+			}
+		})
 	}
 }

@@ -786,7 +786,7 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	}
 	broker.WithLookupNetIP(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-	})
+	}).WithBilibili(true)
 
 	adapterClient := newLoopbackClient(256, 30*time.Second)
 	ytdlpSem := make(chan struct{}, ytdlpConc)

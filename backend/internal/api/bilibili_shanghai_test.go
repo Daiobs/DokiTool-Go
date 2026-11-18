@@ -46,6 +46,16 @@ func newBilibiliShanghaiHarness(
 	jpExec fetch.Executor,
 	extraAdapters map[string]Adapter,
 ) *bilibiliShanghaiHarness {
+	return newBilibiliShanghaiHarnessWithSwitch(t, startNow, jpExec, extraAdapters, true)
+}
+
+func newBilibiliShanghaiHarnessWithSwitch(
+	t *testing.T,
+	startNow time.Time,
+	jpExec fetch.Executor,
+	extraAdapters map[string]Adapter,
+	bilibiliEnabled bool,
+) *bilibiliShanghaiHarness {
 	t.Helper()
 	edgeKey := randomPrintableToken(t, 48)
 	pullToken := randomPrintableToken(t, 48)
@@ -69,6 +79,9 @@ func newBilibiliShanghaiHarness(
 		t.Fatal(err)
 	}
 	broker.WithLookupNetIP(testPublicLookup).WithClock(clock)
+	if bilibiliEnabled {
+		broker.WithBilibili(true)
+	}
 	h.broker = broker
 
 	cat, err := catalog.Load()
@@ -1060,5 +1073,125 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 	snap := h.stats()
 	if snap.Shanghai.ByPlatform.Bilibili.Hits != 3 || snap.Cache.Total.Hits != 1 {
 		t.Fatalf("unexpected multi-P + cache stats: shanghai=%+v cache=%+v", snap.Shanghai.ByPlatform.Bilibili, snap.Cache.Total)
+	}
+}
+
+func TestBilibiliShanghaiDisabledDefaultWithUpgradedWorkerAndDouyinActive(t *testing.T) {
+	const bvid = "BV1234567890"
+	const cidP1 int64 = 3001
+	const cidP2 int64 = 3002
+	baseNow := time.Date(2026, 11, 15, 3, 0, 0, 0, time.UTC)
+
+	var shBiliCalls atomic.Int64
+	var shDouyinCalls atomic.Int64
+	var h *bilibiliShanghaiHarness
+
+	jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if strings.Contains(req.URL, "/x/web-interface/view") {
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: makeBilibiliViewJSON(bvid, cidP1, cidP2)}, nil
+		}
+		u, _ := url.Parse(req.URL)
+		cid := u.Query().Get("cid")
+		jpDL := h.nowUnix() + 7200
+		jpURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/03/%s/%s-1-80.mp4?deadline=%d", cid, cid, jpDL)
+		body, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"quality": 80,
+				"format":  "mp4720",
+				"durl":    []map[string]any{{"url": jpURL, "size": 3145728, "length": 60000}},
+			},
+		})
+		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+	})
+	shBiliExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		shBiliCalls.Add(1)
+		u, _ := url.Parse(req.URL)
+		cid := u.Query().Get("cid")
+		shDL := h.nowUnix() + 7200
+		shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/03/%s/%s-1-80.mp4?deadline=%d", cid, cid, shDL)
+		body, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"quality": 80,
+				"durl":    []map[string]any{{"url": shURL}},
+			},
+		})
+		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+	})
+	shDouyinExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		shDouyinCalls.Add(1)
+		return fetch.Response{
+			StatusCode: 200,
+			URL:        req.URL,
+			Body:       []byte(`{"status_code":0,"aweme_detail":{"aweme_id":"7800000000000000099","video":{"play_addr":{"uri":"v0200fg100007800000000000000099","url_list":["https://v26-luna.douyinvod.com/abc123/video/tos/cn/tos-cn-ve-15/oA0B1C2D3E4F/?a=6383"]}}}}`),
+		}, nil
+	})
+	douyinAdapter := AdapterFunc(func(ctx context.Context, src string, now int64) (unified.Object, error) {
+		idx := strings.LastIndexByte(src, '/')
+		if _, err := h.broker.ResolveWork(ctx, src[idx+1:]); err != nil {
+			return nil, err
+		}
+		return makeStatsOKPayload("douyin", src, now), nil
+	})
+
+	// Bilibili switch is disabled (default false on PullBroker), while an upgraded
+	// Shanghai PullWorker advertising X-DokiTool-Shanghai-Tasks: douyin,bilibili is connected.
+	h = newBilibiliShanghaiHarnessWithSwitch(t, baseNow, jpExec, map[string]Adapter{"douyin": douyinAdapter}, false)
+	if h.broker.BilibiliEnabled() {
+		t.Fatal("expected broker.BilibiliEnabled() == false by default")
+	}
+	h.startPullWorker(shBiliExec, shDouyinExec)
+
+	// 1. Bilibili /api/parse (multi-P P1): zero Shanghai tasks dispatched, Japan-only URL with browser_fetch=allowed + expires_at.
+	code, parsePayload := h.doAPI("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/"+bvid), "198.51.100.50", "")
+	if code != http.StatusOK {
+		t.Fatalf("parse status=%d payload=%v", code, parsePayload)
+	}
+	items := unified.Slice(unified.Map(parsePayload["data"])["items"])
+	p1 := unified.Map(items[0])
+	p2 := unified.Map(items[1])
+	assertAllBilivideoSourcesBrowserFetchAllowed(t, p1)
+	p1URLs := collectVariantSourceURLs(unified.Map(unified.Slice(p1["variants"])[0]))
+	if len(p1URLs) != 1 || !strings.Contains(p1URLs[0], "upos-sz-mirrorcosov.bilivideo.com") {
+		t.Fatalf("expected Japan-only P1 URL when disabled, got %v", p1URLs)
+	}
+
+	// 2. Bilibili /api/resolve (multi-P P2): zero Shanghai tasks dispatched, Japan-only URL with browser_fetch=allowed + expires_at.
+	resolveURL := unified.Str(p2["resolve_url"])
+	code, resPayload := h.doAPI(resolveURL, "198.51.100.50", "")
+	if code != http.StatusOK {
+		t.Fatalf("resolve P2 status=%d payload=%v", code, resPayload)
+	}
+	resP2 := unified.Map(unified.Slice(unified.Map(resPayload["data"])["items"])[1])
+	assertAllBilivideoSourcesBrowserFetchAllowed(t, resP2)
+	p2URLs := collectVariantSourceURLs(unified.Map(unified.Slice(resP2["variants"])[0]))
+	if len(p2URLs) != 1 || !strings.Contains(p2URLs[0], "upos-sz-mirrorcosov.bilivideo.com") {
+		t.Fatalf("expected Japan-only P2 URL when disabled, got %v", p2URLs)
+	}
+	if shBiliCalls.Load() != 0 {
+		t.Fatalf("expected 0 Shanghai Bilibili upstream calls when disabled, got %d", shBiliCalls.Load())
+	}
+
+	snapAfterBili := h.stats()
+	if snapAfterBili.Shanghai.ByPlatform.Bilibili.Hits != 0 || snapAfterBili.Shanghai.ByPlatform.Bilibili.Fallbacks != 0 ||
+		snapAfterBili.Shanghai.Total.Hits != 0 || snapAfterBili.Shanghai.Total.Fallbacks != 0 {
+		t.Fatalf("disabled Bilibili must leave shanghai.by_platform.bilibili at 0, got %+v", snapAfterBili.Shanghai)
+	}
+
+	// 3. On the exact same running server & upgraded PullWorker, Douyin /api/parse hits Shanghai normally!
+	code, _ = h.doAPI("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/7800000000000000099"), "198.51.100.51", "")
+	if code != http.StatusOK {
+		t.Fatalf("Douyin /api/parse status=%d, want 200", code)
+	}
+	if shDouyinCalls.Load() == 0 || shBiliCalls.Load() != 0 {
+		t.Fatalf("unexpected Shanghai call counts: douyin=%d bilibili=%d", shDouyinCalls.Load(), shBiliCalls.Load())
+	}
+	snapFinal := h.stats()
+	if snapFinal.Shanghai.ByPlatform.Douyin.Hits != 1 || snapFinal.Shanghai.ByPlatform.Douyin.Fallbacks != 0 {
+		t.Fatalf("expected Douyin Shanghai hits=1 fallbacks=0, got %+v", snapFinal.Shanghai.ByPlatform.Douyin)
+	}
+	if snapFinal.Shanghai.ByPlatform.Bilibili.Hits != 0 || snapFinal.Shanghai.ByPlatform.Bilibili.Fallbacks != 0 {
+		t.Fatalf("Bilibili Shanghai counters must remain 0 after Douyin hit, got %+v", snapFinal.Shanghai.ByPlatform.Bilibili)
 	}
 }

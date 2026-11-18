@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
@@ -113,6 +114,7 @@ func waiterMatchesTask(proto int, bilibiliCap bool, taskProto int, taskType stri
 type PullBroker struct {
 	responseValidator
 	token                   string
+	bilibiliEnabled         atomic.Bool
 	queueWait               time.Duration
 	queueCap                int
 	claimSlots, resultSlots chan struct{}
@@ -154,6 +156,20 @@ func (b *PullBroker) WithClock(now func() time.Time) *PullBroker {
 		b.now = now
 	}
 	return b
+}
+
+// WithBilibili configures whether Japan dispatches and accepts Bilibili tasks
+// over the Shanghai pull channel (disabled by default).
+func (b *PullBroker) WithBilibili(enabled bool) *PullBroker {
+	if b != nil {
+		b.bilibiliEnabled.Store(enabled)
+	}
+	return b
+}
+
+// BilibiliEnabled reports whether Bilibili Shanghai task dispatch is enabled on b.
+func (b *PullBroker) BilibiliEnabled() bool {
+	return b != nil && b.bilibiliEnabled.Load()
 }
 
 func (b *PullBroker) currentTime() time.Time {
@@ -413,6 +429,9 @@ func (b *PullBroker) ResolveBilibili(parent context.Context, bvid string, cid in
 // BilibiliTimeout, deferring hit vs fallback classification until finish(matched)
 // is called so quality-tier mismatches with Japan are counted as fallbacks monotonically.
 func (b *PullBroker) ResolveBilibiliPending(parent context.Context, bvid string, cid int64) (play *bilibili.ShanghaiPlay, finish func(bool), err error) {
+	if !b.BilibiliEnabled() {
+		return nil, nil, errUnavailable
+	}
 	defer func() {
 		if err != nil {
 			b.stats.recordResolveOutcome(parent, platBilibiliIdx, err)
@@ -545,7 +564,7 @@ func (b *PullBroker) claim(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(ProtocolHeader) == "2" {
 		proto = ProtocolV2
 	}
-	bilibiliCap := proto >= ProtocolV2 && supportsTask(r.Header.Get(TasksHeader), TaskBilibili)
+	bilibiliCap := b.BilibiliEnabled() && proto >= ProtocolV2 && supportsTask(r.Header.Get(TasksHeader), TaskBilibili)
 
 	b.mu.Lock()
 	if ctx.Err() != nil {
@@ -680,7 +699,7 @@ func (b *PullBroker) receive(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case TaskBilibili:
-		if result.Protocol != ProtocolV2 || result.VideoID != "" || result.AwemeID != "" ||
+		if !b.BilibiliEnabled() || result.Protocol != ProtocolV2 || result.VideoID != "" || result.AwemeID != "" ||
 			!bilibili.ValidBVID(result.BVID) || !bilibili.ValidCID(result.CID) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
