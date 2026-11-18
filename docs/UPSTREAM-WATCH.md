@@ -16,7 +16,9 @@ GitHub Actions 的 **Watch upstream updates**（[`.github/workflows/upstream-wat
 - `upstream > locked`：`发现新正式版`
 - `upstream < locked`：`上游 latest 低于本地锁定`（覆盖上游回滚最新正式版、旧分支补丁未设 `make_latest=false` 或本地先行升级）
 - 上游标签无法按预期格式解析：`版本不一致（需人工核对）`（经 `safe_text` 转义后安全降级展示，不抛异常中断通知）
-- 若上述 5 处本地锁定文件之间出现版本号或 Linux x86_64 SHA-256 漂移，对应组件状态会附加 `（本地配置漂移）` 并在正文中列出具体漂移项；同时离线单测通过 `verify_local_pin_consistency` 在 CI 中直接拦截任何未同步更新的改动。
+- 若上述 5 处本地锁定文件之间出现版本号或 Linux x86_64 SHA-256 漂移，采用**“PR 硬门禁阻断 + 每日巡检不中断告警”**职责切分：
+  - **PR 门禁前置阻断**：`python3 -B scripts/check-upstream-updates.py --check-local-pins`（零网络请求、无需 `GITHUB_TOKEN`）调用 `verify_local_pin_consistency` 强校验全部 5 处锁定文件的一致性，已同时接入 PR 工作流 [`.github/workflows/go-migration.yml`](../.github/workflows/go-migration.yml)（其 `pull_request.paths` 亦覆盖 `release-build.yml`、`gateway-isolation.yml` 与 `upstream-watch.yml`）及本地离线总门禁 [`scripts/go-migration/check.py`](../scripts/go-migration/check.py)，在合并前直接拦截任何未同步更新的改动（退出码 `1`）。
+  - **每日巡检持续汇报**：`scripts/tests` 离线单测仅使用临时目录合成夹具验证逻辑与 `--check-local-pins` 行为，不因真实仓库根目录漂移而失败退出；因此即便极端情况下漂移提交绕过门禁进入 `main`，每日定时工作流 `upstream-watch.yml` 仍会通过离线逻辑单测并继续执行 `scripts/check-upstream-updates.py`，在受管 Issue 中将对应组件状态附加 `（本地配置漂移）` 并列出具体漂移项，同时不中断上游新正式版通知。
 
 为什么只监控正式版 Release 的核心发布标识：
 
@@ -41,10 +43,11 @@ GitHub Actions 的 **Watch upstream updates**（[`.github/workflows/upstream-wat
 
 GitHub 定时工作流可能因队列负载延迟执行，`09:00` 为计划触发时间而非精确到分钟的承诺。仓库连续 60 天无活动时，GitHub 可能自动暂停定时调度，届时可在 Actions 页面手动重新启用（参见 [GitHub 官方调度说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)）。
 
-修改脚本、工作流或文档后，在本地执行以下离线验证：
+修改脚本、工作流、锁定版本或文档后，在本地执行以下离线验证：
 
 ```bash
 python3 -B -m unittest discover -s scripts/tests -v
+python3 -B scripts/check-upstream-updates.py --check-local-pins
 python3 -B scripts/check-public-files.py --staged
 ```
 

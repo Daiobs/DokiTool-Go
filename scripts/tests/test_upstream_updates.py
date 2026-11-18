@@ -7,11 +7,11 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from unittest.mock import Mock, patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'check-upstream-updates.py'
@@ -80,11 +80,76 @@ def managed_issue(state, issue_state='open'):
     }
 
 
-def clone_lock_files(dest_root):
-    for rel in watch.LOCK_FILES:
+SYNTHETIC_YTDLP_SHA = '767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795'
+SYNTHETIC_DENO_SHA = '368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7'
+
+
+def write_synthetic_lock_files(
+    dest_root,
+    *,
+    ytdlp_version='2026.10.26',
+    ytdlp_linux_sha=SYNTHETIC_YTDLP_SHA,
+    deno_version='2.9.8',
+    deno_linux_sha=SYNTHETIC_DENO_SHA,
+):
+    files = {
+        watch.YTDLP_SOURCE_REL: (
+            'package ytengine\n\n'
+            f'const PinnedVersion = "{ytdlp_version}"\n\n'
+            'var OfficialSHA256Sums20261026 = map[string]string{\n'
+            '\t"e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3": "yt-dlp",\n'
+            f'\t"{ytdlp_linux_sha}": "yt-dlp_linux",\n'
+            '}\n'
+        ),
+        watch.DENO_SOURCE_REL: (
+            'package youtube\n\n'
+            'const (\n'
+            f'\tPinnedDenoVersion = "{deno_version}"\n'
+            '\tPinnedEJSVersion  = "0.8.0"\n'
+            ')\n\n'
+            'var OfficialDenoSHA256Sums2098 = map[string]string{\n'
+            f'\t"{deno_linux_sha}": "deno-x86_64-unknown-linux-gnu",\n'
+            '\t"b484f780e5149ca05c673f1f79f7fb466f12a2295933bdad917af4a8a5c020e8": "deno-aarch64-unknown-linux-gnu",\n'
+            '}\n'
+        ),
+        watch.RELEASE_BUILD_WORKFLOW_REL: (
+            'name: Release build\n'
+            'jobs:\n'
+            '  build-and-publish:\n'
+            '    steps:\n'
+            f'      - name: Install pinned Deno {deno_version}\n'
+            '        run: |\n'
+            '          curl --fail --silent --show-error --location \\\n'
+            f'            https://github.com/denoland/deno/releases/download/v{deno_version}/deno-x86_64-unknown-linux-gnu.zip \\\n'
+            '            --output "$RUNNER_TEMP/deno/deno.zip"\n'
+            f'          echo "{deno_linux_sha}  $RUNNER_TEMP/deno/deno" | sha256sum --check --strict\n'
+            '          case "$first_line" in\n'
+            f'            "deno {deno_version}"|"deno {deno_version} "*) ;;\n'
+            '            *) exit 1 ;;\n'
+            '          esac\n'
+        ),
+        watch.GATEWAY_ISOLATION_WORKFLOW_REL: (
+            'name: Gateway isolation\n'
+            'jobs:\n'
+            '  controlled-gateway:\n'
+            '    steps:\n'
+            '      - name: Stage the pinned extractor\n'
+            '        run: |\n'
+            '          curl --fail --silent --show-error --location \\\n'
+            f'            https://github.com/yt-dlp/yt-dlp/releases/download/{ytdlp_version}/yt-dlp_linux \\\n'
+            '            --output "$RUNNER_TEMP/gateway-bin/yt-dlp_linux"\n'
+            f'          echo \'{ytdlp_linux_sha}  \'"$RUNNER_TEMP/gateway-bin/yt-dlp_linux" | sha256sum --check --strict\n'
+        ),
+        watch.VALIDATION_REQUIREMENTS_REL: (
+            '# Development/CI contract validation only.\n'
+            'jsonschema>=4.17.3,<5\n'
+            f'deno=={deno_version}\n'
+        ),
+    }
+    for rel, content in files.items():
         target = dest_root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(watch.ROOT / rel, target)
+        target.write_text(content, encoding='utf-8')
 
 
 class FakeGitHub:
@@ -157,15 +222,51 @@ class FakeGitHub:
 
 
 class PinnedVersionAndConsistencyTests(unittest.TestCase):
-    def test_loads_real_repo_pinned_versions_and_verifies_all_five_lock_files(self):
-        pinned = watch.verify_local_pin_consistency(watch.ROOT)
-        self.assertEqual(pinned, {'yt-dlp/yt-dlp': '2026.10.26', 'denoland/deno': '2.9.8'})
-        self.assertEqual(
-            watch.collect_local_pin_drift(watch.ROOT, pinned),
-            {'yt-dlp/yt-dlp': [], 'denoland/deno': []},
-        )
+    def test_module_imports_cleanly_without_coupling_unittest_to_real_repo_locks(self):
+        self.assertTrue(watch.ROOT.is_dir())
+        self.assertEqual(len(watch.LOCK_FILES), 5)
         for rel in watch.LOCK_FILES:
             self.assertIn(rel.as_posix(), watch.UPGRADE_REMINDER)
+
+    def test_synthetic_five_lock_files_pass_consistency_and_cli_without_token_or_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_synthetic_lock_files(root)
+            pinned = watch.verify_local_pin_consistency(root)
+            self.assertEqual(pinned, {'yt-dlp/yt-dlp': '2026.10.26', 'denoland/deno': '2.9.8'})
+            self.assertEqual(
+                watch.collect_local_pin_drift(root, pinned),
+                {'yt-dlp/yt-dlp': [], 'denoland/deno': []},
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {}, clear=True), \
+                 patch.object(urllib.request.OpenerDirector, 'open', side_effect=AssertionError('Unexpected network call')), \
+                 patch.object(sys, 'stdout', stdout), \
+                 patch.object(sys, 'stderr', stderr):
+                rc = watch.cli(['--check-local-pins', '--root', str(root)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(stderr.getvalue(), '')
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(
+                report,
+                {
+                    'passed': True,
+                    'lock_files': 5,
+                    'pinned': {'yt-dlp/yt-dlp': '2026.10.26', 'denoland/deno': '2.9.8'},
+                },
+            )
+
+            proc = subprocess.run(
+                [sys.executable, '-B', str(SCRIPT), '--check-local-pins', '--root', str(root)],
+                env={'PATH': os.environ.get('PATH', '')},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)['passed'], True)
 
     def test_accepts_ytdlp_patch_version_format(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,7 +282,7 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
                 {'yt-dlp/yt-dlp': '2026.10.26.1', 'denoland/deno': '2.10.0'},
             )
 
-    def test_missing_or_corrupt_go_constants_raise_watch_error(self):
+    def test_missing_or_corrupt_go_constants_raise_watch_error_and_fail_cli(self):
         bad_cases = [
             ('missing-files', None, None),
             ('missing-ytdlp-const', 'package ytengine\n', 'const PinnedDenoVersion = "2.9.8"\n'),
@@ -205,33 +306,52 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
                     sandbox.write_text(sandbox_src, encoding='utf-8')
                 with self.assertRaises(watch.WatchError):
                     watch.load_pinned_versions(root)
+                stderr = io.StringIO()
+                with patch.object(sys, 'stderr', stderr):
+                    self.assertEqual(watch.cli(['--check-local-pins', '--root', str(root)]), 1)
+                self.assertIn('Upstream check failed:', stderr.getvalue())
 
     def test_synchronized_upgrade_across_all_five_lock_files_passes(self):
         new_ytdlp_sha = 'a' * 64
         new_deno_sha = 'b' * 64
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            clone_lock_files(root)
-            for rel in (watch.YTDLP_SOURCE_REL, watch.GATEWAY_ISOLATION_WORKFLOW_REL):
-                path = root / rel
-                text = path.read_text(encoding='utf-8')
-                text = text.replace('2026.10.26', '2026.10.26.1')
-                text = text.replace('767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795', new_ytdlp_sha)
-                path.write_text(text, encoding='utf-8')
-            for rel in (watch.DENO_SOURCE_REL, watch.RELEASE_BUILD_WORKFLOW_REL, watch.VALIDATION_REQUIREMENTS_REL):
-                path = root / rel
-                text = path.read_text(encoding='utf-8')
-                text = text.replace('2.9.8', '2.10.0')
-                text = text.replace('368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7', new_deno_sha)
-                path.write_text(text, encoding='utf-8')
+            write_synthetic_lock_files(
+                root,
+                ytdlp_version='2026.10.26.1',
+                ytdlp_linux_sha=new_ytdlp_sha,
+                deno_version='2.10.0',
+                deno_linux_sha=new_deno_sha,
+            )
             self.assertEqual(
                 watch.verify_local_pin_consistency(root),
                 {'yt-dlp/yt-dlp': '2026.10.26.1', 'denoland/deno': '2.10.0'},
             )
+            stdout = io.StringIO()
+            with patch.dict(os.environ, {}, clear=True), patch.object(sys, 'stdout', stdout):
+                self.assertEqual(watch.cli(['--check-local-pins', '--root', str(root)]), 0)
+            self.assertEqual(
+                json.loads(stdout.getvalue())['pinned'],
+                {'yt-dlp/yt-dlp': '2026.10.26.1', 'denoland/deno': '2.10.0'},
+            )
 
-    def test_detects_drift_across_workflows_requirements_and_go_sha_maps(self):
+    def test_detects_drift_across_all_five_lock_files_in_library_and_cli(self):
         wrong_sha = 'f' * 64
         mutations = [
+            (
+                'engine-bumped-ahead-of-gateway-workflow',
+                watch.YTDLP_SOURCE_REL,
+                lambda s: s.replace('const PinnedVersion = "2026.10.26"', 'const PinnedVersion = "2026.11.01"'),
+                'yt-dlp/yt-dlp',
+                '.github/workflows/gateway-isolation.yml',
+            ),
+            (
+                'sandbox-bumped-ahead-of-workflows-and-requirements',
+                watch.DENO_SOURCE_REL,
+                lambda s: s.replace('PinnedDenoVersion = "2.9.8"', 'PinnedDenoVersion = "2.10.0"'),
+                'denoland/deno',
+                'scripts/requirements-validation.txt',
+            ),
             (
                 'release-build-deno-url-version',
                 watch.RELEASE_BUILD_WORKFLOW_REL,
@@ -256,7 +376,7 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
             (
                 'release-build-deno-sha256',
                 watch.RELEASE_BUILD_WORKFLOW_REL,
-                lambda s: s.replace('368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7', wrong_sha),
+                lambda s: s.replace(SYNTHETIC_DENO_SHA, wrong_sha),
                 'denoland/deno',
                 '.github/workflows/release-build.yml',
             ),
@@ -270,7 +390,7 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
             (
                 'gateway-isolation-ytdlp-sha256',
                 watch.GATEWAY_ISOLATION_WORKFLOW_REL,
-                lambda s: s.replace('767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795', wrong_sha),
+                lambda s: s.replace(SYNTHETIC_YTDLP_SHA, wrong_sha),
                 'yt-dlp/yt-dlp',
                 '.github/workflows/gateway-isolation.yml',
             ),
@@ -306,7 +426,7 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
         for label, rel, mutate, target_repo, expected_fragment in mutations:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                clone_lock_files(root)
+                write_synthetic_lock_files(root)
                 path = root / rel
                 path.write_text(mutate(path.read_text(encoding='utf-8')), encoding='utf-8')
                 drift = watch.collect_local_pin_drift(root)
@@ -316,6 +436,11 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
                 self.assertTrue(any(expected_fragment in item for item in drift[target_repo]))
                 with self.assertRaises(watch.WatchError):
                     watch.verify_local_pin_consistency(root)
+                stderr = io.StringIO()
+                with patch.dict(os.environ, {}, clear=True), patch.object(sys, 'stderr', stderr):
+                    self.assertEqual(watch.cli(['--check-local-pins', '--root', str(root)]), 1)
+                self.assertIn('Local pin drift detected:', stderr.getvalue())
+                self.assertIn(expected_fragment, stderr.getvalue())
 
 
 class VersionOrderingTests(unittest.TestCase):
@@ -905,6 +1030,8 @@ class CliEntrypointTests(unittest.TestCase):
         seed = build_state_from_upstreams(upstreams)
         fake_api = FakeGitHub(upstreams, managed_issue(seed))
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'repo'
+            write_synthetic_lock_files(root)
             summary_path = Path(tmp) / 'step-summary.md'
             env = {
                 'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go',
@@ -916,7 +1043,7 @@ class CliEntrypointTests(unittest.TestCase):
             }
             stdout = io.StringIO()
             with patch.dict(os.environ, env, clear=True), \
-                 patch.object(sys, 'argv', ['check-upstream-updates.py', '--dry-run']), \
+                 patch.object(sys, 'argv', ['check-upstream-updates.py', '--dry-run', '--root', str(root)]), \
                  patch.object(watch, 'GitHub', return_value=fake_api), \
                  patch.object(sys, 'stdout', stdout):
                 watch.main()
@@ -928,21 +1055,118 @@ class CliEntrypointTests(unittest.TestCase):
             self.assertIn('https://github.com/Brilliant666/DokiTool-Go/issues/17', summary_md)
 
     def test_cli_exits_nonzero_on_wrong_repository_or_missing_token_offline(self):
-        for extra_env, expected_err in (
-            ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool'}, 'Brilliant666/DokiTool-Go'),
-            ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go'}, 'GITHUB_TOKEN is required'),
-        ):
-            with self.subTest(extra_env=extra_env):
-                env = {'PATH': os.environ.get('PATH', ''), **extra_env}
-                proc = subprocess.run(
-                    [sys.executable, '-B', str(SCRIPT), '--dry-run'],
-                    env=env,
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_synthetic_lock_files(root)
+            for extra_env, expected_err in (
+                ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool'}, 'Brilliant666/DokiTool-Go'),
+                ({'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go'}, 'GITHUB_TOKEN is required'),
+            ):
+                with self.subTest(extra_env=extra_env):
+                    env = {'PATH': os.environ.get('PATH', ''), **extra_env}
+                    proc = subprocess.run(
+                        [sys.executable, '-B', str(SCRIPT), '--dry-run', '--root', str(root)],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertIn(expected_err, proc.stderr)
+
+    def test_check_local_pins_rejects_combining_with_verify_notification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_synthetic_lock_files(root)
+            proc = subprocess.run(
+                [sys.executable, '-B', str(SCRIPT), '--check-local-pins', '--verify-notification', '--root', str(root)],
+                env={'PATH': os.environ.get('PATH', '')},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn('--check-local-pins cannot be combined with --verify-notification', proc.stderr)
+
+    def test_end_to_end_drifted_repo_blocks_pr_gate_while_watch_mode_posts_issue_notification(self):
+        scenarios = [
+            (
+                'requirements-deno-drift',
+                watch.VALIDATION_REQUIREMENTS_REL,
+                lambda s: s.replace('deno==2.9.8', 'deno==2.9.7'),
+                'scripts/requirements-validation.txt',
+            ),
+            (
+                'engine-bumped-ahead-of-gateway',
+                watch.YTDLP_SOURCE_REL,
+                lambda s: s.replace('const PinnedVersion = "2026.10.26"', 'const PinnedVersion = "2026.11.01"'),
+                '.github/workflows/gateway-isolation.yml',
+            ),
+        ]
+        for label, rel, mutate, expected_fragment in scenarios:
+            with self.subTest(scenario=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / 'drifted-repo'
+                write_synthetic_lock_files(root)
+                target = root / rel
+                target.write_text(mutate(target.read_text(encoding='utf-8')), encoding='utf-8')
+
+                # 1) Offline library helpers used by normal watch mode succeed without WatchError.
+                pinned = watch.load_pinned_versions(root)
+                drift = watch.collect_local_pin_drift(root, pinned)
+                self.assertTrue(any(drift.values()))
+
+                # 2) PR gate CLI (--check-local-pins) fails closed with exit code 1.
+                gate_proc = subprocess.run(
+                    [sys.executable, '-B', str(SCRIPT), '--check-local-pins', '--root', str(root)],
+                    env={'PATH': os.environ.get('PATH', '')},
                     text=True,
                     capture_output=True,
                     check=False,
                 )
-                self.assertEqual(proc.returncode, 1)
-                self.assertIn(expected_err, proc.stderr)
+                self.assertEqual(gate_proc.returncode, 1)
+                self.assertIn('Local pin drift detected:', gate_proc.stderr)
+                self.assertIn(expected_fragment, gate_proc.stderr)
+
+                # 3a) Normal watch mode (initial Issue creation) succeeds (exit 0) and writes "本地配置漂移".
+                env = {
+                    'GITHUB_REPOSITORY': 'Brilliant666/DokiTool-Go',
+                    'GITHUB_REPOSITORY_OWNER': 'Brilliant666',
+                    'GITHUB_SERVER_URL': 'https://github.com',
+                    'GITHUB_TOKEN': 'test-token',
+                }
+                initial_api = FakeGitHub(seed_upstream_data())
+                stdout_init = io.StringIO()
+                with patch.dict(os.environ, env, clear=True), \
+                     patch.object(watch, 'GitHub', return_value=initial_api), \
+                     patch.object(sys, 'stdout', stdout_init):
+                    rc_init = watch.cli(['--root', str(root)])
+                self.assertEqual(rc_init, 0)
+                init_result = json.loads(stdout_init.getvalue())
+                self.assertTrue(init_result['issue_created'])
+                self.assertTrue(init_result['notification_posted'])
+                self.assertEqual(len(initial_api.writes), 1)
+                issue_body = initial_api.writes[0][2]['body']
+                self.assertIn('本地配置漂移', issue_body)
+                self.assertIn(expected_fragment, issue_body)
+
+                # 3b) Normal watch mode (incremental comment on existing managed Issue) succeeds (exit 0) and writes "本地配置漂移".
+                upstreams = seed_upstream_data()
+                clean_seed = build_state_from_upstreams(upstreams)
+                comment_api = FakeGitHub(upstreams, managed_issue(clean_seed))
+                stdout_comment = io.StringIO()
+                with patch.dict(os.environ, env, clear=True), \
+                     patch.object(watch, 'GitHub', return_value=comment_api), \
+                     patch.object(sys, 'stdout', stdout_comment):
+                    rc_comment = watch.cli(['--root', str(root)])
+                self.assertEqual(rc_comment, 0)
+                comment_result = json.loads(stdout_comment.getvalue())
+                self.assertTrue(comment_result['changed'])
+                self.assertTrue(comment_result['notification_posted'])
+                self.assertEqual(len(comment_api.writes), 1)
+                self.assertEqual(comment_api.writes[0][1], '/repos/Brilliant666/DokiTool-Go/issues/17/comments')
+                comment_body = comment_api.writes[0][2]['body']
+                self.assertIn('本地配置漂移', comment_body)
+                self.assertIn(expected_fragment, comment_body)
 
 
 if __name__ == '__main__':

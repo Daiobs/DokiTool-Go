@@ -887,14 +887,31 @@ def environment(env):
     return f'https://github.com/{TARGET}/actions/runs/{run_id}' if run_id else None
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true', help='Read and report without writing any Issue or comment')
     parser.add_argument('--verify-notification', action='store_true', help='Send an explicitly labeled notification-channel check')
-    args = parser.parse_args()
+    parser.add_argument(
+        '--check-local-pins',
+        action='store_true',
+        help='Verify all 5 local runtime version/SHA-256 lock files offline without network or GITHUB_TOKEN',
+    )
+    parser.add_argument('--root', type=Path, default=ROOT, help='Repository root directory (defaults to checkout root)')
+    args = parser.parse_args(argv)
+    root = Path(args.root)
+    if args.check_local_pins:
+        if args.verify_notification:
+            raise WatchError('--check-local-pins cannot be combined with --verify-notification')
+        pinned = verify_local_pin_consistency(root)
+        print(json.dumps({
+            'passed': True,
+            'lock_files': len(LOCK_FILES),
+            'pinned': pinned,
+        }, ensure_ascii=False, indent=2))
+        return
     run_url = environment(os.environ)
-    pinned = load_pinned_versions()
-    local_drift = collect_local_pin_drift(ROOT, pinned)
+    pinned = load_pinned_versions(root)
+    local_drift = collect_local_pin_drift(root, pinned)
     result = run_check(
         GitHub(os.environ.get('GITHUB_TOKEN')),
         pinned,
@@ -912,11 +929,16 @@ def main():
                 output.write('\n[通知 Issue](' + result['issue_url'] + ')\n')
 
 
-if __name__ == '__main__':
+def cli(argv=None):
     try:
-        main()
+        main(argv)
     except (WatchError, KeyError, TypeError, AttributeError, OSError, ValueError) as error:
         # Do not echo HTTP response bodies, headers, tokens or upstream payloads.
         message = str(error) if isinstance(error, WatchError) else 'Invalid local configuration or upstream response; state was not advanced'
         print('Upstream check failed: ' + message, file=sys.stderr)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(cli())
