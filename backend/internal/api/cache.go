@@ -193,6 +193,18 @@ func (c *parseCache) getLocked(key cacheKey, now time.Time) (cachedResponse, boo
 	return entry.res, true
 }
 
+// fresh reports whether key currently has an unexpired entry without touching
+// LRU order or evicting anything; admission uses it only as a routing hint.
+func (c *parseCache) fresh(key cacheKey, now time.Time) bool {
+	if c == nil || c.cfg.Disabled {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.entries[key]
+	return ok && now.Before(elem.Value.(*cacheEntry).expiresAt)
+}
+
 func (c *parseCache) putLocked(key cacheKey, res cachedResponse, expiresAt time.Time) {
 	if c == nil || c.cfg.Disabled {
 		return

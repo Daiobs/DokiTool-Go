@@ -119,6 +119,59 @@ func (h *Handler) HasCachedYouTubeContext() bool {
 	return false
 }
 
+// HasFreshCachedParse reports whether a GET /api/parse or /api/resolve request
+// would be answered from a fresh cache entry. Admission then charges the cheap
+// catalog budget instead of a parse token, so revisiting or re-downloading an
+// already parsed link does not hit the per-IP parse limit. It mirrors all
+// pre-cache validation guards and cache key derivation in ServeHTTP so invalid
+// requests never masquerade as cache hits, and it never mutates the cache.
+func (h *Handler) HasFreshCachedParse(path, rawQuery string) bool {
+	if h == nil || h.catalog == nil || h.cache == nil || h.cache.cfg.Disabled {
+		return false
+	}
+	if path != "/api/parse" && path != "/api/resolve" {
+		return false
+	}
+	if version, ok := queryValue(rawQuery, "schema_version"); !ok || version != unified.SchemaVersion {
+		return false
+	}
+	input, scalar := queryValue(rawQuery, "url")
+	source := InputURL(input)
+	if !scalar || source == "" || !h.catalog.ValidInputURL(source) {
+		return false
+	}
+	platform := h.catalog.PlatformForURL(source)
+	if platform == "" || h.adapters[platform] == nil {
+		return false
+	}
+	requested, requestedScalar := queryValue(rawQuery, "platform")
+	if !queryPresent(rawQuery, "platform") {
+		requested, requestedScalar = "all", true
+	}
+	if !requestedScalar || (requested != "all" && (requested != platform || !h.catalog.Has(requested))) {
+		return false
+	}
+	if !cacheableRequest(platform, source) {
+		return false
+	}
+	itemID := ""
+	if path == "/api/resolve" {
+		id, ok := queryValue(rawQuery, "item_id")
+		if !ok || id == "" || len(id) > 256 {
+			return false
+		}
+		itemID = id
+	}
+	debug, _ := queryValue(rawQuery, "debug")
+	return h.cache.fresh(cacheKey{
+		route:    path,
+		platform: platform,
+		url:      normalizeCacheURL(platform, source),
+		itemID:   itemID,
+		debug:    debug == "1",
+	}, h.now())
+}
+
 // ParsePlatform reports the registered catalog platform matched by a scalar url
 // query parameter, or "" when the URL is missing, malformed, or unsupported.
 func (h *Handler) ParsePlatform(rawQuery string) string {
