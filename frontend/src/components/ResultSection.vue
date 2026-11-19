@@ -56,6 +56,7 @@ const emit = defineEmits([
   "refresh-item",
   "install-youtube-helper",
   "refresh-youtube-helper-page",
+  "prompt-select-quality",
 ]);
 const context = { apiOrigin: apiConfig.baseUrl };
 const urlOf = (source) => (source ? sourceUrl(source, context) : "");
@@ -248,6 +249,20 @@ const qualityOptions = computed(() => {
   });
 });
 const hasBackup = computed(() => allQualityOptions.value.length > 0);
+const isTargetBlocked = computed(
+  () =>
+    !target.value ||
+    target.value.kind === "unsupported" ||
+    target.value.kind === "unavailable" ||
+    target.value.kind === "invalid",
+);
+const needsQualitySelection = computed(
+  () =>
+    !isYouTubeHelperBlocked.value &&
+    !isResolving.value &&
+    isTargetBlocked.value &&
+    downloadableQualityOptions.value.length > 0,
+);
 const imageUrl = (item) => {
   const selected = props.selection?.selectionFor(item.id);
   const result = getDownloadTarget(item, selected, context);
@@ -609,7 +624,27 @@ const infoColumnEl = ref(null),
   authorCardEl = ref(null),
   infoCardEl = ref(null),
   tabsEl = ref(null),
-  detailsPanelEl = ref(null);
+  detailsPanelEl = ref(null),
+  backupPanelEl = ref(null);
+const openQualityPicker = (notify = false) => {
+  activeTab.value = "backup";
+  if (notify) {
+    emit("prompt-select-quality");
+  }
+  nextTick(() => {
+    const panel = backupPanelEl.value;
+    panel?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+    const firstOption = panel?.querySelector?.(".rs-backup-item");
+    firstOption?.focus?.();
+  });
+};
+const handlePrimaryDownloadClick = () => {
+  if (needsQualitySelection.value) {
+    openQualityPicker(true);
+    return;
+  }
+  emit("download-main");
+};
 const desktopLayout = ref(false),
   detailsCardHeight = ref(0),
   detailsColumnHeight = ref(0);
@@ -731,6 +766,7 @@ const content = {
     liveSource: "实况来源",
     noBackups: "暂无备用画质",
     selectQuality: "选择画质",
+    selectQualityFirst: "请先选择画质",
   },
   en: {
     resultTitle: "Result",
@@ -804,6 +840,7 @@ const content = {
     liveSource: "Live Source",
     noBackups: "No backup qualities",
     selectQuality: "Select Quality",
+    selectQualityFirst: "Select Quality First",
   },
 };
 
@@ -1091,7 +1128,7 @@ onUnmounted(() => {
                   !isResolving
                 "
                 class="rs-btn rs-btn--ghost"
-                @click="activeTab = 'backup'"
+                @click="openQualityPicker(false)"
               >
                 {{ t(locale, "selectQuality") }}</button
               ><button
@@ -1117,8 +1154,9 @@ onUnmounted(() => {
           </div>
           <div class="rs-card-actions">
             <button
-              @click="emit('download-main')"
+              @click="handlePrimaryDownloadClick"
               class="rs-btn rs-btn--primary"
+              :data-select-quality-first="needsQualitySelection || undefined"
               :data-youtube-mux-save="isActiveYouTubeSplitVideo || undefined"
               :data-youtube-audio-only-save="
                 isActiveYouTubeAudioOnly || undefined
@@ -1126,17 +1164,22 @@ onUnmounted(() => {
               :disabled="
                 isYouTubeHelperBlocked ||
                 isResolving ||
-                target?.kind === 'unsupported' ||
-                target?.kind === 'unavailable' ||
-                target?.kind === 'invalid'
+                (isTargetBlocked && !needsQualitySelection)
               "
             >
-              <AppIcon class="fas fa-download" /><span>{{
-                isActiveYouTubeSplitVideo
-                  ? t(locale, "downloadMux")
-                  : isActiveYouTubeAudioOnly
-                    ? t(locale, "downloadAudioOnly")
-                    : t(locale, "downloadSingle")
+              <AppIcon
+                :class="[
+                  'fas',
+                  needsQualitySelection ? 'fa-layer-group' : 'fa-download',
+                ]"
+              /><span>{{
+                needsQualitySelection
+                  ? t(locale, "selectQualityFirst")
+                  : isActiveYouTubeSplitVideo
+                    ? t(locale, "downloadMux")
+                    : isActiveYouTubeAudioOnly
+                      ? t(locale, "downloadAudioOnly")
+                      : t(locale, "downloadSingle")
               }}</span>
             </button>
             <button
@@ -1523,7 +1566,11 @@ onUnmounted(() => {
               {{ playCountNote }}
             </p>
           </div>
-          <div v-if="activeTab === 'backup'" class="rs-tab-panel">
+          <div
+            v-if="activeTab === 'backup'"
+            ref="backupPanelEl"
+            class="rs-tab-panel"
+          >
             <div class="rs-backup-label-row">
               <span>{{ t(locale, "selectQuality") }}</span>
               <button

@@ -217,7 +217,6 @@ sleep 10
 		{"ERROR: [facebook] 637842556329505: This video is only available for registered users. Use --cookies-from-browser or --cookies for the authentication.", CodeUpstreamBlocked, false, ""},
 		{"ERROR: [facebook] 123456: The video is not available, Facebook said: \"You must log in to continue.\"", CodeUpstreamBlocked, false, ""},
 		{"ERROR: [facebook] 123456: Cannot parse data; please report this issue on https://github.com/yt-dlp/yt-dlp/issues", CodeUpstreamBlocked, false, ""},
-		{"ERROR: [dailymotion] x9zzzzzz999: Not found.", CodeContentUnavailable, false, "未找到可用的媒体，或该内容已不可访问"},
 	}
 	for _, tc := range cases {
 		classified := classifyStderr(tc.stderr, errors.New("exit status 1"))
@@ -243,28 +242,21 @@ sleep 10
 		}
 	}
 
-	// Narrow line-scoped Dailymotion "Not found." classification: positive + negative checks.
-	for _, dmTC := range []struct {
+	// Missing binary / generic "not found" errors must stay retryable UPSTREAM_UNAVAILABLE rather than CONTENT_UNAVAILABLE.
+	for _, nfTC := range []struct {
 		stderr        string
 		wantCode      ErrorCode
 		wantRetryable bool
 	}{
-		{"ERROR: [dailymotion] x8m8jmu: not found.", CodeContentUnavailable, false},
-		{"[dailymotion] x9zzzzzz999: Not found.", CodeContentUnavailable, false},
-		{"ERROR: [dailymotion:playlist] x12345: Not found.", CodeContentUnavailable, false},
-		{"WARNING: [dailymotion] Retrying API\r\nERROR: [dailymotion] x9zzzzzz999: Not found.\r\n", CodeContentUnavailable, false},
 		{"yt-dlp: not found", CodeUpstreamUnavailable, true},
 		{"sh: 1: yt-dlp: not found", CodeUpstreamUnavailable, true},
 		{"ERROR: [youtube] x9zzzzzz999: Not found.", CodeUpstreamUnavailable, true},
-		{"ERROR: [dailymotionfoo] x9zzzzzz999: Not found.", CodeUpstreamUnavailable, true},
-		{"ERROR: [dailymotion] x9zzzzzz999: Executable not found", CodeUpstreamUnavailable, true},
-		{"ERROR: [dailymotion] x9zzzzzz999: ffmpeg not found.", CodeUpstreamUnavailable, true},
-		{"[dailymotion] x9zzzzzz999: Downloading JSON\nERROR: [generic] x9zzzzzz999: Not found.\n", CodeUpstreamUnavailable, true},
+		{"ERROR: [generic] x9zzzzzz999: ffmpeg not found.", CodeUpstreamUnavailable, true},
 	} {
-		got := classifyStderr(dmTC.stderr, errors.New("exit status 1"))
-		if got.Code != dmTC.wantCode || got.Retryable != dmTC.wantRetryable {
+		got := classifyStderr(nfTC.stderr, errors.New("exit status 1"))
+		if got.Code != nfTC.wantCode || got.Retryable != nfTC.wantRetryable {
 			t.Fatalf("classifyStderr(%q) = (code=%s, retryable=%v), want (code=%s, retryable=%v)",
-				dmTC.stderr, got.Code, got.Retryable, dmTC.wantCode, dmTC.wantRetryable)
+				nfTC.stderr, got.Code, got.Retryable, nfTC.wantCode, nfTC.wantRetryable)
 		}
 	}
 }
@@ -2199,6 +2191,90 @@ func TestPopulateMissingMP4SizesRecoversProberPanicWithoutDeadlock(t *testing.T)
 	for _, forbidden := range []string{"ytengine-probe-secret", "ytprobesecret", "cdn.example.com"} {
 		if strings.Contains(logged, forbidden) {
 			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
+	}
+}
+
+func TestSortAudioFormatsStrictWeakOrdering(t *testing.T) {
+	abr := 128.0
+	ch := int64(2)
+	makeFmt := func(id, tag string) Format {
+		return Format{
+			FormatID:      id,
+			URL:           "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&tag=" + tag,
+			Ext:           "m4a",
+			Protocol:      "https",
+			VCodec:        "none",
+			ACodec:        "mp4a.40.2",
+			ABR:           &abr,
+			AudioChannels: &ch,
+		}
+	}
+
+	// Probe the exact strict-less relation induced by sortAudioFormats via 2-element SliceStable:
+	// [b, a] swaps to [a, b] iff less(a, b) is true.
+	less := func(aID, bID string) bool {
+		pair := []Format{makeFmt(bID, "b"), makeFmt(aID, "a")}
+		sortAudioFormats(pair)
+		return strings.HasSuffix(pair[0].URL, "tag=a")
+	}
+	incomp := func(aID, bID string) bool {
+		return !less(aID, bID) && !less(bID, aID)
+	}
+
+	ids := []string{"140", "140-dup2", "140-0", "140-drc", "140-dup3", "139"}
+	for _, a := range ids {
+		if less(a, a) {
+			t.Fatalf("irreflexivity violated: less(%q, %q) == true", a, a)
+		}
+		for _, b := range ids {
+			if less(a, b) && less(b, a) {
+				t.Fatalf("asymmetry violated for (%q, %q)", a, b)
+			}
+			for _, c := range ids {
+				if less(a, b) && less(b, c) && !less(a, c) {
+					t.Fatalf("transitivity violated: less(%q, %q) && less(%q, %q), but !less(%q, %q)", a, b, b, c, a, c)
+				}
+				if incomp(a, b) && incomp(b, c) && !incomp(a, c) {
+					t.Fatalf("transitivity of incomparability violated for (%q, %q, %q): less(a,c)=%v less(c,a)=%v",
+						a, b, c, less(a, c), less(c, a))
+				}
+			}
+		}
+	}
+
+	// Deterministic sort.SliceStable output on ["140", "140-dup2", "140-0", "140-drc"]:
+	// - "140-0" has baseFormatID "140-0" > "140" (and non-DRC) -> first
+	// - "140" and "140-dup2" share baseFormatID "140" -> SliceStable preserves ["140", "140-dup2"]
+	// - "140-drc" is deprioritized by DRC penalty -> last
+	formats := []Format{
+		makeFmt("140", "first-140"),
+		makeFmt("140-dup2", "dup2-140"),
+		makeFmt("140-0", "zero-140"),
+		makeFmt("140-drc", "drc-140"),
+	}
+	sortAudioFormats(formats)
+	gotOrder := []string{formats[0].FormatID, formats[1].FormatID, formats[2].FormatID, formats[3].FormatID}
+	wantOrder := []string{"140-0", "140", "140-dup2", "140-drc"}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("sortAudioFormats([140, 140-dup2, 140-0, 140-drc]) = %v, want %v", gotOrder, wantOrder)
+		}
+	}
+
+	// Reversing "140-dup2" before "140" also preserves stability among equal baseFormatIDs while keeping "140-0" first and "140-drc" last.
+	reversedDup := []Format{
+		makeFmt("140-drc", "drc-140"),
+		makeFmt("140-dup2", "dup2-140"),
+		makeFmt("140-0", "zero-140"),
+		makeFmt("140", "first-140"),
+	}
+	sortAudioFormats(reversedDup)
+	gotRev := []string{reversedDup[0].FormatID, reversedDup[1].FormatID, reversedDup[2].FormatID, reversedDup[3].FormatID}
+	wantRev := []string{"140-0", "140-dup2", "140", "140-drc"}
+	for i := range wantRev {
+		if gotRev[i] != wantRev[i] {
+			t.Fatalf("sortAudioFormats([140-drc, 140-dup2, 140-0, 140]) = %v, want %v", gotRev, wantRev)
 		}
 	}
 }

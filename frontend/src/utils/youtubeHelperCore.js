@@ -3,7 +3,7 @@
 // userscript (Tampermonkey / Violentmonkey), the Vue frontend, and Node unit tests,
 // and can be packaged into a browser extension in the future.
 
-export const YOUTUBE_HELPER_VERSION = "1.3.1";
+export const YOUTUBE_HELPER_VERSION = "1.3.2";
 export const MIN_YOUTUBE_HELPER_VERSION = "1.3.1";
 export const YOUTUBE_HELPER_SCRIPT_URL = "/helper/dokitool-youtube.user.js";
 export const YOUTUBE_OPFS_TEMP_PREFIX = "dokitool-yt-tmp-";
@@ -198,6 +198,41 @@ export function extractUrlClen(rawUrl) {
   }
 }
 
+function extractXtagsAudioContent(entry) {
+  let rawUrl = "";
+  if (typeof entry?.url === "string" && entry.url.trim()) {
+    rawUrl = entry.url.trim();
+  } else if (
+    typeof entry?.signatureCipher === "string" &&
+    entry.signatureCipher.trim()
+  ) {
+    try {
+      const cipherParams = new URLSearchParams(entry.signatureCipher);
+      rawUrl = (cipherParams.get("url") || "").trim();
+    } catch {
+      rawUrl = "";
+    }
+  }
+  if (!rawUrl) return "";
+  try {
+    const parsed = new URL(rawUrl);
+    const xtags = (parsed.searchParams.get("xtags") || "").trim();
+    if (!xtags) return "";
+    let acont = "";
+    for (const part of xtags.split(":")) {
+      const eqIdx = part.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const k = part.slice(0, eqIdx).trim().toLowerCase();
+      if (k === "acont") {
+        acont = part.slice(eqIdx + 1).trim().toLowerCase();
+      }
+    }
+    return acont;
+  } catch {
+    return "";
+  }
+}
+
 function pickUsableVariantSource(variant) {
   const sources = variant && variant.delivery && variant.delivery.sources;
   if (!Array.isArray(sources) || sources.length === 0) return null;
@@ -276,6 +311,7 @@ export function selectYouTubeMuxPair(
           }))
       : []),
   ];
+  const matched = [];
   for (const cand of candidates) {
     if (
       !cand ||
@@ -313,15 +349,47 @@ export function selectYouTubeMuxPair(
     if (!audioSource || !isValidGooglevideoPlaybackUrl(audioSource.url)) {
       continue;
     }
+    matched.push({ cand, audioSource, outFmt });
+  }
+
+  if (matched.length > 0) {
+    const isDubbedOrDescriptive = ({ cand, audioSource }) => {
+      const role = norm(cand.metadata?.audio_language_role);
+      const label = String(cand.label || "");
+      const acont = extractXtagsAudioContent({ url: audioSource?.url });
+      return (
+        role === "alternate" ||
+        acont === "descriptive" ||
+        acont === "dubbed" ||
+        acont === "dubbed-auto" ||
+        acont === "secondary" ||
+        /dubbed|auto-dubbed|配音|descriptive|description/i.test(label)
+      );
+    };
+    const isExplicitOriginal = ({ cand, audioSource }) => {
+      const role = norm(cand.metadata?.audio_language_role);
+      const label = String(cand.label || "");
+      const acont = extractXtagsAudioContent({ url: audioSource?.url });
+      return (
+        !isDubbedOrDescriptive({ cand, audioSource }) &&
+        (role === "main" ||
+          acont === "original" ||
+          /original|原声|原音/i.test(label))
+      );
+    };
+    const chosen =
+      matched.find(isExplicitOriginal) ||
+      matched.find((m) => !isDubbedOrDescriptive(m)) ||
+      matched[0];
     return {
       ok: true,
-      outputContainer: outFmt,
-      outputExtension: outFmt,
-      outputMimeType: `video/${outFmt}`,
+      outputContainer: chosen.outFmt,
+      outputExtension: chosen.outFmt,
+      outputMimeType: `video/${chosen.outFmt}`,
       videoVariant,
-      audioVariant: cand,
+      audioVariant: chosen.cand,
       videoSource,
-      audioSource,
+      audioSource: chosen.audioSource,
     };
   }
 
@@ -509,6 +577,66 @@ export function buildTVHTML5PlayerPayload(params) {
   };
 }
 
+const AUDIO_TRACK_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const MAX_AUDIO_TRACK_DISPLAY_NAME_CHARS = 80;
+
+function sanitizeAudioTrack(rawTrack) {
+  if (!rawTrack || typeof rawTrack !== "object" || Array.isArray(rawTrack)) {
+    return null;
+  }
+  const out = {};
+  if (typeof rawTrack.id === "string") {
+    const trimmedId = rawTrack.id.trim();
+    if (AUDIO_TRACK_ID_RE.test(trimmedId)) {
+      out.id = trimmedId;
+    }
+  }
+  const displayName = sanitizeHelperText(
+    rawTrack.displayName,
+    MAX_AUDIO_TRACK_DISPLAY_NAME_CHARS,
+  );
+  if (displayName) {
+    out.displayName = displayName;
+  }
+  if (typeof rawTrack.audioIsDefault === "boolean") {
+    out.audioIsDefault = rawTrack.audioIsDefault;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function isDescriptiveAudio(at) {
+  return Boolean(
+    at && /descriptive|description/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
+function isDubbedAudio(at) {
+  return Boolean(
+    at && /dubbed|auto-dubbed|配音/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
+function isOriginalAudio(at) {
+  return Boolean(
+    at && /original|原声|原音/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
+function classifyAudioFormatEntry(entry) {
+  const at = entry?.audioTrack || null;
+  const acont = extractXtagsAudioContent(entry);
+  const isDescriptive = acont === "descriptive" || isDescriptiveAudio(at);
+  const isDubbed =
+    acont === "dubbed" ||
+    acont === "dubbed-auto" ||
+    acont === "secondary" ||
+    isDubbedAudio(at);
+  const isOriginal = acont === "original" || isOriginalAudio(at);
+  const isDefault = at?.audioIsDefault === true;
+  const hasHint = Boolean(at) || isDescriptive || isDubbed || isOriginal;
+  return { entry, hasHint, isOriginal, isDescriptive, isDubbed, isDefault };
+}
+
 function sanitizeFormatArray(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
@@ -520,6 +648,10 @@ function sanitizeFormatArray(list) {
         clean[key] = item[key];
       }
     }
+    const cleanAudioTrack = sanitizeAudioTrack(item.audioTrack);
+    if (cleanAudioTrack) {
+      clean.audioTrack = cleanAudioTrack;
+    }
     if (
       typeof clean.itag === "number" &&
       clean.itag > 0 &&
@@ -528,6 +660,32 @@ function sanitizeFormatArray(list) {
       out.push(clean);
     }
   }
+
+  const isAudioOnly = (entry) =>
+    typeof entry.mimeType === "string" &&
+    entry.mimeType.trim().toLowerCase().startsWith("audio/");
+  const nonAudioEntries = out.filter((entry) => !isAudioOnly(entry));
+  const audioEntries = out.filter(isAudioOnly);
+
+  const classifiedAudio = audioEntries.map(classifyAudioFormatEntry);
+  if (classifiedAudio.some((c) => c.hasHint)) {
+    const tiers = [
+      (c) => c.isOriginal && !c.isDescriptive && !c.isDubbed,
+      (c) => c.isDefault && !c.isDescriptive && !c.isDubbed,
+      (c) => c.isDefault && !c.isDescriptive,
+      (c) => c.isDefault,
+    ];
+    let keptAudio = audioEntries;
+    for (const pred of tiers) {
+      const matched = classifiedAudio.filter(pred);
+      if (matched.length > 0) {
+        keptAudio = matched.map((c) => c.entry);
+        break;
+      }
+    }
+    return [...nonAudioEntries, ...keptAudio];
+  }
+
   return out;
 }
 

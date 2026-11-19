@@ -27,7 +27,6 @@ const xArtwork = brandSvg("fa-x-twitter", "#0f172a");
 const youtubeArtwork = brandSvg("fa-youtube", "#ff0003");
 const facebookArtwork = brandSvg("fa-facebook", "#1877f2");
 const tumblrArtwork = brandSvg("fa-tumblr", "#001935");
-const dailymotionArtwork = brandSvg("fa-dailymotion", "#0d0d0d");
 const instagramArtwork =
   "data:image/svg+xml;utf8," +
   encodeURIComponent(
@@ -95,11 +94,6 @@ const platformArtwork = {
     img: tumblrArtwork,
     desc: "解析 Tumblr 视频",
     color: "#001935",
-  },
-  dailymotion: {
-    img: dailymotionArtwork,
-    desc: "解析 Dailymotion 视频",
-    color: "#0d0d0d",
   },
 };
 const allPlatforms = computed(() =>

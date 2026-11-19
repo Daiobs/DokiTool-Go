@@ -298,7 +298,7 @@ func loadFullCatalog() (*catalog.Catalog, error) {
 			return nil, err
 		}
 	}
-	for _, id := range []string{"facebook", "tumblr", "dailymotion"} {
+	for _, id := range []string{"facebook", "tumblr"} {
 		spec, ok := ytgeneric.LookupSite(id)
 		if !ok {
 			return nil, fmt.Errorf("missing builtin site %q", id)
@@ -924,7 +924,6 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		"instagram":   slowAdapter("instagram"),
 		"facebook":    slowAdapter("facebook"),
 		"tumblr":      slowAdapter("tumblr"),
-		"dailymotion": slowAdapter("dailymotion"),
 	}
 
 	var weiboMedia api.PublicMedia

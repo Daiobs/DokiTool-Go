@@ -30,19 +30,14 @@ var builtinSites = []SiteSpec{
 		MaxEntries:                   4,
 		AllowCodecLessProgressiveMP4: true,
 	},
-	{
-		PlatformID:          "dailymotion",
-		Name:                "Dailymotion",
-		SiteURL:             "https://www.dailymotion.com/",
-		Icon:                "dailymotion",
-		CatalogExactDomains: []string{"www.dailymotion.com", "dailymotion.com", "dai.ly"},
-		InputHosts:          []string{"www.dailymotion.com"},
-		OutboundHosts:       []string{"graphql.api.dailymotion.com", "cdndirector.dailymotion.com"},
-		MediaHostSuffix:     []string{".dmcdn.net"},
-		Extractors:          []string{"Dailymotion"},
-		MaxEntries:          4,
-		SingleStreamHLSOnly: true,
-	},
+}
+
+// retiredSiteIDs lists formerly supported ytgeneric site IDs that ParseSitesEnv
+// skips without failing startup so existing deployments carrying legacy
+// DOKITOOL_YTDLP_SITES values (e.g. facebook,tumblr,dailymotion) remain safe
+// across rollout and rollback before environment cleanup.
+var retiredSiteIDs = map[string]bool{
+	"dailymotion": true,
 }
 
 func cloneSiteSpec(s SiteSpec) SiteSpec {
@@ -75,7 +70,8 @@ func LookupSite(id string) (SiteSpec, bool) {
 }
 
 // ParseSitesEnv parses DOKITOOL_YTDLP_SITES (comma-separated, default empty).
-// Any empty token or unknown site ID returns an error so process startup fails closed.
+// Retired site IDs (such as "dailymotion") are ignored gracefully; any empty
+// token or unknown site ID returns an error so process startup fails closed.
 func ParseSitesEnv(raw string) ([]SiteSpec, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -88,6 +84,9 @@ func ParseSitesEnv(raw string) ([]SiteSpec, error) {
 		id := strings.TrimSpace(token)
 		if id == "" {
 			return nil, fmt.Errorf("DOKITOOL_YTDLP_SITES must not contain empty site entries")
+		}
+		if retiredSiteIDs[id] {
+			continue
 		}
 		spec, ok := LookupSite(id)
 		if !ok {

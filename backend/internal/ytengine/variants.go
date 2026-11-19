@@ -908,9 +908,26 @@ func dashCodecRank(vcodec string) int {
 	}
 }
 
+func derefLangPref(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func baseFormatID(raw string) string {
+	base, _, _ := strings.Cut(raw, "-dup")
+	return base
+}
+
 func sortAudioFormats(formats []Format) {
 	sort.SliceStable(formats, func(i, j int) bool {
 		a, b := formats[i], formats[j]
+		// Prefer original / default audio tracks over dubbed or descriptive tracks.
+		lpa, lpb := derefLangPref(a.LanguagePreference), derefLangPref(b.LanguagePreference)
+		if lpa != lpb {
+			return lpa > lpb
+		}
 		// Prefer MP4/M4A AAC audio for universal playback compatibility
 		aM4A := strings.EqualFold(a.Ext, "m4a") || strings.EqualFold(a.Ext, "mp4")
 		bM4A := strings.EqualFold(b.Ext, "m4a") || strings.EqualFold(b.Ext, "mp4")
@@ -943,7 +960,7 @@ func sortAudioFormats(formats []Format) {
 		if aa != ab {
 			return aa > ab
 		}
-		return a.FormatID > b.FormatID
+		return baseFormatID(a.FormatID) > baseFormatID(b.FormatID)
 	})
 }
 

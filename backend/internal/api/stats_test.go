@@ -39,7 +39,7 @@ func makeStatsTestCatalog(t *testing.T) *catalog.Catalog {
 			t.Fatal(err)
 		}
 	}
-	specs, err := ytgeneric.ParseSitesEnv("facebook,tumblr,dailymotion")
+	specs, err := ytgeneric.ParseSitesEnv("facebook,tumblr")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestStatsBoundedPlatformCodeChannelMatrix(t *testing.T) {
 	hostilePlatform := "attacker_plat_" + randomPrintableToken(t, 12)
 	hostileURL := "https://evil.example.org/watch?v=" + randomPrintableToken(t, 16)
 
-	if len(KnownPlatforms()) != 16 || len(KnownOutcomeCodes()) != 13 {
+	if len(KnownPlatforms()) != 15 || len(KnownOutcomeCodes()) != 13 {
 		t.Fatalf("unexpected closed vocabulary sizes: platforms=%d codes=%d", len(KnownPlatforms()), len(KnownOutcomeCodes()))
 	}
 	if NormalizePlatform(hostilePlatform) != PlatformUnknown {

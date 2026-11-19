@@ -2,7 +2,7 @@
 
 DokiTool 是面向多平台的公开短视频、图集与实况照片无水印解析及浏览器直连保存工具，线上站点：<https://snap.dokitool.com>。
 
-## 支持平台（15 个）
+## 支持平台（14 个）
 
 平台目录真值位于 `backend/config/platforms.json` 与 `backend/internal/catalog/catalog.go`（部分平台按服务端启动开关启用，详见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）。前端粘贴文本时会自动提取首个 `http(s)` 链接并剥离尾随标点。
 
@@ -12,17 +12,16 @@ DokiTool 是面向多平台的公开短视频、图集与实况照片无水印�
 | 快手（`kuaishou`） | 视频 / 图片 | `kuaishou.com`（`www.kuaishou.com/short-video/...`、`/f/...`、`v.kuaishou.com`、`c.kuaishou.com`） | 仅公开分享作品；触发上游页面风控时返回 `UPSTREAM_BLOCKED` |
 | 哔哩哔哩（`bilibili`） | 视频 | `bilibili.com`（`www.bilibili.com`、`m.bilibili.com`）、`b23.tv` | 多 P 分集按需逐集调用 `/api/resolve`；不支持番剧、付费或大会员专享稿件 |
 | 小红书（`xiaohongshu`） | 视频 / 图片 / 实况 | `xiaohongshu.com`、`xhslink.com`、`rednote.com` | 网页直链须含 `xsec_token`，缺失时需从小红书 App 复制分享链接 |
-| 今日头条（`toutiao`） | 视频 | `toutiao.com`（`www.toutiao.com`、`m.toutiao.com` 的 `/video/`、`/group/`、`/i<id>`） | `*.toutiaovod.com` 走浏览器原生附件下载，文件名由上游响应头决定，站内无法跟踪进度 |
+| 今日头条（`toutiao`） | 视频 | `toutiao.com`（`www.toutiao.com`、`m.toutiao.com` 的 `/video/`、`/group/`、`/i<id>`） | `*.toutiaovod.com` 上游无跨域读取头与附件下载头，通过「打开源链接」在新标签页右键「视频另存为」（手机端长按保存） |
 | 微博（`weibo`） | 视频 | `weibo.com`、`www.weibo.com`、`video.weibo.com/show?fid=...`、`m.weibo.cn` | 视频经本站 `/api/media/weibo` 短期签名票据（30 分钟有效）中转，依赖服务端配置签名密钥 |
 | 皮皮虾（`pipixia`） | 视频 / 图片 | `pipix.com`（`h5.pipix.com/item/...`、`/ppx/item/...`） | 仅支持公开分享帖子 |
 | 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP 打包），失败回退手动打开源链接 |
 | 最右（`zuiyou`） | 视频 / 图片 | `izuiyou.com`、`share.xiaochuankeji.cn` | 线上关闭视频 `tbvideo` 改写，视频通过「打开源链接」手动保存；图片支持直下与打包 |
 | X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（含 `www.`、`mobile.`、`m.` 状态页及 `/photo/<N>`、`/video/<N>`） | 不支持 `t.co` 短链；纯文本推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需开启 `-x-tombstone-fallback=fxtwitter` 才查询公开回退源 |
-| YouTube（`youtube`） | 视频 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | 桌面端需安装并启用用户脚本 `DokiTool YouTube Helper`（`1.3.1`）取址与浏览器内无损合并；手机端无脚本管理器时暂不支持 |
+| YouTube（`youtube`） | 视频 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | 桌面端需安装并启用用户脚本 `DokiTool YouTube Helper`（`1.3.2`）取址与浏览器内无损合并；手机端无脚本管理器时暂不支持 |
 | Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.` 的 `/p/`、`/reel/`、`/reels/`、`/tv/`） | 不支持 `instagr.am` 短链（返回 `UNSUPPORTED_PLATFORM`）；不支持 Stories（`/stories/`）及私密或需登录帖（返回 `UPSTREAM_BLOCKED`） |
 | Facebook（`facebook`） | 视频 | `facebook.com`、`www.facebook.com`、`m.facebook.com`、`fb.watch` | `fb.watch` 短链需登录展开，接口直接返回 `INVALID_INPUT` 提示先在浏览器打开并复制 `facebook.com` 完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
 | Tumblr（`tumblr`） | 视频 | `tumblr.com`、`www.tumblr.com`、`*.tumblr.com` | 仅支持公开视频帖（单帖最多提取 4 个视频条目） |
-| Dailymotion（`dailymotion`） | 视频 | `dailymotion.com`、`www.dailymotion.com`、`dai.ly` | 仅支持单流 fMP4 HLS 清单并在浏览器按序拼接保存；仅含非 fMP4（如 TS 分片）HLS 的视频返回 `NO_MEDIA` |
 
 ## 架构概览
 
@@ -67,7 +66,7 @@ DokiTool 是面向多平台的公开短视频、图集与实况照片无水印�
 | --- | --- | --- |
 | `fast` | `DOKITOOL_PARSE_` | 未命中缓存的纯 Go 国内平台 `GET /api/parse` 请求及已退役旧路径，含单客户端/全局令牌桶、并发上限与有界 FIFO 等待队列 |
 | `resolve` | `DOKITOOL_RESOLVE_` | 未命中缓存的纯 Go 平台按需分集解析 `GET /api/resolve`（如哔哩哔哩多 P 选集），提供独立更宽的单 IP 突发与并发配额，避免挤占首次解析配额 |
-| `slow` | `DOKITOOL_PARSE_SLOW_` | 未命中缓存的海外慢解析平台（`x`、`youtube`、`instagram`、`facebook`、`tumblr`、`dailymotion`）`/api/parse` 与 `/api/resolve`，以及未命中缓存的 `GET /api/youtube/context` 和 `POST /api/youtube/finalize` |
+| `slow` | `DOKITOOL_PARSE_SLOW_` | 未命中缓存的海外慢解析平台（`x`、`youtube`、`instagram`、`facebook`、`tumblr`）`/api/parse` 与 `/api/resolve`，以及未命中缓存的 `GET /api/youtube/context` 和 `POST /api/youtube/finalize` |
 | `catalog` | `DOKITOOL_CATALOG_` | `GET /api/platforms`、命中缓存的 `GET /api/youtube/context`，以及**命中进程内新鲜缓存（`DOKITOOL_PARSE_CACHE`）的 `GET /api/parse` 与 `GET /api/resolve` 请求**（零上游开销，不消耗解析池配额） |
 | `owner` | `DOKITOOL_OWNER_*` | 携带有效 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN` 的个人 Agent 通道请求（与匿名池完全隔离；无效鉴权头绝不降级为匿名请求，而是扣减调用方 IP 在 `fast` 池的防刷配额并返回 `401` / `429`） |
 

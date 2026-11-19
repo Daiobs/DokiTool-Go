@@ -298,3 +298,202 @@ func TestShortLinkRedirectReusesLandingBodyOrFallsBack(t *testing.T) {
 		}
 	})
 }
+
+func TestShortLinkSecondHopSecurityRedirectRetainsNoteURLAndMapsUpstreamBlocked(t *testing.T) {
+	const (
+		now          int64 = 1793361600
+		shortURL           = "http://xhslink.com/o/6JXkFnl35ex"
+		canonicalURL       = "https://www.xiaohongshu.com/discovery/item/abc123?xsec_token=tok%2Bvalid+1%3D&xsec_source=pc_share"
+		rednoteURL         = "https://www.rednote.com/discovery/item/abc123?xsec_token=tok%2Bvalid+1%3D&xsec_source=pc_share"
+		secRelPath         = "/404/sec_verify_token?redirectPath=https%3A%2F%2Fwww.xiaohongshu.com%2Fdiscovery%2Fitem%2Fabc123&error_code=300031&error_msg=sec"
+		secXHSURL          = "https://www.xiaohongshu.com" + secRelPath
+		secRednote         = "https://www.rednote.com" + secRelPath
+		noteHTML           = `<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{"abc123":{"note":{"noteId":"abc123","type":"video","title":"Recovered via rednote","video":{"media":{"stream":{"h264":[{"masterUrl":"https://sns-video-qn.xhscdn.com/synthetic/720.mp4","width":1280,"height":720}]}}}}}}}};</script>`
+	)
+
+	t.Run("rednote-succeeds-after-xhs-second-hop-sec-redirect", func(t *testing.T) {
+		var pageURLs []string
+		p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+			pageURLs = append(pageURLs, r.URL)
+			switch r.URL {
+			case shortURL:
+				return fetch.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": {canonicalURL}},
+					URL:        r.URL,
+				}, nil
+			case canonicalURL:
+				return fetch.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": {secRelPath}},
+					URL:        r.URL,
+				}, nil
+			case secXHSURL:
+				return fetch.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       []byte(`<html><body>security block</body></html>`),
+					URL:        r.URL,
+				}, nil
+			case rednoteURL:
+				return fetch.Response{
+					StatusCode: http.StatusOK,
+					Body:       []byte(noteHTML),
+					URL:        r.URL,
+				}, nil
+			default:
+				t.Fatalf("unexpected request URL: %s", r.URL)
+				return fetch.Response{}, nil
+			}
+		}))
+		got, err := p.Parse(context.Background(), shortURL, now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if unified.Str(got["code"]) != "OK" {
+			t.Fatalf("expected OK when rednote succeeds, got %#v", got)
+		}
+		if title := unified.Str(unified.Map(got["data"])["title"]); title != "Recovered via rednote" {
+			t.Fatalf("title = %q, want Recovered via rednote", title)
+		}
+		wantOrder := []string{shortURL, canonicalURL, secXHSURL, rednoteURL}
+		if len(pageURLs) != len(wantOrder) {
+			t.Fatalf("pageURLs = %v, want %v", pageURLs, wantOrder)
+		}
+		for i, want := range wantOrder {
+			if pageURLs[i] != want {
+				t.Fatalf("pageURLs[%d] = %q, want %q", i, pageURLs[i], want)
+			}
+		}
+	})
+
+	t.Run("both-hosts-blocked-returns-upstream-blocked-not-invalid-input", func(t *testing.T) {
+		for _, rednoteMode := range []string{"sec-302-to-200", "sec-302-to-404", "direct-403"} {
+			t.Run(rednoteMode, func(t *testing.T) {
+				var pageURLs []string
+				p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+					pageURLs = append(pageURLs, r.URL)
+					switch r.URL {
+					case shortURL:
+						return fetch.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {canonicalURL}},
+							URL:        r.URL,
+						}, nil
+					case canonicalURL:
+						return fetch.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {secRelPath}},
+							URL:        r.URL,
+						}, nil
+					case secXHSURL:
+						return fetch.Response{
+							StatusCode: http.StatusOK,
+							Body:       []byte(`<html><body>sec page</body></html>`),
+							URL:        r.URL,
+						}, nil
+					case rednoteURL:
+						if rednoteMode == "direct-403" {
+							return fetch.Response{StatusCode: http.StatusForbidden, URL: r.URL}, nil
+						}
+						return fetch.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {secRelPath}},
+							URL:        r.URL,
+						}, nil
+					case secRednote:
+						st := http.StatusOK
+						if rednoteMode == "sec-302-to-404" {
+							st = http.StatusNotFound
+						}
+						return fetch.Response{
+							StatusCode: st,
+							Body:       []byte(`<html><body>rednote sec page</body></html>`),
+							URL:        r.URL,
+						}, nil
+					default:
+						t.Fatalf("unexpected request URL (already-blocked xhs must not be retried): %s", r.URL)
+						return fetch.Response{}, nil
+					}
+				}))
+				got, err := p.Parse(context.Background(), shortURL, now)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := unified.ValidateEnvelopeAt(got, now); err != nil {
+					t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+				}
+				if code := unified.Str(got["code"]); code != "UPSTREAM_BLOCKED" {
+					t.Fatalf("code = %q, want UPSTREAM_BLOCKED (payload=%#v)", code, got)
+				}
+			})
+		}
+	})
+
+	t.Run("direct-403-on-canonical-landing-skips-xhs-retry-and-falls-back-straight-to-rednote", func(t *testing.T) {
+		for _, rednoteSucceeds := range []bool{true, false} {
+			name := "rednote-200"
+			if !rednoteSucceeds {
+				name = "rednote-404-still-skips-xhs-retry"
+			}
+			t.Run(name, func(t *testing.T) {
+				var pageURLs []string
+				p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+					pageURLs = append(pageURLs, r.URL)
+					switch r.URL {
+					case shortURL:
+						return fetch.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {canonicalURL}},
+							URL:        r.URL,
+						}, nil
+					case canonicalURL:
+						return fetch.Response{
+							StatusCode: http.StatusForbidden,
+							Body:       []byte(`<html><body>403 forbidden</body></html>`),
+							URL:        r.URL,
+						}, nil
+					case rednoteURL:
+						if rednoteSucceeds {
+							return fetch.Response{
+								StatusCode: http.StatusOK,
+								Body:       []byte(noteHTML),
+								URL:        r.URL,
+							}, nil
+						}
+						return fetch.Response{
+							StatusCode: http.StatusNotFound,
+							Body:       []byte(`<html><body>not found</body></html>`),
+							URL:        r.URL,
+						}, nil
+					default:
+						t.Fatalf("unexpected request URL: %s", r.URL)
+						return fetch.Response{}, nil
+					}
+				}))
+				got, err := p.Parse(context.Background(), shortURL, now)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				// Exactly 1 request to shortURL + 1 request to xiaohongshu + 1 fallback request to rednote (no second xiaohongshu fetch!)
+				wantOrder := []string{shortURL, canonicalURL, rednoteURL}
+				if len(pageURLs) != len(wantOrder) {
+					t.Fatalf("pageURLs = %v, want %v", pageURLs, wantOrder)
+				}
+				for i, want := range wantOrder {
+					if pageURLs[i] != want {
+						t.Fatalf("pageURLs[%d] = %q, want %q", i, pageURLs[i], want)
+					}
+				}
+				if rednoteSucceeds {
+					if unified.Str(got["code"]) != "OK" {
+						t.Fatalf("expected OK when rednote succeeds, got %#v", got)
+					}
+				} else {
+					if unified.Str(got["code"]) != "UPSTREAM_BLOCKED" {
+						t.Fatalf("expected UPSTREAM_BLOCKED when xhs returned 403 and rednote failed, got %#v", got)
+					}
+				}
+			})
+		}
+	})
+}

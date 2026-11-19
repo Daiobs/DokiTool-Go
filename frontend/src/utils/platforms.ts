@@ -63,7 +63,6 @@ const tabIcons: Record<string, string> = {
   instagram: "fa-instagram",
   facebook: "fa-facebook",
   tumblr: "fa-tumblr",
-  dailymotion: "fa-dailymotion",
 };
 export const POPULAR_PLATFORM_IDS = [
   "douyin",

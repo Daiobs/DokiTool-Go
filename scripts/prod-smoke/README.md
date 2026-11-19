@@ -18,12 +18,12 @@
 | 检查组 | 默认状态 | 检查内容 |
 | --- | --- | --- |
 | `frontend_hashes` | 传 `--manifest` 时执行，否则 `SKIP` | 对照构建产物 `release-manifest.json` 的 `frontend_dist_files`，逐文件（含 `/`、`index.html`、油猴脚本等）校验线上静态文件原始字节 SHA-256 |
-| `platforms` | 开启 | `GET /api/platforms?schema_version=1.0` 返回 `200 OK`，`data.platforms` 长度为 `15` 且 15 个平台 ID 完整匹配 |
+| `platforms` | 开启 | `GET /api/platforms?schema_version=1.0` 返回 `200 OK`，`data.platforms` 长度为 `14` 且 14 个平台 ID 完整匹配 |
 | `cache` | 开启 | 对缓存样本连续发起 2 次间隔 `>= 8.0s` 的 `/api/parse`，校验两次响应原始字节 SHA-256 与 `generated_at` 完全一致 |
 | `x_fast_path` | 开启 | 校验 X 视频样本返回 `200 OK` 且包含 `https://video.twimg.com` MP4 `file` 直链规格 |
 | `douyin_domestic` | 开启 | 校验抖音样本媒体域名包含 `*.douyinvod.com`（确认上海 `pull` 解析通道生效） |
 | `direct_markers` | 开启 | 校验 `douyin`、`xiaohongshu`（同时要求全部媒体源 `100%` 为 `https://`，`0` 个 `http://`）、`kuaishou`、`pipixia` 已验证 HTTPS CDN 源带 `browser_fetch: "allowed"` |
-| `all_platforms` | 开启 | 校验全部 15 个支持平台均返回合法的 `200 OK` 统一协议响应与可用媒体源 |
+| `all_platforms` | 开启 | 校验全部 14 个支持平台均返回合法的 `200 OK` 统一协议响应与可用媒体源 |
 | `api_boundary` | 开启（排在全部解析检查之后） | 校验接口鉴权与网关白名单边界（不触发 `/api/parse` 8s 间隔）：① `GET /api/stats?schema_version=1.0` 不带头返回 `401` JSON（`code: "INVALID_INPUT"`）；② 随机未白名单路径 `GET /api/<random>` 返回 `404` JSON（`code: "INVALID_INPUT"`，拒绝 HTML/纯文本兜底） |
 | `rate_limit` | **默认关闭**（需传 `--enable-rate-limit`） | 在最后阶段先等待限流桶补满，再连续快速发送 6 个不同 URL 的 `/api/parse`，校验前序 `200 OK`、超额返回 `429 RATE_LIMITED` 且 `retry_after_seconds > 0` |
 

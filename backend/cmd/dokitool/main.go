@@ -56,6 +56,8 @@ func preparePublicMedia(key string) api.PublicMedia {
 			return kuaishou.PreparePublic(ctx, platform, payload, now)
 		case "pipixia":
 			return pipixia.PreparePublic(ctx, platform, payload, now)
+		case "zuiyou":
+			return zuiyou.PreparePublic(ctx, platform, payload, now)
 		default:
 			return weibo(ctx, platform, payload, now)
 		}

@@ -31,9 +31,10 @@ test('built homepage contains the actual content, local visuals and honest contr
   assert.ok(!html.includes('更多平台'));
   assert.doesNotMatch(html, /data-more-platforms-toggle|data-more-platform-tab/);
   const supportedSection = html.slice(html.indexOf('id="Supported_Platforms"'));
-  for (const name of ['抖音', '快手', 'B站', '小红书', '今日头条', '微博', '皮皮虾', '皮皮搞笑', '最右', 'X', 'YouTube', 'Instagram', 'Facebook', 'Tumblr', 'Dailymotion']) {
+  for (const name of ['抖音', '快手', 'B站', '小红书', '今日头条', '微博', '皮皮虾', '皮皮搞笑', '最右', 'X', 'YouTube', 'Instagram', 'Facebook', 'Tumblr']) {
     assert.ok(supportedSection.includes(name), `prerendered Supported_Platforms must include ${name}`);
   }
+  assert.ok(!supportedSection.includes('Dailymotion'), 'retired Dailymotion must not appear in Supported_Platforms');
   assert.match(html, /<noscript>[\s\S]*?解析和下载需要 JavaScript/);
   const logos = [...html.matchAll(/<img[^>]*alt="DokiTool"[^>]*>/g)].map(match => match[0]);
   assert.ok(logos.length >= 1);

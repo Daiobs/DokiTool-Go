@@ -93,7 +93,7 @@ function triggerBrowserDownload(
   return !threw && !clickEvent?.defaultPrevented;
 }
 
-function isToutiaovodAttachmentUrl(rawUrl: string): boolean {
+function isToutiaovodVideoUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
@@ -142,7 +142,7 @@ function inferredVideoFileExtension(
       return undefined;
     }
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (isToutiaovodAttachmentUrl(rawUrl)) {
+    if (isToutiaovodVideoUrl(rawUrl)) {
       return "mp4";
     }
     if (
@@ -163,7 +163,7 @@ function inferredVideoFileExtension(
 }
 
 function isCorsBlockedDirectCdn(rawUrl: string): boolean {
-  if (isToutiaovodAttachmentUrl(rawUrl)) {
+  if (isToutiaovodVideoUrl(rawUrl)) {
     return true;
   }
   try {
@@ -178,9 +178,6 @@ function isCorsBlockedDirectCdn(rawUrl: string): boolean {
 // URL parameters only indicate that a direct attachment attempt can be made;
 // they never prove that the actual upstream HTTP response is a verified attachment.
 function canAttemptDirectAttachment(rawUrl: string): boolean {
-  if (isToutiaovodAttachmentUrl(rawUrl)) {
-    return true;
-  }
   try {
     const parsed = new URL(rawUrl);
     const host = parsed.hostname.toLowerCase();
@@ -536,19 +533,14 @@ export function useMediaDownload({
         return;
       }
       if (canAttemptDirectAttachment(url)) {
-        const isYtNative = !isToutiaovodAttachmentUrl(url);
         if (triggerBrowserDownload(url, filename, true)) {
           videoStore.updateDownload(downloadId, {
             deliveryId,
             transport: "browser_native",
             status: "handed-off",
             statusText: "已交给浏览器",
-            ...(isYtNative
-              ? {
-                  savePath: "browser_native",
-                  savePathLabel: formatYouTubeSavePathLabel("browser_native"),
-                }
-              : {}),
+            savePath: "browser_native",
+            savePathLabel: formatYouTubeSavePathLabel("browser_native"),
             abortController: null,
             percent: 0,
             loaded: 0,
@@ -700,6 +692,10 @@ export function useMediaDownload({
         }
         return;
       }
+      const isToutiaoManual = isToutiaovodVideoUrl(url);
+      const openedToutiaoTab = isToutiaoManual
+        ? triggerBrowserDownload(url, filename, true)
+        : false;
       videoStore.updateDownload(downloadId, {
         deliveryId,
         transport: undefined,
@@ -722,7 +718,11 @@ export function useMediaDownload({
         workerBuild: undefined,
       });
       showToast(
-        "该直链未提供附件下载头，请点击下载卡片中的“打开源链接”手动保存",
+        isToutiaoManual
+          ? openedToutiaoTab
+            ? "因头条 CDN 限制跨域直下，已切换为打开源链接，请在新标签页右键选择「视频另存为」（手机端长按保存）"
+            : "因头条 CDN 限制跨域直下，已切换为打开源链接；请点击下载卡片中的「打开源链接」，在新标签页右键选择「视频另存为」（手机端长按保存）"
+          : "该直链未提供附件下载头，请点击下载卡片中的“打开源链接”手动保存",
         "info",
         6000,
       );
@@ -2290,6 +2290,24 @@ export function useMediaDownload({
       showToast(
         "浏览器限制了新标签页打开，请允许弹窗后再次点击“打开源链接”",
         "warning",
+        6000,
+      );
+      return;
+    }
+    if (isToutiaovodVideoUrl(task.url)) {
+      videoStore.updateDownload(id, {
+        status: "manual",
+        statusText: "打开源链接",
+        abortController: null,
+        speed: 0,
+        averageSpeed: 0,
+        percent: 0,
+        error: null,
+        nativeAvailable: true,
+      });
+      showToast(
+        "已在新标签页打开源视频，请右键选择「视频另存为」（手机端长按保存）",
+        "info",
         6000,
       );
       return;

@@ -751,6 +751,8 @@
 !/backend/internal/platform/zuiyou/parser.go
 !/backend/internal/platform/zuiyou/parser_test.go
 !/backend/internal/platform/zuiyou/php_value.go
+!/backend/internal/platform/zuiyou/public_media.go
+!/backend/internal/platform/zuiyou/public_media_test.go
 !/backend/internal/platform/zuiyou/request.go
 !/backend/internal/platform/zuiyou/testdata/
 /backend/internal/testsupport/publicoracle/*
@@ -866,7 +868,6 @@
 !/backend/internal/platform/youtube/testdata/finalize_sample_46.json
 !/backend/internal/platform/youtube/testdata/player_base_fixture.js
 /backend/internal/platform/ytgeneric/testdata/*
-!/backend/internal/platform/ytgeneric/testdata/dailymotion.json
 !/backend/internal/platform/ytgeneric/testdata/facebook.json
 !/backend/internal/platform/ytgeneric/testdata/tumblr.json
 /backend/internal/platform/zuiyou/testdata/*

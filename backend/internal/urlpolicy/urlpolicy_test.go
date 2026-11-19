@@ -326,10 +326,6 @@ func TestPlatformAllowlistBeforeAfterEquivalence(t *testing.T) {
 	if !ok {
 		t.Fatal("missing tumblr spec")
 	}
-	dmSpec, ok := ytgeneric.LookupSite("dailymotion")
-	if !ok {
-		t.Fatal("missing dailymotion spec")
-	}
 	mixedSpec := ytgeneric.SiteSpec{
 		PlatformID:      "vimeo",
 		MediaHostSuffix: []string{".vimeocdn.com", "vimeo.com"},
@@ -365,11 +361,6 @@ func TestPlatformAllowlistBeforeAfterEquivalence(t *testing.T) {
 			name:   "ytgeneric.tumblr.MatchMediaURL",
 			before: legacyYTGenericMatchMediaURL(tbSpec.MediaHostSuffix, false),
 			after:  ytgeneric.New(tbSpec, nil, nil).MatchMediaURL,
-		},
-		{
-			name:   "ytgeneric.dailymotion.MatchMediaURL",
-			before: legacyYTGenericMatchMediaURL(dmSpec.MediaHostSuffix, false),
-			after:  ytgeneric.New(dmSpec, nil, nil).MatchMediaURL,
 		},
 		{
 			name:   "ytgeneric.mixedExactAndSuffix.MatchMediaURL",

@@ -22,12 +22,11 @@ type platformTrait struct {
 }
 
 var platformTraits = map[string]platformTrait{
-	"x":           {slowEngine: true, strictInput2048: true},
-	"youtube":     {slowEngine: true, strictInput2048: false},
-	"instagram":   {slowEngine: true, strictInput2048: true},
-	"facebook":    {slowEngine: true, strictInput2048: true},
-	"tumblr":      {slowEngine: true, strictInput2048: true},
-	"dailymotion": {slowEngine: true, strictInput2048: true},
+	"x":         {slowEngine: true, strictInput2048: true},
+	"youtube":   {slowEngine: true, strictInput2048: false},
+	"instagram": {slowEngine: true, strictInput2048: true},
+	"facebook":  {slowEngine: true, strictInput2048: true},
+	"tumblr":    {slowEngine: true, strictInput2048: true},
 }
 
 func traitsForPlatform(platform string) platformTrait {

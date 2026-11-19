@@ -154,6 +154,13 @@ func TestUniversalAdapterBlocksPrivateIPResolution(t *testing.T) {
 }
 
 func TestParseSitesEnvValidation(t *testing.T) {
+	if got := KnownSiteIDs(); !reflect.DeepEqual(got, []string{"facebook", "tumblr"}) {
+		t.Fatalf("KnownSiteIDs() = %v, want [facebook tumblr]", got)
+	}
+	if _, ok := LookupSite("dailymotion"); ok {
+		t.Fatal("retired site dailymotion must not be returned by LookupSite")
+	}
+
 	specs, err := ParseSitesEnv("")
 	if err != nil || len(specs) != 0 {
 		t.Fatalf("expected empty env to return no sites, got specs=%v err=%v", specs, err)
@@ -162,24 +169,43 @@ func TestParseSitesEnvValidation(t *testing.T) {
 	if err != nil || len(specs) != 0 {
 		t.Fatalf("expected whitespace env to return no sites, got specs=%v err=%v", specs, err)
 	}
-	specs, err = ParseSitesEnv("facebook, tumblr, dailymotion, facebook")
-	if err != nil || len(specs) != 3 {
-		t.Fatalf("expected 3 deduplicated sites, got specs=%v err=%v", specs, err)
+	specs, err = ParseSitesEnv("facebook, tumblr, facebook")
+	if err != nil || len(specs) != 2 {
+		t.Fatalf("expected 2 deduplicated sites, got specs=%v err=%v", specs, err)
 	}
-	gotIDs := []string{specs[0].PlatformID, specs[1].PlatformID, specs[2].PlatformID}
-	wantIDs := []string{"facebook", "tumblr", "dailymotion"}
+	gotIDs := []string{specs[0].PlatformID, specs[1].PlatformID}
+	wantIDs := []string{"facebook", "tumblr"}
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("got IDs %v, want %v", gotIDs, wantIDs)
+	}
+
+	// Operational guard: retired "dailymotion" token in legacy DOKITOOL_YTDLP_SITES
+	// must be skipped gracefully without failing startup.
+	specs, err = ParseSitesEnv("facebook,tumblr,dailymotion")
+	if err != nil || len(specs) != 2 {
+		t.Fatalf("expected ParseSitesEnv(facebook,tumblr,dailymotion) to skip retired site without error, got specs=%v err=%v", specs, err)
+	}
+	if got := []string{specs[0].PlatformID, specs[1].PlatformID}; !reflect.DeepEqual(got, wantIDs) {
+		t.Fatalf("got IDs %v, want %v", got, wantIDs)
+	}
+	specs, err = ParseSitesEnv("dailymotion")
+	if err != nil || len(specs) != 0 {
+		t.Fatalf("expected ParseSitesEnv(dailymotion) to return empty slice without error, got specs=%v err=%v", specs, err)
 	}
 
 	for _, invalid := range []string{
 		"unknown",
 		"pinterest",
 		"facebook,unknown",
+		"dailymotion,unknown",
 		"facebook,,tumblr",
+		"facebook,,dailymotion",
 		"facebook,",
+		"dailymotion,",
 		",facebook",
+		",dailymotion",
 		"FACEBOOK",
+		"DAILYMOTION",
 	} {
 		if _, err := ParseSitesEnv(invalid); err == nil {
 			t.Fatalf("expected ParseSitesEnv(%q) to fail", invalid)
@@ -192,7 +218,7 @@ func TestBuiltinSitesSpecsAndAllowlists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"facebook", "tumblr", "dailymotion"} {
+	for _, id := range []string{"facebook", "tumblr"} {
 		spec, ok := LookupSite(id)
 		if !ok {
 			t.Fatalf("missing builtin site %q", id)
@@ -210,14 +236,9 @@ func TestBuiltinSitesSpecsAndAllowlists(t *testing.T) {
 	if !reflect.DeepEqual(tbSpec.Extractors, []string{"Tumblr"}) {
 		t.Fatalf("unexpected tumblr extractors: %v", tbSpec.Extractors)
 	}
-	dmSpec, _ := LookupSite("dailymotion")
-	if !reflect.DeepEqual(dmSpec.Extractors, []string{"Dailymotion"}) {
-		t.Fatalf("unexpected dailymotion extractors: %v", dmSpec.Extractors)
-	}
 
 	fb := New(fbSpec, nil, nil)
 	tb := New(tbSpec, nil, nil)
-	dm := New(dmSpec, nil, nil)
 
 	// 1. Input URL allowlist positive + negative checks
 	inputCases := []struct {
@@ -276,34 +297,6 @@ func TestBuiltinSitesSpecsAndAllowlists(t *testing.T) {
 				"file:///etc/passwd",
 			},
 		},
-		{
-			parser:   dm,
-			platform: "dailymotion",
-			valid: []string{
-				"https://www.dailymotion.com/video/xbvrf7u",
-				"https://www.dailymotion.com/video/xbvrdzy",
-				"https://dailymotion.com/video/xbvrf7u",
-				"https://dai.ly/xbvrf7u",
-			},
-			invalid: []string{
-				"https://www.dai.ly/xbvrf7u",
-				"https://sub.dai.ly/xbvrf7u",
-				"https://evildai.ly/xbvrf7u",
-				"https://dai.ly.evil.com/xbvrf7u",
-				"https://dai.ly:8080/xbvrf7u",
-				"https://dai.ly:8443/xbvrf7u",
-				"https://user:pass@dai.ly/xbvrf7u",
-				"https://dai.ly/",
-				"https://dai.ly/xbvrf7u/extra",
-				"https://graphql.api.dailymotion.com/video/xbvrf7u",
-				"https://evildailymotion.com/video/xbvrf7u",
-				"https://evilwww.dailymotion.com/video/xbvrf7u",
-				"https://www.dailymotion.com.evil.com/video/xbvrf7u",
-				"https://www.dailymotion.com:8443/video/xbvrf7u",
-				"https://user:pass@www.dailymotion.com/video/xbvrf7u",
-				"https://www.dailymotion.com/",
-			},
-		},
 	}
 
 	for _, tc := range inputCases {
@@ -323,6 +316,15 @@ func TestBuiltinSitesSpecsAndAllowlists(t *testing.T) {
 	}
 	if got := c.PlatformForURL("https://fb.watch/abc123/"); got != "facebook" {
 		t.Fatalf("catalog.PlatformForURL(fb.watch) = %q, want facebook", got)
+	}
+	for _, retiredURL := range []string{
+		"https://www.dailymotion.com/video/xbs7xfa",
+		"https://dailymotion.com/video/xbs7xfa",
+		"https://dai.ly/xbs7xfa",
+	} {
+		if got := c.PlatformForURL(retiredURL); got != "" {
+			t.Fatalf("catalog.PlatformForURL(%q) = %q, want empty after retirement", retiredURL, got)
+		}
 	}
 
 	// 2. Outbound host & media URL allowlist checks (strictly matching P0 proxy logs)
@@ -390,36 +392,6 @@ func TestBuiltinSitesSpecsAndAllowlists(t *testing.T) {
 				"https://evilmedia.tumblr.com.evil.com/sample.mp4",
 			},
 		},
-		{
-			parser:   dm,
-			platform: "dailymotion",
-			validHosts: []string{
-				"www.dailymotion.com",
-				"graphql.api.dailymotion.com",
-				"cdndirector.dailymotion.com",
-				"vod2.cf.dmcdn.net",
-				"s2.dmcdn.net",
-			},
-			invalidHosts: []string{
-				"dailymotion.com",
-				"api.dailymotion.com",
-				"evil.dailymotion.com",
-				"dmcdn.net",
-				"evildmcdn.net",
-				"www.dailymotion.com.evil.com",
-				"127.0.0.1",
-			},
-			validMedia: []string{
-				"https://vod2.cf.dmcdn.net/sec2(tok)/cloud/fmp4/1/h264_aac_fhd/1/manifest.m3u8",
-				"https://s2.dmcdn.net/v/xbvrdzy/x1080",
-			},
-			invalidMedia: []string{
-				"https://dmcdn.net/manifest.m3u8",
-				"https://www.dailymotion.com/manifest.m3u8",
-				"https://graphql.api.dailymotion.com/manifest.m3u8",
-				"https://cdndirector.dailymotion.com/manifest.m3u8",
-			},
-		},
 	}
 
 	for _, tc := range outboundCases {
@@ -459,7 +431,7 @@ func loadFixtureInfo(t *testing.T, filename string) *ytengine.Info {
 	return &info
 }
 
-func TestP0FixturesFacebookTumblrDailymotion(t *testing.T) {
+func TestP0FixturesFacebookTumblr(t *testing.T) {
 	const now int64 = 1762300800
 	publicAddr := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
 	pubResolver := stubResolver{
@@ -470,12 +442,6 @@ func TestP0FixturesFacebookTumblrDailymotion(t *testing.T) {
 			"maskofthedragon.tumblr.com":   publicAddr,
 			"va.media.tumblr.com":          publicAddr,
 			"64.media.tumblr.com":          publicAddr,
-			"www.dailymotion.com":          publicAddr,
-			"vod2.cf.dmcdn.net":            publicAddr,
-			"vod3.cf.dmcdn.net":            publicAddr,
-			"s2.dmcdn.net":                 publicAddr,
-			"graphql.api.dailymotion.com":  publicAddr,
-			"cdndirector.dailymotion.com":  publicAddr,
 		},
 	}
 
@@ -580,145 +546,6 @@ func TestP0FixturesFacebookTumblrDailymotion(t *testing.T) {
 			t.Fatalf("expected labels [720p, 480p], got [%s, %s]", unified.Str(v0["label"]), unified.Str(v1["label"]))
 		}
 	})
-
-	// 3. Dailymotion P0 fixture: outputs ONLY verified single-stream combined fMP4 HLS (scope == "single")
-	t.Run("dailymotion", func(t *testing.T) {
-		spec, _ := LookupSite("dailymotion")
-		parser := NewWithResolver(spec, &stubExtractor{
-			enabled: true,
-			extract: func(ctx context.Context, rawURL string) (*ytengine.Info, error) {
-				info := loadFixtureInfo(t, "dailymotion.json")
-				// Inject extra non-verified formats to ensure Dailymotion never outputs anything else
-				w, h := int64(1280), int64(720)
-				info.Formats = append(info.Formats,
-					ytengine.Format{
-						FormatID: "http-720",
-						URL:      "https://vod2.cf.dmcdn.net/progressive/720.mp4",
-						Ext:      "mp4",
-						Protocol: "https",
-						Width:    &w,
-						Height:   &h,
-						VCodec:   "avc1.64001f",
-						ACodec:   "mp4a.40.2",
-					},
-					ytengine.Format{
-						FormatID: "hls-video-only",
-						URL:      "https://vod2.cf.dmcdn.net/sec2(tok)/cloud/fmp4/718473886/video_only/manifest.m3u8",
-						Ext:      "mp4",
-						Protocol: "m3u8_native",
-						Width:    &w,
-						Height:   &h,
-						VCodec:   "avc1.64001f",
-						ACodec:   "none",
-					},
-					ytengine.Format{
-						FormatID: "hls-legacy-ts",
-						URL:      "https://vod3.cf.dmcdn.net/sec2(tok)/video/790/233/154332097_mp4_h264_aac_hd.m3u8",
-						Ext:      "mp4",
-						Protocol: "m3u8_native",
-						Width:    &w,
-						Height:   &h,
-						VCodec:   "avc1.64001f",
-						ACodec:   "mp4a.40.2",
-					},
-				)
-				return info, nil
-			},
-		}, nil, pubResolver)
-
-		payload, err := parser.Parse(context.Background(), "https://www.dailymotion.com/video/xbvrdzy", now)
-		if err != nil {
-			t.Fatalf("dailymotion Parse failed: %v", err)
-		}
-		for name, env := range map[string]unified.Object{
-			"raw":    payload,
-			"normal": unified.PublicView(payload, false, now),
-			"debug":  unified.PublicView(payload, true, now),
-		} {
-			if err := unified.ValidateEnvelopeAt(env, now); err != nil {
-				t.Fatalf("dailymotion %s ValidateEnvelopeAt failed: %v", name, err)
-			}
-		}
-		pub := unified.PublicView(payload, false, now)
-		data := unified.Map(pub["data"])
-		if unified.Str(data["platform"]) != "dailymotion" || unified.Str(data["content_id"]) != "xbvrdzy" {
-			t.Fatalf("unexpected dailymotion data: %+v", data)
-		}
-		item := unified.Map(unified.Slice(data["items"])[0])
-		if item["default"] != nil || unified.Str(item["default_unavailable_reason"]) != "processing_required" {
-			t.Fatalf("expected null default + processing_required, got default=%v reason=%v", item["default"], item["default_unavailable_reason"])
-		}
-		variants := unified.Slice(item["variants"])
-		if len(variants) != 4 {
-			t.Fatalf("expected exactly 4 single-stream HLS variants, got %d: %+v", len(variants), variants)
-		}
-		wantLabels := []string{"1080p60", "720p60", "480p", "288p"}
-		for idx, rawV := range variants {
-			v := unified.Map(rawV)
-			if unified.Str(v["label"]) != wantLabels[idx] {
-				t.Fatalf("variant[%d] label=%q, want %q", idx, unified.Str(v["label"]), wantLabels[idx])
-			}
-			delivery := unified.Map(v["delivery"])
-			if unified.Str(delivery["kind"]) != "hls" || unified.Str(delivery["scope"]) != "single" {
-				t.Fatalf("variant[%d] delivery=%+v, want kind=hls scope=single", idx, delivery)
-			}
-			if _, exists := delivery["selection"]; exists {
-				t.Fatalf("variant[%d] must not carry selection: %+v", idx, delivery)
-			}
-			output := unified.Map(delivery["output"])
-			if unified.Str(output["container"]) != "mp4" || unified.Str(output["extension"]) != "mp4" || unified.Str(output["mime_type"]) != "video/mp4" {
-				t.Fatalf("variant[%d] unexpected output: %+v", idx, output)
-			}
-		}
-
-		// Legacy MPEG-TS-only Dailymotion video and live Dailymotion stream must return NO_MEDIA rather than unverified formats.
-		legacyParser := NewWithResolver(spec, &stubExtractor{
-			enabled: true,
-			extract: func(ctx context.Context, rawURL string) (*ytengine.Info, error) {
-				info := loadFixtureInfo(t, "dailymotion.json")
-				w, h := int64(1280), int64(720)
-				if strings.Contains(rawURL, "live") {
-					isLive := true
-					info.IsLive = &isLive
-					return info, nil
-				}
-				info.Formats = []ytengine.Format{
-					{
-						FormatID: "hls-720",
-						URL:      "https://vod3.cf.dmcdn.net/sec2(tok)/video/790/233/154332097_mp4_h264_aac_hd.m3u8",
-						Ext:      "mp4",
-						Protocol: "m3u8_native",
-						Width:    &w,
-						Height:   &h,
-						VCodec:   "avc1.64001f",
-						ACodec:   "mp4a.40.2",
-					},
-				}
-				return info, nil
-			},
-		}, nil, pubResolver)
-		for _, badURL := range []string{
-			"https://www.dailymotion.com/video/x2jvvep",
-			"https://www.dailymotion.com/video/xlive123",
-		} {
-			res, err := legacyParser.Parse(context.Background(), badURL, now)
-			if err != nil {
-				t.Fatalf("dailymotion(%s) Parse failed: %v", badURL, err)
-			}
-			if err := unified.ValidateEnvelopeAt(res, now); err != nil {
-				t.Fatalf("dailymotion(%s) ValidateEnvelopeAt failed: %v", badURL, err)
-			}
-			if unified.Str(res["code"]) != "NO_MEDIA" {
-				t.Fatalf("dailymotion(%s) code=%q, want NO_MEDIA", badURL, unified.Str(res["code"]))
-			}
-			if badURL == "https://www.dailymotion.com/video/x2jvvep" {
-				msg := unified.Str(unified.Map(res["error"])["message"])
-				if !strings.Contains(msg, "不支持") {
-					t.Fatalf("expected non-fMP4 TS-HLS error message to mention 不支持, got %q", msg)
-				}
-			}
-		}
-	})
 }
 
 func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
@@ -733,10 +560,6 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 			"www.tumblr.com":               publicAddr,
 			"va.media.tumblr.com":          publicAddr,
 			"64.media.tumblr.com":          publicAddr,
-			"www.dailymotion.com":          publicAddr,
-			"vod2.cf.dmcdn.net":            publicAddr,
-			"vod3.cf.dmcdn.net":            publicAddr,
-			"s2.dmcdn.net":                 publicAddr,
 		},
 	}
 
@@ -744,7 +567,7 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"facebook", "tumblr", "dailymotion"} {
+	for _, id := range []string{"facebook", "tumblr"} {
 		spec, _ := LookupSite(id)
 		if err := c.Register(spec.CatalogEntry()); err != nil {
 			t.Fatal(err)
@@ -752,13 +575,6 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 	}
 
 	for _, badCatalogURL := range []string{
-		"https://evildai.ly/xbvrf7u",
-		"https://dai.ly.evil.com/xbvrf7u",
-		"https://www.dai.ly/xbvrf7u",
-		"https://sub.dai.ly/xbvrf7u",
-		"https://user:pass@dai.ly/xbvrf7u",
-		"https://dai.ly:8080/xbvrf7u",
-		"https://dai.ly:8443/xbvrf7u",
 		"https://evilfb.watch/abc123",
 		"https://fb.watch.evil.com/abc123",
 		"https://www.fb.watch/abc123",
@@ -767,58 +583,13 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 		"https://fb.watch:8080/abc123",
 		"https://fb.watch:8443/abc123",
 		"https://web.facebook.com/watch/?v=1",
-		"https://graphql.api.dailymotion.com/video/xbvrf7u",
+		"https://www.dailymotion.com/video/xbvrf7u",
+		"https://dai.ly/xbvrf7u",
 	} {
 		if got := c.PlatformForURL(badCatalogURL); got != "" {
 			t.Fatalf("catalog.PlatformForURL(%q) = %q, want empty", badCatalogURL, got)
 		}
 	}
-
-	// 1. Bare/mobile domain normalization + dai.ly zero-network local rewrite.
-	t.Run("dailymotion-bare-and-daily-zero-network", func(t *testing.T) {
-		dmSpec, _ := LookupSite("dailymotion")
-		var extractedURL string
-		httpCalls := 0
-		policyP := New(dmSpec, nil, nil)
-		prober := ytengine.NewSizeProber(executorFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
-			httpCalls++
-			t.Fatalf("dai.ly / dailymotion must make ZERO HTTP preflight requests, got %s %s", r.Method, r.URL)
-			return fetch.Response{}, nil
-		}), policyP.MatchMediaURL)
-		p := NewWithResolver(dmSpec, &stubExtractor{
-			enabled: true,
-			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
-				extractedURL = rawURL
-				return loadFixtureInfo(t, "dailymotion.json"), nil
-			},
-		}, prober, pubResolver)
-
-		if p.AllowedOutboundHost("dai.ly") || p.AllowedOutboundHost("dailymotion.com") || p.AllowedTargetURL("https://dai.ly/xbvrdzy") || p.AllowedTargetURL("https://dailymotion.com/video/xbvrdzy") {
-			t.Fatal("dai.ly and bare dailymotion.com must never enter yt-dlp target or outbound allowlist")
-		}
-
-		for _, input := range []string{
-			"https://dailymotion.com/video/xbvrdzy?playlist=x1",
-			"https://dai.ly/xbvrdzy",
-			"http://dai.ly/xbvrdzy/",
-		} {
-			extractedURL = ""
-			res, err := p.Parse(context.Background(), input, now)
-			if err != nil || unified.Str(res["code"]) != "OK" {
-				t.Fatalf("Parse(%q) failed: res=%v err=%v", input, res, err)
-			}
-			wantCanonical := "https://www.dailymotion.com/video/xbvrdzy"
-			if strings.Contains(input, "playlist=x1") {
-				wantCanonical += "?playlist=x1"
-			}
-			if extractedURL != wantCanonical {
-				t.Fatalf("Parse(%q) passed %q to yt-dlp, want %q", input, extractedURL, wantCanonical)
-			}
-			if httpCalls != 0 {
-				t.Fatalf("expected 0 HTTP calls, got %d", httpCalls)
-			}
-		}
-	})
 
 	t.Run("tumblr-bare-domain-normalized-to-www", func(t *testing.T) {
 		tbSpec, _ := LookupSite("tumblr")

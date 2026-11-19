@@ -70,32 +70,33 @@ type Thumbnail struct {
 // be used as an exact byte length for Worker/Range integrity checks.
 // HTTPHeaders are retained only in memory and must never be emitted to public JSON.
 type Format struct {
-	FormatID       string            `json:"format_id"`
-	FormatNote     string            `json:"format_note"`
-	URL            string            `json:"url"`
-	ManifestURL    string            `json:"manifest_url"`
-	Ext            string            `json:"ext"`
-	VideoExt       string            `json:"video_ext"`
-	AudioExt       string            `json:"audio_ext"`
-	Protocol       string            `json:"protocol"`
-	Width          *int64            `json:"width"`
-	Height         *int64            `json:"height"`
-	FPS            *float64          `json:"fps"`
-	Quality        *float64          `json:"quality"`
-	TBR            *float64          `json:"tbr"`
-	VBR            *float64          `json:"vbr"`
-	ABR            *float64          `json:"abr"`
-	ASR            *int64            `json:"asr"`
-	AudioChannels  *int64            `json:"audio_channels"`
-	DynamicRange   string            `json:"dynamic_range"`
-	VCodec         string            `json:"vcodec"`
-	ACodec         string            `json:"acodec"`
-	Container      string            `json:"container"`
-	Resolution     string            `json:"resolution"`
-	Language       string            `json:"language"`
-	Filesize       *int64            `json:"filesize"`
-	FilesizeApprox *int64            `json:"filesize_approx"`
-	HTTPHeaders    map[string]string `json:"http_headers"`
+	FormatID           string            `json:"format_id"`
+	FormatNote         string            `json:"format_note"`
+	URL                string            `json:"url"`
+	ManifestURL        string            `json:"manifest_url"`
+	Ext                string            `json:"ext"`
+	VideoExt           string            `json:"video_ext"`
+	AudioExt           string            `json:"audio_ext"`
+	Protocol           string            `json:"protocol"`
+	Width              *int64            `json:"width"`
+	Height             *int64            `json:"height"`
+	FPS                *float64          `json:"fps"`
+	Quality            *float64          `json:"quality"`
+	TBR                *float64          `json:"tbr"`
+	VBR                *float64          `json:"vbr"`
+	ABR                *float64          `json:"abr"`
+	ASR                *int64            `json:"asr"`
+	AudioChannels      *int64            `json:"audio_channels"`
+	DynamicRange       string            `json:"dynamic_range"`
+	VCodec             string            `json:"vcodec"`
+	ACodec             string            `json:"acodec"`
+	Container          string            `json:"container"`
+	Resolution         string            `json:"resolution"`
+	Language           string            `json:"language"`
+	LanguagePreference *int              `json:"language_preference,omitempty"`
+	Filesize           *int64            `json:"filesize"`
+	FilesizeApprox     *int64            `json:"filesize_approx"`
+	HTTPHeaders        map[string]string `json:"http_headers"`
 }
 
 // Info models the subset of yt-dlp -J top-level and playlist entry fields.

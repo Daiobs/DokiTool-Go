@@ -78,17 +78,74 @@ func extractID(raw string) string {
 // Replace only the authority; signed query bytes and '+' remain unchanged.
 func desktopURL(raw, host string) string { return authority.ReplaceAllString(raw, "https://"+host) }
 
+func canonicalHostGroup(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "xiaohongshu.com", "www.xiaohongshu.com":
+		return "www.xiaohongshu.com"
+	case "rednote.com", "www.rednote.com":
+		return "www.rednote.com"
+	}
+	return ""
+}
+
+func isSecurityBlockURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	escaped := strings.ToLower(u.EscapedPath())
+	if strings.Contains(escaped, "/404/sec_") ||
+		strings.HasPrefix(escaped, "/website-login/captcha") || strings.HasPrefix(escaped, "/website-login/error") {
+		return true
+	}
+	q := u.Query()
+	return q.Get("error_code") == "300031" || q.Get("verifyUuid") != ""
+}
+
+func extractNoteURLCandidate(raw string) string {
+	if AllowedURL(raw) && extractID(raw) != "" {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return ""
+	}
+	if rp := strings.TrimSpace(u.Query().Get("redirectPath")); rp != "" && isCanonicalNoteURL(rp) && extractID(rp) != "" {
+		return rp
+	}
+	return ""
+}
+
 type pageResponse struct {
-	status int
-	body   string
-	url    string
+	status       int
+	body         string
+	url          string
+	firstNoteURL string
+	blocked      bool
 }
 
 func (p *Parser) page(parent context.Context, address string) pageResponse {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	deadline := p.clock().Add(10 * time.Second)
+	firstNoteURL := ""
+	blocked := false
+	observeURL := func(candidate string) {
+		if firstNoteURL == "" {
+			if noteURL := extractNoteURLCandidate(candidate); noteURL != "" {
+				firstNoteURL = noteURL
+			}
+		}
+		if isSecurityBlockURL(candidate) {
+			blocked = true
+		}
+	}
 	for redirects := 0; redirects <= 5 && AllowedURL(address); redirects++ {
+		observeURL(address)
 		remaining := deadline.Sub(p.clock()).Truncate(time.Millisecond)
 		if remaining < time.Millisecond || ctx.Err() != nil {
 			break
@@ -98,10 +155,13 @@ func (p *Parser) page(parent context.Context, address string) pageResponse {
 				"Accept-Language": {"zh-CN,zh;q=0.9,en;q=0.8"}, "Accept-Encoding": {"gzip,deflate"}},
 			Policy: fetch.Policy{Purpose: "xiaohongshu-page", AllowedURL: AllowedURL, Timeout: remaining, MaxBytes: 8 << 20}})
 		if err != nil {
-			return pageResponse{url: address}
+			return pageResponse{url: address, firstNoteURL: firstNoteURL, blocked: blocked}
 		}
 		if len(r.History) != 0 || r.URL != "" && r.URL != address || len(r.Body) > 8<<20 {
-			return pageResponse{status: 502, url: address}
+			return pageResponse{status: 502, url: address, firstNoteURL: firstNoteURL, blocked: blocked}
+		}
+		if r.StatusCode == http.StatusForbidden {
+			blocked = true
 		}
 		switch r.StatusCode {
 		case 301, 302, 303, 307, 308:
@@ -115,15 +175,16 @@ func (p *Parser) page(parent context.Context, address string) pageResponse {
 					next = "https://" + current.Hostname() + next
 				}
 				if !AllowedURL(next) {
-					return pageResponse{status: 502, url: address}
+					return pageResponse{status: 502, url: address, firstNoteURL: firstNoteURL, blocked: blocked}
 				}
+				observeURL(next)
 				address = next
 				continue
 			}
 		}
-		return pageResponse{status: r.StatusCode, body: string(r.Body), url: address}
+		return pageResponse{status: r.StatusCode, body: string(r.Body), url: address, firstNoteURL: firstNoteURL, blocked: blocked}
 	}
-	return pageResponse{status: 502, url: address}
+	return pageResponse{status: 502, url: address, firstNoteURL: firstNoteURL, blocked: blocked}
 }
 
 func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Object, error) {
@@ -154,17 +215,38 @@ func (p *Parser) parseLegacy(ctx context.Context, input string) (unified.Object,
 		address = desktopURL(address, "xhslink.com")
 	}
 	id := extractID(address)
+	fromShortLink := id == ""
+	sawBlocked := false
+	redirectedBlocked := false
+	blockedHost := ""
 	if id == "" {
 		redirected := p.page(ctx, address)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if redirected.blocked {
+			sawBlocked = true
+			redirectedBlocked = true
+		}
 		address = redirected.url
 		id = extractID(address)
+		if id == "" && redirected.firstNoteURL != "" {
+			address = redirected.firstNoteURL
+			id = extractID(address)
+		}
+		if redirected.blocked {
+			blockedHost = canonicalHostGroup(redirected.url)
+			if blockedHost == "" {
+				blockedHost = canonicalHostGroup(address)
+			}
+		}
 		if !AllowedURL(address) || id == "" {
+			if sawBlocked {
+				return legacyResult(403, "未取得可用笔记内容，请检查分享 token 是否有效；来源可能要求验证或暂时限制访问", nil), nil
+			}
 			return legacyResult(400, "分享链接未指向可识别的笔记", nil), nil
 		}
-		if redirected.status == http.StatusOK && redirected.body != "" && isCanonicalNoteURL(address) {
+		if redirected.status == http.StatusOK && redirected.body != "" && isCanonicalNoteURL(redirected.url) && extractID(redirected.url) == id {
 			if note := extractNote(redirected.body, id); note != nil {
 				data, err := p.formatNote(ctx, note)
 				if err != nil {
@@ -176,9 +258,18 @@ func (p *Parser) parseLegacy(ctx context.Context, input string) (unified.Object,
 	}
 	lastStatus := 0
 	for _, host := range []string{"www.rednote.com", "www.xiaohongshu.com"} {
+		if host == blockedHost {
+			if lastStatus == 0 {
+				lastStatus = http.StatusForbidden
+			}
+			continue
+		}
 		response := p.page(ctx, desktopURL(address, host))
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if response.blocked {
+			sawBlocked = true
 		}
 		lastStatus = response.status
 		if lastStatus != 200 {
@@ -192,7 +283,10 @@ func (p *Parser) parseLegacy(ctx context.Context, input string) (unified.Object,
 			return legacyResult(200, "解析成功", data), nil
 		}
 	}
-	if !hasXsecToken(address) && lastStatus != 0 && lastStatus < 500 && lastStatus != 429 {
+	if sawBlocked && lastStatus != http.StatusTooManyRequests && ((lastStatus > 0 && lastStatus < 500) || (lastStatus == 0 && redirectedBlocked)) {
+		lastStatus = http.StatusForbidden
+	}
+	if !fromShortLink && !hasXsecToken(address) && !sawBlocked && lastStatus != 0 && lastStatus < 500 && lastStatus != 429 {
 		return legacyResult(400, "链接缺少 xsec_token，请从小红书 App 复制分享链接后重试", nil), nil
 	}
 	code := 404

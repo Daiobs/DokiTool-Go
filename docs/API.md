@@ -68,7 +68,7 @@ curl --get 'https://snap.example.com/api/parse' \
 | delivery | 行为说明 |
 | --- | --- |
 | `file` | 完整视频、音频或图片；读取服务端默认或用户显式选择，接入下载管理器（YouTube 分离轨道经浏览器端用户脚本并发拉取并使用 Mediabunny 无损合并）。 |
-| `hls` | 保留显式清单及作用域（如 Dailymotion 单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
+| `hls` | 保留显式清单及作用域（如单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
 | `segments` | 只有具备布局验证证据的 `byte_concat` 才允许拼接；`remux` 明确暂不支持。 |
 | `pair` | 静图与动态片段有明确角色，按实况操作处理。 |
 | `dash`、`mux` | 结构保留、能力识别与“暂不支持”提示；服务端不执行音视频合流。 |
@@ -107,7 +107,7 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
      }
      ```
 2. **`POST /api/youtube/finalize?schema_version=1.0`**（可选 `&debug=1`）
-   - 走 `PARSE_SLOW` 准入池；请求体上限为 **`512 KiB`**，`formats` 与 `adaptiveFormats` 条目总数上限为 **`64`**。
+   - 走 `PARSE_SLOW` 准入池；请求体上限为 **`512 KiB`**，`formats` 与 `adaptiveFormats` 条目总数上限为 **`256`**。
    - 请求 JSON 字段：`video_id`（11 位视频 ID）、`player_id`（8 位十六进制播放器 ID）、可选元数据（`title`、`author`、`duration_seconds`、`thumbnail`）以及客户端从 `www.youtube.com` 取回的 `formats` / `adaptiveFormats` 数组。
    - 服务端在零权限 Deno 沙箱中批量解算 `s` / `n` 挑战参数，严格校验生成的直链必须为 `https://*.googlevideo.com/videoplayback`（无凭据、无自定义端口、无片段锚点），最终返回标准统一媒体 v1 响应（`extra.youtube_helper.status = "ready"`）。
 
@@ -122,8 +122,8 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 | `INVALID_INPUT` | `400` / `405` / `409` / `410` | 缺少或非法的 `url` / `item_id`；链接与显式指定的 `platform` 不匹配；缺少或不匹配的 `schema_version`（`409`）；不支持的 HTTP 方法（`405`）；已退役旧路径（`410`）；以及特定需先展开的短链提示（如 Facebook `fb.watch` 短链需登录展开，接口本地直接返回 `400 INVALID_INPUT` 提示先在浏览器打开后复制 `facebook.com` 完整视频链接，抖音 `mix_id` 合集链接、小红书缺失 `xsec_token` 同属此类）。 |
 | `UNSUPPORTED_PLATFORM` | `400` | 输入包含合法的 `http(s)` 公开域名链接，但该域名不属于任何当前已启用的平台（例如未接入站点，或 X 的 `t.co`、Instagram 的 `instagr.am` 短链），或查询参数显式传入了未注册的 `platform` ID。 |
 | `UPSTREAM_BLOCKED` | `403` | 上游平台拒绝匿名公开读取或要求登录验证：<br>• **X 受限推文（`TweetTombstone`）**：年龄限制、敏感内容或需登录查看的推文在默认配置（`-x-tombstone-fallback=off`）下返回 `403 UPSTREAM_BLOCKED`；若服务端显式启用 `-x-tombstone-fallback=fxtwitter`，则在遇到 `TweetTombstone` 时向 `api.fxtwitter.com` 查询公开元数据，仍被拒绝或不可读时保持失败关闭。<br>• **Facebook / Instagram 登录与权限限制**：Facebook 私密/年龄受限视频，以及 Instagram Stories（`/stories/`）、私密长短码链接与需登录查看的帖子均返回 `403 UPSTREAM_BLOCKED`。 |
-| `NO_MEDIA` | `404` | 目标内容公开可访问，但作品本身不包含任何受支持的媒体资源：例如 **X 纯文本推文**（无视频也无图片）、**Dailymotion 仅提供非 fMP4（如 TS 分片）HLS 流**的视频，或空图文帖。 |
-| `CONTENT_UNAVAILABLE` | `404` | 目标作品不存在、已被作者或平台删除，或 `/api/resolve` 请求的 `item_id` 在作品中不存在或不可用（例如不存在的 Dailymotion 视频 ID）。 |
+| `NO_MEDIA` | `404` | 目标内容公开可访问，但作品本身不包含任何受支持的媒体资源：例如 **X 纯文本推文**（无视频也无图片）、仅含不受支持流格式的视频，或空图文帖。 |
+| `CONTENT_UNAVAILABLE` | `404` | 目标作品不存在、已被作者或平台删除，或 `/api/resolve` 请求的 `item_id` 在作品中不存在或不可用。 |
 | `RATE_LIMITED` | `429` | 触发单客户端或全局令牌桶/并发上限。响应同时携带 `Retry-After` HTTP 头以及 `error.retryable: true` 和正整数 `error.retry_after_seconds`。<br>**前端自动等待重试策略**：前端在请求收到 `429` 且 `0 < retry_after_seconds <= 15` 时，自动按秒倒计时等待并重试（单次操作最多重试 **2 次**；若 `retry_after_seconds > 15` 或重试耗尽仍受限，则立即向用户展示限流提示）。 |
 | `UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` | `504` / `502` | 上游抓取超时（`504`）、上游暂不可用或提取失败（`502`）、上游响应不符合预期结构（`502`）。 |
 | `SERVICE_NOT_CONFIGURED` / `INTERNAL_ERROR` | `503` / `500` | 平台适配器或媒体签名密钥未配置完成（`503`），或内部响应编码异常（`500`）。 |

@@ -431,3 +431,26 @@ test('debug switch hides data-download-host and 分段计时 by default and show
   assert.ok(shownByStorage.button('分段计时', shownByStorage.row('dbg')));
   shownByStorage.stop();
 });
+
+test('a newly added manual source-link task auto-expands the panel and renders 打开源链接 guidance without claiming handed-off', async t => {
+  const view = await mount(t);
+  await view.update([
+    task('toutiao-1', 'manual', {
+      statusText: '打开源链接',
+      url: 'https://v3-web.toutiaovod.com/sample/video/mp4/?mime_type=video_mp4',
+      nativeAvailable: true,
+      loaded: 0,
+      total: 0,
+      percent: 0,
+    }),
+  ]);
+  assert.equal(view.expanded(), true, 'new manual task must auto-expand the panel so 打开源链接 is immediately visible');
+  const row = view.row('toutiao-1');
+  assert.ok(row);
+  assert.ok(view.button('打开源链接', row));
+  assert.match(textOf(row), /打开源链接/);
+  assert.match(textOf(row), /视频另存为/);
+  assert.doesNotMatch(textOf(row), /已交给浏览器|传输完成/);
+  await view.click(view.button('打开源链接', row));
+  assert.deepEqual(view.events, [['handoff', 'toutiao-1']]);
+});
