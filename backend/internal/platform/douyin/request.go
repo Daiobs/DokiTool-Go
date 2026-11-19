@@ -11,6 +11,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 const (
@@ -38,13 +39,8 @@ func allowedDetailURL(raw string) bool {
 // redirect resolver. The probe separately validates subsequent public CDN hops.
 // It does not limit browser URLs or authorize arbitrary metadata API requests.
 func AllowedMediaURL(raw string) bool {
-	if len(raw) > 8192 || strings.Contains(raw, "#") || unified.MediaURL(raw) == "" {
+	if len(raw) > 8192 || strings.Contains(raw, "#") || urlpolicy.HasUnsafeChars(raw) || unified.MediaURL(raw) == "" {
 		return false
-	}
-	for _, r := range raw {
-		if r <= 0x20 || r == 0x7f || r == '\\' {
-			return false
-		}
 	}
 	scheme, remainder, ok := strings.Cut(raw, "://")
 	if !ok || scheme != "https" {

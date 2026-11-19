@@ -125,6 +125,7 @@
 !/backend/internal/shresolver/
 !/backend/internal/testsupport/
 !/backend/internal/unified/
+!/backend/internal/urlpolicy/
 !/backend/internal/ytengine/
 /backend/lib/*
 !/backend/lib/douyin-media-probe.php
@@ -466,6 +467,9 @@
 !/backend/internal/unified/variants_test.go
 !/backend/internal/unified/work.go
 !/backend/internal/unified/work_test.go
+/backend/internal/urlpolicy/*
+!/backend/internal/urlpolicy/urlpolicy.go
+!/backend/internal/urlpolicy/urlpolicy_test.go
 /backend/internal/ytengine/*
 !/backend/internal/ytengine/adapter.go
 !/backend/internal/ytengine/engine.go

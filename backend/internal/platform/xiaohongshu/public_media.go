@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 // AllowedBrowserFetchURL reports whether raw is a direct HTTPS Xiaohongshu or
@@ -145,16 +146,11 @@ func markDeliveryBrowserFetch(delivery unified.Object) {
 }
 
 func httpsDirectHost(raw string) (string, bool) {
-	if len(raw) < 8 || len(raw) > 8192 || strings.Contains(raw, "#") || unified.MediaURL(raw) != raw {
+	if len(raw) < 8 || len(raw) > 8192 || strings.Contains(raw, "#") || urlpolicy.HasUnsafeChars(raw) || unified.MediaURL(raw) != raw {
 		return "", false
 	}
-	for _, r := range raw {
-		if r <= 0x20 || r == 0x7f || r == '\\' {
-			return "", false
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" || u.Scheme != "https" || strings.HasSuffix(u.Host, ":") || (u.Port() != "" && u.Port() != "443") {
+	u, ok := urlpolicy.ParseCanonicalURL(raw, urlpolicy.HTTPSOnly)
+	if !ok || strings.HasSuffix(u.Host, ":") {
 		return "", false
 	}
 	for _, b := range []byte(u.Host) {
@@ -189,9 +185,7 @@ func hasSubdomain(host, suffix string) bool {
 }
 
 func httpsMotionURL(raw string) string {
-	if len(raw) < 7 || !strings.EqualFold(raw[:7], "http://") || strings.IndexFunc(raw, func(r rune) bool {
-		return r <= 0x20 || r == 0x7f || r == '\\'
-	}) >= 0 {
+	if len(raw) < 7 || !strings.EqualFold(raw[:7], "http://") || urlpolicy.HasUnsafeChars(raw) {
 		return raw
 	}
 	u, err := url.Parse(raw)

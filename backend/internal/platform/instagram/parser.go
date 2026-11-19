@@ -24,6 +24,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -253,27 +254,8 @@ func AllowedPageURL(raw string) bool {
 
 // AllowedMediaURL restricts public media and cover URLs to official Instagram CDN hosts.
 func AllowedMediaURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" {
-		return false
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return false
-	}
-	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || (scheme == "https" && n != 443) || (scheme == "http" && n != 80) {
-			return false
-		}
-	}
-	host := strings.ToLower(u.Hostname())
-	for _, suffix := range []string{".cdninstagram.com", ".fbcdn.net", ".instagram.com"} {
-		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
-			return true
-		}
-	}
-	return false
+	return urlpolicy.HostSuffixURL(raw, urlpolicy.HTTPAndHTTPS,
+		".cdninstagram.com", ".fbcdn.net", ".instagram.com")
 }
 
 func splitNonEmptyPath(escapedPath string) []string {
