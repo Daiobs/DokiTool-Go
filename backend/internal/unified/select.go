@@ -244,7 +244,12 @@ func comparePHPID(a, b string) int {
 	return 0
 }
 
-func isYTDLPPlatform(platform string) bool {
+// requiresAudibleDefault reports whether unified-v1 contract rule #38 requires
+// default video file selection to prefer audible files (has_audio: true, with
+// Instagram's unknown-audio MP4 fallback) over silent DASH video-only tracks.
+// This is a contract-level media selection rule for these three platforms only,
+// NOT a general list of yt-dlp or slow-parse platforms.
+func requiresAudibleDefault(platform string) bool {
 	switch platform {
 	case "x", "youtube", "instagram":
 		return true
@@ -281,7 +286,7 @@ func isUnknownAudioMP4VideoFile(v Object) bool {
 }
 
 func defaultEligibleFiles(platform, itemType string, usableFiles []Object) []Object {
-	if !isYTDLPPlatform(platform) || itemType != "video" {
+	if !requiresAudibleDefault(platform) || itemType != "video" {
 		return usableFiles
 	}
 	audible := make([]Object, 0, len(usableFiles))

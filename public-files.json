@@ -58,6 +58,7 @@
     "backend/internal/api/owner_channel_test.go",
     "backend/internal/api/pipigx_http_test.go",
     "backend/internal/api/pipixia_http_test.go",
+    "backend/internal/api/platform_traits.go",
     "backend/internal/api/stats.go",
     "backend/internal/api/stats_test.go",
     "backend/internal/api/tbvideo_outcome.go",

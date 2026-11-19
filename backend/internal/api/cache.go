@@ -102,20 +102,11 @@ func cacheablePlatform(platform string) bool {
 
 var dailyShortPath = regexp.MustCompile(`^/([A-Za-z0-9]{1,64})/?$`)
 
-func hasStrictInputLen2048(platform string) bool {
-	switch platform {
-	case "x", "instagram", "facebook", "tumblr", "dailymotion":
-		return true
-	default:
-		return false
-	}
-}
-
 func cacheableRequest(platform, source string) bool {
 	if !cacheablePlatform(platform) {
 		return false
 	}
-	if hasStrictInputLen2048(platform) && len(source) > maxYTDLPInputBytes {
+	if traitsForPlatform(platform).strictInput2048 && len(source) > maxYTDLPInputBytes {
 		return false
 	}
 	return true
@@ -285,7 +276,7 @@ func (c *parseCache) configSnapshot() (enabled bool, entries int, totalBytes int
 // aliases without reordering or stripping query parameters (preserving ?p=N,
 // duplicate query precedence, xsec_token, modal_id, and path selectors).
 func normalizeCacheURL(platform, source string) string {
-	if hasStrictInputLen2048(platform) && len(source) > maxYTDLPInputBytes {
+	if traitsForPlatform(platform).strictInput2048 && len(source) > maxYTDLPInputBytes {
 		// Keep a disjoint prefix so >2048-byte inputs rejected by platform parsers
 		// never shrink or match a <=2048-byte alias that expanded on rewrite.
 		return "overlong:" + source
