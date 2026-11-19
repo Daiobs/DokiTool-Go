@@ -58,6 +58,12 @@ export interface YouTubeHelperVideoDetails {
   thumbnail?: string;
 }
 
+export interface YouTubeHelperAudioTrack {
+  id?: string;
+  displayName?: string;
+  audioIsDefault?: boolean;
+}
+
 export interface YouTubeHelperPlayerResult {
   playabilityStatus: {
     status: string;

@@ -411,7 +411,7 @@ function sliceRangeFromFixture(bytes, rawUrl) {
 }
 
 describe("YouTube helper userscript static header & validation contract", () => {
-  test("static userscript file has exact v1.3.1 headers, strict @connect allowlist, MPL-2.0 notice, and build parity", async () => {
+  test("static userscript file has exact v1.3.2 headers, strict @connect allowlist, MPL-2.0 notice, and build parity", async () => {
     const scriptText = await readFile(
       new URL("../public/helper/dokitool-youtube.user.js", import.meta.url),
       "utf8",
@@ -458,9 +458,12 @@ describe("YouTube helper userscript static header & validation contract", () => 
     ].map((m) => m[1]);
     assert.deepEqual(grants.sort(), ["GM_download", "GM_xmlhttpRequest"]);
     assert.match(headerBlock, /^\/\/ @noframes$/m);
-    assert.match(headerBlock, /^\/\/ @version\s+1\.3\.1$/m);
-    assert.equal(YOUTUBE_HELPER_VERSION, "1.3.1");
+    assert.match(headerBlock, /^\/\/ @version\s+1\.3\.2$/m);
+    assert.equal(YOUTUBE_HELPER_VERSION, "1.3.2");
     assert.equal(MIN_YOUTUBE_HELPER_VERSION, "1.3.1");
+    assert.equal(isHelperVersionSupported("1.3.2"), true);
+    assert.equal(isHelperVersionSupported("1.3.1"), true);
+    assert.equal(isHelperVersionSupported("1.3.0"), false);
     assert.match(
       headerBlock,
       /^\/\/ @updateURL\s+https:\/\/snap\.dokitool\.com\/helper\/dokitool-youtube\.user\.js$/m,
@@ -994,14 +997,14 @@ describe("YouTube helper userscript static header & validation contract", () => 
       filename: "dokitool-youtube.user.js",
     });
 
-    // 1. Ping published script -> version 1.3.1, supported: true
+    // 1. Ping published script -> version 1.3.2, supported: true
     const pingRes = await pingYouTubeHelper({
       eventTarget: fakeWindow,
       timeoutMs: 100,
     });
     assert.deepEqual(pingRes, {
       installed: true,
-      version: "1.3.1",
+      version: "1.3.2",
       supported: true,
     });
 
@@ -1172,6 +1175,242 @@ describe("YouTube helper userscript static header & validation contract", () => 
     assert.equal(pickerCalls[2].id, "dokitool-youtube");
     assert.ok(streamedChunks.length > 0, "StreamTarget must stream chunks into picker writable");
     assert.ok(gmRequests.every((r) => r.anonymous === true), "every GM_xmlhttpRequest must set anonymous: true");
+  });
+
+  test("sanitizePlayerApiResponse prunes 118-stream multi-audio TVHTML5 responses to default original audioTrack, enforces strict wire keys, and leaves single-language streams untouched", () => {
+    // Build a realistic 118-stream YouTube TVHTML5 response:
+    // - 1 muxed format (itag 18)
+    // - 45 adaptive video streams (AVC1 / VP9 / AV1 across 144p..2160p60)
+    // - 18 audio tracks (1 default original + 1 descriptive + 16 foreign AI-dubbed languages) × 4 itags = 72 audio streams
+    // Total: 1 + 45 + 72 = 118 streams (> 64 old cap)
+    const videoAdaptive = Array.from({ length: 45 }, (_, idx) => ({
+      itag: 200 + idx,
+      url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=${200 + idx}`,
+      mimeType:
+        idx % 3 === 0
+          ? 'video/mp4; codecs="avc1.640028"'
+          : idx % 3 === 1
+            ? 'video/webm; codecs="vp9"'
+            : 'video/mp4; codecs="av01.0.08M.08"',
+      width: 1920,
+      height: 1080,
+      fps: 60,
+      bitrate: 3500000 - idx * 20000,
+      contentLength: "18000000",
+    }));
+
+    const audioItags = [
+      { itag: 139, mimeType: 'audio/mp4; codecs="mp4a.40.5"', bitrate: 48000 },
+      { itag: 140, mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 128000 },
+      { itag: 249, mimeType: 'audio/webm; codecs="opus"', bitrate: 50000 },
+      { itag: 251, mimeType: 'audio/webm; codecs="opus"', bitrate: 160000 },
+    ];
+
+    const dubbedLangs = [
+      ["es.3", "Spanish"],
+      ["fr.3", "French"],
+      ["de.3", "German"],
+      ["ja.3", "Japanese"],
+      ["ko.3", "Korean"],
+      ["pt.3", "Portuguese"],
+      ["hi.3", "Hindi"],
+      ["id.3", "Indonesian"],
+      ["ru.3", "Russian"],
+      ["ar.3", "Arabic"],
+      ["tr.3", "Turkish"],
+      ["vi.3", "Vietnamese"],
+      ["th.3", "Thai"],
+      ["it.3", "Italian"],
+      ["pl.3", "Polish"],
+      ["nl.3", "Dutch"],
+    ];
+
+    const audioTracksSpec = [
+      ...dubbedLangs.slice(0, 8).map(([id, name]) => ({
+        id,
+        displayName: `${name} (auto-dubbed)`,
+        audioIsDefault: false,
+        isAutoDubbed: true,
+      })),
+      {
+        id: "en.desc",
+        displayName: "English descriptive",
+        audioIsDefault: true,
+        unknownSecretKey: "must_be_dropped",
+      },
+      {
+        id: "  en.4  ",
+        displayName: "  English\u0000 original  ",
+        audioIsDefault: true,
+        isAutoDubbed: false,
+        extraProtoField: "must_be_dropped",
+      },
+      ...dubbedLangs.slice(8).map(([id, name]) => ({
+        id,
+        displayName: name,
+        audioIsDefault: false,
+      })),
+    ];
+    assert.equal(audioTracksSpec.length, 18);
+
+    const audioAdaptive = audioTracksSpec.flatMap((track, tIdx) =>
+      audioItags.map((spec) => ({
+        itag: spec.itag,
+        url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=${spec.itag}&xtags=acont%3D${encodeURIComponent(track.id.trim())}&t=${tIdx}`,
+        mimeType: spec.mimeType,
+        bitrate: spec.bitrate,
+        contentLength: "3200000",
+        audioQuality: spec.bitrate > 100000 ? "AUDIO_QUALITY_MEDIUM" : "AUDIO_QUALITY_LOW",
+        audioSampleRate: "48000",
+        audioChannels: 2,
+        audioTrack: track,
+      })),
+    );
+
+    const raw118 = {
+      playabilityStatus: { status: "OK" },
+      streamingData: {
+        formats: [
+          {
+            itag: 18,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18",
+            mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+            width: 640,
+            height: 360,
+          },
+        ],
+        adaptiveFormats: [...videoAdaptive, ...audioAdaptive],
+      },
+    };
+    assert.equal(
+      raw118.streamingData.formats.length + raw118.streamingData.adaptiveFormats.length,
+      118,
+    );
+
+    const sanitized = sanitizePlayerApiResponse(raw118);
+    const totalAfter =
+      sanitized.streamingData.formats.length +
+      sanitized.streamingData.adaptiveFormats.length;
+    assert.equal(sanitized.streamingData.formats.length, 1);
+    assert.equal(
+      sanitized.streamingData.adaptiveFormats.length,
+      49,
+      "must retain all 45 video streams + 4 default original audio streams (AAC + Opus)",
+    );
+    assert.ok(totalAfter < 64, `expected < 64 total streams, got ${totalAfter}`);
+
+    const keptAudio = sanitized.streamingData.adaptiveFormats.filter((f) =>
+      f.mimeType.startsWith("audio/"),
+    );
+    assert.deepEqual(
+      keptAudio.map((f) => f.itag),
+      [139, 140, 249, 251],
+    );
+    for (const entry of keptAudio) {
+      assert.deepEqual(Object.keys(entry.audioTrack).sort(), [
+        "audioIsDefault",
+        "displayName",
+        "id",
+      ]);
+      assert.deepEqual(entry.audioTrack, {
+        id: "en.4",
+        displayName: "English original",
+        audioIsDefault: true,
+      });
+    }
+
+    // 2. Fallback when audioIsDefault is false on all tracks: prefers original non-descriptive track over AI dubs & descriptive
+    const noDefaultFlagRaw = {
+      playabilityStatus: { status: "OK" },
+      streamingData: {
+        formats: [],
+        adaptiveFormats: [
+          {
+            itag: 140,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&lang=en",
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            audioTrack: { id: "en.3", displayName: "English", audioIsDefault: false },
+          },
+          {
+            itag: 140,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&lang=ja-desc",
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            audioTrack: { id: "ja.desc", displayName: "Japanese (original, descriptive)", audioIsDefault: false },
+          },
+          {
+            itag: 140,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&lang=ja",
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            audioTrack: { id: "ja.4", displayName: "日语（原声）", audioIsDefault: false },
+          },
+        ],
+      },
+    };
+    const sanitizedFallback = sanitizePlayerApiResponse(noDefaultFlagRaw);
+    assert.equal(sanitizedFallback.streamingData.adaptiveFormats.length, 1);
+    assert.equal(
+      sanitizedFallback.streamingData.adaptiveFormats[0].audioTrack.id,
+      "ja.4",
+    );
+
+    // 3. Invalid audioTrack fields are dropped instead of emitting malformed keys, and single-language streams without audioTrack stay untouched
+    const singleLangRaw = {
+      playabilityStatus: { status: "OK" },
+      streamingData: {
+        formats: [],
+        adaptiveFormats: [
+          {
+            itag: 140,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140",
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+          },
+          {
+            itag: 251,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=251",
+            mimeType: 'audio/webm; codecs="opus"',
+            audioTrack: { id: "bad/id with spaces", displayName: "\u0000   ", audioIsDefault: "yes" },
+          },
+        ],
+      },
+    };
+    const sanitizedSingle = sanitizePlayerApiResponse(singleLangRaw);
+    assert.equal(sanitizedSingle.streamingData.adaptiveFormats.length, 2);
+    assert.equal("audioTrack" in sanitizedSingle.streamingData.adaptiveFormats[0], false);
+    assert.equal("audioTrack" in sanitizedSingle.streamingData.adaptiveFormats[1], false);
+
+    // 4. selectYouTubeMuxPair prefers main/original audio over alternate/dubbed when multiple standalone candidates exist
+    const muxVideo = {
+      id: "v-1080p",
+      state: "ready",
+      metadata: { has_audio: false, video_codec: "avc1.640028", container: "mp4", extension: "mp4" },
+      delivery: {
+        kind: "file",
+        sources: [{ id: "sv", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137" }],
+      },
+    };
+    const dubbedAudio = {
+      id: "a-dub-es",
+      state: "ready",
+      label: "Spanish (dubbed)",
+      metadata: { has_audio: true, audio_codec: "mp4a.40.2", container: "m4a", extension: "m4a", mime_type: "audio/mp4", audio_language: "es", audio_language_role: "alternate" },
+      delivery: {
+        kind: "file",
+        sources: [{ id: "sa-es", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&lang=es" }],
+      },
+    };
+    const mainAudio = {
+      id: "a-orig-en",
+      state: "ready",
+      label: "English (original)",
+      metadata: { has_audio: true, audio_codec: "mp4a.40.2", container: "m4a", extension: "m4a", mime_type: "audio/mp4", audio_language: "en", audio_language_role: "main" },
+      delivery: {
+        kind: "file",
+        sources: [{ id: "sa-en", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&lang=en" }],
+      },
+    };
+    const pair = selectYouTubeMuxPair(muxVideo, [muxVideo, dubbedAudio, mainAudio]);
+    assert.equal(pair.ok, true);
+    assert.equal(pair.audioVariant.id, "a-orig-en");
   });
 
   test("CustomEvent handshake and semver version check", async () => {

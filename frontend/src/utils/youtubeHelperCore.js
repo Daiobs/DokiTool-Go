@@ -3,7 +3,7 @@
 // userscript (Tampermonkey / Violentmonkey), the Vue frontend, and Node unit tests,
 // and can be packaged into a browser extension in the future.
 
-export const YOUTUBE_HELPER_VERSION = "1.3.1";
+export const YOUTUBE_HELPER_VERSION = "1.3.2";
 export const MIN_YOUTUBE_HELPER_VERSION = "1.3.1";
 export const YOUTUBE_HELPER_SCRIPT_URL = "/helper/dokitool-youtube.user.js";
 export const YOUTUBE_OPFS_TEMP_PREFIX = "dokitool-yt-tmp-";
@@ -276,6 +276,7 @@ export function selectYouTubeMuxPair(
           }))
       : []),
   ];
+  const matched = [];
   for (const cand of candidates) {
     if (
       !cand ||
@@ -313,15 +314,39 @@ export function selectYouTubeMuxPair(
     if (!audioSource || !isValidGooglevideoPlaybackUrl(audioSource.url)) {
       continue;
     }
+    matched.push({ cand, audioSource, outFmt });
+  }
+
+  if (matched.length > 0) {
+    const isDubbedOrDescriptive = ({ cand }) => {
+      const role = norm(cand.metadata?.audio_language_role);
+      const label = String(cand.label || "");
+      return (
+        role === "alternate" ||
+        /dubbed|配音|descriptive|description/i.test(label)
+      );
+    };
+    const isExplicitOriginal = ({ cand }) => {
+      const role = norm(cand.metadata?.audio_language_role);
+      const label = String(cand.label || "");
+      return (
+        !isDubbedOrDescriptive({ cand }) &&
+        (role === "main" || /original|原声|原音/i.test(label))
+      );
+    };
+    const chosen =
+      matched.find(isExplicitOriginal) ||
+      matched.find((m) => !isDubbedOrDescriptive(m)) ||
+      matched[0];
     return {
       ok: true,
-      outputContainer: outFmt,
-      outputExtension: outFmt,
-      outputMimeType: `video/${outFmt}`,
+      outputContainer: chosen.outFmt,
+      outputExtension: chosen.outFmt,
+      outputMimeType: `video/${chosen.outFmt}`,
       videoVariant,
-      audioVariant: cand,
+      audioVariant: chosen.cand,
       videoSource,
-      audioSource,
+      audioSource: chosen.audioSource,
     };
   }
 
@@ -509,6 +534,45 @@ export function buildTVHTML5PlayerPayload(params) {
   };
 }
 
+const AUDIO_TRACK_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const MAX_AUDIO_TRACK_DISPLAY_NAME_CHARS = 80;
+
+function sanitizeAudioTrack(rawTrack) {
+  if (!rawTrack || typeof rawTrack !== "object" || Array.isArray(rawTrack)) {
+    return null;
+  }
+  const out = {};
+  if (typeof rawTrack.id === "string") {
+    const trimmedId = rawTrack.id.trim();
+    if (AUDIO_TRACK_ID_RE.test(trimmedId)) {
+      out.id = trimmedId;
+    }
+  }
+  const displayName = sanitizeHelperText(
+    rawTrack.displayName,
+    MAX_AUDIO_TRACK_DISPLAY_NAME_CHARS,
+  );
+  if (displayName) {
+    out.displayName = displayName;
+  }
+  if (typeof rawTrack.audioIsDefault === "boolean") {
+    out.audioIsDefault = rawTrack.audioIsDefault;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function isDescriptiveAudio(at) {
+  return Boolean(
+    at && /descriptive|description/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
+function isOriginalAudio(at) {
+  return Boolean(
+    at && /original|原声|原音/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
 function sanitizeFormatArray(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
@@ -520,6 +584,10 @@ function sanitizeFormatArray(list) {
         clean[key] = item[key];
       }
     }
+    const cleanAudioTrack = sanitizeAudioTrack(item.audioTrack);
+    if (cleanAudioTrack) {
+      clean.audioTrack = cleanAudioTrack;
+    }
     if (
       typeof clean.itag === "number" &&
       clean.itag > 0 &&
@@ -528,6 +596,47 @@ function sanitizeFormatArray(list) {
       out.push(clean);
     }
   }
+
+  const isAudioOnly = (entry) =>
+    typeof entry.mimeType === "string" &&
+    entry.mimeType.trim().toLowerCase().startsWith("audio/");
+  const nonAudioEntries = out.filter((entry) => !isAudioOnly(entry));
+  const audioEntries = out.filter(isAudioOnly);
+
+  if (audioEntries.some((e) => Boolean(e.audioTrack))) {
+    let keptAudio = audioEntries;
+    if (
+      audioEntries.some(
+        (e) =>
+          e.audioTrack?.audioIsDefault === true &&
+          !isDescriptiveAudio(e.audioTrack),
+      )
+    ) {
+      keptAudio = audioEntries.filter(
+        (e) =>
+          e.audioTrack?.audioIsDefault === true &&
+          !isDescriptiveAudio(e.audioTrack),
+      );
+    } else if (
+      audioEntries.some(
+        (e) =>
+          isOriginalAudio(e.audioTrack) && !isDescriptiveAudio(e.audioTrack),
+      )
+    ) {
+      keptAudio = audioEntries.filter(
+        (e) =>
+          isOriginalAudio(e.audioTrack) && !isDescriptiveAudio(e.audioTrack),
+      );
+    } else if (
+      audioEntries.some((e) => e.audioTrack?.audioIsDefault === true)
+    ) {
+      keptAudio = audioEntries.filter(
+        (e) => e.audioTrack?.audioIsDefault === true,
+      );
+    }
+    return [...nonAudioEntries, ...keptAudio];
+  }
+
   return out;
 }
 
