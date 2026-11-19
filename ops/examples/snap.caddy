@@ -1,8 +1,12 @@
-# Review-only site fragment. Merge into the existing Caddy configuration.
-# Never replace the fleet Caddyfile. Verify 9081 and socket paths before use.
+# Review-only site fragment for the Go dokitool backend (127.0.0.1:9080).
+# Merge into the existing Caddy configuration; never replace the fleet Caddyfile.
+# Pair with `dokitool serve -listen 127.0.0.1:9080 -client-identity caddy` and
+# inject SNAP_INGRESS_KEY from a restricted service environment file so
+# X-DokiTool-Client-IP and X-DokiTool-Edge-Key authenticate this loopback hop.
 snap.example.com {
     @api path /api/downloads/tbvideo-result /api/parse /api/resolve /api/platforms /api/short_videos /api/douyin /api/ksjx /api/bilibili /api/xhsjx /api/toutiao /api/youtube/context /api/youtube/finalize /api/stats
-    @compress not path /api/media/weibo
+    @shanghai path /internal/shanghai/claim /internal/shanghai/result
+    @compress not path /api/media/weibo /internal/shanghai/claim /internal/shanghai/result
     @source path *.php /backend/* /internal/* /ops/* /.git/* /.env*
     # Preserve ordering: Caddy otherwise sorts handle before route.
     route {
@@ -22,23 +26,30 @@ snap.example.com {
     request_header @download_bridge -If-None-Match
     request_header @download_bridge -If-Modified-Since
 
-    # Exact signed-media endpoint: dedicated workers, no response buffering/compression.
+    # Exact signed-media endpoint: Go streaming relay, no response buffering/compression.
     handle /api/media/weibo {
-        root * /srv/dokitool/current/backend/public
-        rewrite * /index.php
-        php_fastcgi unix//run/php/snap-media.sock {
-            resolve_root_symlink
-            read_timeout 310s
-            write_timeout 310s
-            # Negative intervals disable upstream cancellation on client disconnect.
-            flush_interval 100ms
+        reverse_proxy 127.0.0.1:9080 {
+            flush_interval -1
+            header_up X-DokiTool-Client-IP {remote_host}
+            header_up X-DokiTool-Edge-Key {env.SNAP_INGRESS_KEY}
+            transport http {
+                read_timeout 310s
+                write_timeout 310s
+            }
         }
     }
     handle @api {
-        root * /srv/dokitool/current/backend/public
-        rewrite * /index.php
-        php_fastcgi unix//run/php/snap-public.sock {
-            resolve_root_symlink
+        reverse_proxy 127.0.0.1:9080 {
+            header_up X-DokiTool-Client-IP {remote_host}
+            header_up X-DokiTool-Edge-Key {env.SNAP_INGRESS_KEY}
+        }
+    }
+    # Outbound-pull Shanghai control plane: exact paths before @source blocks /internal/*.
+    handle @shanghai {
+        reverse_proxy 127.0.0.1:9080 {
+            flush_interval -1
+            header_up X-DokiTool-Client-IP {remote_host}
+            header_up X-DokiTool-Edge-Key {env.SNAP_INGRESS_KEY}
         }
     }
     handle /api/* {
@@ -96,25 +107,5 @@ snap.example.com {
             }
         }
     }
-    }
-}
-
-# Only the aggregator can call these routes over loopback. Different FPM pool:
-# public requests must never consume all workers needed to answer a self-request.
-http://:9081 {
-    bind 127.0.0.1
-    @parser {
-        host snap.example.com
-        path /parse
-    }
-    handle @parser {
-        root * /srv/dokitool/current/backend/internal
-        rewrite * /index.php
-        php_fastcgi unix//run/php/snap-internal.sock {
-            resolve_root_symlink
-        }
-    }
-    handle {
-        respond 404
     }
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -114,7 +113,7 @@ func waiterMatchesTask(proto int, bilibiliCap bool, taskProto int, taskType stri
 // still falls back immediately.
 type PullBroker struct {
 	responseValidator
-	token                   string
+	auth                    bearerAuth
 	bilibiliEnabled         atomic.Bool
 	queueWait               time.Duration
 	queueCap                int
@@ -129,12 +128,13 @@ type PullBroker struct {
 }
 
 func NewPullBroker(token string) (*PullBroker, error) {
-	if !ValidToken(token) {
+	auth, err := newBearerAuth(token)
+	if err != nil {
 		return nil, errUnavailable
 	}
 	return &PullBroker{
 		responseValidator: newResponseValidator(),
-		token:             token,
+		auth:              auth,
 		queueWait:         DefaultPullQueueWait,
 		queueCap:          pullQueueCapacity,
 		claimSlots:        make(chan struct{}, pullCapacity),
@@ -524,8 +524,7 @@ func (b *PullBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	auth := r.Header.Values("Authorization")
-	if len(auth) != 1 || subtle.ConstantTimeCompare([]byte(auth[0]), []byte("Bearer "+b.token)) != 1 {
+	if !b.auth.verifyHeader(r.Header.Values("Authorization")) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}

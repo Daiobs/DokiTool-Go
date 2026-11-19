@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
@@ -171,4 +173,110 @@ func TestResolveWorkStalledOriginalProbeReturnsRenditionsWithinBudget(t *testing
 
 	wCancel()
 	<-wDone
+}
+
+func TestBearerAuthDigestComparisonAndFailClosed(t *testing.T) {
+	// Zero-value bearerAuth, server, and PullBroker must fail closed on all inputs.
+	var zeroAuth bearerAuth
+	for _, headers := range [][]string{nil, {""}, {"Bearer "}, {"Bearer " + strings.Repeat("a", 32)}} {
+		if zeroAuth.verifyHeader(headers) {
+			t.Fatalf("zero bearerAuth accepted %v", headers)
+		}
+	}
+	if zeroAuth.String() != "bearerAuth{enabled:false}" || zeroAuth.GoString() != "bearerAuth{enabled:false}" {
+		t.Fatalf("unexpected zero bearerAuth formatting: %q / %q", zeroAuth.String(), zeroAuth.GoString())
+	}
+
+	var zeroServer server
+	zw := httptest.NewRecorder()
+	zr := httptest.NewRequest(http.MethodPost, Path, strings.NewReader(`{"video_id":"v0200fg10000d9umdsfog65tds1f8o0g"}`))
+	zr.Header.Set("Authorization", "Bearer ")
+	zeroServer.ServeHTTP(zw, zr)
+	if zw.Code != http.StatusUnauthorized {
+		t.Fatalf("zero server must fail closed with 401, got %d", zw.Code)
+	}
+
+	var zeroBroker PullBroker
+	zbw := httptest.NewRecorder()
+	zbr := httptest.NewRequest(http.MethodPost, ClaimPath, nil)
+	zbr.Header.Set("Authorization", "Bearer ")
+	zeroBroker.ServeHTTP(zbw, zbr)
+	if zbw.Code != http.StatusUnauthorized {
+		t.Fatalf("zero PullBroker must fail closed with 401, got %d", zbw.Code)
+	}
+
+	const secret = "shanghai-secret-token-48-bytes-not-a-real-secret"
+	vid := "v0200fg10000d9umdsfog65tds1f8o0g"
+	srvHandler, err := NewHandler(secret, resolverFunc(func(_ context.Context, _ string) ([]unified.Object, error) {
+		return nil, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewPullBroker(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	formatted := fmt.Sprintf("%v %+v %#v %v %+v %#v", srvHandler, srvHandler, srvHandler, broker, broker, broker)
+	if strings.Contains(formatted, secret) {
+		t.Fatal("plaintext token leaked in formatted handler/broker structs")
+	}
+
+	badHeaders := [][]string{
+		nil,
+		{""},
+		{"Bearer"},
+		{"Bearer "},
+		{"bearer " + secret},
+		{"Basic " + secret},
+		{"Bearer short"},
+		{"Bearer " + secret[:len(secret)-1]},
+		{"Bearer " + secret + "x"},
+		{"Bearer " + strings.Repeat("x", len(secret))},
+		{"Bearer " + strings.Repeat("x", 256)},
+		{"Bearer " + strings.Repeat("x", maxBearerAuthHeaderBytes)},
+		{"Bearer " + secret, "Bearer " + secret},
+	}
+	for _, hdrs := range badHeaders {
+		sr := httptest.NewRequest(http.MethodPost, Path, strings.NewReader(`{"video_id":"`+vid+`"}`))
+		for _, v := range hdrs {
+			sr.Header.Add("Authorization", v)
+		}
+		sw := httptest.NewRecorder()
+		srvHandler.ServeHTTP(sw, sr)
+		if sw.Code != http.StatusUnauthorized {
+			t.Fatalf("server accepted bad Authorization %v: status=%d", hdrs, sw.Code)
+		}
+
+		for _, target := range []string{ClaimPath, ResultPath} {
+			br := httptest.NewRequest(http.MethodPost, target, nil)
+			for _, v := range hdrs {
+				br.Header.Add("Authorization", v)
+			}
+			bw := httptest.NewRecorder()
+			broker.ServeHTTP(bw, br)
+			if bw.Code != http.StatusUnauthorized {
+				t.Fatalf("broker %s accepted bad Authorization %v: status=%d", target, hdrs, bw.Code)
+			}
+		}
+	}
+
+	// Exact valid bearer succeeds on server (200) and canceled claim (204).
+	okSrvReq := httptest.NewRequest(http.MethodPost, Path, strings.NewReader(`{"video_id":"`+vid+`"}`))
+	okSrvReq.Header.Set("Authorization", "Bearer "+secret)
+	okSrvRec := httptest.NewRecorder()
+	srvHandler.ServeHTTP(okSrvRec, okSrvReq)
+	if okSrvRec.Code != http.StatusOK {
+		t.Fatalf("valid bearer rejected by server: %d", okSrvRec.Code)
+	}
+
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	okClaimReq := httptest.NewRequestWithContext(canceledCtx, http.MethodPost, ClaimPath, nil)
+	okClaimReq.Header.Set("Authorization", "Bearer "+secret)
+	okClaimRec := httptest.NewRecorder()
+	broker.ServeHTTP(okClaimRec, okClaimReq)
+	if okClaimRec.Code != http.StatusNoContent {
+		t.Fatalf("valid bearer rejected by PullBroker claim: %d", okClaimRec.Code)
+	}
 }

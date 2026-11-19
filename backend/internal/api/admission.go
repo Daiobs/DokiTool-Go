@@ -128,6 +128,7 @@ func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string
 		now:         time.Now,
 		stats:       st,
 		public:      newConfiguredPool(config.Parse, config.MaxClients),
+		controlAuth: newConfiguredPool(config.Parse, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
@@ -139,13 +140,13 @@ func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string
 }
 
 type admission struct {
-	next, pullControl                     http.Handler
-	edgeKey                               string
-	ownerAuth                             OwnerAuth
-	now                                   func() time.Time
-	stats                                 *Stats
-	public, slow, catalog, relay, reports *pool
-	owner                                 *ownerPool
+	next, pullControl                                  http.Handler
+	edgeKey                                            string
+	ownerAuth                                          OwnerAuth
+	now                                                func() time.Time
+	stats                                              *Stats
+	public, controlAuth, slow, catalog, relay, reports *pool
+	owner                                              *ownerPool
 }
 
 func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -157,14 +158,25 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del(edgeHeader)
 	r.Header.Del(clientHeader)
 	// Long polls and result submissions authenticate the ingress hop as usual.
-	// The control handler enforces its own bearer, byte, time and concurrency limits.
+	// Valid control traffic consumes zero client quota so steady 15s worker polls
+	// never self-throttle, while 401 bearer failures charge per-IP abuse tokens.
 	if a.pullControl != nil && (path == shresolver.ClaimPath || path == shresolver.ResultPath) {
 		if !client.IsValid() {
 			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		a.pullControl.ServeHTTP(w, r)
+		if retry := a.controlAuth.clientRetryAfter(client, a.now()); retry > 0 {
+			rejectControlRateLimit(w, retry)
+			return
+		}
+		cw := &controlStatusWriter{
+			ResponseWriter: w,
+			onUnauthorized: func() int {
+				return a.controlAuth.chargeClient(client, a.now())
+			},
+		}
+		a.pullControl.ServeHTTP(cw, r)
 		return
 	}
 	if kind == unknown {
@@ -614,6 +626,31 @@ func (p *pool) releaseSlot(c *clientState) {
 	p.active--
 }
 
+// clientRetryAfter reports whether ip's per-IP abuse bucket is currently
+// exhausted (< 1 token) without allocating state or deducting tokens.
+func (p *pool) clientRetryAfter(ip netip.Addr, now time.Time) (retrySeconds int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if now.Before(p.global.at) {
+		now = p.global.at
+	}
+	c := p.clients[ip]
+	if c == nil {
+		return 0
+	}
+	if now.Before(c.bucket.at) {
+		now = c.bucket.at
+	}
+	local := c.available(now, p.clientBurst, p.clientRate)
+	if local < 1 {
+		if c.idleElem != nil {
+			p.idle.MoveToBack(c.idleElem)
+		}
+		return int(math.Ceil(max(1, (1-local)/p.clientRate)))
+	}
+	return 0
+}
+
 // chargeClient deducts one token from the visitor's per-IP abuse budget without
 // consuming global service tokens or concurrency leases. Failed authentication
 // attempts therefore throttle the caller IP without starving other visitors.
@@ -806,6 +843,60 @@ func (a *admission) statsSnapshot() AdmissionStatsSnapshot {
 		Slow:  a.slow.statsSnapshot(),
 		Owner: a.owner.statsSnapshot(),
 	}
+}
+
+func rejectControlRateLimit(w http.ResponseWriter, retry int) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	w.WriteHeader(http.StatusTooManyRequests)
+}
+
+type controlStatusWriter struct {
+	http.ResponseWriter
+	onUnauthorized func() int
+	wroteHeader    bool
+	suppressBody   bool
+}
+
+func (w *controlStatusWriter) WriteHeader(code int) {
+	if code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		if code == http.StatusUnauthorized && w.onUnauthorized != nil {
+			if retry := w.onUnauthorized(); retry > 0 {
+				w.suppressBody = true
+				rejectControlRateLimit(w.ResponseWriter, retry)
+				return
+			}
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *controlStatusWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+	}
+	if w.suppressBody {
+		return len(b), nil
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *controlStatusWriter) Flush() {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *controlStatusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func rejectUnauthorized(w http.ResponseWriter, r *http.Request, kind route) {
