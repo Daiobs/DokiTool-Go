@@ -108,6 +108,42 @@ func fixtureParser(t *testing.T, input, expected unified.Object) (*Parser, *orac
 	return NewWithClock(tape, func() time.Time { return time.Unix(100, 0) }), tape
 }
 
+// intentionalTransportSavings documents frozen PHP baseline cases where Go
+// reuses a valid 200 canonical note page body already returned at the end of
+// short-link redirect resolution instead of issuing PHP's redundant second
+// canonical page GET. Public normal/debug/legacy_response envelopes remain
+// byte-for-byte identical to the frozen PHP oracle.
+var intentionalTransportSavings = map[string]struct {
+	consumed   int
+	skippedURL string
+}{
+	"xiaohongshu/entry/short": {
+		consumed:   2,
+		skippedURL: "https://www.rednote.com/explore/fixture01?xsec_token=synthetic%2Btoken%2Fvalue%3D&xsec_source=pc_feed&keep=a+b%2525",
+	},
+	"xiaohongshu/entry/xhs-com-alias": {
+		consumed:   2,
+		skippedURL: "https://www.rednote.com/explore/fixture01?xsec_token=synthetic%2Btoken%2Fvalue%3D&xsec_source=pc_feed&keep=a+b%2525",
+	},
+}
+
+func assertOracleTapeConsumed(t *testing.T, id string, tape *oracleTape) {
+	t.Helper()
+	if saving, ok := intentionalTransportSavings[id]; ok {
+		if tape.position != saving.consumed || len(tape.responses) != saving.consumed+1 || len(tape.requests) != saving.consumed+1 {
+			t.Fatalf("short-link transport saving mismatch for %s: consumed %d of %d, want %d of %d",
+				id, tape.position, len(tape.responses), saving.consumed, saving.consumed+1)
+		}
+		if gotSkipped := unified.Str(unified.Map(tape.requests[saving.consumed])["url"]); gotSkipped != saving.skippedURL {
+			t.Fatalf("short-link skipped request mismatch for %s: got %q, want %q", id, gotSkipped, saving.skippedURL)
+		}
+		return
+	}
+	if tape.position != len(tape.responses) || tape.position != len(tape.requests) {
+		t.Fatalf("unused upstream tape: consumed %d of %d", tape.position, len(tape.responses))
+	}
+}
+
 func TestPHPXiaohongshuBaseline(t *testing.T) {
 	body, err := os.ReadFile("testdata/php-baseline.json")
 	if err != nil {
@@ -121,10 +157,15 @@ func TestPHPXiaohongshuBaseline(t *testing.T) {
 	if document["baseline_commit"] != "25beaee107f8c1a208ced9deb3c637068445e316" || len(cases) != 37 {
 		t.Fatal("wrong XHS oracle inventory")
 	}
+	seenSavings := make(map[string]bool, len(intentionalTransportSavings))
 	exports := unified.Array{}
 	for _, raw := range cases {
 		entry := unified.Map(raw)
-		t.Run(unified.Str(entry["id"]), func(t *testing.T) {
+		id := unified.Str(entry["id"])
+		if _, ok := intentionalTransportSavings[id]; ok {
+			seenSavings[id] = true
+		}
+		t.Run(id, func(t *testing.T) {
 			input, expected := unified.Map(entry["input"]), unified.Map(entry["expected"])
 			now, _ := unified.PHPInt(input["now"])
 			parser, tape := fixtureParser(t, input, expected)
@@ -132,9 +173,7 @@ func TestPHPXiaohongshuBaseline(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tape.position != len(tape.responses) || tape.position != len(tape.requests) {
-				t.Fatalf("unused upstream tape: consumed %d of %d", tape.position, len(tape.responses))
-			}
+			assertOracleTapeConsumed(t, id, tape)
 			actual := unified.Object{"id": entry["id"]}
 			for _, view := range []string{"normal", "debug"} {
 				t.Run(view, func(t *testing.T) {
@@ -158,11 +197,12 @@ func TestPHPXiaohongshuBaseline(t *testing.T) {
 					t.Fatal(err)
 				}
 				oracleEqual(t, wire, expected["legacy_response"])
-				if tape.position != len(tape.responses) {
-					t.Fatal("legacy parser left upstream tape unused")
-				}
+				assertOracleTapeConsumed(t, id, tape)
 			})
 		})
+	}
+	if len(seenSavings) != len(intentionalTransportSavings) {
+		t.Fatalf("unused intentionalTransportSavings declarations: exercised %d of %d", len(seenSavings), len(intentionalTransportSavings))
 	}
 	if destination := os.Getenv("DOKITOOL_GO_XIAOHONGSHU_OUTPUT"); destination != "" && !t.Failed() {
 		if !filepath.IsAbs(destination) || len(exports) != len(cases) {

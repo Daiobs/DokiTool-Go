@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -502,4 +503,129 @@ func TestPlatformScopedDefaultEligibilityAndUnknownVideoFields(t *testing.T) {
 	if err := ValidateEnvelopeAt(finalIGCoexist, now); err != nil {
 		t.Fatalf("instagram coexist failed validation: %v", err)
 	}
+}
+
+func readCanonicalExampleBytes(tb testing.TB, prefix string) []byte {
+	tb.Helper()
+	paths, err := filepath.Glob(filepath.Join("..", "..", "..", "docs", "schema", "unified-v1", "examples", prefix+"-*.json"))
+	if err != nil || len(paths) != 1 {
+		tb.Fatalf("example %s: %v %v", prefix, paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return data
+}
+
+func TestDeterministicErrorParityOnInvalidEnvelopes(t *testing.T) {
+	defs := Map(schemaDocument["$defs"])
+	successSchema := Map(defs["Success"])
+	mediaMetadataSchema := Map(defs["MediaMetadata"])
+	if successSchema == nil || mediaMetadataSchema == nil {
+		t.Fatal("missing expected $defs in embedded schema")
+	}
+
+	// Top-level envelope is a root oneOf (Success | Failure), so
+	// structural envelope violations deterministically report "$: invalid schema branch".
+	badEnvelope := contractExample(t, "02")
+	Map(badEnvelope["data"])["platform"] = "BadPlatform!"
+	if err := ValidateEnvelopeAt(badEnvelope, 1793448000); err == nil || err.Error() != "$: invalid schema branch" {
+		t.Fatalf("expected root oneOf error '$: invalid schema branch', got %v", err)
+	}
+
+	// Sub-schema validations (including ValidateMetadata field_conflicts and direct
+	// validateSchemaNode calls) preserve exact deterministic path diagnostics.
+	if err := validateSchemaNode(badEnvelope, successSchema, "$"); err == nil || err.Error() != "$.data.platform: invalid pattern" {
+		t.Fatalf("expected '$.data.platform: invalid pattern', got %v", err)
+	}
+
+	apiErrorSchema := Map(defs["APIError"])
+	if apiErrorSchema == nil {
+		t.Fatal("missing APIError in $defs")
+	}
+	if err := validateSchemaNode(Object{"code": "NO_MEDIA", "message": "x", "retry_after_seconds": -1}, apiErrorSchema, "$.error"); err == nil || err.Error() != "$.error.retry_after_seconds: outside minimum" {
+		t.Fatalf("expected '$.error.retry_after_seconds: outside minimum', got %v", err)
+	}
+	if err := validateSchemaNode(Object{"fps": 0, "evidence": "upstream"}, mediaMetadataSchema, "$.metadata"); err == nil || err.Error() != "$.metadata.fps: outside exclusiveMinimum" {
+		t.Fatalf("expected '$.metadata.fps: outside exclusiveMinimum', got %v", err)
+	}
+	if err := validateSchemaNode(Object{"zzz_unknown": 1, "aaa_unknown": 2}, mediaMetadataSchema, "$.metadata"); err == nil || err.Error() != "$.metadata: unknown aaa_unknown" {
+		t.Fatalf("expected deterministic alphabetical '$.metadata: unknown aaa_unknown', got %v", err)
+	}
+
+	conflictPayload := contractExample(t, "16")
+	mux := contractVariant(contractFirstItem(conflictPayload), 1)
+	video := Map(Slice(Map(mux["delivery"])["resources"])[0])
+	Map(video["metadata"])["field_conflicts"] = Object{
+		"fps": Array{
+			Object{"value": 0, "evidence": "upstream"},
+			Object{"value": 60, "evidence": "probe"},
+		},
+	}
+	if err := ValidateEnvelopeAt(conflictPayload, 1793448000); err == nil || err.Error() != "$.metadata.field_conflicts.fps: outside exclusiveMinimum" {
+		t.Fatalf("expected field_conflicts bound error, got %v", err)
+	}
+}
+
+func BenchmarkValidateStructure(b *testing.B) {
+	payload := benchmarkEnvelope(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ValidateStructure(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValidateEnvelopeAt(b *testing.B) {
+	payload := benchmarkEnvelope(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ValidateEnvelopeAt(payload, 1793448000); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkEnvelope(tb testing.TB) Object {
+	tb.Helper()
+	data := readCanonicalExampleBytes(tb, "16")
+	payload, err := Decode(data)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return payload
+}
+
+func TestSchemaPatternCacheIsSharedAndConcurrentSafe(t *testing.T) {
+	first, err := compileSchemaPattern(`^[a-z]+$`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := compileSchemaPattern(`^[a-z]+$`)
+	if err != nil || first != second {
+		t.Fatalf("expected cached regexp reuse, got %p %p %v", first, second, err)
+	}
+	if _, err := compileSchemaPattern(`(`); err == nil {
+		t.Fatal("invalid pattern must still fail")
+	}
+
+	payload := benchmarkEnvelope(t)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				if err := ValidateEnvelopeAt(payload, 1793448000); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

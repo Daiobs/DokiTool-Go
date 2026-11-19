@@ -1,11 +1,14 @@
 package instagram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1551,5 +1554,130 @@ func TestInstagramEmbedHTMLSingleImageDimensionsFallback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type igLockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *igLockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *igLockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestInstagramNativeFetchGoroutinePanicRecoversWithoutHanging(t *testing.T) {
+	const (
+		now       int64 = 1762300800
+		sourceURL       = "https://www.instagram.com/p/aye83DjauH/"
+	)
+
+	var logBuf igLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	t.Run("YTDLPSucceedsWhileNativeFetchPanics", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		p := NewWithFetcher(
+			&stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return &ytengine.Info{
+						ID:        "aye83DjauH",
+						Title:     "Post video",
+						Uploader:  "instagram",
+						Width:     int64Ptr(720),
+						Height:    int64Ptr(1280),
+						Thumbnail: "https://scontent-nrt1-2.cdninstagram.com/v/t51.2885-15/thumb.jpg",
+						Formats: []ytengine.Format{
+							{
+								FormatID: "1",
+								URL:      "https://scontent-nrt1-2.cdninstagram.com/o1/v/t16/f2/m69/prog720.mp4",
+								Ext:      "mp4",
+								Protocol: "https",
+								Filesize: int64Ptr(1112223),
+							},
+						},
+					}, nil
+				},
+			},
+			nil,
+			fakeFetcher{
+				fn: func(context.Context, fetch.Request) (fetch.Response, error) {
+					panic("ig-native-secret-https://instagram.example/leak?sessionid=igsecret1")
+				},
+			},
+		)
+
+		start := time.Now()
+		env, err := p.Parse(ctx, sourceURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error: %v", err)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("Parse blocked for %v after native fetch panic; expected immediate return", elapsed)
+		}
+		if unified.Str(env["code"]) != "OK" {
+			t.Fatalf("expected OK from yt-dlp when native supplement panics, got %+v", env)
+		}
+	})
+
+	t.Run("YTDLPFailsAndNativeFetchPanics", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		p := NewWithFetcher(
+			&stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return nil, &ytengine.Error{
+						Code:      ytengine.CodeContentUnavailable,
+						Message:   "未找到可用的媒体或该帖子已不可访问",
+						Retryable: false,
+					}
+				},
+			},
+			nil,
+			fakeFetcher{
+				fn: func(context.Context, fetch.Request) (fetch.Response, error) {
+					panic(errors.New("ig-native-secret-2-token=igsecret2"))
+				},
+			},
+		)
+
+		start := time.Now()
+		env, err := p.Parse(ctx, sourceURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error: %v", err)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("Parse blocked for %v after yt-dlp error + native fetch panic; expected immediate wakeup", elapsed)
+		}
+		if unified.Str(env["code"]) != "CONTENT_UNAVAILABLE" {
+			t.Fatalf("expected CONTENT_UNAVAILABLE fallback error, got %+v", env)
+		}
+	})
+
+	logged := logBuf.String()
+	if strings.Count(logged, "instagram: native fetch goroutine panic recovered: panic_type=") != 2 {
+		t.Fatalf("expected 2 sanitized native fetch panic logs, got %q", logged)
+	}
+	for _, forbidden := range []string{"ig-native-secret", "igsecret1", "igsecret2", "instagram.example"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
 	}
 }

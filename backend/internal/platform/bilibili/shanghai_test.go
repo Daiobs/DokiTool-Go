@@ -1,13 +1,18 @@
 package bilibili
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
 type shanghaiTestExecutor func(context.Context, fetch.Request) (fetch.Response, error)
@@ -307,5 +312,141 @@ func TestShanghaiCallAbortCancelsChildContextWithoutCancelingParent(t *testing.T
 	<-call2.done
 	if parent.Err() != nil {
 		t.Fatalf("abort() unexpectedly canceled parent context: %v", parent.Err())
+	}
+}
+
+type shanghaiLockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *shanghaiLockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *shanghaiLockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type panickingShanghaiResolver struct {
+	ctxCanceled chan struct{}
+}
+
+func (r *panickingShanghaiResolver) ResolveBilibili(ctx context.Context, _ string, _ int64) (*ShanghaiPlay, error) {
+	go func() {
+		<-ctx.Done()
+		close(r.ctxCanceled)
+	}()
+	panic("bili-secret-token-https://sh.example/leak?token=bilisecret1")
+}
+
+type panickingPendingShanghaiResolver struct {
+	ctxCanceled chan struct{}
+}
+
+func (r *panickingPendingShanghaiResolver) ResolveBilibili(ctx context.Context, bvid string, cid int64) (*ShanghaiPlay, error) {
+	play, _, err := r.ResolveBilibiliPending(ctx, bvid, cid)
+	return play, err
+}
+
+func (r *panickingPendingShanghaiResolver) ResolveBilibiliPending(ctx context.Context, _ string, _ int64) (*ShanghaiPlay, func(bool), error) {
+	go func() {
+		<-ctx.Done()
+		close(r.ctxCanceled)
+	}()
+	panic(errors.New("bili-secret-pending-https://sh.example/leak?token=bilisecret2"))
+}
+
+type errorShanghaiResolver struct{}
+
+func (errorShanghaiResolver) ResolveBilibili(context.Context, string, int64) (*ShanghaiPlay, error) {
+	return nil, errors.New("shanghai unavailable")
+}
+
+func TestShanghaiCallAndParsePanicRecovery(t *testing.T) {
+	var logBuf shanghaiLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	exec := shanghaiTestExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: http.StatusOK, Body: []byte(testView), URL: req.URL}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: http.StatusOK, Body: []byte(testPlay), URL: req.URL}, nil
+		default:
+			return fetch.Response{}, errors.New("unexpected purpose: " + req.Policy.Purpose)
+		}
+	})
+
+	japanBaseline, err := NewWithShanghai(exec, errorShanghaiResolver{}).Parse(context.Background(), testURL, 1800000000)
+	if err != nil {
+		t.Fatalf("Japan fallback baseline Parse failed: %v", err)
+	}
+
+	// 1. Full Parser.Parse with panicking ShanghaiResolver wakes immediately and falls back to Japan.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	panicRes := &panickingShanghaiResolver{ctxCanceled: make(chan struct{})}
+	start := time.Now()
+	got, err := NewWithShanghai(exec, panicRes).Parse(ctx, testURL, 1800000000)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Parse failed after Shanghai panic: %v", err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("Parse blocked for %v after Shanghai panic; expected immediate wakeup well below %v", elapsed, ShanghaiTotalBudget)
+	}
+	if !unified.Equal(got, japanBaseline) {
+		t.Fatalf("Shanghai panic altered Japan fallback result: got=%#v want=%#v", got, japanBaseline)
+	}
+	select {
+	case <-panicRes.ctxCanceled:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("panicking ResolveBilibili child context was not canceled")
+	}
+
+	// 2. Direct startShanghaiCall + await with panicking pending resolver sets call.err, cancels child ctx, and wakes await().
+	pendingPanicRes := &panickingPendingShanghaiResolver{ctxCanceled: make(chan struct{})}
+	call := startShanghaiCall(ctx, pendingPanicRes, "BV1234567890", 101)
+	if call == nil {
+		t.Fatal("expected non-nil shanghaiCall")
+	}
+	awaitStart := time.Now()
+	play, finish := call.await(ctx)
+	if awaitElapsed := time.Since(awaitStart); awaitElapsed >= 500*time.Millisecond {
+		t.Fatalf("await() blocked for %v after panic", awaitElapsed)
+	}
+	if play != nil || finish != nil {
+		t.Fatalf("expected (nil, nil) from await() after panic, got play=%+v finish=%v", play, finish != nil)
+	}
+	call.mu.Lock()
+	callErr := call.err
+	call.mu.Unlock()
+	if callErr == nil {
+		t.Fatal("expected non-nil call.err after Shanghai goroutine panic")
+	}
+	select {
+	case <-pendingPanicRes.ctxCanceled:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("panicking ResolveBilibiliPending child context was not canceled")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent context unexpectedly canceled: %v", ctx.Err())
+	}
+
+	logged := logBuf.String()
+	if strings.Count(logged, "bilibili: shanghai goroutine panic recovered: panic_type=") != 2 {
+		t.Fatalf("expected 2 sanitized panic recovery logs, got %q", logged)
+	}
+	for _, forbidden := range []string{"bili-secret", "bilisecret1", "bilisecret2", "sh.example"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
 	}
 }

@@ -101,7 +101,7 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_ADMISSION_MAX_CLIENTS` | 指定每个准入限流池内跟踪的独立客户端状态表容量上限 | 否 |
-| `DOKITOOL_PARSE_CLIENT_BURST` | 快解析池（覆盖纯 Go 国内平台解析与按需单集解析）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_CLIENT_BURST` | 快解析池（覆盖未命中缓存的纯 Go 国内平台 `/api/parse` 请求及历史兼容路由）单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_PARSE_CLIENT_RPS` | 快解析池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_PARSE_CLIENT_CONCURRENCY` | 快解析池单客户端允许同时在途的最大请求数 | 否 |
 | `DOKITOOL_PARSE_GLOBAL_BURST` | 快解析池全局令牌桶突发容量 | 否 |
@@ -109,7 +109,15 @@
 | `DOKITOOL_PARSE_GLOBAL_CONCURRENCY` | 快解析池全局允许同时在途的最大请求数 | 否 |
 | `DOKITOOL_PARSE_QUEUE_WAIT` | 快解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
 | `DOKITOOL_PARSE_QUEUE_SIZE` | 快解析池 FIFO 等待队列的最大容量上限 | 否 |
-| `DOKITOOL_PARSE_SLOW_CLIENT_BURST` | 慢解析池（覆盖海外提取器平台及未命中缓存的 YouTube 助手接口）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_RESOLVE_CLIENT_BURST` | 按需单集解析池（覆盖未命中缓存的纯 Go 国内平台 `/api/resolve` 请求，避免多 P 分集按需拉取挤占首次解析配额）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_RESOLVE_CLIENT_RPS` | 按需单集解析池单客户端每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_RESOLVE_CLIENT_CONCURRENCY` | 按需单集解析池单客户端允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_RESOLVE_GLOBAL_BURST` | 按需单集解析池全局令牌桶突发容量 | 否 |
+| `DOKITOOL_RESOLVE_GLOBAL_RPS` | 按需单集解析池全局每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_RESOLVE_GLOBAL_CONCURRENCY` | 按需单集解析池全局允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_RESOLVE_QUEUE_WAIT` | 按需单集解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
+| `DOKITOOL_RESOLVE_QUEUE_SIZE` | 按需单集解析池 FIFO 等待队列的最大容量上限 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_BURST` | 慢解析池（覆盖未命中缓存的海外提取器平台 `/api/parse`、`/api/resolve` 及 YouTube 助手接口）单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_PARSE_SLOW_CLIENT_RPS` | 慢解析池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY` | 慢解析池单客户端允许同时在途的最大请求数 | 否 |
 | `DOKITOOL_PARSE_SLOW_GLOBAL_BURST` | 慢解析池全局令牌桶突发容量 | 否 |
@@ -120,7 +128,7 @@
 | `DOKITOOL_OWNER_CONCURRENCY` | 个人 Agent 独立通道允许同时在途的最大并发请求数 | 否 |
 | `DOKITOOL_OWNER_QUEUE_WAIT` | 个人 Agent 独立通道在并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
 | `DOKITOOL_OWNER_QUEUE_SIZE` | 个人 Agent 独立通道 FIFO 等待队列的最大容量上限 | 否 |
-| `DOKITOOL_CATALOG_CLIENT_BURST` | 目录池（覆盖平台目录及命中缓存的 YouTube 上下文接口）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_CATALOG_CLIENT_BURST` | 目录池（覆盖平台目录、命中进程内新鲜缓存的 `/api/parse` 与 `/api/resolve` 请求，以及命中缓存的 YouTube 上下文接口）单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_CATALOG_CLIENT_RPS` | 目录池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_CATALOG_CLIENT_CONCURRENCY` | 目录池单客户端允许同时在途的最大请求数 | 否 |
 | `DOKITOOL_CATALOG_GLOBAL_BURST` | 目录池全局令牌桶突发容量 | 否 |

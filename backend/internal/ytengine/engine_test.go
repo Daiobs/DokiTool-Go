@@ -2,6 +2,7 @@
 package ytengine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2111,5 +2113,92 @@ func TestSingleStreamHLSOnlyFiltering(t *testing.T) {
 	}
 	if unified.Str(liveEnv["code"]) != "NO_MEDIA" {
 		t.Fatalf("expected live stream to return NO_MEDIA in SingleStreamHLSOnly mode, got %+v", liveEnv)
+	}
+}
+
+type ytLockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *ytLockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *ytLockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestPopulateMissingMP4SizesRecoversProberPanicWithoutDeadlock(t *testing.T) {
+	var logBuf ytLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const totalFormats = sizeProbeConcurrency + 2
+	w, h := int64(1280), int64(720)
+	formats := make([]Format, 0, totalFormats)
+	for i := 0; i < totalFormats; i++ {
+		formats = append(formats, Format{
+			FormatID: fmt.Sprintf("mp4-%d", i),
+			URL:      fmt.Sprintf("https://cdn.example.com/media/v%d.mp4", i),
+			Ext:      "mp4",
+			Protocol: "https",
+			Width:    &w,
+			Height:   &h,
+			VCodec:   "avc1.4d401f",
+			ACodec:   "mp4a.40.2",
+		})
+	}
+	info := &Info{ID: "vid1", Formats: formats}
+	opts := AdaptOptions{
+		PlatformID: "youtube",
+		ContentID:  "vid1",
+		SourceURL:  "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		AllowedMediaURL: func(raw string) bool {
+			return strings.HasPrefix(raw, "https://cdn.example.com/")
+		},
+	}
+
+	start := time.Now()
+	PopulateMissingMP4Sizes(ctx, info, func(_ context.Context, u string) (int64, bool) {
+		for i := 0; i < sizeProbeConcurrency; i++ {
+			if strings.HasSuffix(u, fmt.Sprintf("/v%d.mp4", i)) {
+				panic("ytengine-probe-secret-" + u + "?sig=ytprobesecret")
+			}
+		}
+		return 3141592, true
+	}, opts)
+	elapsed := time.Since(start)
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("PopulateMissingMP4Sizes blocked for %v on prober panic", elapsed)
+	}
+
+	for i := 0; i < sizeProbeConcurrency; i++ {
+		if info.Formats[i].Filesize != nil {
+			t.Fatalf("panicking format %d unexpectedly got Filesize=%v", i, *info.Formats[i].Filesize)
+		}
+	}
+	for i := sizeProbeConcurrency; i < totalFormats; i++ {
+		if info.Formats[i].Filesize == nil || *info.Formats[i].Filesize != 3141592 {
+			t.Fatalf("healthy format %d expected Filesize=3141592, got %v", i, info.Formats[i].Filesize)
+		}
+	}
+
+	logged := logBuf.String()
+	if strings.Count(logged, "ytengine: size probe goroutine panic recovered: panic_type=") != sizeProbeConcurrency {
+		t.Fatalf("expected %d sanitized size probe panic logs, got %q", sizeProbeConcurrency, logged)
+	}
+	for _, forbidden := range []string{"ytengine-probe-secret", "ytprobesecret", "cdn.example.com"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
 	}
 }

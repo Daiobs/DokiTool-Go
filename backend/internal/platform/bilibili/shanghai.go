@@ -3,6 +3,7 @@ package bilibili
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -111,18 +112,43 @@ func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid s
 	if !shanghaiResolverEnabled(resolver) || !ValidBVID(bvid) || !ValidCID(cid) {
 		return nil
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
 	call := &shanghaiCall{done: make(chan struct{})}
 	go func() {
 		defer close(call.done)
 		ctx, cancel := context.WithCancel(parent)
 		keepCtxAlive := false
+		var completed bool
 		defer func() {
 			if !keepCtxAlive {
 				cancel()
 			}
 		}()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("bilibili: shanghai goroutine panic recovered: panic_type=%T", recovered)
+				if !keepCtxAlive {
+					cancel()
+				}
+				call.mu.Lock()
+				call.err = errors.New("bilibili shanghai internal panic")
+				call.mu.Unlock()
+			} else if !completed {
+				if !keepCtxAlive {
+					cancel()
+				}
+				call.mu.Lock()
+				if !call.closed && call.err == nil {
+					call.err = errors.New("bilibili shanghai internal panic")
+				}
+				call.mu.Unlock()
+			}
+		}()
 		call.mu.Lock()
 		if call.closed {
+			completed = true
 			call.mu.Unlock()
 			return
 		}
@@ -140,6 +166,7 @@ func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid s
 		}
 		call.mu.Lock()
 		if call.closed {
+			completed = true
 			call.mu.Unlock()
 			if finish != nil {
 				finish(false)
@@ -160,6 +187,7 @@ func startShanghaiCall(parent context.Context, resolver ShanghaiResolver, bvid s
 		call.play = play
 		call.finish = finish
 		call.err = err
+		completed = true
 		call.mu.Unlock()
 	}()
 	return call

@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
@@ -125,7 +124,7 @@ func New(spec SiteSpec, engine ytengine.Extractor, prober ytengine.SizeProber) *
 }
 
 // NewWithResolver creates a universal yt-dlp parser with an explicit DNS resolver
-// that enforces public-IP resolution on input and media hosts.
+// that enforces public-IP resolution on the input host fetched by yt-dlp.
 func NewWithResolver(spec SiteSpec, engine ytengine.Extractor, prober ytengine.SizeProber, resolver ytengine.Resolver) *Parser {
 	if spec.MaxEntries <= 0 {
 		spec.MaxEntries = 4
@@ -189,7 +188,7 @@ func (p *Parser) verifyPublicHost(ctx context.Context, host string) bool {
 	return true
 }
 
-const defaultMediaDNSTimeout = 5 * time.Second
+const defaultInputDNSTimeout = 5 * time.Second
 
 func (p *Parser) matchMediaHost(host string) bool {
 	if p == nil || len(p.spec.MediaHostSuffix) == 0 {
@@ -243,22 +242,14 @@ func (p *Parser) MatchMediaURL(raw string) bool {
 	return p.matchMediaHost(host)
 }
 
-// AllowedMediaURL checks whether a media/thumbnail URL belongs to spec.MediaHostSuffix
-// and resolves solely to public IP addresses within a bounded timeout.
+// AllowedMediaURL checks whether a media/thumbnail URL belongs to
+// spec.MediaHostSuffix. These URLs are returned to the browser and never
+// relayed by the server; any server-side fetch goes through fetch.Client,
+// which resolves DNS, rejects non-public IPs and pins the dialed address.
+// A DNS check here only produced false negatives (fake-IP/DNS64 resolvers)
+// and extra latency, so the check is purely syntactic.
 func (p *Parser) AllowedMediaURL(raw string) bool {
-	if !p.MatchMediaURL(raw) {
-		return false
-	}
-	if p.resolver == nil {
-		return true
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	lookupCtx, cancel := context.WithTimeout(context.Background(), defaultMediaDNSTimeout)
-	defer cancel()
-	return p.verifyPublicHost(lookupCtx, u.Hostname())
+	return p.MatchMediaURL(raw)
 }
 
 func parseSafeHTTPURL(raw string) (*url.URL, bool) {
@@ -388,61 +379,18 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	if p == nil || p.engine == nil || !p.engine.Enabled() {
 		return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
 	}
-	type hostLookup struct {
-		done chan struct{}
-		ok   bool
-	}
-	var (
-		hostMu    sync.Mutex
-		hostCache = make(map[string]*hostLookup)
-	)
-	checkPublicHost := func(host string) bool {
-		if p == nil || p.resolver == nil {
-			return true
-		}
-		cleanHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-		if cleanHost == "" || net.ParseIP(cleanHost) != nil {
-			return false
-		}
-		if ctx.Err() != nil {
-			return false
-		}
-		hostMu.Lock()
-		entry, exists := hostCache[cleanHost]
-		if !exists {
-			entry = &hostLookup{done: make(chan struct{})}
-			hostCache[cleanHost] = entry
-			hostMu.Unlock()
-
-			lookupCtx, cancel := context.WithTimeout(ctx, defaultMediaDNSTimeout)
-			ok := p.verifyPublicHost(lookupCtx, cleanHost)
-			cancel()
-			if ctx.Err() != nil {
-				hostMu.Lock()
-				delete(hostCache, cleanHost)
-				hostMu.Unlock()
-				close(entry.done)
-				return false
-			}
-			entry.ok = ok
-			close(entry.done)
-			return ok
-		}
-		hostMu.Unlock()
-
-		select {
-		case <-entry.done:
-			if ctx.Err() != nil {
-				return false
-			}
-			return entry.ok
-		case <-ctx.Done():
-			return false
-		}
-	}
-
+	// yt-dlp fetches the input page server-side, so the allowlisted input host
+	// must still resolve to public addresses. Media/cover URLs are only handed
+	// to the browser (and every server-side size probe re-checks DNS inside
+	// fetch.Client), so they are validated syntactically below.
 	parsedURL, err := url.Parse(cleanURL)
-	if err != nil || !checkPublicHost(parsedURL.Hostname()) {
+	inputOK := false
+	if err == nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, defaultInputDNSTimeout)
+		inputOK = p.verifyPublicHost(lookupCtx, parsedURL.Hostname())
+		cancel()
+	}
+	if !inputOK {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if errors.Is(ctxErr, context.Canceled) {
 				return nil, ctxErr
@@ -480,23 +428,12 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 		contentID = hex.EncodeToString(sum[:])[:16]
 	}
 
-	allowedMediaURL := func(raw string) bool {
-		if !p.MatchMediaURL(raw) {
-			return false
-		}
-		u, err := url.Parse(raw)
-		if err != nil {
-			return false
-		}
-		return checkPublicHost(u.Hostname())
-	}
-
 	opts := ytengine.AdaptOptions{
 		PlatformID:                   p.spec.PlatformID,
 		ContentID:                    contentID,
 		SourceURL:                    source,
 		MaxEntries:                   p.spec.MaxEntries,
-		AllowedMediaURL:              allowedMediaURL,
+		AllowedMediaURL:              p.MatchMediaURL,
 		EnableDASHMux:                p.spec.EnableDASHMux,
 		EnableHLS:                    p.spec.EnableHLS,
 		AllowCodecLessProgressiveMP4: p.spec.AllowCodecLessProgressiveMP4,

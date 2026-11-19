@@ -37,6 +37,19 @@ func TestXHSChrome131FormalAPIThroughFrozenPHPPageFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// intentionalTransportSavings documents frozen PHP page fixtures where Go
+	// reuses the 200 canonical note page body already returned by short-link
+	// redirect resolution instead of issuing PHP's redundant second canonical GET.
+	intentionalTransportSavings := map[string]struct {
+		consumed   int
+		skippedURL string
+	}{
+		"xiaohongshu/entry/short": {
+			consumed:   2,
+			skippedURL: "https://www.rednote.com/explore/fixture01?xsec_token=synthetic%2Btoken%2Fvalue%3D&xsec_source=pc_feed&keep=a+b%2525",
+		},
+	}
+	seenSavings := make(map[string]bool, len(intentionalTransportSavings))
 	exports := unified.Array{}
 	tested := 0
 	for _, value := range unified.Slice(document["cases"]) {
@@ -58,6 +71,9 @@ func TestXHSChrome131FormalAPIThroughFrozenPHPPageFixtures(t *testing.T) {
 		}
 		if !pageOnly {
 			continue
+		}
+		if _, ok := intentionalTransportSavings[id]; ok {
+			seenSavings[id] = true
 		}
 		tested++
 		for _, h2 := range []bool{false, true} {
@@ -149,7 +165,15 @@ func TestXHSChrome131FormalAPIThroughFrozenPHPPageFixtures(t *testing.T) {
 						mutex.Lock()
 						consumed := next
 						mutex.Unlock()
-						if consumed != len(responses) {
+						if saving, ok := intentionalTransportSavings[id]; ok {
+							if consumed != saving.consumed || len(responses) != saving.consumed+1 {
+								t.Fatalf("short-link transport saving mismatch for %s: %d/%d, want %d/%d",
+									id, consumed, len(responses), saving.consumed, saving.consumed+1)
+							}
+							if gotSkipped := unified.Str(unified.Map(responses[saving.consumed])["url"]); gotSkipped != saving.skippedURL {
+								t.Fatalf("short-link skipped request mismatch for %s: got %q, want %q", id, gotSkipped, saving.skippedURL)
+							}
+						} else if consumed != len(responses) {
 							t.Fatalf("unused PHP request tape: %d/%d", consumed, len(responses))
 						}
 						statuses := map[string]int{"OK": 200, "INVALID_INPUT": 400, "UPSTREAM_BLOCKED": 403, "RATE_LIMITED": 429, "CONTENT_UNAVAILABLE": 404, "NO_MEDIA": 404, "UPSTREAM_INVALID_RESPONSE": 502}
@@ -163,6 +187,9 @@ func TestXHSChrome131FormalAPIThroughFrozenPHPPageFixtures(t *testing.T) {
 				}
 			}
 		}
+	}
+	if len(seenSavings) != len(intentionalTransportSavings) {
+		t.Fatalf("unused intentionalTransportSavings declarations: %d/%d", len(seenSavings), len(intentionalTransportSavings))
 	}
 	if output := os.Getenv("DOKITOOL_GO_XHS_TRANSPORT_OUTPUT"); output != "" {
 		encoded, err := unified.Encode(unified.Object{"responses": exports})

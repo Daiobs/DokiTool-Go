@@ -2,6 +2,7 @@ package x
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -111,6 +112,11 @@ func populateMissingMP4Sizes(ctx context.Context, info *ytengine.Info, prober Si
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("x: size probe goroutine panic recovered: panic_type=%T", recovered)
+				}
+			}()
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()

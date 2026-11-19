@@ -2,6 +2,7 @@ package shresolver
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -118,8 +119,60 @@ func wrapBilibiliExecutor(exec fetch.Executor) fetch.Executor {
 	return strictBilibiliExecutor{exec: exec}
 }
 
+const maxBearerAuthHeaderBytes = 1024
+
+// bearerAuth stores only the precomputed SHA-256 digest of a validated
+// Shanghai control-plane token so neither the plaintext token nor its length
+// remains in memory or leaks via variable-length comparison timing.
+type bearerAuth struct {
+	enabled bool
+	digest  [32]byte
+}
+
+func newBearerAuth(token string) (bearerAuth, error) {
+	if !ValidToken(token) {
+		return bearerAuth{}, errUnavailable
+	}
+	return bearerAuth{
+		enabled: true,
+		digest:  sha256.Sum256([]byte(token)),
+	}, nil
+}
+
+func (a bearerAuth) String() string {
+	if a.enabled {
+		return "bearerAuth{enabled:true}"
+	}
+	return "bearerAuth{enabled:false}"
+}
+
+func (a bearerAuth) GoString() string {
+	return a.String()
+}
+
+func (a bearerAuth) verifyHeader(values []string) bool {
+	if !a.enabled || len(values) != 1 {
+		return false
+	}
+	raw := values[0]
+	if len(raw) > maxBearerAuthHeaderBytes {
+		return false
+	}
+	const bearerPrefix = "Bearer "
+	if !strings.HasPrefix(raw, bearerPrefix) {
+		return false
+	}
+	candidate := raw[len(bearerPrefix):]
+	if candidate == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(candidate))
+	match := subtle.ConstantTimeCompare(sum[:], a.digest[:]) == 1
+	return a.enabled && match
+}
+
 type server struct {
-	token    string
+	auth     bearerAuth
 	detail   fetch.Executor
 	bilibili fetch.Executor
 	probe    originalProbe
@@ -128,19 +181,21 @@ type server struct {
 // NewHandler authorizes the legacy v1 video_id metadata-only endpoint; the
 // command binds to loopback behind a certificate-validating HTTPS ingress.
 func NewHandler(token string, p originalProbe) (http.Handler, error) {
-	if !ValidToken(token) || p == nil {
+	auth, err := newBearerAuth(token)
+	if err != nil || p == nil {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
-	return &server{token: token, probe: p}, nil
+	return &server{auth: auth, probe: p}, nil
 }
 
 // NewHandlerWithDetail authorizes v1 (video_id) and v2 (Douyin aweme_id + Bilibili bvid/cid) requests.
 func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) (http.Handler, error) {
-	if !ValidToken(token) || detail == nil || p == nil {
+	auth, err := newBearerAuth(token)
+	if err != nil || detail == nil || p == nil {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
 	return &server{
-		token:    token,
+		auth:     auth,
 		detail:   detail,
 		bilibili: wrapBilibiliExecutor(detail),
 		probe:    p,
@@ -149,11 +204,12 @@ func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) 
 
 // NewHandlerWithExecutors authorizes v1/v2 requests with explicit Douyin detail and Bilibili executors.
 func NewHandlerWithExecutors(token string, detail, bilibiliExec fetch.Executor, p originalProbe) (http.Handler, error) {
-	if !ValidToken(token) || p == nil || (detail == nil && bilibiliExec == nil) {
+	auth, err := newBearerAuth(token)
+	if err != nil || p == nil || (detail == nil && bilibiliExec == nil) {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
 	return &server{
-		token:    token,
+		auth:     auth,
 		detail:   detail,
 		bilibili: wrapBilibiliExecutor(bilibiliExec),
 		probe:    p,
@@ -183,8 +239,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	auth := r.Header.Values("Authorization")
-	if len(auth) != 1 || subtle.ConstantTimeCompare([]byte(auth[0]), []byte("Bearer "+s.token)) != 1 {
+	if !s.auth.verifyHeader(r.Header.Values("Authorization")) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}

@@ -104,12 +104,29 @@ func TestXiaohongshuHTTPFrozenPHP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// intentionalTransportSavings documents frozen PHP baseline cases where Go
+	// reuses the 200 canonical note page body already returned by short-link
+	// redirect resolution instead of issuing PHP's redundant second canonical GET.
+	intentionalTransportSavings := map[string]struct {
+		consumed   int
+		skippedURL string
+	}{
+		"xiaohongshu/entry/short": {
+			consumed:   2,
+			skippedURL: "https://www.rednote.com/explore/fixture01?xsec_token=synthetic%2Btoken%2Fvalue%3D&xsec_source=pc_feed&keep=a+b%2525",
+		},
+	}
+	seenSavings := make(map[string]bool, len(intentionalTransportSavings))
 	for _, raw := range unified.Slice(document["cases"]) {
 		fixture := unified.Map(raw)
+		fixtureID := unified.Str(fixture["id"])
+		if _, ok := intentionalTransportSavings[fixtureID]; ok {
+			seenSavings[fixtureID] = true
+		}
 		input, expected := unified.Map(fixture["input"]), unified.Map(fixture["expected"])
 		// The parser historically accepts xhs.com aliases, but the frozen
 		// public catalog does not. Preserve that gateway preflight boundary.
-		gatewayRejects := strings.Contains(unified.Str(fixture["id"]), "/entry/reject-") || fixture["id"] == "xiaohongshu/entry/xhs-com-alias"
+		gatewayRejects := strings.Contains(fixtureID, "/entry/reject-") || fixtureID == "xiaohongshu/entry/xhs-com-alias"
 		for _, view := range []string{"normal", "debug"} {
 			base := unified.Map(expected[view])
 			choices := []string{""}
@@ -122,7 +139,7 @@ func TestXiaohongshuHTTPFrozenPHP(t *testing.T) {
 				choices = append(choices, "missing-item")
 			}
 			for _, itemID := range choices {
-				t.Run(unified.Str(fixture["id"])+"/"+view+"/"+itemID, func(t *testing.T) {
+				t.Run(fixtureID+"/"+view+"/"+itemID, func(t *testing.T) {
 					tape := &xhsHTTPOracleTape{t: t, responses: unified.Slice(input["http_responses"]), requests: unified.Slice(expected["http_requests"])}
 					if gatewayRejects {
 						tape.responses, tape.requests = nil, nil
@@ -150,7 +167,7 @@ func TestXiaohongshuHTTPFrozenPHP(t *testing.T) {
 					}
 					want := unified.Clone(base)
 					if gatewayRejects {
-						if fixture["id"] == "xiaohongshu/entry/reject-foreign" || fixture["id"] == "xiaohongshu/entry/xhs-com-alias" {
+						if fixtureID == "xiaohongshu/entry/reject-foreign" || fixtureID == "xiaohongshu/entry/xhs-com-alias" {
 							want = unified.Object{"schema_version": "1.0", "code": "UNSUPPORTED_PLATFORM", "error": unified.Object{"code": "UNSUPPORTED_PLATFORM", "message": "暂不支持该平台链接解析"}}
 						} else {
 							want = unified.Object{"schema_version": "1.0", "code": "INVALID_INPUT", "error": unified.Object{"code": "INVALID_INPUT", "message": "请输入对应平台的有效分享链接"}}
@@ -162,8 +179,19 @@ func TestXiaohongshuHTTPFrozenPHP(t *testing.T) {
 					}
 					xhsHTTPJSON(t, actual, want)
 					status := map[string]int{"OK": 200, "INVALID_INPUT": 400, "UNSUPPORTED_PLATFORM": 400, "UPSTREAM_BLOCKED": 403, "RATE_LIMITED": 429, "CONTENT_UNAVAILABLE": 404, "NO_MEDIA": 404, "UPSTREAM_INVALID_RESPONSE": 502, "UPSTREAM_UNAVAILABLE": 502}[unified.Str(want["code"])]
-					if status == 0 || recorder.Code != status || tape.next != len(tape.responses) {
-						t.Fatalf("status/tape mismatch: status %d want %d, consumed %d/%d", recorder.Code, status, tape.next, len(tape.responses))
+					if status == 0 || recorder.Code != status {
+						t.Fatalf("status mismatch: status %d want %d", recorder.Code, status)
+					}
+					if saving, ok := intentionalTransportSavings[fixtureID]; ok {
+						if tape.next != saving.consumed || len(tape.responses) != saving.consumed+1 || len(tape.requests) != saving.consumed+1 {
+							t.Fatalf("short-link transport saving mismatch for %s: consumed %d/%d, want %d/%d",
+								fixtureID, tape.next, len(tape.responses), saving.consumed, saving.consumed+1)
+						}
+						if gotSkipped := unified.Str(unified.Map(tape.requests[saving.consumed])["url"]); gotSkipped != saving.skippedURL {
+							t.Fatalf("short-link skipped request mismatch for %s: got %q, want %q", fixtureID, gotSkipped, saving.skippedURL)
+						}
+					} else if tape.next != len(tape.responses) {
+						t.Fatalf("tape mismatch: consumed %d/%d", tape.next, len(tape.responses))
 					}
 					if recorder.Header().Get("Content-Type") != "application/json; charset=utf-8" || recorder.Header().Get("Cache-Control") != "no-store" || recorder.Header().Get("X-Content-Type-Options") != "nosniff" || recorder.Header().Get("Access-Control-Allow-Origin") != "" {
 						t.Fatal("public response headers changed")
@@ -171,5 +199,8 @@ func TestXiaohongshuHTTPFrozenPHP(t *testing.T) {
 				})
 			}
 		}
+	}
+	if len(seenSavings) != len(intentionalTransportSavings) {
+		t.Fatalf("unused intentionalTransportSavings declarations: %d/%d", len(seenSavings), len(intentionalTransportSavings))
 	}
 }

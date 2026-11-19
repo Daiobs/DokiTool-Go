@@ -131,6 +131,7 @@ type PoolConfig struct {
 
 type AdmissionConfig struct {
 	Parse            PoolConfig
+	Resolve          PoolConfig
 	SlowParse        PoolConfig
 	Catalog          PoolConfig
 	Relay            PoolConfig
@@ -152,6 +153,19 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			GlobalRPS:         50,
 			ClientConcurrency: 1,
 			GlobalConcurrency: 64,
+			QueueWait:         DefaultFastParseQueueWait,
+			QueueSize:         DefaultFastParseQueueSize,
+		},
+		// Resolve serves per-item follow-ups of an already parsed link (for
+		// example Bilibili multi-P episodes), so it gets its own, roomier
+		// per-IP budget instead of competing with first-time parses.
+		Resolve: PoolConfig{
+			ClientBurst:       12,
+			ClientRPS:         0.5,
+			GlobalBurst:       100,
+			GlobalRPS:         50,
+			ClientConcurrency: 2,
+			GlobalConcurrency: 32,
 			QueueWait:         DefaultFastParseQueueWait,
 			QueueSize:         DefaultFastParseQueueSize,
 		},
@@ -205,6 +219,7 @@ func (c AdmissionConfig) Validate() error {
 		maxQueueSize   int
 	}{
 		{"PARSE", c.Parse, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
+		{"RESOLVE", c.Resolve, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"PARSE_SLOW", c.SlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"CATALOG", c.Catalog, 4096, 0, 0},
 		{"WEIBO", c.Relay, 4096, 0, 0},
@@ -272,6 +287,7 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 		p    *PoolConfig
 	}{
 		{"PARSE", &c.Parse},
+		{"RESOLVE", &c.Resolve},
 		{"PARSE_SLOW", &c.SlowParse},
 		{"CATALOG", &c.Catalog},
 		{"WEIBO", &c.Relay},
@@ -317,6 +333,7 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 		maxQueueSize int
 	}{
 		{"PARSE", &c.Parse, MaxFastParseQueueWait, MaxFastParseQueueSize},
+		{"RESOLVE", &c.Resolve, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"PARSE_SLOW", &c.SlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 	} {
 		waitKey := "DOKITOOL_" + entry.name + "_QUEUE_WAIT"

@@ -1,12 +1,15 @@
 package x
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -4378,4 +4381,227 @@ func BenchmarkXVideoSyndicationFastPathVsYTDLP(b *testing.B) {
 			b.Fatalf("expected %d yt-dlp subprocess spawns on LegacyYTDLPSubprocessPath, got %d", b.N, got)
 		}
 	})
+}
+
+type xLockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *xLockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *xLockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestXChildGoroutinePanicsRecoverWithoutHanging(t *testing.T) {
+	const (
+		now       int64 = 1762300800
+		sourceURL       = "https://x.com/historyinmemes/status/1790637656616943991"
+	)
+
+	var logBuf xLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	validYTInfo := func() *ytengine.Info {
+		return &ytengine.Info{
+			ID:        "1790637589910654976",
+			DisplayID: "1790637656616943991",
+			Title:     "X fallback video",
+			Uploader:  "historyinmemes",
+			Thumbnail: "https://pbs.twimg.com/ext_tw_video_thumb/1790637589910654976/pu/img/thumb.jpg",
+			Formats: []ytengine.Format{
+				{
+					FormatID: "http-832",
+					URL:      "https://video.twimg.com/ext_tw_video/1790637589910654976/pu/vid/avc1/640x360/vid.mp4",
+					Ext:      "mp4",
+					Protocol: "https",
+					Width:    int64Ptr(640),
+					Height:   int64Ptr(360),
+					Filesize: int64Ptr(1234567),
+					VCodec:   "avc1.4d001e",
+					ACodec:   "mp4a.40.2",
+				},
+			},
+		}
+	}
+
+	t.Run("Stage1SyndicationPanicFallsBackToYTDLPImmediately", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		p := NewWithFetcher(
+			&stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					return validYTInfo(), nil
+				},
+			},
+			nil,
+			fakeXFetcher{
+				fn: func(context.Context, fetch.Request) (fetch.Response, error) {
+					panic("x-syn-secret-https://syndication.example/leak?token=xsynsecret")
+				},
+			},
+		)
+
+		start := time.Now()
+		env, err := p.Parse(ctx, sourceURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error: %v", err)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("Parse blocked for %v after syndication panic; expected immediate fallback below %v", elapsed, syndicationSupplementTimeout)
+		}
+		if unified.Str(env["code"]) != "OK" {
+			t.Fatalf("expected OK fallback from yt-dlp, got %+v", env)
+		}
+	})
+
+	t.Run("Stage2YTDLPPanicReturnsCleanErrorImmediately", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		p := NewWithFetcher(
+			&stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					panic(errors.New("x-ytdlp-secret-https://proxy.example/leak?pass=xytdlpsecret"))
+				},
+			},
+			nil,
+			fakeXFetcher{
+				fn: func(context.Context, fetch.Request) (fetch.Response, error) {
+					return fetch.Response{StatusCode: http.StatusServiceUnavailable}, nil
+				},
+			},
+		)
+
+		start := time.Now()
+		env, err := p.Parse(ctx, sourceURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error: %v", err)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("Parse blocked for %v after yt-dlp panic; expected immediate error return", elapsed)
+		}
+		if unified.Str(env["code"]) != "UPSTREAM_UNAVAILABLE" {
+			t.Fatalf("expected UPSTREAM_UNAVAILABLE after syndication 503 + yt-dlp panic, got %+v", env)
+		}
+	})
+
+	t.Run("Stage2YTDLPPanicRecoversViaSlowSyndicationPhotoFastPath", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		ytStarted := make(chan struct{})
+		p := NewWithFetcher(
+			&stubExtractor{
+				enabled: true,
+				extract: func(context.Context, string) (*ytengine.Info, error) {
+					close(ytStarted)
+					panic("x-ytdlp-secret-stage2")
+				},
+			},
+			nil,
+			fakeXFetcher{
+				fn: func(context.Context, fetch.Request) (fetch.Response, error) {
+					<-ytStarted
+					return fetch.Response{
+						StatusCode: http.StatusOK,
+						Body:       []byte(`{"id_str":"1790637656616943991","text":"photo post","user":{"name":"User","screen_name":"historyinmemes"},"photos":[{"url":"https://pbs.twimg.com/media/Abc123XYZ.jpg","width":1200,"height":800}]}`),
+					}, nil
+				},
+			},
+		)
+		p.supplementTimeout = 5 * time.Millisecond
+
+		start := time.Now()
+		env, err := p.Parse(ctx, sourceURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse returned unexpected error: %v", err)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("Parse blocked for %v in Stage 2 recovery", elapsed)
+		}
+		if unified.Str(env["code"]) != "OK" {
+			t.Fatalf("expected OK via syndication fast-path after yt-dlp panic, got %+v", env)
+		}
+	})
+
+	t.Run("SizeProberPanicReleasesSemaphoreAndPopulatesHealthyFormats", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		const totalFormats = sizeProbeConcurrency + 2
+		formats := make([]ytengine.Format, 0, totalFormats)
+		for i := 0; i < totalFormats; i++ {
+			formats = append(formats, ytengine.Format{
+				FormatID: fmt.Sprintf("http-%d", i),
+				URL:      fmt.Sprintf("https://video.twimg.com/ext_tw_video/1790637589910654976/pu/vid/avc1/640x360/v%d.mp4", i),
+				Ext:      "mp4",
+				Protocol: "https",
+				Width:    int64Ptr(640),
+				Height:   int64Ptr(360),
+				VCodec:   "avc1.4d001e",
+				ACodec:   "mp4a.40.2",
+			})
+		}
+		info := &ytengine.Info{ID: "1790637589910654976", Formats: formats}
+
+		start := time.Now()
+		populateMissingMP4Sizes(ctx, info, func(_ context.Context, u string) (int64, bool) {
+			for i := 0; i < sizeProbeConcurrency; i++ {
+				if strings.HasSuffix(u, fmt.Sprintf("/v%d.mp4", i)) {
+					panic("x-probe-secret-" + u + "?sig=xprobesecret")
+				}
+			}
+			return 2468000, true
+		})
+		elapsed := time.Since(start)
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("populateMissingMP4Sizes blocked for %v on prober panic", elapsed)
+		}
+		for i := 0; i < sizeProbeConcurrency; i++ {
+			if info.Formats[i].Filesize != nil {
+				t.Fatalf("panicking format %d unexpectedly got Filesize=%v", i, *info.Formats[i].Filesize)
+			}
+		}
+		for i := sizeProbeConcurrency; i < totalFormats; i++ {
+			if info.Formats[i].Filesize == nil || *info.Formats[i].Filesize != 2468000 {
+				t.Fatalf("healthy format %d expected Filesize=2468000, got %v", i, info.Formats[i].Filesize)
+			}
+		}
+	})
+
+	logged := logBuf.String()
+	for _, want := range []string{
+		"x: syndication goroutine panic recovered: panic_type=",
+		"x: ytdlp goroutine panic recovered: panic_type=",
+		"x: size probe goroutine panic recovered: panic_type=",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("expected log substring %q, got %q", want, logged)
+		}
+	}
+	for _, forbidden := range []string{
+		"x-syn-secret", "xsynsecret", "syndication.example",
+		"x-ytdlp-secret", "xytdlpsecret", "proxy.example",
+		"x-probe-secret", "xprobesecret", "video.twimg.com",
+	} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -20,23 +21,33 @@ import (
 //go:embed unified-v1.generated.schema.json
 var embeddedSchema []byte
 
-var schemaDocument = func() Object {
-	schema, err := Decode(embeddedSchema)
-	if err != nil {
-		panic("invalid embedded unified-v1 schema: " + err.Error())
-	}
-	if err := ValidateSchemaDefinition(schema); err != nil {
-		panic("unsupported embedded unified-v1 schema: " + err.Error())
-	}
-	return schema
-}()
+var (
+	embeddedAuditOnce sync.Once
+	schemaDocument    Object
+)
+
+func init() { ensureEmbeddedSchema() }
+
+func ensureEmbeddedSchema() {
+	embeddedAuditOnce.Do(func() {
+		schema, err := Decode(embeddedSchema)
+		if err != nil {
+			panic("invalid embedded unified-v1 schema: " + err.Error())
+		}
+		if err := ValidateSchemaDefinition(schema); err != nil {
+			panic("unsupported embedded unified-v1 schema: " + err.Error())
+		}
+		schemaDocument = schema
+	})
+}
 
 func SchemaBytes() []byte { return append([]byte(nil), embeddedSchema...) }
 
 // ValidateStructure implements the keywords used by the canonical schema.
 // Independent Draft 2020-12 validation remains an external acceptance check.
 func ValidateStructure(value any) error {
-	return validateSchemaNode(value, schemaDocument, "$")
+	ensureEmbeddedSchema()
+	return validateNode(value, schemaDocument, "$", false)
 }
 
 func sortedObjectKeys(object Object) []string {
@@ -93,10 +104,33 @@ func parseContractTime(raw string) (time.Time, bool) {
 	return t, err == nil
 }
 
+// schemaPatterns memoizes compiled "pattern" keywords. Patterns come from the
+// embedded contract (a small fixed set), so the cache stays bounded while hot
+// envelope validation no longer recompiles the same regular expressions.
+var schemaPatterns sync.Map // pattern string -> *regexp.Regexp
+
+func compileSchemaPattern(pattern string) (*regexp.Regexp, error) {
+	if cached, ok := schemaPatterns.Load(pattern); ok {
+		return cached.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := schemaPatterns.LoadOrStore(pattern, re)
+	return actual.(*regexp.Regexp), nil
+}
+
 func validateSchemaNode(value any, node Object, path string) error {
+	return validateNode(value, node, path, true)
+}
+
+func validateNode(value any, node Object, path string, audit bool) error {
 	fail := func(message string) error { return fmt.Errorf("%s: %s", path, message) }
-	if err := auditSchemaKeywords(node, path); err != nil {
-		return err
+	if audit {
+		if err := auditSchemaKeywords(node, path); err != nil {
+			return err
+		}
 	}
 	if reference := Str(node["$ref"]); reference != "" {
 		const prefix = "#/$defs/"
@@ -107,7 +141,7 @@ func validateSchemaNode(value any, node Object, path string) error {
 		if definition == nil {
 			return fail("unknown schema reference")
 		}
-		return validateSchemaNode(value, definition, path)
+		return validateNode(value, definition, path, false)
 	}
 	if alternatives, one := Slice(node["oneOf"]), true; alternatives != nil || Slice(node["anyOf"]) != nil {
 		if alternatives == nil {
@@ -115,7 +149,7 @@ func validateSchemaNode(value any, node Object, path string) error {
 		}
 		matches := 0
 		for _, alternative := range alternatives {
-			if validateSchemaNode(value, Map(alternative), path) == nil {
+			if validateNode(value, Map(alternative), path, audit) == nil {
 				matches++
 			}
 		}
@@ -173,18 +207,18 @@ func validateSchemaNode(value any, node Object, path string) error {
 		properties := Map(node["properties"])
 		for _, key := range sortedObjectKeys(object) {
 			if names := Map(node["propertyNames"]); names != nil {
-				if err := validateSchemaNode(key, names, path+".[property]"); err != nil {
+				if err := validateNode(key, names, path+".[property]", audit); err != nil {
 					return err
 				}
 			}
 			if child := Map(properties[key]); child != nil {
-				if err := validateSchemaNode(object[key], child, path+"."+key); err != nil {
+				if err := validateNode(object[key], child, path+"."+key, audit); err != nil {
 					return err
 				}
 			} else if node["additionalProperties"] == false {
 				return fail("unknown " + key)
 			} else if child := Map(node["additionalProperties"]); child != nil {
-				if err := validateSchemaNode(object[key], child, path+"."+key); err != nil {
+				if err := validateNode(object[key], child, path+"."+key, audit); err != nil {
 					return err
 				}
 			}
@@ -206,7 +240,7 @@ func validateSchemaNode(value any, node Object, path string) error {
 					}
 				}
 			}
-			if err := validateSchemaNode(child, Map(node["items"]), fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			if err := validateNode(child, Map(node["items"]), fmt.Sprintf("%s[%d]", path, index), audit); err != nil {
 				return err
 			}
 		}
@@ -224,7 +258,7 @@ func validateSchemaNode(value any, node Object, path string) error {
 			return fail("text too long")
 		}
 		if pattern := Str(node["pattern"]); pattern != "" {
-			re, err := regexp.Compile(pattern)
+			re, err := compileSchemaPattern(pattern)
 			if err != nil {
 				return fail("unsupported schema pattern")
 			}
@@ -419,7 +453,7 @@ func ValidateSchemaDefinition(document Object) error {
 			if !ok {
 				return fmt.Errorf("%s.pattern: string required", path)
 			}
-			if _, err := regexp.Compile(pattern); err != nil {
+			if _, err := compileSchemaPattern(pattern); err != nil {
 				return fmt.Errorf("%s.pattern: unsupported expression: %w", path, err)
 			}
 		}

@@ -17,6 +17,9 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 	if defaults.Parse.GlobalConcurrency != 64 || defaults.Parse.GlobalRPS != 50 || defaults.Parse.GlobalBurst != 100 ||
 		defaults.Parse.ClientConcurrency != 1 || defaults.Parse.ClientBurst != 4 ||
 		defaults.Parse.QueueWait != 1500*time.Millisecond || defaults.Parse.QueueSize != 128 ||
+		defaults.Resolve.GlobalConcurrency != 32 || defaults.Resolve.GlobalRPS != 50 || defaults.Resolve.GlobalBurst != 100 ||
+		defaults.Resolve.ClientConcurrency != 2 || defaults.Resolve.ClientBurst != 12 || defaults.Resolve.ClientRPS != 0.5 ||
+		defaults.Resolve.QueueWait != 1500*time.Millisecond || defaults.Resolve.QueueSize != 128 ||
 		defaults.SlowParse.GlobalConcurrency != 2 || defaults.SlowParse.GlobalRPS != 10 || defaults.SlowParse.GlobalBurst != 32 ||
 		defaults.SlowParse.ClientConcurrency != 1 || defaults.SlowParse.ClientBurst != 4 ||
 		defaults.SlowParse.QueueWait != 5*time.Second || defaults.SlowParse.QueueSize != 32 ||
@@ -47,6 +50,14 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 		"DOKITOOL_PARSE_CLIENT_RPS":              "0.5",
 		"DOKITOOL_PARSE_QUEUE_WAIT":              "2s",
 		"DOKITOOL_PARSE_QUEUE_SIZE":              "256",
+		"DOKITOOL_RESOLVE_GLOBAL_CONCURRENCY":    "48",
+		"DOKITOOL_RESOLVE_GLOBAL_RPS":            "60",
+		"DOKITOOL_RESOLVE_GLOBAL_BURST":          "120",
+		"DOKITOOL_RESOLVE_CLIENT_CONCURRENCY":    "3",
+		"DOKITOOL_RESOLVE_CLIENT_BURST":          "16",
+		"DOKITOOL_RESOLVE_CLIENT_RPS":            "1.5",
+		"DOKITOOL_RESOLVE_QUEUE_WAIT":            "3s",
+		"DOKITOOL_RESOLVE_QUEUE_SIZE":            "192",
 		"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY": "10",
 		"DOKITOOL_PARSE_SLOW_GLOBAL_RPS":         "15",
 		"DOKITOOL_PARSE_SLOW_GLOBAL_BURST":       "40",
@@ -64,6 +75,9 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 	if got.Parse.GlobalConcurrency != 96 || got.Parse.GlobalRPS != 80 || got.Parse.GlobalBurst != 160 ||
 		got.Parse.ClientConcurrency != 2 || got.Parse.ClientRPS != 0.5 ||
 		got.Parse.QueueWait != 2*time.Second || got.Parse.QueueSize != 256 ||
+		got.Resolve.GlobalConcurrency != 48 || got.Resolve.GlobalRPS != 60 || got.Resolve.GlobalBurst != 120 ||
+		got.Resolve.ClientConcurrency != 3 || got.Resolve.ClientBurst != 16 || got.Resolve.ClientRPS != 1.5 ||
+		got.Resolve.QueueWait != 3*time.Second || got.Resolve.QueueSize != 192 ||
 		got.SlowParse.GlobalConcurrency != 10 || got.SlowParse.GlobalRPS != 15 || got.SlowParse.GlobalBurst != 40 ||
 		got.SlowParse.QueueWait != 8*time.Second || got.SlowParse.QueueSize != 64 ||
 		got.Catalog.GlobalConcurrency != 80 || got.Relay.GlobalConcurrency != 8 ||
@@ -86,6 +100,19 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 		{"DOKITOOL_PARSE_QUEUE_SIZE", "-1"},
 		{"DOKITOOL_PARSE_QUEUE_SIZE", "4097"},
 		{"DOKITOOL_PARSE_QUEUE_SIZE", "secret-invalid"},
+		{"DOKITOOL_RESOLVE_GLOBAL_RPS", "NaN"},
+		{"DOKITOOL_RESOLVE_CLIENT_RPS", "-Inf"},
+		{"DOKITOOL_RESOLVE_GLOBAL_BURST", "0"},
+		{"DOKITOOL_RESOLVE_CLIENT_BURST", "0.5"},
+		{"DOKITOOL_RESOLVE_CLIENT_CONCURRENCY", "33"},
+		{"DOKITOOL_RESOLVE_GLOBAL_CONCURRENCY", "0"},
+		{"DOKITOOL_RESOLVE_GLOBAL_CONCURRENCY", "4097"},
+		{"DOKITOOL_RESOLVE_QUEUE_WAIT", "-1ms"},
+		{"DOKITOOL_RESOLVE_QUEUE_WAIT", "16s"},
+		{"DOKITOOL_RESOLVE_QUEUE_WAIT", "secret-invalid"},
+		{"DOKITOOL_RESOLVE_QUEUE_SIZE", "-1"},
+		{"DOKITOOL_RESOLVE_QUEUE_SIZE", "4097"},
+		{"DOKITOOL_RESOLVE_QUEUE_SIZE", "secret-invalid"},
 		{"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY", "0"},
 		{"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY", "65"},
 		{"DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY", "3"},
@@ -126,6 +153,7 @@ func TestAdmissionCatalogIndependentOfBusyParse(t *testing.T) {
 	called := 0
 	cfg := DefaultAdmissionConfig()
 	cfg.Parse.QueueWait = 0
+	cfg.Resolve.QueueWait = 0
 	cfg.SlowParse.QueueWait = 0
 	h, err := WithAdmissionConfig(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called++; w.WriteHeader(204) }), nil, "caddy", testEdgeKey, cfg)
 	if err != nil {
@@ -147,6 +175,13 @@ func TestAdmissionCatalogIndependentOfBusyParse(t *testing.T) {
 		}
 		releases = append(releases, release)
 	}
+	for i := 0; i < cfg.Resolve.GlobalConcurrency; i++ {
+		release, retry := a.resolve.acquire(netip.MustParseAddr(fmt.Sprintf("198.18.0.%d", i+1)), now)
+		if retry != 0 {
+			t.Fatal(retry)
+		}
+		releases = append(releases, release)
+	}
 	for i := 0; i < cfg.SlowParse.GlobalConcurrency; i++ {
 		release, retry := a.slow.acquire(netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i+1)), now)
 		if retry != 0 {
@@ -156,6 +191,9 @@ func TestAdmissionCatalogIndependentOfBusyParse(t *testing.T) {
 	}
 	if w := call(h, edgeRequest("/api/parse", "203.0.113.1")); w.Code != 429 {
 		t.Fatal("global capacity not enforced", w.Code)
+	}
+	if w := call(h, edgeRequest("/api/resolve", "203.0.113.1")); w.Code != 429 {
+		t.Fatal("resolve global capacity not enforced", w.Code)
 	}
 	if w := call(h, edgeRequest("/api/platforms?schema_version=1.0", "192.0.2.1")); w.Code != 204 {
 		t.Fatal("catalog blocked by parsing", w.Code)
@@ -193,7 +231,7 @@ func TestAdmissionGlobalCapacityDoesNotRelaxClientProtection(t *testing.T) {
 			t.Fatal(w.Code)
 		}
 	}
-	if w := call(h, edgeRequest("/api/resolve", "192.0.2.1")); w.Code != 429 || w.Header().Get("Retry-After") != "5" {
+	if w := call(h, edgeRequest("/api/parse", "192.0.2.1")); w.Code != 429 || w.Header().Get("Retry-After") != "5" {
 		t.Fatal("client rate limit relaxed", w.Code, w.Header())
 	}
 	if a.public.active != 0 {

@@ -128,6 +128,7 @@ func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string
 		now:         time.Now,
 		stats:       st,
 		public:      newConfiguredPool(config.Parse, config.MaxClients),
+		resolve:     newConfiguredPool(config.Resolve, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
@@ -139,13 +140,13 @@ func WithAdmissionWithOwner(next, pullControl http.Handler, mode, edgeKey string
 }
 
 type admission struct {
-	next, pullControl                     http.Handler
-	edgeKey                               string
-	ownerAuth                             OwnerAuth
-	now                                   func() time.Time
-	stats                                 *Stats
-	public, slow, catalog, relay, reports *pool
-	owner                                 *ownerPool
+	next, pullControl                              http.Handler
+	edgeKey                                        string
+	ownerAuth                                      OwnerAuth
+	now                                            func() time.Time
+	stats                                          *Stats
+	public, resolve, slow, catalog, relay, reports *pool
+	owner                                          *ownerPool
 }
 
 func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -276,13 +277,28 @@ func (a *admission) selectPool(r *http.Request, kind route, path string) *pool {
 		}
 		return a.slow
 	case parser:
-		if r.Method == http.MethodGet && isSlowParsePlatform(a.parsePlatform(r.URL.RawQuery)) {
+		if r.Method != http.MethodGet {
+			return a.public
+		}
+		// Fresh cache hits do no upstream work; charge them like catalog reads.
+		if a.hasFreshCachedParse(path, r.URL.RawQuery) {
+			return a.catalog
+		}
+		if isSlowParsePlatform(a.parsePlatform(r.URL.RawQuery)) {
 			return a.slow
+		}
+		if path == "/api/resolve" {
+			return a.resolve
 		}
 		return a.public
 	default:
 		return a.public
 	}
+}
+
+func (a *admission) hasFreshCachedParse(path, rawQuery string) bool {
+	checker, ok := a.next.(interface{ HasFreshCachedParse(string, string) bool })
+	return ok && checker.HasFreshCachedParse(path, rawQuery)
 }
 
 func (a *admission) hasCachedYouTubeContext() bool {

@@ -90,7 +90,7 @@ func TestAdmissionRateAndContracts(t *testing.T) {
 	now := time.Unix(1000, 0)
 	entry := protected(t, "caddy", next)
 	entry.now = func() time.Time { return now }
-	paths := []string{"/api/parse", "/api/resolve", "/api/parse", "/api/bilibili"}
+	paths := []string{"/api/parse", "/api/parse", "/api/parse", "/api/bilibili"}
 	for _, path := range paths {
 		if got := call(entry, edgeRequest(path, "::ffff:198.51.100.11")); got.Code != 200 {
 			t.Fatalf("%s: %d", path, got.Code)
@@ -119,7 +119,7 @@ func TestAdmissionRateAndContracts(t *testing.T) {
 	}
 	check("/api/short_videos", 5, "解析请求过于频繁，请稍后重试")
 	now = now.Add(1500 * time.Millisecond)
-	check("/api/resolve", 4, "解析请求过于频繁，请稍后重试")
+	check("/api/parse", 4, "解析请求过于频繁，请稍后重试")
 	if w := call(entry, edgeRequest("/api/media/weibo", "198.51.100.11")); w.Code != 200 {
 		t.Fatalf("public exhausted relay: %d", w.Code)
 	}
@@ -289,10 +289,10 @@ func TestAdmissionFullStreamLeaseAndRelease(t *testing.T) {
 	}
 	p1 := hold("/api/parse", "192.0.2.1")
 	defer p1.Body.Close()
-	check("/api/resolve", "192.0.2.1", 429)
-	p2 := hold("/api/resolve", "192.0.2.2")
+	check("/api/parse", "192.0.2.1", 429)
+	p2 := hold("/api/parse", "192.0.2.2")
 	defer p2.Body.Close()
-	check("/api/resolve", "192.0.2.3", 429)
+	check("/api/parse", "192.0.2.3", 429)
 	m1 := hold("/api/media/weibo", "192.0.2.1")
 	defer m1.Body.Close()
 	m2 := hold("/api/media/weibo", "192.0.2.1")
@@ -300,7 +300,7 @@ func TestAdmissionFullStreamLeaseAndRelease(t *testing.T) {
 	check("/api/media/weibo", "192.0.2.2", 429)
 	stop(m1)
 	stop(p1)
-	check("/api/resolve?error", "192.0.2.1", 502)
+	check("/api/parse?error", "192.0.2.1", 502)
 	check("/api/parse", "192.0.2.1", 204)
 	check("/api/media/weibo", "192.0.2.1", 204)
 	stop(m2)
@@ -381,7 +381,7 @@ func TestPullControlIngressIsolation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("control request did not reach handler")
 	}
-	for _, path := range []string{"/api/parse", "/api/resolve", "/api/platforms", "/api/bilibili", "/api/parse", "/api/media/weibo"} {
+	for _, path := range []string{"/api/parse", "/api/parse", "/api/platforms", "/api/bilibili", "/api/parse", "/api/media/weibo"} {
 		if w := call(h, edgeRequest(path, from)); w.Code != 200 {
 			t.Fatalf("waiting control poll affected %s: %d", path, w.Code)
 		}
@@ -932,5 +932,299 @@ func TestAnonymousQueuedPoolsExtendAndResetWriteDeadline(t *testing.T) {
 	tcpResp.Body.Close()
 	if tcpResp.StatusCode != http.StatusOK || string(tcpBody) != `{"ok":true}` {
 		t.Fatalf("unexpected TCP response: status=%d body=%q", tcpResp.StatusCode, string(tcpBody))
+	}
+}
+
+func TestFreshCachedParseAndResolveRouteToCatalogPool(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Unix(1793448000, 0)
+
+	var biliCalls, xCalls, dyCalls atomic.Int32
+	adapters := map[string]Adapter{
+		"bilibili": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			biliCalls.Add(1)
+			return makeSyntheticEnvelope("bilibili", src, ts, "", "p1", "p2", "p3"), nil
+		}),
+		"x": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			xCalls.Add(1)
+			return makeSyntheticEnvelope("x", src, ts, "", "vid-1", "vid-2"), nil
+		}),
+		"douyin": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			dyCalls.Add(1)
+			return makeSyntheticEnvelope("douyin", src, ts, "", "dy-1"), nil
+		}),
+	}
+	h, err := New(c, adapters, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse.ClientBurst = 1
+	cfg.Parse.ClientRPS = 0.001
+	cfg.Parse.QueueWait = 0
+	cfg.Resolve.ClientBurst = 1
+	cfg.Resolve.ClientRPS = 0.001
+	cfg.Resolve.QueueWait = 0
+	cfg.SlowParse.ClientBurst = 1
+	cfg.SlowParse.ClientRPS = 0.001
+	cfg.SlowParse.QueueWait = 0
+	cfg.Catalog.ClientBurst = 25
+	cfg.Catalog.ClientRPS = 10
+
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	adm.now = func() time.Time { return now }
+
+	// 1. Fast platform: 1st /api/parse and /api/resolve spend the single Parse/Resolve token;
+	//    12+ subsequent fresh cache hits from the same IP succeed via Catalog with zero upstream calls.
+	const fastIP = "198.51.100.10"
+	const biliURL = "https://www.bilibili.com/video/BV1xx411c7mD"
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(biliURL), fastIP)); w.Code != http.StatusOK {
+		t.Fatalf("initial bilibili parse failed: %d %s", w.Code, w.Body.String())
+	}
+	biliAliases := []string{
+		"/api/parse?schema_version=1.0&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&platform=all&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&platform=bilibili&url=" + url.QueryEscape("HTTPS://WWW.BILIBILI.COM:443/video/BV1xx411c7mD#reply"),
+		"/api/parse?schema_version=1.0&url=" + url.QueryEscape("分享视频 "+biliURL+"！"),
+	}
+	for i := range 12 {
+		target := biliAliases[i%len(biliAliases)]
+		if w := call(entry, edgeRequest(target, fastIP)); w.Code != http.StatusOK {
+			t.Fatalf("cached bilibili parse #%d (%s) failed: %d %s", i+1, target, w.Code, w.Body.String())
+		}
+	}
+	if biliCalls.Load() != 1 {
+		t.Fatalf("expected 1 upstream bilibili parse call across 13 requests, got %d", biliCalls.Load())
+	}
+
+	resolveBili := "/api/resolve?schema_version=1.0&url=" + url.QueryEscape(biliURL) + "&item_id=p2"
+	if w := call(entry, edgeRequest(resolveBili, fastIP)); w.Code != http.StatusOK {
+		t.Fatalf("initial bilibili resolve failed: %d %s", w.Code, w.Body.String())
+	}
+	for i := range 12 {
+		if w := call(entry, edgeRequest(resolveBili, fastIP)); w.Code != http.StatusOK {
+			t.Fatalf("cached bilibili resolve #%d failed: %d %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	if biliCalls.Load() != 2 {
+		t.Fatalf("expected 2 total upstream bilibili calls (1 parse + 1 resolve), got %d", biliCalls.Load())
+	}
+
+	// 2. Slow platform (X): cached /api/parse and /api/resolve also route to Catalog,
+	//    even when SlowParse per-IP burst is exhausted AND SlowParse global concurrency is full!
+	const slowParseIP = "198.51.100.11"
+	const xURL = "https://x.com/user/status/1800000000000000001"
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(xURL), slowParseIP)); w.Code != http.StatusOK {
+		t.Fatalf("initial X parse failed: %d %s", w.Code, w.Body.String())
+	}
+	const slowResolveIP = "198.51.100.12"
+	resolveX := "/api/resolve?schema_version=1.0&url=" + url.QueryEscape(xURL) + "&item_id=vid-2"
+	if w := call(entry, edgeRequest(resolveX, slowResolveIP)); w.Code != http.StatusOK {
+		t.Fatalf("initial X resolve failed: %d %s", w.Code, w.Body.String())
+	}
+
+	var slowHolds []func()
+	for i := 0; i < cfg.SlowParse.GlobalConcurrency; i++ {
+		rel, retry := adm.slow.acquire(netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", 200+i)), now)
+		if retry != 0 {
+			t.Fatalf("hold slow slot %d: retry=%d", i, retry)
+		}
+		slowHolds = append(slowHolds, rel)
+	}
+	xAliases := []string{
+		"https://x.com/user/status/1800000000000000001",
+		"https://twitter.com/user/status/1800000000000000001",
+		"https://mobile.x.com/user/status/1800000000000000001",
+	}
+	for i := range 12 {
+		u := url.QueryEscape(xAliases[i%len(xAliases)])
+		if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+u, slowParseIP)); w.Code != http.StatusOK {
+			t.Fatalf("cached X parse #%d failed while SlowParse full: %d", i+1, w.Code)
+		}
+		if w := call(entry, edgeRequest("/api/resolve?schema_version=1.0&url="+u+"&item_id=vid-2", slowResolveIP)); w.Code != http.StatusOK {
+			t.Fatalf("cached X resolve #%d failed while SlowParse full: %d", i+1, w.Code)
+		}
+	}
+	for _, rel := range slowHolds {
+		rel()
+	}
+	if xCalls.Load() != 2 {
+		t.Fatalf("expected 2 total upstream X calls, got %d", xCalls.Load())
+	}
+
+	// 3. Pre-cache validation guards: invalid or uncached query variants against the
+	//    exact cached URL must NEVER masquerade as cache hits on Catalog (so with
+	//    fastIP's Parse=0 and Resolve=0 tokens, every one must hit 429).
+	nonCacheQueries := []string{
+		"/api/parse?schema_version=1.0&platform=douyin&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&platform=nonexistent&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&platform[]=bilibili&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=2.0&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version[]=1.0&url=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&url[]=" + url.QueryEscape(biliURL),
+		"/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.bilibili.com:8443/video/BV1xx411c7mD"),
+		"/api/parse?schema_version=1.0&debug=1&url=" + url.QueryEscape(biliURL),
+		"/api/resolve?schema_version=1.0&url=" + url.QueryEscape(biliURL),
+		"/api/resolve?schema_version=1.0&url=" + url.QueryEscape(biliURL) + "&item_id[]=p2",
+		"/api/resolve?schema_version=1.0&url=" + url.QueryEscape(biliURL) + "&item_id=" + strings.Repeat("a", 257),
+		"/api/resolve?schema_version=1.0&url=" + url.QueryEscape(biliURL) + "&item_id=p3",
+	}
+	for _, bad := range nonCacheQueries {
+		if w := call(entry, edgeRequest(bad, fastIP)); w.Code != http.StatusTooManyRequests {
+			t.Fatalf("invalid/uncached query %q masqueraded as cache hit (status=%d, want 429)", bad, w.Code)
+		}
+	}
+	postReq := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(biliURL), fastIP)
+	postReq.Method = http.MethodPost
+	if w := call(entry, postReq); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("POST to cached URL must not use Catalog pool (status=%d, want 429)", w.Code)
+	}
+	if h.HasFreshCachedParse("/api/parse", "schema_version=1.0&url="+url.QueryEscape("https://www.instagram.com/reel/C123456/")) {
+		t.Fatal("HasFreshCachedParse must be false when platform adapter is nil")
+	}
+
+	// 4. Expired cache entries stop using Catalog and charge Parse / Resolve / SlowParse again.
+	now = now.Add(defaultCacheTTL) // 60s * 0.001 RPS = 0.06 tokens (< 1, still rate-limited)
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(biliURL), fastIP)); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expired bilibili parse must charge Parse pool and hit 429, got %d", w.Code)
+	}
+	if w := call(entry, edgeRequest(resolveBili, fastIP)); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expired bilibili resolve must charge Resolve pool and hit 429, got %d", w.Code)
+	}
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(xURL), slowParseIP)); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expired X parse must charge SlowParse pool and hit 429, got %d", w.Code)
+	}
+	now = now.Add(1000 * time.Second) // refill 1 token
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(biliURL), fastIP)); w.Code != http.StatusOK || biliCalls.Load() != 3 {
+		t.Fatalf("refilled post-expiry parse failed: status=%d calls=%d", w.Code, biliCalls.Load())
+	}
+}
+
+func TestUncachedResolveUsesDedicatedResolvePoolWithoutTouchingParse(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Unix(1793448000, 0)
+
+	episodeIDs := make([]string, 13)
+	for i := range episodeIDs {
+		episodeIDs[i] = fmt.Sprintf("ep-%02d", i+1)
+	}
+
+	var holdConcurrent atomic.Bool
+	twoEntered := make(chan struct{})
+	releaseConcurrent := make(chan struct{})
+	var enteredCount atomic.Int32
+
+	adapters := map[string]Adapter{
+		"bilibili": AdapterFunc(func(ctx context.Context, src string, ts int64) (unified.Object, error) {
+			if holdConcurrent.Load() {
+				if enteredCount.Add(1) == 2 {
+					close(twoEntered)
+				}
+				select {
+				case <-releaseConcurrent:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return makeSyntheticEnvelope("bilibili", src, ts, "", episodeIDs...), nil
+		}),
+		"x": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("x", src, ts, "", "vid-1", "vid-2", "vid-3", "vid-4", "vid-5"), nil
+		}),
+	}
+	h, err := New(c, adapters, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := WithAdmission(h, nil, "caddy", testEdgeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	adm.now = func() time.Time { return now }
+
+	// 1. Visitor parses a 13-part Bilibili video (1 Parse token used; 3 Parse tokens left),
+	//    then resolves 12 uncached episodes back-to-back (Resolve.ClientBurst=12).
+	const visitorIP = "203.0.113.55"
+	const multiURL = "https://www.bilibili.com/video/BV1multiPart"
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(multiURL), visitorIP)); w.Code != http.StatusOK {
+		t.Fatalf("initial multi-P parse failed: %d %s", w.Code, w.Body.String())
+	}
+	for i := 0; i < 12; i++ {
+		target := "/api/resolve?schema_version=1.0&url=" + url.QueryEscape(multiURL) + "&item_id=" + episodeIDs[i]
+		if w := call(entry, edgeRequest(target, visitorIP)); w.Code != http.StatusOK {
+			t.Fatalf("uncached episode resolve #%d failed: %d %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	// 13th immediate uncached resolve exhausts Resolve.ClientBurst (12) -> 429 Retry-After: 2 (1 / 0.5 RPS).
+	w13 := call(entry, edgeRequest("/api/resolve?schema_version=1.0&url="+url.QueryEscape(multiURL)+"&item_id="+episodeIDs[12], visitorIP))
+	if w13.Code != http.StatusTooManyRequests || w13.Header().Get("Retry-After") != "2" {
+		t.Fatalf("13th immediate uncached resolve expected 429 Retry-After:2, got %d (%v)", w13.Code, w13.Header())
+	}
+
+	// Parse budget was untouched by the 13 /api/resolve requests: 3 more uncached /api/parse calls succeed.
+	for i := 1; i <= 3; i++ {
+		otherURL := fmt.Sprintf("https://www.bilibili.com/video/BV1other%02d", i)
+		if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(otherURL), visitorIP)); w.Code != http.StatusOK {
+			t.Fatalf("remaining Parse token #%d unexpectedly failed: %d", i, w.Code)
+		}
+	}
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/BV1other04"), visitorIP)); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th additional uncached parse expected 429, got %d", w.Code)
+	}
+
+	// 2. Resolve.ClientConcurrency = 2 allows 2 parallel uncached resolves from the same IP and rejects a 3rd.
+	const parallelIP = "203.0.113.56"
+	const parallelURL = "https://www.bilibili.com/video/BV1parallel"
+	holdConcurrent.Store(true)
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			target := "/api/resolve?schema_version=1.0&url=" + url.QueryEscape(parallelURL) + "&item_id=" + episodeIDs[idx]
+			codes[idx] = call(entry, edgeRequest(target, parallelIP)).Code
+		}(i)
+	}
+	select {
+	case <-twoEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("2 parallel /api/resolve requests from same IP did not enter concurrently")
+	}
+	if w3 := call(entry, edgeRequest("/api/resolve?schema_version=1.0&url="+url.QueryEscape(parallelURL)+"&item_id="+episodeIDs[2], parallelIP)); w3.Code != http.StatusTooManyRequests {
+		t.Fatalf("3rd parallel /api/resolve from same IP expected 429, got %d", w3.Code)
+	}
+	close(releaseConcurrent)
+	wg.Wait()
+	holdConcurrent.Store(false)
+	if codes[0] != http.StatusOK || codes[1] != http.StatusOK {
+		t.Fatalf("parallel /api/resolve statuses = %v, want [200 200]", codes)
+	}
+
+	// 3. Uncached slow-platform /api/resolve still routes to SlowParse (burst=4), NOT Resolve.
+	const slowIP = "203.0.113.57"
+	const slowXURL = "https://x.com/user/status/1800000000000000999"
+	for i := 1; i <= 4; i++ {
+		target := fmt.Sprintf("/api/resolve?schema_version=1.0&url=%s&item_id=vid-%d", url.QueryEscape(slowXURL), i)
+		if w := call(entry, edgeRequest(target, slowIP)); w.Code != http.StatusOK {
+			t.Fatalf("uncached slow X resolve #%d failed: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	wSlow5 := call(entry, edgeRequest("/api/resolve?schema_version=1.0&url="+url.QueryEscape(slowXURL)+"&item_id=vid-5", slowIP))
+	if wSlow5.Code != http.StatusTooManyRequests || wSlow5.Header().Get("Retry-After") != "5" {
+		t.Fatalf("5th uncached slow X resolve expected SlowParse 429 Retry-After:5, got %d (%v)", wSlow5.Code, wSlow5.Header())
+	}
+	adm.resolve.mu.Lock()
+	_, slowTrackedInResolve := adm.resolve.clients[netip.MustParseAddr(slowIP)]
+	adm.resolve.mu.Unlock()
+	if slowTrackedInResolve {
+		t.Fatal("slow-platform /api/resolve must route to SlowParse, not Resolve")
 	}
 }
