@@ -650,8 +650,10 @@
 !/backend/internal/platform/douyin/testdata/
 !/backend/internal/platform/douyin/video.go
 /backend/internal/platform/instagram/*
+!/backend/internal/platform/instagram/native.go
 !/backend/internal/platform/instagram/parser.go
 !/backend/internal/platform/instagram/parser_test.go
+!/backend/internal/platform/instagram/ytdlp.go
 /backend/internal/platform/kuaishou/*
 !/backend/internal/platform/kuaishou/baseline_test.go
 !/backend/internal/platform/kuaishou/formatter.go
