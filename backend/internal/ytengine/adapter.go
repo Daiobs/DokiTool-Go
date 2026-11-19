@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -276,6 +277,11 @@ func PopulateMissingMP4Sizes(ctx context.Context, info *Info, prober SizeProber,
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("ytengine: size probe goroutine panic recovered: panic_type=%T", recovered)
+				}
+			}()
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()

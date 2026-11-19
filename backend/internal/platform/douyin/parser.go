@@ -5,7 +5,9 @@ package douyin
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -145,7 +147,17 @@ func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Ob
 		defer cancelSh()
 		shCh = make(chan shanghaiOutcome, 1)
 		go func() {
+			var completed bool
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("douyin: shanghai goroutine panic recovered: panic_type=%T", recovered)
+					shCh <- shanghaiOutcome{err: errors.New("shanghai internal panic")}
+				} else if !completed {
+					shCh <- shanghaiOutcome{err: errors.New("shanghai internal panic")}
+				}
+			}()
 			work, err := workResolver.ResolveWork(shCtx, id)
+			completed = true
 			shCh <- shanghaiOutcome{work: work, err: err}
 		}()
 	}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -333,6 +334,7 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 		post     *nativePost
 		loginReq bool
 		ok       bool
+		err      error
 	}
 	var (
 		nativeCh        chan nativeFetchResult
@@ -347,7 +349,17 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 		supplementTimer = time.NewTimer(p.effectiveSupplementTimeout())
 		defer supplementTimer.Stop()
 		go func() {
+			var completed bool
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("instagram: native fetch goroutine panic recovered: panic_type=%T", recovered)
+					nativeCh <- nativeFetchResult{err: errors.New("instagram native fetch internal panic")}
+				} else if !completed {
+					nativeCh <- nativeFetchResult{err: errors.New("instagram native fetch internal panic")}
+				}
+			}()
 			post, loginReq, ok := p.fetchNativePost(nativeCtx, shortcode, false)
+			completed = true
 			nativeCh <- nativeFetchResult{post: post, loginReq: loginReq, ok: ok}
 		}()
 	}
@@ -393,7 +405,7 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 						if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(ctxErr, context.Canceled) {
 							return nil, ctxErr
 						}
-						if gotNative && res.ok && res.post != nil &&
+						if gotNative && res.err == nil && res.ok && res.post != nil &&
 							len(res.post.Items) > 1 && (res.post.hasImage() || len(res.post.Items) > len(ytItems)) {
 							if merged := p.buildNativeEnvelopeWithYTVideos(ctx, res.post, ytItems, shortcode, source, now); unified.Str(merged["code"]) == "OK" {
 								return merged, nil
@@ -422,7 +434,7 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 			select {
 			case res := <-nativeCh:
 				loginReq = res.loginReq
-				if res.ok && res.post != nil && len(res.post.Items) > 0 {
+				if res.err == nil && res.ok && res.post != nil && len(res.post.Items) > 0 {
 					if env := p.buildNativeEnvelope(ctx, res.post, shortcode, source, now); unified.Str(env["code"]) == "OK" {
 						nativeEnv = env
 						nativeOK = true

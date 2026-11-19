@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -371,7 +372,17 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	synCh := make(chan syndicationResult, 1)
 	fetcher := p.fetcher
 	go func() {
+		var completed bool
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("x: syndication goroutine panic recovered: panic_type=%T", recovered)
+				synCh <- syndicationResult{err: errors.New("x syndication internal panic")}
+			} else if !completed {
+				synCh <- syndicationResult{err: errors.New("x syndication internal panic")}
+			}
+		}()
 		st, synErr := fetchSyndicationTweet(synCtx, fetcher, tweetID)
+		completed = true
 		synCh <- syndicationResult{tweet: st, err: synErr}
 	}()
 
@@ -414,7 +425,17 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	ytCh := make(chan ytExtractResult, 1)
 	engine := p.engine
 	go func() {
+		var completed bool
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("x: ytdlp goroutine panic recovered: panic_type=%T", recovered)
+				ytCh <- ytExtractResult{err: errors.New("x ytdlp internal panic")}
+			} else if !completed {
+				ytCh <- ytExtractResult{err: errors.New("x ytdlp internal panic")}
+			}
+		}()
 		info, ytErr := engine.Extract(ytCtx, canonicalURL)
+		completed = true
 		ytCh <- ytExtractResult{info: info, err: ytErr}
 	}()
 

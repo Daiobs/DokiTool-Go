@@ -1,10 +1,13 @@
 package douyin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -393,5 +396,104 @@ func TestFetchShanghaiDetailExtractsBitRateVIDAndFiltersHosts(t *testing.T) {
 	wantV26Luna := strings.Replace(v26Web, "://v26-web.douyinvod.com", "://v26-luna.douyinvod.com", 1)
 	if len(urls) != 2 || urls[0] != wantV26Luna || urls[1] != v11Weba {
 		t.Fatalf("unexpected extracted URLs (want v26-luna + v11-weba only): %#v", urls)
+	}
+}
+
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestShanghaiResolveWorkPanicRecoversAndFallsBackImmediately(t *testing.T) {
+	var logBuf lockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	const (
+		workID = "7704056737233449610"
+		vid    = "v0200fg10000dbl4sn7og65ijmfp8hm0"
+		ov1080 = "https://v3-dy-ov.zjcdn.com/11111111111111111111111111111111/6a000001/video/tos/cn/tos-cn-v-0015/o1080/?a=6383&mime_type=video_mp4"
+	)
+	videoDetailJSON := `{"status_code":0,"aweme_detail":{"aweme_id":"` + workID + `","video":{"duration":10000,"play_addr":{"uri":"` + vid + `"},"bit_rate":[{"gear_name":"normal_1080_0","format":"mp4","bit_rate":2000000,"play_addr":{"uri":"` + vid + `","file_hash":"h1","width":1920,"height":1080,"data_size":2500000,"url_list":["` + ov1080 + `"]}}]}}}`
+
+	plainExec := executorFunc(func(context.Context, fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: 200, Body: []byte(videoDetailJSON)}, nil
+	})
+	japanBaseline, err := NewWithOriginalResolver(plainExec, nil, mockWorkResolver{
+		workFn: func(context.Context, string) (*ShanghaiWork, error) {
+			return nil, errors.New("shanghai unavailable")
+		},
+	}).Parse(context.Background(), "https://www.douyin.com/video/"+workID, 1800000000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	got, err := NewWithOriginalResolver(plainExec, nil, mockWorkResolver{
+		workFn: func(context.Context, string) (*ShanghaiWork, error) {
+			panic(errors.New("secret-dy-token-https://internal.example/leak?sig=dysecret"))
+		},
+	}).Parse(ctx, "https://www.douyin.com/video/"+workID, 1800000000)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Parse failed after Shanghai panic: %v", err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("Parse blocked for %v after Shanghai panic; expected immediate fallback", elapsed)
+	}
+	if !unified.Equal(got, japanBaseline) {
+		t.Fatalf("Shanghai panic altered Japan fallback result: got=%#v want=%#v", got, japanBaseline)
+	}
+
+	// Album path (parent cancels Shanghai without reading shCh): panicking goroutine still recovers without leaking/blocking.
+	albumJSON := `{"status_code":0,"aweme_detail":{"aweme_id":"` + workID + `","images":[{"url_list":["https://p3-sign.douyinpic.com/img1.jpeg"]}]}}`
+	albumExec := executorFunc(func(context.Context, fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: 200, Body: []byte(albumJSON)}, nil
+	})
+	albumPanicDone := make(chan struct{})
+	albumGot, err := NewWithOriginalResolver(albumExec, nil, mockWorkResolver{
+		workFn: func(shCtx context.Context, _ string) (*ShanghaiWork, error) {
+			defer close(albumPanicDone)
+			<-shCtx.Done()
+			panic("secret-dy-token-album")
+		},
+	}).Parse(ctx, "https://www.douyin.com/note/"+workID, 1800000000)
+	if err != nil || unified.Str(albumGot["code"]) != "OK" {
+		t.Fatalf("album Parse failed when Shanghai goroutine panicked after cancel: env=%#v err=%v", albumGot, err)
+	}
+	select {
+	case <-albumPanicDone:
+	case <-time.After(time.Second):
+		t.Fatal("album Shanghai goroutine did not exit promptly")
+	}
+	// Give defer recover() a brief moment on the unawaited album goroutine before inspecting logs.
+	for i := 0; i < 50 && strings.Count(logBuf.String(), "douyin: shanghai goroutine panic recovered: panic_type=") < 2; i++ {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	logged := logBuf.String()
+	if strings.Count(logged, "douyin: shanghai goroutine panic recovered: panic_type=") != 2 {
+		t.Fatalf("expected 2 sanitized panic recovery logs, got %q", logged)
+	}
+	for _, forbidden := range []string{"secret-dy-token", "dysecret", "internal.example"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
+		}
 	}
 }
