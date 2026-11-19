@@ -2546,7 +2546,7 @@ test('tbvideo manual fallback on pipigx and zuiyou allows a fresh main-button at
   }
 });
 
-test('toutiaovod native attachment handoff uses isolated noopener/no-referrer link without reading cross-origin bytes and names MP4s as .mp4', async () => {
+test('toutiaovod delivery presents honest manual 打开源链接 state without fake handed-off or cross-origin fetch and names MP4s as .mp4', async () => {
   clicked = [];
   fetched = [];
   const toutiaoUrl =
@@ -2578,10 +2578,15 @@ test('toutiaovod native attachment handoff uses isolated noopener/no-referrer li
   await settled(hToutiao.store.downloads[0]);
   assert.equal(fetched.length, 0, 'toutiaovod must never trigger JS/SW cross-origin fetch');
   assert.equal(hToutiao.store.downloads.length, 1);
-  assert.equal(hToutiao.store.downloads[0].status, 'handed-off');
-  assert.equal(hToutiao.store.downloads[0].statusText, '已交给浏览器');
-  assert.equal(hToutiao.store.downloads[0].transport, 'browser_native');
+  assert.equal(hToutiao.store.downloads[0].status, 'manual');
+  assert.equal(hToutiao.store.downloads[0].statusText, '打开源链接');
+  assert.equal(hToutiao.store.downloads[0].transport, undefined);
+  assert.equal(hToutiao.store.downloads[0].nativeAvailable, true);
   assert.equal(hToutiao.store.downloads[0].filename, '南大光电重大突破.mp4');
+  assert.ok(
+    hToutiao.toasts.some(([msg]) => msg.includes('因头条 CDN 限制跨域直下') && msg.includes('视频另存为')),
+    'must toast clear right-click / long-press save guidance',
+  );
   assert.equal(clicked.length, 1);
   assert.equal(clicked[0].href, toutiaoUrl);
   assert.equal(clicked[0].filename, '南大光电重大突破.mp4');
@@ -2589,7 +2594,19 @@ test('toutiaovod native attachment handoff uses isolated noopener/no-referrer li
   assert.equal(clicked[0].rel, 'noopener noreferrer');
   assert.equal(clicked[0].referrerPolicy, 'no-referrer');
 
-  // Popup-blocked fallback transitions cleanly to manual ("打开源链接") while keeping .mp4 filename
+  const cardHtml = await renderToString(createSSRApp({ render: () => h(DownloadCard, { downloads: hToutiao.store.downloads }) }));
+  assert.ok(cardHtml.includes('打开源链接'), 'manual card must expose 打开源链接 action');
+  assert.ok(!cardHtml.includes('已交给浏览器'), 'toutiaovod card must never falsely claim 已交给浏览器');
+
+  // Clicking 打开源链接 on the card re-opens the isolated tab while keeping honest manual state
+  hToutiao.instance.handleBrowserDownload(hToutiao.store.downloads[0].id);
+  assert.equal(hToutiao.store.downloads[0].status, 'manual');
+  assert.equal(hToutiao.store.downloads[0].statusText, '打开源链接');
+  assert.equal(clicked.length, 2);
+  assert.equal(clicked[1].href, toutiaoUrl);
+
+  // Popup-blocked fallback also settles cleanly in manual ("打开源链接") while keeping .mp4 filename
+  clicked = [];
   const blockClick = (e) => e.preventDefault();
   globalThis.document.addEventListener('click', blockClick);
   try {
@@ -2601,9 +2618,13 @@ test('toutiaovod native attachment handoff uses isolated noopener/no-referrer li
     });
     await hBlocked.instance.downloadMainVideo();
     await settled(hBlocked.store.downloads[0]);
+    assert.equal(clicked.length, 0);
     assert.equal(hBlocked.store.downloads[0].status, 'manual');
     assert.equal(hBlocked.store.downloads[0].statusText, '打开源链接');
     assert.equal(hBlocked.store.downloads[0].filename, '南大光电重大突破.mp4');
+    assert.ok(
+      hBlocked.toasts.some(([msg]) => msg.includes('打开源链接') && msg.includes('视频另存为')),
+    );
   } finally {
     globalThis.document.removeEventListener('click', blockClick);
   }

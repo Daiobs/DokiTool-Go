@@ -21,8 +21,8 @@ const formatElapsed = (elapsed) => {
   const seconds = Math.floor(rawSeconds)
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
 }
-const getStatusColor = (status) => ({ downloading: 'text-blue-500', completed: 'text-green-500', failed: 'text-red-500', cancelled: 'text-gray-500', 'handed-off': 'text-blue-500' }[status] || 'text-slate-500')
-const getStatusIcon = (status) => ({ downloading: 'fa-spinner fa-spin', completed: 'fa-check-circle', failed: 'fa-exclamation-circle', cancelled: 'fa-times-circle', 'handed-off': 'fa-external-link-alt' }[status] || 'fa-hourglass-half')
+const getStatusColor = (status) => ({ downloading: 'text-blue-500', completed: 'text-green-500', failed: 'text-red-500', cancelled: 'text-gray-500', 'handed-off': 'text-blue-500', manual: 'text-amber-600 dark:text-amber-400' }[status] || 'text-slate-500')
+const getStatusIcon = (status) => ({ downloading: 'fa-spinner fa-spin', completed: 'fa-check-circle', failed: 'fa-exclamation-circle', cancelled: 'fa-times-circle', 'handed-off': 'fa-external-link-alt', manual: 'fa-external-link-alt' }[status] || 'fa-hourglass-half')
 const observationText = (item) => item.recoveryExpired ? '结果未确认' : item.observation === 'unknown' ? '暂时无法获取进度' : item.observation === 'stalled' ? '传输暂无进展，可等待或取消' : ''
 const isActive = (item) => !item.recoveryExpired && (['queued', 'preparing', 'downloading'].includes(item.status) || item.observation === 'unknown')
 const isSettled = (item) => (item.transport === 'browser_streaming' && item.observation === 'unknown' && item.ownerGone === true && item.recoveryExpired === true)
@@ -37,7 +37,7 @@ const summary = computed(() => activeCount.value
   ? `${activeCount.value} 个进行中${settledCount.value ? ` · 已结束 ${settledCount.value}` : ''}`
   : [outcomeSummary.value, props.downloads.some(item => item.recoveryExpired) ? `未确认 ${props.downloads.filter(item => item.recoveryExpired).length}` : ''].filter(Boolean).join(' · ') || '下载记录')
 const statusText = (item) => observationText(item) || (item.status === 'completed' ? '传输完成' : item.statusText)
-  || ({ queued: '排队中', preparing: '准备下载', downloading: '下载中…', failed: '下载失败', cancelled: '已取消', interrupted: '下载连接已中断', 'handed-off': '已交给浏览器' }[item.status] || item.status)
+  || ({ queued: '排队中', preparing: '准备下载', downloading: '下载中…', failed: '下载失败', cancelled: '已取消', interrupted: '下载连接已中断', 'handed-off': '已交给浏览器', manual: '打开源链接' }[item.status] || item.status)
 const hostOf = (item) => {
   try {
     const u = typeof item?.url === 'string' && new URL(item.url)
@@ -90,7 +90,7 @@ onMounted(() => {
     if (saved) expanded.value = saved === 'expanded'
   } catch { /* Private browsing must not disable the panel. */ }
 })
-watch(() => props.downloads.filter(isActive).map(item => item.id), (ids, previous) => {
+watch(() => props.downloads.filter(item => isActive(item) || item.status === 'manual').map(item => item.id), (ids, previous) => {
   if (!manuallyCollapsed.value && ids.some(id => !previous.includes(id))) expanded.value = true
 })
 watch(() => props.downloads.length, (count) => {
@@ -231,6 +231,9 @@ onBeforeUnmount(stopCollapseTimer)
             </div>
             <div v-if="item.status === 'handed-off'" class="text-xs text-slate-500 mt-2">
               请在浏览器下载列表确认进度和结果，本站无法追踪。
+            </div>
+            <div v-if="item.status === 'manual'" class="text-xs text-slate-500 mt-2">
+              请点击「打开源链接」，在新标签页右键选择「视频另存为」（手机端长按保存）。
             </div>
             <div v-if="isDebug() && item.timing" class="mt-2 text-xs">
               <button type="button" @click="toggleTiming(item.id)" :aria-expanded="timingId === item.id"
