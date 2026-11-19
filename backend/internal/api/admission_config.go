@@ -1,8 +1,6 @@
 package api
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -62,7 +61,7 @@ func NewOwnerAuth(token string) (OwnerAuth, error) {
 	}
 	return OwnerAuth{
 		enabled: true,
-		digest:  sha256.Sum256([]byte(token)),
+		digest:  bearer.Digest(token),
 	}, nil
 }
 
@@ -91,28 +90,7 @@ func (o OwnerAuth) GoString() string {
 }
 
 func (o OwnerAuth) verifyHeader(values []string) bool {
-	if len(values) != 1 {
-		return false
-	}
-	raw := values[0]
-	if len(raw) > MaxOwnerAuthHeaderBytes {
-		return false
-	}
-	const bearerPrefix = "Bearer "
-	if !strings.HasPrefix(raw, bearerPrefix) {
-		return false
-	}
-	candidate := raw[len(bearerPrefix):]
-	if candidate == "" {
-		return false
-	}
-	for i := 0; i < len(candidate); i++ {
-		if candidate[i] < 33 || candidate[i] > 126 {
-			return false
-		}
-	}
-	sum := sha256.Sum256([]byte(candidate))
-	match := subtle.ConstantTimeCompare(sum[:], o.digest[:]) == 1
+	match := bearer.VerifyHeader(values, o.digest, MaxOwnerAuthHeaderBytes)
 	return o.enabled && match
 }
 

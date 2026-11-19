@@ -115,6 +115,7 @@
 !/backend/docs/视频解析统一JSON格式3.0.md
 /backend/internal/*
 !/backend/internal/api/
+!/backend/internal/bearer/
 !/backend/internal/catalog/
 !/backend/internal/fetch/
 !/backend/internal/index.php
@@ -379,6 +380,9 @@
 !/backend/internal/api/xiaohongshu_test.go
 !/backend/internal/api/youtube_helper_test.go
 !/backend/internal/api/zuiyou_http_test.go
+/backend/internal/bearer/*
+!/backend/internal/bearer/bearer.go
+!/backend/internal/bearer/bearer_test.go
 /backend/internal/catalog/*
 !/backend/internal/catalog/catalog.go
 !/backend/internal/catalog/catalog_test.go

@@ -69,6 +69,8 @@
     "backend/internal/api/xiaohongshu_test.go",
     "backend/internal/api/youtube_helper_test.go",
     "backend/internal/api/zuiyou_http_test.go",
+    "backend/internal/bearer/bearer.go",
+    "backend/internal/bearer/bearer_test.go",
     "backend/internal/catalog/catalog.go",
     "backend/internal/catalog/catalog_test.go",
     "backend/internal/fetch/auto_referer_test.go",
