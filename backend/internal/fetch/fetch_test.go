@@ -281,6 +281,7 @@ func newPoolTestServer(t *testing.T, useTLS bool, names []string, handler http.H
 		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
 		MinVersion:   tls.VersionTLS12,
 	}
+	server.EnableHTTP2 = true
 	server.StartTLS()
 	t.Cleanup(server.Close)
 	return server, roots, stats
@@ -301,8 +302,8 @@ func TestKeepAlivePoolReusesSingleConnection(t *testing.T) {
 				if useTLS && (r.TLS == nil || (r.TLS.ServerName != "api.example.test" && r.TLS.ServerName != "cdn.example.test")) {
 					t.Errorf("unexpected TLS SNI: %+v", r.TLS)
 				}
-				if r.ProtoMajor != 1 {
-					t.Errorf("expected HTTP/1.1 pooled transport, got %s", r.Proto)
+				if wantMajor := map[bool]int{false: 1, true: 2}[useTLS]; r.ProtoMajor != wantMajor {
+					t.Errorf("expected HTTP/%d pooled transport, got %s", wantMajor, r.Proto)
 				}
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusOK)
@@ -583,8 +584,14 @@ func TestKeepAlivePoolMidBodyCancellationAbortsPromptlyAndRecovers(t *testing.T)
 					t.Fatalf("post-cancel recovery call %d failed: %+v %v", i+1, res, err)
 				}
 			}
-			if stats.stateNew.Load() != 2 {
-				t.Fatalf("expected 1 fresh socket reused across post-cancel requests (StateNew=2), got %d", stats.stateNew.Load())
+			// HTTP/1.1 must drop the poisoned socket and dial once more; h2 only
+			// resets the cancelled stream and keeps multiplexing the same socket.
+			wantNew := int32(2)
+			if useTLS {
+				wantNew = 1
+			}
+			if got := stats.stateNew.Load(); got != wantNew {
+				t.Fatalf("expected StateNew=%d after post-cancel recovery, got %d", wantNew, got)
 			}
 		})
 	}

@@ -500,10 +500,13 @@ func (c *Client) newPooledTransport(lowerHost, port string, verifiedIP netip.Add
 		return conn, nil
 	}
 	return &http.Transport{
-		Proxy:                  nil,
-		DisableCompression:     true,
-		DisableKeepAlives:      false,
-		ForceAttemptHTTP2:      false,
+		Proxy:              nil,
+		DisableCompression: true,
+		DisableKeepAlives:  false,
+		// Keep ALPN h2 offered like the pre-pool transport did: a custom
+		// DialContext/TLSClientConfig would otherwise silently downgrade every
+		// non-strict request to HTTP/1.1 and change the upstream fingerprint.
+		ForceAttemptHTTP2:      true,
 		MaxIdleConns:           2,
 		MaxIdleConnsPerHost:    2,
 		IdleConnTimeout:        25 * time.Second,
