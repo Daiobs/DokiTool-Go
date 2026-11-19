@@ -44,8 +44,6 @@ func AllowedAPIURL(raw string) bool {
 		(u.EscapedPath() == "/x/web-interface/view" || u.EscapedPath() == "/x/player/playurl")
 }
 
-func allowedAPIURL(raw string) bool { return AllowedAPIURL(raw) }
-
 func shareRequest(raw string) fetch.Request {
 	return fetch.Request{URL: raw, Method: http.MethodHead, Header: http.Header{"User-Agent": {""}},
 		Policy: fetch.Policy{Purpose: "bilibili-share", AllowedURL: allowedShareURL, Timeout: 10 * time.Second, MaxBytes: 1, FollowRedirects: true, MaxRedirects: 5}}
@@ -67,7 +65,7 @@ func playRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
 
 func apiRequest(purpose, raw string, timeout time.Duration) fetch.Request {
 	return fetch.Request{URL: raw, Method: http.MethodGet, Header: http.Header{"User-Agent": {""}, "Accept-Encoding": {"gzip,deflate"}},
-		Policy: fetch.Policy{Purpose: purpose, AllowedURL: allowedAPIURL, Timeout: timeout, MaxBytes: 8 << 20}}
+		Policy: fetch.Policy{Purpose: purpose, AllowedURL: AllowedAPIURL, Timeout: timeout, MaxBytes: 8 << 20}}
 }
 
 func remaining(ctx context.Context, maximum time.Duration) time.Duration {

@@ -72,7 +72,7 @@ printf 'artifact_directory=%s\n' "$OUT"
 | 精确微博 relay | 12 / 24 | 每秒 1 / 2 | 2 / 12 |
 | tbvideo 结果上报 | 10 / 60 | 每秒 1 / 5 | 2 / 16 |
 
-四池独立，按可信 IPv4 地址或 IPv6 /64 分组；目录请求不再占用解析名额。并发租约持有至处理返回，含流式传输、错误和取消。过载返回 429 和 `Retry-After`。每池默认最多记录 4096 个客户。表满时仅回收无在途且令牌已经补满的条目；活动请求和仍欠额度的客户不被驱逐。限额在单进程内共享；重启会重置短期令牌，不能并行运行多份面向同一站点的实例。在入口代理前还有 CDN 时，须另行验证可信客户端地址链；直接采用客户端提交的 XFF 不满足上述要求。
+四池独立（该表记录早期四池迁移基线；后续版本已将按需分集解析 `/api/resolve`、海外慢解析平台以及命中进程内新鲜缓存的解析请求拆分至独立池，完整现行配置见 [../CONFIGURATION.md](../CONFIGURATION.md)），按可信 IPv4 地址或 IPv6 /64 分组；目录请求不再占用解析名额。并发租约持有至处理返回，含流式传输、错误和取消。过载返回 429 和 `Retry-After`。每池默认最多记录 4096 个客户。表满时仅回收无在途且令牌已经补满的条目；活动请求和仍欠额度的客户不被驱逐。限额在单进程内共享；重启会重置短期令牌，不能并行运行多份面向同一站点的实例。在入口代理前还有 CDN 时，须另行验证可信客户端地址链；直接采用客户端提交的 XFF 不满足上述要求。
 
 ### 可配置的生产容量
 
@@ -80,9 +80,12 @@ printf 'artifact_directory=%s\n' "$OUT"
 每个池分别配置单客户防刷和全局容量；不使用一个全站固定的两并发上限。
 环境变量在日本 Go 启动时读取，修改后按现有流程重启，无需重新编译。
 
-前缀为 `DOKITOOL_PARSE_`、`DOKITOOL_CATALOG_`、`DOKITOOL_WEIBO_`、
-`DOKITOOL_REPORT_`，均支持 `CLIENT_BURST`、`CLIENT_RPS`、
-`CLIENT_CONCURRENCY`、`GLOBAL_BURST`、`GLOBAL_RPS`、`GLOBAL_CONCURRENCY`。
+前缀为 `DOKITOOL_PARSE_`、`DOKITOOL_RESOLVE_`、`DOKITOOL_PARSE_SLOW_`、
+`DOKITOOL_CATALOG_`、`DOKITOOL_WEIBO_`、`DOKITOOL_REPORT_`，均支持
+`CLIENT_BURST`、`CLIENT_RPS`、`CLIENT_CONCURRENCY`、`GLOBAL_BURST`、
+`GLOBAL_RPS`、`GLOBAL_CONCURRENCY`（其中 `DOKITOOL_PARSE_`、
+`DOKITOOL_RESOLVE_`、`DOKITOOL_PARSE_SLOW_` 另支持 `QUEUE_WAIT` 与
+`QUEUE_SIZE`；个人 Agent 独立通道另由 `DOKITOOL_OWNER_*` 配置）。
 RPS 为每秒补充令牌数（允许小数）；并发和令牌速率分别生效。
 例如 `DOKITOOL_PARSE_GLOBAL_CONCURRENCY=32`、`DOKITOOL_PARSE_GLOBAL_RPS=20`
 可单独调整服务容量，而不放宽单 IP 限额。不能把它当作实测每秒完成 20 次解析的保证。

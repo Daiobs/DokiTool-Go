@@ -2,28 +2,23 @@ package xiaohongshu
 
 import (
 	"context"
-	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 var mediaPath = regexp.MustCompile(`^/[A-Za-z0-9_/-]+$`)
 
 func AllowedMediaURL(raw string) bool {
-	if len(raw) > 8192 || strings.Contains(raw, "#") || unified.MediaURL(raw) == "" {
+	if len(raw) > 8192 || strings.Contains(raw, "#") || urlpolicy.HasUnsafeChars(raw) || unified.MediaURL(raw) == "" {
 		return false
 	}
-	for _, r := range raw {
-		if r <= 0x20 || r == 0x7f || r == '\\' {
-			return false
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" || u.Scheme != "https" || (u.Port() != "" && u.Port() != "443") || !mediaPath.MatchString(u.EscapedPath()) || strings.Contains(u.EscapedPath(), "..") {
+	u, ok := urlpolicy.ParseCanonicalURL(raw, urlpolicy.HTTPSOnly)
+	if !ok || !mediaPath.MatchString(u.EscapedPath()) || strings.Contains(u.EscapedPath(), "..") {
 		return false
 	}
 	switch u.Hostname() {

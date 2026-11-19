@@ -54,15 +54,6 @@ func classify(path string) route {
 	}
 }
 
-func isSlowParsePlatform(platform string) bool {
-	switch platform {
-	case "x", "youtube", "instagram", "facebook", "tumblr", "dailymotion":
-		return true
-	default:
-		return false
-	}
-}
-
 const clientHeader = "X-DokiTool-Client-IP"
 const edgeHeader = "X-DokiTool-Edge-Key"
 const serverWriteWindow = 50 * time.Second
@@ -284,7 +275,7 @@ func (a *admission) selectPool(r *http.Request, kind route, path string) *pool {
 		if a.hasFreshCachedParse(path, r.URL.RawQuery) {
 			return a.catalog
 		}
-		if isSlowParsePlatform(a.parsePlatform(r.URL.RawQuery)) {
+		if traitsForPlatform(a.parsePlatform(r.URL.RawQuery)).slowEngine {
 			return a.slow
 		}
 		if path == "/api/resolve" {

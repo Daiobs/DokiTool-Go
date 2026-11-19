@@ -2,8 +2,6 @@ package shresolver
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
@@ -135,7 +134,7 @@ func newBearerAuth(token string) (bearerAuth, error) {
 	}
 	return bearerAuth{
 		enabled: true,
-		digest:  sha256.Sum256([]byte(token)),
+		digest:  bearer.Digest(token),
 	}, nil
 }
 
@@ -151,23 +150,7 @@ func (a bearerAuth) GoString() string {
 }
 
 func (a bearerAuth) verifyHeader(values []string) bool {
-	if !a.enabled || len(values) != 1 {
-		return false
-	}
-	raw := values[0]
-	if len(raw) > maxBearerAuthHeaderBytes {
-		return false
-	}
-	const bearerPrefix = "Bearer "
-	if !strings.HasPrefix(raw, bearerPrefix) {
-		return false
-	}
-	candidate := raw[len(bearerPrefix):]
-	if candidate == "" {
-		return false
-	}
-	sum := sha256.Sum256([]byte(candidate))
-	match := subtle.ConstantTimeCompare(sum[:], a.digest[:]) == 1
+	match := bearer.VerifyHeader(values, a.digest, maxBearerAuthHeaderBytes)
 	return a.enabled && match
 }
 

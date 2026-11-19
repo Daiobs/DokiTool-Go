@@ -21,24 +21,17 @@ import (
 //go:embed unified-v1.generated.schema.json
 var embeddedSchema []byte
 
-var (
-	embeddedAuditOnce sync.Once
-	schemaDocument    Object
-)
+var schemaDocument Object
 
-func init() { ensureEmbeddedSchema() }
-
-func ensureEmbeddedSchema() {
-	embeddedAuditOnce.Do(func() {
-		schema, err := Decode(embeddedSchema)
-		if err != nil {
-			panic("invalid embedded unified-v1 schema: " + err.Error())
-		}
-		if err := ValidateSchemaDefinition(schema); err != nil {
-			panic("unsupported embedded unified-v1 schema: " + err.Error())
-		}
-		schemaDocument = schema
-	})
+func init() {
+	schema, err := Decode(embeddedSchema)
+	if err != nil {
+		panic("invalid embedded unified-v1 schema: " + err.Error())
+	}
+	if err := ValidateSchemaDefinition(schema); err != nil {
+		panic("unsupported embedded unified-v1 schema: " + err.Error())
+	}
+	schemaDocument = schema
 }
 
 func SchemaBytes() []byte { return append([]byte(nil), embeddedSchema...) }
@@ -46,7 +39,6 @@ func SchemaBytes() []byte { return append([]byte(nil), embeddedSchema...) }
 // ValidateStructure implements the keywords used by the canonical schema.
 // Independent Draft 2020-12 validation remains an external acceptance check.
 func ValidateStructure(value any) error {
-	ensureEmbeddedSchema()
 	return validateNode(value, schemaDocument, "$", false)
 }
 

@@ -92,7 +92,7 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 当服务端启用 `DOKITOOL_YOUTUBE_HELPER` 且 Deno 与 `yt-dlp-ejs` 脚本通过启动期 SHA-256 校验时，开放以下同源协作接口（服务端全程只访问 `https://www.youtube.com` 获取播放器脚本，绝不请求 `*.googlevideo.com`）：
 
 1. **`GET /api/youtube/context?schema_version=1.0`**
-   - 内存缓存命中未过期播放器上下文时走 `CATALOG` 准入池，缓存未命中触发刷新时走 `PARSE` 准入池（播放器缓存默认有效期 6 小时，刷新失败时允许最多 1 小时陈旧回退）。
+   - 内存缓存命中未过期播放器上下文时走 `CATALOG` 准入池，缓存未命中触发刷新时走 `PARSE_SLOW` 准入池（播放器缓存默认有效期 6 小时，刷新失败时允许最多 1 小时陈旧回退）。
    - 成功返回 HTTP `200`：
      ```json
      {
@@ -107,7 +107,7 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
      }
      ```
 2. **`POST /api/youtube/finalize?schema_version=1.0`**（可选 `&debug=1`）
-   - 走 `PARSE` 准入池；请求体上限为 **`512 KiB`**，`formats` 与 `adaptiveFormats` 条目总数上限为 **`64`**。
+   - 走 `PARSE_SLOW` 准入池；请求体上限为 **`512 KiB`**，`formats` 与 `adaptiveFormats` 条目总数上限为 **`64`**。
    - 请求 JSON 字段：`video_id`（11 位视频 ID）、`player_id`（8 位十六进制播放器 ID）、可选元数据（`title`、`author`、`duration_seconds`、`thumbnail`）以及客户端从 `www.youtube.com` 取回的 `formats` / `adaptiveFormats` 数组。
    - 服务端在零权限 Deno 沙箱中批量解算 `s` / `n` 挑战参数，严格校验生成的直链必须为 `https://*.googlevideo.com/videoplayback`（无凭据、无自定义端口、无片段锚点），最终返回标准统一媒体 v1 响应（`extra.youtube_helper.status = "ready"`）。
 

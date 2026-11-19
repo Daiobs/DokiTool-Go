@@ -96,11 +96,6 @@ func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *Shanghai
 	return data, matchedShanghai
 }
 
-func variants(raw object, bvid string, page int64, cid any, now int64) array {
-	out, _ := variantsWithShanghai(raw, bvid, page, cid, now, nil)
-	return out
-}
-
 func variantsWithShanghai(raw object, bvid string, page int64, cid any, now int64, shPlay *ShanghaiPlay) (array, bool) {
 	if shPlay != nil {
 		if cidInt, ok := parsePositiveCID(cid); !ok || shPlay.BVID != bvid || shPlay.CID != cidInt {

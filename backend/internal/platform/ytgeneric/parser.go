@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
-	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -92,18 +92,6 @@ func (s SiteSpec) CatalogEntry() unified.Object {
 	return entry
 }
 
-func hostMatchesRule(host, rule string) bool {
-	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	r := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rule), "."))
-	if h == "" || r == "" {
-		return false
-	}
-	if strings.HasPrefix(r, ".") {
-		return strings.HasSuffix(h, r) && len(h) > len(r)
-	}
-	return h == r
-}
-
 // Parser implements api.Adapter for any SiteSpec using the shared ytengine pipeline.
 type Parser struct {
 	spec       SiteSpec
@@ -151,17 +139,17 @@ func (p *Parser) AllowedOutboundHost(host string) bool {
 		return false
 	}
 	for _, allowed := range p.spec.InputHosts {
-		if hostMatchesRule(h, allowed) {
+		if urlpolicy.MatchHostRule(h, allowed) {
 			return true
 		}
 	}
 	for _, allowed := range p.spec.OutboundHosts {
-		if hostMatchesRule(h, allowed) {
+		if urlpolicy.MatchHostRule(h, allowed) {
 			return true
 		}
 	}
 	for _, suffix := range p.spec.MediaHostSuffix {
-		if hostMatchesRule(h, suffix) {
+		if urlpolicy.MatchHostRule(h, suffix) {
 			return true
 		}
 	}
@@ -190,56 +178,15 @@ func (p *Parser) verifyPublicHost(ctx context.Context, host string) bool {
 
 const defaultInputDNSTimeout = 5 * time.Second
 
-func (p *Parser) matchMediaHost(host string) bool {
-	if p == nil || len(p.spec.MediaHostSuffix) == 0 {
-		return false
-	}
-	for _, suffix := range p.spec.MediaHostSuffix {
-		if hostMatchesRule(host, suffix) {
-			return true
-		}
-	}
-	return false
-}
-
 // MatchMediaURL performs pure-syntax and host-allowlist validation against
 // spec.MediaHostSuffix without performing any DNS lookups. Pair this with
 // fetch.Executor-backed probers (e.g. ytengine.NewSizeProber) that already
 // enforce request-scoped DNS resolution, PublicIP checks, and pinned-IP dialing.
 func (p *Parser) MatchMediaURL(raw string) bool {
-	if p == nil || len(p.spec.MediaHostSuffix) == 0 || len(raw) == 0 || len(raw) > 8192 {
+	if p == nil {
 		return false
 	}
-	for _, r := range raw {
-		if r <= 0x20 || r == 0x7f || r == '\\' {
-			return false
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
-		return false
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return false
-	}
-	if port := u.Port(); port != "" {
-		if !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
-			return false
-		}
-	}
-	rawHost := strings.TrimSpace(u.Hostname())
-	host := strings.ToLower(strings.TrimSuffix(rawHost, "."))
-	if host == "" {
-		return false
-	}
-	if _, err := netip.ParseAddr(rawHost); err == nil {
-		return false
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return false
-	}
-	return p.matchMediaHost(host)
+	return urlpolicy.StrictHostRuleURL(raw, urlpolicy.HTTPAndHTTPS, 8192, p.spec.MediaHostSuffix...)
 }
 
 // AllowedMediaURL checks whether a media/thumbnail URL belongs to
@@ -305,7 +252,7 @@ func (p *Parser) sanitizeTargetURL(raw string) (string, bool) {
 	host := strings.ToLower(u.Hostname())
 	matched := false
 	for _, allowed := range p.spec.InputHosts {
-		if hostMatchesRule(host, allowed) {
+		if urlpolicy.MatchHostRule(host, allowed) {
 			matched = true
 			break
 		}
@@ -326,7 +273,7 @@ func (p *Parser) normalizeInputURL(raw string) (string, bool) {
 	}
 	host := strings.ToLower(u.Hostname())
 	for _, allowed := range p.spec.InputHosts {
-		if hostMatchesRule(host, allowed) {
+		if urlpolicy.MatchHostRule(host, allowed) {
 			return u.String(), true
 		}
 	}

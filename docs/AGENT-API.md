@@ -52,7 +52,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 **强制安全约束**：
 - **仅接受 `Authorization` 请求头**：单次请求仅允许携带 1 个 `Authorization` 头，前缀必须精确区分大小写为 `"Bearer "`（后接单个空格与令牌），整行请求头总长度不得超过 **`1024` 字节**。
-- **严禁放入 URL 查询参数**：服务端仅从 `Authorization` 请求头读取令牌。在 `/api/parse`、`/api/resolve`、`/api/platforms` 中，查询参数里的令牌（如 `?token=...`、`?owner_token=...`）会被忽略，请求按**匿名访客**处理（例如解析接口受匿名单 IP `Burst=4`、`0.2/s` 限流且微博返回中转票据），**不会报错提醒**（仅 `GET /api/stats` 会在缺少请求头时返回 `401`、在已带有效请求头时拒绝多余的查询参数并返回 `400 INVALID_INPUT`）；同时查询参数里的令牌还会暴露在日志和终端历史里。
+- **严禁放入 URL 查询参数**：服务端仅从 `Authorization` 请求头读取令牌。在 `/api/parse`、`/api/resolve`、`/api/platforms` 中，查询参数里的令牌（如 `?token=...`、`?owner_token=...`）会被忽略，请求按**匿名访客**处理（例如未命中缓存的匿名 `/api/parse` 受单 IP `Burst=4`、`0.2/s` 限流，纯 Go 平台的匿名 `/api/resolve` 走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，命中进程内新鲜缓存的 `/api/parse` 与 `/api/resolve` 走轻量的 `Catalog` 池，且微博返回中转票据），**不会报错提醒**（仅 `GET /api/stats` 会在缺少请求头时返回 `401`、在已带有效请求头时拒绝多余的查询参数并返回 `400 INVALID_INPUT`）；同时查询参数里的令牌还会暴露在日志和终端历史里。
 - **严禁向第三方 CDN 转发凭据**：`/api/parse` 与 `/api/resolve` 返回的媒体 URL 指向抖音、X 等第三方平台 CDN。下载媒体字节时**绝对禁止携带 `Authorization` 头或任何 `Cookie`**。
 
 ### 2.2 鉴权失败的精确行为（HTTP `401` 与防暴力限流 `429`）
@@ -91,7 +91,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.1 `GET /api/parse` — 解析分享链接或分享口令文本
 
-- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（推荐 Agent 始终携带以进入独立 `owner` 并发池；不带时走匿名快/慢解析池限流）。
+- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（推荐 Agent 始终携带以进入独立 `owner` 并发池；不带时命中进程内新鲜缓存走轻量的 `Catalog` 池，未命中缓存走匿名快/慢解析池限流）。
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
@@ -210,7 +210,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 当 `/api/parse` 返回多 P 合集（`data.groups[*].kind == "multipart"`）时，非首集条目通常处于 `state: "deferred"` 状态，不含 `variants`，但提供 API 相对路径 **`item.resolve_url`**（例如 `"/api/resolve?schema_version=1.0&platform=bilibili&url=...&item_id=..."`）。
 
-- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（Agent 调用时应继续携带同一请求头）。
+- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（Agent 调用时应继续携带同一请求头以进入 `owner` 池；不带时命中进程内新鲜缓存走轻量的 `Catalog` 池，未命中缓存时纯 Go 平台走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，海外慢解析平台走慢解析池）。
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
@@ -591,7 +591,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 ### 6.1 个人通道并发池与服务端排队机制
 
-通过 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN` 验证的 `/api/parse`、`/api/resolve` 与 `/api/platforms` 请求进入独立的 `owner` 准入池，与匿名公网流量（`fast` 池与 `slow` 池）完全隔离：
+通过 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN` 验证的 `/api/parse`、`/api/resolve` 与 `/api/platforms` 请求进入独立的 `owner` 准入池，与匿名公网流量（`fast`、`resolve`、`slow`、`catalog` 等限流池）完全隔离：
 
 - **默认容量与上限**：
   - 最大同时在途请求数 `DOKITOOL_OWNER_CONCURRENCY`：默认 **`8`**（可配置范围 `1..32`）。

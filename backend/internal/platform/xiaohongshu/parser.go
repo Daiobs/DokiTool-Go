@@ -13,6 +13,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 const desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -34,13 +35,8 @@ func NewWithClock(executor fetch.Executor, clock func() time.Time) *Parser {
 }
 
 func AllowedURL(raw string) bool {
-	if unified.MediaURL(raw) == "" {
+	if urlpolicy.HasUnsafeChars(raw) || unified.MediaURL(raw) == "" {
 		return false
-	}
-	for _, r := range raw {
-		if r <= 0x20 || r == 0x7f || r == '\\' {
-			return false
-		}
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.User != nil || u.Opaque != "" || (u.Scheme != "https" && u.Scheme != "http") || (u.Port() != "" && u.Port() != "80" && u.Port() != "443") {
