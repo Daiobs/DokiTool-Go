@@ -711,6 +711,7 @@
 !/backend/internal/platform/weibo/testdata/
 /backend/internal/platform/x/*
 !/backend/internal/platform/x/formatter.go
+!/backend/internal/platform/x/fxtwitter.go
 !/backend/internal/platform/x/parser.go
 !/backend/internal/platform/x/parser_test.go
 !/backend/internal/platform/x/probe.go
