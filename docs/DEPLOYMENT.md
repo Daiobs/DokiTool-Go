@@ -85,7 +85,7 @@ Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下
 前后端统一围绕 `schema_version=1.0` 契约协同发布：
 
 - 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（需个人通道令牌）、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
-- **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 通过本地回环 `reverse_proxy`（附带 `X-DokiTool-Client-IP` 与 `X-DokiTool-Edge-Key` 边缘认证头）向 `dokitool` 转发显式白名单路由（流式中转 `/api/media/weibo` 独立前置并启用 `flush_interval -1`，公开接口采用 `@api path ...` 逐条列举，上海拉取控制面 `@shanghai path /internal/shanghai/claim /internal/shanghai/result` 置于 `@source` 拦截 `/internal/*` 之前），未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
+- **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 通过本地回环 `reverse_proxy`（附带 `X-DokiTool-Client-IP` 与 `X-DokiTool-Edge-Key` 边缘认证头；Caddy 直连访客时传 `{remote_host}`，若前置 CDN 或负载均衡器则须在全局 `servers` 块配置 `trusted_proxies` 并改传 `{client_ip}`，避免所有访客共享代理节点限流配额）向 `dokitool` 转发显式白名单路由（流式中转 `/api/media/weibo` 独立前置并启用 `flush_interval -1`，公开接口采用 `@api path ...` 逐条列举，上海拉取控制面 `@shanghai path /internal/shanghai/claim /internal/shanghai/result` 置于 `@source` 拦截 `/internal/*` 之前），未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
 - 已退役的旧 `/api/short_videos`、`/api/douyin` 等兼容路径固定返回 JSON 版本提示错误（`410`），不得回退为 SPA HTML。接口契约与 Schema 校验规则详见 [API.md](API.md) 与 [schema/unified-v1/README.md](schema/unified-v1/README.md)。
 
 ---

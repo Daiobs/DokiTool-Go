@@ -3,6 +3,10 @@
 # Pair with `dokitool serve -listen 127.0.0.1:9080 -client-identity caddy` and
 # inject SNAP_INGRESS_KEY from a restricted service environment file so
 # X-DokiTool-Client-IP and X-DokiTool-Edge-Key authenticate this loopback hop.
+# `{remote_host}` below assumes Caddy accepts visitor connections directly; if
+# Caddy sits behind a CDN or load balancer, configure `trusted_proxies` in the
+# global `servers` block and pass `{client_ip}` instead of `{remote_host}` so
+# all visitors are not collapsed onto the proxy's IP.
 snap.example.com {
     @api path /api/downloads/tbvideo-result /api/parse /api/resolve /api/platforms /api/short_videos /api/douyin /api/ksjx /api/bilibili /api/xhsjx /api/toutiao /api/youtube/context /api/youtube/finalize /api/stats
     @shanghai path /internal/shanghai/claim /internal/shanghai/result
