@@ -291,10 +291,6 @@ type shanghaiValidated struct {
 	metadata  object
 }
 
-func (p *Parser) probeOriginal(ctx context.Context, vid, entry string, detail object, known qualityVideo) (object, *shanghaiSameObject, error) {
-	return p.probeOriginalWithShanghai(ctx, vid, entry, detail, known, shanghaiState{})
-}
-
 // The official dispatcher and validated service response establish provenance.
 // Compare against this work's own duration and declared renditions before
 // allowing an optional resolver to replace or supplement the Japan route.
@@ -429,10 +425,6 @@ func declaredCandidateSource(candidate object) object {
 		}
 	}
 	return src
-}
-
-func prependSameObjectSources(mainCandidate object, backups array, same *shanghaiSameObject) {
-	prependShanghaiSources(mainCandidate, backups, same, nil)
 }
 
 func prependShanghaiSources(mainCandidate object, backups array, same *shanghaiSameObject, renditions map[string]array) {

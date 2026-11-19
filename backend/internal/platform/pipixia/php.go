@@ -191,26 +191,6 @@ func truthy(value any) bool {
 	}
 	return true
 }
-func scalarString(value any) string {
-	switch value := value.(type) {
-	case string:
-		return value
-	case int64:
-		return strconv.FormatInt(value, 10)
-	case int:
-		return strconv.Itoa(value)
-	case float64:
-		return strconv.FormatFloat(value, 'G', 14, 64)
-	case bool:
-		if value {
-			return "1"
-		}
-		return ""
-	case nil:
-		return ""
-	}
-	return "Array"
-}
 func percentDecode(raw string) string {
 	var out strings.Builder
 	for i := 0; i < len(raw); i++ {

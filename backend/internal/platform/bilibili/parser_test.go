@@ -68,7 +68,7 @@ func TestShareRedirectFragmentIsAllowedButNeverSent(t *testing.T) {
 	if requestLine != "GET /video/av123?p=2&track=%23 HTTP/1.1" {
 		t.Fatalf("fragment altered request bytes: %s", requestLine)
 	}
-	if allowedAPIURL("https://api.bilibili.com/x/web-interface/view?bvid=BV1234567890#discard") {
+	if AllowedAPIURL("https://api.bilibili.com/x/web-interface/view?bvid=BV1234567890#discard") {
 		t.Fatal("metadata API unexpectedly accepts fragments")
 	}
 }
@@ -124,12 +124,12 @@ func TestRequestPolicyKeepsMetadataOnApprovedOrigins(t *testing.T) {
 		})
 	}
 	for _, raw := range []string{"https://api.bilibili.com/x/web-interface/view?bvid=BV1234567890", "https://api.bilibili.com/x/player/playurl?cid=101"} {
-		if !allowedAPIURL(raw) {
+		if !AllowedAPIURL(raw) {
 			t.Fatalf("approved API rejected: %s", raw)
 		}
 	}
 	for _, raw := range []string{testURL, "http://api.bilibili.com/x/web-interface/view", "https://api.bilibili.com/x/other", "https://api.bilibili.com/x/player%2fplayurl", "https://api.bilibili.com.evil.test/x/player/playurl", "https://user@api.bilibili.com/x/player/playurl", "https://api.bilibili.com/x/player/playurl#fragment"} {
-		if allowedAPIURL(raw) {
+		if AllowedAPIURL(raw) {
 			t.Fatalf("unapproved API accepted: %s", raw)
 		}
 	}

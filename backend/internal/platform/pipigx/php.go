@@ -171,26 +171,6 @@ func first(values ...any) any {
 	}
 	return nil
 }
-func truthy(value any) bool {
-	switch value := value.(type) {
-	case nil:
-		return false
-	case bool:
-		return value
-	case string:
-		return value != "" && value != "0"
-	case int64:
-		return value != 0
-	case float64:
-		return value != 0
-	case *phpObject:
-		return len(value.keys) != 0
-	}
-	if list := unified.Slice(value); list != nil {
-		return len(list) != 0
-	}
-	return true
-}
 func scalarString(value any) string {
 	switch value := value.(type) {
 	case string:

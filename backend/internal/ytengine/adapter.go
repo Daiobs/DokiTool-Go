@@ -901,14 +901,6 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 	return variants, audioAttachment
 }
 
-func buildMuxTrackResource(f Format, role string, now int64) unified.Object {
-	return buildMuxTrackResourceWithTitle(f, role, "", now)
-}
-
-func buildMuxTrackResourceWithTitle(f Format, role, itemTitle string, now int64) unified.Object {
-	return buildMuxTrackResourceWithContext(f, role, AdaptOptions{}, "", f.FormatID, itemTitle, now)
-}
-
 func buildMuxTrackResourceWithContext(f Format, role string, opts AdaptOptions, entryKey, formatKey, itemTitle string, now int64) unified.Object {
 	sources := buildFormatSourcesWithContext(f, opts, entryKey, formatKey, itemTitle, now)
 	if len(sources) == 0 {
@@ -1031,14 +1023,6 @@ func buildAudioFileMetadata(af Format) unified.Object {
 		meta["audio_channels"] = *af.AudioChannels
 	}
 	return meta
-}
-
-func buildFormatSources(f Format, now int64) unified.Array {
-	return buildFormatSourcesWithTitle(f, "", now)
-}
-
-func buildFormatSourcesWithTitle(f Format, itemTitle string, now int64) unified.Array {
-	return buildFormatSourcesWithContext(f, AdaptOptions{}, "", f.FormatID, itemTitle, now)
 }
 
 func buildFormatSourcesWithContext(f Format, opts AdaptOptions, entryKey, formatKey, itemTitle string, now int64) unified.Array {

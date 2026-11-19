@@ -552,11 +552,6 @@ func (np *nativePost) hasImage() bool {
 	return false
 }
 
-func (p *Parser) extractNative(ctx context.Context, shortcode, canonicalURL, sourceURL string, now int64) (unified.Object, bool) {
-	env, _, ok := p.extractNativeWithStatus(ctx, shortcode, canonicalURL, sourceURL, now)
-	return env, ok
-}
-
 func (p *Parser) extractNativeWithStatus(ctx context.Context, shortcode, canonicalURL, sourceURL string, now int64) (unified.Object, bool, bool) {
 	needVideo := isReelOrTVCanonical(canonicalURL)
 	post, loginReq, ok := p.fetchNativePost(ctx, shortcode, needVideo)
