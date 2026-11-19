@@ -200,6 +200,14 @@ const downloadAllLivePhotos = () => downloadAllMedia("live");
 const downloadAllLiveCovers = () => downloadAllMedia("covers");
 
 const switchVideo = (choice) => selection.choose(choice);
+const promptSelectQuality = () => {
+  showToast(
+    locale.value === "en"
+      ? "Please select a quality version in the Quality tab first"
+      : "请先在「画质选项」中选择需要的清晰度版本",
+    "info",
+  );
+};
 
 const formatNumber = (num) => {
   if (!num && num !== 0) return "0";
@@ -334,6 +342,7 @@ onUnmounted(() => {
         @install-youtube-helper="markWaitingForYouTubeHelperInstall"
         @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"
+        @prompt-select-quality="promptSelectQuality"
         @download-backup="downloadBackupVideo"
         @download-separate="downloadYouTubeSeparate"
         @download-all="downloadAll"

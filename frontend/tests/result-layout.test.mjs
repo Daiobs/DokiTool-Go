@@ -296,3 +296,96 @@ test('unmount cancels queued work and detaches layout observers and listeners', 
   await view.flush();
   assert.equal(view.reads(), reads, 'late observer callbacks cannot measure a removed result');
 });
+
+test('no-default item with selectable variants enables 请先选择画质 CTA to open quality picker without auto-selecting, then switches to 下载视频 once chosen', async () => {
+  const hlsOnlyItem = {
+    id: 'video-hls-1',
+    type: 'video',
+    default: null,
+    default_unavailable_reason: 'processing_required',
+    variants: [
+      {
+        id: 'hls-720p',
+        label: '720p',
+        metadata: { width: 1280, height: 720, video_codec: 'h264', evidence: 'upstream' },
+        delivery: { kind: 'hls', scope: 'single', output: { container: 'mp4', extension: 'mp4' }, sources: [{ id: 's0', url: 'https://media.test/720p.m3u8' }] },
+      },
+      {
+        id: 'hls-480p',
+        label: '480p',
+        metadata: { width: 854, height: 480, video_codec: 'h264', evidence: 'upstream' },
+        delivery: { kind: 'hls', scope: 'single', output: { container: 'mp4', extension: 'mp4' }, sources: [{ id: 's1', url: 'https://media.test/480p.m3u8' }] },
+      },
+    ],
+  };
+  const hlsData = { ...video, items: [hlsOnlyItem], default_item_id: hlsOnlyItem.id };
+  const view = await mount(hlsData);
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  let downloadCalls = 0;
+  let promptCalls = 0;
+  view.state.value = {
+    ...view.state.value,
+    onDownloadMain() { downloadCalls++; },
+    onPromptSelectQuality() { promptCalls++; },
+  };
+  await view.flush();
+  try {
+    // 1. Unified-v1 rule: useVideoSelection must NOT silently auto-select a non-default variant
+    assert.equal(view.state.value.selection.currentSelection.value, null);
+    assert.equal(view.state.value.selection.currentTarget.value.kind, 'unsupported');
+
+    // 2. Primary CTA is enabled and labeled 请先选择画质 instead of a silent disabled 下载视频
+    const primaryBtn = () => view.elements('rs-btn--primary')[0];
+    assert.equal(Boolean(primaryBtn().props.disabled), false);
+    assert.equal(primaryBtn().props['data-select-quality-first'], true);
+    assert.equal(textOf(primaryBtn()), '请先选择画质');
+    assert.equal(view.elements('rs-backup-item').length, 0, 'starts on details tab');
+
+    // 3. Clicking 请先选择画质 opens the quality tab and emits prompt-select-quality WITHOUT starting an unchosen download
+    primaryBtn().props.onClick();
+    await view.flush();
+    assert.equal(downloadCalls, 0, 'must never start an unchosen download');
+    assert.equal(promptCalls, 1, 'emits prompt-select-quality guidance');
+    assert.equal(view.state.value.selection.currentSelection.value, null, 'still no implicit selection');
+    assert.equal(view.elements('rs-backup-item').length, 2, 'switches activeTab to quality picker');
+
+    // 4. Once user explicitly picks 480p, primary CTA immediately turns into 下载视频 and triggers download-main on click
+    view.elements('rs-backup-item')[1].props.onClick();
+    await view.flush();
+    assert.deepEqual(view.state.value.selection.currentSelection.value, { variant_id: 'hls-480p' });
+    assert.equal(Boolean(primaryBtn().props.disabled), false);
+    assert.equal(primaryBtn().props['data-select-quality-first'], undefined);
+    assert.equal(textOf(primaryBtn()), '下载视频');
+
+    primaryBtn().props.onClick();
+    await view.flush();
+    assert.equal(downloadCalls, 1);
+
+    // 5. Conversely, if no variant is downloadable (e.g. only unsupported adaptive dash), primary CTA stays disabled
+    const noDownloadableItem = {
+      id: 'video-dash-only',
+      type: 'video',
+      default: null,
+      default_unavailable_reason: 'processing_required',
+      variants: [
+        {
+          id: 'dash-1080p',
+          label: '1080p',
+          delivery: { kind: 'dash', scope: 'adaptive', sources: [{ id: 's0', url: 'https://media.test/manifest.mpd' }] },
+        },
+      ],
+    };
+    view.state.value = {
+      ...view.state.value,
+      resultVersion: 2,
+      resultData: { ...video, items: [noDownloadableItem], default_item_id: noDownloadableItem.id },
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: view.state.value.resultData });
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(Boolean(primaryBtn().props.disabled), true);
+    assert.equal(textOf(primaryBtn()), '下载视频');
+  } finally {
+    view.app.unmount();
+  }
+});
