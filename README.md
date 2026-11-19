@@ -98,6 +98,16 @@ go test ./...
 go run ./cmd/dokitool serve
 ```
 
+## 已退役的 PHP 对拍代码
+
+仓库内原地保留以下历史 PHP 代码、导出脚本与配置示例：
+
+- `backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`
+- `backend/tests/*.php`、`scripts/go-migration/produce*.php`
+- 历史 PHP-FPM 配置示例：`ops/examples/snap-fpm.conf`
+
+上述文件均**已退役，完全不参与线上生产运行**（生产环境不部署 PHP / PHP-FPM，所有流量由 Go 二进制独立承载），原地保留仅用作 Go 实现的冻结行为对拍基准（Oracle），供 `.github/workflows/go-migration.yml` 中的 `bilibili-php-oracle` CI 任务以及离线门禁脚本 `scripts/go-migration/check.py --check-php-source` 重放和核对固定版本源码摘要使用。**禁止在这些 PHP 文件中新增功能，仅允许为维持既有对拍能力所必需的修正。**
+
 ## 文档索引
 
 - [docs/API.md](docs/API.md)：统一媒体 v1 接口契约、错误码（含 `UNSUPPORTED_PLATFORM`、`UPSTREAM_BLOCKED`、`NO_MEDIA`、`429` 退避）与 YouTube Helper 接口

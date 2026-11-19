@@ -22,7 +22,7 @@ DokiTool 最初为基于 PHP 后端与 Vue 3 + Vite 前端的短视频/图文去
 
 Go 后端替代完成后，初期线上以「日本 Go 主服务 + 上海 `pull` worker」承载九平台解析与下载（参见 [抖音上海通道说明](go-migration/douyin-shanghai.md) 与 [下载说明](DOWNLOADS.md#production-download-capabilities)），随后在 Go 单栈基础上陆续接入 X、YouTube、Instagram、Facebook、Tumblr、Dailymotion 六个海外平台，扩展至 15 个平台。
 
-Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/README.md#当前运行方式)。仓库根目录历史 PHP `api/` 在迁移过渡期仅保留用于离线基线对照、语法门禁与历史参考，不再作为线上新部署入口。
+Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/README.md#当前运行方式)。仓库根目录历史 PHP `api/` 在迁移过渡期仅保留用于离线基线对照、语法门禁与历史参考，不再作为线上新部署入口；当前仓库内原地保留但已退役的 PHP 对拍代码路径清单、CI 用途与冻结维护约束见 [README.md — 已退役的 PHP 对拍代码](../README.md#已退役的-php-对拍代码)。
 
 ### 来源与许可历史记录
 
