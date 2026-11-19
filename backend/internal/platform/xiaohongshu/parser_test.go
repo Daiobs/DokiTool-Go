@@ -167,3 +167,134 @@ func TestMissingXsecTokenPromptsAppShareLink(t *testing.T) {
 		t.Fatalf("expected prompt to copy share link from App, got %q", msg)
 	}
 }
+
+func TestShortLinkRedirectReusesLandingBodyOrFallsBack(t *testing.T) {
+	const (
+		now          int64 = 1793361600
+		shortURL           = "https://xhslink.com/a/short01"
+		aliasURL           = "https://xhs.com/a/short01"
+		canonicalURL       = "https://www.xiaohongshu.com/explore/abc123?xsec_token=tok_valid&xsec_source=pc_feed"
+		rednoteURL         = "https://www.rednote.com/explore/abc123?xsec_token=tok_valid&xsec_source=pc_feed"
+		noteHTML           = `<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{"abc123":{"note":{"noteId":"abc123","type":"video","title":"Short-link note","video":{"media":{"stream":{"h264":[{"masterUrl":"https://sns-video-qn.xhscdn.com/synthetic/720.mp4","width":1280,"height":720}]}}}}}}}};</script>`
+	)
+
+	t.Run("200-landing-with-valid-initial-state-avoids-second-canonical-get", func(t *testing.T) {
+		for _, input := range []string{shortURL, aliasURL} {
+			var pageURLs []string
+			p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+				if r.Policy.Purpose != "xiaohongshu-page" {
+					t.Fatalf("unexpected purpose %q", r.Policy.Purpose)
+				}
+				pageURLs = append(pageURLs, r.URL)
+				switch r.URL {
+				case shortURL:
+					return fetch.Response{
+						StatusCode: http.StatusFound,
+						Header:     http.Header{"Location": {canonicalURL}},
+						URL:        r.URL,
+					}, nil
+				case canonicalURL:
+					return fetch.Response{
+						StatusCode: http.StatusOK,
+						Body:       []byte(noteHTML),
+						URL:        r.URL,
+					}, nil
+				default:
+					t.Fatalf("unexpected redundant canonical page GET: %s", r.URL)
+					return fetch.Response{}, nil
+				}
+			}))
+			got, err := p.Parse(context.Background(), input, now)
+			if err != nil {
+				t.Fatalf("input=%s unexpected error: %v", input, err)
+			}
+			if unified.Str(got["code"]) != "OK" {
+				t.Fatalf("input=%s expected code OK, got %v", input, got["code"])
+			}
+			if len(pageURLs) != 2 || pageURLs[0] != shortURL || pageURLs[1] != canonicalURL {
+				t.Fatalf("input=%s expected exactly 1 canonical page fetch after 302 ([%s, %s]), got %v", input, shortURL, canonicalURL, pageURLs)
+			}
+		}
+	})
+
+	t.Run("200-landing-without-initial-state-falls-back-to-canonical-fetch", func(t *testing.T) {
+		for _, landingBody := range []string{
+			`<!doctype html><html><body><script>location.replace("/explore/abc123")</script></body></html>`,
+			``,
+			`<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{}}};</script>`,
+		} {
+			var pageURLs []string
+			p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+				pageURLs = append(pageURLs, r.URL)
+				switch r.URL {
+				case shortURL:
+					return fetch.Response{
+						StatusCode: http.StatusFound,
+						Header:     http.Header{"Location": {canonicalURL}},
+						URL:        r.URL,
+					}, nil
+				case canonicalURL:
+					return fetch.Response{
+						StatusCode: http.StatusOK,
+						Body:       []byte(landingBody),
+						URL:        r.URL,
+					}, nil
+				case rednoteURL:
+					return fetch.Response{
+						StatusCode: http.StatusOK,
+						Body:       []byte(noteHTML),
+						URL:        r.URL,
+					}, nil
+				default:
+					t.Fatalf("unexpected URL %s", r.URL)
+					return fetch.Response{}, nil
+				}
+			}))
+			got, err := p.Parse(context.Background(), shortURL, now)
+			if err != nil || unified.Str(got["code"]) != "OK" {
+				t.Fatalf("landingBody=%q expected fallback OK, got code=%v err=%v", landingBody, got["code"], err)
+			}
+			if len(pageURLs) != 3 || pageURLs[2] != rednoteURL {
+				t.Fatalf("landingBody=%q expected fallback to %s, got %v", landingBody, rednoteURL, pageURLs)
+			}
+		}
+	})
+
+	t.Run("non-200-redirect-stop-falls-back-to-canonical-fetch", func(t *testing.T) {
+		var pageURLs []string
+		p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+			pageURLs = append(pageURLs, r.URL)
+			switch r.URL {
+			case shortURL:
+				return fetch.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": {canonicalURL}},
+					URL:        r.URL,
+				}, nil
+			case canonicalURL:
+				// Simulate redirect chain stopping on a 302 without Location header.
+				return fetch.Response{
+					StatusCode: http.StatusFound,
+					Body:       []byte(noteHTML),
+					URL:        r.URL,
+				}, nil
+			case rednoteURL:
+				return fetch.Response{
+					StatusCode: http.StatusOK,
+					Body:       []byte(noteHTML),
+					URL:        r.URL,
+				}, nil
+			default:
+				t.Fatalf("unexpected URL %s", r.URL)
+				return fetch.Response{}, nil
+			}
+		}))
+		got, err := p.Parse(context.Background(), shortURL, now)
+		if err != nil || unified.Str(got["code"]) != "OK" {
+			t.Fatalf("expected fallback OK after 302 stop, got code=%v err=%v", got["code"], err)
+		}
+		if len(pageURLs) != 3 || pageURLs[2] != rednoteURL {
+			t.Fatalf("expected fallback to %s, got %v", rednoteURL, pageURLs)
+		}
+	})
+}

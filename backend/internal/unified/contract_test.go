@@ -3,9 +3,11 @@ package unified
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -502,4 +504,311 @@ func TestPlatformScopedDefaultEligibilityAndUnknownVideoFields(t *testing.T) {
 	if err := ValidateEnvelopeAt(finalIGCoexist, now); err != nil {
 		t.Fatalf("instagram coexist failed validation: %v", err)
 	}
+}
+
+func readCanonicalExampleBytes(tb testing.TB, prefix string) []byte {
+	tb.Helper()
+	paths, err := filepath.Glob(filepath.Join("..", "..", "..", "docs", "schema", "unified-v1", "examples", prefix+"-*.json"))
+	if err != nil || len(paths) != 1 {
+		tb.Fatalf("example %s: %v %v", prefix, paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return data
+}
+
+func TestPrecompiledSchemaZeroRuntimeAuditsAndCompiles(t *testing.T) {
+	ensureEmbeddedSchema()
+	if len(precompiledPatterns) == 0 {
+		t.Fatal("expected embedded schema patterns to be precompiled at initialization")
+	}
+
+	paths, err := filepath.Glob(filepath.Join("..", "..", "..", "docs", "schema", "unified-v1", "examples", "*.json"))
+	if err != nil || len(paths) != 29 {
+		t.Fatalf("expected 29 canonical examples, got %d (%v)", len(paths), err)
+	}
+	examples := make([]Object, 0, len(paths)+1)
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, err := Decode(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		examples = append(examples, doc)
+	}
+
+	// Include a payload exercising ValidateMetadata -> validateSchemaNode on
+	// embedded MediaMetadata property sub-schemas (field_conflicts).
+	withConflict := contractExample(t, "16")
+	mux := contractVariant(contractFirstItem(withConflict), 1)
+	video := Map(Slice(Map(mux["delivery"])["resources"])[0])
+	Map(video["metadata"])["field_conflicts"] = Object{
+		"fps": Array{
+			Object{"value": 30, "evidence": "upstream"},
+			Object{"value": 60, "evidence": "probe"},
+		},
+	}
+	examples = append(examples, withConflict)
+
+	auditsBefore := runtimeKeywordAudits.Load()
+	compilesBefore := regexpCompileCount.Load()
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, ex := range examples {
+				if err := ValidateStructure(ex); err != nil {
+					t.Errorf("ValidateStructure failed: %v", err)
+					return
+				}
+				if err := ValidateEnvelopeAt(ex, 1793448000); err != nil {
+					t.Errorf("ValidateEnvelopeAt failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if gotAudits := runtimeKeywordAudits.Load() - auditsBefore; gotAudits != 0 {
+		t.Fatalf("expected 0 runtime auditSchemaKeywords calls on embedded schema, got %d", gotAudits)
+	}
+	if gotCompiles := regexpCompileCount.Load() - compilesBefore; gotCompiles != 0 {
+		t.Fatalf("expected 0 runtime regexp.Compile calls on embedded schema, got %d", gotCompiles)
+	}
+}
+
+func TestSyntheticSchemaAuditsOnceAndCachesDynamicPatterns(t *testing.T) {
+	ensureEmbeddedSchema()
+
+	// 1. Unknown keywords anywhere in a synthetic schema (root or nested) must fail closed,
+	// even if the input value does not visit the offending child property/branch.
+	badSchemas := []struct {
+		name   string
+		schema Object
+		value  any
+	}{
+		{
+			name:   "root unknown keyword",
+			schema: Object{"type": "string", "minLength": 1, "futureKeyword": true},
+			value:  "ok",
+		},
+		{
+			name: "nested property unknown keyword with empty object value",
+			schema: Object{
+				"type": "object",
+				"properties": Object{
+					"unused": Object{"type": "string", "not": Object{"const": "x"}},
+				},
+			},
+			value: Object{},
+		},
+		{
+			name: "nested array items unknown keyword with empty array value",
+			schema: Object{
+				"type":  "array",
+				"items": Object{"type": "integer", "multipleOf": 5},
+			},
+			value: Array{},
+		},
+		{
+			name: "nested oneOf branch unknown keyword",
+			schema: Object{
+				"oneOf": Array{
+					Object{"type": "string"},
+					Object{"type": "integer", "exclusiveMaximum": 10},
+				},
+			},
+			value: "hello",
+		},
+		{
+			name: "nested additionalProperties unknown keyword",
+			schema: Object{
+				"type":                 "object",
+				"additionalProperties": Object{"type": "string", "contentEncoding": "base64"},
+			},
+			value: Object{},
+		},
+		{
+			name: "nested $defs unknown keyword",
+			schema: Object{
+				"$defs": Object{
+					"Custom": Object{"type": "string", "patternProperties": Object{}},
+				},
+				"$ref": "#/$defs/Custom",
+			},
+			value: "hello",
+		},
+	}
+	for _, tc := range badSchemas {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateSchemaNode(tc.value, tc.schema, "$"); err == nil {
+				t.Fatalf("expected synthetic schema %q to fail keyword audit", tc.name)
+			}
+		})
+	}
+
+	// 2. Dynamic pattern on a synthetic array schema compiles the regexp once
+	// via sync.Map and audits only the 2 schema nodes (not 50 array elements).
+	const dynamicPattern = `^synthetic-item-[0-9]{4}$`
+	dynamicPatternCache.Delete(dynamicPattern)
+
+	synthetic := Object{
+		"type": "array",
+		"items": Object{
+			"type":    "string",
+			"pattern": dynamicPattern,
+		},
+	}
+	items := make(Array, 50)
+	for i := range items {
+		items[i] = fmt.Sprintf("synthetic-item-%04d", i)
+	}
+
+	compilesBefore := regexpCompileCount.Load()
+	auditsBefore := runtimeKeywordAudits.Load()
+	for run := 0; run < 5; run++ {
+		if err := validateSchemaNode(items, synthetic, "$"); err != nil {
+			t.Fatalf("run %d failed: %v", run, err)
+		}
+	}
+	if gotCompiles := regexpCompileCount.Load() - compilesBefore; gotCompiles != 1 {
+		t.Fatalf("expected exactly 1 regexp.Compile across 250 dynamic pattern matches, got %d", gotCompiles)
+	}
+	// 2 schema nodes (array + items) audited once per custom validateSchemaNode call = 10 total, not 5*(1+50)=255.
+	if gotAudits := runtimeKeywordAudits.Load() - auditsBefore; gotAudits != 10 {
+		t.Fatalf("expected 10 schema-node audits across 5 synthetic calls (2 nodes each), got %d", gotAudits)
+	}
+
+	badItems := append(Array(nil), items...)
+	badItems[37] = "synthetic-item-bad"
+	err := validateSchemaNode(badItems, synthetic, "$")
+	if err == nil || !strings.Contains(err.Error(), "$[37]: invalid pattern") {
+		t.Fatalf("expected deterministic item path error $[37]: invalid pattern, got %v", err)
+	}
+
+	// 3. Invalid $ref and invalid pattern error parity on synthetic schemas.
+	if err := validateSchemaNode("x", Object{"$ref": "https://example.test/ref"}, "$"); err == nil || !strings.Contains(err.Error(), "unsupported schema reference") {
+		t.Fatalf("expected unsupported schema reference, got %v", err)
+	}
+	if err := validateSchemaNode("x", Object{"$ref": "#/$defs/MissingDef"}, "$"); err == nil || !strings.Contains(err.Error(), "unknown schema reference") {
+		t.Fatalf("expected unknown schema reference, got %v", err)
+	}
+	if err := validateSchemaNode("x", Object{"type": "string", "pattern": "["}, "$"); err == nil || !strings.Contains(err.Error(), "unsupported schema pattern") {
+		t.Fatalf("expected unsupported schema pattern, got %v", err)
+	}
+}
+
+func TestDeterministicErrorParityOnInvalidEnvelopes(t *testing.T) {
+	ensureEmbeddedSchema()
+	defs := Map(schemaDocument["$defs"])
+	successSchema := Map(defs["Success"])
+	mediaMetadataSchema := Map(defs["MediaMetadata"])
+	if successSchema == nil || mediaMetadataSchema == nil {
+		t.Fatal("missing expected $defs in embedded schema")
+	}
+
+	// Top-level envelope is a root oneOf (Success | Failure), so
+	// structural envelope violations deterministically report "$: invalid schema branch".
+	badEnvelope := contractExample(t, "02")
+	Map(badEnvelope["data"])["platform"] = "BadPlatform!"
+	if err := ValidateEnvelopeAt(badEnvelope, 1793448000); err == nil || err.Error() != "$: invalid schema branch" {
+		t.Fatalf("expected root oneOf error '$: invalid schema branch', got %v", err)
+	}
+
+	// Sub-schema validations (including ValidateMetadata field_conflicts and direct
+	// validateSchemaNode calls) preserve exact deterministic path diagnostics.
+	if err := validateSchemaNode(badEnvelope, successSchema, "$"); err == nil || err.Error() != "$.data.platform: invalid pattern" {
+		t.Fatalf("expected '$.data.platform: invalid pattern', got %v", err)
+	}
+
+	apiErrorSchema := Map(defs["APIError"])
+	if apiErrorSchema == nil {
+		t.Fatal("missing APIError in $defs")
+	}
+	if err := validateSchemaNode(Object{"code": "NO_MEDIA", "message": "x", "retry_after_seconds": -1}, apiErrorSchema, "$.error"); err == nil || err.Error() != "$.error.retry_after_seconds: outside minimum" {
+		t.Fatalf("expected '$.error.retry_after_seconds: outside minimum', got %v", err)
+	}
+	if err := validateSchemaNode(Object{"fps": 0, "evidence": "upstream"}, mediaMetadataSchema, "$.metadata"); err == nil || err.Error() != "$.metadata.fps: outside exclusiveMinimum" {
+		t.Fatalf("expected '$.metadata.fps: outside exclusiveMinimum', got %v", err)
+	}
+	if err := validateSchemaNode(Object{"zzz_unknown": 1, "aaa_unknown": 2}, mediaMetadataSchema, "$.metadata"); err == nil || err.Error() != "$.metadata: unknown aaa_unknown" {
+		t.Fatalf("expected deterministic alphabetical '$.metadata: unknown aaa_unknown', got %v", err)
+	}
+
+	conflictPayload := contractExample(t, "16")
+	mux := contractVariant(contractFirstItem(conflictPayload), 1)
+	video := Map(Slice(Map(mux["delivery"])["resources"])[0])
+	Map(video["metadata"])["field_conflicts"] = Object{
+		"fps": Array{
+			Object{"value": 0, "evidence": "upstream"},
+			Object{"value": 60, "evidence": "probe"},
+		},
+	}
+	if err := ValidateEnvelopeAt(conflictPayload, 1793448000); err == nil || err.Error() != "$.metadata.field_conflicts.fps: outside exclusiveMinimum" {
+		t.Fatalf("expected field_conflicts bound error, got %v", err)
+	}
+}
+
+func TestValidateEnvelopeAllocationsDropped(t *testing.T) {
+	payload := benchmarkEnvelope(t)
+	// Before precompilation, ValidateStructure allocated ~1,004 objects/op and
+	// ValidateEnvelopeAt allocated ~1,152 objects/op on canonical example 16
+	// (~10 allocs/op non-race and ~43 allocs/op under -race after precompilation).
+	structAllocs := testing.AllocsPerRun(100, func() {
+		if err := ValidateStructure(payload); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if structAllocs > 80 {
+		t.Fatalf("ValidateStructure allocations regressed: got %.1f allocs/op, want <= 80 (was ~1004 before precompile)", structAllocs)
+	}
+
+	envAllocs := testing.AllocsPerRun(100, func() {
+		if err := ValidateEnvelopeAt(payload, 1793448000); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if envAllocs > 300 {
+		t.Fatalf("ValidateEnvelopeAt allocations regressed: got %.1f allocs/op, want <= 300 (was ~1152 before precompile)", envAllocs)
+	}
+}
+
+func BenchmarkValidateStructure(b *testing.B) {
+	payload := benchmarkEnvelope(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ValidateStructure(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValidateEnvelopeAt(b *testing.B) {
+	payload := benchmarkEnvelope(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ValidateEnvelopeAt(payload, 1793448000); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkEnvelope(tb testing.TB) Object {
+	tb.Helper()
+	data := readCanonicalExampleBytes(tb, "16")
+	payload, err := Decode(data)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return payload
 }

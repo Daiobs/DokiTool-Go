@@ -53,6 +53,21 @@ func AllowedURL(raw string) bool {
 	return false
 }
 
+func isCanonicalNoteURL(raw string) bool {
+	if !AllowedURL(raw) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "xiaohongshu.com", "www.xiaohongshu.com", "rednote.com", "www.rednote.com":
+		return true
+	}
+	return false
+}
+
 func extractID(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -152,6 +167,15 @@ func (p *Parser) parseLegacy(ctx context.Context, input string) (unified.Object,
 		id = extractID(address)
 		if !AllowedURL(address) || id == "" {
 			return legacyResult(400, "分享链接未指向可识别的笔记", nil), nil
+		}
+		if redirected.status == http.StatusOK && redirected.body != "" && isCanonicalNoteURL(address) {
+			if note := extractNote(redirected.body, id); note != nil {
+				data, err := p.formatNote(ctx, note)
+				if err != nil {
+					return nil, err
+				}
+				return legacyResult(200, "解析成功", data), nil
+			}
 		}
 	}
 	lastStatus := 0
