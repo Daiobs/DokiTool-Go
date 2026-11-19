@@ -305,13 +305,13 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         rhs = normalize_for_parity(comp_schemas[def_name])
         require(lhs == rhs, f"Schema drift detected between unified-v1.schema.json and openapi.json for {def_name}")
 
-    # Parity check with backend/config/platforms.json + 6 optional Go-registered platforms
-    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr", "dailymotion"]
+    # Parity check with backend/config/platforms.json + 5 optional Go-registered platforms
+    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
     platform_ids = [entry["id"] for entry in platforms_cfg] + optional_go_platforms
-    require(len(set(platform_ids)) == 15, "Expected 15 distinct platform IDs across platforms.json + Go adapters")
+    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs across platforms.json + Go adapters")
     require(
         comp_schemas["PlatformQuery"]["enum"] == ["all", *platform_ids],
-        "PlatformQuery enum does not match the 15 registered platform IDs",
+        "PlatformQuery enum does not match the 14 registered platform IDs",
     )
     all_cfg_caps = {cap for entry in platforms_cfg for cap in entry.get("capabilities", [])}
     require(
@@ -320,8 +320,8 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
     )
     require(
         set(comp_schemas["StatsPlatform"]["enum"]) == {*platform_ids, "unknown"}
-        and len(comp_schemas["StatsPlatform"]["enum"]) == 16,
-        "StatsPlatform enum must match the 15 registered platforms + 'unknown'",
+        and len(comp_schemas["StatsPlatform"]["enum"]) == 15,
+        "StatsPlatform enum must match the 14 registered platforms + 'unknown'",
     )
     wire_error_codes = set(comp_schemas["APIError"]["properties"]["code"]["enum"])
     require(

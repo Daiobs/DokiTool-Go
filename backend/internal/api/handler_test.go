@@ -304,7 +304,7 @@ func (r *countingDNSResolver) LookupNetIP(_ context.Context, _, _ string) ([]net
 	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 }
 
-func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
+func TestFBWatchLocalHintZeroOutboundAndNotFound404(t *testing.T) {
 	const now int64 = 1793448000
 
 	dir := t.TempDir()
@@ -313,7 +313,7 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(dir, "yt-dlp")
-	scriptBody := "#!/bin/sh\nset -eu\nmktemp \"" + invDir + "/inv.XXXXXX\" >/dev/null\necho 'ERROR: [dailymotion] x9zzzzzz999: Not found.' >&2\nexit 1\n"
+	scriptBody := "#!/bin/sh\nset -eu\nmktemp \"" + invDir + "/inv.XXXXXX\" >/dev/null\necho 'ERROR: [Tumblr] 999999999: HTTP Error 404: Not Found' >&2\nexit 1\n"
 	if err := os.WriteFile(scriptPath, []byte(scriptBody), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -336,8 +336,8 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		t.Fatal(err)
 	}
 	fbSpec, _ := ytgeneric.LookupSite("facebook")
-	dmSpec, _ := ytgeneric.LookupSite("dailymotion")
-	for _, entry := range []unified.Object{fbSpec.CatalogEntry(), dmSpec.CatalogEntry()} {
+	tbSpec, _ := ytgeneric.LookupSite("tumblr")
+	for _, entry := range []unified.Object{fbSpec.CatalogEntry(), tbSpec.CatalogEntry()} {
 		if err := c.Register(entry); err != nil {
 			t.Fatal(err)
 		}
@@ -345,12 +345,12 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 
 	fbPolicy := ytgeneric.New(fbSpec, nil, nil)
 	fbEng := baseEng.WithTargetPolicy(fbPolicy.AllowedTargetURL, fbPolicy.AllowedOutboundHost).WithExtractors(fbSpec.Extractors...)
-	dmPolicy := ytgeneric.New(dmSpec, nil, nil)
-	dmEng := baseEng.WithTargetPolicy(dmPolicy.AllowedTargetURL, dmPolicy.AllowedOutboundHost).WithExtractors(dmSpec.Extractors...)
+	tbPolicy := ytgeneric.New(tbSpec, nil, nil)
+	tbEng := baseEng.WithTargetPolicy(tbPolicy.AllowedTargetURL, tbPolicy.AllowedOutboundHost).WithExtractors(tbSpec.Extractors...)
 
 	adapters := map[string]Adapter{
-		"facebook":    ytgeneric.NewWithResolver(fbSpec, fbEng, ytengine.NewSizeProber(httpExec, fbPolicy.MatchMediaURL), resolver),
-		"dailymotion": ytgeneric.NewWithResolver(dmSpec, dmEng, nil, resolver),
+		"facebook": ytgeneric.NewWithResolver(fbSpec, fbEng, ytengine.NewSizeProber(httpExec, fbPolicy.MatchMediaURL), resolver),
+		"tumblr":   ytgeneric.NewWithResolver(tbSpec, tbEng, nil, resolver),
 	}
 	h, err := New(c, adapters, func() time.Time { return time.Unix(now, 0) }, nil)
 	if err != nil {
@@ -394,7 +394,7 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		t.Fatalf("expected 400 INVALID_INPUT platform mismatch for fb.watch + platform=douyin, got status=%d body=%s", wMismatch.Code, wMismatch.Body.String())
 	}
 
-	// 3. Lookalike domains, subdomains, userinfo, and non-default ports are rejected with 0 outbound calls.
+	// 3. Lookalike domains, subdomains, retired dailymotion/dai.ly domains, userinfo, and non-default ports are rejected with 0 outbound calls.
 	for _, bad := range []struct {
 		url      string
 		wantCode string
@@ -403,6 +403,8 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		{"https://fb.watch.evil.com/vtkorrRM0p/", "UNSUPPORTED_PLATFORM"},
 		{"https://www.fb.watch/vtkorrRM0p/", "UNSUPPORTED_PLATFORM"},
 		{"https://sub.fb.watch/vtkorrRM0p/", "UNSUPPORTED_PLATFORM"},
+		{"https://www.dailymotion.com/video/xbs7xfa", "UNSUPPORTED_PLATFORM"},
+		{"https://dai.ly/xbs7xfa", "UNSUPPORTED_PLATFORM"},
 		{"https://user:pass@fb.watch/vtkorrRM0p/", "INVALID_INPUT"},
 		{"https://fb.watch:8080/vtkorrRM0p/", "INVALID_INPUT"},
 		{"https://fb.watch:8443/vtkorrRM0p/", "INVALID_INPUT"},
@@ -419,22 +421,22 @@ func TestFBWatchLocalHintZeroOutboundAndDailymotionNotFound404(t *testing.T) {
 		}
 	}
 
-	// 4. Dailymotion non-existent video ("ERROR: [dailymotion] x9zzzzzz999: Not found.") returns 404 CONTENT_UNAVAILABLE.
-	dmQ := url.Values{"schema_version": {"1.0"}, "url": {"https://www.dailymotion.com/video/x9zzzzzz999"}}
-	wDM := httptest.NewRecorder()
-	h.ServeHTTP(wDM, httptest.NewRequest(http.MethodGet, "/api/parse?"+dmQ.Encode(), nil))
-	if wDM.Code != http.StatusNotFound {
-		t.Fatalf("dailymotion non-existent video status=%d, want 404: %s", wDM.Code, wDM.Body.String())
+	// 4. Non-existent ytgeneric post ("HTTP Error 404: Not Found") returns 404 CONTENT_UNAVAILABLE.
+	tbQ := url.Values{"schema_version": {"1.0"}, "url": {"https://www.tumblr.com/blog/999999999"}}
+	wTB := httptest.NewRecorder()
+	h.ServeHTTP(wTB, httptest.NewRequest(http.MethodGet, "/api/parse?"+tbQ.Encode(), nil))
+	if wTB.Code != http.StatusNotFound {
+		t.Fatalf("tumblr non-existent post status=%d, want 404: %s", wTB.Code, wTB.Body.String())
 	}
-	dmPayload, err := unified.Decode(wDM.Body.Bytes())
+	tbPayload, err := unified.Decode(wTB.Body.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unified.ValidateEnvelopeAt(dmPayload, now); err != nil {
-		t.Fatalf("dailymotion 404 ValidateEnvelopeAt failed: %v", err)
+	if err := unified.ValidateEnvelopeAt(tbPayload, now); err != nil {
+		t.Fatalf("tumblr 404 ValidateEnvelopeAt failed: %v", err)
 	}
-	dmErr := unified.Map(dmPayload["error"])
-	if unified.Str(dmPayload["code"]) != "CONTENT_UNAVAILABLE" || dmErr["retryable"] == true {
-		t.Fatalf("unexpected dailymotion 404 payload: %v", dmPayload)
+	tbErr := unified.Map(tbPayload["error"])
+	if unified.Str(tbPayload["code"]) != "CONTENT_UNAVAILABLE" || tbErr["retryable"] == true {
+		t.Fatalf("unexpected tumblr 404 payload: %v", tbPayload)
 	}
 }

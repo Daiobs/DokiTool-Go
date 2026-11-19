@@ -40,7 +40,7 @@ const (
 	chOwnerIdx = 1
 	numCh      = 2
 
-	numPlatforms    = 16
+	numPlatforms    = 15
 	numOutcomeCodes = 13
 )
 
@@ -65,7 +65,6 @@ var knownPlatforms = [numPlatforms]string{
 	"instagram",
 	"facebook",
 	"tumblr",
-	"dailymotion",
 	PlatformUnknown,
 }
 
@@ -85,7 +84,7 @@ var knownOutcomeCodes = [numOutcomeCodes]string{
 	OutcomeUnauthorized,
 }
 
-// KnownPlatforms returns a copy of the closed 16-element platform vocabulary (15 platforms + "unknown").
+// KnownPlatforms returns a copy of the closed 15-element platform vocabulary (14 platforms + "unknown").
 func KnownPlatforms() []string {
 	out := make([]string, len(knownPlatforms))
 	copy(out, knownPlatforms[:])
@@ -129,14 +128,12 @@ func platformIndex(raw string) int {
 		return 12
 	case "tumblr":
 		return 13
-	case "dailymotion":
-		return 14
 	default:
-		return 15 // PlatformUnknown
+		return 14 // PlatformUnknown
 	}
 }
 
-// NormalizePlatform maps any platform string onto the closed 16-element set.
+// NormalizePlatform maps any platform string onto the closed 15-element set.
 func NormalizePlatform(raw string) string {
 	return knownPlatforms[platformIndex(raw)]
 }

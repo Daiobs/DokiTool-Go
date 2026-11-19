@@ -1999,8 +1999,7 @@
           "youtube",
           "instagram",
           "facebook",
-          "tumblr",
-          "dailymotion"
+          "tumblr"
         ],
         "description": "Optional target platform ID from /api/platforms, or 'all' for automatic domain detection."
       },
@@ -2212,7 +2211,6 @@
           "instagram",
           "facebook",
           "tumblr",
-          "dailymotion",
           "unknown"
         ]
       },

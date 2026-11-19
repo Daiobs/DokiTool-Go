@@ -228,7 +228,7 @@ func newOwnerTestRouter(t *testing.T, cfg AdmissionConfig, ownerToken, edgeKey s
 	adapters := make(map[string]Adapter)
 	for _, id := range []string{
 		"douyin", "bilibili", "toutiao", "kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu",
-		"x", "youtube", "instagram", "facebook", "tumblr", "dailymotion",
+		"x", "youtube", "instagram", "facebook", "tumblr",
 	} {
 		adapters[id] = adapterFn(id)
 	}

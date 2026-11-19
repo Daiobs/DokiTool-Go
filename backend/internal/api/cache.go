@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -99,8 +98,6 @@ func cacheablePlatform(platform string) bool {
 		return true
 	}
 }
-
-var dailyShortPath = regexp.MustCompile(`^/([A-Za-z0-9]{1,64})/?$`)
 
 func cacheableRequest(platform, source string) bool {
 	if !cacheablePlatform(platform) {
@@ -321,22 +318,6 @@ func normalizeCacheURL(platform, source string) string {
 			host = "www.tumblr.com"
 			scheme = "https"
 			port = ""
-		}
-	case "dailymotion":
-		if host == "dailymotion.com" {
-			host = "www.dailymotion.com"
-			scheme = "https"
-			port = ""
-		} else if host == "dai.ly" {
-			if m := dailyShortPath.FindStringSubmatch(escapedPath); m != nil {
-				host = "www.dailymotion.com"
-				scheme = "https"
-				port = ""
-				escapedPath = "/video/" + m[1]
-				if u.RawQuery == "" {
-					forceQuery = false
-				}
-			}
 		}
 	}
 

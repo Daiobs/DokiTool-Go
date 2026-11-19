@@ -39,7 +39,7 @@ test('all existing and future platform IDs use one versioned parse endpoint',asy
   assert.equal(config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/'}).mode,'php');
   assert.throws(()=>config.resolveApiConfig({VITE_API_MODE:'typo'}));
   assert.throws(()=>config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/api'}));
-  for(const platform of ['all','douyin','kuaishou','bilibili','xiaohongshu','toutiao','weibo','pipixia','pipigx','zuiyou','x','instagram','facebook','tumblr','dailymotion','future_platform']) {
+  for(const platform of ['all','douyin','kuaishou','bilibili','xiaohongshu','toutiao','weibo','pipixia','pipigx','zuiyou','x','instagram','facebook','tumblr','future_platform']) {
     const {instance,store}=harness();let requested;
     globalThis.fetch=async url=>{requested=new URL(url,'https://snap.example.test');return Response.json(good({platform}));};
     instance.selectPlatform(platform);await instance.parseVideo();
@@ -52,7 +52,6 @@ test('all existing and future platform IDs use one versioned parse endpoint',asy
     ['pipigx', 'https://h5.pipigx.com/pp/post/123456'],
     ['zuiyou', 'https://share.izuiyou.com/detail/123456'],
     ['tumblr', 'https://www.tumblr.com/blog/123456789'],
-    ['dailymotion', 'https://www.dailymotion.com/video/xbvrdzy'],
   ]) {
     const {instance,store}=harness(`分享链接 ${sampleUrl} 复制此消息`);let requested;
     globalThis.fetch=async url=>{requested=new URL(url,'https://snap.example.test');return Response.json(good({platform:nonHeroPlatform}));};

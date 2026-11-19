@@ -180,15 +180,15 @@ async function waitUntil(predicate) {
 }
 const base = { title: '示例', images: [], live_photo: [], video_backup: [], music: {}, extra: {}, url: 'https://media.test/main.mp4' };
 
-test('all fifteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
+test('all fourteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
   assert.deepEqual(platforms.supportedPlatforms.value.map((item) => item.id), [
     'douyin', 'kuaishou', 'bilibili', 'xiaohongshu', 'toutiao', 'weibo', 'pipixia', 'pipigx', 'zuiyou',
-    'x', 'youtube', 'instagram', 'facebook', 'tumblr', 'dailymotion',
+    'x', 'youtube', 'instagram', 'facebook', 'tumblr',
   ]);
   const heroHtml = await renderToString(createSSRApp({ render: () => h(HeroSection, { locale: 'zh-CN', currentPlatform: 'all' }) }));
   const gridHtml = await renderToString(createSSRApp({ render: () => h(PlatformGrid, { locale: 'zh-CN' }) }));
   for (const platform of platforms.supportedPlatforms.value) assert.ok(gridHtml.includes(platform.name));
-  for (const name of ['微视', '西瓜视频', '好看视频', '火山小视频']) {
+  for (const name of ['微视', '西瓜视频', '好看视频', '火山小视频', 'Dailymotion']) {
     assert.ok(!heroHtml.includes(name));
     assert.ok(!gridHtml.includes(name));
   }
@@ -2743,7 +2743,7 @@ test('homepage button row stays fixed to popular platforms without 更多平台 
       );
       assert.ok(!html.includes('更多平台'));
       assert.doesNotMatch(html, /data-more-platforms-toggle|data-more-platform-tab/);
-      for (const nonPopular of ['今日头条', '皮皮虾', '皮皮搞笑', '最右', 'Tumblr', 'Dailymotion']) {
+      for (const nonPopular of ['今日头条', '皮皮虾', '皮皮搞笑', '最右', 'Tumblr']) {
         assert.ok(!html.includes(nonPopular), `non-popular platform ${nonPopular} must not appear in HeroSection`);
       }
       assert.match(html, /data-reserve="正在准备…"[^>]*data-reserve-alt="开始解析"/);
@@ -2764,7 +2764,7 @@ test('homepage button row stays fixed to popular platforms without 更多平台 
     const gridWithThreads = await renderToString(
       createSSRApp({ render: () => h(PlatformGrid, { locale: 'zh-CN' }) }),
     );
-    for (const label of ['抖音', '今日头条', '皮皮虾', '皮皮搞笑', '最右', 'Tumblr', 'Dailymotion', 'Threads']) {
+    for (const label of ['抖音', '今日头条', '皮皮虾', '皮皮搞笑', '最右', 'Tumblr', 'Threads']) {
       assert.ok(gridWithThreads.includes(label));
     }
 

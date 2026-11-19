@@ -29,12 +29,14 @@ Weibo's signed `/api/media/weibo` route remains a server relay when required.
    - 页面初始化时检测微信、QQ、微博、抖音、小红书、哔哩哔哩、支付宝、Instagram、Facebook 等应用内嵌 WebView UA；命中时在顶部展示非阻断横幅：**`检测到应用内置浏览器，保存文件可能受限，请在系统浏览器中打开。`**（英文界面显示对应提示）。
 5. **本地生成文件 `ObjectURL` 45 秒延迟回收**：
    - Blob 兼容下载（`blob.ts`）、fMP4 HLS / 字节分片拼接（`segmentDownload.ts`）以及 ZIP 打包（`useMediaDownload.ts`）在触发浏览器保存后，统一延迟 **`45 秒`（`45_000 ms`）** 再执行 `URL.revokeObjectURL`，防止系统保存对话框未确认前对象地址失效。
+6. **无跨域与附件头直链的「打开源链接」交付（今日头条、最右视频等）**：
+   - 对实测既无 `Access-Control-Allow-Origin` 跨域读取头、又无 `Content-Disposition: attachment` 附件头的 CDN 直链（如今日头条 `*.toutiaovod.com`、线上关闭 `tbvideo` 改写的最右视频），任务卡片不再假报 `已交给浏览器`，而是直接置为 `manual`（「`打开源链接`」），使用隔离的 `noopener noreferrer` + `no-referrer` 打开源视频并提示右键「视频另存为」（手机端长按保存）。
 
 ---
 
 ### 早期九平台生产交付基线记录
 
-下表保留早期九平台生产按钮验收、浏览器直接打开附件实测及手动保存入口记录。截至历史 [#33 发布回执](https://github.com/Brilliant666/DokiTool-Go/pull/33#issuecomment-6649301507)（后续抖音上海 `v2` 升级见 [douyin-shanghai.md](go-migration/douyin-shanghai.md)，15 平台完整矩阵见根 [README.md](../README.md)）：
+下表保留早期九平台生产按钮验收、浏览器直接打开附件实测及手动保存入口记录。截至历史 [#33 发布回执](https://github.com/Brilliant666/DokiTool-Go/pull/33#issuecomment-6649301507)（后续抖音上海 `v2` 升级见 [douyin-shanghai.md](go-migration/douyin-shanghai.md)，14 平台完整矩阵见根 [README.md](../README.md)）：
 
 | 平台 | 已确认的能力和边界 |
 | --- | --- |

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"net"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,8 +20,6 @@ import (
 )
 
 const fbWatchLocalHint = "fb.watch 短链需要登录才能展开，请在浏览器中打开后复制 facebook.com 的完整视频链接"
-
-var dailyShortPath = regexp.MustCompile(`^/([A-Za-z0-9]{1,64})/?$`)
 
 // SiteSpec declaratively defines an allowlisted long-tail yt-dlp platform.
 type SiteSpec struct {
@@ -278,23 +275,6 @@ func (p *Parser) normalizeInputURL(raw string) (string, bool) {
 		}
 	}
 	switch p.spec.PlatformID {
-	case "dailymotion":
-		if host == "dailymotion.com" {
-			u.Scheme = "https"
-			u.Host = "www.dailymotion.com"
-			return u.String(), true
-		}
-		if host == "dai.ly" {
-			m := dailyShortPath.FindStringSubmatch(u.EscapedPath())
-			if m == nil {
-				return "", false
-			}
-			rewritten := "https://www.dailymotion.com/video/" + m[1]
-			if u.RawQuery != "" {
-				rewritten += "?" + u.RawQuery
-			}
-			return rewritten, true
-		}
 	case "tumblr":
 		if host == "tumblr.com" {
 			u.Scheme = "https"

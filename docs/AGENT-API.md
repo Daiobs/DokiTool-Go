@@ -495,7 +495,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
   }
   ```
 - **核心统计字段说明**：
-  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 15 个内置平台 ID 加 `"unknown"`（共 16 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`。
+  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 14 个内置平台 ID 加 `"unknown"`（共 15 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`。
   - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
   - 直方图（`HistogramSnapshot`）：`buckets` 键集合固定为 `<=10`、`<=50`、`<=100`、`<=250`、`<=500`、`<=1000`、`<=2500`、`<=5000`、`<=10000`、`<=30000`、`+Inf`（单位毫秒，采用 Prometheus 风格的**累积上界桶**，单调不减且 `buckets["+Inf"] == count`）。
@@ -538,7 +538,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 | `pair` | `delivery.resources[*]`（`role: "image"` + `role: "motion"`） | **实况照片成对资源**。每个 `resource` 内部各有自己的 `metadata` 与 `delivery`（通常均为 `kind: "file"`），分别按各自扩展名保存为 `<stem>_image.<ext>` 与 `<stem>_motion.<ext>`。 |
 | `mux` | `delivery.resources[*]`（1 个 `role: "video"` + `>=1` 个 `role: "audio"`） | **音视频分离轨道**。服务端不执行混流；若无需本地 `ffmpeg -c copy` 合并，请直接使用 `item.default` 指向的完整 `file` 版本。 |
 | `segments` | `delivery.init`（可选）+ `delivery.pieces[*]` | **显式分片序列**。仅当 `delivery.join == "byte_concat"` 且 `join_evidence == "validated_fragment_layout"` 时可按 `index` 顺序字节拼接；`join == "remux"` 需重封装。 |
-| `hls` / `dash` | `delivery.sources[*]`（清单 URL） | **流媒体清单**（例如 Dailymotion 单流 fMP4 HLS）。批量脚本若未集成清单分片下载器，可明确记录不支持并跳过。 |
+| `hls` / `dash` | `delivery.sources[*]`（清单 URL） | **流媒体清单**（例如单流 fMP4 HLS 清单）。批量脚本若未集成清单分片下载器，可明确记录不支持并跳过。 |
 
 > 注意：若单个 `variant` 带有 `"state": "deferred"`，表示它是尚未抓取的预留能力占位项（无 `delivery` 字段），遍历 `variants` 时必须先跳过 `variant.get("state") == "deferred"`。
 
@@ -575,7 +575,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | **`401`** | `INVALID_INPUT` | `false` | `Authorization` 令牌错误、格式非法、超长（`> 1024 B`）、重复发送，或服务端未配置 `DOKITOOL_OWNER_TOKEN`（每次失败还会扣减单 IP 突发配额） | **立即中止整批任务并告警**；检查环境变量 `$DOKITOOL_OWNER_TOKEN` 与目标服务端配置，**严禁重试或继续遍历后续 URL**。 |
 | `400` / `405` / `409` / `410` | `INVALID_INPUT` | `false` | 缺少/非法 `url` 或 `item_id`、`/api/stats` 携带未知查询参数、`platform` 与链接不匹配、抖音合集 `mix_id`、小红书缺失 `xsec_token`、Facebook `fb.watch` 短链、`schema_version` 不匹配（`409`）、方法错误（`405`）、旧路径退役（`410`） | **不重试**；将该条输入标记为永久输入错误（`failed_permanent`）并继续处理下一条 URL。 |
 | `400` | `UNSUPPORTED_PLATFORM` | `false` | 链接域名不在支持目录（如 `t.co`、`instagr.am` 短链或未接入网站），或目标平台在当前实例未启用 | **不重试**；标记为不支持平台并跳过。 |
-| `404` | `NO_MEDIA` | `false` | 帖子公开存在但不含受支持媒体（如 X 纯文本推文、仅含 TS 分片的 Dailymotion 视频） | **不重试**；标记为无媒体作品并跳过。 |
+| `404` | `NO_MEDIA` | `false` | 帖子公开存在但不含受支持媒体（如 X 纯文本推文、仅含不受支持流格式的作品） | **不重试**；标记为无媒体作品并跳过。 |
 | `404` | `CONTENT_UNAVAILABLE` | `false` | 作品已删除、不存在，或请求的 `item_id` 不存在（服务端会负缓存 `10s`） | **不重试**；标记为作品不可用并跳过。 |
 | `403` | `UPSTREAM_BLOCKED` | `false` | 作品私密、年龄受限、需登录查看（如 Instagram Stories、私密帖、未开回退的 X 受限推文）或触发上游页面风控 | **不在紧循环中重试**；标记为受限/风控阻塞并跳过。 |
 | **`429`** | `RATE_LIMITED` | `true` | `owner` 等待队列已满或排队满 `60s` 超时、上游平台返回 `429`，或鉴权失败累计触发单 IP 限流 | **退避后重试**（单条最多 2–3 次）：优先读取 `error.retry_after_seconds` 或 HTTP `Retry-After` 头（默认至少等待 `1s`）并加少量随机抖动；若此前曾发过无效 token，先排查鉴权配置。 |
@@ -609,7 +609,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | **抖音（`douyin`）、哔哩哔哩（`bilibili`）** | 纯 Go 解析；若开启上海 `pull` 模式（哔哩哔哩需同时在主后端显式开启 `DOKITOOL_SHANGHAI_BILIBILI`），上海 `shanghai-resolver` 默认运行 `3` 个出站 worker。当全部上海 worker 忙碌时，主后端最多等待 **`300ms`**，未获认领或超时即无阻塞回退日本主后端解析结果（仍返回可用直链，但可能少国内 `*.douyinvod.com` 或 `cn-*.bilivideo.com` 候选）。 | 追求最高吞吐：**`<= 8`**；<br>追求最高上海国内线路命中率：**`<= 3`**（或配合调高 `shanghai-resolver -workers`）。 |
 | **X（`x`）常规图文与视频推文** | 默认优先走纯 Go 官方 Syndication 快路径（无需拉起 `yt-dlp` 子进程）；仅在 Syndication 未命中或需回退时才请求 `yt-dlp` 槽位。 | **`4–8`**（若大批链接含需回退的复杂推文，建议降至 **`1–2`**）。 |
 | **快手、小红书、皮皮虾等纯 Go 平台** | 纯 Go 无状态抓取与探测，无子进程开销。 | **`4–8`**（建议不超过 `DOKITOOL_OWNER_CONCURRENCY`）。 |
-| **Instagram、Facebook、Tumblr、Dailymotion** | 每次未命中缓存的解析均需申请全局共享的 `DOKITOOL_YTDLP_CONCURRENCY` 子进程信号量（默认 `2`，可配置范围 `1..24`）。 | **`<= 1–2`**（默认配置下建议 `1`，留出余量避免长时间占满全部提取器槽位）。 |
+| **Instagram、Facebook、Tumblr** | 每次未命中缓存的解析均需申请全局共享的 `DOKITOOL_YTDLP_CONCURRENCY` 子进程信号量（默认 `2`，可配置范围 `1..24`）。 | **`<= 1–2`**（默认配置下建议 `1`，留出余量避免长时间占满全部提取器槽位）。 |
 
 > **提示**：解析与 CDN 媒体文件下载可以流水线解耦——例如保持 `4` 个并发协程调用 `/api/parse`，拿到直链后立即交给 `4–8` 个独立的 CDN 下载协程流式落盘。
 

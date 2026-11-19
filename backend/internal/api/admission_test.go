@@ -424,7 +424,7 @@ func TestFastAndSlowPoolClassificationAndIsolation(t *testing.T) {
 	adapters := make(map[string]Adapter)
 	for _, id := range []string{
 		"douyin", "bilibili", "toutiao", "kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu",
-		"x", "youtube", "instagram", "facebook", "tumblr", "dailymotion",
+		"x", "youtube", "instagram", "facebook", "tumblr",
 	} {
 		adapters[id] = okAdapter
 	}
@@ -450,14 +450,13 @@ func TestFastAndSlowPoolClassificationAndIsolation(t *testing.T) {
 	}
 	defer relSlow()
 
-	// All 6 yt-dlp slow platforms hit 429 on SlowParse when saturated.
+	// All 5 yt-dlp slow platforms hit 429 on SlowParse when saturated.
 	slowURLs := []string{
 		"https://x.com/user/status/123456",
 		"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
 		"https://www.instagram.com/reel/C123456/",
 		"https://www.facebook.com/watch/?v=123456",
 		"https://demo.tumblr.com/post/123456",
-		"https://www.dailymotion.com/video/x8t9abc",
 	}
 	for i, u := range slowURLs {
 		ip := fmt.Sprintf("198.51.100.%d", i+1)

@@ -14,8 +14,7 @@
     "youtube",
     "instagram",
     "facebook",
-    "tumblr",
-    "dailymotion"
+    "tumblr"
   ],
   "cache_sample_key": "kuaishou",
   "x_fast_path_key": "x",
@@ -110,10 +109,6 @@
     },
     "tumblr": {
       "url": "https://maskofthedragon.tumblr.com/post/626907179849564160/mona-talking-in-english",
-      "pool": "slow_parse"
-    },
-    "dailymotion": {
-      "url": "https://www.dailymotion.com/video/xbvrf7u",
       "pool": "slow_parse"
     }
   },

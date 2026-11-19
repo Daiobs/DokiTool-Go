@@ -41,13 +41,6 @@ const onlineExtras = [
     icon: "tumblr",
     capabilities: ["video"],
   },
-  {
-    id: "dailymotion",
-    name: "Dailymotion",
-    site_url: "https://www.dailymotion.com/",
-    icon: "dailymotion",
-    capabilities: ["video"],
-  },
 ];
 const seenIds = new Set(registry.map(({ id }) => id));
 const platforms = [

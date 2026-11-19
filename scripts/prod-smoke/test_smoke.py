@@ -70,7 +70,6 @@ def make_envelope(
         "instagram": ("https://scontent.cdninstagram.com/v/t50.2886-16/ig.mp4?_nc_ht=ig", None),
         "facebook": ("https://video.xx.fbcdn.net/v/t42.1790-2/fb.mp4?efg=abc", None),
         "tumblr": ("https://va.media.tumblr.com/tumblr_sample.mp4", None),
-        "dailymotion": ("https://proxy-01.dailymotion.com/sec(secret)/video/dm.mp4", None),
     }
     chosen_url, default_bf = default_hosts.get(
         platform, ("https://cdn.example.com/v.mp4", None)
@@ -331,7 +330,6 @@ class FakeDokiServer:
             "instagram.com": "instagram",
             "facebook.com": "facebook",
             "tumblr.com": "tumblr",
-            "dailymotion.com": "dailymotion",
         }
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
         for suffix, plat in mapping.items():
@@ -404,8 +402,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(report["summary"]["fail"], 0)
             # rate_limit is SKIP by default
             self.assertEqual(report["summary"]["skip"], 1)
-            # 1 frontend + 1 platforms + 1 cache + 1 x + 1 dy_dom + 4 dm + 15 platforms + 2 api_boundary = 26 PASS
-            self.assertEqual(report["summary"]["pass"], 26)
+            # 1 frontend + 1 platforms + 1 cache + 1 x + 1 dy_dom + 4 dm + 14 platforms + 2 api_boundary = 25 PASS
+            self.assertEqual(report["summary"]["pass"], 25)
 
             # Verify api_boundary runs strictly AFTER all parse check groups and BEFORE rate_limit
             groups_in_order = [c["group"] for c in report["checks"]]
@@ -426,8 +424,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "PASS")
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["http_status"], 404)
 
-            # Verify >= 8.0s pacing across all /api/parse calls (16 total: 2 cache + 14 unique platforms)
-            self.assertEqual(len(srv.parse_Requests), 16)
+            # Verify >= 8.0s pacing across all /api/parse calls (15 total: 2 cache + 13 unique platforms)
+            self.assertEqual(len(srv.parse_Requests), 15)
             timestamps = [r["timestamp"] for r in srv.parse_Requests]
             for prev_ts, next_ts in zip(timestamps, timestamps[1:]):
                 self.assertGreaterEqual(next_ts - prev_ts, 8.0)

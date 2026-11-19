@@ -371,6 +371,15 @@ func TestYTDLPSitesConfiguration(t *testing.T) {
 			wantErr:   true,
 		},
 		{
+			name: "retired-dailymotion-only-is-graceful-noop",
+			env: map[string]string{
+				"DOKITOOL_YTDLP_SITES":  "dailymotion",
+				"DOKITOOL_YTDLP_BINARY": filepath.Join(dir, "missing-yt-dlp"),
+			},
+			wantSites: nil,
+			wantErr:   false,
+		},
+		{
 			name: "enabled-missing-binary-not-registered-in-catalog",
 			env: map[string]string{
 				"DOKITOOL_YTDLP_SITES":  "facebook,tumblr,dailymotion",
@@ -380,12 +389,12 @@ func TestYTDLPSitesConfiguration(t *testing.T) {
 			wantErr:   false,
 		},
 		{
-			name: "enabled-verified-binary-registers-selected-sites-only",
+			name: "enabled-verified-binary-registers-selected-sites-and-skips-retired-dailymotion",
 			env: map[string]string{
 				"DOKITOOL_YTDLP_SITES":  "facebook,tumblr,dailymotion",
 				"DOKITOOL_YTDLP_BINARY": fakeBin,
 			},
-			wantSites: []string{"facebook", "tumblr", "dailymotion"},
+			wantSites: []string{"facebook", "tumblr"},
 			wantErr:   false,
 		},
 	}
@@ -411,15 +420,15 @@ func TestYTDLPSitesConfiguration(t *testing.T) {
 					t.Fatalf("site %s: catalog.Has=%v adapter=%v, want=%v", id, c.Has(id), adapters[id] != nil, want)
 				}
 			}
-			if len(tc.wantSites) == 3 {
+			if len(tc.wantSites) == 2 {
 				if got := c.PlatformForURL("https://www.facebook.com/reel/1517545242764683"); got != "facebook" {
 					t.Fatalf("PlatformForURL(facebook)=%q, want facebook", got)
 				}
 				if got := c.PlatformForURL("https://maskofthedragon.tumblr.com/post/706987028632748032"); got != "tumblr" {
 					t.Fatalf("PlatformForURL(tumblr)=%q, want tumblr", got)
 				}
-				if got := c.PlatformForURL("https://www.dailymotion.com/video/x8t9abc"); got != "dailymotion" {
-					t.Fatalf("PlatformForURL(dailymotion)=%q, want dailymotion", got)
+				if got := c.PlatformForURL("https://www.dailymotion.com/video/x8t9abc"); got != "" {
+					t.Fatalf("PlatformForURL(dailymotion)=%q, want empty", got)
 				}
 			}
 		})

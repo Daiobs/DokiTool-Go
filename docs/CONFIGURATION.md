@@ -73,7 +73,7 @@
 | `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
 | `DOKITOOL_YTDLP_YOUTUBE_ENABLED` | 控制是否注册并启用 YouTube 解析路由适配器（启用时在启动阶段强校验提取器可用性） | 否 |
 | `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
-| `DOKITOOL_YTDLP_SITES` | 按逗号分隔指定启用的长尾海外平台标识集合（含未知标识或空项时拒绝启动） | 否 |
+| `DOKITOOL_YTDLP_SITES` | 按逗号分隔指定启用的长尾海外平台标识集合（含未知标识或空项时拒绝启动；已退役标识静默忽略） | 否 |
 | `DOKITOOL_YOUTUBE_HELPER` | 控制是否启用 YouTube 浏览器助手上下文与签名结算接口（启用时在启动阶段校验运行时与脚本文件摘要） | 否 |
 
 ### 3. 外部提取器、任务网关与签名解算沙箱
