@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -425,10 +426,15 @@ func TestYouTubeHelperFinalizeRejections(t *testing.T) {
 	// Restore time for remaining checks.
 	currentNow = time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 
-	// 5. Format entries > 64.
-	many := make([]any, 65)
+	// 5. Format entries > 256 (MaxFinalizeFormatEntries).
+	compactFmt := map[string]any{
+		"itag":     18,
+		"mimeType": `video/mp4; codecs="avc1.42001E, mp4a.40.2"`,
+		"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=I9JvDaciaFk&itag=18&n=CHALLENGE_N_18",
+	}
+	many := make([]any, MaxFinalizeFormatEntries+1)
 	for i := range many {
-		many[i] = firstFmt
+		many[i] = compactFmt
 	}
 	tooManyBody, _ := json.Marshal(map[string]any{
 		"video_id":        "I9JvDaciaFk",
@@ -436,7 +442,30 @@ func TestYouTubeHelperFinalizeRejections(t *testing.T) {
 		"formats":         many[:1],
 		"adaptiveFormats": many[1:],
 	})
-	mustReject("entries > 64", tooManyBody)
+	if len(tooManyBody) >= MaxFinalizeBodyBytes {
+		t.Fatalf("tooManyBody length %d must be < MaxFinalizeBodyBytes %d to test entry cap", len(tooManyBody), MaxFinalizeBodyBytes)
+	}
+	mustReject("entries > 256", tooManyBody)
+
+	// 5b. Unknown field inside audioTrack must be rejected.
+	unknownAudioTrackBody, _ := json.Marshal(map[string]any{
+		"video_id":  "I9JvDaciaFk",
+		"player_id": "a5c2aafe",
+		"formats": []any{
+			map[string]any{
+				"itag":     140,
+				"mimeType": `audio/mp4; codecs="mp4a.40.2"`,
+				"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=I9JvDaciaFk&itag=140&n=CHALLENGE_N_18",
+				"audioTrack": map[string]any{
+					"id":             "en.4",
+					"displayName":    "English original",
+					"audioIsDefault": true,
+					"unexpectedKey":  1,
+				},
+			},
+		},
+	})
+	mustReject("unknown audioTrack field", unknownAudioTrackBody)
 
 	// 6. Body > 512 KiB.
 	hugeBody := bytes.Repeat([]byte(" "), MaxFinalizeBodyBytes+1)
@@ -780,4 +809,282 @@ func TestYouTubeHelperRefreshPanicDoesNotWedgeSubsequentContext(t *testing.T) {
 	if !helper.HasCachedContext() {
 		t.Fatal("expected HasCachedContext() == true after successful refresh")
 	}
+}
+
+func TestYouTubeHelperMultiAudio120EntriesAndV131Compatibility(t *testing.T) {
+	sb := newTestSandbox(t)
+	playerJS, err := os.ReadFile(filepath.Join("testdata", "player_base_fixture.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	execMock := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+	}
+	currentNow := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	helper, err := NewHelper(execMock, sb, func() time.Time { return currentNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, st := helper.Context(context.Background()); st != http.StatusOK {
+		t.Fatalf("Context status = %d", st)
+	}
+
+	const videoID = "R3GfuzLMPkA"
+	progFormat := map[string]any{
+		"itag":     18,
+		"mimeType": `video/mp4; codecs="avc1.42001E, mp4a.40.2"`,
+		"width":    640,
+		"height":   360,
+		"fps":      30,
+		"bitrate":  500000,
+		"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=18&n=CHALLENGE_N_18",
+	}
+
+	// Build 45 adaptive video streams across resolutions/codecs.
+	videoStreams := make([]any, 0, 45)
+	resolutions := [][2]int{{3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720}, {854, 480}}
+	for i := 0; i < 45; i++ {
+		res := resolutions[i%len(resolutions)]
+		itag := 137 + i
+		mime := `video/mp4; codecs="avc1.640028"`
+		if i%3 == 1 {
+			mime = `video/webm; codecs="vp9"`
+		} else if i%3 == 2 {
+			mime = `video/mp4; codecs="av01.0.08M.08"`
+		}
+		videoStreams = append(videoStreams, map[string]any{
+			"itag":     itag,
+			"mimeType": mime,
+			"width":    res[0],
+			"height":   res[1],
+			"fps":      30,
+			"bitrate":  2500000 - i*10000,
+			"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(itag) + "&n=CHALLENGE_N_18",
+		})
+	}
+
+	extractAudioURLs := func(t *testing.T, finPayload unified.Object) (m4aURL, webmURL, attURL string) {
+		t.Helper()
+		data := unified.Map(finPayload["data"])
+		item := unified.Map(unified.Slice(data["items"])[0])
+		for _, rawV := range unified.Slice(item["variants"]) {
+			v := unified.Map(rawV)
+			label := unified.Str(v["label"])
+			srcURL := unified.Str(unified.Map(unified.Slice(unified.Map(v["delivery"])["sources"])[0])["url"])
+			if strings.HasPrefix(label, "仅音频 M4A") {
+				m4aURL = srcURL
+			} else if strings.HasPrefix(label, "仅音频 WEBM") {
+				webmURL = srcURL
+			}
+		}
+		atts := unified.Slice(data["attachments"])
+		if len(atts) > 0 {
+			res := unified.Map(unified.Map(atts[0])["resource"])
+			attURL = unified.Str(unified.Map(unified.Slice(unified.Map(res["delivery"])["sources"])[0])["url"])
+		}
+		return m4aURL, webmURL, attURL
+	}
+
+	// Subtest 1: 120-entry multi-audio payload (1 prog + 45 video + 18 langs * 4 audio + 2 descriptive = 120)
+	// with dubbed & descriptive tracks appearing BEFORE the original default track.
+	t.Run("120-entries-with-audioTrack-selects-original-over-dubs-and-descriptive", func(t *testing.T) {
+		langs := []struct {
+			id   string
+			name string
+			def  bool
+		}{
+			{"es.1", "Spanish", false},
+			{"fr.1", "French", false},
+			{"de.1", "German", false},
+			{"pt.1", "Portuguese", false},
+			{"hi.1", "Hindi", false},
+			{"ar.1", "Arabic", false},
+			{"ja.1", "Japanese", false},
+			{"ko.1", "Korean", false},
+			{"ru.1", "Russian", false},
+			{"it.1", "Italian", false},
+			{"id.1", "Indonesian", false},
+			{"tr.1", "Turkish", false},
+			{"vi.1", "Vietnamese", false},
+			{"th.1", "Thai", false},
+			{"pl.1", "Polish", false},
+			{"nl.1", "Dutch", false},
+			{"zh-Hans.1", "Chinese (Simplified)", false},
+			{"en.4", "English original", true},
+		}
+		audioItags := []struct {
+			itag    int
+			mime    string
+			bitrate int
+		}{
+			{139, `audio/mp4; codecs="mp4a.40.5"`, 48000},
+			{140, `audio/mp4; codecs="mp4a.40.2"`, 128000},
+			{249, `audio/webm; codecs="opus"`, 50000},
+			{251, `audio/webm; codecs="opus"`, 160000},
+		}
+
+		adaptive := append([]any{}, videoStreams...)
+		// Descriptive English tracks marked audioIsDefault: true placed first to ensure descriptive is excluded.
+		for _, it := range audioItags[:2] {
+			adaptive = append(adaptive, map[string]any{
+				"itag":            it.itag,
+				"mimeType":        it.mime,
+				"bitrate":         it.bitrate + 20000,
+				"audioSampleRate": "44100",
+				"audioChannels":   2,
+				"url":             "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(it.itag) + "&track=en-descriptive&n=CHALLENGE_N_18",
+				"audioTrack": map[string]any{
+					"id":             "en.desc",
+					"displayName":    "English descriptive",
+					"audioIsDefault": true,
+				},
+			})
+		}
+		for _, lg := range langs {
+			for _, it := range audioItags {
+				br := it.bitrate
+				if !lg.def {
+					br += 10000 // Give dubbed tracks slightly higher nominal bitrate to prove original still wins!
+				}
+				adaptive = append(adaptive, map[string]any{
+					"itag":            it.itag,
+					"mimeType":        it.mime,
+					"bitrate":         br,
+					"audioSampleRate": "44100",
+					"audioChannels":   2,
+					"url":             "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(it.itag) + "&track=" + lg.id + "&n=CHALLENGE_N_18",
+					"audioTrack": map[string]any{
+						"id":             lg.id,
+						"displayName":    lg.name,
+						"audioIsDefault": lg.def,
+					},
+				})
+			}
+		}
+
+		total := 1 + len(adaptive)
+		if total != 120 {
+			t.Fatalf("expected 120 total entries, got %d", total)
+		}
+		body, err := json.Marshal(map[string]any{
+			"video_id":        videoID,
+			"player_id":       "a5c2aafe",
+			"title":           "Multi-Audio 120 Stream Video",
+			"formats":         []any{progFormat},
+			"adaptiveFormats": adaptive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, status := helper.Finalize(context.Background(), body, false)
+		if status != http.StatusOK {
+			t.Fatalf("120-entry Finalize status = %d, payload = %#v", status, payload)
+		}
+		if err := unified.ValidateEnvelopeAt(payload, currentNow.Unix()); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		m4aURL, webmURL, attURL := extractAudioURLs(t, payload)
+		if !strings.Contains(m4aURL, "itag=140") || !strings.Contains(m4aURL, "track=en.4") {
+			t.Fatalf("M4A audio URL selected wrong track: %q", m4aURL)
+		}
+		if !strings.Contains(webmURL, "itag=251") || !strings.Contains(webmURL, "track=en.4") {
+			t.Fatalf("WebM audio URL selected wrong track: %q", webmURL)
+		}
+		if !strings.Contains(attURL, "itag=140") || !strings.Contains(attURL, "track=en.4") {
+			t.Fatalf("background_audio attachment selected wrong track: %q", attURL)
+		}
+	})
+
+	// Subtest 2: v1.3.1 backward compatibility (118 entries WITHOUT audioTrack and WITH duplicate itags).
+	t.Run("v1.3.1-without-audioTrack-handles-duplicate-itags-and-prefers-original-xtags", func(t *testing.T) {
+		adaptive := append([]any{}, videoStreams...)
+		// 18 languages * 4 itags = 72 audio streams + 45 video + 1 prog = 118 entries (no audioTrack field).
+		for i := 0; i < 18; i++ {
+			acont := "dubbed-auto"
+			lang := "lang" + strconv.Itoa(i)
+			if i == 12 {
+				acont = "original"
+				lang = "en"
+			}
+			for _, it := range []struct {
+				itag int
+				mime string
+				br   int
+			}{
+				{139, `audio/mp4; codecs="mp4a.40.5"`, 48000},
+				{140, `audio/mp4; codecs="mp4a.40.2"`, 128000},
+				{249, `audio/webm; codecs="opus"`, 50000},
+				{251, `audio/webm; codecs="opus"`, 160000},
+			} {
+				xtags := url.QueryEscape("acont=" + acont + ":lang=" + lang)
+				adaptive = append(adaptive, map[string]any{
+					"itag":            it.itag,
+					"mimeType":        it.mime,
+					"bitrate":         it.br,
+					"audioSampleRate": "44100",
+					"audioChannels":   2,
+					"url":             "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(it.itag) + "&xtags=" + xtags + "&n=CHALLENGE_N_18",
+				})
+			}
+		}
+		if got := 1 + len(adaptive); got != 118 {
+			t.Fatalf("expected 118 entries, got %d", got)
+		}
+		body, _ := json.Marshal(map[string]any{
+			"video_id":        videoID,
+			"player_id":       "a5c2aafe",
+			"formats":         []any{progFormat},
+			"adaptiveFormats": adaptive,
+		})
+		payload, status := helper.Finalize(context.Background(), body, false)
+		if status != http.StatusOK {
+			t.Fatalf("v1.3.1 118-entry Finalize status = %d, payload = %#v", status, payload)
+		}
+		if err := unified.ValidateEnvelopeAt(payload, currentNow.Unix()); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		m4aURL, webmURL, attURL := extractAudioURLs(t, payload)
+		if !strings.Contains(m4aURL, "acont%3Doriginal%3Alang%3Den") {
+			t.Fatalf("v1.3.1 M4A URL did not select xtags original track: %q", m4aURL)
+		}
+		if !strings.Contains(webmURL, "acont%3Doriginal%3Alang%3Den") {
+			t.Fatalf("v1.3.1 WebM URL did not select xtags original track: %q", webmURL)
+		}
+		if !strings.Contains(attURL, "acont%3Doriginal%3Alang%3Den") {
+			t.Fatalf("v1.3.1 attachment URL did not select xtags original track: %q", attURL)
+		}
+	})
+
+	// Subtest 3: Duplicate audio itags without audioTrack and without xtags keep first-seen track order.
+	t.Run("duplicate-itags-without-audioTrack-or-xtags-preserves-first-track", func(t *testing.T) {
+		body, _ := json.Marshal(map[string]any{
+			"video_id":  videoID,
+			"player_id": "a5c2aafe",
+			"formats":   []any{progFormat},
+			"adaptiveFormats": []any{
+				videoStreams[0],
+				map[string]any{
+					"itag":     140,
+					"mimeType": `audio/mp4; codecs="mp4a.40.2"`,
+					"bitrate":  128000,
+					"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=140&order=first&n=CHALLENGE_N_18",
+				},
+				map[string]any{
+					"itag":     140,
+					"mimeType": `audio/mp4; codecs="mp4a.40.2"`,
+					"bitrate":  128000,
+					"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=140&order=second&n=CHALLENGE_N_18",
+				},
+			},
+		})
+		payload, status := helper.Finalize(context.Background(), body, false)
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, payload = %#v", status, payload)
+		}
+		m4aURL, _, attURL := extractAudioURLs(t, payload)
+		if !strings.Contains(m4aURL, "order=first") || !strings.Contains(attURL, "order=first") {
+			t.Fatalf("expected first duplicate itag=140 to win, got m4a=%q att=%q", m4aURL, attURL)
+		}
+	})
 }

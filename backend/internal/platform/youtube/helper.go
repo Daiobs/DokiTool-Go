@@ -31,8 +31,8 @@ const (
 	// MaxFinalizeBodyBytes caps POST /api/youtube/finalize request bodies at 512 KiB.
 	MaxFinalizeBodyBytes = 512 << 10
 
-	// MaxFinalizeFormatEntries caps combined formats[] + adaptiveFormats[] entries at 64.
-	MaxFinalizeFormatEntries = 64
+	// MaxFinalizeFormatEntries caps combined formats[] + adaptiveFormats[] entries at 256.
+	MaxFinalizeFormatEntries = 256
 
 	// MaxFinalizeTitleRunes caps sanitized finalize title/author strings at 200 runes.
 	MaxFinalizeTitleRunes = 200
@@ -53,6 +53,7 @@ var (
 	signatureTimestampPattern = regexp.MustCompile(`(?:signatureTimestamp|sts)\s*:\s*([0-9]{5})\b`)
 	googlevideoHostPattern    = regexp.MustCompile(`^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.googlevideo\.com$`)
 	opaquePlaybackIDPattern   = regexp.MustCompile(`^o-[A-Za-z0-9_-]{40,48}$`)
+	bcp47TagPattern           = regexp.MustCompile(`^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$`)
 )
 
 // AllowYouTubePlayerFetchURL restricts server-side player JS discovery and
@@ -508,7 +509,19 @@ func AllowYouTubeThumbnailURL(raw string) bool {
 	return host == "i.ytimg.com" || strings.HasSuffix(host, ".ytimg.com") || host == "img.youtube.com"
 }
 
-// finalizeFormatInput retains only the 12 allowed format fields and discards all others.
+type finalizeAudioTrack struct {
+	ID             string
+	DisplayName    string
+	AudioIsDefault *bool
+}
+
+type rawFinalizeAudioTrack struct {
+	ID             string `json:"id"`
+	DisplayName    string `json:"displayName"`
+	AudioIsDefault *bool  `json:"audioIsDefault"`
+}
+
+// finalizeFormatInput retains only the allowed format fields and discards all others.
 type finalizeFormatInput struct {
 	Itag            int
 	URL             string
@@ -522,6 +535,7 @@ type finalizeFormatInput struct {
 	AudioQuality    string
 	AudioSampleRate string
 	AudioChannels   *int64
+	AudioTrack      *finalizeAudioTrack
 }
 
 type rawFinalizeFormatFields struct {
@@ -537,6 +551,52 @@ type rawFinalizeFormatFields struct {
 	AudioQuality    string          `json:"audioQuality"`
 	AudioSampleRate json.RawMessage `json:"audioSampleRate"`
 	AudioChannels   *int64          `json:"audioChannels"`
+	AudioTrack      json.RawMessage `json:"audioTrack"`
+}
+
+func sanitizeAudioTrackID(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) == 0 || len(trimmed) > 64 {
+		return ""
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] < 0x21 || trimmed[i] > 0x7e {
+			return ""
+		}
+	}
+	return trimmed
+}
+
+func parseOptionalAudioTrack(raw json.RawMessage) (*finalizeAudioTrack, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	var parsed rawFinalizeAudioTrack
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("trailing data in audioTrack")
+	}
+	cleanID := sanitizeAudioTrackID(parsed.ID)
+	cleanName := sanitizeFinalizeText(parsed.DisplayName, 80)
+	var isDef *bool
+	if parsed.AudioIsDefault != nil {
+		v := *parsed.AudioIsDefault
+		isDef = &v
+	}
+	if cleanID == "" && cleanName == "" && isDef == nil {
+		return nil, nil
+	}
+	return &finalizeAudioTrack{
+		ID:             cleanID,
+		DisplayName:    cleanName,
+		AudioIsDefault: isDef,
+	}, nil
 }
 
 func (f *finalizeFormatInput) UnmarshalJSON(data []byte) error {
@@ -552,6 +612,10 @@ func (f *finalizeFormatInput) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("invalid audioSampleRate: %w", err)
 	}
+	at, err := parseOptionalAudioTrack(raw.AudioTrack)
+	if err != nil {
+		return fmt.Errorf("invalid audioTrack: %w", err)
+	}
 	*f = finalizeFormatInput{
 		Itag:            raw.Itag,
 		URL:             strings.TrimSpace(raw.URL),
@@ -565,6 +629,7 @@ func (f *finalizeFormatInput) UnmarshalJSON(data []byte) error {
 		AudioQuality:    strings.TrimSpace(raw.AudioQuality),
 		AudioSampleRate: asr,
 		AudioChannels:   raw.AudioChannels,
+		AudioTrack:      at,
 	}
 	return nil
 }
@@ -669,11 +734,7 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 	allInputs = append(allInputs, req.Formats...)
 	allInputs = append(allInputs, req.AdaptiveFormats...)
 
-	entries := make([]parsedStreamEntry, 0, totalEntries)
-	var nChallenges []string
-	nSeen := make(map[string]bool)
-	var sigChallenges []string
-	sigSeen := make(map[string]bool)
+	validatedEntries := make([]parsedStreamEntry, 0, totalEntries)
 	expectedStreamID := ""
 
 	for _, item := range allInputs {
@@ -749,17 +810,9 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 				return unified.ContractError("INVALID_INPUT", "媒体链接参数 n 无效", false), http.StatusBadRequest
 			}
 			nVal = strings.TrimSpace(nVals[0])
-			if !nSeen[nVal] {
-				nSeen[nVal] = true
-				nChallenges = append(nChallenges, nVal)
-			}
-		}
-		if sigChallenge != "" && !sigSeen[sigChallenge] {
-			sigSeen[sigChallenge] = true
-			sigChallenges = append(sigChallenges, sigChallenge)
 		}
 
-		entries = append(entries, parsedStreamEntry{
+		validatedEntries = append(validatedEntries, parsedStreamEntry{
 			input:      item,
 			baseURL:    streamURL,
 			nChallenge: nVal,
@@ -768,12 +821,29 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		})
 	}
 
+	entries := filterMultiAudioStreamEntries(validatedEntries)
+	var nChallenges []string
+	nSeen := make(map[string]bool)
+	var sigChallenges []string
+	sigSeen := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.nChallenge != "" && !nSeen[entry.nChallenge] {
+			nSeen[entry.nChallenge] = true
+			nChallenges = append(nChallenges, entry.nChallenge)
+		}
+		if entry.sChallenge != "" && !sigSeen[entry.sChallenge] {
+			sigSeen[entry.sChallenge] = true
+			sigChallenges = append(sigChallenges, entry.sChallenge)
+		}
+	}
+
 	nSolved, sigSolved, err := h.sandbox.Solve(ctx, cachedPlayer.PreprocessedPlayerJS, nChallenges, sigChallenges)
 	if err != nil {
 		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube 媒体签名挑战解密失败", false), http.StatusBadGateway
 	}
 
 	ytFormats := make([]ytengine.Format, 0, len(entries))
+	itagCounts := make(map[int]int, len(entries))
 	for _, entry := range entries {
 		finalURL := entry.baseURL
 		if entry.nChallenge != "" {
@@ -802,7 +872,12 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 			return unified.ContractError("INVALID_INPUT", "解密后的媒体链接不合法", false), http.StatusBadRequest
 		}
 
-		yf, ok := convertToYTFormat(entry.input, finalURL)
+		itagCounts[entry.input.Itag]++
+		formatID := strconv.Itoa(entry.input.Itag)
+		if count := itagCounts[entry.input.Itag]; count > 1 {
+			formatID = fmt.Sprintf("%d-dup%d", entry.input.Itag, count)
+		}
+		yf, ok := convertToYTFormat(entry.input, formatID, finalURL)
 		if !ok {
 			return unified.ContractError("INVALID_INPUT", "媒体流 mimeType 或参数无效", false), http.StatusBadRequest
 		}
@@ -845,13 +920,131 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 	return payload, status
 }
 
-func convertToYTFormat(in finalizeFormatInput, resolvedURL string) (ytengine.Format, bool) {
+func isAudioOnlyMimeType(raw string) bool {
+	semi := strings.SplitN(raw, ";", 2)
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(semi[0])), "audio/")
+}
+
+func isDescriptiveAudioTrack(at *finalizeAudioTrack) bool {
+	if at == nil {
+		return false
+	}
+	combined := strings.ToLower(at.ID + " " + at.DisplayName)
+	return strings.Contains(combined, "descriptive") || strings.Contains(combined, "description")
+}
+
+func isOriginalAudioTrack(at *finalizeAudioTrack) bool {
+	if at == nil {
+		return false
+	}
+	combined := strings.ToLower(at.ID + " " + at.DisplayName)
+	return strings.Contains(combined, "original") || strings.Contains(at.DisplayName, "原声") || strings.Contains(at.DisplayName, "原音")
+}
+
+func filterMultiAudioStreamEntries(entries []parsedStreamEntry) []parsedStreamEntry {
+	hasAnyAudioTrack := false
+	hasDefaultNonDescriptive := false
+	hasOriginalNonDescriptive := false
+	hasAnyDefault := false
+	for _, e := range entries {
+		if !isAudioOnlyMimeType(e.input.MimeType) || e.input.AudioTrack == nil {
+			continue
+		}
+		hasAnyAudioTrack = true
+		at := e.input.AudioTrack
+		desc := isDescriptiveAudioTrack(at)
+		if at.AudioIsDefault != nil && *at.AudioIsDefault {
+			hasAnyDefault = true
+			if !desc {
+				hasDefaultNonDescriptive = true
+			}
+		}
+		if isOriginalAudioTrack(at) && !desc {
+			hasOriginalNonDescriptive = true
+		}
+	}
+	if !hasAnyAudioTrack || (!hasDefaultNonDescriptive && !hasOriginalNonDescriptive && !hasAnyDefault) {
+		return entries
+	}
+	filtered := make([]parsedStreamEntry, 0, len(entries))
+	for _, e := range entries {
+		if !isAudioOnlyMimeType(e.input.MimeType) {
+			filtered = append(filtered, e)
+			continue
+		}
+		at := e.input.AudioTrack
+		switch {
+		case hasDefaultNonDescriptive:
+			if at != nil && at.AudioIsDefault != nil && *at.AudioIsDefault && !isDescriptiveAudioTrack(at) {
+				filtered = append(filtered, e)
+			}
+		case hasOriginalNonDescriptive:
+			if isOriginalAudioTrack(at) && !isDescriptiveAudioTrack(at) {
+				filtered = append(filtered, e)
+			}
+		case hasAnyDefault:
+			if at != nil && at.AudioIsDefault != nil && *at.AudioIsDefault {
+				filtered = append(filtered, e)
+			}
+		}
+	}
+	return filtered
+}
+
+func extractBaseBCP47Language(rawID string) string {
+	base, _, _ := strings.Cut(strings.TrimSpace(rawID), ".")
+	if bcp47TagPattern.MatchString(base) {
+		return base
+	}
+	return ""
+}
+
+func parseXtagsAudioHints(rawURL string) (lang string, pref *int) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.RawQuery == "" {
+		return "", nil
+	}
+	xtags := strings.TrimSpace(u.Query().Get("xtags"))
+	if xtags == "" {
+		return "", nil
+	}
+	for _, kv := range strings.Split(xtags, ":") {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "lang":
+			if candidate := extractBaseBCP47Language(v); candidate != "" {
+				lang = candidate
+			}
+		case "acont":
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "original":
+				p := 10
+				pref = &p
+			case "descriptive":
+				p := -20
+				pref = &p
+			case "dubbed", "dubbed-auto", "secondary":
+				p := -10
+				pref = &p
+			}
+		}
+	}
+	return lang, pref
+}
+
+func convertToYTFormat(in finalizeFormatInput, formatID, resolvedURL string) (ytengine.Format, bool) {
 	ext, vcodec, acodec, hdr, ok := parseYouTubeMimeType(in.MimeType)
 	if !ok {
 		return ytengine.Format{}, false
 	}
+	if formatID == "" {
+		formatID = strconv.Itoa(in.Itag)
+	}
 	f := ytengine.Format{
-		FormatID:     strconv.Itoa(in.Itag),
+		FormatID:     formatID,
 		URL:          resolvedURL,
 		Ext:          ext,
 		Protocol:     "https",
@@ -859,6 +1052,32 @@ func convertToYTFormat(in finalizeFormatInput, resolvedURL string) (ytengine.For
 		ACodec:       acodec,
 		DynamicRange: hdr,
 		FormatNote:   in.AudioQuality,
+	}
+	if vcodec == "none" && acodec != "none" {
+		if in.AudioTrack != nil {
+			if lang := extractBaseBCP47Language(in.AudioTrack.ID); lang != "" {
+				f.Language = lang
+			}
+			switch {
+			case isDescriptiveAudioTrack(in.AudioTrack):
+				p := -20
+				f.LanguagePreference = &p
+			case (in.AudioTrack.AudioIsDefault != nil && *in.AudioTrack.AudioIsDefault) || isOriginalAudioTrack(in.AudioTrack):
+				p := 10
+				f.LanguagePreference = &p
+			case in.AudioTrack.AudioIsDefault != nil && !*in.AudioTrack.AudioIsDefault:
+				p := -10
+				f.LanguagePreference = &p
+			}
+		} else {
+			lang, pref := parseXtagsAudioHints(resolvedURL)
+			if lang != "" {
+				f.Language = lang
+			}
+			if pref != nil {
+				f.LanguagePreference = pref
+			}
+		}
 	}
 	if in.Width != nil && *in.Width > 0 {
 		w := *in.Width
