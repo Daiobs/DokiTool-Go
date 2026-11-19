@@ -146,8 +146,9 @@ func TestUniversalAdapterBlocksPrivateIPResolution(t *testing.T) {
 		if unified.Str(payload["code"]) != "UPSTREAM_BLOCKED" {
 			t.Fatalf("expected UPSTREAM_BLOCKED when input host resolves to %s, got %v", privateIP, payload["code"])
 		}
-		if parser.AllowedMediaURL("https://cdn.vimeocdn.com/video.mp4") {
-			t.Fatalf("expected AllowedMediaURL to reject media host resolving to %s", privateIP)
+		// Media URLs are browser-side links: allowlist syntax only, no DNS.
+		if !parser.AllowedMediaURL("https://cdn.vimeocdn.com/video.mp4") {
+			t.Fatalf("expected syntax-only AllowedMediaURL to accept allowlisted media host (resolver=%s)", privateIP)
 		}
 	}
 }
@@ -948,7 +949,7 @@ func (f funcResolver) LookupNetIP(ctx context.Context, network, host string) ([]
 	return f(ctx, network, host)
 }
 
-func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
+func TestParserInputDNSBoundedAndMediaHostsSyntaxOnly(t *testing.T) {
 	const now int64 = 1762300800
 	publicAddr := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
 	fbSpec, ok := LookupSite("facebook")
@@ -956,10 +957,8 @@ func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
 		t.Fatal("missing facebook spec")
 	}
 
-	// (a) Canceled ctx in Parse(ctx) returns immediately without blocking on a hung DNS resolver
-	//     (both during input host DNS lookup and during media CDN host DNS lookup).
-	t.Run("canceled-ctx-returns-immediately-on-hung-dns", func(t *testing.T) {
-		// Case a1: hung DNS during input host lookup.
+	// (a) A canceled ctx returns immediately even if the input-host DNS lookup hangs.
+	t.Run("canceled-ctx-returns-immediately-on-hung-input-dns", func(t *testing.T) {
 		inputDNSStarted := make(chan struct{})
 		hungInputResolver := funcResolver(func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
 			select {
@@ -970,75 +969,25 @@ func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		})
-		pInput := NewWithResolver(fbSpec, &stubExtractor{enabled: true}, nil, hungInputResolver)
-		ctx1, cancel1 := context.WithCancel(context.Background())
-		done1 := make(chan error, 1)
+		p := NewWithResolver(fbSpec, &stubExtractor{enabled: true}, nil, hungInputResolver)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
 		go func() {
-			_, err := pInput.Parse(ctx1, "https://www.facebook.com/watch/?v=647537299265662", now)
-			done1 <- err
+			_, err := p.Parse(ctx, "https://www.facebook.com/watch/?v=647537299265662", now)
+			done <- err
 		}()
 		<-inputDNSStarted
-		tStart1 := time.Now()
-		cancel1()
-		err1 := <-done1
-		if !errors.Is(err1, context.Canceled) || time.Since(tStart1) >= 200*time.Millisecond {
-			t.Fatalf("canceled input DNS Parse err=%v elapsed=%v, want context.Canceled in <200ms", err1, time.Since(tStart1))
-		}
-
-		// Case a2: hung DNS during media CDN host lookup after Extract returns.
-		mediaDNSStarted := make(chan struct{})
-		hungMediaResolver := funcResolver(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
-			if host == "www.facebook.com" {
-				return publicAddr, nil
-			}
-			select {
-			case <-mediaDNSStarted:
-			default:
-				close(mediaDNSStarted)
-			}
-			<-ctx.Done()
-			return nil, ctx.Err()
-		})
-		w, h := int64(1280), int64(720)
-		sz := int64(4096000)
-		pMedia := NewWithResolver(fbSpec, &stubExtractor{
-			enabled: true,
-			extract: func(context.Context, string) (*ytengine.Info, error) {
-				return &ytengine.Info{
-					ID:        "647537299265662",
-					Title:     "Hung Media DNS",
-					Thumbnail: "https://scontent-nrt1-2.xx.fbcdn.net/v/thumb.jpg",
-					Formats: []ytengine.Format{
-						{
-							FormatID: "hd",
-							URL:      "https://video-nrt6-1.xx.fbcdn.net/o1/v/t2/f2/m366/hd.mp4",
-							Ext:      "mp4",
-							Protocol: "https",
-							Width:    &w,
-							Height:   &h,
-							Filesize: &sz,
-						},
-					},
-				}, nil
-			},
-		}, nil, hungMediaResolver)
-		ctx2, cancel2 := context.WithCancel(context.Background())
-		done2 := make(chan error, 1)
-		go func() {
-			_, err := pMedia.Parse(ctx2, "https://www.facebook.com/watch/?v=647537299265662", now)
-			done2 <- err
-		}()
-		<-mediaDNSStarted
-		tStart2 := time.Now()
-		cancel2()
-		err2 := <-done2
-		if !errors.Is(err2, context.Canceled) || time.Since(tStart2) >= 200*time.Millisecond {
-			t.Fatalf("canceled media DNS Parse err=%v elapsed=%v, want context.Canceled in <200ms", err2, time.Since(tStart2))
+		start := time.Now()
+		cancel()
+		err := <-done
+		if !errors.Is(err, context.Canceled) || time.Since(start) >= 200*time.Millisecond {
+			t.Fatalf("canceled input DNS Parse err=%v elapsed=%v, want context.Canceled in <200ms", err, time.Since(start))
 		}
 	})
 
-	// (b) 15+ formats and thumbnails on the same CDN hostname invoke the DNS resolver ONLY ONCE per Parse.
-	t.Run("per-request-host-cache-deduplicates-18-formats-and-thumbnails", func(t *testing.T) {
+	// (b) Only the input host is resolved (with a deadline); 18 formats plus
+	// thumbnails on CDN hosts trigger zero additional DNS lookups.
+	t.Run("only-input-host-resolved", func(t *testing.T) {
 		var (
 			mu         sync.Mutex
 			hostCounts = make(map[string]int)
@@ -1108,14 +1057,15 @@ func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
 		cdnCount := hostCounts[cdnHost]
 		fbCount := hostCounts["www.facebook.com"]
 		mu.Unlock()
-		if cdnCount != 1 || fbCount != 1 || totalCalls.Load() != 2 {
-			t.Fatalf("expected exactly 1 DNS lookup for %s and 1 for www.facebook.com (total=2), got cdn=%d fb=%d total=%d", cdnHost, cdnCount, fbCount, totalCalls.Load())
+		if cdnCount != 0 || fbCount != 1 || totalCalls.Load() != 1 {
+			t.Fatalf("expected exactly 1 DNS lookup (www.facebook.com), got cdn=%d fb=%d total=%d", cdnCount, fbCount, totalCalls.Load())
 		}
 	})
 
-	// (c) Private/loopback IP resolution is still rejected even when input host is public
-	//     and formats already carry filesize > 0 (bypassing PopulateMissingMP4Sizes) or thumbnails.
-	t.Run("private-ip-media-and-thumbnails-rejected-even-with-filesize", func(t *testing.T) {
+	// (c) Media/cover hosts that a fake-IP or DNS64 resolver maps to
+	// non-public addresses are still delivered: the browser downloads them and
+	// the server never fetches them without fetch.Client's own DNS checks.
+	t.Run("fake-ip-media-hosts-still-delivered", func(t *testing.T) {
 		spec := SiteSpec{
 			PlatformID:      "vimeo",
 			Name:            "Vimeo",
@@ -1125,89 +1075,42 @@ func TestParserContextBoundedHostCachedPublicDNSValidation(t *testing.T) {
 		}
 		w, h := int64(1920), int64(1080)
 		sz := int64(12345678)
-
-		for _, privateIP := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1"} {
-			privAddr := []netip.Addr{netip.MustParseAddr(privateIP)}
-			// Case c1: media CDN resolves to private IP with filesize > 0 -> NO_MEDIA.
-			pBlockedMedia := NewWithResolver(spec, &stubExtractor{
-				enabled: true,
-				extract: func(context.Context, string) (*ytengine.Info, error) {
-					return &ytengine.Info{
-						ID:        "999888",
-						Title:     "Private CDN Test",
-						Thumbnail: "https://i.vimeocdn.com/video/thumb.jpg",
-						Formats: []ytengine.Format{
-							{
-								FormatID: "http-1080p",
-								URL:      "https://cdn.vimeocdn.com/exp=1/sample1080.mp4",
-								Ext:      "mp4",
-								Protocol: "https",
-								Width:    &w,
-								Height:   &h,
-								VCodec:   "avc1.640028",
-								ACodec:   "mp4a.40.2",
-								Filesize: &sz,
-							},
-						},
-					}, nil
-				},
-			}, nil, stubResolver{
-				ips: map[string][]netip.Addr{
-					"vimeo.com":        publicAddr,
-					"cdn.vimeocdn.com": privAddr,
-					"i.vimeocdn.com":   privAddr,
-				},
-			})
-			res, err := pBlockedMedia.Parse(context.Background(), "https://vimeo.com/999888", now)
-			if err != nil {
-				t.Fatalf("unexpected error for %s: %v", privateIP, err)
-			}
-			if unified.Str(res["code"]) != "NO_MEDIA" {
-				t.Fatalf("expected NO_MEDIA when filesize>0 format host resolves to %s, got %v", privateIP, res)
-			}
-
-			// Case c2: video CDN is public, but thumbnail CDN resolves to private IP -> cover stripped!
-			pPrivateThumb := NewWithResolver(spec, &stubExtractor{
-				enabled: true,
-				extract: func(context.Context, string) (*ytengine.Info, error) {
-					return &ytengine.Info{
-						ID:        "999889",
-						Title:     "Private Thumb Test",
-						Thumbnail: "https://priv-thumb.vimeocdn.com/video/secret.jpg",
-						Thumbnails: []ytengine.Thumbnail{
-							{ID: "t1", URL: "https://priv-thumb.vimeocdn.com/video/secret2.jpg"},
-						},
-						Formats: []ytengine.Format{
-							{
-								FormatID: "http-1080p",
-								URL:      "https://pub-cdn.vimeocdn.com/exp=1/sample1080.mp4",
-								Ext:      "mp4",
-								Protocol: "https",
-								Width:    &w,
-								Height:   &h,
-								VCodec:   "avc1.640028",
-								ACodec:   "mp4a.40.2",
-								Filesize: &sz,
-							},
-						},
-					}, nil
-				},
-			}, nil, stubResolver{
-				ips: map[string][]netip.Addr{
-					"vimeo.com":               publicAddr,
-					"pub-cdn.vimeocdn.com":    publicAddr,
-					"priv-thumb.vimeocdn.com": privAddr,
-				},
-			})
-			resThumb, err := pPrivateThumb.Parse(context.Background(), "https://vimeo.com/999889", now)
-			if err != nil || unified.Str(resThumb["code"]) != "OK" {
-				t.Fatalf("expected OK with stripped private thumbnail for %s, got res=%v err=%v", privateIP, resThumb, err)
-			}
-			data := unified.Map(resThumb["data"])
-			item := unified.Map(unified.Slice(data["items"])[0])
-			if data["cover_url"] != nil || item["cover_url"] != nil {
-				t.Fatalf("private-IP thumbnail leaked into envelope for %s: data.cover_url=%v item.cover_url=%v", privateIP, data["cover_url"], item["cover_url"])
-			}
+		fakeIP := []netip.Addr{netip.MustParseAddr("198.18.0.7")}
+		p := NewWithResolver(spec, &stubExtractor{
+			enabled: true,
+			extract: func(context.Context, string) (*ytengine.Info, error) {
+				return &ytengine.Info{
+					ID:        "999889",
+					Title:     "Fake-IP CDN",
+					Thumbnail: "https://i.vimeocdn.com/video/thumb.jpg",
+					Formats: []ytengine.Format{{
+						FormatID: "http-1080p",
+						URL:      "https://cdn.vimeocdn.com/exp=1/sample1080.mp4",
+						Ext:      "mp4",
+						Protocol: "https",
+						Width:    &w,
+						Height:   &h,
+						VCodec:   "avc1.640028",
+						ACodec:   "mp4a.40.2",
+						Filesize: &sz,
+					}},
+				}, nil
+			},
+		}, nil, stubResolver{ips: map[string][]netip.Addr{
+			"vimeo.com":        publicAddr,
+			"cdn.vimeocdn.com": fakeIP,
+			"i.vimeocdn.com":   fakeIP,
+		}})
+		res, err := p.Parse(context.Background(), "https://vimeo.com/999889", now)
+		if err != nil || unified.Str(res["code"]) != "OK" {
+			t.Fatalf("expected OK, got res=%v err=%v", res, err)
+		}
+		if unified.Map(res["data"])["cover"] == nil {
+			t.Fatalf("expected cover to be kept, got %v", res["data"])
+		}
+		// Syntax rules still apply: off-allowlist hosts and IP literals are rejected.
+		if p.AllowedMediaURL("https://evil.example.com/a.mp4") || p.AllowedMediaURL("https://10.0.0.1/a.mp4") {
+			t.Fatal("expected off-allowlist or IP-literal media URLs to be rejected")
 		}
 	})
 }
@@ -1406,8 +1309,10 @@ func TestSizeProberRealWiringMatchMediaURLAndSSRF(t *testing.T) {
 		fbDNS := hostCounts["www.facebook.com"]
 		cdnDNS := hostCounts[cdnHost]
 		dnsMu.Unlock()
-		if fbDNS != 1 || cdnDNS != 1 || totalDNS.Load() != 2 {
-			t.Fatalf("Parse DNS counts: fb=%d cdn=%d total=%d, want 1/1/2", fbDNS, cdnDNS, totalDNS.Load())
+		// Only the yt-dlp input host is resolved by Parse; media hosts are
+		// resolved solely inside fetch.Client when actually probed.
+		if fbDNS != 1 || cdnDNS != 0 || totalDNS.Load() != 1 {
+			t.Fatalf("Parse DNS counts: fb=%d cdn=%d total=%d, want 1/0/1", fbDNS, cdnDNS, totalDNS.Load())
 		}
 		if got := probeHTTPCalls.Load(); got != 6 {
 			t.Fatalf("expected 6 HTTP Range size probes, got %d", got)
@@ -1525,7 +1430,8 @@ func TestSizeProberRealWiringMatchMediaURLAndSSRF(t *testing.T) {
 				t.Fatalf("%s: expected fetch.Client resolver to be consulted once before rejecting private IP, got %d", tc.name, resolverCalls.Load())
 			}
 
-			// End-to-end Parse with the same real-wiring SizeProber + privResolver rejects media as NO_MEDIA.
+			// End-to-end Parse: the browser-side link is still returned, but the
+			// server never fetched it, so no probed size is attached.
 			w, h := int64(1280), int64(720)
 			adapter := NewWithResolver(fbSpec, &stubExtractor{
 				enabled: true,
@@ -1553,8 +1459,14 @@ func TestSizeProberRealWiringMatchMediaURLAndSSRF(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: unexpected error: %v", tc.name, err)
 			}
-			if unified.Str(res["code"]) != "NO_MEDIA" {
-				t.Fatalf("%s: expected NO_MEDIA when whitelisted CDN resolves to %v, got %v", tc.name, tc.addrs, res)
+			if unified.Str(res["code"]) != "OK" {
+				t.Fatalf("%s: expected OK browser-side link when CDN resolves to %v, got %v", tc.name, tc.addrs, res)
+			}
+			item := unified.Map(unified.Slice(unified.Map(res["data"])["items"])[0])
+			variant := unified.Map(unified.Slice(item["variants"])[0])
+			src := unified.Map(unified.Slice(unified.Map(variant["delivery"])["sources"])[0])
+			if _, probed := src["size_bytes"]; probed {
+				t.Fatalf("%s: private-IP probe must not yield size_bytes, got %v", tc.name, src)
 			}
 		}
 	})
