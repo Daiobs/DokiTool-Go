@@ -933,37 +933,87 @@ func isDescriptiveAudioTrack(at *finalizeAudioTrack) bool {
 	return strings.Contains(combined, "descriptive") || strings.Contains(combined, "description")
 }
 
+func isDubbedAudioTrack(at *finalizeAudioTrack) bool {
+	if at == nil {
+		return false
+	}
+	combined := strings.ToLower(at.ID + " " + at.DisplayName)
+	return strings.Contains(combined, "dubbed") || strings.Contains(combined, "配音")
+}
+
 func isOriginalAudioTrack(at *finalizeAudioTrack) bool {
 	if at == nil {
 		return false
 	}
 	combined := strings.ToLower(at.ID + " " + at.DisplayName)
-	return strings.Contains(combined, "original") || strings.Contains(at.DisplayName, "原声") || strings.Contains(at.DisplayName, "原音")
+	return strings.Contains(combined, "original") || strings.Contains(combined, "原声") || strings.Contains(combined, "原音")
+}
+
+type xtagsAudioHints struct {
+	lang          string
+	isOriginal    bool
+	isDescriptive bool
+	isDubbed      bool
+}
+
+type audioStreamClassification struct {
+	hints         xtagsAudioHints
+	hasHint       bool
+	isOriginal    bool
+	isDescriptive bool
+	isDubbed      bool
+	isDefault     bool
+	hasDefault    bool
+}
+
+func classifyAudioStream(at *finalizeAudioTrack, rawURL string) audioStreamClassification {
+	hints := parseXtagsAudioHints(rawURL)
+	isDesc := hints.isDescriptive || isDescriptiveAudioTrack(at)
+	isDub := hints.isDubbed || isDubbedAudioTrack(at)
+	isOrig := hints.isOriginal || isOriginalAudioTrack(at)
+	hasDef := at != nil && at.AudioIsDefault != nil
+	isDef := hasDef && *at.AudioIsDefault
+	hasHint := at != nil || hints.isOriginal || hints.isDescriptive || hints.isDubbed
+	return audioStreamClassification{
+		hints:         hints,
+		hasHint:       hasHint,
+		isOriginal:    isOrig,
+		isDescriptive: isDesc,
+		isDubbed:      isDub,
+		isDefault:     isDef,
+		hasDefault:    hasDef,
+	}
 }
 
 func filterMultiAudioStreamEntries(entries []parsedStreamEntry) []parsedStreamEntry {
-	hasAnyAudioTrack := false
+	hasAnyHint := false
+	hasOriginalClean := false
+	hasDefaultClean := false
 	hasDefaultNonDescriptive := false
-	hasOriginalNonDescriptive := false
 	hasAnyDefault := false
 	for _, e := range entries {
-		if !isAudioOnlyMimeType(e.input.MimeType) || e.input.AudioTrack == nil {
+		if !isAudioOnlyMimeType(e.input.MimeType) {
 			continue
 		}
-		hasAnyAudioTrack = true
-		at := e.input.AudioTrack
-		desc := isDescriptiveAudioTrack(at)
-		if at.AudioIsDefault != nil && *at.AudioIsDefault {
+		c := classifyAudioStream(e.input.AudioTrack, e.baseURL)
+		if !c.hasHint {
+			continue
+		}
+		hasAnyHint = true
+		if c.isOriginal && !c.isDescriptive && !c.isDubbed {
+			hasOriginalClean = true
+		}
+		if c.isDefault {
 			hasAnyDefault = true
-			if !desc {
+			if !c.isDescriptive {
 				hasDefaultNonDescriptive = true
+				if !c.isDubbed {
+					hasDefaultClean = true
+				}
 			}
 		}
-		if isOriginalAudioTrack(at) && !desc {
-			hasOriginalNonDescriptive = true
-		}
 	}
-	if !hasAnyAudioTrack || (!hasDefaultNonDescriptive && !hasOriginalNonDescriptive && !hasAnyDefault) {
+	if !hasAnyHint || (!hasOriginalClean && !hasDefaultClean && !hasDefaultNonDescriptive && !hasAnyDefault) {
 		return entries
 	}
 	filtered := make([]parsedStreamEntry, 0, len(entries))
@@ -972,18 +1022,22 @@ func filterMultiAudioStreamEntries(entries []parsedStreamEntry) []parsedStreamEn
 			filtered = append(filtered, e)
 			continue
 		}
-		at := e.input.AudioTrack
+		c := classifyAudioStream(e.input.AudioTrack, e.baseURL)
 		switch {
-		case hasDefaultNonDescriptive:
-			if at != nil && at.AudioIsDefault != nil && *at.AudioIsDefault && !isDescriptiveAudioTrack(at) {
+		case hasOriginalClean:
+			if c.isOriginal && !c.isDescriptive && !c.isDubbed {
 				filtered = append(filtered, e)
 			}
-		case hasOriginalNonDescriptive:
-			if isOriginalAudioTrack(at) && !isDescriptiveAudioTrack(at) {
+		case hasDefaultClean:
+			if c.isDefault && !c.isDescriptive && !c.isDubbed {
+				filtered = append(filtered, e)
+			}
+		case hasDefaultNonDescriptive:
+			if c.isDefault && !c.isDescriptive {
 				filtered = append(filtered, e)
 			}
 		case hasAnyDefault:
-			if at != nil && at.AudioIsDefault != nil && *at.AudioIsDefault {
+			if c.isDefault {
 				filtered = append(filtered, e)
 			}
 		}
@@ -999,14 +1053,15 @@ func extractBaseBCP47Language(rawID string) string {
 	return ""
 }
 
-func parseXtagsAudioHints(rawURL string) (lang string, pref *int) {
+func parseXtagsAudioHints(rawURL string) xtagsAudioHints {
+	var hints xtagsAudioHints
 	u, err := url.Parse(rawURL)
 	if err != nil || u.RawQuery == "" {
-		return "", nil
+		return hints
 	}
 	xtags := strings.TrimSpace(u.Query().Get("xtags"))
 	if xtags == "" {
-		return "", nil
+		return hints
 	}
 	for _, kv := range strings.Split(xtags, ":") {
 		k, v, ok := strings.Cut(kv, "=")
@@ -1016,23 +1071,23 @@ func parseXtagsAudioHints(rawURL string) (lang string, pref *int) {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "lang":
 			if candidate := extractBaseBCP47Language(v); candidate != "" {
-				lang = candidate
+				hints.lang = candidate
 			}
 		case "acont":
+			hints.isOriginal = false
+			hints.isDescriptive = false
+			hints.isDubbed = false
 			switch strings.ToLower(strings.TrimSpace(v)) {
 			case "original":
-				p := 10
-				pref = &p
+				hints.isOriginal = true
 			case "descriptive":
-				p := -20
-				pref = &p
+				hints.isDescriptive = true
 			case "dubbed", "dubbed-auto", "secondary":
-				p := -10
-				pref = &p
+				hints.isDubbed = true
 			}
 		}
 	}
-	return lang, pref
+	return hints
 }
 
 func convertToYTFormat(in finalizeFormatInput, formatID, resolvedURL string) (ytengine.Format, bool) {
@@ -1054,29 +1109,28 @@ func convertToYTFormat(in finalizeFormatInput, formatID, resolvedURL string) (yt
 		FormatNote:   in.AudioQuality,
 	}
 	if vcodec == "none" && acodec != "none" {
+		c := classifyAudioStream(in.AudioTrack, resolvedURL)
 		if in.AudioTrack != nil {
 			if lang := extractBaseBCP47Language(in.AudioTrack.ID); lang != "" {
 				f.Language = lang
 			}
-			switch {
-			case isDescriptiveAudioTrack(in.AudioTrack):
-				p := -20
-				f.LanguagePreference = &p
-			case (in.AudioTrack.AudioIsDefault != nil && *in.AudioTrack.AudioIsDefault) || isOriginalAudioTrack(in.AudioTrack):
-				p := 10
-				f.LanguagePreference = &p
-			case in.AudioTrack.AudioIsDefault != nil && !*in.AudioTrack.AudioIsDefault:
-				p := -10
-				f.LanguagePreference = &p
-			}
-		} else {
-			lang, pref := parseXtagsAudioHints(resolvedURL)
-			if lang != "" {
-				f.Language = lang
-			}
-			if pref != nil {
-				f.LanguagePreference = pref
-			}
+		}
+		if f.Language == "" && c.hints.lang != "" {
+			f.Language = c.hints.lang
+		}
+		switch {
+		case c.isOriginal && !c.isDescriptive && !c.isDubbed:
+			p := 20
+			f.LanguagePreference = &p
+		case c.isDefault && !c.isDescriptive && !c.isDubbed:
+			p := 10
+			f.LanguagePreference = &p
+		case c.isDescriptive:
+			p := -20
+			f.LanguagePreference = &p
+		case c.isDubbed || (c.hasDefault && !c.isDefault):
+			p := -10
+			f.LanguagePreference = &p
 		}
 	}
 	if in.Width != nil && *in.Width > 0 {

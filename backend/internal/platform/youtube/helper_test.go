@@ -1087,4 +1087,117 @@ func TestYouTubeHelperMultiAudio120EntriesAndV131Compatibility(t *testing.T) {
 			t.Fatalf("expected first duplicate itag=140 to win, got m4a=%q att=%q", m4aURL, attURL)
 		}
 	})
+
+	// Subtest 4: Non-English original track (ja.4, audioIsDefault: false) wins over hl="en" English AI auto-dub (en.3, audioIsDefault: true).
+	t.Run("non-english-original-track-wins-over-hl-en-auto-dub-marked-default", func(t *testing.T) {
+		audioItags := []struct {
+			itag    int
+			mime    string
+			bitrate int
+		}{
+			{139, `audio/mp4; codecs="mp4a.40.5"`, 48000},
+			{140, `audio/mp4; codecs="mp4a.40.2"`, 128000},
+			{249, `audio/webm; codecs="opus"`, 50000},
+			{251, `audio/webm; codecs="opus"`, 160000},
+		}
+		adaptive := append([]any{}, videoStreams[:5]...)
+		for _, it := range audioItags {
+			adaptive = append(adaptive, map[string]any{
+				"itag":            it.itag,
+				"mimeType":        it.mime,
+				"bitrate":         it.bitrate + 16000, // Give English auto-dub higher nominal bitrate and earlier position
+				"audioSampleRate": "48000",
+				"audioChannels":   2,
+				"url":             "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(it.itag) + "&xtags=acont%3Ddubbed-auto%3Alang%3Den&n=CHALLENGE_N_18",
+				"audioTrack": map[string]any{
+					"id":             "en.3",
+					"displayName":    "English (auto-dubbed)",
+					"audioIsDefault": true,
+				},
+			})
+		}
+		for _, it := range audioItags {
+			adaptive = append(adaptive, map[string]any{
+				"itag":            it.itag,
+				"mimeType":        it.mime,
+				"bitrate":         it.bitrate,
+				"audioSampleRate": "48000",
+				"audioChannels":   2,
+				"url":             "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=" + strconv.Itoa(it.itag) + "&xtags=acont%3Doriginal%3Alang%3Dja&n=CHALLENGE_N_18",
+				"audioTrack": map[string]any{
+					"id":             "ja.4",
+					"displayName":    "Japanese original",
+					"audioIsDefault": false,
+				},
+			})
+		}
+
+		body, err := json.Marshal(map[string]any{
+			"video_id":        videoID,
+			"player_id":       "a5c2aafe",
+			"title":           "Japanese Original Video",
+			"formats":         []any{progFormat},
+			"adaptiveFormats": adaptive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, status := helper.Finalize(context.Background(), body, false)
+		if status != http.StatusOK {
+			t.Fatalf("Finalize status = %d, payload = %#v", status, payload)
+		}
+		if err := unified.ValidateEnvelopeAt(payload, currentNow.Unix()); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		m4aURL, webmURL, attURL := extractAudioURLs(t, payload)
+		if !strings.Contains(m4aURL, "itag=140") || !strings.Contains(m4aURL, "acont%3Doriginal%3Alang%3Dja") {
+			t.Fatalf("M4A audio URL selected wrong track (expected ja.4 original): %q", m4aURL)
+		}
+		if !strings.Contains(webmURL, "itag=251") || !strings.Contains(webmURL, "acont%3Doriginal%3Alang%3Dja") {
+			t.Fatalf("WebM audio URL selected wrong track (expected ja.4 original): %q", webmURL)
+		}
+		if !strings.Contains(attURL, "itag=140") || !strings.Contains(attURL, "acont%3Doriginal%3Alang%3Dja") {
+			t.Fatalf("background_audio attachment selected wrong track (expected ja.4 original): %q", attURL)
+		}
+	})
+
+	// Subtest 5: convertToYTFormat always combines AudioTrack with parseXtagsAudioHints.
+	t.Run("convertToYTFormat-combines-audioTrack-and-xtags-preferences", func(t *testing.T) {
+		boolVal := func(v bool) *bool { return &v }
+		jaOrig, ok := convertToYTFormat(finalizeFormatInput{
+			Itag:       140,
+			MimeType:   `audio/mp4; codecs="mp4a.40.2"`,
+			AudioTrack: &finalizeAudioTrack{ID: "", DisplayName: "原声", AudioIsDefault: boolVal(false)},
+		}, "140", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id="+videoID+"&itag=140&xtags=acont%3Doriginal%3Alang%3Dja")
+		if !ok || jaOrig.Language != "ja" || jaOrig.LanguagePreference == nil || *jaOrig.LanguagePreference != 20 {
+			t.Fatalf("expected jaOrig Language=ja LanguagePreference=20, got ok=%v lang=%q pref=%v", ok, jaOrig.Language, jaOrig.LanguagePreference)
+		}
+
+		cleanDef, ok := convertToYTFormat(finalizeFormatInput{
+			Itag:       140,
+			MimeType:   `audio/mp4; codecs="mp4a.40.2"`,
+			AudioTrack: &finalizeAudioTrack{ID: "en.4", DisplayName: "English", AudioIsDefault: boolVal(true)},
+		}, "140", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id="+videoID+"&itag=140")
+		if !ok || cleanDef.Language != "en" || cleanDef.LanguagePreference == nil || *cleanDef.LanguagePreference != 10 {
+			t.Fatalf("expected cleanDef Language=en LanguagePreference=10, got ok=%v lang=%q pref=%v", ok, cleanDef.Language, cleanDef.LanguagePreference)
+		}
+
+		enAutoDub, ok := convertToYTFormat(finalizeFormatInput{
+			Itag:       140,
+			MimeType:   `audio/mp4; codecs="mp4a.40.2"`,
+			AudioTrack: &finalizeAudioTrack{ID: "en.3", DisplayName: "English", AudioIsDefault: boolVal(true)},
+		}, "140-dup2", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id="+videoID+"&itag=140&xtags=acont%3Ddubbed-auto%3Alang%3Den")
+		if !ok || enAutoDub.Language != "en" || enAutoDub.LanguagePreference == nil || *enAutoDub.LanguagePreference != -10 {
+			t.Fatalf("expected enAutoDub Language=en LanguagePreference=-10 even when audioIsDefault=true, got ok=%v lang=%q pref=%v", ok, enAutoDub.Language, enAutoDub.LanguagePreference)
+		}
+
+		enDesc, ok := convertToYTFormat(finalizeFormatInput{
+			Itag:       140,
+			MimeType:   `audio/mp4; codecs="mp4a.40.2"`,
+			AudioTrack: &finalizeAudioTrack{ID: "en.desc", DisplayName: "English descriptive", AudioIsDefault: boolVal(true)},
+		}, "140-dup3", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id="+videoID+"&itag=140")
+		if !ok || enDesc.LanguagePreference == nil || *enDesc.LanguagePreference > -10 {
+			t.Fatalf("expected descriptive track LanguagePreference <= -10, got ok=%v pref=%v", ok, enDesc.LanguagePreference)
+		}
+	})
 }

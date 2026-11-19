@@ -428,4 +428,72 @@ func TestShortLinkSecondHopSecurityRedirectRetainsNoteURLAndMapsUpstreamBlocked(
 			})
 		}
 	})
+
+	t.Run("direct-403-on-canonical-landing-skips-xhs-retry-and-falls-back-straight-to-rednote", func(t *testing.T) {
+		for _, rednoteSucceeds := range []bool{true, false} {
+			name := "rednote-200"
+			if !rednoteSucceeds {
+				name = "rednote-404-still-skips-xhs-retry"
+			}
+			t.Run(name, func(t *testing.T) {
+				var pageURLs []string
+				p := New(requestFunc(func(_ context.Context, r fetch.Request) (fetch.Response, error) {
+					pageURLs = append(pageURLs, r.URL)
+					switch r.URL {
+					case shortURL:
+						return fetch.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {canonicalURL}},
+							URL:        r.URL,
+						}, nil
+					case canonicalURL:
+						return fetch.Response{
+							StatusCode: http.StatusForbidden,
+							Body:       []byte(`<html><body>403 forbidden</body></html>`),
+							URL:        r.URL,
+						}, nil
+					case rednoteURL:
+						if rednoteSucceeds {
+							return fetch.Response{
+								StatusCode: http.StatusOK,
+								Body:       []byte(noteHTML),
+								URL:        r.URL,
+							}, nil
+						}
+						return fetch.Response{
+							StatusCode: http.StatusNotFound,
+							Body:       []byte(`<html><body>not found</body></html>`),
+							URL:        r.URL,
+						}, nil
+					default:
+						t.Fatalf("unexpected request URL: %s", r.URL)
+						return fetch.Response{}, nil
+					}
+				}))
+				got, err := p.Parse(context.Background(), shortURL, now)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				// Exactly 1 request to shortURL + 1 request to xiaohongshu + 1 fallback request to rednote (no second xiaohongshu fetch!)
+				wantOrder := []string{shortURL, canonicalURL, rednoteURL}
+				if len(pageURLs) != len(wantOrder) {
+					t.Fatalf("pageURLs = %v, want %v", pageURLs, wantOrder)
+				}
+				for i, want := range wantOrder {
+					if pageURLs[i] != want {
+						t.Fatalf("pageURLs[%d] = %q, want %q", i, pageURLs[i], want)
+					}
+				}
+				if rednoteSucceeds {
+					if unified.Str(got["code"]) != "OK" {
+						t.Fatalf("expected OK when rednote succeeds, got %#v", got)
+					}
+				} else {
+					if unified.Str(got["code"]) != "UPSTREAM_BLOCKED" {
+						t.Fatalf("expected UPSTREAM_BLOCKED when xhs returned 403 and rednote failed, got %#v", got)
+					}
+				}
+			})
+		}
+	})
 }

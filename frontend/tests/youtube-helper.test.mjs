@@ -1413,6 +1413,185 @@ describe("YouTube helper userscript static header & validation contract", () => 
     assert.equal(pair.audioVariant.id, "a-orig-en");
   });
 
+  test("sanitizePlayerApiResponse and selectYouTubeMuxPair prioritize non-English original track over hl=en AI auto-dub marked audioIsDefault=true", () => {
+    // Under TVHTML5 hl:"en", non-English videos (e.g. Japanese original ja.4 with audioIsDefault: false)
+    // often receive an English AI auto-dub (en.3 "English (auto-dubbed)" with audioIsDefault: true and xtags acont=dubbed-auto).
+    const audioItags = [
+      { itag: 139, mimeType: 'audio/mp4; codecs="mp4a.40.5"', bitrate: 48000 },
+      { itag: 140, mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 128000 },
+      { itag: 249, mimeType: 'audio/webm; codecs="opus"', bitrate: 50000 },
+      { itag: 251, mimeType: 'audio/webm; codecs="opus"', bitrate: 160000 },
+    ];
+    const nonEnglishRaw = {
+      playabilityStatus: { status: "OK" },
+      streamingData: {
+        formats: [],
+        adaptiveFormats: [
+          {
+            itag: 137,
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+            mimeType: 'video/mp4; codecs="avc1.640028"',
+            width: 1920,
+            height: 1080,
+            fps: 30,
+          },
+          ...audioItags.map((spec) => ({
+            itag: spec.itag,
+            url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=${spec.itag}&xtags=acont%3Ddubbed-auto%3Alang%3Den`,
+            mimeType: spec.mimeType,
+            bitrate: spec.bitrate + 10000,
+            audioTrack: {
+              id: "en.3",
+              displayName: "English (auto-dubbed)",
+              audioIsDefault: true,
+            },
+          })),
+          ...audioItags.map((spec) => ({
+            itag: spec.itag,
+            url: `https://rr1---sn-test.googlevideo.com/videoplayback?itag=${spec.itag}&xtags=acont%3Doriginal%3Alang%3Dja`,
+            mimeType: spec.mimeType,
+            bitrate: spec.bitrate,
+            audioTrack: {
+              id: "ja.4",
+              displayName: "Japanese original",
+              audioIsDefault: false,
+            },
+          })),
+        ],
+      },
+    };
+
+    const sanitized = sanitizePlayerApiResponse(nonEnglishRaw);
+    const keptAudio = sanitized.streamingData.adaptiveFormats.filter((f) =>
+      f.mimeType.startsWith("audio/"),
+    );
+    assert.equal(keptAudio.length, 4);
+    assert.deepEqual(
+      keptAudio.map((f) => f.itag),
+      [139, 140, 249, 251],
+    );
+    for (const entry of keptAudio) {
+      assert.equal(entry.audioTrack.id, "ja.4");
+      assert.equal(entry.audioTrack.displayName, "Japanese original");
+      assert.equal(entry.audioTrack.audioIsDefault, false);
+      assert.ok(entry.url.includes("acont%3Doriginal%3Alang%3Dja"));
+    }
+
+    // Also inspect signatureCipher inner URL xtags when displayName has no explicit "original" / "auto-dubbed" suffix
+    const cipherRaw = {
+      playabilityStatus: { status: "OK" },
+      streamingData: {
+        formats: [],
+        adaptiveFormats: [
+          {
+            itag: 140,
+            signatureCipher:
+              "s=SIG1&sp=sig&url=" +
+              encodeURIComponent(
+                "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&xtags=acont%3Ddubbed-auto%3Alang%3Den",
+              ),
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            audioTrack: {
+              id: "en.3",
+              displayName: "English",
+              audioIsDefault: true,
+            },
+          },
+          {
+            itag: 140,
+            signatureCipher:
+              "s=SIG2&sp=sig&url=" +
+              encodeURIComponent(
+                "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&xtags=acont%3Doriginal%3Alang%3Dja",
+              ),
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            audioTrack: {
+              id: "ja.4",
+              displayName: "Japanese",
+              audioIsDefault: false,
+            },
+          },
+        ],
+      },
+    };
+    const sanitizedCipher = sanitizePlayerApiResponse(cipherRaw);
+    assert.equal(sanitizedCipher.streamingData.adaptiveFormats.length, 1);
+    assert.equal(
+      sanitizedCipher.streamingData.adaptiveFormats[0].audioTrack.id,
+      "ja.4",
+    );
+
+    // selectYouTubeMuxPair also honors xtags acont=original over acont=dubbed-auto when labels are neutral
+    const muxVideo = {
+      id: "v-1080p",
+      state: "ready",
+      metadata: {
+        has_audio: false,
+        video_codec: "avc1.640028",
+        container: "mp4",
+        extension: "mp4",
+      },
+      delivery: {
+        kind: "file",
+        sources: [
+          {
+            id: "sv",
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137",
+          },
+        ],
+      },
+    };
+    const autoDubCand = {
+      id: "a-en-dub",
+      state: "ready",
+      label: "仅音频 M4A (128 kbps)",
+      metadata: {
+        has_audio: true,
+        audio_codec: "mp4a.40.2",
+        container: "mp4",
+        extension: "m4a",
+        mime_type: "audio/mp4",
+      },
+      delivery: {
+        kind: "file",
+        sources: [
+          {
+            id: "sa-en",
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&xtags=acont%3Ddubbed-auto%3Alang%3Den",
+          },
+        ],
+      },
+    };
+    const origJaCand = {
+      id: "a-ja-orig",
+      state: "ready",
+      label: "仅音频 M4A (128 kbps)",
+      metadata: {
+        has_audio: true,
+        audio_codec: "mp4a.40.2",
+        container: "mp4",
+        extension: "m4a",
+        mime_type: "audio/mp4",
+      },
+      delivery: {
+        kind: "file",
+        sources: [
+          {
+            id: "sa-ja",
+            url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&xtags=acont%3Doriginal%3Alang%3Dja",
+          },
+        ],
+      },
+    };
+    const muxPair = selectYouTubeMuxPair(muxVideo, [
+      muxVideo,
+      autoDubCand,
+      origJaCand,
+    ]);
+    assert.equal(muxPair.ok, true);
+    assert.equal(muxPair.audioVariant.id, "a-ja-orig");
+  });
+
   test("CustomEvent handshake and semver version check", async () => {
     assert.equal(compareSemver("1.0.0", "1.0.0"), 0);
     assert.equal(compareSemver("1.1.0", "1.0.0"), 1);

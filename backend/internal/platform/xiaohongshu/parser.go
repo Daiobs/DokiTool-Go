@@ -98,7 +98,7 @@ func isSecurityBlockURL(raw string) bool {
 		return false
 	}
 	escaped := strings.ToLower(u.EscapedPath())
-	if strings.HasPrefix(escaped, "/404/sec_") || strings.Contains(escaped, "/404/sec_") ||
+	if strings.Contains(escaped, "/404/sec_") ||
 		strings.HasPrefix(escaped, "/website-login/captcha") || strings.HasPrefix(escaped, "/website-login/error") {
 		return true
 	}
@@ -233,8 +233,11 @@ func (p *Parser) parseLegacy(ctx context.Context, input string) (unified.Object,
 		if id == "" && redirected.firstNoteURL != "" {
 			address = redirected.firstNoteURL
 			id = extractID(address)
-			if redirected.blocked {
-				blockedHost = canonicalHostGroup(redirected.firstNoteURL)
+		}
+		if redirected.blocked {
+			blockedHost = canonicalHostGroup(redirected.url)
+			if blockedHost == "" {
+				blockedHost = canonicalHostGroup(address)
 			}
 		}
 		if !AllowedURL(address) || id == "" {

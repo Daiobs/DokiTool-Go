@@ -960,10 +960,7 @@ func sortAudioFormats(formats []Format) {
 		if aa != ab {
 			return aa > ab
 		}
-		if baseFormatID(a.FormatID) == baseFormatID(b.FormatID) {
-			return false
-		}
-		return a.FormatID > b.FormatID
+		return baseFormatID(a.FormatID) > baseFormatID(b.FormatID)
 	})
 }
 

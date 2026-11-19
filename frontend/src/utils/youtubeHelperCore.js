@@ -198,6 +198,41 @@ export function extractUrlClen(rawUrl) {
   }
 }
 
+function extractXtagsAudioContent(entry) {
+  let rawUrl = "";
+  if (typeof entry?.url === "string" && entry.url.trim()) {
+    rawUrl = entry.url.trim();
+  } else if (
+    typeof entry?.signatureCipher === "string" &&
+    entry.signatureCipher.trim()
+  ) {
+    try {
+      const cipherParams = new URLSearchParams(entry.signatureCipher);
+      rawUrl = (cipherParams.get("url") || "").trim();
+    } catch {
+      rawUrl = "";
+    }
+  }
+  if (!rawUrl) return "";
+  try {
+    const parsed = new URL(rawUrl);
+    const xtags = (parsed.searchParams.get("xtags") || "").trim();
+    if (!xtags) return "";
+    let acont = "";
+    for (const part of xtags.split(":")) {
+      const eqIdx = part.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const k = part.slice(0, eqIdx).trim().toLowerCase();
+      if (k === "acont") {
+        acont = part.slice(eqIdx + 1).trim().toLowerCase();
+      }
+    }
+    return acont;
+  } catch {
+    return "";
+  }
+}
+
 function pickUsableVariantSource(variant) {
   const sources = variant && variant.delivery && variant.delivery.sources;
   if (!Array.isArray(sources) || sources.length === 0) return null;
@@ -318,20 +353,28 @@ export function selectYouTubeMuxPair(
   }
 
   if (matched.length > 0) {
-    const isDubbedOrDescriptive = ({ cand }) => {
+    const isDubbedOrDescriptive = ({ cand, audioSource }) => {
       const role = norm(cand.metadata?.audio_language_role);
       const label = String(cand.label || "");
+      const acont = extractXtagsAudioContent({ url: audioSource?.url });
       return (
         role === "alternate" ||
-        /dubbed|配音|descriptive|description/i.test(label)
+        acont === "descriptive" ||
+        acont === "dubbed" ||
+        acont === "dubbed-auto" ||
+        acont === "secondary" ||
+        /dubbed|auto-dubbed|配音|descriptive|description/i.test(label)
       );
     };
-    const isExplicitOriginal = ({ cand }) => {
+    const isExplicitOriginal = ({ cand, audioSource }) => {
       const role = norm(cand.metadata?.audio_language_role);
       const label = String(cand.label || "");
+      const acont = extractXtagsAudioContent({ url: audioSource?.url });
       return (
-        !isDubbedOrDescriptive({ cand }) &&
-        (role === "main" || /original|原声|原音/i.test(label))
+        !isDubbedOrDescriptive({ cand, audioSource }) &&
+        (role === "main" ||
+          acont === "original" ||
+          /original|原声|原音/i.test(label))
       );
     };
     const chosen =
@@ -567,10 +610,31 @@ function isDescriptiveAudio(at) {
   );
 }
 
+function isDubbedAudio(at) {
+  return Boolean(
+    at && /dubbed|auto-dubbed|配音/i.test(`${at.id || ""} ${at.displayName || ""}`),
+  );
+}
+
 function isOriginalAudio(at) {
   return Boolean(
     at && /original|原声|原音/i.test(`${at.id || ""} ${at.displayName || ""}`),
   );
+}
+
+function classifyAudioFormatEntry(entry) {
+  const at = entry?.audioTrack || null;
+  const acont = extractXtagsAudioContent(entry);
+  const isDescriptive = acont === "descriptive" || isDescriptiveAudio(at);
+  const isDubbed =
+    acont === "dubbed" ||
+    acont === "dubbed-auto" ||
+    acont === "secondary" ||
+    isDubbedAudio(at);
+  const isOriginal = acont === "original" || isOriginalAudio(at);
+  const isDefault = at?.audioIsDefault === true;
+  const hasHint = Boolean(at) || isDescriptive || isDubbed || isOriginal;
+  return { entry, hasHint, isOriginal, isDescriptive, isDubbed, isDefault };
 }
 
 function sanitizeFormatArray(list) {
@@ -603,36 +667,21 @@ function sanitizeFormatArray(list) {
   const nonAudioEntries = out.filter((entry) => !isAudioOnly(entry));
   const audioEntries = out.filter(isAudioOnly);
 
-  if (audioEntries.some((e) => Boolean(e.audioTrack))) {
+  const classifiedAudio = audioEntries.map(classifyAudioFormatEntry);
+  if (classifiedAudio.some((c) => c.hasHint)) {
+    const tiers = [
+      (c) => c.isOriginal && !c.isDescriptive && !c.isDubbed,
+      (c) => c.isDefault && !c.isDescriptive && !c.isDubbed,
+      (c) => c.isDefault && !c.isDescriptive,
+      (c) => c.isDefault,
+    ];
     let keptAudio = audioEntries;
-    if (
-      audioEntries.some(
-        (e) =>
-          e.audioTrack?.audioIsDefault === true &&
-          !isDescriptiveAudio(e.audioTrack),
-      )
-    ) {
-      keptAudio = audioEntries.filter(
-        (e) =>
-          e.audioTrack?.audioIsDefault === true &&
-          !isDescriptiveAudio(e.audioTrack),
-      );
-    } else if (
-      audioEntries.some(
-        (e) =>
-          isOriginalAudio(e.audioTrack) && !isDescriptiveAudio(e.audioTrack),
-      )
-    ) {
-      keptAudio = audioEntries.filter(
-        (e) =>
-          isOriginalAudio(e.audioTrack) && !isDescriptiveAudio(e.audioTrack),
-      );
-    } else if (
-      audioEntries.some((e) => e.audioTrack?.audioIsDefault === true)
-    ) {
-      keptAudio = audioEntries.filter(
-        (e) => e.audioTrack?.audioIsDefault === true,
-      );
+    for (const pred of tiers) {
+      const matched = classifiedAudio.filter(pred);
+      if (matched.length > 0) {
+        keptAudio = matched.map((c) => c.entry);
+        break;
+      }
     }
     return [...nonAudioEntries, ...keptAudio];
   }
