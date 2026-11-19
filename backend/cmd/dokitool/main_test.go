@@ -32,6 +32,7 @@ import (
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/zuiyou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -574,10 +575,16 @@ func TestPreparePublicMediaMultiRoutePlatforms(t *testing.T) {
 		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(ppxHTML)}, nil
 	}))
 
+	zyBody := `{"ret":1,"data":{"post":{"id":427896637,"content":"ZY image","member":{"name":"ZY","avatar_urls":{"origin":{"urls":["http://bd-tbfile.izuiyou.com/avatar/1?sig=a%2Bb"]}}},"imgs":[{"id":1,"urls":{"origin":{"urls":["http://web-f01.izuiyou.com/img/view/id/427896637?sig=a%2Bb"]},"540_webp":{"urls":["http://web-f01.izuiyou.com/img/webp/id/427896637"]}}}],"videos":{}}}}`
+	zyAdapter := zuiyou.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(zyBody)}, nil
+	}))
+
 	h, err := api.New(registry, map[string]api.Adapter{
 		"xiaohongshu": xhsAdapter,
 		"kuaishou":    ksAdapter,
 		"pipixia":     ppxAdapter,
+		"zuiyou":      zyAdapter,
 	}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia(strings.Repeat("x", 64)))
 	if err != nil {
 		t.Fatal(err)
@@ -605,6 +612,11 @@ func TestPreparePublicMediaMultiRoutePlatforms(t *testing.T) {
 				"https://v6-cdn-tos.ppxvod.com/" + strings.Repeat("a", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1",
 				"https://v26-cdn-tos.ppxvod.com/" + strings.Repeat("b", 32) + "/6a000001/video/tos/cn/tos-cn-ve-0026/ObjA/?a=1319&ft=1&dy_q=1&l=1",
 			},
+		},
+		{
+			platform:  "zuiyou",
+			sourceURL: "https://share.xiaochuankeji.cn/hybrid/share/post?pid=427896637",
+			wantURLs:  []string{"https://web-f01.izuiyou.com/img/view/id/427896637?sig=a%2Bb"},
 		},
 	}
 

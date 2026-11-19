@@ -155,3 +155,57 @@ func TestZuiyouHTTPPHPOracle(t *testing.T) {
 		}
 	}
 }
+
+type zuiyouExecutorFunc func(context.Context, fetch.Request) (fetch.Response, error)
+
+func (f zuiyouExecutorFunc) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	return f(ctx, req)
+}
+
+func TestZuiyouHTTPPublicMediaUpgradesImageURLsWithoutMixedContent(t *testing.T) {
+	const now int64 = 1793448000
+	registry, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiBody := `{"ret":1,"data":{"post":{"id":427896637,"content":"单图测试","member":{"name":"作者","avatar_urls":{"origin":{"urls":["http://bd-tbfile.izuiyou.com/avatar/101?sig=a%2Bb"]}}},"imgs":[{"id":1,"urls":{"origin":{"urls":["http://web-f01.izuiyou.com/img/view/id/427896637?sig=a%2Bb+z"]},"540_webp":{"urls":["http://web-f01.izuiyou.com/img/webp/id/427896637?sig=c%2Fd"]}}}],"videos":{}}}}`
+	adapter := zuiyou.NewWithTBVideo(zuiyouExecutorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(apiBody)}, nil
+	}), true)
+	handler, err := New(registry, map[string]Adapter{"zuiyou": adapter}, func() time.Time { return time.Unix(now, 0) }, zuiyou.PreparePublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{"schema_version": {"1.0"}, "url": {"https://share.xiaochuankeji.cn/hybrid/share/post?pid=427896637"}}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	payload, err := unified.Decode(rec.Body.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unified.ValidateEnvelopeAt(payload, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+	data := unified.Map(payload["data"])
+	if got := unified.Str(unified.Map(data["cover"])["url"]); got != "https://web-f01.izuiyou.com/img/webp/id/427896637?sig=c%2Fd" {
+		t.Fatalf("cover.url = %q", got)
+	}
+	if got := unified.Str(unified.Map(unified.Map(data["author"])["avatar"])["url"]); got != "https://bd-tbfile.izuiyou.com/avatar/101?sig=a%2Bb" {
+		t.Fatalf("avatar.url = %q", got)
+	}
+	item := unified.Map(unified.Slice(data["items"])[0])
+	const wantImg = "https://web-f01.izuiyou.com/img/view/id/427896637?sig=a%2Bb+z"
+	if got := unified.Str(unified.Map(item["default"])["url"]); got != wantImg {
+		t.Fatalf("default.url = %q, want %q", got, wantImg)
+	}
+	src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(item["variants"])[0])["delivery"])["sources"])[0])
+	if got := unified.Str(src["url"]); got != wantImg {
+		t.Fatalf("source.url = %q, want %q", got, wantImg)
+	}
+	if got := unified.Str(src["browser_fetch"]); got != "allowed" {
+		t.Fatalf("source.browser_fetch = %q, want allowed", got)
+	}
+}
