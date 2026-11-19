@@ -2,16 +2,13 @@ package unified
 
 import (
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"math/big"
-	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -25,439 +22,23 @@ import (
 var embeddedSchema []byte
 
 var (
-	embeddedSchemaOnce  sync.Once
-	schemaDocument      Object
-	embeddedRoot        *compiledSchemaNode
-	embeddedDefs        map[string]*compiledSchemaNode
-	embeddedNodesByPtr  map[uintptr]*compiledSchemaNode
-	precompiledPatterns map[string]*regexp.Regexp
-	dynamicPatternCache sync.Map // map[string]*regexp.Regexp
-
-	runtimeKeywordAudits atomic.Int64
-	regexpCompileCount   atomic.Int64
+	embeddedAuditOnce sync.Once
+	schemaDocument    Object
 )
 
-func init() {
-	ensureEmbeddedSchema()
-}
+func init() { ensureEmbeddedSchema() }
 
 func ensureEmbeddedSchema() {
-	embeddedSchemaOnce.Do(func() {
+	embeddedAuditOnce.Do(func() {
 		schema, err := Decode(embeddedSchema)
 		if err != nil {
 			panic("invalid embedded unified-v1 schema: " + err.Error())
 		}
-		patterns, err := precompileEmbeddedPatterns(schema)
-		if err != nil {
-			panic("invalid embedded unified-v1 schema pattern: " + err.Error())
-		}
-		precompiledPatterns = patterns
 		if err := ValidateSchemaDefinition(schema); err != nil {
 			panic("unsupported embedded unified-v1 schema: " + err.Error())
 		}
-		defs, root, byPtr := buildEmbeddedCompiledSchema(schema)
 		schemaDocument = schema
-		embeddedDefs = defs
-		embeddedRoot = root
-		embeddedNodesByPtr = byPtr
 	})
-}
-
-func precompileEmbeddedPatterns(root Object) (map[string]*regexp.Regexp, error) {
-	patterns := make(map[string]*regexp.Regexp)
-	var walk func(Object) error
-	walk = func(node Object) error {
-		if node == nil {
-			return nil
-		}
-		if pattern, ok := node["pattern"].(string); ok && pattern != "" {
-			if _, exists := patterns[pattern]; !exists {
-				regexpCompileCount.Add(1)
-				re, err := regexp.Compile(pattern)
-				if err != nil {
-					return err
-				}
-				patterns[pattern] = re
-			}
-		}
-		for _, key := range []string{"$defs", "properties"} {
-			if children := Map(node[key]); children != nil {
-				for _, child := range children {
-					if err := walk(Map(child)); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		for _, key := range []string{"items", "propertyNames", "additionalProperties"} {
-			if child := Map(node[key]); child != nil {
-				if err := walk(child); err != nil {
-					return err
-				}
-			}
-		}
-		for _, key := range []string{"anyOf", "oneOf"} {
-			for _, child := range Slice(node[key]) {
-				if err := walk(Map(child)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	if err := walk(root); err != nil {
-		return nil, err
-	}
-	return patterns, nil
-}
-
-func compilePattern(pattern string) (*regexp.Regexp, error) {
-	if precompiledPatterns != nil {
-		if re, ok := precompiledPatterns[pattern]; ok {
-			return re, nil
-		}
-	}
-	if cached, ok := dynamicPatternCache.Load(pattern); ok {
-		return cached.(*regexp.Regexp), nil
-	}
-	regexpCompileCount.Add(1)
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil, err
-	}
-	actual, _ := dynamicPatternCache.LoadOrStore(pattern, re)
-	return actual.(*regexp.Regexp), nil
-}
-
-type compiledNumericBound struct {
-	rat      *big.Rat
-	hasInt64 bool
-	int64Val int64
-}
-
-func makeNumericBound(raw any) (compiledNumericBound, bool) {
-	limit, present := schemaNumber(raw)
-	if !present {
-		return compiledNumericBound{}, false
-	}
-	b := compiledNumericBound{rat: limit}
-	if limit.IsInt() && limit.Num().IsInt64() {
-		b.hasInt64 = true
-		b.int64Val = limit.Num().Int64()
-	}
-	return b, true
-}
-
-type compiledSchemaNode struct {
-	refRaw         string
-	refUnsupported bool
-	refTarget      *compiledSchemaNode
-
-	hasOneOf bool
-	hasAnyOf bool
-	branches []*compiledSchemaNode
-
-	hasConst bool
-	constVal any
-
-	hasEnum  bool
-	enumVals Array
-
-	typeName string
-
-	hasMinProperties   bool
-	minProperties      float64
-	required           []string
-	properties         map[string]*compiledSchemaNode
-	propertyNames      *compiledSchemaNode
-	disallowAdditional bool
-	additionalSchema   *compiledSchemaNode
-
-	hasMinItems bool
-	minItems    float64
-	hasMaxItems bool
-	maxItems    float64
-	uniqueItems bool
-	items       *compiledSchemaNode
-
-	hasMinLength bool
-	minLength    float64
-	hasMaxLength bool
-	maxLength    float64
-	hasPattern   bool
-	patternRe    *regexp.Regexp
-	patternErr   error
-	format       string
-
-	hasNumericBounds    bool
-	hasMinimum          bool
-	minimum             compiledNumericBound
-	hasExclusiveMinimum bool
-	exclusiveMinimum    compiledNumericBound
-	hasMaximum          bool
-	maximum             compiledNumericBound
-}
-
-func buildEmbeddedCompiledSchema(schema Object) (map[string]*compiledSchemaNode, *compiledSchemaNode, map[uintptr]*compiledSchemaNode) {
-	byPtr := make(map[uintptr]*compiledSchemaNode)
-	defsMap := Map(schema["$defs"])
-	defs := make(map[string]*compiledSchemaNode, len(defsMap))
-	for name, rawDef := range defsMap {
-		if defObj := Map(rawDef); defObj != nil {
-			compiled := &compiledSchemaNode{}
-			defs[name] = compiled
-			if ptr := reflect.ValueOf(defObj).Pointer(); ptr != 0 {
-				byPtr[ptr] = compiled
-			}
-		}
-	}
-	var compileNode func(Object) *compiledSchemaNode
-	compileNode = func(raw Object) *compiledSchemaNode {
-		if raw == nil {
-			return &compiledSchemaNode{}
-		}
-		ptr := reflect.ValueOf(raw).Pointer()
-		if ptr != 0 {
-			if existing, ok := byPtr[ptr]; ok {
-				return existing
-			}
-		}
-		compiled := &compiledSchemaNode{}
-		if ptr != 0 {
-			byPtr[ptr] = compiled
-		}
-		populateCompiledSchemaNode(compiled, raw, defs, compileNode)
-		return compiled
-	}
-	for name, rawDef := range defsMap {
-		if defObj := Map(rawDef); defObj != nil {
-			populateCompiledSchemaNode(defs[name], defObj, defs, compileNode)
-		}
-	}
-	root := compileNode(schema)
-	return defs, root, byPtr
-}
-
-func populateCompiledSchemaNode(dst *compiledSchemaNode, raw Object, defs map[string]*compiledSchemaNode, compileChild func(Object) *compiledSchemaNode) {
-	if reference := Str(raw["$ref"]); reference != "" {
-		dst.refRaw = reference
-		const prefix = "#/$defs/"
-		if !strings.HasPrefix(reference, prefix) {
-			dst.refUnsupported = true
-		} else {
-			dst.refTarget = defs[strings.TrimPrefix(reference, prefix)]
-		}
-		return
-	}
-	if oneOf := Slice(raw["oneOf"]); oneOf != nil {
-		dst.hasOneOf = true
-		dst.branches = make([]*compiledSchemaNode, len(oneOf))
-		for i, alt := range oneOf {
-			dst.branches[i] = compileChild(Map(alt))
-		}
-		return
-	}
-	if anyOf := Slice(raw["anyOf"]); anyOf != nil {
-		dst.hasAnyOf = true
-		dst.branches = make([]*compiledSchemaNode, len(anyOf))
-		for i, alt := range anyOf {
-			dst.branches[i] = compileChild(Map(alt))
-		}
-		return
-	}
-	if wanted, exists := raw["const"]; exists {
-		dst.hasConst = true
-		dst.constVal = wanted
-	}
-	if enumeration := Slice(raw["enum"]); enumeration != nil {
-		dst.hasEnum = true
-		dst.enumVals = enumeration
-	}
-	dst.typeName = Str(raw["type"])
-	if dst.typeName == "object" {
-		if minimum, ok := Numeric(raw["minProperties"]); ok {
-			dst.hasMinProperties = true
-			dst.minProperties = minimum
-		}
-		if reqSlice := Slice(raw["required"]); len(reqSlice) > 0 {
-			dst.required = make([]string, len(reqSlice))
-			for i, r := range reqSlice {
-				dst.required[i] = Str(r)
-			}
-		}
-		if props := Map(raw["properties"]); len(props) > 0 {
-			dst.properties = make(map[string]*compiledSchemaNode, len(props))
-			for k, v := range props {
-				if childMap := Map(v); childMap != nil {
-					dst.properties[k] = compileChild(childMap)
-				}
-			}
-		}
-		if names := Map(raw["propertyNames"]); names != nil {
-			dst.propertyNames = compileChild(names)
-		}
-		if raw["additionalProperties"] == false {
-			dst.disallowAdditional = true
-		} else if addMap := Map(raw["additionalProperties"]); addMap != nil {
-			dst.additionalSchema = compileChild(addMap)
-		}
-	}
-	if dst.typeName == "array" {
-		if minimum, ok := Numeric(raw["minItems"]); ok {
-			dst.hasMinItems = true
-			dst.minItems = minimum
-		}
-		if maximum, ok := Numeric(raw["maxItems"]); ok {
-			dst.hasMaxItems = true
-			dst.maxItems = maximum
-		}
-		dst.uniqueItems = raw["uniqueItems"] == true
-		if itemMap := Map(raw["items"]); itemMap != nil {
-			dst.items = compileChild(itemMap)
-		}
-	}
-	if dst.typeName == "string" {
-		if minimum, ok := Numeric(raw["minLength"]); ok {
-			dst.hasMinLength = true
-			dst.minLength = minimum
-		}
-		if maximum, ok := Numeric(raw["maxLength"]); ok {
-			dst.hasMaxLength = true
-			dst.maxLength = maximum
-		}
-		if pattern := Str(raw["pattern"]); pattern != "" {
-			dst.hasPattern = true
-			dst.patternRe, dst.patternErr = compilePattern(pattern)
-		}
-		dst.format = Str(raw["format"])
-	}
-	if b, ok := makeNumericBound(raw["minimum"]); ok {
-		dst.hasMinimum = true
-		dst.minimum = b
-		dst.hasNumericBounds = true
-	}
-	if b, ok := makeNumericBound(raw["exclusiveMinimum"]); ok {
-		dst.hasExclusiveMinimum = true
-		dst.exclusiveMinimum = b
-		dst.hasNumericBounds = true
-	}
-	if b, ok := makeNumericBound(raw["maximum"]); ok {
-		dst.hasMaximum = true
-		dst.maximum = b
-		dst.hasNumericBounds = true
-	}
-}
-
-func lookupEmbeddedCompiledNode(node Object) *compiledSchemaNode {
-	if node == nil {
-		return nil
-	}
-	ptr := reflect.ValueOf(node).Pointer()
-	if ptr == 0 {
-		return nil
-	}
-	return embeddedNodesByPtr[ptr]
-}
-
-// compileCustomSchema audits keywords once across a synthetic/non-embedded
-// schema tree and compiles its nodes using the shared regex cache.
-func compileCustomSchema(root Object, rootPath string) (*compiledSchemaNode, error) {
-	visited := make(map[uintptr]bool)
-	var auditTree func(Object, string) error
-	auditTree = func(node Object, path string) error {
-		if node == nil {
-			return nil
-		}
-		if ptr := reflect.ValueOf(node).Pointer(); ptr != 0 {
-			if visited[ptr] {
-				return nil
-			}
-			visited[ptr] = true
-		}
-		if err := auditSchemaKeywords(node, path); err != nil {
-			return err
-		}
-		for _, key := range []string{"$defs", "properties"} {
-			if children := Map(node[key]); children != nil {
-				for _, name := range sortedObjectKeys(children) {
-					if child := Map(children[name]); child != nil {
-						if err := auditTree(child, path+"."+key+"."+name); err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
-		for _, key := range []string{"items", "propertyNames"} {
-			if child := Map(node[key]); child != nil {
-				if err := auditTree(child, path+"."+key); err != nil {
-					return err
-				}
-			}
-		}
-		if value, exists := node["additionalProperties"]; exists {
-			if _, boolean := value.(bool); !boolean {
-				if child := Map(value); child != nil {
-					if err := auditTree(child, path+".additionalProperties"); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		for _, key := range []string{"anyOf", "oneOf"} {
-			for index, rawChild := range Slice(node[key]) {
-				if child := Map(rawChild); child != nil {
-					if err := auditTree(child, fmt.Sprintf("%s.%s[%d]", path, key, index)); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		return nil
-	}
-	if err := auditTree(root, rootPath); err != nil {
-		return nil, err
-	}
-
-	defs := make(map[string]*compiledSchemaNode, len(embeddedDefs))
-	for k, v := range embeddedDefs {
-		defs[k] = v
-	}
-	memo := make(map[uintptr]*compiledSchemaNode)
-	customDefs := Map(root["$defs"])
-	for name, rawDef := range customDefs {
-		if defObj := Map(rawDef); defObj != nil {
-			compiled := &compiledSchemaNode{}
-			defs[name] = compiled
-			if ptr := reflect.ValueOf(defObj).Pointer(); ptr != 0 {
-				memo[ptr] = compiled
-			}
-		}
-	}
-	var compileNode func(Object) *compiledSchemaNode
-	compileNode = func(raw Object) *compiledSchemaNode {
-		if raw == nil {
-			return &compiledSchemaNode{}
-		}
-		ptr := reflect.ValueOf(raw).Pointer()
-		if ptr != 0 {
-			if existing, ok := memo[ptr]; ok {
-				return existing
-			}
-		}
-		compiled := &compiledSchemaNode{}
-		if ptr != 0 {
-			memo[ptr] = compiled
-		}
-		populateCompiledSchemaNode(compiled, raw, defs, compileNode)
-		return compiled
-	}
-	for name, rawDef := range customDefs {
-		if defObj := Map(rawDef); defObj != nil {
-			populateCompiledSchemaNode(defs[name], defObj, defs, compileNode)
-		}
-	}
-	return compileNode(root), nil
 }
 
 func SchemaBytes() []byte { return append([]byte(nil), embeddedSchema...) }
@@ -466,10 +47,7 @@ func SchemaBytes() []byte { return append([]byte(nil), embeddedSchema...) }
 // Independent Draft 2020-12 validation remains an external acceptance check.
 func ValidateStructure(value any) error {
 	ensureEmbeddedSchema()
-	if compiledNodeMatches(value, embeddedRoot) {
-		return nil
-	}
-	return validateCompiledSchemaNode(value, embeddedRoot, "$")
+	return validateNode(value, schemaDocument, "$", false)
 }
 
 func sortedObjectKeys(object Object) []string {
@@ -494,18 +72,17 @@ func schemaNumber(value any) (*big.Rat, bool) {
 }
 
 func schemaInteger(value any) bool {
-	switch v := value.(type) {
-	case int, int64, int32, uint, uint64:
-		return true
+	switch value.(type) {
 	case float32, float64:
 		return false
-	case json.Number:
-		// Preserve the PHP runtime's integer wire values. Numeric strings and
-		// floating point observations are not integer metadata, even when integral.
-		return integerSpelling.MatchString(v.String())
-	default:
+	}
+	text, ok := numberText(value)
+	if !ok {
 		return false
 	}
+	// Preserve the PHP runtime's integer wire values. Numeric strings and
+	// floating point observations are not integer metadata, even when integral.
+	return integerSpelling.MatchString(text)
 }
 
 var integerSpelling = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)$`)
@@ -527,249 +104,75 @@ func parseContractTime(raw string) (time.Time, bool) {
 	return t, err == nil
 }
 
-func fastInt64Value(value any) (int64, bool) {
-	switch v := value.(type) {
-	case int:
-		return int64(v), true
-	case int64:
-		return v, true
-	case int32:
-		return int64(v), true
-	case json.Number:
-		s := v.String()
-		if !integerSpelling.MatchString(s) {
-			return 0, false
-		}
-		n, err := strconv.ParseInt(s, 10, 64)
-		return n, err == nil
-	default:
-		return 0, false
+// schemaPatterns memoizes compiled "pattern" keywords. Patterns come from the
+// embedded contract (a small fixed set), so the cache stays bounded while hot
+// envelope validation no longer recompiles the same regular expressions.
+var schemaPatterns sync.Map // pattern string -> *regexp.Regexp
+
+func compileSchemaPattern(pattern string) (*regexp.Regexp, error) {
+	if cached, ok := schemaPatterns.Load(pattern); ok {
+		return cached.(*regexp.Regexp), nil
 	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := schemaPatterns.LoadOrStore(pattern, re)
+	return actual.(*regexp.Regexp), nil
 }
 
-func checkNumericBounds(value any, node *compiledSchemaNode) string {
-	if iv, ok := fastInt64Value(value); ok &&
-		(!node.hasMinimum || node.minimum.hasInt64) &&
-		(!node.hasExclusiveMinimum || node.exclusiveMinimum.hasInt64) &&
-		(!node.hasMaximum || node.maximum.hasInt64) {
-		if node.hasMinimum && iv < node.minimum.int64Val {
-			return "outside minimum"
-		}
-		if node.hasExclusiveMinimum && iv <= node.exclusiveMinimum.int64Val {
-			return "outside exclusiveMinimum"
-		}
-		if node.hasMaximum && iv > node.maximum.int64Val {
-			return "outside maximum"
-		}
-		return ""
-	}
-	if number, ok := schemaNumber(value); ok {
-		if node.hasMinimum && number.Cmp(node.minimum.rat) < 0 {
-			return "outside minimum"
-		}
-		if node.hasExclusiveMinimum && number.Cmp(node.exclusiveMinimum.rat) <= 0 {
-			return "outside exclusiveMinimum"
-		}
-		if node.hasMaximum && number.Cmp(node.maximum.rat) > 0 {
-			return "outside maximum"
-		}
-	}
-	return ""
+func validateSchemaNode(value any, node Object, path string) error {
+	return validateNode(value, node, path, true)
 }
 
-// compiledNodeMatches performs allocation-free boolean schema validation for
-// valid envelopes and oneOf/anyOf branch probing. When it returns false at the
-// entry point, validateCompiledSchemaNode produces the exact deterministic path error.
-func compiledNodeMatches(value any, node *compiledSchemaNode) bool {
-	if node == nil {
-		return true
-	}
-	if node.refRaw != "" {
-		if node.refUnsupported || node.refTarget == nil {
-			return false
-		}
-		return compiledNodeMatches(value, node.refTarget)
-	}
-	if node.hasOneOf || node.hasAnyOf {
-		matches := 0
-		for _, alt := range node.branches {
-			if compiledNodeMatches(value, alt) {
-				matches++
-			}
-		}
-		if node.hasOneOf {
-			return matches == 1
-		}
-		return matches > 0
-	}
-	if node.hasConst && !Equal(value, node.constVal) {
-		return false
-	}
-	if node.hasEnum {
-		found := false
-		for _, allowed := range node.enumVals {
-			if Equal(value, allowed) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	switch node.typeName {
-	case "object":
-		object := Map(value)
-		if object == nil {
-			return false
-		}
-		if node.hasMinProperties && float64(len(object)) < node.minProperties {
-			return false
-		}
-		for _, req := range node.required {
-			if _, exists := object[req]; !exists {
-				return false
-			}
-		}
-		for key, childVal := range object {
-			if node.propertyNames != nil && !compiledNodeMatches(key, node.propertyNames) {
-				return false
-			}
-			if childSchema := node.properties[key]; childSchema != nil {
-				if !compiledNodeMatches(childVal, childSchema) {
-					return false
-				}
-			} else if node.disallowAdditional {
-				return false
-			} else if node.additionalSchema != nil {
-				if !compiledNodeMatches(childVal, node.additionalSchema) {
-					return false
-				}
-			}
-		}
-	case "array":
-		values := Slice(value)
-		if values == nil {
-			return false
-		}
-		if node.hasMinItems && float64(len(values)) < node.minItems {
-			return false
-		}
-		if node.hasMaxItems && float64(len(values)) > node.maxItems {
-			return false
-		}
-		for index, child := range values {
-			if node.uniqueItems {
-				for _, prior := range values[:index] {
-					if Equal(prior, child) {
-						return false
-					}
-				}
-			}
-			if node.items != nil && !compiledNodeMatches(child, node.items) {
-				return false
-			}
-		}
-	case "string":
-		text, ok := value.(string)
-		if !ok || !utf8.ValidString(text) {
-			return false
-		}
-		if node.hasMinLength || node.hasMaxLength {
-			length := float64(utf8.RuneCountInString(text))
-			if node.hasMinLength && length < node.minLength {
-				return false
-			}
-			if node.hasMaxLength && length > node.maxLength {
-				return false
-			}
-		}
-		if node.hasPattern {
-			if node.patternErr != nil || !node.patternRe.MatchString(text) {
-				return false
-			}
-		}
-		switch node.format {
-		case "date-time":
-			if _, ok := parseContractTime(text); !ok {
-				return false
-			}
-		case "uri":
-			if MediaURL(text) != text {
-				return false
-			}
-		}
-	case "integer":
-		if !schemaInteger(value) {
-			return false
-		}
-	case "number":
-		if _, ok := schemaNumber(value); !ok {
-			return false
-		}
-	case "boolean":
-		if _, ok := value.(bool); !ok {
-			return false
-		}
-	case "null":
-		if value != nil {
-			return false
-		}
-	case "":
-	default:
-		return false
-	}
-	if node.hasNumericBounds {
-		if msg := checkNumericBounds(value, node); msg != "" {
-			return false
-		}
-	}
-	return true
-}
-
-func validateCompiledSchemaNode(value any, node *compiledSchemaNode, path string) error {
-	if node == nil {
-		return nil
-	}
+func validateNode(value any, node Object, path string, audit bool) error {
 	fail := func(message string) error { return fmt.Errorf("%s: %s", path, message) }
-	if node.refRaw != "" {
-		if node.refUnsupported {
+	if audit {
+		if err := auditSchemaKeywords(node, path); err != nil {
+			return err
+		}
+	}
+	if reference := Str(node["$ref"]); reference != "" {
+		const prefix = "#/$defs/"
+		if !strings.HasPrefix(reference, prefix) {
 			return fail("unsupported schema reference")
 		}
-		if node.refTarget == nil {
+		definition := Map(Map(schemaDocument["$defs"])[strings.TrimPrefix(reference, prefix)])
+		if definition == nil {
 			return fail("unknown schema reference")
 		}
-		return validateCompiledSchemaNode(value, node.refTarget, path)
+		return validateNode(value, definition, path, false)
 	}
-	if node.hasOneOf || node.hasAnyOf {
+	if alternatives, one := Slice(node["oneOf"]), true; alternatives != nil || Slice(node["anyOf"]) != nil {
+		if alternatives == nil {
+			alternatives, one = Slice(node["anyOf"]), false
+		}
 		matches := 0
-		for _, alternative := range node.branches {
-			if compiledNodeMatches(value, alternative) {
+		for _, alternative := range alternatives {
+			if validateNode(value, Map(alternative), path, audit) == nil {
 				matches++
 			}
 		}
-		if (node.hasOneOf && matches != 1) || (!node.hasOneOf && matches == 0) {
+		if (one && matches != 1) || (!one && matches == 0) {
 			return fail("invalid schema branch")
 		}
 		return nil
 	}
-	if node.hasConst && !Equal(value, node.constVal) {
+	if wanted, exists := node["const"]; exists && !Equal(value, wanted) {
 		return fail("invalid constant")
 	}
-	if node.hasEnum {
+	if enumeration := Slice(node["enum"]); enumeration != nil {
 		found := false
-		for _, allowed := range node.enumVals {
-			if Equal(value, allowed) {
-				found = true
-				break
-			}
+		for _, allowed := range enumeration {
+			found = found || Equal(value, allowed)
 		}
 		if !found {
 			return fail("invalid enum")
 		}
 	}
+	typeName := Str(node["type"])
 	valid := true
-	switch node.typeName {
+	switch typeName {
 	case "object":
 		valid = Map(value) != nil
 	case "array":
@@ -791,79 +194,79 @@ func validateCompiledSchemaNode(value any, node *compiledSchemaNode, path string
 	if !valid {
 		return fail("invalid type")
 	}
-	if node.typeName == "object" {
+	if typeName == "object" {
 		object := Map(value)
-		if node.hasMinProperties && float64(len(object)) < node.minProperties {
+		if minimum, ok := Numeric(node["minProperties"]); ok && float64(len(object)) < minimum {
 			return fail("too few properties")
 		}
-		for _, required := range node.required {
-			if _, exists := object[required]; !exists {
-				return fail("missing " + required)
+		for _, required := range Slice(node["required"]) {
+			if _, exists := object[Str(required)]; !exists {
+				return fail("missing " + Str(required))
 			}
 		}
+		properties := Map(node["properties"])
 		for _, key := range sortedObjectKeys(object) {
-			if node.propertyNames != nil {
-				if !compiledNodeMatches(key, node.propertyNames) {
-					return validateCompiledSchemaNode(key, node.propertyNames, path+".[property]")
+			if names := Map(node["propertyNames"]); names != nil {
+				if err := validateNode(key, names, path+".[property]", audit); err != nil {
+					return err
 				}
 			}
-			if child := node.properties[key]; child != nil {
-				if !compiledNodeMatches(object[key], child) {
-					return validateCompiledSchemaNode(object[key], child, path+"."+key)
+			if child := Map(properties[key]); child != nil {
+				if err := validateNode(object[key], child, path+"."+key, audit); err != nil {
+					return err
 				}
-			} else if node.disallowAdditional {
+			} else if node["additionalProperties"] == false {
 				return fail("unknown " + key)
-			} else if node.additionalSchema != nil {
-				if !compiledNodeMatches(object[key], node.additionalSchema) {
-					return validateCompiledSchemaNode(object[key], node.additionalSchema, path+"."+key)
+			} else if child := Map(node["additionalProperties"]); child != nil {
+				if err := validateNode(object[key], child, path+"."+key, audit); err != nil {
+					return err
 				}
 			}
 		}
 	}
-	if node.typeName == "array" {
+	if typeName == "array" {
 		values := Slice(value)
-		if node.hasMinItems && float64(len(values)) < node.minItems {
+		if minimum, ok := Numeric(node["minItems"]); ok && float64(len(values)) < minimum {
 			return fail("too few array items")
 		}
-		if node.hasMaxItems && float64(len(values)) > node.maxItems {
+		if maximum, ok := Numeric(node["maxItems"]); ok && float64(len(values)) > maximum {
 			return fail("too many array items")
 		}
 		for index, child := range values {
-			if node.uniqueItems {
+			if node["uniqueItems"] == true {
 				for _, prior := range values[:index] {
 					if Equal(prior, child) {
 						return fail("duplicate array item")
 					}
 				}
 			}
-			if node.items != nil && !compiledNodeMatches(child, node.items) {
-				return validateCompiledSchemaNode(child, node.items, fmt.Sprintf("%s[%d]", path, index))
+			if err := validateNode(child, Map(node["items"]), fmt.Sprintf("%s[%d]", path, index), audit); err != nil {
+				return err
 			}
 		}
 	}
-	if node.typeName == "string" {
+	if typeName == "string" {
 		text := Str(value)
 		if !utf8.ValidString(text) {
 			return fail("invalid UTF-8")
 		}
-		if node.hasMinLength || node.hasMaxLength {
-			length := float64(utf8.RuneCountInString(text))
-			if node.hasMinLength && length < node.minLength {
-				return fail("text too short")
-			}
-			if node.hasMaxLength && length > node.maxLength {
-				return fail("text too long")
-			}
+		length := float64(utf8.RuneCountInString(text))
+		if minimum, ok := Numeric(node["minLength"]); ok && length < minimum {
+			return fail("text too short")
 		}
-		if node.hasPattern {
-			if node.patternErr != nil {
+		if maximum, ok := Numeric(node["maxLength"]); ok && length > maximum {
+			return fail("text too long")
+		}
+		if pattern := Str(node["pattern"]); pattern != "" {
+			re, err := compileSchemaPattern(pattern)
+			if err != nil {
 				return fail("unsupported schema pattern")
 			}
-			if !node.patternRe.MatchString(text) {
+			if !re.MatchString(text) {
 				return fail("invalid pattern")
 			}
 		}
-		switch node.format {
+		switch Str(node["format"]) {
 		case "date-time":
 			if _, ok := parseContractTime(text); !ok {
 				return fail("invalid RFC3339 timestamp")
@@ -877,33 +280,17 @@ func validateCompiledSchemaNode(value any, node *compiledSchemaNode, path string
 			}
 		}
 	}
-	if node.hasNumericBounds {
-		if msg := checkNumericBounds(value, node); msg != "" {
-			return fail(msg)
+	if number, ok := schemaNumber(value); ok {
+		for _, bound := range []struct {
+			name  string
+			valid func(int) bool
+		}{{"minimum", func(c int) bool { return c >= 0 }}, {"exclusiveMinimum", func(c int) bool { return c > 0 }}, {"maximum", func(c int) bool { return c <= 0 }}} {
+			if limit, present := schemaNumber(node[bound.name]); present && !bound.valid(number.Cmp(limit)) {
+				return fail("outside " + bound.name)
+			}
 		}
 	}
 	return nil
-}
-
-func validateSchemaNode(value any, node Object, path string) error {
-	ensureEmbeddedSchema()
-	if node == nil {
-		return nil
-	}
-	if compiled := lookupEmbeddedCompiledNode(node); compiled != nil {
-		if compiledNodeMatches(value, compiled) {
-			return nil
-		}
-		return validateCompiledSchemaNode(value, compiled, path)
-	}
-	compiled, err := compileCustomSchema(node, path)
-	if err != nil {
-		return err
-	}
-	if compiledNodeMatches(value, compiled) {
-		return nil
-	}
-	return validateCompiledSchemaNode(value, compiled, path)
 }
 
 var schemaAnnotations = map[string]bool{
@@ -920,7 +307,6 @@ var schemaAssertions = map[string]bool{
 }
 
 func auditSchemaKeywords(node Object, path string) error {
-	runtimeKeywordAudits.Add(1)
 	fail := func(message string) error { return fmt.Errorf("%s: %s", path, message) }
 	for key := range node {
 		if !schemaAnnotations[key] && !schemaAssertions[key] {
@@ -1067,7 +453,7 @@ func ValidateSchemaDefinition(document Object) error {
 			if !ok {
 				return fmt.Errorf("%s.pattern: string required", path)
 			}
-			if _, err := compilePattern(pattern); err != nil {
+			if _, err := compileSchemaPattern(pattern); err != nil {
 				return fmt.Errorf("%s.pattern: unsupported expression: %w", path, err)
 			}
 		}
