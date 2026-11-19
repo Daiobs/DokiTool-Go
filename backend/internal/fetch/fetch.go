@@ -8,8 +8,10 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"container/list"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -73,9 +76,33 @@ type Resolver interface {
 }
 type roundTrip func(*http.Request, []netip.Addr, Policy) (*http.Response, error)
 
+const (
+	maxPooledTransports  = 64
+	maxPolicyHeaderBytes = 64 << 10
+)
+
+type transportKey struct {
+	host string
+	port string
+	ip   string
+}
+
+type pooledTransportEntry struct {
+	key       transportKey
+	transport *http.Transport
+}
+
 type Client struct {
 	resolver  Resolver
 	transport roundTrip
+
+	dial           func(context.Context, string, string) (net.Conn, error)
+	tlsRootCAs     *x509.CertPool
+	maxPoolEntries int
+
+	poolMu  sync.Mutex
+	pool    map[transportKey]*list.Element
+	poolLRU *list.List
 }
 
 func New() *Client { return NewWithResolver(net.DefaultResolver) }
@@ -86,7 +113,30 @@ func NewWithResolver(r Resolver) *Client {
 	if r == nil {
 		r = net.DefaultResolver
 	}
-	return &Client{resolver: r, transport: standardRoundTrip}
+	c := &Client{
+		resolver: r,
+		pool:     make(map[transportKey]*list.Element),
+		poolLRU:  list.New(),
+	}
+	c.transport = c.pooledRoundTrip
+	return c
+}
+
+// CloseIdleConnections closes all idle Keep-Alive connections in the client's
+// bounded transport pool. Active in-flight requests are unaffected.
+func (c *Client) CloseIdleConnections() {
+	if c == nil {
+		return
+	}
+	c.poolMu.Lock()
+	transports := make([]*http.Transport, 0, len(c.pool))
+	for _, elem := range c.pool {
+		transports = append(transports, elem.Value.(*pooledTransportEntry).transport)
+	}
+	c.poolMu.Unlock()
+	for _, tr := range transports {
+		tr.CloseIdleConnections()
+	}
 }
 
 // AllowHosts validates server-side request targets separately from the input
@@ -170,11 +220,11 @@ func prefixes(values ...string) []netip.Prefix {
 
 func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 	p := in.Policy
-	if p.AllowedURL == nil || p.Purpose == "" || p.Timeout <= 0 || p.Timeout > 45*time.Second || p.MaxBytes < 1 || p.MaxBytes > 8<<20 || p.MaxHeaderBytes < 0 || p.MaxHeaderBytes > 64<<10 || p.MaxRedirects < 0 || p.MaxRedirects > 5 {
+	if p.AllowedURL == nil || p.Purpose == "" || p.Timeout <= 0 || p.Timeout > 45*time.Second || p.MaxBytes < 1 || p.MaxBytes > 8<<20 || p.MaxHeaderBytes < 0 || p.MaxHeaderBytes > maxPolicyHeaderBytes || p.MaxRedirects < 0 || p.MaxRedirects > 5 {
 		return Response{}, ErrPolicy
 	}
 	if p.MaxHeaderBytes == 0 {
-		p.MaxHeaderBytes = 64 << 10
+		p.MaxHeaderBytes = maxPolicyHeaderBytes
 	}
 	ctx, cancel := context.WithTimeout(parent, p.Timeout)
 	defer cancel()
@@ -229,6 +279,10 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 		}
 		if response == nil || response.Body == nil {
 			return Response{}, fmt.Errorf("missing upstream response")
+		}
+		if !p.StrictMediaHeaders && p.MaxHeaderBytes < maxPolicyHeaderBytes && minHeaderWireBytes(response.Header) > p.MaxHeaderBytes {
+			response.Body.Close()
+			return Response{}, errors.New("net/http: server responded with more than allowed bytes of response headers")
 		}
 		out := Response{StatusCode: response.StatusCode, Header: response.Header.Clone(), URL: current, History: append([]string(nil), history...)}
 		isRedirect := response.StatusCode == 301 || response.StatusCode == 302 || response.StatusCode == 303 || response.StatusCode == 307 || response.StatusCode == 308
@@ -305,6 +359,176 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 	}
 }
 
+type pinnedDialError struct {
+	err error
+}
+
+func (e *pinnedDialError) Error() string { return e.err.Error() }
+func (e *pinnedDialError) Unwrap() error { return e.err }
+
+func (c *Client) dialer() func(context.Context, string, string) (net.Conn, error) {
+	if c != nil && c.dial != nil {
+		return c.dial
+	}
+	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+}
+
+// pooledRoundTrip reuses Keep-Alive connections strictly within the same
+// (lowercaseHost, port, verifiedIP) boundary after Do has resolved DNS and
+// checked PublicIP on every hop. StrictMediaHeaders stays unpooled so raw wire
+// header inspection remains completely isolated per request.
+func (c *Client) pooledRoundTrip(req *http.Request, ips []netip.Addr, policy Policy) (*http.Response, error) {
+	if policy.StrictMediaHeaders {
+		return roundTripWithDialAndRoots(req, ips, policy, c.dialer(), c.tlsRootCAs)
+	}
+	if req == nil || req.URL == nil || len(ips) == 0 || (req.URL.Scheme != "https" && req.URL.Scheme != "http") {
+		return nil, ErrPolicy
+	}
+	for _, ip := range ips {
+		if !PublicIP(ip) {
+			return nil, ErrPolicy
+		}
+	}
+	lowerHost := strings.ToLower(req.URL.Hostname())
+	port := req.URL.Port()
+	if port == "" {
+		if req.URL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	if lowerHost == "" || !((req.URL.Scheme == "https" && port == "443") || (req.URL.Scheme == "http" && port == "80")) {
+		return nil, ErrPolicy
+	}
+	if lowerAuthority := strings.ToLower(req.URL.Host); req.URL.Host != lowerAuthority {
+		cloned := req.Clone(req.Context())
+		cloned.URL.Host = lowerAuthority
+		cloned.Host = strings.ToLower(req.Host)
+		req = cloned
+	}
+	var lastErr error
+	for i, ip := range ips {
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+		attempt := req
+		if i > 0 {
+			attempt = req.Clone(req.Context())
+			if req.GetBody != nil {
+				bodyCopy, err := req.GetBody()
+				if err != nil {
+					return nil, err
+				}
+				attempt.Body = bodyCopy
+			}
+		}
+		tr := c.pooledTransport(lowerHost, port, ip)
+		resp, err := tr.RoundTrip(attempt)
+		if err == nil {
+			return resp, nil
+		}
+		if req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
+		var dialErr *pinnedDialError
+		if !errors.As(err, &dialErr) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (c *Client) pooledTransport(lowerHost, port string, ip netip.Addr) *http.Transport {
+	key := transportKey{host: lowerHost, port: port, ip: ip.String()}
+	var evicted []*http.Transport
+
+	c.poolMu.Lock()
+	if c.pool == nil {
+		c.pool = make(map[transportKey]*list.Element)
+		c.poolLRU = list.New()
+	}
+	if elem, ok := c.pool[key]; ok {
+		c.poolLRU.MoveToFront(elem)
+		tr := elem.Value.(*pooledTransportEntry).transport
+		c.poolMu.Unlock()
+		return tr
+	}
+	limit := c.maxPoolEntries
+	if limit <= 0 {
+		limit = maxPooledTransports
+	}
+	for c.poolLRU.Len() >= limit {
+		oldest := c.poolLRU.Back()
+		if oldest == nil {
+			break
+		}
+		c.poolLRU.Remove(oldest)
+		entry := oldest.Value.(*pooledTransportEntry)
+		delete(c.pool, entry.key)
+		evicted = append(evicted, entry.transport)
+	}
+	tr := c.newPooledTransport(lowerHost, port, ip)
+	elem := c.poolLRU.PushFront(&pooledTransportEntry{key: key, transport: tr})
+	c.pool[key] = elem
+	c.poolMu.Unlock()
+
+	for _, old := range evicted {
+		old.CloseIdleConnections()
+	}
+	return tr
+}
+
+func (c *Client) newPooledTransport(lowerHost, port string, verifiedIP netip.Addr) *http.Transport {
+	pinnedAddr := net.JoinHostPort(verifiedIP.String(), port)
+	dial := c.dialer()
+	dialPinned := func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		if !PublicIP(verifiedIP) || (network != "tcp" && network != "tcp4" && network != "tcp6") {
+			return nil, ErrPolicy
+		}
+		dialHost, dialPort, err := net.SplitHostPort(address)
+		if err != nil || !strings.EqualFold(dialHost, lowerHost) || dialPort != port {
+			return nil, ErrPolicy
+		}
+		boundCtx, cancel := context.WithTimeout(dialCtx, 5*time.Second)
+		defer cancel()
+		conn, err := dial(boundCtx, "tcp", pinnedAddr)
+		if err != nil {
+			return nil, &pinnedDialError{err: err}
+		}
+		return conn, nil
+	}
+	return &http.Transport{
+		Proxy:                  nil,
+		DisableCompression:     true,
+		DisableKeepAlives:      false,
+		ForceAttemptHTTP2:      false,
+		MaxIdleConns:           2,
+		MaxIdleConnsPerHost:    2,
+		IdleConnTimeout:        25 * time.Second,
+		TLSHandshakeTimeout:    10 * time.Second,
+		ResponseHeaderTimeout:  20 * time.Second,
+		MaxResponseHeaderBytes: maxPolicyHeaderBytes,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: lowerHost,
+			RootCAs:    c.tlsRootCAs,
+		},
+		DialContext: dialPinned,
+	}
+}
+
+func minHeaderWireBytes(headers http.Header) int64 {
+	var total int64
+	for key, values := range headers {
+		for _, value := range values {
+			total += int64(len(key) + len(value) + 2)
+		}
+	}
+	return total
+}
+
 // One transport per outbound hop keeps DNS checks and the actual socket bound
 // together. A platform cannot enable environment proxies, redirects or cookies.
 // The transport replacement point receives only already approved IPs.
@@ -313,6 +537,10 @@ func standardRoundTrip(req *http.Request, ips []netip.Addr, policy Policy) (*htt
 }
 
 func roundTripWithDial(req *http.Request, ips []netip.Addr, policy Policy, dial func(context.Context, string, string) (net.Conn, error)) (*http.Response, error) {
+	return roundTripWithDialAndRoots(req, ips, policy, dial, nil)
+}
+
+func roundTripWithDialAndRoots(req *http.Request, ips []netip.Addr, policy Policy, dial func(context.Context, string, string) (net.Conn, error), roots *x509.CertPool) (*http.Response, error) {
 	host, port := req.URL.Hostname(), req.URL.Port()
 	if port == "" {
 		if req.URL.Scheme == "https" {
@@ -366,7 +594,7 @@ func roundTripWithDial(req *http.Request, ips []netip.Addr, policy Policy, dial 
 			if err != nil {
 				return nil, err
 			}
-			secure := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}})
+			secure := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: roots})
 			handshake, cancel := context.WithTimeout(req.Context(), 5*time.Second)
 			defer cancel()
 			if err := secure.HandshakeContext(handshake); err != nil {

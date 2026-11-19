@@ -4,11 +4,24 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
+	"log"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -204,5 +217,612 @@ func TestPartialMediaOnlyRejectsWholeFileBeforeReading(t *testing.T) {
 		if !errors.Is(err, ErrPolicy) || body.read {
 			t.Fatalf("%d %q err=%v body read=%v", tc.code, tc.span, err, body.read)
 		}
+	}
+}
+
+type poolConnStats struct {
+	stateNew    atomic.Int32
+	stateIdle   atomic.Int32
+	stateClosed atomic.Int32
+}
+
+func newPoolTestServer(t *testing.T, useTLS bool, names []string, handler http.Handler) (*httptest.Server, *x509.CertPool, *poolConnStats) {
+	t.Helper()
+	stats := &poolConnStats{}
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			stats.stateNew.Add(1)
+		case http.StateIdle:
+			stats.stateIdle.Add(1)
+		case http.StateClosed:
+			stats.stateClosed.Add(1)
+		}
+	}
+	if !useTLS {
+		server.Start()
+		t.Cleanup(server.Close)
+		return server, nil, stats
+	}
+	if len(names) == 0 {
+		names = []string{"api.example.test", "cdn.example.test", "example.com"}
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "DokiTool keepalive pool test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		DNSNames:              names,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(parsed)
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server, roots, stats
+}
+
+func TestKeepAlivePoolReusesSingleConnection(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		scheme := "http"
+		expectedPort := "80"
+		if useTLS {
+			scheme = "https"
+			expectedPort = "443"
+		}
+		t.Run(scheme, func(t *testing.T) {
+			var reqCount atomic.Int32
+			srv, roots, stats := newPoolTestServer(t, useTLS, []string{"api.example.test", "cdn.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n := reqCount.Add(1)
+				if useTLS && (r.TLS == nil || (r.TLS.ServerName != "api.example.test" && r.TLS.ServerName != "cdn.example.test")) {
+					t.Errorf("unexpected TLS SNI: %+v", r.TLS)
+				}
+				if r.ProtoMajor != 1 {
+					t.Errorf("expected HTTP/1.1 pooled transport, got %s", r.Proto)
+				}
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				_, _ = fmt.Fprintf(w, "resp-%d", n)
+			}))
+
+			var lookups, dials atomic.Int32
+			c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+				lookups.Add(1)
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			}))
+			t.Cleanup(c.CloseIdleConnections)
+			c.tlsRootCAs = roots
+			c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if network != "tcp" || addr != "93.184.216.34:"+expectedPort {
+					return nil, fmt.Errorf("unexpected dial %s %s", network, addr)
+				}
+				dials.Add(1)
+				return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+			}
+
+			policy := testPolicy()
+			requests := []Request{
+				{URL: scheme + "://api.example.test/one", Method: http.MethodGet, Policy: policy},
+				{URL: scheme + "://API.Example.Test/two", Method: http.MethodPost, Body: []byte(`{"ok":true}`), Policy: policy},
+				{URL: scheme + "://api.example.test/three", Method: http.MethodHead, Policy: policy},
+				{URL: scheme + "://api.example.test/four", Method: http.MethodGet, Policy: policy},
+			}
+			for i, req := range requests {
+				res, err := c.Do(context.Background(), req)
+				if err != nil || res.StatusCode != http.StatusOK {
+					t.Fatalf("call %d failed: status=%d err=%v", i+1, res.StatusCode, err)
+				}
+			}
+			if lookups.Load() != 4 {
+				t.Fatalf("expected per-request DNS resolution (4 lookups), got %d", lookups.Load())
+			}
+			if stats.stateNew.Load() != 1 || dials.Load() != 1 {
+				t.Fatalf("expected 1 pooled TCP connection across 4 calls, got StateNew=%d dials=%d", stats.stateNew.Load(), dials.Load())
+			}
+
+			// Different hostname resolving to the exact same IP must not coalesce onto api.example.test's socket.
+			res, err := c.Do(context.Background(), Request{URL: scheme + "://cdn.example.test/asset", Policy: policy})
+			if err != nil || res.StatusCode != http.StatusOK {
+				t.Fatalf("cdn request failed: status=%d err=%v", res.StatusCode, err)
+			}
+			if stats.stateNew.Load() != 2 || dials.Load() != 2 {
+				t.Fatalf("expected separate socket for distinct host, got StateNew=%d dials=%d", stats.stateNew.Load(), dials.Load())
+			}
+		})
+	}
+}
+
+func TestKeepAlivePoolDNSRebindingAndIPChangeIsolation(t *testing.T) {
+	var reqsA, reqsB atomic.Int32
+	srvA, rootsA, statsA := newPoolTestServer(t, true, []string{"example.com"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqsA.Add(1)
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "https://example.com/landed", http.StatusFound)
+			return
+		}
+		_, _ = io.WriteString(w, "from-ip-A")
+	}))
+	srvB, rootsB, statsB := newPoolTestServer(t, true, []string{"example.com"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reqsB.Add(1)
+		_, _ = io.WriteString(w, "from-ip-B")
+	}))
+
+	combinedRoots := x509.NewCertPool()
+	combinedRoots.AddCert(srvA.Certificate())
+	combinedRoots.AddCert(srvB.Certificate())
+	_ = rootsA
+	_ = rootsB
+
+	var mu sync.Mutex
+	currentIPs := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	var rebindOnSecondHop bool
+	var hopLookups int
+
+	var dialsA, dialsB, unexpectedDials atomic.Int32
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "example.com" {
+			return nil, fmt.Errorf("unexpected host %q", host)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		hopLookups++
+		if rebindOnSecondHop && hopLookups == 2 {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		}
+		return append([]netip.Addr(nil), currentIPs...), nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = combinedRoots
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		switch addr {
+		case "93.184.216.34:443":
+			dialsA.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, srvA.Listener.Addr().String())
+		case "1.1.1.1:443":
+			dialsB.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, srvB.Listener.Addr().String())
+		case "93.184.216.99:443":
+			return nil, errors.New("synthetic unreachable public IP")
+		default:
+			unexpectedDials.Add(1)
+			return nil, fmt.Errorf("unexpected dial target %s", addr)
+		}
+	}
+
+	policy := Policy{
+		Purpose:         "test-rebinding",
+		AllowedURL:      AllowHosts("example.com"),
+		Timeout:         2 * time.Second,
+		MaxBytes:        1024,
+		FollowRedirects: true,
+		MaxRedirects:    2,
+	}
+
+	// 1. Seed Keep-Alive pool with example.com -> 93.184.216.34.
+	res1, err := c.Do(context.Background(), Request{URL: "https://example.com/init", Policy: policy})
+	if err != nil || string(res1.Body) != "from-ip-A" || dialsA.Load() != 1 || reqsA.Load() != 1 || statsA.stateNew.Load() != 1 {
+		t.Fatalf("initial pooled call failed: body=%q err=%v dialsA=%d reqsA=%d", string(res1.Body), err, dialsA.Load(), reqsA.Load())
+	}
+
+	// 2. Rebind example.com -> 127.0.0.1 (and mixed public+private, and IPv6 loopback):
+	//    must reject with ErrPolicy BEFORE touching the pooled 93.184.216.34 socket.
+	for _, rebound := range [][]netip.Addr{
+		{netip.MustParseAddr("127.0.0.1")},
+		{netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr("127.0.0.1")},
+		{netip.MustParseAddr("::1")},
+	} {
+		mu.Lock()
+		currentIPs = rebound
+		mu.Unlock()
+		if _, err := c.Do(context.Background(), Request{URL: "https://example.com/rebound", Policy: policy}); !errors.Is(err, ErrPolicy) {
+			t.Fatalf("expected ErrPolicy on rebound %v, got %v", rebound, err)
+		}
+		if reqsA.Load() != 1 || dialsA.Load() != 1 || unexpectedDials.Load() != 0 {
+			t.Fatalf("DNS rebinding touched pooled socket or dialed: reqsA=%d dialsA=%d unexpected=%d",
+				reqsA.Load(), dialsA.Load(), unexpectedDials.Load())
+		}
+	}
+
+	// 3. Rebind on redirect hop 2 (hop 1 uses pooled 93.184.216.34 -> 302, hop 2 resolves to 127.0.0.1).
+	mu.Lock()
+	currentIPs = []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	rebindOnSecondHop = true
+	hopLookups = 0
+	mu.Unlock()
+	if _, err := c.Do(context.Background(), Request{URL: "https://example.com/redirect", Policy: policy}); !errors.Is(err, ErrPolicy) {
+		t.Fatalf("expected ErrPolicy on redirect hop rebinding, got %v", err)
+	}
+	if reqsA.Load() != 2 || statsA.stateNew.Load() != 1 || unexpectedDials.Load() != 0 {
+		t.Fatalf("redirect hop 1 should reuse pool and hop 2 should reject before socket: reqsA=%d StateNewA=%d unexpected=%d",
+			reqsA.Load(), statsA.stateNew.Load(), unexpectedDials.Load())
+	}
+
+	// 4. DNS rotates to a different public IP (example.com -> 1.1.1.1): must dial 1.1.1.1, NOT reuse 93.184.216.34.
+	mu.Lock()
+	rebindOnSecondHop = false
+	currentIPs = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
+	mu.Unlock()
+	for i := range 2 {
+		resB, err := c.Do(context.Background(), Request{URL: "https://example.com/rotated", Policy: policy})
+		if err != nil || string(resB.Body) != "from-ip-B" {
+			t.Fatalf("rotated public IP call %d failed: body=%q err=%v", i+1, string(resB.Body), err)
+		}
+	}
+	if reqsA.Load() != 2 || dialsB.Load() != 1 || reqsB.Load() != 2 || statsB.stateNew.Load() != 1 {
+		t.Fatalf("expected 1 dial and 2 requests to new public IP without touching old IP: reqsA=%d dialsB=%d reqsB=%d StateNewB=%d",
+			reqsA.Load(), dialsB.Load(), reqsB.Load(), statsB.stateNew.Load())
+	}
+
+	// 5. Multi-IP dial fallback ([unreachable public IP, 1.1.1.1]) falls back cleanly to 1.1.1.1's pooled transport.
+	mu.Lock()
+	currentIPs = []netip.Addr{netip.MustParseAddr("93.184.216.99"), netip.MustParseAddr("1.1.1.1")}
+	mu.Unlock()
+	resFallback, err := c.Do(context.Background(), Request{URL: "https://example.com/fallback", Method: http.MethodPost, Body: []byte("payload"), Policy: policy})
+	if err != nil || string(resFallback.Body) != "from-ip-B" || dialsB.Load() != 1 || reqsB.Load() != 3 {
+		t.Fatalf("multi-IP fallback failed: body=%q err=%v dialsB=%d reqsB=%d", string(resFallback.Body), err, dialsB.Load(), reqsB.Load())
+	}
+}
+
+func TestKeepAlivePoolMidBodyCancellationAbortsPromptlyAndRecovers(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		scheme := "http"
+		expectedPort := "80"
+		if useTLS {
+			scheme = "https"
+			expectedPort = "443"
+		}
+		t.Run(scheme, func(t *testing.T) {
+			flushed := make(chan struct{})
+			serverSawDisconnect := make(chan struct{})
+			srv, roots, stats := newPoolTestServer(t, useTLS, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/stall" {
+					w.Header().Set("Content-Length", "512")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, "partial-bytes")
+					w.(http.Flusher).Flush()
+					close(flushed)
+					<-r.Context().Done()
+					close(serverSawDisconnect)
+					return
+				}
+				_, _ = io.WriteString(w, "healthy")
+			}))
+
+			c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			}))
+			t.Cleanup(c.CloseIdleConnections)
+			c.tlsRootCAs = roots
+			c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if addr != "93.184.216.34:"+expectedPort {
+					return nil, fmt.Errorf("unexpected dial %s", addr)
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+			}
+
+			policy := testPolicy()
+			policy.Timeout = 5 * time.Second
+			policy.MaxBytes = 4096
+
+			// Warm up pooled socket.
+			if res, err := c.Do(context.Background(), Request{URL: scheme + "://api.example.test/ok", Policy: policy}); err != nil || string(res.Body) != "healthy" {
+				t.Fatalf("warmup failed: %+v %v", res, err)
+			}
+			if stats.stateNew.Load() != 1 {
+				t.Fatalf("expected StateNew=1 after warmup, got %d", stats.stateNew.Load())
+			}
+
+			// Start mid-body stalling request and cancel while Do is reading resp.Body.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := c.Do(ctx, Request{URL: scheme + "://api.example.test/stall", Policy: policy})
+				done <- err
+			}()
+
+			select {
+			case <-flushed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("server never flushed partial body")
+			}
+			// Give the client reader a brief moment to enter readBody on the flushed bytes.
+			time.Sleep(15 * time.Millisecond)
+
+			cancelStart := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				elapsed := time.Since(cancelStart)
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("expected context.Canceled on mid-body abort, got %v", err)
+				}
+				if elapsed >= 200*time.Millisecond {
+					t.Fatalf("mid-body cancellation took %v (want < 200ms)", elapsed)
+				}
+			case <-time.After(200 * time.Millisecond):
+				t.Fatal("Do() did not abort within 200ms after mid-body cancellation")
+			}
+
+			select {
+			case <-serverSawDisconnect:
+			case <-time.After(time.Second):
+				t.Fatal("cancelled mid-body socket stayed open on server")
+			}
+
+			// Subsequent requests must dial a clean new connection and resume pooling cleanly.
+			for i := range 2 {
+				res, err := c.Do(context.Background(), Request{URL: scheme + "://api.example.test/ok", Policy: policy})
+				if err != nil || string(res.Body) != "healthy" {
+					t.Fatalf("post-cancel recovery call %d failed: %+v %v", i+1, res, err)
+				}
+			}
+			if stats.stateNew.Load() != 2 {
+				t.Fatalf("expected 1 fresh socket reused across post-cancel requests (StateNew=2), got %d", stats.stateNew.Load())
+			}
+		})
+	}
+}
+
+func TestStrictMediaHeadersRemainsIsolatedFromKeepAlivePool(t *testing.T) {
+	srv, roots, stats := newPoolTestServer(t, true, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dup-cl" {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("hijacking unsupported")
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, _ = buf.WriteString("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/10\r\nContent-Length: 3\r\nContent-Length: 3\r\nContent-Type: video/mp4\r\n\r\nabc")
+			_ = buf.Flush()
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-2/10")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "abc")
+	}))
+
+	var dials atomic.Int32
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = roots
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != "93.184.216.34:443" {
+			return nil, fmt.Errorf("unexpected dial %s", addr)
+		}
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+
+	normalPolicy := testPolicy()
+	for i := range 2 {
+		if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/meta", Policy: normalPolicy}); err != nil {
+			t.Fatalf("normal call %d failed: %v", i+1, err)
+		}
+	}
+	if dials.Load() != 1 || stats.stateNew.Load() != 1 {
+		t.Fatalf("expected normal calls to share 1 pooled socket, got dials=%d StateNew=%d", dials.Load(), stats.stateNew.Load())
+	}
+
+	strictPolicy := testPolicy()
+	strictPolicy.StrictMediaHeaders = true
+	strictPolicy.PartialMediaOnly = true
+	strictPolicy.FollowRedirects = false
+	for i := range 2 {
+		res, err := c.Do(context.Background(), Request{URL: "https://api.example.test/media", Policy: strictPolicy})
+		if err != nil || string(res.Body) != "abc" {
+			t.Fatalf("strict media call %d failed: %+v %v", i+1, res, err)
+		}
+	}
+	if dials.Load() != 3 || stats.stateNew.Load() != 3 {
+		t.Fatalf("expected each StrictMediaHeaders call to use an isolated socket (dials=3 StateNew=3), got dials=%d StateNew=%d",
+			dials.Load(), stats.stateNew.Load())
+	}
+
+	// Raw duplicate critical header on wire must still be rejected by mediaHeaderConn.
+	if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/dup-cl", Policy: strictPolicy}); !errors.Is(err, ErrMediaHeaders) {
+		t.Fatalf("expected ErrMediaHeaders on raw duplicate Content-Length, got %v", err)
+	}
+
+	// Normal pooled socket remains intact and untouched by strict calls.
+	if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/meta", Policy: normalPolicy}); err != nil {
+		t.Fatalf("post-strict normal call failed: %v", err)
+	}
+	if dials.Load() != 4 {
+		t.Fatalf("expected post-strict normal call to reuse pooled socket without dialing (dials=4), got %d", dials.Load())
+	}
+}
+
+func TestCloseIdleConnectionsAndConcurrentPoolEviction(t *testing.T) {
+	// Safe no-op on nil and zero-value Client.
+	var nilClient *Client
+	nilClient.CloseIdleConnections()
+	(&Client{}).CloseIdleConnections()
+
+	srv, roots, stats := newPoolTestServer(t, true, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oversized-header" {
+			w.Header().Set("X-Large", strings.Repeat("h", 2048))
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+
+	var ipMu sync.Mutex
+	targetIP := netip.MustParseAddr("93.184.216.1")
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		ipMu.Lock()
+		ip := targetIP
+		ipMu.Unlock()
+		return []netip.Addr{ip}, nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = roots
+	c.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+
+	policy := testPolicy()
+	policy.Timeout = 3 * time.Second
+
+	// 1. Reuse pooled socket, then CloseIdleConnections() forces a fresh connection on next Do().
+	for range 2 {
+		if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/ping", Policy: policy}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stats.stateNew.Load() != 1 {
+		t.Fatalf("expected StateNew=1 before CloseIdleConnections, got %d", stats.stateNew.Load())
+	}
+
+	c.CloseIdleConnections()
+	deadline := time.Now().Add(time.Second)
+	for stats.stateClosed.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stats.stateClosed.Load() < 1 {
+		t.Fatalf("expected idle socket to close after CloseIdleConnections, StateClosed=%d", stats.stateClosed.Load())
+	}
+
+	for range 2 {
+		if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/ping", Policy: policy}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stats.stateNew.Load() != 2 {
+		t.Fatalf("expected StateNew=2 after CloseIdleConnections + 2 reused calls, got %d", stats.stateNew.Load())
+	}
+
+	// Verify per-request smaller MaxHeaderBytes is still enforced on a pooled transport.
+	smallHeaderPolicy := policy
+	smallHeaderPolicy.MaxHeaderBytes = 1024
+	if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/oversized-header", Policy: smallHeaderPolicy}); err == nil {
+		t.Fatal("expected oversized header response to fail per-request MaxHeaderBytes")
+	}
+
+	// 2. Bounded pool eviction at maxPooledTransports (64): inserting 65 distinct public IPs evicts oldest & closes its idle conn.
+	closedBeforeEvict := stats.stateClosed.Load()
+	for i := 1; i <= maxPooledTransports+1; i++ {
+		ipMu.Lock()
+		targetIP = netip.MustParseAddr(fmt.Sprintf("93.184.216.%d", i))
+		ipMu.Unlock()
+		if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/evict", Policy: policy}); err != nil {
+			t.Fatalf("eviction step %d failed: %v", i, err)
+		}
+	}
+	c.poolMu.Lock()
+	poolLen := len(c.pool)
+	_, firstStillPresent := c.pool[transportKey{host: "api.example.test", port: "443", ip: "93.184.216.1"}]
+	c.poolMu.Unlock()
+	if poolLen != maxPooledTransports || firstStillPresent {
+		t.Fatalf("expected pool capped at %d with oldest entry evicted, got len=%d firstStillPresent=%v",
+			maxPooledTransports, poolLen, firstStillPresent)
+	}
+	deadline = time.Now().Add(time.Second)
+	for stats.stateClosed.Load() <= closedBeforeEvict && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stats.stateClosed.Load() <= closedBeforeEvict {
+		t.Fatalf("expected evicted transport's idle connection to close: before=%d after=%d",
+			closedBeforeEvict, stats.stateClosed.Load())
+	}
+
+	// 3. Concurrent Do() + pool eviction + CloseIdleConnections() under -race.
+	var seq atomic.Uint32
+	raceClient := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		n := (seq.Add(1) % 96) + 1
+		return []netip.Addr{netip.MustParseAddr(fmt.Sprintf("93.184.217.%d", n))}, nil
+	}))
+	t.Cleanup(raceClient.CloseIdleConnections)
+	raceClient.tlsRootCAs = roots
+	raceClient.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+
+	var wg sync.WaitGroup
+	stopClosers := make(chan struct{})
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopClosers:
+					return
+				default:
+					raceClient.CloseIdleConnections()
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	errCh := make(chan error, 16)
+	var workers sync.WaitGroup
+	for w := range 8 {
+		workers.Add(1)
+		go func(workerID int) {
+			defer workers.Done()
+			for iter := range 20 {
+				p := policy
+				if (workerID+iter)%7 == 0 {
+					p.StrictMediaHeaders = true
+					p.FollowRedirects = false
+				}
+				res, err := raceClient.Do(context.Background(), Request{URL: "https://api.example.test/race", Policy: p})
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				if string(res.Body) != "ok" {
+					select {
+					case errCh <- fmt.Errorf("unexpected body %q", string(res.Body)):
+					default:
+					}
+					return
+				}
+			}
+		}(w)
+	}
+	workers.Wait()
+	close(stopClosers)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent pool race error: %v", err)
 	}
 }
