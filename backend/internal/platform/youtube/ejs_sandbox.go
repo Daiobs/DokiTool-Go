@@ -21,7 +21,7 @@ import (
 )
 
 // PinnedDenoVersion and PinnedEJSVersion lock the Deno runtime and yt-dlp/ejs
-// solver assets corresponding to production yt-dlp 2026.10.26.
+// solver assets corresponding to the pinned production yt-dlp release.
 const (
 	PinnedDenoVersion = "2.9.8"
 	PinnedEJSVersion  = "0.8.0"
@@ -41,9 +41,9 @@ const (
 	maxEJSStderrBytes  = 64 << 10  // 64 KiB
 )
 
-// OfficialDenoSHA256Sums2098 maps the SHA-256 digests of the extracted official
-// Deno v2.9.8 binaries to their release asset identifiers.
-var OfficialDenoSHA256Sums2098 = map[string]string{
+// OfficialDenoSHA256Sums maps the SHA-256 digests of the extracted official
+// Deno binaries for PinnedDenoVersion to their release asset identifiers.
+var OfficialDenoSHA256Sums = map[string]string{
 	"368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7": "deno-x86_64-unknown-linux-gnu",
 	"b484f780e5149ca05c673f1f79f7fb466f12a2295933bdad917af4a8a5c020e8": "deno-aarch64-unknown-linux-gnu",
 	"d1e99265e5e6ee096c5780d88ff7d3e6cfdf33b1953a118b4889cab8ca6980ba": "deno-aarch64-apple-darwin",
@@ -122,7 +122,7 @@ func NewEJSSandbox(cfg SandboxConfig) (*EJSSandbox, error) {
 	}
 	allowedDeno := cfg.AllowedDenoHashes
 	if len(allowedDeno) == 0 {
-		allowedDeno = OfficialDenoSHA256Sums2098
+		allowedDeno = OfficialDenoSHA256Sums
 	}
 	denoSum, err := verifyExecutableFileSHA256(resolvedDeno, maxDenoBinaryBytes)
 	if err != nil {

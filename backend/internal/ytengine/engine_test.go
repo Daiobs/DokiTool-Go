@@ -45,8 +45,8 @@ func writeFakeYTDLP(t *testing.T, scriptBody string) (string, map[string]string)
 }
 
 func TestOfficialSHA256VerificationAndMismatchDegradation(t *testing.T) {
-	if len(OfficialSHA256Sums20261026) != 6 {
-		t.Fatalf("expected 6 official SHA-256 entries for %s, got %d", PinnedVersion, len(OfficialSHA256Sums20261026))
+	if len(OfficialSHA256Sums) != 6 {
+		t.Fatalf("expected 6 official SHA-256 entries for %s, got %d", PinnedVersion, len(OfficialSHA256Sums))
 	}
 
 	// Missing binary -> returns disabled engine and error without panicking.
@@ -62,11 +62,11 @@ func TestOfficialSHA256VerificationAndMismatchDegradation(t *testing.T) {
 		t.Fatalf("expected SERVICE_NOT_CONFIGURED from disabled engine, got %v (%v)", extractErr, eErr)
 	}
 
-	// Tampered binary whose SHA-256 does not match OfficialSHA256Sums20261026 -> rejected.
+	// Tampered binary whose SHA-256 does not match OfficialSHA256Sums -> rejected.
 	binPath, _ := writeFakeYTDLP(t, `echo '{"id":"1"}'`)
 	tamperedEng, err := New(Config{
 		BinaryPath:    binPath,
-		AllowedHashes: OfficialSHA256Sums20261026,
+		AllowedHashes: OfficialSHA256Sums,
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match pinned release "+PinnedVersion) {
 		t.Fatalf("expected SHA-256 mismatch error, got %v", err)
@@ -299,7 +299,7 @@ func TestPathDiscoveryAndSHA256Verification(t *testing.T) {
 	badEng, err := New(Config{
 		BinaryPath:    "",
 		EnvPath:       dir,
-		AllowedHashes: OfficialSHA256Sums20261026,
+		AllowedHashes: OfficialSHA256Sums,
 	})
 	if err == nil || badEng.Enabled() || !strings.Contains(err.Error(), "does not match pinned release") {
 		t.Fatalf("expected PATH wrong-hash rejection, got enabled=%v err=%v", badEng != nil && badEng.Enabled(), err)
@@ -1678,7 +1678,7 @@ func TestOmniGetPoint2PythonZipappAndStaleTempCleanup(t *testing.T) {
 	}
 	zipappDir := t.TempDir()
 	zipappPath := filepath.Join(zipappDir, "yt-dlp")
-	pyBody := "#!/usr/bin/env python3\n# PK\x03\x04 simulated zipapp header\nimport json, sys\nif '--version' in sys.argv:\n    print('2026.10.26')\n    sys.exit(0)\nprint(json.dumps({'id':'zipapp-ok','title':'Zipapp Test','formats':[{'format_id':'18','url':'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18','ext':'mp4','protocol':'https','width':1280,'height':720,'vcodec':'avc1.42001E','acodec':'mp4a.40.2'}]}))\n"
+	pyBody := "#!/usr/bin/env python3\n# PK\x03\x04 simulated zipapp header\nimport json, sys\nif '--version' in sys.argv:\n    print('" + PinnedVersion + "')\n    sys.exit(0)\nprint(json.dumps({'id':'zipapp-ok','title':'Zipapp Test','formats':[{'format_id':'18','url':'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18','ext':'mp4','protocol':'https','width':1280,'height':720,'vcodec':'avc1.42001E','acodec':'mp4a.40.2'}]}))\n"
 	if err := os.WriteFile(zipappPath, []byte(pyBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1726,7 +1726,7 @@ func TestOmniGetPythonZipappStartupVersionSelfCheckFallback(t *testing.T) {
 	// with a working direct interpreter -> falls back cleanly to direct execution (UsingPythonZipapp() == false, Enabled() == true).
 	execZipDir := t.TempDir()
 	execZipPath := filepath.Join(execZipDir, "yt-dlp")
-	execZipBody := fmt.Sprintf("#!%s\n# PK\x03\x04 simulated zipapp header\nimport json, sys\nif '--version' in sys.argv:\n    print('2026.10.26')\n    sys.exit(0)\nprint(json.dumps({'id':'direct-fallback-ok','title':'Direct Fallback','formats':[{'format_id':'18','url':'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18','ext':'mp4','protocol':'https','width':1280,'height':720,'vcodec':'avc1.42001E','acodec':'mp4a.40.2'}]}))\n", realPython3)
+	execZipBody := fmt.Sprintf("#!%s\n# PK\x03\x04 simulated zipapp header\nimport json, sys\nif '--version' in sys.argv:\n    print('%s')\n    sys.exit(0)\nprint(json.dumps({'id':'direct-fallback-ok','title':'Direct Fallback','formats':[{'format_id':'18','url':'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18','ext':'mp4','protocol':'https','width':1280,'height':720,'vcodec':'avc1.42001E','acodec':'mp4a.40.2'}]}))\n", realPython3, PinnedVersion)
 	if err := os.WriteFile(execZipPath, []byte(execZipBody), 0o755); err != nil {
 		t.Fatal(err)
 	}
