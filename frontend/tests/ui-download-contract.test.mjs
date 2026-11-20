@@ -13,7 +13,7 @@ import { ref, computed, h, createSSRApp, createRenderer, nextTick, markRaw } fro
 import { renderToString } from '@vue/server-renderer';
 import JSZip from 'jszip';
 
-let vite, downloads, ResultSection, HeroSection, PlatformGrid, DownloadCard, platforms, parser, mediaSources, mediaContract, selectionModule, configuration;
+let vite, downloads, ResultSection, HeroSection, PlatformGrid, DownloadCard, platforms, parser, mediaSources, mediaContract, selectionModule, configuration, youtubeHelperCore;
 let clicked, blobs, fetched, nativeFrames;
 const originals = { fetch: globalThis.fetch, document: globalThis.document, window: globalThis.window, location: globalThis.location, cryptoDescriptor: Object.getOwnPropertyDescriptor(globalThis, 'crypto'), createObjectURL: URL.createObjectURL, revokeObjectURL: URL.revokeObjectURL };
 before(async () => {
@@ -52,6 +52,7 @@ before(async () => {
   selectionModule = await vite.ssrLoadModule('/src/composables/useVideoSelection.ts');
   configuration = await vite.ssrLoadModule('/src/services/apiConfig.ts');
   mediaSources = await vite.ssrLoadModule('/src/utils/mediaSources.ts');
+  youtubeHelperCore = await vite.ssrLoadModule('/src/utils/youtubeHelperCore.js');
   platforms = await vite.ssrLoadModule('/src/utils/platforms.ts');
   parser = await vite.ssrLoadModule('/src/composables/useVideoParser.ts');
   globalThis.window = { setTimeout, clearTimeout, addEventListener() {}, removeEventListener() {} };
@@ -252,7 +253,7 @@ async function mountResultPlayer(data, locale = 'zh-CN') {
   new Function('require', 'module', 'exports', code.code)(
     (id) => id === './VideoPlaylist.vue' ? { __esModule: true, default: { render: () => null } }
       : id === './AppIcon.vue' ? { __esModule: true, default: { render: () => h('i') } }
-      : id === '../utils/mediaSources' ? mediaSources : id === '../utils/mediaContract' ? mediaContract : id === '../services/apiConfig' ? configuration : require(id),
+      : id === '../utils/mediaSources' ? mediaSources : id === '../utils/mediaContract' ? mediaContract : id === '../utils/youtubeHelperCore' ? youtubeHelperCore : id === '../services/apiConfig' ? configuration : require(id),
     module, module.exports,
   );
   const element = (type, text = '') => markRaw({ type, text, props: {}, children: [], parent: null, style: {}, removeAttribute() {} });
@@ -3506,4 +3507,81 @@ test('#91 PR1 item 6: archive enforces total byte cap (declared & streaming) and
   assert.match(hStream.store.downloads[0].error, /500\s*MB/);
   assert.equal(streamCancelled, true, 'streaming reader must be cancelled as soon as cumulative bytes exceed 500 MiB');
   assert.equal(chunksEmitted, 8, 'stops immediately on the chunk that crosses 500 MiB');
+});
+
+test('codec humanization contract: formatCodecLabel maps raw codecs to readable names while ResultSection preserves raw codec in title attribute', () => {
+  assert.equal(mediaSources.formatCodecLabel('av01.0.13M.08'), 'AV1');
+  assert.equal(mediaSources.formatCodecLabel('av1'), 'AV1');
+  assert.equal(mediaSources.formatCodecLabel('avc1.64002A'), 'H.264');
+  assert.equal(mediaSources.formatCodecLabel('h264'), 'H.264');
+  assert.equal(mediaSources.formatCodecLabel('vp09.00.51.08'), 'VP9');
+  assert.equal(mediaSources.formatCodecLabel('vp9'), 'VP9');
+  assert.equal(mediaSources.formatCodecLabel('hev1.1.6.L93.B0'), 'HEVC');
+  assert.equal(mediaSources.formatCodecLabel('hvc1.1.6.L120.90'), 'HEVC');
+  assert.equal(mediaSources.formatCodecLabel('hevc'), 'HEVC');
+  assert.equal(mediaSources.formatCodecLabel('h265'), 'HEVC');
+  assert.equal(mediaSources.formatCodecLabel('mp4a.40.2'), 'AAC');
+  assert.equal(mediaSources.formatCodecLabel('opus'), 'Opus');
+  assert.equal(mediaSources.formatCodecLabel('vp8'), 'vp8');
+});
+
+test('copy-url button remains enabled and emits exact activeVideoUrl on YouTube split high-res stream in both zh-CN and en', async () => {
+  const split4kUrl = 'https://rr4---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=401&id=o-split4k';
+  const prog360Url = 'https://rr4---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=18&id=o-prog360&title=Sample_360p';
+  const audioM4aUrl = 'https://rr4---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=140&id=o-audiom4a';
+  const ytData = {
+    platform: 'youtube',
+    title: 'Sample YouTube Split Copy Test',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-item-1',
+    extra: {
+      youtube_helper: { status: 'ready', version: '1.3.2', script_url: '/helper/dokitool-youtube.user.js' },
+    },
+    items: [
+      {
+        id: 'yt-item-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'v-360', source_id: 's-360', url: prog360Url },
+        variants: [
+          {
+            id: 'v-4k',
+            label: '2026p60 (4K · 仅视频无声)',
+            metadata: { width: 3840, height: 2026, fps: 60, has_audio: false, video_codec: 'av01.0.13M.08', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-4k', url: split4kUrl, size_bytes: 90000000 }] },
+          },
+          {
+            id: 'v-360',
+            label: '360p (含音频)',
+            metadata: { width: 640, height: 360, has_audio: true, video_codec: 'avc1.42001E', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-360', url: prog360Url, size_bytes: 12000000 }] },
+          },
+          {
+            id: 'v-m4a',
+            label: '仅音频 M4A (128 kbps)',
+            metadata: { has_audio: true, audio_codec: 'mp4a.40.2', container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-m4a', url: audioM4aUrl, size_bytes: 7000000 }] },
+          },
+        ],
+      },
+    ],
+  };
+
+  for (const [locale, expectedCopyLabel] of [['zh-CN', '复制链接'], ['en', 'Copy URL']]) {
+    const view = await mountResultPlayer(ytData, locale);
+    const copied = [];
+    view.state.value.onCopyUrl = (url) => copied.push(url);
+    try {
+      view.state.value.selection.choose({ variant_id: 'v-4k', source_id: 's-4k' });
+      await nextTick();
+      const copyBtn = view.copyButton();
+      assert.ok(copyBtn, `${locale}: copy button must exist on YouTube split stream`);
+      assert.equal(Boolean(copyBtn.props.disabled), false, `${locale}: copy button must stay enabled on YouTube split stream`);
+      assert.equal(view.text(copyBtn), expectedCopyLabel);
+      copyBtn.props.onClick();
+      assert.deepEqual(copied, [split4kUrl], `${locale}: clicking copy button must emit copy-url with activeVideoUrl`);
+    } finally {
+      view.app.unmount();
+    }
+  }
 });

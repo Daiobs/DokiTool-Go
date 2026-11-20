@@ -5,12 +5,16 @@ import { createRequire } from 'node:module';
 import { transformWithEsbuild } from 'vite';
 import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, h, markRaw, nextTick, ref } from 'vue';
+import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
 
 const require = createRequire(import.meta.url);
 const originalGlobals = { window: globalThis.window, document: globalThis.document };
 let ResultSection, useVideoSelection, validateMediaEnvelope;
 before(async () => {
-  const modules = { '../services/apiConfig': { apiConfig: { baseUrl: '' } } };
+  const modules = {
+    '../services/apiConfig': { apiConfig: { baseUrl: '' } },
+    '../utils/youtubeHelperCore': youtubeHelperCore,
+  };
   for (const id of ['../utils/mediaSources', '../utils/mediaContract', '../composables/useVideoSelection']) {
     const utilities = await readFile(new URL(`../src/${id.slice(3)}.ts`, import.meta.url), 'utf8');
     const module = { exports: {} };
@@ -385,6 +389,100 @@ test('no-default item with selectable variants enables 请先选择画质 CTA to
     await view.flush();
     assert.equal(Boolean(primaryBtn().props.disabled), true);
     assert.equal(textOf(primaryBtn()), '下载视频');
+  } finally {
+    view.app.unmount();
+  }
+});
+
+test('quality selection badge shows 当前已选 / Selected across platforms and YouTube ready layout slims top banner while keeping pure Scheme A quality cards', async () => {
+  const ytVideo4kUrl = 'https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=401&id=o-test4k';
+  const ytVideo1080Url = 'https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=299&id=o-test1080';
+  const ytVideo360Url = 'https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=18&id=o-test360&title=Sample_360p';
+  const ytAudioM4aUrl = 'https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=140&id=o-testm4a';
+  const ytItem = {
+    id: 'video-yt-layout',
+    type: 'video',
+    default: { variant_id: 'v-360', source_id: 's-360', url: ytVideo360Url },
+    variants: [
+      {
+        id: 'v-4k',
+        label: '2026p60 (4K · 仅视频无声)',
+        metadata: { width: 3840, height: 2026, fps: 60, has_audio: false, video_codec: 'av01.0.13M.08', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+        delivery: { kind: 'file', sources: [{ id: 's-4k', url: ytVideo4kUrl, size_bytes: 90000000 }] },
+      },
+      {
+        id: 'v-4k-tier-only',
+        label: '4K (仅视频无声)',
+        metadata: { width: 3840, height: 2160, fps: 30, has_audio: false, video_codec: 'avc1.640033', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+        delivery: { kind: 'file', sources: [{ id: 's-4k-tier', url: ytVideo1080Url, size_bytes: 80000000 }] },
+      },
+      {
+        id: 'v-360',
+        label: '360p (含音频)',
+        metadata: { width: 640, height: 360, has_audio: true, video_codec: 'avc1.42001E', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+        delivery: { kind: 'file', sources: [{ id: 's-360', url: ytVideo360Url, size_bytes: 12000000 }] },
+      },
+      {
+        id: 'v-audio-m4a',
+        label: '仅音频 M4A (128 kbps)',
+        metadata: { has_audio: true, audio_codec: 'mp4a.40.2', container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4', evidence: 'upstream' },
+        delivery: { kind: 'file', sources: [{ id: 's-audio-m4a', url: ytAudioM4aUrl, size_bytes: 7000000 }] },
+      },
+    ],
+  };
+  const ytData = {
+    platform: 'youtube',
+    title: 'YouTube UI Polish Test',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    items: [ytItem],
+    default_item_id: ytItem.id,
+    author: { name: 'Creator', id: 'creator' },
+    extra: { youtube_helper: { status: 'ready', version: '1.3.2', script_url: '/helper/dokitool-youtube.user.js' } },
+  };
+
+  const view = await mount(ytData);
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  try {
+    // Slimmed top status pill: no full-row .rs-yt-helper-notice banner
+    assert.equal(view.elements('rs-yt-helper-notice').length, 0);
+    const hint = view.elements('rs-header-hint')[0];
+    assert.ok(hasClass(hint, 'rs-header-hint--ready'));
+    assert.equal(textOf(hint), '助手 v1.3.2 已就绪 · 自动合成原声');
+    assert.match(hint.props.title, /YouTube 助手 \(v1\.3\.2\)已就绪/);
+
+    // Switch to Quality tab -> pure Scheme A cards (no .rs-backup-split-actions) and 当前已选 badge
+    await view.tab('画质选项');
+    assert.equal(view.elements('rs-backup-split-actions').length, 0);
+    assert.equal(textOf(view.elements('rs-backup-playing')[0]), '当前已选');
+    assert.deepEqual(view.elements('rs-backup-name').map(textOf), [
+      '约 97.0 MB · 2026p60 (4K)',
+      '约 87.0 MB · 4K',
+      '12.0 MB · 360p (含音频)',
+      '7.0 MB · 仅音频 M4A (128 kbps)',
+    ]);
+
+    // Select 2026p60 (4K) -> .rs-quality-tag shows silent-preview/audio-download hint and primary button shows 下载 4K 有声视频
+    view.elements('rs-backup-item')[0].props.onClick();
+    await view.flush();
+    assert.equal(textOf(view.elements('rs-quality-tag')[0]), '2026p60 · 4K（预览无声 · 下载含音频）');
+    assert.equal(textOf(view.elements('rs-btn--primary')[0]), '下载 4K 有声视频');
+    assert.equal(view.elements('rs-btn--primary')[0].props['data-youtube-mux-save'], true);
+
+    // Select 4K tier-only label -> no duplicate "4K · 4K" in .rs-quality-tag
+    view.elements('rs-backup-item')[1].props.onClick();
+    await view.flush();
+    assert.equal(textOf(view.elements('rs-quality-tag')[0]), '4K（预览无声 · 下载含音频）');
+
+    // Switch locale to English -> Selected badge, ~97.0 MB, English header pill, English .rs-quality-tag & primary CTA
+    view.elements('rs-backup-item')[0].props.onClick();
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(view.elements('rs-header-hint')[0]), 'Helper v1.3.2 Ready · Auto Audio Mux');
+    assert.match(view.elements('rs-header-hint')[0].props.title, /YouTube Helper \(v1\.3\.2\) is ready/);
+    assert.equal(textOf(view.elements('rs-backup-playing')[0]), 'Selected');
+    assert.equal(textOf(view.elements('rs-backup-name')[0]), '~97.0 MB · 2026p60 (4K)');
+    assert.equal(textOf(view.elements('rs-quality-tag')[0]), '2026p60 · 4K (Silent preview · Audio included on download)');
+    assert.equal(textOf(view.elements('rs-btn--primary')[0]), 'Download 4K Video with Audio');
   } finally {
     view.app.unmount();
   }

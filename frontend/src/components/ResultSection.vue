@@ -14,9 +14,11 @@ import {
 import {
   variantLabel,
   formatMediaSize,
+  formatCodecLabel,
   groupVariantsForDisplay,
   variantSpecifications,
 } from "../utils/mediaSources";
+import { selectYouTubeMuxPair } from "../utils/youtubeHelperCore";
 import { apiConfig } from "../services/apiConfig";
 const props = defineProps({
   resultData: Object,
@@ -114,6 +116,7 @@ const activeVariant = computed(() =>
       : null,
 );
 const metadata = computed(() => activeVariant.value?.metadata || {});
+const attachments = computed(() => props.resultData?.attachments || []);
 const isYouTubeAudioOnlyVariant = (variant) =>
   props.resultData?.platform === "youtube" &&
   variant?.metadata?.has_audio === true &&
@@ -129,14 +132,163 @@ const isActiveYouTubeSplitVideo = computed(
 const isActiveYouTubeAudioOnly = computed(() =>
   isYouTubeAudioOnlyVariant(activeVariant.value),
 );
-const isYouTubeSplitOption = (option) =>
-  props.resultData?.platform === "youtube" &&
-  currentItem.value?.type === "video" &&
-  option?.downloadTarget?.kind === "file" &&
-  option?.variant?.metadata?.has_audio === false;
-const isYouTubeAudioOnlyOption = (option) =>
-  option?.downloadTarget?.kind === "file" &&
-  isYouTubeAudioOnlyVariant(option?.variant);
+const youtubeMuxPairsByVariantId = computed(() => {
+  const map = new Map();
+  if (
+    props.resultData?.platform !== "youtube" ||
+    !isYouTubeHelperReady.value ||
+    currentItem.value?.type !== "video" ||
+    !readyItem(currentItem.value)
+  ) {
+    return map;
+  }
+  const itemVariants = currentItem.value.variants;
+  const itemAttachments = attachments.value;
+  for (const variant of itemVariants) {
+    if (
+      variant?.state !== "deferred" &&
+      variant?.metadata?.has_audio === false
+    ) {
+      const pair = selectYouTubeMuxPair(variant, itemVariants, itemAttachments);
+      if (pair?.ok) {
+        map.set(variant.id, pair);
+      }
+    }
+  }
+  return map;
+});
+const activeYouTubeMuxPair = computed(() =>
+  activeVariant.value?.id
+    ? youtubeMuxPairsByVariantId.value.get(activeVariant.value.id) || null
+    : null,
+);
+const SILENT_ONLY_PART_RE =
+  /^(?:仅视频(?:无声)?|无声视频|无音频|无声|video[\s-]*only(?:\s*,?\s*no\s+audio|\s+silent)?|silent(?:\s+video)?(?:\s+only)?|without\s+audio|no\s+audio|no\s+sound|muted)$/i;
+const stripSilentOnlyNotice = (label) => {
+  if (typeof label !== "string" || !label) return "";
+  const cleanedParens = label.replace(
+    /\s*([（(])([^()（）]*)([)）])/g,
+    (_match, open, inner, close) => {
+      const parts = String(inner)
+        .split(/\s*[·•,，]\s*/)
+        .map((p) => p.trim())
+        .filter((p) => p && !SILENT_ONLY_PART_RE.test(p));
+      if (!parts.length) return "";
+      return open === "（" && close === "）"
+        ? `（${parts.join(" · ")}）`
+        : ` (${parts.join(" · ")})`;
+    },
+  );
+  return cleanedParens
+    .replace(
+      /\s*[·•]\s*(?:仅视频(?:无声)?|无声视频|无音频|无声|video[\s-]*only(?:\s*,?\s*no\s+audio|\s+silent)?|silent(?:\s+video)?(?:\s+only)?|without\s+audio|no\s+audio|no\s+sound|muted)\s*$/i,
+      "",
+    )
+    .trim();
+};
+const displayVariantLabel = (variant) => {
+  const raw = variantLabel(variant, props.locale);
+  if (!variant) return raw;
+  if (youtubeMuxPairsByVariantId.value.has(variant.id)) {
+    const stripped = stripSilentOnlyNotice(raw);
+    const out = stripped || raw;
+    return props.locale === "en" && out === "自适应" ? "Adaptive" : out;
+  }
+  return raw;
+};
+const parsePositiveSafeBytes = (raw) => {
+  const n =
+    typeof raw === "number" || (typeof raw === "string" && raw.trim())
+      ? Number(raw)
+      : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+};
+const formatOptionSize = (option) => {
+  const pair = option?.variant?.id
+    ? youtubeMuxPairsByVariantId.value.get(option.variant.id)
+    : null;
+  if (pair) {
+    const videoBytes = parsePositiveSafeBytes(
+      option.source?.size_bytes ?? pair.videoSource?.size_bytes,
+    );
+    const audioBytes = parsePositiveSafeBytes(pair.audioSource?.size_bytes);
+    if (
+      videoBytes > 0 &&
+      audioBytes > 0 &&
+      Number.isSafeInteger(videoBytes + audioBytes)
+    ) {
+      const base = formatMediaSize(videoBytes + audioBytes, props.locale);
+      if (props.locale === "en") {
+        return base.startsWith("<") ? base : `~${base}`;
+      }
+      return `约 ${base}`;
+    }
+    if (videoBytes > 0) {
+      return formatMediaSize(videoBytes, props.locale);
+    }
+    return formatMediaSize(undefined, props.locale);
+  }
+  return formatMediaSize(option?.source?.size_bytes, props.locale);
+};
+const resolveVariantDimensions = (variant) => {
+  const meta = variant?.state === "deferred" ? undefined : variant?.metadata;
+  const w = Number(meta?.width) || 0;
+  const h = Number(meta?.height) || 0;
+  const shortEdge = w > 0 && h > 0 ? Math.min(w, h) : h || w;
+  const longEdge = Math.max(w, h);
+  return { w, h, shortEdge, longEdge };
+};
+const resolveYouTubeHighResTier = (variant) => {
+  const { shortEdge, longEdge } = resolveVariantDimensions(variant);
+  if (shortEdge >= 4320 || longEdge >= 7680) return "8K";
+  if (shortEdge >= 2160 || longEdge >= 3840) return "4K";
+  if (shortEdge >= 1440 || longEdge >= 2560) return "2K";
+  return "";
+};
+const resolveYouTubeDownloadTier = (variant) => {
+  if (!variant) return "";
+  const rawLabel = typeof variant.label === "string" ? variant.label.trim() : "";
+  const { shortEdge, longEdge } = resolveVariantDimensions(variant);
+  if (/\b8k\b/i.test(rawLabel) || shortEdge >= 4320 || longEdge >= 7680) {
+    return "8K";
+  }
+  if (/\b4k\b/i.test(rawLabel) || shortEdge >= 2160 || longEdge >= 3840) {
+    return "4K";
+  }
+  if (/\b2k\b/i.test(rawLabel) || shortEdge >= 1440 || longEdge >= 2560) {
+    return "2K";
+  }
+  if (shortEdge === 1080 || longEdge === 1920) return "1080p";
+  if (shortEdge === 720 || longEdge === 1280) return "720p";
+  if (shortEdge === 480 || longEdge === 854) return "480p";
+  if (shortEdge === 360 || longEdge === 640) return "360p";
+  if (shortEdge === 240 || longEdge === 426) return "240p";
+  if (shortEdge === 144 || longEdge === 256) return "144p";
+  const pMatch = /\b(\d{3,4})p(?:\d{2,3})?\b/i.exec(rawLabel);
+  if (pMatch) {
+    const hVal = Number(pMatch[1]);
+    if (hVal >= 4320) return "8K";
+    if (hVal >= 2160) return "4K";
+    if (hVal >= 1440) return "2K";
+    if (hVal > 0) return `${hVal}p`;
+  }
+  if (shortEdge > 0) return `${shortEdge}p`;
+  return "";
+};
+const resolveYouTubeAudioFormatLabel = (variant) => {
+  const meta = variant?.state === "deferred" ? undefined : variant?.metadata;
+  const ext = String(meta?.extension || meta?.container || "")
+    .trim()
+    .toLowerCase();
+  const rawLabel = String(variant?.label || "");
+  if (ext === "m4a" || ext === "mp4" || /\bm4a\b/i.test(rawLabel)) {
+    return "M4A";
+  }
+  if (ext === "webm" || /\bwebm\b/i.test(rawLabel)) {
+    return "WEBM";
+  }
+  return "";
+};
 const hasVideo = computed(
   () =>
     currentItem.value && ["video", "audio"].includes(currentItem.value.type),
@@ -147,7 +299,6 @@ const imageItems = computed(() =>
 const liveItems = computed(() =>
   props.resultData.items.filter((item) => item.type === "live_photo"),
 );
-const attachments = computed(() => props.resultData.attachments || []);
 const hasImages = computed(() => imageItems.value.length > 0);
 const activeLiveIndex = ref(0),
   liveViewMode = ref("video");
@@ -369,6 +520,91 @@ const sourceHint = computed(() =>
       : "sourceHint",
   ),
 );
+const headerStatusText = computed(() => {
+  if (isYouTubeHelperReady.value) {
+    const ver = youtubeHelper.value?.version
+      ? `v${youtubeHelper.value.version}`
+      : "";
+    if (props.locale === "en") {
+      return ver
+        ? `Helper ${ver} Ready · Auto Audio Mux`
+        : "Helper Ready · Auto Audio Mux";
+    }
+    return ver
+      ? `助手 ${ver} 已就绪 · 自动合成原声`
+      : "助手已就绪 · 自动合成原声";
+  }
+  return sourceHint.value;
+});
+const headerStatusTitle = computed(() => {
+  if (!isYouTubeHelperReady.value) return undefined;
+  const ver = youtubeHelper.value?.version
+    ? ` (v${youtubeHelper.value.version})`
+    : "";
+  return props.locale === "en"
+    ? `YouTube Helper${ver} is ready: high-quality downloads automatically mux original audio losslessly in the browser; 360p includes audio for inline preview and direct download.`
+    : `YouTube 助手${ver}已就绪：高画质下载自动分块并发无损合成原声至浏览器默认下载目录；360p 音画合一支持在线预览与浏览器直下。`;
+});
+const playerQualityTagText = computed(() => {
+  if (!activeVariant.value) return "";
+  const baseLabel = displayVariantLabel(activeVariant.value);
+  if (!activeYouTubeMuxPair.value) {
+    return baseLabel;
+  }
+  const tokens = [];
+  const addToken = (tok) => {
+    const tVal = String(tok || "").trim();
+    if (!tVal) return;
+    if (
+      !tokens.some((existing) => existing.toLowerCase() === tVal.toLowerCase())
+    ) {
+      tokens.push(tVal);
+    }
+  };
+  const parenParts = [];
+  const outside = baseLabel
+    .replace(/\s*[（(]([^()（）]*)[)）]/g, (_m, inner) => {
+      for (const part of String(inner).split(/\s*[·•,，]\s*/)) {
+        parenParts.push(part);
+      }
+      return "";
+    })
+    .trim();
+  for (const part of outside.split(/\s*[·•]\s*/)) {
+    addToken(part);
+  }
+  for (const part of parenParts) {
+    addToken(part);
+  }
+  const highTier = resolveYouTubeHighResTier(activeVariant.value);
+  if (highTier) {
+    addToken(highTier);
+  }
+  const specPrefix = tokens.join(" · ") || baseLabel;
+  return props.locale === "en"
+    ? `${specPrefix} (Silent preview · Audio included on download)`
+    : `${specPrefix}（预览无声 · 下载含音频）`;
+});
+const primaryDownloadLabel = computed(() => {
+  if (needsQualitySelection.value) {
+    return t(props.locale, "selectQualityFirst");
+  }
+  if (isActiveYouTubeSplitVideo.value && activeYouTubeMuxPair.value) {
+    const tier = resolveYouTubeDownloadTier(activeVariant.value);
+    if (tier) {
+      return t(props.locale, "downloadTierWithAudio").replace("{tier}", tier);
+    }
+    return t(props.locale, "downloadWithAudio");
+  }
+  if (isActiveYouTubeAudioOnly.value) {
+    const fmt = resolveYouTubeAudioFormatLabel(activeVariant.value);
+    if (fmt) {
+      return t(props.locale, "downloadAudioFormat").replace("{format}", fmt);
+    }
+    return t(props.locale, "downloadAudio");
+  }
+  return t(props.locale, "downloadSingle");
+});
 const author = computed(() => props.resultData.author || null);
 const stats = computed(() =>
   Object.entries(props.resultData.statistics || {}).map(([key, stat]) => ({
@@ -439,7 +675,7 @@ const infoCards = computed(() => [
   {
     icon: "fa-expand",
     label: t(props.locale, "quality"),
-    value: variantLabel(activeVariant.value, props.locale),
+    value: displayVariantLabel(activeVariant.value),
   },
   {
     icon: "fa-clock",
@@ -702,8 +938,10 @@ const content = {
     playbackFailed: "该视频源无法在本站直接播放，可尝试其他画质或打开原作品。",
     openOriginal: "打开原作品",
     downloadSingle: "下载视频",
-    downloadMux: "合并保存",
-    downloadAudioOnly: "仅音频",
+    downloadWithAudio: "下载有声视频",
+    downloadTierWithAudio: "下载 {tier} 有声视频",
+    downloadAudio: "下载音频",
+    downloadAudioFormat: "下载音频 ({format})",
     downloadLive: "下载实况",
     downloadAll: "下载全部",
     downloadSelected: "下载选中",
@@ -757,7 +995,7 @@ const content = {
     bitRate: "码率",
     codec: "编码",
     resolution: "分辨率",
-    currentPlaying: "当前播放",
+    currentPlaying: "当前已选",
     preview: "预览",
     close: "关闭",
     page: "页",
@@ -776,8 +1014,10 @@ const content = {
       "This source cannot play directly here. Try another quality or open the original post.",
     openOriginal: "Open original post",
     downloadSingle: "Download Video",
-    downloadMux: "Merge & Save",
-    downloadAudioOnly: "Audio Only",
+    downloadWithAudio: "Download Video with Audio",
+    downloadTierWithAudio: "Download {tier} Video with Audio",
+    downloadAudio: "Download Audio",
+    downloadAudioFormat: "Download Audio ({format})",
     downloadLive: "Download Live",
     downloadAll: "Download All",
     downloadSelected: "Download Selected",
@@ -831,7 +1071,7 @@ const content = {
     bitRate: "Bitrate",
     codec: "Codec",
     resolution: "Resolution",
-    currentPlaying: "Now Playing",
+    currentPlaying: "Selected",
     preview: "Preview",
     close: "Close",
     page: "page",
@@ -1020,11 +1260,20 @@ onUnmounted(() => {
           >
         </div>
         <div class="rs-header-right">
-          <span class="rs-header-hint"
-            ><AppIcon class="fas fa-link rs-header-hint-icon" /><span
-              class="rs-header-hint-text"
-              >{{ sourceHint }}</span
-            ></span
+          <span
+            class="rs-header-hint"
+            :class="{ 'rs-header-hint--ready': isYouTubeHelperReady }"
+            :title="headerStatusTitle"
+            :role="isYouTubeHelperReady ? 'status' : undefined"
+            ><AppIcon
+              :class="[
+                'fas',
+                isYouTubeHelperReady ? 'fa-circle-check' : 'fa-link',
+                'rs-header-hint-icon',
+              ]"
+            /><span class="rs-header-hint-text">{{
+              headerStatusText
+            }}</span></span
           >
         </div>
       </div>
@@ -1053,16 +1302,6 @@ onUnmounted(() => {
       </p>
     </div>
     <div
-      v-else-if="isYouTubeHelperReady"
-      class="rs-yt-helper-notice"
-      role="status"
-    >
-      <AppIcon class="fas fa-info-circle" />
-      <span>
-        YouTube 助手已就绪（v{{ youtubeHelper.version }}）：高画质默认分块并发无损「合并保存」至浏览器默认下载目录，也支持单独保存「仅音频」；360p 音画合一由浏览器原生直下。
-      </span>
-    </div>
-    <div
       class="rs-main"
       :class="{ 'rs-main--align-details': hasDetailsBaseline }"
       :style="detailsLayoutStyle"
@@ -1076,7 +1315,7 @@ onUnmounted(() => {
               }}</span>
             </div>
             <span v-if="activeVariant" class="rs-quality-tag">{{
-              variantLabel(activeVariant, locale)
+              playerQualityTagText
             }}</span>
           </div>
           <div class="rs-video-stage">
@@ -1172,15 +1411,7 @@ onUnmounted(() => {
                   'fas',
                   needsQualitySelection ? 'fa-layer-group' : 'fa-download',
                 ]"
-              /><span>{{
-                needsQualitySelection
-                  ? t(locale, "selectQualityFirst")
-                  : isActiveYouTubeSplitVideo
-                    ? t(locale, "downloadMux")
-                    : isActiveYouTubeAudioOnly
-                      ? t(locale, "downloadAudioOnly")
-                      : t(locale, "downloadSingle")
-              }}</span>
+              /><span>{{ primaryDownloadLabel }}</span>
             </button>
             <button
               v-if="isMulti"
@@ -1607,10 +1838,8 @@ onUnmounted(() => {
                 >
                   <div class="rs-backup-hd">
                     <span class="rs-backup-name"
-                      >{{
-                        formatMediaSize(option.source?.size_bytes, locale)
-                      }}
-                      · {{ variantLabel(option.variant, locale) }}</span
+                      >{{ formatOptionSize(option) }}
+                      · {{ displayVariantLabel(option.variant) }}</span
                     ><span v-if="option.active" class="rs-backup-playing"
                       ><AppIcon class="fas fa-circle-check rs-backup-cur" />{{
                         t(locale, "currentPlaying")
@@ -1640,8 +1869,16 @@ onUnmounted(() => {
                     ><span
                       v-if="option.variant.metadata?.video_codec"
                       class="rs-backup-meta-tag"
+                      :title="option.variant.metadata.video_codec"
                       ><AppIcon class="fas fa-microchip" />{{
-                        option.variant.metadata.video_codec
+                        formatCodecLabel(option.variant.metadata.video_codec)
+                      }}</span
+                    ><span
+                      v-else-if="option.variant.metadata?.audio_codec"
+                      class="rs-backup-meta-tag"
+                      :title="option.variant.metadata.audio_codec"
+                      ><AppIcon class="fas fa-microchip" />{{
+                        formatCodecLabel(option.variant.metadata.audio_codec)
                       }}</span
                     ><span
                       v-if="option.capabilities.length"
@@ -1650,43 +1887,12 @@ onUnmounted(() => {
                     >
                   </div>
                 </button>
-                <div
-                  v-if="
-                    isYouTubeSplitOption(option) ||
-                    isYouTubeAudioOnlyOption(option)
-                  "
-                  class="rs-backup-split-actions"
-                >
-                  <button
-                    type="button"
-                    class="rs-btn rs-btn--primary rs-btn--sm"
-                    :data-youtube-mux-save="
-                      isYouTubeSplitOption(option) || undefined
-                    "
-                    :data-youtube-audio-only-save="
-                      isYouTubeAudioOnlyOption(option) || undefined
-                    "
-                    :disabled="isYouTubeHelperBlocked || isResolving"
-                    @click="
-                      selectQuality(option);
-                      emit('download-backup', {
-                        variant_id: option.variant.id,
-                      });
-                    "
-                  >
-                    <AppIcon class="fas fa-download" /><span>{{
-                      isYouTubeAudioOnlyOption(option)
-                        ? t(locale, "downloadAudioOnly")
-                        : t(locale, "downloadMux")
-                    }}</span>
-                  </button>
-                </div>
               </div>
             </div>
             <details v-if="otherQualityOptions.length" :key="currentItem.id" class="rs-other-versions">
               <summary>{{ locale === "en" ? "Other versions" : "其他版本" }} ({{ otherQualityOptions.length }})</summary>
               <div v-for="option in otherQualityOptions" :key="option.variant.id" class="rs-other-version">
-                <div class="rs-backup-name">{{ variantLabel(option.variant, locale) }}</div>
+                <div class="rs-backup-name">{{ displayVariantLabel(option.variant) }}</div>
                 <div class="rs-backup-meta">
                   <span v-for="specification in variantSpecifications(option.variant)" :key="specification" class="rs-backup-meta-tag">{{ specification }}</span>
                   <span v-if="option.capabilities.length" class="rs-backup-meta-tag">{{ option.capabilities.join(" + ") }}</span>
@@ -2125,6 +2331,21 @@ onUnmounted(() => {
   align-items: center;
   gap: .25rem;
 }
+.rs-header-hint--ready {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.22);
+}
+.rs-header-hint--ready:hover {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.32);
+}
+.rs-header-hint--ready .rs-header-hint-icon {
+  color: var(--c-success);
+}
+.rs-header-hint--ready .rs-header-hint-text {
+  color: var(--c-fg-2);
+  font-weight: 600;
+}
 
 /* ═══════════════════════════════════════════════════════════════
    PLAYBACK ERROR
@@ -2256,6 +2477,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: .5rem;
   padding: .875rem 1.125rem;
   background: var(--c-bg-2);
@@ -3589,18 +3811,13 @@ onUnmounted(() => {
 }
 
 /* Dark Mode：复制 Toast 随 .rs 内 token 自动翻转，无需单独覆盖 */
-.rs-yt-helper-alert,
-.rs-yt-helper-notice {
+.rs-yt-helper-alert {
   margin-bottom: 1.25rem;
   padding: 1rem 1.25rem;
   border-radius: var(--r-xl);
-  background: var(--c-bg-elevated);
-  border: 1px solid var(--c-border);
-  box-shadow: var(--sh-sm);
-}
-.rs-yt-helper-alert {
-  border-color: rgba(239, 68, 68, 0.35);
+  border: 1px solid rgba(239, 68, 68, 0.35);
   background: rgba(239, 68, 68, 0.06);
+  box-shadow: var(--sh-sm);
 }
 .rs-yt-helper-alert-title {
   display: flex;
@@ -3760,21 +3977,5 @@ onUnmounted(() => {
   .rs-yt-helper-actions .rs-btn {
     width: 100%;
   }
-}
-.rs-yt-helper-notice {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  font-size: 0.875rem;
-  color: var(--c-fg-2);
-  border-color: rgba(108, 92, 231, 0.25);
-  background: rgba(108, 92, 231, 0.05);
-}
-.rs-backup-split-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 0.375rem;
-  padding: 0 0.25rem 0.25rem;
 }
 </style>
