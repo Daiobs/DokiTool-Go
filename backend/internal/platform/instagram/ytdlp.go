@@ -56,12 +56,7 @@ func (p *Parser) buildNativeEnvelopeWithYTVideos(ctx context.Context, post *nati
 		return unified.ContractError("NO_MEDIA", "该内容未包含可解析的媒体", false)
 	}
 
-	nativeVideoCount := 0
-	for _, entry := range post.Items {
-		if entry.Kind == "video" && entry.VideoURL != "" {
-			nativeVideoCount++
-		}
-	}
+	nativeVideoCount := countNativeVideoItems(post.Items)
 	useYTVideoVariants := len(ytVideos) > 0 && len(ytVideos) == nativeVideoCount
 	ytVideoCursor := 0
 
@@ -70,148 +65,25 @@ func (p *Parser) buildNativeEnvelopeWithYTVideos(ctx context.Context, post *nati
 
 	for idx, entry := range post.Items {
 		position := idx + 1
-		entryKey := entry.ID
-		if entryKey == "" || entryKey == shortcode {
-			if u, err := url.Parse(nonEmptyStr(entry.VideoURL, entry.ImageURL)); err == nil && u.Path != "" {
-				entryKey = path.Base(u.Path)
-			} else {
-				entryKey = strconv.Itoa(position)
-			}
-		}
+		entryKey := resolveNativeEntryKey(entry, shortcode, position)
 
 		if entry.Kind == "video" && entry.VideoURL != "" {
-			cleanVideoURL := ytengine.SanitizeMediaURL(entry.VideoURL, AllowedMediaURL)
-			if cleanVideoURL == "" {
-				continue
-			}
-			itemID := "video-" + shortHash("instagram:item:"+shortcode+":"+entryKey)
-			var variants unified.Array
-			if useYTVideoVariants && ytVideoCursor < len(ytVideos) {
-				ytItem := unified.Map(ytVideos[ytVideoCursor])
+			ytVariants := peekYTVideoVariants(ytVideos, useYTVideoVariants, ytVideoCursor)
+			item, consumedSlot := p.buildNativeVideoItem(ctx, entry, post, ytVariants, shortcode, entryKey, sourceURL, position, now)
+			if consumedSlot && useYTVideoVariants && ytVideoCursor < len(ytVideos) {
 				ytVideoCursor++
-				if ytVars := unified.Slice(ytItem["variants"]); len(ytVars) > 0 {
-					variants = unified.CloneValue(ytVars).(unified.Array)
-				}
 			}
-			if len(variants) == 0 {
-				rawSource := unified.Object{
-					"url": cleanVideoURL,
-					"private_source_identity": unified.PHPIdentityJSON(unified.Array{
-						"instagram-native-video",
-						shortcode,
-						entryKey,
-						canonicalInstagramCDNIdentity(cleanVideoURL),
-					}, true),
-				}
-				if p.sizeProber != nil {
-					if sz, ok := p.sizeProber(ctx, cleanVideoURL); ok && sz > 0 {
-						rawSource["size_bytes"] = sz
-					}
-				}
-				sources := unified.Sources(unified.Array{rawSource}, now)
-				if len(sources) == 0 {
-					continue
-				}
-				meta := unified.Object{
-					"evidence":  "upstream",
-					"container": "mp4",
-					"extension": "mp4",
-					"mime_type": "video/mp4",
-				}
-				label := "默认画质"
-				if entry.Width > 0 && entry.Height > 0 {
-					meta["width"] = entry.Width
-					meta["height"] = entry.Height
-					minEdge := entry.Width
-					if entry.Height < minEdge {
-						minEdge = entry.Height
-					}
-					label = strconv.FormatInt(minEdge, 10) + "p"
-				}
-				variantID := "v-" + shortHash("instagram:native-video:"+shortcode+":"+entryKey)
-				variant := unified.Object{
-					"id":       variantID,
-					"label":    label,
-					"metadata": meta,
-					"delivery": unified.Object{
-						"kind":    "file",
-						"sources": sources,
-					},
-				}
-				variants = unified.Array{variant}
+			if item != nil {
+				items = append(items, item)
 			}
-			item := unified.Object{
-				"id":          itemID,
-				"type":        "video",
-				"index":       int64(position),
-				"default":     nil,
-				"variants":    variants,
-				"resolve_url": unified.ResolveURL(sourceURL, itemID),
-			}
-			if entry.Duration > 0 {
-				durMs := int64(math.Round(entry.Duration * 1000))
-				if durMs > 0 {
-					item["duration_ms"] = durMs
-				}
-			}
-			if coverSrc := buildCoverSource(nonEmptyStr(entry.ImageURL, post.CoverURL), now); coverSrc != nil {
-				item["cover"] = coverSrc
-			}
-			items = append(items, item)
 			continue
 		}
 
 		if entry.ImageURL != "" {
-			cleanImageURL := ytengine.SanitizeMediaURL(entry.ImageURL, AllowedMediaURL)
-			if cleanImageURL == "" {
-				continue
+			if item, itemID, ok := buildNativeImageItem(entry, shortcode, entryKey, sourceURL, position, now); ok {
+				items = append(items, item)
+				imageItemIDs = append(imageItemIDs, itemID)
 			}
-			rawSource := unified.Object{
-				"url": cleanImageURL,
-				"private_source_identity": unified.PHPIdentityJSON(unified.Array{
-					"instagram-native-image",
-					shortcode,
-					entryKey,
-					canonicalInstagramCDNIdentity(cleanImageURL),
-				}, true),
-			}
-			sources := unified.Sources(unified.Array{rawSource}, now)
-			if len(sources) == 0 {
-				continue
-			}
-			container, ext, mimeType := detectImageFormat(cleanImageURL)
-			meta := unified.Object{
-				"evidence":  "upstream",
-				"container": container,
-				"extension": ext,
-				"mime_type": mimeType,
-			}
-			if entry.Width > 0 {
-				meta["width"] = entry.Width
-			}
-			if entry.Height > 0 {
-				meta["height"] = entry.Height
-			}
-			variantID := "img-" + shortHash("instagram:native-image:"+shortcode+":"+entryKey)
-			variant := unified.Object{
-				"id":       variantID,
-				"metadata": meta,
-				"delivery": unified.Object{
-					"kind":    "file",
-					"sources": sources,
-				},
-			}
-			itemID := "image-" + shortHash("instagram:item:"+shortcode+":"+entryKey)
-			item := unified.Object{
-				"id":          itemID,
-				"type":        "image",
-				"index":       int64(position),
-				"default":     nil,
-				"variants":    unified.Array{variant},
-				"resolve_url": unified.ResolveURL(sourceURL, itemID),
-			}
-			items = append(items, item)
-			imageItemIDs = append(imageItemIDs, itemID)
 		}
 	}
 
@@ -228,7 +100,175 @@ func (p *Parser) buildNativeEnvelopeWithYTVideos(ctx context.Context, post *nati
 		"items":           items,
 		"generated_at":    time.Unix(now, 0).UTC().Format("2006-01-02T15:04:05Z"),
 	}
-	if len(imageItemIDs) > 0 && len(items) > 1 {
+	populateNativeEnvelopeMetadata(data, post, imageItemIDs, len(items), now)
+	return unified.FinalizeData(data, now)
+}
+
+func countNativeVideoItems(items []nativeMediaItem) int {
+	count := 0
+	for _, entry := range items {
+		if entry.Kind == "video" && entry.VideoURL != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func resolveNativeEntryKey(entry nativeMediaItem, shortcode string, position int) string {
+	if entry.ID != "" && entry.ID != shortcode {
+		return entry.ID
+	}
+	if u, err := url.Parse(nonEmptyStr(entry.VideoURL, entry.ImageURL)); err == nil && u.Path != "" {
+		return path.Base(u.Path)
+	}
+	return strconv.Itoa(position)
+}
+
+func peekYTVideoVariants(ytVideos unified.Array, enabled bool, cursor int) unified.Array {
+	if !enabled || cursor >= len(ytVideos) {
+		return nil
+	}
+	ytItem := unified.Map(ytVideos[cursor])
+	if ytVars := unified.Slice(ytItem["variants"]); len(ytVars) > 0 {
+		return unified.CloneValue(ytVars).(unified.Array)
+	}
+	return nil
+}
+
+func (p *Parser) buildFallbackNativeVideoVariant(ctx context.Context, entry nativeMediaItem, cleanVideoURL, shortcode, entryKey string, now int64) (unified.Object, bool) {
+	rawSource := unified.Object{
+		"url": cleanVideoURL,
+		"private_source_identity": unified.PHPIdentityJSON(unified.Array{
+			"instagram-native-video",
+			shortcode,
+			entryKey,
+			canonicalInstagramCDNIdentity(cleanVideoURL),
+		}, true),
+	}
+	if p.sizeProber != nil {
+		if sz, ok := p.sizeProber(ctx, cleanVideoURL); ok && sz > 0 {
+			rawSource["size_bytes"] = sz
+		}
+	}
+	sources := unified.Sources(unified.Array{rawSource}, now)
+	if len(sources) == 0 {
+		return nil, false
+	}
+	meta := unified.Object{
+		"evidence":  "upstream",
+		"container": "mp4",
+		"extension": "mp4",
+		"mime_type": "video/mp4",
+	}
+	label := "默认画质"
+	if entry.Width > 0 && entry.Height > 0 {
+		meta["width"] = entry.Width
+		meta["height"] = entry.Height
+		minEdge := entry.Width
+		if entry.Height < minEdge {
+			minEdge = entry.Height
+		}
+		label = strconv.FormatInt(minEdge, 10) + "p"
+	}
+	variantID := "v-" + shortHash("instagram:native-video:"+shortcode+":"+entryKey)
+	return unified.Object{
+		"id":       variantID,
+		"label":    label,
+		"metadata": meta,
+		"delivery": unified.Object{
+			"kind":    "file",
+			"sources": sources,
+		},
+	}, true
+}
+
+func (p *Parser) buildNativeVideoItem(ctx context.Context, entry nativeMediaItem, post *nativePost, ytVariants unified.Array, shortcode, entryKey, sourceURL string, position int, now int64) (unified.Object, bool) {
+	cleanVideoURL := ytengine.SanitizeMediaURL(entry.VideoURL, AllowedMediaURL)
+	if cleanVideoURL == "" {
+		return nil, false
+	}
+	itemID := "video-" + shortHash("instagram:item:"+shortcode+":"+entryKey)
+	variants := ytVariants
+	if len(variants) == 0 {
+		fallbackVar, ok := p.buildFallbackNativeVideoVariant(ctx, entry, cleanVideoURL, shortcode, entryKey, now)
+		if !ok {
+			return nil, true
+		}
+		variants = unified.Array{fallbackVar}
+	}
+	item := unified.Object{
+		"id":          itemID,
+		"type":        "video",
+		"index":       int64(position),
+		"default":     nil,
+		"variants":    variants,
+		"resolve_url": unified.ResolveURL(sourceURL, itemID),
+	}
+	if entry.Duration > 0 {
+		if durMs := int64(math.Round(entry.Duration * 1000)); durMs > 0 {
+			item["duration_ms"] = durMs
+		}
+	}
+	if coverSrc := buildCoverSource(nonEmptyStr(entry.ImageURL, post.CoverURL), now); coverSrc != nil {
+		item["cover"] = coverSrc
+	}
+	return item, true
+}
+
+func buildNativeImageItem(entry nativeMediaItem, shortcode, entryKey, sourceURL string, position int, now int64) (unified.Object, string, bool) {
+	cleanImageURL := ytengine.SanitizeMediaURL(entry.ImageURL, AllowedMediaURL)
+	if cleanImageURL == "" {
+		return nil, "", false
+	}
+	rawSource := unified.Object{
+		"url": cleanImageURL,
+		"private_source_identity": unified.PHPIdentityJSON(unified.Array{
+			"instagram-native-image",
+			shortcode,
+			entryKey,
+			canonicalInstagramCDNIdentity(cleanImageURL),
+		}, true),
+	}
+	sources := unified.Sources(unified.Array{rawSource}, now)
+	if len(sources) == 0 {
+		return nil, "", false
+	}
+	container, ext, mimeType := detectImageFormat(cleanImageURL)
+	meta := unified.Object{
+		"evidence":  "upstream",
+		"container": container,
+		"extension": ext,
+		"mime_type": mimeType,
+	}
+	if entry.Width > 0 {
+		meta["width"] = entry.Width
+	}
+	if entry.Height > 0 {
+		meta["height"] = entry.Height
+	}
+	variantID := "img-" + shortHash("instagram:native-image:"+shortcode+":"+entryKey)
+	variant := unified.Object{
+		"id":       variantID,
+		"metadata": meta,
+		"delivery": unified.Object{
+			"kind":    "file",
+			"sources": sources,
+		},
+	}
+	itemID := "image-" + shortHash("instagram:item:"+shortcode+":"+entryKey)
+	item := unified.Object{
+		"id":          itemID,
+		"type":        "image",
+		"index":       int64(position),
+		"default":     nil,
+		"variants":    unified.Array{variant},
+		"resolve_url": unified.ResolveURL(sourceURL, itemID),
+	}
+	return item, itemID, true
+}
+
+func populateNativeEnvelopeMetadata(data unified.Object, post *nativePost, imageItemIDs unified.Array, itemsLen int, now int64) {
+	if len(imageItemIDs) > 0 && itemsLen > 1 {
 		data["groups"] = unified.Array{
 			unified.Object{
 				"id":          "album",
@@ -264,6 +304,12 @@ func (p *Parser) buildNativeEnvelopeWithYTVideos(ctx context.Context, post *nati
 	if post.Timestamp > 0 {
 		data["published_at"] = time.Unix(post.Timestamp, 0).UTC().Format("2006-01-02T15:04:05Z")
 	}
+	if stats := buildNativePostStatistics(post); len(stats) > 0 {
+		data["statistics"] = stats
+	}
+}
+
+func buildNativePostStatistics(post *nativePost) unified.Object {
 	stats := unified.Object{}
 	if post.ViewCount != nil && *post.ViewCount >= 0 {
 		stats["views"] = unified.Object{"value": *post.ViewCount}
@@ -274,11 +320,7 @@ func (p *Parser) buildNativeEnvelopeWithYTVideos(ctx context.Context, post *nati
 	if post.CommentCount != nil && *post.CommentCount >= 0 {
 		stats["comments"] = unified.Object{"value": *post.CommentCount}
 	}
-	if len(stats) > 0 {
-		data["statistics"] = stats
-	}
-
-	return unified.FinalizeData(data, now)
+	return stats
 }
 
 func buildCoverSource(rawURL string, now int64) unified.Object {
