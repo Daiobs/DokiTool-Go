@@ -120,6 +120,7 @@
 !/backend/internal/fetch/
 !/backend/internal/index.php
 !/backend/internal/media/
+!/backend/internal/phpcompat/
 !/backend/internal/platform/
 !/backend/internal/probe/
 !/backend/internal/shresolver/
@@ -237,7 +238,6 @@
 !/frontend/src/downloads/
 !/frontend/src/generated/
 !/frontend/src/main.ts
-!/frontend/src/router/
 !/frontend/src/services/
 !/frontend/src/ssr/
 !/frontend/src/stores/
@@ -404,6 +404,9 @@
 /backend/internal/media/*
 !/backend/internal/media/tbvideo/
 !/backend/internal/media/weibo/
+/backend/internal/phpcompat/*
+!/backend/internal/phpcompat/phpcompat.go
+!/backend/internal/phpcompat/phpcompat_test.go
 /backend/internal/platform/*
 !/backend/internal/platform/bilibili/
 !/backend/internal/platform/douyin/
@@ -554,7 +557,6 @@
 !/frontend/src/composables/useButtonControl.js
 !/frontend/src/composables/useI18n.js
 !/frontend/src/composables/useMediaDownload.ts
-!/frontend/src/composables/useRequestTimeout.js
 !/frontend/src/composables/useVideoParser.ts
 !/frontend/src/composables/useVideoSelection.ts
 /frontend/src/downloads/*
@@ -570,8 +572,6 @@
 !/frontend/src/downloads/types.ts
 /frontend/src/generated/*
 !/frontend/src/generated/platform-catalog.json
-/frontend/src/router/*
-!/frontend/src/router/index.js
 /frontend/src/services/*
 !/frontend/src/services/apiConfig.ts
 !/frontend/src/services/operationLogger.js
@@ -596,7 +596,6 @@
 !/frontend/src/utils/mediaSources.ts
 !/frontend/src/utils/parseHelpers.ts
 !/frontend/src/utils/platforms.ts
-!/frontend/src/utils/rateLimit.js
 !/frontend/src/utils/segmentDownload.ts
 !/frontend/src/utils/videoFilename.ts
 !/frontend/src/utils/youtubeHelperCore.d.ts
