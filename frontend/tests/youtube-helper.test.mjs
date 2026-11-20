@@ -4782,4 +4782,278 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       silentView.app.unmount();
     }
   });
+
+  test("ResultDetailsSidebar music tab blocks background_audio playback and disables download when youtube_helper is missing, outdated, or login_required without leaking fallthrough prop", async () => {
+    const mediaSourcesMod = await vite.ssrLoadModule("/src/utils/mediaSources.ts");
+    const mediaContractMod = await vite.ssrLoadModule("/src/utils/mediaContract.ts");
+    const apiConfigMod = await vite.ssrLoadModule("/src/services/apiConfig.ts");
+    const ytHelperCoreMod = await vite.ssrLoadModule("/src/utils/youtubeHelperCore.js");
+    const { loadSfc } = await import("./helpers/loadSfc.mjs");
+    const ClientResultSection = await loadSfc(
+      new URL("../src/components/ResultSection.vue", import.meta.url),
+      {
+        modules: {
+          "./AppIcon.vue": { default: { render: (_, { attrs }) => h("i", attrs) } },
+          "../utils/mediaSources": mediaSourcesMod,
+          "../utils/mediaContract": mediaContractMod,
+          "../utils/youtubeHelperCore": ytHelperCoreMod,
+          "../services/apiConfig": apiConfigMod,
+        },
+      },
+    );
+
+    const bgmUrl = makeItagUrl(140, 7_000_000);
+    const buildDataForHelperStatus = (status) => ({
+      platform: "youtube",
+      content_id: "I9JvDaciaFk",
+      source_url: "https://www.youtube.com/watch?v=I9JvDaciaFk",
+      title: "Sample YouTube With BGM",
+      default_item_id: "yt-v1",
+      extra: {
+        youtube_helper: {
+          status,
+          version: status === "outdated" ? "1.3.0" : YOUTUBE_HELPER_VERSION,
+          min_version: MIN_YOUTUBE_HELPER_VERSION,
+          script_url: "/helper/dokitool-youtube.user.js",
+        },
+      },
+      attachments: [
+        {
+          id: "att-bgm-1",
+          role: "background_audio",
+          title: "Sample Background Audio",
+          author: { name: "Sample Artist" },
+          resource: {
+            role: "audio",
+            delivery: {
+              kind: "file",
+              sources: [{ id: "s-bgm", url: bgmUrl, size_bytes: 7_000_000 }],
+            },
+          },
+        },
+      ],
+      items: [
+        {
+          id: "yt-v1",
+          type: "video",
+          state: "ready",
+          default: { variant_id: "v-360", source_id: "s-360", url: itag18Url },
+          variants: [
+            {
+              id: "v-360",
+              label: "360p (含音频)",
+              metadata: {
+                width: 640,
+                height: 360,
+                fps: 30,
+                has_audio: true,
+                video_codec: "avc1.42001E",
+                audio_codec: "mp4a.40.2",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-360", url: itag18Url, size_bytes: 12_000_000 }],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const mountWithStatus = async (status) => {
+      const store = reactive({
+        resultData: buildDataForHelperStatus(status),
+        resultVersion: 1,
+      });
+      const selection = markRaw(
+        selectionMod.useVideoSelection({ videoStore: store }),
+      );
+      selection.syncResult();
+      const musicDownloads = [];
+
+      const element = (type, text = "") =>
+        markRaw({
+          type,
+          text,
+          props: {},
+          children: [],
+          parent: null,
+          style: {},
+          dataset: {},
+          removeAttribute(name) {
+            delete this.props[name];
+          },
+          getAttribute(name) {
+            return this.props[name];
+          },
+        });
+      const detach = (node) => {
+        if (node.parent) {
+          node.parent.children = node.parent.children.filter(
+            (item) => item !== node,
+          );
+        }
+        node.parent = null;
+      };
+      const portal = element("portal");
+      const renderer = createRenderer({
+        querySelector: () => portal,
+        createElement: element,
+        createText: (text) => element("#text", text),
+        createComment: (text) => element("#comment", text),
+        setText(node, text) {
+          node.text = text;
+        },
+        setElementText(node, text) {
+          node.text = text;
+          node.children = [];
+        },
+        parentNode: (node) => node.parent,
+        nextSibling: (node) =>
+          node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+        insert(node, parent, anchor) {
+          detach(node);
+          node.parent = parent;
+          const idx = parent.children.indexOf(anchor);
+          parent.children.splice(
+            idx < 0 ? parent.children.length : idx,
+            0,
+            node,
+          );
+        },
+        remove: detach,
+        patchProp(node, key, _, value) {
+          if (value === undefined || value === null) delete node.props[key];
+          else node.props[key] = value;
+          if (key === "src") node.src = value;
+        },
+      });
+      const root = element("root");
+      const app = renderer.createApp({
+        render: () =>
+          h(ClientResultSection, {
+            resultData: store.resultData,
+            resultVersion: store.resultVersion,
+            locale: "zh-CN",
+            selection,
+            isDownloading: false,
+            resolvingIds: new Set(),
+            formatNumber: String,
+            formatDuration: String,
+            onDownloadMusic(attachment) {
+              musicDownloads.push(attachment.id);
+            },
+          }),
+      });
+      app.mount(root);
+      await nextTick();
+      const hasClass = (node, cls) =>
+        String(node.props?.class || "")
+          .split(/\s+/)
+          .includes(cls);
+      const findAll = (node, pred) => [
+        ...(pred(node) ? [node] : []),
+        ...(node.children || []).flatMap((c) => findAll(c, pred)),
+      ];
+      const textOf = (node) =>
+        node
+          ? [node.text || "", ...(node.children || []).map(textOf)].join("")
+          : "";
+      return {
+        app,
+        root,
+        musicDownloads,
+        findAll,
+        textOf,
+        byClass: (cls) => findAll(root, (n) => hasClass(n, cls)),
+      };
+    };
+
+    for (const blockedStatus of ["missing", "outdated", "login_required"]) {
+      const view = await mountWithStatus(blockedStatus);
+      try {
+        const infoCol = view.byClass("rs-info-col")[0];
+        assert.ok(infoCol, `expected .rs-info-col for status=${blockedStatus}`);
+        assert.equal(
+          "is-youtube-helper-blocked" in infoCol.props,
+          false,
+          `must not leak fallthrough is-youtube-helper-blocked attr on .rs-info-col (${blockedStatus})`,
+        );
+        assert.equal(
+          "isYoutubeHelperBlocked" in infoCol.props,
+          false,
+          `must not leak fallthrough isYoutubeHelperBlocked attr on .rs-info-col (${blockedStatus})`,
+        );
+
+        const musicTab = view
+          .byClass("rs-tab")
+          .find((n) => view.textOf(n).includes("音乐"));
+        assert.ok(musicTab, `expected 音乐 tab for status=${blockedStatus}`);
+        musicTab.props.onClick();
+        await nextTick();
+
+        const musicCard = view.byClass("rs-music")[0];
+        assert.ok(musicCard, `expected .rs-music card for status=${blockedStatus}`);
+        assert.equal(
+          view.findAll(musicCard, (n) => n.type === "audio").length,
+          0,
+          `blocked status=${blockedStatus} must not render <audio>`,
+        );
+        assert.ok(
+          view.textOf(musicCard).includes("该附件暂不支持直接播放"),
+          `blocked status=${blockedStatus} must render fallback note`,
+        );
+        const dlBtn = view.findAll(
+          musicCard,
+          (n) => n.type === "button" && view.textOf(n).includes("下载附件"),
+        )[0];
+        assert.ok(dlBtn);
+        assert.equal(
+          dlBtn.props.disabled,
+          true,
+          `blocked status=${blockedStatus} must disable attachment download button`,
+        );
+      } finally {
+        view.app.unmount();
+      }
+    }
+
+    const readyView = await mountWithStatus("ready");
+    try {
+      const infoCol = readyView.byClass("rs-info-col")[0];
+      assert.equal("is-youtube-helper-blocked" in infoCol.props, false);
+
+      const musicTab = readyView
+        .byClass("rs-tab")
+        .find((n) => readyView.textOf(n).includes("音乐"));
+      assert.ok(musicTab);
+      musicTab.props.onClick();
+      await nextTick();
+
+      const musicCard = readyView.byClass("rs-music")[0];
+      assert.ok(musicCard);
+      const audioEls = readyView.findAll(musicCard, (n) => n.type === "audio");
+      assert.equal(audioEls.length, 1, "ready status must render <audio>");
+      assert.equal(audioEls[0].props.src, bgmUrl);
+
+      const dlBtn = readyView.findAll(
+        musicCard,
+        (n) => n.type === "button" && readyView.textOf(n).includes("下载附件"),
+      )[0];
+      assert.ok(dlBtn);
+      assert.equal(
+        Boolean(dlBtn.props.disabled),
+        false,
+        "ready status must enable attachment download button",
+      );
+      dlBtn.props.onClick();
+      assert.deepEqual(readyView.musicDownloads, ["att-bgm-1"]);
+    } finally {
+      readyView.app.unmount();
+    }
+  });
 });

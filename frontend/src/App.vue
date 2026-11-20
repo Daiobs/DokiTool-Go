@@ -82,9 +82,8 @@ const ToastContainer = defineAsyncComponent(() =>
 const ProgressModal = defineAsyncComponent(() =>
   import("./components/ProgressModal.vue"),
 );
-const DownloadCard = defineAsyncComponent(() =>
-  import("./components/DownloadCard.vue"),
-);
+const loadDownloadCard = () => import("./components/DownloadCard.vue");
+const DownloadCard = defineAsyncComponent(loadDownloadCard);
 
 const videoStore = useVideoStore();
 const hasShownToast = ref(false);
@@ -235,6 +234,7 @@ watch(
   (loading) => {
     if (loading) {
       void loadResultSection().catch(() => {});
+      void loadDownloadCard().catch(() => {});
       void ensureVideoSelection().catch(() => {});
       void ensureMediaDownload().catch(() => {});
     }
@@ -250,7 +250,10 @@ watch(
     } else if (videoStore.resultData) {
       void ensureVideoSelection().catch(() => {});
     }
-    if (videoStore.resultData) void ensureMediaDownload().catch(() => {});
+    if (videoStore.resultData) {
+      void loadDownloadCard().catch(() => {});
+      void ensureMediaDownload().catch(() => {});
+    }
   },
   { flush: "sync" },
 );
@@ -341,6 +344,7 @@ onMounted(() => {
     hasSavedDownloads = false;
   }
   if (hasSavedDownloads) {
+    void loadDownloadCard().catch(() => {});
     void ensureMediaDownload()
       .then((ctrl) => ctrl.restoreDownloads())
       .catch(() => {});

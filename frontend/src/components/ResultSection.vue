@@ -702,7 +702,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         :metadata="metadata"
         :attachments="attachments"
         :has-backup="hasBackup"
-        :is-youtube-helper-blocked="isYouTubeHelperBlocked"
+        :is-you-tube-helper-blocked="isYouTubeHelperBlocked"
         :can-align-base="canAlignBase"
         :align-details="hasDetailsBaseline"
         :media-identity="mediaIdentity"

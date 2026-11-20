@@ -454,3 +454,51 @@ test('a newly added manual source-link task auto-expands the panel and renders �
   await view.click(view.button('打开源链接', row));
   assert.deepEqual(view.events, [['handoff', 'toutiao-1']]);
 });
+
+test('mounting DownloadCard directly with a single manual task initializes expanded when no preference is saved', async t => {
+  const view = await mount(t, [
+    task('toutiao-lazy-mount', 'manual', {
+      statusText: '打开源链接',
+      url: 'https://v3-web.toutiaovod.com/sample/video/mp4/?mime_type=video_mp4',
+      nativeAvailable: true,
+      loaded: 0,
+      total: 0,
+      percent: 0,
+    }),
+  ]);
+  const list = descendants(view.root, n => n.props.id === 'download-panel-list')[0];
+  assert.ok(list);
+  assert.equal(Boolean(list.props.hidden), false, '#download-panel-list must not be hidden on initial manual mount');
+  assert.equal(view.expanded(), true);
+  const row = view.row('toutiao-lazy-mount');
+  assert.ok(row);
+  assert.ok(view.button('打开源链接', row));
+  await view.click(view.button('打开源链接', row));
+  assert.deepEqual(view.events, [['handoff', 'toutiao-lazy-mount']]);
+});
+
+test('mounting DownloadCard with a single manual task respects saved collapsed preference in localStorage', async t => {
+  const view = await mount(
+    t,
+    [
+      task('toutiao-saved-collapsed', 'manual', {
+        statusText: '打开源链接',
+        url: 'https://v3-web.toutiaovod.com/sample/video/mp4/?mime_type=video_mp4',
+        nativeAvailable: true,
+        loaded: 0,
+        total: 0,
+        percent: 0,
+      }),
+    ],
+    { preference: 'collapsed' },
+  );
+  const list = descendants(view.root, n => n.props.id === 'download-panel-list')[0];
+  assert.ok(list);
+  assert.equal(list.props.hidden, true, '#download-panel-list must stay hidden when localStorage preference is collapsed');
+  assert.equal(view.expanded(), false);
+  assert.equal(view.rows().length, 0);
+  await view.click(view.toggle());
+  assert.equal(Boolean(list.props.hidden), false);
+  assert.equal(view.expanded(), true);
+  assert.ok(view.row('toutiao-saved-collapsed'));
+});

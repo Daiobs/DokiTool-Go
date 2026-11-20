@@ -3579,6 +3579,10 @@ test('App.vue lazy-loads youtubeHelperCore, useMediaDownload, and DownloadCard w
     assert.equal(hooksCold.loaded.includes('./composables/useMediaDownload'), false);
     assert.equal(hooksCold.loaded.includes('./utils/youtubeHelperCore'), false);
     assert.equal(hooksCold.loaded.includes('./components/DownloadCard.vue'), false);
+    storeMod.useVideoStore(coldPinia).setResult(fixture(base));
+    await vueMod.nextTick();
+    await new Promise(r => setTimeout(r, 5));
+    assert.equal(hooksCold.loaded.includes('./components/DownloadCard.vue'), true);
     coldApp.unmount();
 
     // 2) Saved downloads + OPFS support loads both modules cleanly and preserves synchronous userActivation on callbacks
