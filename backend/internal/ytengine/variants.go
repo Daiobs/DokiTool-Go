@@ -29,72 +29,102 @@ func resolveFormatHasAudio(acodec string) *bool {
 	return nil
 }
 
+type classifiedFormats struct {
+	mp4       []Format
+	dashVideo []Format
+	dashAudio []Format
+	hlsVideo  []Format
+	hlsAudio  []Format
+}
+
 func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts AdaptOptions, now int64) (unified.Array, unified.Object) {
 	if opts.SingleStreamHLSOnly {
-		if (entry.IsLive != nil && *entry.IsLive) || (parent != nil && parent.IsLive != nil && *parent.IsLive) {
-			return nil, nil
-		}
-		var singleHLS []Format
-		for _, f := range entry.Formats {
-			cleanURL := SanitizeMediaURL(f.URL, opts.AllowedMediaURL)
-			if cleanURL == "" {
-				continue
-			}
-			f.URL = cleanURL
-			if isSingleStreamCombinedMP4HLS(f) {
-				singleHLS = append(singleHLS, f)
-			}
-		}
-		sortFormats(singleHLS)
-		deduped := deduplicateSingleStreamHLSFormats(singleHLS)
-		variants := make(unified.Array, 0, len(deduped))
-		seenVariantIDs := make(map[string]bool, len(deduped))
-		for i, f := range deduped {
-			formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("hls-%d", i+1))
-			sources := buildFormatSourcesWithContext(f, opts, entryKey, formatKey, "", now)
-			if len(sources) == 0 {
-				continue
-			}
-			metadata := buildFormatMetadata(f, boolPtr(true), false)
-			variantID := "v-" + shortDigest(opts.PlatformID+":hls-single:"+entryKey+":"+formatKey)
-			if seenVariantIDs[variantID] {
-				continue
-			}
-			seenVariantIDs[variantID] = true
-			variants = append(variants, unified.Object{
-				"id":       variantID,
-				"label":    qualityLabel(f, ""),
-				"metadata": metadata,
-				"delivery": unified.Object{
-					"kind":    "hls",
-					"scope":   "single",
-					"sources": sources,
-					"output": unified.Object{
-						"container": "mp4",
-						"extension": "mp4",
-						"mime_type": "video/mp4",
-					},
-				},
-			})
-		}
-		return variants, nil
+		return buildSingleStreamHLSVariants(entry, parent, entryKey, opts, now)
 	}
 
-	var mp4Formats []Format
-	var dashVideoFormats []Format
-	var dashAudioFormats []Format
-	var hlsVideoFormats []Format
-	var hlsAudioFormats []Format
+	classified := classifyEntryFormats(entry, opts)
+	variants := make(unified.Array, 0, len(classified.mp4)+len(classified.dashVideo)+len(classified.hlsVideo)+1)
+	seenVariantIDs := make(map[string]bool)
 
-	// First pass: check if any audio-bearing format exists in the entry and count
-	// distinct progressive MP4 URLs (so top-level dimensions are inherited only when
-	// all progressive MP4 entries refer to a single stream rather than distinct SD/HD tiers).
-	hasAnyAudioInEntry := false
+	dedupedMP4 := deduplicateProgressiveFormats(classified.mp4)
+	filteredDASHVideo := filterDASHVideoFormats(classified.dashVideo, dedupedMP4, opts)
+	hasSplitSilentTracks := len(filteredDASHVideo) > 0
+
+	// 1. High-Resolution DASH Video-Only Tracks as Directly Downloadable Files (kind == "file", has_audio == false).
+	variants = appendDASHVideoVariants(variants, seenVariantIDs, filteredDASHVideo, entryKey, opts, now)
+
+	// 2. Deliverable Progressive MP4s with Embedded Audio (kind == "file")
+	variants = appendProgressiveMP4Variants(variants, seenVariantIDs, dedupedMP4, hasSplitSilentTracks, entryKey, itemTitle, opts, now)
+
+	// 3. Standalone Audio Tracks (both as downloadable file variants and as a background_audio attachment)
+	var audioAttachment unified.Object
+	if opts.EnableDASHMux && hasSplitSilentTracks && len(classified.dashAudio) > 0 {
+		variants, audioAttachment = appendStandaloneAudioVariantsAndAttachment(
+			variants, seenVariantIDs, classified.dashAudio, entry, parent, entryKey, itemTitle, opts, now,
+		)
+	}
+
+	// 4. Non-single-file HLS variants (kind == "hls", scope == "adaptive")
+	if opts.EnableHLS && len(classified.hlsVideo) > 0 {
+		variants = appendAdaptiveHLSVariants(variants, seenVariantIDs, classified.hlsVideo, classified.hlsAudio, entryKey, opts, now)
+	}
+
+	return variants, audioAttachment
+}
+
+func buildSingleStreamHLSVariants(entry, parent *Info, entryKey string, opts AdaptOptions, now int64) (unified.Array, unified.Object) {
+	if (entry.IsLive != nil && *entry.IsLive) || (parent != nil && parent.IsLive != nil && *parent.IsLive) {
+		return nil, nil
+	}
+	var singleHLS []Format
 	for _, f := range entry.Formats {
-		if !isNoCodec(f.ACodec) && strings.TrimSpace(f.ACodec) != "" {
-			hasAnyAudioInEntry = true
-			break
+		cleanURL := SanitizeMediaURL(f.URL, opts.AllowedMediaURL)
+		if cleanURL == "" {
+			continue
 		}
+		f.URL = cleanURL
+		if isSingleStreamCombinedMP4HLS(f) {
+			singleHLS = append(singleHLS, f)
+		}
+	}
+	sortFormats(singleHLS)
+	deduped := deduplicateSingleStreamHLSFormats(singleHLS)
+	variants := make(unified.Array, 0, len(deduped))
+	seenVariantIDs := make(map[string]bool, len(deduped))
+	for i, f := range deduped {
+		formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("hls-%d", i+1))
+		sources := buildFormatSourcesWithContext(f, opts, entryKey, formatKey, "", now)
+		if len(sources) == 0 {
+			continue
+		}
+		metadata := buildFormatMetadata(f, boolPtr(true), false)
+		variantID := "v-" + shortDigest(opts.PlatformID+":hls-single:"+entryKey+":"+formatKey)
+		if seenVariantIDs[variantID] {
+			continue
+		}
+		seenVariantIDs[variantID] = true
+		variants = append(variants, unified.Object{
+			"id":       variantID,
+			"label":    qualityLabel(f, ""),
+			"metadata": metadata,
+			"delivery": unified.Object{
+				"kind":    "hls",
+				"scope":   "single",
+				"sources": sources,
+				"output": unified.Object{
+					"container": "mp4",
+					"extension": "mp4",
+					"mime_type": "video/mp4",
+				},
+			},
+		})
+	}
+	return variants, nil
+}
+
+func shouldInheritEntryDimensions(entry *Info, opts AdaptOptions, hasAnyAudioInEntry bool) bool {
+	if entry.Width == nil || entry.Height == nil || *entry.Width <= 0 || *entry.Height <= 0 {
+		return false
 	}
 	uniqueProgressiveMP4URLs := make(map[string]bool)
 	for _, f := range entry.Formats {
@@ -109,8 +139,23 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 			uniqueProgressiveMP4URLs[cleanURL] = true
 		}
 	}
-	inheritEntryDimensions := len(uniqueProgressiveMP4URLs) == 1 &&
-		entry.Width != nil && entry.Height != nil && *entry.Width > 0 && *entry.Height > 0
+	return len(uniqueProgressiveMP4URLs) == 1
+}
+
+func classifyEntryFormats(entry *Info, opts AdaptOptions) classifiedFormats {
+	var out classifiedFormats
+
+	// First pass: check if any audio-bearing format exists in the entry and count
+	// distinct progressive MP4 URLs (so top-level dimensions are inherited only when
+	// all progressive MP4 entries refer to a single stream rather than distinct SD/HD tiers).
+	hasAnyAudioInEntry := false
+	for _, f := range entry.Formats {
+		if !isNoCodec(f.ACodec) && strings.TrimSpace(f.ACodec) != "" {
+			hasAnyAudioInEntry = true
+			break
+		}
+	}
+	inheritEntryDimensions := shouldInheritEntryDimensions(entry, opts, hasAnyAudioInEntry)
 
 	for _, f := range entry.Formats {
 		cleanURL := SanitizeMediaURL(f.URL, opts.AllowedMediaURL)
@@ -120,80 +165,75 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 		f.URL = cleanURL
 
 		if isHLSAudioOnly(f) {
-			hlsAudioFormats = append(hlsAudioFormats, f)
+			out.hlsAudio = append(out.hlsAudio, f)
 			continue
 		}
-		if isProgressiveMP4Format(f, opts.AllowCodecLessProgressiveMP4) {
+		if isProgressiveMP4Format(f, opts.AllowCodecLessProgressiveMP4) ||
+			(opts.AllowCodecLessProgressiveMP4 && !hasAnyAudioInEntry && isSilentCodecLessMP4(f)) {
 			if inheritEntryDimensions && f.Width == nil && f.Height == nil {
 				w, h := *entry.Width, *entry.Height
 				f.Width = &w
 				f.Height = &h
 			}
-			mp4Formats = append(mp4Formats, f)
-			continue
-		}
-		// Silent progressive MP4 post (e.g. vintage Instagram post with no audio streams at all)
-		if opts.AllowCodecLessProgressiveMP4 && !hasAnyAudioInEntry && isSilentCodecLessMP4(f) {
-			if inheritEntryDimensions && f.Width == nil && f.Height == nil {
-				w, h := *entry.Width, *entry.Height
-				f.Width = &w
-				f.Height = &h
-			}
-			mp4Formats = append(mp4Formats, f)
+			out.mp4 = append(out.mp4, f)
 			continue
 		}
 		if isHTTPDASHVideoOnly(f) {
-			dashVideoFormats = append(dashVideoFormats, f)
+			out.dashVideo = append(out.dashVideo, f)
 			continue
 		}
 		if isHTTPDASHAudioOnly(f) {
-			dashAudioFormats = append(dashAudioFormats, f)
+			out.dashAudio = append(out.dashAudio, f)
 			continue
 		}
 		if isHLSVideo(f) {
-			hlsVideoFormats = append(hlsVideoFormats, f)
+			out.hlsVideo = append(out.hlsVideo, f)
 			continue
 		}
 	}
 
-	sortFormats(mp4Formats)
-	sortDASHVideoFormats(dashVideoFormats)
-	sortAudioFormats(dashAudioFormats)
-	sortFormats(hlsVideoFormats)
-	sortAudioFormats(hlsAudioFormats)
+	sortFormats(out.mp4)
+	sortDASHVideoFormats(out.dashVideo)
+	sortAudioFormats(out.dashAudio)
+	sortFormats(out.hlsVideo)
+	sortAudioFormats(out.hlsAudio)
+	return out
+}
 
-	variants := make(unified.Array, 0, len(mp4Formats)+len(dashVideoFormats)+len(hlsVideoFormats)+1)
-	seenVariantIDs := make(map[string]bool)
-	var audioAttachment unified.Object
-
-	dedupedMP4 := deduplicateProgressiveFormats(mp4Formats)
-	var filteredDASHVideo []Format
-	if opts.EnableDASHMux && len(dashVideoFormats) > 0 {
-		var maxMP4Edge int64
-		var maxMP4FPS float64
-		if len(dedupedMP4) > 0 {
-			maxMP4Edge = shortEdge(dedupedMP4[0])
-			maxMP4FPS = derefFloat(dedupedMP4[0].FPS)
-		}
-		dedupedDASH := deduplicateDASHVideoFormats(dashVideoFormats)
-		for _, vf := range dedupedDASH {
-			if maxMP4Edge > 0 {
-				edge := shortEdge(vf)
-				fps := derefFloat(vf.FPS)
-				higherFPS := edge == maxMP4Edge && fps > maxMP4FPS+5 && fps >= 50
-				if edge <= maxMP4Edge && !higherFPS {
-					continue
-				}
-			}
-			filteredDASHVideo = append(filteredDASHVideo, vf)
-		}
+func filterDASHVideoFormats(dashVideoFormats, dedupedMP4 []Format, opts AdaptOptions) []Format {
+	if !opts.EnableDASHMux || len(dashVideoFormats) == 0 {
+		return nil
 	}
+	var maxMP4Edge int64
+	var maxMP4FPS float64
+	if len(dedupedMP4) > 0 {
+		maxMP4Edge = shortEdge(dedupedMP4[0])
+		maxMP4FPS = derefFloat(dedupedMP4[0].FPS)
+	}
+	dedupedDASH := deduplicateDASHVideoFormats(dashVideoFormats)
+	filtered := make([]Format, 0, len(dedupedDASH))
+	for _, vf := range dedupedDASH {
+		if maxMP4Edge > 0 {
+			edge := shortEdge(vf)
+			fps := derefFloat(vf.FPS)
+			higherFPS := edge == maxMP4Edge && fps > maxMP4FPS+5 && fps >= 50
+			if edge <= maxMP4Edge && !higherFPS {
+				continue
+			}
+		}
+		filtered = append(filtered, vf)
+	}
+	return filtered
+}
 
-	hasSplitSilentTracks := len(filteredDASHVideo) > 0
-
-	// 1. High-Resolution DASH Video-Only Tracks as Directly Downloadable Files (kind == "file", has_audio == false).
-	// True width and height are preserved in metadata; unified.SelectDefault explicitly
-	// prefers complete audiovisual files over split silent video-only tracks for item.default.
+func appendDASHVideoVariants(
+	variants unified.Array,
+	seenVariantIDs map[string]bool,
+	filteredDASHVideo []Format,
+	entryKey string,
+	opts AdaptOptions,
+	now int64,
+) unified.Array {
 	for i, vf := range filteredDASHVideo {
 		videoKey := nonEmptyOr(vf.FormatID, fmt.Sprintf("dashv-%d", i+1))
 		sources := buildFormatSourcesWithContext(vf, opts, entryKey, videoKey, "", now)
@@ -207,7 +247,7 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 		}
 		seenVariantIDs[variantID] = true
 
-		variant := unified.Object{
+		variants = append(variants, unified.Object{
 			"id":       variantID,
 			"label":    qualityLabel(vf, formatSilentVideoSuffix(vf)),
 			"metadata": metadata,
@@ -215,11 +255,20 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 				"kind":    "file",
 				"sources": sources,
 			},
-		}
-		variants = append(variants, variant)
+		})
 	}
+	return variants
+}
 
-	// 2. Deliverable Progressive MP4s with Embedded Audio (kind == "file")
+func appendProgressiveMP4Variants(
+	variants unified.Array,
+	seenVariantIDs map[string]bool,
+	dedupedMP4 []Format,
+	hasSplitSilentTracks bool,
+	entryKey, itemTitle string,
+	opts AdaptOptions,
+	now int64,
+) unified.Array {
 	for i, f := range dedupedMP4 {
 		formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("mp4-%d", i+1))
 		hasAudio := resolveFormatHasAudio(f.ACodec)
@@ -267,111 +316,125 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 		}
 		variants = append(variants, variant)
 	}
+	return variants
+}
 
-	// 3. Standalone Audio Tracks (both as downloadable file variants in quality options and as a background_audio attachment)
-	if opts.EnableDASHMux && hasSplitSilentTracks && len(dashAudioFormats) > 0 {
-		seenAudioContainer := make(map[string]bool, 2)
-		for _, candAudio := range dashAudioFormats {
-			audioMeta := buildAudioFileMetadata(candAudio)
-			audioContainer := unified.Str(audioMeta["container"])
-			if audioContainer == "" {
-				audioContainer = "mp4"
-			}
-			if seenAudioContainer[audioContainer] {
-				continue
-			}
-			candKey := nonEmptyOr(candAudio.FormatID, "audio-"+audioContainer)
-			audioSources := buildFormatSourcesWithContext(candAudio, opts, entryKey, candKey, "", now)
-			if len(audioSources) == 0 {
-				continue
-			}
-			audioVariantID := "v-" + shortDigest(opts.PlatformID+":dasha-file:"+entryKey+":"+candKey)
-			if seenVariantIDs[audioVariantID] {
-				continue
-			}
-			seenAudioContainer[audioContainer] = true
-			seenVariantIDs[audioVariantID] = true
-			audioVariant := unified.Object{
-				"id":       audioVariantID,
-				"label":    formatAudioVariantLabel(candAudio),
-				"metadata": audioMeta,
-				"delivery": unified.Object{
-					"kind":    "file",
-					"sources": audioSources,
-				},
-			}
-			variants = append(variants, audioVariant)
+func appendStandaloneAudioVariantsAndAttachment(
+	variants unified.Array,
+	seenVariantIDs map[string]bool,
+	dashAudioFormats []Format,
+	entry, parent *Info,
+	entryKey, itemTitle string,
+	opts AdaptOptions,
+	now int64,
+) (unified.Array, unified.Object) {
+	seenAudioContainer := make(map[string]bool, 2)
+	for _, candAudio := range dashAudioFormats {
+		audioMeta := buildAudioFileMetadata(candAudio)
+		audioContainer := unified.Str(audioMeta["container"])
+		if audioContainer == "" {
+			audioContainer = "mp4"
 		}
-		bestAudio := dashAudioFormats[0]
-		audioKey := nonEmptyOr(bestAudio.FormatID, "audio")
-		if audioResource := buildMuxTrackResourceWithContext(bestAudio, "audio", opts, entryKey, audioKey, "", now); audioResource != nil {
-			attID := "att-" + shortDigest(opts.PlatformID+":att-audio:"+opts.ContentID+":"+entryKey)
-			attTitle := formatAudioAttachmentTitle(itemTitle, bestAudio)
-			audioAttachment = unified.Object{
-				"id":       attID,
-				"role":     "background_audio",
-				"title":    attTitle,
-				"resource": audioResource,
-			}
-			if author := buildAuthorObject(parent); author != nil {
-				audioAttachment["author"] = author
-			}
-			if cover := pickSingleCover(entry, opts.AllowedMediaURL, now); cover != nil {
-				audioAttachment["cover"] = cover
-			} else if cover := pickSingleCover(parent, opts.AllowedMediaURL, now); cover != nil {
-				audioAttachment["cover"] = cover
-			}
+		if seenAudioContainer[audioContainer] {
+			continue
 		}
+		candKey := nonEmptyOr(candAudio.FormatID, "audio-"+audioContainer)
+		audioSources := buildFormatSourcesWithContext(candAudio, opts, entryKey, candKey, "", now)
+		if len(audioSources) == 0 {
+			continue
+		}
+		audioVariantID := "v-" + shortDigest(opts.PlatformID+":dasha-file:"+entryKey+":"+candKey)
+		if seenVariantIDs[audioVariantID] {
+			continue
+		}
+		seenAudioContainer[audioContainer] = true
+		seenVariantIDs[audioVariantID] = true
+		variants = append(variants, unified.Object{
+			"id":       audioVariantID,
+			"label":    formatAudioVariantLabel(candAudio),
+			"metadata": audioMeta,
+			"delivery": unified.Object{
+				"kind":    "file",
+				"sources": audioSources,
+			},
+		})
 	}
 
-	// 4. Non-single-file HLS variants (kind == "hls", scope == "adaptive")
-	if opts.EnableHLS && len(hlsVideoFormats) > 0 {
-		var bestHLSAudio *Format
-		if len(hlsAudioFormats) > 0 {
-			bestHLSAudio = &hlsAudioFormats[0]
+	var audioAttachment unified.Object
+	bestAudio := dashAudioFormats[0]
+	audioKey := nonEmptyOr(bestAudio.FormatID, "audio")
+	if audioResource := buildMuxTrackResourceWithContext(bestAudio, "audio", opts, entryKey, audioKey, "", now); audioResource != nil {
+		attID := "att-" + shortDigest(opts.PlatformID+":att-audio:"+opts.ContentID+":"+entryKey)
+		attTitle := formatAudioAttachmentTitle(itemTitle, bestAudio)
+		audioAttachment = unified.Object{
+			"id":       attID,
+			"role":     "background_audio",
+			"title":    attTitle,
+			"resource": audioResource,
 		}
-		dedupedHLS := deduplicateProgressiveFormats(hlsVideoFormats)
-		for i, f := range dedupedHLS {
-			formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("hls-%d", i+1))
-			sources := buildFormatSourcesWithContext(f, opts, entryKey, formatKey, "", now)
-			if len(sources) == 0 {
-				continue
-			}
-			hasEmbeddedAudio := !isNoCodec(f.ACodec) && strings.TrimSpace(f.ACodec) != ""
-			metadata := buildFormatMetadata(f, boolPtr(hasEmbeddedAudio), false)
-			variantID := "v-" + shortDigest(opts.PlatformID+":hls:"+entryKey+":"+formatKey)
-			if seenVariantIDs[variantID] {
-				continue
-			}
-			seenVariantIDs[variantID] = true
-
-			selection := unified.Object{
-				"video_representation_id": formatKey,
-			}
-			if !hasEmbeddedAudio && bestHLSAudio != nil && strings.TrimSpace(bestHLSAudio.FormatID) != "" {
-				selection["audio_representation_id"] = strings.TrimSpace(bestHLSAudio.FormatID)
-			}
-			variant := unified.Object{
-				"id":       variantID,
-				"label":    qualityLabel(f, "HLS 需合流"),
-				"metadata": metadata,
-				"delivery": unified.Object{
-					"kind":      "hls",
-					"scope":     "adaptive",
-					"selection": selection,
-					"sources":   sources,
-					"output": unified.Object{
-						"container": "mp4",
-						"extension": "mp4",
-						"mime_type": "video/mp4",
-					},
-				},
-			}
-			variants = append(variants, variant)
+		if author := buildAuthorObject(parent); author != nil {
+			audioAttachment["author"] = author
+		}
+		if cover := pickSingleCover(entry, opts.AllowedMediaURL, now); cover != nil {
+			audioAttachment["cover"] = cover
+		} else if cover := pickSingleCover(parent, opts.AllowedMediaURL, now); cover != nil {
+			audioAttachment["cover"] = cover
 		}
 	}
-
 	return variants, audioAttachment
+}
+
+func appendAdaptiveHLSVariants(
+	variants unified.Array,
+	seenVariantIDs map[string]bool,
+	hlsVideoFormats, hlsAudioFormats []Format,
+	entryKey string,
+	opts AdaptOptions,
+	now int64,
+) unified.Array {
+	var bestHLSAudio *Format
+	if len(hlsAudioFormats) > 0 {
+		bestHLSAudio = &hlsAudioFormats[0]
+	}
+	dedupedHLS := deduplicateProgressiveFormats(hlsVideoFormats)
+	for i, f := range dedupedHLS {
+		formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("hls-%d", i+1))
+		sources := buildFormatSourcesWithContext(f, opts, entryKey, formatKey, "", now)
+		if len(sources) == 0 {
+			continue
+		}
+		hasEmbeddedAudio := !isNoCodec(f.ACodec) && strings.TrimSpace(f.ACodec) != ""
+		metadata := buildFormatMetadata(f, boolPtr(hasEmbeddedAudio), false)
+		variantID := "v-" + shortDigest(opts.PlatformID+":hls:"+entryKey+":"+formatKey)
+		if seenVariantIDs[variantID] {
+			continue
+		}
+		seenVariantIDs[variantID] = true
+
+		selection := unified.Object{
+			"video_representation_id": formatKey,
+		}
+		if !hasEmbeddedAudio && bestHLSAudio != nil && strings.TrimSpace(bestHLSAudio.FormatID) != "" {
+			selection["audio_representation_id"] = strings.TrimSpace(bestHLSAudio.FormatID)
+		}
+		variants = append(variants, unified.Object{
+			"id":       variantID,
+			"label":    qualityLabel(f, "HLS 需合流"),
+			"metadata": metadata,
+			"delivery": unified.Object{
+				"kind":      "hls",
+				"scope":     "adaptive",
+				"selection": selection,
+				"sources":   sources,
+				"output": unified.Object{
+					"container": "mp4",
+					"extension": "mp4",
+					"mime_type": "video/mp4",
+				},
+			},
+		})
+	}
+	return variants
 }
 
 func buildMuxTrackResourceWithContext(f Format, role string, opts AdaptOptions, entryKey, formatKey, itemTitle string, now int64) unified.Object {
