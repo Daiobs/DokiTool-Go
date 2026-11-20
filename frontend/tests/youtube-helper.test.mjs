@@ -4268,42 +4268,19 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     const mediaContractMod = await vite.ssrLoadModule("/src/utils/mediaContract.ts");
     const apiConfigMod = await vite.ssrLoadModule("/src/services/apiConfig.ts");
     const ytHelperCoreMod = await vite.ssrLoadModule("/src/utils/youtubeHelperCore.js");
-    const sfcSource = await readFile(
+    const { loadSfc } = await import("./helpers/loadSfc.mjs");
+    const ClientResultSection = await loadSfc(
       new URL("../src/components/ResultSection.vue", import.meta.url),
-      "utf8",
+      {
+        modules: {
+          "./AppIcon.vue": { default: { render: (_, { attrs }) => h("i", attrs) } },
+          "../utils/mediaSources": mediaSourcesMod,
+          "../utils/mediaContract": mediaContractMod,
+          "../utils/youtubeHelperCore": ytHelperCoreMod,
+          "../services/apiConfig": apiConfigMod,
+        },
+      },
     );
-    const { descriptor } = parse(sfcSource);
-    const compiledScript = compileScript(descriptor, {
-      id: "yt-ui-polish-test",
-      inlineTemplate: true,
-      templateOptions: { compilerOptions: { hoistStatic: false } },
-    });
-    const cjsCode = await transformWithEsbuild(
-      compiledScript.content,
-      "ResultSection.js",
-      { loader: "js", format: "cjs" },
-    );
-    const cjsMod = { exports: {} };
-    const req = createRequire(import.meta.url);
-    new Function("require", "module", "exports", cjsCode.code)(
-      (id) =>
-        id === "./VideoPlaylist.vue"
-          ? { __esModule: true, default: { render: () => null } }
-          : id === "./AppIcon.vue"
-            ? { __esModule: true, default: { render: () => h("i") } }
-            : id === "../utils/mediaSources"
-              ? mediaSourcesMod
-              : id === "../utils/mediaContract"
-                ? mediaContractMod
-                : id === "../utils/youtubeHelperCore"
-                  ? ytHelperCoreMod
-                  : id === "../services/apiConfig"
-                    ? apiConfigMod
-                    : req(id),
-      cjsMod,
-      cjsMod.exports,
-    );
-    const ClientResultSection = cjsMod.exports.default;
 
     const mountInteractiveResult = async (resultData, initialLocale = "zh-CN") => {
       const store = reactive({ resultData, resultVersion: 1 });

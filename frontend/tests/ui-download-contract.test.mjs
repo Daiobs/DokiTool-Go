@@ -12,6 +12,7 @@ import { parse, compileScript } from '@vue/compiler-sfc';
 import { ref, computed, h, createSSRApp, createRenderer, nextTick, markRaw } from 'vue';
 import { renderToString } from '@vue/server-renderer';
 import JSZip from 'jszip';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
 let vite, downloads, ResultSection, HeroSection, PlatformGrid, DownloadCard, platforms, parser, mediaSources, mediaContract, selectionModule, configuration, youtubeHelperCore;
 let clicked, blobs, fetched, nativeFrames;
@@ -247,17 +248,17 @@ test('checkbox change toggles once and checkbox key events do not select the epi
 });
 
 async function mountResultPlayer(data, locale = 'zh-CN') {
-  const source = await readFile(new URL('../src/components/ResultSection.vue', import.meta.url), 'utf8');
-  const { descriptor } = parse(source);
-  const script = compileScript(descriptor, { id: 'media-error-test', inlineTemplate: true,
-    templateOptions: { compilerOptions: { hoistStatic: false } } });
-  const code = await transformWithEsbuild(script.content, 'ResultSection.js', { loader: 'js', format: 'cjs' });
-  const module = { exports: {} }, require = createRequire(import.meta.url);
-  new Function('require', 'module', 'exports', code.code)(
-    (id) => id === './VideoPlaylist.vue' ? { __esModule: true, default: { render: () => null } }
-      : id === './AppIcon.vue' ? { __esModule: true, default: { render: () => h('i') } }
-      : id === '../utils/mediaSources' ? mediaSources : id === '../utils/mediaContract' ? mediaContract : id === '../utils/youtubeHelperCore' ? youtubeHelperCore : id === '../services/apiConfig' ? configuration : require(id),
-    module, module.exports,
+  const CompiledResultSection = await loadSfc(
+    new URL('../src/components/ResultSection.vue', import.meta.url),
+    {
+      modules: {
+        './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
+        '../utils/mediaSources': mediaSources,
+        '../utils/mediaContract': mediaContract,
+        '../utils/youtubeHelperCore': youtubeHelperCore,
+        '../services/apiConfig': configuration,
+      },
+    },
   );
   const element = (type, text = '') => markRaw({ type, text, props: {}, children: [], parent: null, style: {}, removeAttribute() {} });
   const portal = element('portal');
@@ -278,7 +279,7 @@ async function mountResultPlayer(data, locale = 'zh-CN') {
   const state = ref(resultProps(data,locale));
   state.value.onSwitchVideo = choice => state.value.selection.choose(choice);
   const root = element('root');
-  const app = renderer.createApp({ render: () => h(module.exports.default, state.value) });
+  const app = renderer.createApp({ render: () => h(CompiledResultSection, state.value) });
   app.mount(root); await nextTick();
   const find = (node, match) => match(node) ? node : node.children.map((child) => find(child, match)).find(Boolean);
   return { state, app, player: () => find(root, (node) => node.type === 'video'),

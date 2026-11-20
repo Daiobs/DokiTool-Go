@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { transformWithEsbuild } from 'vite';
-import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, h, markRaw, nextTick, ref } from 'vue';
 import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
 const require = createRequire(import.meta.url);
 const originalGlobals = { window: globalThis.window, document: globalThis.document };
@@ -24,19 +24,16 @@ before(async () => {
   }
   ({ useVideoSelection } = modules['../composables/useVideoSelection']);
   ({ validateMediaEnvelope } = modules['../utils/mediaContract']);
-  const content = await readFile(new URL('../src/components/ResultSection.vue', import.meta.url), 'utf8');
-  const { descriptor } = parse(content);
-  const script = compileScript(descriptor, { id: 'result-layout', inlineTemplate: true,
-    templateOptions: { compilerOptions: { hoistStatic: false } } });
-  const compiled = await transformWithEsbuild(script.content, 'ResultSection.js', { loader: 'js', format: 'cjs' });
-  const module = { exports: {} };
-  new Function('require', 'module', 'exports', compiled.code)((id) => {
-    if (id === './AppIcon.vue') return { __esModule: true, default: { render: () => h('i') } };
-    if (id === './VideoPlaylist.vue') return { __esModule: true, default: { render: () => h('div', { class: 'test-playlist' }) } };
-    if (modules[id]) return modules[id];
-    return require(id);
-  }, module, module.exports);
-  ResultSection = module.exports.default;
+  ResultSection = await loadSfc(
+    new URL('../src/components/ResultSection.vue', import.meta.url),
+    {
+      modules: {
+        ...modules,
+        './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
+        './VideoPlaylist.vue': { default: { render: () => h('div', { class: 'test-playlist' }) } },
+      },
+    },
+  );
 });
 after(() => Object.assign(globalThis, originalGlobals));
 
