@@ -1,13 +1,6 @@
-import { shallowRef, watch, type Ref } from "vue";
-import { useButtonControl } from "./useButtonControl";
+import { computed, ref, shallowRef, watch, type Ref } from "vue";
 import { apiConfig } from "../services/apiConfig";
-import { secureApiClient } from "../services/secureApiClient";
-import { withTbvideoItems } from "../services/tbvideo";
-import { validateMediaEnvelope, readyItem } from "../utils/mediaContract";
-import {
-  extractYouTubeVideoId,
-  pingYouTubeHelper,
-} from "../utils/youtubeHelperCore";
+import type { pingYouTubeHelper } from "../utils/youtubeHelperCore";
 import type { useVideoStore } from "../stores/video";
 import type {
   MediaItem,
@@ -171,7 +164,14 @@ export function useVideoParser(options: {
         window.location.reload();
       }
     });
-  const pingHelper = options.pingHelper ?? pingYouTubeHelper;
+  const pingHelper: typeof pingYouTubeHelper =
+    options.pingHelper ??
+    (async (...args) => {
+      const { pingYouTubeHelper: ping } = await import(
+        "../utils/youtubeHelperCore"
+      );
+      return ping(...args);
+    });
 
   const inputUrl = shallowRef(""),
     parseError = shallowRef(""),
@@ -224,11 +224,29 @@ export function useVideoParser(options: {
       // Ignore storage errors
     }
   }
-  const parseButton = useButtonControl({
-    action: "parse",
-    timeout: 0,
-    retry: false,
-  });
+  const parseButtonState = ref<string>("idle");
+  const parseButtonError = ref<Error | null>(null);
+  const parseButton = {
+    state: parseButtonState,
+    error: parseButtonError,
+    isLoading: computed(() => parseButtonState.value === "loading"),
+    isDisabled: computed(
+      () =>
+        parseButtonState.value === "loading" ||
+        parseButtonState.value === "disabled",
+    ),
+    canClick: computed(
+      () =>
+        parseButtonState.value === "idle" || parseButtonState.value === "error",
+    ),
+    reset: () => {
+      parseButtonState.value = "idle";
+      parseButtonError.value = null;
+    },
+    setLoading: (loading: boolean) => {
+      parseButtonState.value = loading ? "loading" : "idle";
+    },
+  };
   let generation = 0,
     active: AbortController | null = null;
   const invalidate = () => {
@@ -245,21 +263,29 @@ export function useVideoParser(options: {
     url: string,
     signal: AbortSignal,
   ): Promise<UnifiedMedia> {
-    const payload =
+    const payloadPromise =
       apiConfig.mode === "secure"
-        ? await secureApiClient!.parse(
-            {
-              url,
-              platform: currentPlatform.value,
-              locale: options.locale.value === "en" ? "en" : "zh-CN",
-              schema_version: "1.0",
-            },
-            { signal },
+        ? import("../services/secureApiClient").then(({ secureApiClient }) =>
+            secureApiClient!.parse(
+              {
+                url,
+                platform: currentPlatform.value,
+                locale: options.locale.value === "en" ? "en" : "zh-CN",
+                schema_version: "1.0",
+              },
+              { signal },
+            ),
           )
-        : await fetchJSON(
+        : fetchJSON(
             `${apiConfig.parseUrl}?schema_version=1.0&platform=${encodeURIComponent(currentPlatform.value)}&url=${encodeURIComponent(url)}`,
             signal,
           );
+    const [payload, { validateMediaEnvelope }, { withTbvideoItems }] =
+      await Promise.all([
+        payloadPromise,
+        import("../utils/mediaContract"),
+        import("../services/tbvideo"),
+      ]);
     return withTbvideoItems(validateMediaEnvelope(payload));
   }
 
@@ -332,10 +358,18 @@ export function useVideoParser(options: {
           return;
         }
       }
-      const youtubeVideoId =
-        currentPlatform.value === "all" || currentPlatform.value === "youtube"
-          ? extractYouTubeVideoId(url)
-          : "";
+      let youtubeVideoId = "";
+      if (
+        (currentPlatform.value === "all" ||
+          currentPlatform.value === "youtube") &&
+        /(?:youtube\.com|youtu\.be)/i.test(url)
+      ) {
+        const { extractYouTubeVideoId } = await import(
+          "../utils/youtubeHelperCore"
+        );
+        if (run !== generation || controller.signal.aborted) return;
+        youtubeVideoId = extractYouTubeVideoId(url);
+      }
       if (youtubeVideoId) {
         await parseYouTubeWithHelper(url, youtubeVideoId, run, controller);
       } else {
@@ -373,19 +407,22 @@ export function useVideoParser(options: {
   ): Promise<MediaItem> {
     if (item.state === "unavailable") throw new Error(item.error.message);
     if (!item.resolve_url) {
+      const { readyItem } = await import("../utils/mediaContract");
       if (readyItem(item)) return item;
       throw new Error("条目缺少解析入口");
     }
     const url = resolveApiUrl(item.resolve_url);
-    const data = withTbvideoItems(
-      validateMediaEnvelope(
-        await withRateLimitRetry(
+    const [rawPayload, { validateMediaEnvelope }, { withTbvideoItems }] =
+      await Promise.all([
+        withRateLimitRetry(
           () => fetchJSON(url, signal),
           signal,
           options?.onRateLimitWait,
         ),
-      ),
-    );
+        import("../utils/mediaContract"),
+        import("../services/tbvideo"),
+      ]);
+    const data = withTbvideoItems(validateMediaEnvelope(rawPayload));
     const resolved = data.items.find((candidate) => candidate.id === item.id);
     if (!resolved) throw new Error("解析响应缺少所请求条目");
     return resolved;

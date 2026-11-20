@@ -19,6 +19,8 @@ before(async()=>{
   selection=await vite.ssrLoadModule('/src/composables/useVideoSelection.ts');
   parseHelpers=await vite.ssrLoadModule('/src/utils/parseHelpers.ts');
   ytHelperCore=await vite.ssrLoadModule('/src/utils/youtubeHelperCore.js');
+  await vite.ssrLoadModule('/src/services/tbvideo.ts');
+  await vite.ssrLoadModule('/src/services/secureApiClient.ts');
   (await vite.ssrLoadModule('/src/services/operationLogger.js')).operationLogger.enableConsole=false;
   globalThis.window={setTimeout,clearTimeout};
 });
