@@ -63,4 +63,32 @@ func TestInputDomainBoundary(t *testing.T) {
 			t.Errorf("%s => %q want %q", raw, actual, expected)
 		}
 	}
+
+	if err := c.Register(XPlatform()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Register(InstagramPlatform()); err != nil {
+		t.Fatal(err)
+	}
+	for raw, expected := range map[string]string{
+		"https://t.co/Zgzhvix8ES":                 "x",
+		"http://T.CO:80/Zgzhvix8ES":               "x",
+		"https://sub.t.co/Zgzhvix8ES":             "x",
+		"https://t.co:8443/Zgzhvix8ES":            "",
+		"https://user@t.co/Zgzhvix8ES":            "",
+		"https://nott.co/Zgzhvix8ES":              "",
+		"https://t.co.evil.example/Zgzhvix8ES":    "",
+		"https://instagr.am/p/aye83DjauH/":        "instagram",
+		"https://www.instagr.am/reel/CTApqC8BGWd": "instagram",
+		"http://INSTAGR.AM:80/tv/aye83DjauH/":     "instagram",
+		"https://foo.instagr.am/p/aye83DjauH/":    "instagram",
+		"https://instagr.am:8443/p/aye83DjauH/":   "",
+		"https://user@instagr.am/p/aye83DjauH/":   "",
+		"https://notinstagr.am/p/aye83DjauH/":     "",
+		"https://instagr.am.evil.example/p/abc/":  "",
+	} {
+		if actual := c.PlatformForURL(raw); actual != expected {
+			t.Errorf("%s => %q want %q", raw, actual, expected)
+		}
+	}
 }

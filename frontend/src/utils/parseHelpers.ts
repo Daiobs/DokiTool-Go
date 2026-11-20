@@ -19,7 +19,7 @@ import type {
 } from "../types/media";
 
 const ALIAS_PAIRS =
-  "douyin:iesdouyin.com bilibili:b23.tv xiaohongshu:xhslink.com,rednote.com toutiao:toutiaoimg.com weibo:weibo.cn pipigx:ippzone.com x:twitter.com youtube:youtu.be facebook:fb.watch";
+  "douyin:iesdouyin.com bilibili:b23.tv xiaohongshu:xhslink.com,rednote.com toutiao:toutiaoimg.com weibo:weibo.cn pipigx:ippzone.com x:twitter.com,t.co youtube:youtu.be instagram:instagr.am facebook:fb.watch";
 
 export function detectUrlPlatform(rawUrl: string): string | null {
   try {

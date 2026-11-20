@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -279,7 +280,7 @@ func normalizeCacheURL(platform, source string) string {
 		return "overlong:" + source
 	}
 	u, err := url.Parse(source)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
 		return source
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -290,34 +291,44 @@ func normalizeCacheURL(platform, source string) string {
 	}
 	escapedPath := u.EscapedPath()
 	forceQuery := u.ForceQuery
+	isStandardHTTP := (scheme == "http" || scheme == "https") && port == ""
 
-	switch platform {
-	case "x":
-		switch host {
-		case "x.com", "www.x.com", "mobile.x.com", "m.x.com",
-			"twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com":
-			host = "x.com"
-			scheme = "https"
-			port = ""
-		}
-	case "instagram":
-		switch host {
-		case "www.instagram.com", "instagram.com", "m.instagram.com":
-			host = "www.instagram.com"
-			scheme = "https"
-			port = ""
-		}
-	case "facebook":
-		if host == "facebook.com" || host == "m.facebook.com" {
-			host = "www.facebook.com"
-			scheme = "https"
-			port = ""
-		}
-	case "tumblr":
-		if host == "tumblr.com" {
-			host = "www.tumblr.com"
-			scheme = "https"
-			port = ""
+	if isStandardHTTP {
+		switch platform {
+		case "x":
+			switch host {
+			case "x.com", "www.x.com", "mobile.x.com", "m.x.com",
+				"twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com":
+				host = "x.com"
+				scheme = "https"
+			case "t.co":
+				host = "t.co"
+				scheme = "https"
+			}
+		case "instagram":
+			if _, canonical, ok := instagram.ExtractPostTarget(source); ok {
+				if cu, parseErr := url.Parse(canonical); parseErr == nil {
+					scheme = "https"
+					host = "www.instagram.com"
+					escapedPath = cu.EscapedPath()
+				}
+			} else {
+				switch host {
+				case "www.instagram.com", "instagram.com", "m.instagram.com":
+					host = "www.instagram.com"
+					scheme = "https"
+				}
+			}
+		case "facebook":
+			if host == "facebook.com" || host == "m.facebook.com" {
+				host = "www.facebook.com"
+				scheme = "https"
+			}
+		case "tumblr":
+			if host == "tumblr.com" {
+				host = "www.tumblr.com"
+				scheme = "https"
+			}
 		}
 	}
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
@@ -316,14 +317,48 @@ func TestNormalizeCacheURLAliasesAndDistinctQueries(t *testing.T) {
 			want: "https://x.com/user/status/123",
 		},
 		{
+			platform: "x",
+			inputs: []string{
+				"https://t.co/AbCdEf12",
+				"http://t.co:80/AbCdEf12",
+				"HTTPS://T.CO:443/AbCdEf12#share",
+			},
+			want: "https://t.co/AbCdEf12",
+		},
+		{
 			platform: "instagram",
 			inputs: []string{
 				"https://instagram.com/reel/CTApqC8BGWd/",
 				"https://m.instagram.com/reel/CTApqC8BGWd/",
 				"http://www.instagram.com:80/reel/CTApqC8BGWd/",
 				"https://www.instagram.com:443/reel/CTApqC8BGWd/#ig",
+				"https://www.instagram.com/reels/CTApqC8BGWd",
+				"https://instagr.am/reel/CTApqC8BGWd/",
+				"https://instagr.am/reel/CTApqC8BGWd",
+				"https://www.instagr.am/reels/CTApqC8BGWd",
+				"http://INSTAGR.AM:80/reel/CTApqC8BGWd#ig",
 			},
 			want: "https://www.instagram.com/reel/CTApqC8BGWd/",
+		},
+		{
+			platform: "instagram",
+			inputs: []string{
+				"https://www.instagram.com/p/aye83DjauH/",
+				"https://www.instagram.com/p/aye83DjauH",
+				"https://instagr.am/p/aye83DjauH/",
+				"https://instagr.am/p/aye83DjauH",
+				"https://www.instagr.am/p/aye83DjauH/",
+			},
+			want: "https://www.instagram.com/p/aye83DjauH/",
+		},
+		{
+			platform: "instagram",
+			inputs: []string{
+				"https://www.instagram.com/tv/aye83DjauH/",
+				"https://instagr.am/tv/aye83DjauH",
+				"https://www.instagr.am/tv/aye83DjauH/",
+			},
+			want: "https://www.instagram.com/tv/aye83DjauH/",
 		},
 		{
 			platform: "facebook",
@@ -359,9 +394,21 @@ func TestNormalizeCacheURLAliasesAndDistinctQueries(t *testing.T) {
 		t.Fatal("overlong tumblr URL collided with expanded valid bare tumblr.com URL")
 	}
 
-	// Distinct media selectors / query tokens MUST remain distinct.
+	// Distinct media selectors / query tokens / case-sensitive t.co codes / non-standard ports MUST remain distinct.
 	if normalizeCacheURL("x", "https://x.com/u/status/1/photo/1") == normalizeCacheURL("x", "https://x.com/u/status/1/photo/2") {
 		t.Fatal("X /photo/1 and /photo/2 collided")
+	}
+	if normalizeCacheURL("x", "https://t.co/AbCd") == normalizeCacheURL("x", "https://t.co/abcd") {
+		t.Fatal("case-sensitive t.co/AbCd and t.co/abcd collided")
+	}
+	if normalizeCacheURL("x", "https://t.co:8443/AbCd") == normalizeCacheURL("x", "https://t.co/AbCd") ||
+		normalizeCacheURL("x", "http://t.co:443/AbCd") == normalizeCacheURL("x", "https://t.co/AbCd") {
+		t.Fatal("non-standard t.co port collided with valid t.co cache key")
+	}
+	if normalizeCacheURL("instagram", "https://instagr.am:8443/p/aye83DjauH/") == normalizeCacheURL("instagram", "https://www.instagram.com/p/aye83DjauH/") ||
+		normalizeCacheURL("instagram", "https://instagr.am/someuser/p/aye83DjauH/") == normalizeCacheURL("instagram", "https://www.instagram.com/p/aye83DjauH/") ||
+		normalizeCacheURL("instagram", "https://foo.instagr.am/p/aye83DjauH/") == normalizeCacheURL("instagram", "https://www.instagram.com/p/aye83DjauH/") {
+		t.Fatal("invalid instagr.am path/subdomain/port collided with canonical www.instagram.com cache key")
 	}
 	if normalizeCacheURL("xiaohongshu", "https://www.xiaohongshu.com/explore/1?xsec_token=a") ==
 		normalizeCacheURL("xiaohongshu", "https://www.xiaohongshu.com/explore/1?xsec_token=b") {
@@ -467,6 +514,151 @@ func TestWarmCacheDoesNotBypassPlatformURLValidation(t *testing.T) {
 			t.Fatalf("warm cache bypassed >2048-byte rejection for len=%d (%s...): status=%d body=%s",
 				len(overlong), overlong[:48], w.Code, w.Body.String())
 		}
+	}
+}
+
+type cacheFakeFetcher func(context.Context, fetch.Request) (fetch.Response, error)
+
+func (f cacheFakeFetcher) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	return f(ctx, req)
+}
+
+func TestShortlinksCacheEquivalenceAndCaseSensitivity(t *testing.T) {
+	const nowUnix int64 = 1793448000
+	c := loadCacheTestCatalog(t)
+
+	var igCalls, xTCoUpperCalls, xTCoLowerCalls atomic.Int32
+	w720, h720 := int64(1280), int64(720)
+	dur := 8.0
+	tbr := 1800.0
+
+	igAdapter := instagram.New(&stubXExtractor{
+		enabled: true,
+		extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
+			igCalls.Add(1)
+			return &ytengine.Info{
+				ID:         "CTApqC8BGWd",
+				Title:      "IG Shortlink Reel",
+				Duration:   &dur,
+				Thumbnail:  "https://scontent.cdninstagram.com/v/t51.2885-15/100_n.jpg",
+				WebpageURL: rawURL,
+				Formats: []ytengine.Format{
+					{
+						FormatID: "0",
+						URL:      "https://scontent.cdninstagram.com/v/t50.2886-16/100_n.mp4",
+						Ext:      "mp4",
+						Protocol: "https",
+						Width:    &w720,
+						Height:   &h720,
+						TBR:      &tbr,
+					},
+				},
+			}, nil
+		},
+	})
+
+	xAdapter := x.NewWithFetcher(
+		&stubXExtractor{
+			enabled: true,
+			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
+				id := strings.TrimPrefix(rawURL, "https://x.com/i/status/")
+				return &ytengine.Info{
+					ID:        id,
+					DisplayID: id,
+					Title:     "Tweet " + id,
+					Duration:  &dur,
+					Thumbnail: "https://pbs.twimg.com/media/a.jpg",
+					Formats: []ytengine.Format{
+						{
+							FormatID: "http-720",
+							URL:      "https://video.twimg.com/ext_tw_video/" + id + "/pu/vid/1280x720/a.mp4",
+							Ext:      "mp4",
+							Protocol: "https",
+							Width:    &w720,
+							Height:   &h720,
+							TBR:      &tbr,
+							VCodec:   "avc1.64001f",
+							ACodec:   "mp4a.40.2",
+						},
+					},
+				}, nil
+			},
+		},
+		nil,
+		cacheFakeFetcher(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.URL {
+			case "https://t.co/AbCd":
+				xTCoUpperCalls.Add(1)
+				hdr := make(http.Header)
+				hdr.Set("Location", "https://x.com/user/status/1800000000000000001")
+				return fetch.Response{StatusCode: http.StatusMovedPermanently, Header: hdr, URL: req.URL}, nil
+			case "https://t.co/abcd":
+				xTCoLowerCalls.Add(1)
+				hdr := make(http.Header)
+				hdr.Set("Location", "https://x.com/user/status/1800000000000000002")
+				return fetch.Response{StatusCode: http.StatusMovedPermanently, Header: hdr, URL: req.URL}, nil
+			default:
+				return fetch.Response{StatusCode: http.StatusNotFound, URL: req.URL}, nil
+			}
+		}),
+	)
+
+	h, err := New(c, map[string]Adapter{
+		"instagram": igAdapter,
+		"x":         xAdapter,
+	}, func() time.Time { return time.Unix(nowUnix, 0) }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doParse := func(rawURL string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		q := url.Values{"schema_version": {"1.0"}, "url": {rawURL}}
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil))
+		return w
+	}
+
+	// 1. Instagram shortlink & canonical URL share exact cache entry; invalid instagr.am variants still 400.
+	for _, eq := range []string{
+		"https://instagr.am/reels/CTApqC8BGWd",
+		"https://www.instagr.am/reel/CTApqC8BGWd/",
+		"https://www.instagram.com/reel/CTApqC8BGWd/",
+	} {
+		if w := doParse(eq); w.Code != http.StatusOK {
+			t.Fatalf("parse %q status=%d body=%s", eq, w.Code, w.Body.String())
+		}
+	}
+	if igCalls.Load() != 1 {
+		t.Fatalf("expected instagr.am and www.instagram.com to coalesce into 1 upstream call, got %d", igCalls.Load())
+	}
+	for _, badIG := range []string{
+		"https://instagr.am/someuser/reel/CTApqC8BGWd/",
+		"https://foo.instagr.am/reel/CTApqC8BGWd/",
+		"https://instagr.am:8443/reel/CTApqC8BGWd/",
+	} {
+		if w := doParse(badIG); w.Code != http.StatusBadRequest {
+			t.Fatalf("warm cache must not accept invalid %q: got status=%d body=%s", badIG, w.Code, w.Body.String())
+		}
+	}
+
+	// 2. t.co cache key normalizes scheme/host/port while strictly preserving case-sensitive path code.
+	wUpper1 := doParse("https://t.co/AbCd")
+	wUpper2 := doParse("http://T.CO:80/AbCd#frag")
+	wLower := doParse("https://t.co/abcd")
+	if wUpper1.Code != http.StatusOK || wUpper2.Code != http.StatusOK || wLower.Code != http.StatusOK {
+		t.Fatalf("unexpected statuses: upper1=%d upper2=%d lower=%d", wUpper1.Code, wUpper2.Code, wLower.Code)
+	}
+	if xTCoUpperCalls.Load() != 1 || xTCoLowerCalls.Load() != 1 {
+		t.Fatalf("expected 1 call for AbCd and 1 call for abcd, got upper=%d lower=%d", xTCoUpperCalls.Load(), xTCoLowerCalls.Load())
+	}
+	envUpper, _ := unified.Decode(wUpper2.Body.Bytes())
+	envLower, _ := unified.Decode(wLower.Body.Bytes())
+	if unified.Str(unified.Map(envUpper["data"])["content_id"]) != "1800000000000000001" ||
+		unified.Str(unified.Map(envLower["data"])["content_id"]) != "1800000000000000002" {
+		t.Fatalf("case-sensitive t.co responses cross-contaminated: upper=%v lower=%v", envUpper["data"], envLower["data"])
+	}
+	if wBadPort := doParse("https://t.co:8443/AbCd"); wBadPort.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-standard port https://t.co:8443/AbCd, got %d", wBadPort.Code)
 	}
 }
 

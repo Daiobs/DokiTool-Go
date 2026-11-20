@@ -17,9 +17,9 @@ DokiTool 是面向多平台的公开短视频、图集与实况照片无水印�
 | 皮皮虾（`pipixia`） | 视频 / 图片 | `pipix.com`（`h5.pipix.com/item/...`、`/ppx/item/...`） | 仅支持公开分享帖子 |
 | 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP 打包），失败回退手动打开源链接 |
 | 最右（`zuiyou`） | 视频 / 图片 | `izuiyou.com`、`share.xiaochuankeji.cn` | 线上关闭视频 `tbvideo` 改写，视频通过「打开源链接」手动保存；图片支持直下与打包 |
-| X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（含 `www.`、`mobile.`、`m.` 状态页及 `/photo/<N>`、`/video/<N>`） | 不支持 `t.co` 短链；纯文本推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需开启 `-x-tombstone-fallback=fxtwitter` 才查询公开回退源 |
+| X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（含 `www.`、`mobile.`、`m.` 状态页及 `/photo/<N>`、`/video/<N>`）、`t.co`（受控单跳展开至推文页） | `t.co` 未指向有效推文页时返回 `INVALID_INPUT`；纯文本推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需开启 `-x-tombstone-fallback=fxtwitter` 才查询公开回退源 |
 | YouTube（`youtube`） | 视频 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | 桌面端需安装并启用用户脚本 `DokiTool YouTube Helper`（`1.3.2`）取址与浏览器内无损合并；手机端无脚本管理器时暂不支持 |
-| Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.` 的 `/p/`、`/reel/`、`/reels/`、`/tv/`） | 不支持 `instagr.am` 短链（返回 `UNSUPPORTED_PLATFORM`）；不支持 Stories（`/stories/`）及私密或需登录帖（返回 `UPSTREAM_BLOCKED`） |
+| Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.`）、`instagr.am`（`www.`）的 `/p/`、`/reel/`、`/reels/`、`/tv/` | `instagr.am` 仅接受标准帖子/Reels/TV 短链路径；不支持 Stories（`/stories/`）及私密或需登录帖（返回 `UPSTREAM_BLOCKED`） |
 | Facebook（`facebook`） | 视频 | `facebook.com`、`www.facebook.com`、`m.facebook.com`、`fb.watch` | `fb.watch` 短链需登录展开，接口直接返回 `INVALID_INPUT` 提示先在浏览器打开并复制 `facebook.com` 完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
 | Tumblr（`tumblr`） | 视频 | `tumblr.com`、`www.tumblr.com`、`*.tumblr.com` | 仅支持公开视频帖（单帖最多提取 4 个视频条目） |
 
