@@ -2,9 +2,12 @@
 import {
   computed,
   defineAsyncComponent,
+  getCurrentScope,
   h,
   inject,
+  markRaw,
   ref,
+  shallowRef,
   onMounted,
   onUnmounted,
   watch,
@@ -16,15 +19,9 @@ import PlatformGrid from "./components/PlatformGrid.vue";
 import TutorialSection from "./components/TutorialSection.vue";
 import FaqSection from "./components/FaqSection.vue";
 import FooterSection from "./components/FooterSection.vue";
-import ToastContainer from "./components/ToastContainer.vue";
-import ProgressModal from "./components/ProgressModal.vue";
 import ParticlesCanvas from "./components/ParticlesCanvas.vue";
-import DownloadCard from "./components/DownloadCard.vue";
 import { useVideoParser } from "./composables/useVideoParser";
-import { useMediaDownload } from "./composables/useMediaDownload";
-import { useVideoSelection } from "./composables/useVideoSelection";
 import { refreshPlatformCatalog } from "./utils/platforms";
-import { cleanupLeftoverYouTubeOpfsTempFiles } from "./utils/youtubeHelperCore";
 import {
   homeInitialStateKey,
   isInAppBrowser,
@@ -79,7 +76,24 @@ const ResultSection = defineAsyncComponent({
   },
 });
 
+const ToastContainer = defineAsyncComponent(() =>
+  import("./components/ToastContainer.vue"),
+);
+const ProgressModal = defineAsyncComponent(() =>
+  import("./components/ProgressModal.vue"),
+);
+const loadDownloadCard = () => import("./components/DownloadCard.vue");
+const DownloadCard = defineAsyncComponent(loadDownloadCard);
+
 const videoStore = useVideoStore();
+const hasShownToast = ref(false);
+watch(
+  () => videoStore.toasts.length,
+  (len) => {
+    if (len > 0) hasShownToast.value = true;
+  },
+  { flush: "sync", immediate: true },
+);
 const isDark = ref(initialState.isDark);
 
 const isDownloading = computed(() =>
@@ -110,54 +124,9 @@ const {
 });
 inputUrl.value = initialState.inputUrl;
 
-// Start fetching the result UI alongside a valid parse request, not on the
-// initial visit and not only after the API has finished.
-watch(
-  () => parseButton.isLoading.value,
-  (loading) => {
-    if (loading) void loadResultSection().catch(() => {});
-  },
-  { flush: "sync" },
-);
-
-const selection = useVideoSelection({ videoStore });
-
-watch(
-  () => videoStore.resultVersion,
-  () => selection.syncResult(),
-  { flush: "sync" },
-);
-
 const showToast = (message, type = "success", duration = 3000) => {
   videoStore.addToast(message, type, duration);
 };
-
-const {
-  restoreDownloads,
-  downloadMainVideo,
-  downloadBackupVideo,
-  downloadYouTubeSeparate,
-  downloadVideoByIndex,
-  downloadSelected,
-  downloadAllVideos,
-  downloadVideosAsZip,
-  downloadAllMedia,
-  downloadMusic,
-  downloadLiveVideo,
-  downloadLiveCover,
-  downloadImage,
-  handleCancelDownload,
-  handleRetryDownload,
-  handleRefreshDownload,
-  handleQueryDownload,
-  handleBrowserDownload,
-  handleClearCompleted,
-} = useMediaDownload({
-  videoStore,
-  showToast,
-  selection,
-  resolveItem,
-});
 
 const resolveSelectedItem = async (item) => {
   if (!item?.resolve_url || videoStore.resolvingItems.has(item.id)) return;
@@ -174,11 +143,119 @@ const resolveSelectedItem = async (item) => {
       videoStore.setResolving(item.id, false);
   }
 };
+
+const appScope = getCurrentScope();
+const selectionRef = shallowRef(null);
+let selectionCtrl;
+let selectionPromise;
+const ensureVideoSelection = () => {
+  if (selectionCtrl) return Promise.resolve(selectionCtrl);
+  return (selectionPromise ??= import("./composables/useVideoSelection")
+    .then(({ useVideoSelection }) => {
+      if (!selectionCtrl) {
+        const init = () => {
+          const ctrl = markRaw(useVideoSelection({ videoStore }));
+          ctrl.syncResult();
+          watch(
+            () => ctrl.currentVideo.value,
+            (item) => {
+              if (item?.state === "deferred") void resolveSelectedItem(item);
+            },
+            { immediate: true },
+          );
+          return ctrl;
+        };
+        selectionCtrl = (appScope && appScope.run(init)) || init();
+        selectionRef.value = selectionCtrl;
+      }
+      return selectionCtrl;
+    })
+    .catch((error) => {
+      selectionPromise = undefined;
+      throw error;
+    }));
+};
+
+let downloadCtrl;
+let mediaDownloadPromise;
+const ensureMediaDownload = () => {
+  if (downloadCtrl) return Promise.resolve(downloadCtrl);
+  return (mediaDownloadPromise ??= Promise.all([
+    import("./composables/useMediaDownload"),
+    ensureVideoSelection(),
+  ])
+    .then(([{ useMediaDownload }, selection]) => {
+      downloadCtrl ??= useMediaDownload({
+        videoStore,
+        showToast,
+        selection,
+        resolveItem,
+      });
+      return downloadCtrl;
+    })
+    .catch((error) => {
+      mediaDownloadPromise = undefined;
+      throw error;
+    }));
+};
+
+const forwardDownloadAction =
+  (method) =>
+  (...args) => {
+    if (downloadCtrl) return downloadCtrl[method](...args);
+    return ensureMediaDownload().then((ctrl) => ctrl[method](...args));
+  };
+
+const downloadMainVideo = forwardDownloadAction("downloadMainVideo");
+const downloadBackupVideo = forwardDownloadAction("downloadBackupVideo");
+const downloadYouTubeSeparate = forwardDownloadAction(
+  "downloadYouTubeSeparate",
+);
+const downloadVideoByIndex = forwardDownloadAction("downloadVideoByIndex");
+const downloadSelected = forwardDownloadAction("downloadSelected");
+const downloadAllVideos = forwardDownloadAction("downloadAllVideos");
+const downloadVideosAsZip = forwardDownloadAction("downloadVideosAsZip");
+const downloadAllMedia = forwardDownloadAction("downloadAllMedia");
+const downloadMusic = forwardDownloadAction("downloadMusic");
+const downloadLiveVideo = forwardDownloadAction("downloadLiveVideo");
+const downloadLiveCover = forwardDownloadAction("downloadLiveCover");
+const downloadImage = forwardDownloadAction("downloadImage");
+const handleCancelDownload = forwardDownloadAction("handleCancelDownload");
+const handleRetryDownload = forwardDownloadAction("handleRetryDownload");
+const handleRefreshDownload = forwardDownloadAction("handleRefreshDownload");
+const handleQueryDownload = forwardDownloadAction("handleQueryDownload");
+const handleBrowserDownload = forwardDownloadAction("handleBrowserDownload");
+const handleClearCompleted = forwardDownloadAction("handleClearCompleted");
+
+// Start fetching the result UI and media download controller alongside a valid
+// parse request, not on the initial visit and not only after the API finishes.
 watch(
-  () => selection.currentVideo.value,
-  (item) => {
-    if (item?.state === "deferred") void resolveSelectedItem(item);
+  () => parseButton.isLoading.value,
+  (loading) => {
+    if (loading) {
+      void loadResultSection().catch(() => {});
+      void loadDownloadCard().catch(() => {});
+      void ensureVideoSelection().catch(() => {});
+      void ensureMediaDownload().catch(() => {});
+    }
   },
+  { flush: "sync" },
+);
+
+watch(
+  () => videoStore.resultVersion,
+  () => {
+    if (selectionCtrl) {
+      selectionCtrl.syncResult();
+    } else if (videoStore.resultData) {
+      void ensureVideoSelection().catch(() => {});
+    }
+    if (videoStore.resultData) {
+      void loadDownloadCard().catch(() => {});
+      void ensureMediaDownload().catch(() => {});
+    }
+  },
+  { flush: "sync" },
 );
 
 const copyUrl = async (url) => {
@@ -199,7 +276,12 @@ const downloadAllImages = () => downloadAllMedia("images");
 const downloadAllLivePhotos = () => downloadAllMedia("live");
 const downloadAllLiveCovers = () => downloadAllMedia("covers");
 
-const switchVideo = (choice) => selection.choose(choice);
+const switchVideo = (choice) => selectionCtrl?.choose(choice);
+const selectVideo = (index) => selectionCtrl?.selectIndex(index);
+const toggleVideo = (index) => selectionCtrl?.toggleSelect(index);
+const selectAllVideos = () => selectionCtrl?.selectAll();
+const clearSelection = () => selectionCtrl?.clearSelection();
+const selectCollection = (index) => selectionCtrl?.setSection(index);
 const promptSelectQuality = () => {
   showToast(
     locale.value === "en"
@@ -252,8 +334,31 @@ const onVisibilityOrFocus = () => {
 
 onMounted(() => {
   void refreshPlatformCatalog();
-  void restoreDownloads();
-  void cleanupLeftoverYouTubeOpfsTempFiles().catch(() => {});
+  let hasSavedDownloads = false;
+  try {
+    hasSavedDownloads = Boolean(
+      typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem("dokitool-downloads-v1"),
+    );
+  } catch {
+    hasSavedDownloads = false;
+  }
+  if (hasSavedDownloads) {
+    void loadDownloadCard().catch(() => {});
+    void ensureMediaDownload()
+      .then((ctrl) => ctrl.restoreDownloads())
+      .catch(() => {});
+  }
+  if (
+    typeof navigator !== "undefined" &&
+    typeof navigator.storage?.getDirectory === "function"
+  ) {
+    void import("./utils/youtubeHelperCore")
+      .then(({ cleanupLeftoverYouTubeOpfsTempFiles }) =>
+        cleanupLeftoverYouTubeOpfsTempFiles(),
+      )
+      .catch(() => {});
+  }
   // Static HTML and the first client render use the same language and controls.
   // Restore preferences only after hydration; the head bootstrap already applied
   // the background theme before CSS, without mutating the hydrated subtree.
@@ -279,11 +384,12 @@ onUnmounted(() => {
 <template>
   <div class="min-h-screen">
     <ParticlesCanvas />
-    <ToastContainer />
+    <ToastContainer v-if="hasShownToast" />
     <!-- Body teleports are created after hydration; the static page has no
          teleport targets, so Vue must not hydrate them against body content. -->
-    <ProgressModal v-if="isReady" />
+    <ProgressModal v-if="isReady && videoStore.showProgress" />
     <DownloadCard
+      v-if="videoStore.downloads.length > 0"
       :downloads="videoStore.downloads"
       @cancel="handleCancelDownload"
       @retry="handleRetryDownload"
@@ -328,13 +434,13 @@ onUnmounted(() => {
       />
 
       <ResultSection
-        v-if="videoStore.resultData"
+        v-if="videoStore.resultData && selectionRef"
         :result-data="videoStore.resultData"
         :result-version="videoStore.resultVersion"
         :is-downloading="isDownloading"
         :needs-manual-helper-refresh="needsManualHelperRefresh"
         :locale="locale"
-        :selection="selection"
+        :selection="selectionRef"
         :format-number="formatNumber"
         :format-duration="formatDuration"
         :resolving-ids="videoStore.resolvingItems"
@@ -355,11 +461,11 @@ onUnmounted(() => {
         @download-all-live-covers="downloadAllLiveCovers"
         @copy-url="copyUrl"
         @switch-video="switchVideo"
-        @select-video="selection.selectIndex"
-        @toggle-video="selection.toggleSelect"
-        @select-all-videos="selection.selectAll"
-        @clear-selection="selection.clearSelection"
-        @select-collection="selection.setSection"
+        @select-video="selectVideo"
+        @toggle-video="toggleVideo"
+        @select-all-videos="selectAllVideos"
+        @clear-selection="clearSelection"
+        @select-collection="selectCollection"
         @download-index="downloadVideoByIndex"
         @download-selected="downloadSelected"
         @download-all-videos="downloadAllVideos"

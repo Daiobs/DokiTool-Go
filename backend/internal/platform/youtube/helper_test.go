@@ -35,7 +35,7 @@ func resolveTestDenoBinary(t *testing.T) string {
 	if p, err := exec.LookPath("deno"); err == nil && p != "" {
 		return p
 	}
-	t.Fatal("deno v2.9.8 binary not found in DOKITOOL_DENO_BINARY or PATH")
+	t.Fatalf("deno v%s binary not found in DOKITOOL_DENO_BINARY or PATH", PinnedDenoVersion)
 	return ""
 }
 
@@ -82,7 +82,7 @@ func TestEJSSandboxVerification(t *testing.T) {
 
 	// Tampered deno binary must fail verification.
 	fakeDeno := filepath.Join(badDir, "deno")
-	if err := os.WriteFile(fakeDeno, []byte("#!/bin/sh\necho deno 2.9.8\n"), 0o755); err != nil {
+	if err := os.WriteFile(fakeDeno, []byte("#!/bin/sh\necho deno "+PinnedDenoVersion+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewEJSSandbox(SandboxConfig{

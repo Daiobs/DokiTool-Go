@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { transformWithEsbuild } from 'vite';
-import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, h, markRaw, nextTick, reactive, ref } from 'vue';
 import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
 const require = createRequire(import.meta.url);
 let labels, contract, useVideoSelection, ResultSection;
@@ -24,18 +24,15 @@ before(async () => {
   modules['../utils/youtubeHelperCore'] = youtubeHelperCore;
   modules['../services/apiConfig'] = { apiConfig: { baseUrl: '' } };
   ({ useVideoSelection } = await load('../src/composables/useVideoSelection.ts'));
-  const content = await readFile(new URL('../src/components/ResultSection.vue', import.meta.url), 'utf8');
-  const { descriptor } = parse(content);
-  const script = compileScript(descriptor, { id: 'media-sources', inlineTemplate: true,
-    templateOptions: { compilerOptions: { hoistStatic: false } } });
-  const compiled = await transformWithEsbuild(script.content, 'ResultSection.js', { loader: 'js', format: 'cjs' });
-  const module = { exports: {} };
-  new Function('require', 'module', 'exports', compiled.code)(id => {
-    if (id === './VideoPlaylist.vue') return { __esModule: true, default: { render: () => null } };
-    if (id === './AppIcon.vue') return { __esModule: true, default: { render: () => h('i') } };
-    return modules[id] || require(id);
-  }, module, module.exports);
-  ResultSection = module.exports.default;
+  ResultSection = await loadSfc(
+    new URL('../src/components/ResultSection.vue', import.meta.url),
+    {
+      modules: {
+        ...modules,
+        './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
+      },
+    },
+  );
   globalThis.window = { addEventListener() {}, removeEventListener() {} };
   globalThis.document = { body: { style: {} } };
 });

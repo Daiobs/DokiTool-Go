@@ -12,6 +12,7 @@ import { parse, compileScript } from '@vue/compiler-sfc';
 import { ref, computed, h, createSSRApp, createRenderer, nextTick, markRaw } from 'vue';
 import { renderToString } from '@vue/server-renderer';
 import JSZip from 'jszip';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
 let vite, downloads, ResultSection, HeroSection, PlatformGrid, DownloadCard, platforms, parser, mediaSources, mediaContract, selectionModule, configuration, youtubeHelperCore;
 let clicked, blobs, fetched, nativeFrames;
@@ -44,6 +45,9 @@ before(async () => {
   await vite.ssrLoadModule('/src/downloads/manager.ts');
   await vite.ssrLoadModule('/src/downloads/routeProbe.ts');
   await vite.ssrLoadModule('/src/utils/segmentDownload.ts');
+  await vite.ssrLoadModule('/src/services/tbvideo.ts');
+  await vite.ssrLoadModule('/src/services/secureApiClient.ts');
+  await vite.ssrLoadModule('/src/utils/parseHelpers.ts');
   ResultSection = (await vite.ssrLoadModule('/src/components/ResultSection.vue')).default;
   HeroSection = (await vite.ssrLoadModule('/src/components/HeroSection.vue')).default;
   PlatformGrid = (await vite.ssrLoadModule('/src/components/PlatformGrid.vue')).default;
@@ -244,17 +248,17 @@ test('checkbox change toggles once and checkbox key events do not select the epi
 });
 
 async function mountResultPlayer(data, locale = 'zh-CN') {
-  const source = await readFile(new URL('../src/components/ResultSection.vue', import.meta.url), 'utf8');
-  const { descriptor } = parse(source);
-  const script = compileScript(descriptor, { id: 'media-error-test', inlineTemplate: true,
-    templateOptions: { compilerOptions: { hoistStatic: false } } });
-  const code = await transformWithEsbuild(script.content, 'ResultSection.js', { loader: 'js', format: 'cjs' });
-  const module = { exports: {} }, require = createRequire(import.meta.url);
-  new Function('require', 'module', 'exports', code.code)(
-    (id) => id === './VideoPlaylist.vue' ? { __esModule: true, default: { render: () => null } }
-      : id === './AppIcon.vue' ? { __esModule: true, default: { render: () => h('i') } }
-      : id === '../utils/mediaSources' ? mediaSources : id === '../utils/mediaContract' ? mediaContract : id === '../utils/youtubeHelperCore' ? youtubeHelperCore : id === '../services/apiConfig' ? configuration : require(id),
-    module, module.exports,
+  const CompiledResultSection = await loadSfc(
+    new URL('../src/components/ResultSection.vue', import.meta.url),
+    {
+      modules: {
+        './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
+        '../utils/mediaSources': mediaSources,
+        '../utils/mediaContract': mediaContract,
+        '../utils/youtubeHelperCore': youtubeHelperCore,
+        '../services/apiConfig': configuration,
+      },
+    },
   );
   const element = (type, text = '') => markRaw({ type, text, props: {}, children: [], parent: null, style: {}, removeAttribute() {} });
   const portal = element('portal');
@@ -275,7 +279,7 @@ async function mountResultPlayer(data, locale = 'zh-CN') {
   const state = ref(resultProps(data,locale));
   state.value.onSwitchVideo = choice => state.value.selection.choose(choice);
   const root = element('root');
-  const app = renderer.createApp({ render: () => h(module.exports.default, state.value) });
+  const app = renderer.createApp({ render: () => h(CompiledResultSection, state.value) });
   app.mount(root); await nextTick();
   const find = (node, match) => match(node) ? node : node.children.map((child) => find(child, match)).find(Boolean);
   return { state, app, player: () => find(root, (node) => node.type === 'video'),
@@ -3268,6 +3272,11 @@ test('#91 PR1 item 3: 5-item batch archive hitting 429 on items 4 & 5 shows wait
 
   const archivePromise = dl.downloadVideosAsZip(store.resultData.items);
   for (let tick = 0; tick < 20; tick++) {
+    for (let m = 0; m < 200; m++) {
+      await new Promise(r => setImmediate(r));
+      const cur = store.downloads[0];
+      if (cur?.status === 'completed' || cur?.status === 'failed' || cur?.statusText?.includes('秒')) break;
+    }
     for (let m = 0; m < 4; m++) await new Promise(r => setImmediate(r));
     if (store.downloads[0]?.status === 'completed' || store.downloads[0]?.status === 'failed') break;
     // Render DownloadCard while waiting to confirm wait seconds render on the panel
@@ -3322,7 +3331,7 @@ test('#91 PR1 item 5: App.vue renders top open-in-system-browser banner only for
     inlineTemplate: true,
     templateOptions: { compilerOptions: { hoistStatic: false } },
   });
-  const compiled = await transformWithEsbuild(script.content, 'App.js', { loader: 'js', format: 'cjs' });
+  const compiled = await transformWithEsbuild(script.content, 'App.js', { loader: 'js', format: 'cjs', supported: { 'dynamic-import': false } });
   const mod = { exports: {} };
   const req = createRequire(import.meta.url);
   const stubComponent = { __esModule: true, default: { render: () => vueMod.h('div') } };
@@ -3428,6 +3437,233 @@ test('#91 PR1 item 5: App.vue renders top open-in-system-browser banner only for
   } finally {
     if (prevNav) Object.defineProperty(globalThis, 'navigator', prevNav);
     else delete globalThis.navigator;
+  }
+});
+
+test('App.vue lazy-loads youtubeHelperCore, useMediaDownload, and DownloadCard while preserving synchronous userActivation once initialized', async () => {
+  const vueMod = await import('vue');
+  const { createPinia, setActivePinia } = await import('pinia');
+  const storeMod = await vite.ssrLoadModule('/src/stores/video.ts');
+  const stateMod = await vite.ssrLoadModule('/src/ssr/initialState.ts');
+  const appSource = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8');
+  const { descriptor } = parse(appSource);
+  const script = compileScript(descriptor, {
+    id: 'app-lazy-budget-test',
+    inlineTemplate: true,
+    templateOptions: { compilerOptions: { hoistStatic: false } },
+  });
+  const compiled = await transformWithEsbuild(script.content, 'App.js', { loader: 'js', format: 'cjs', supported: { 'dynamic-import': false } });
+  const req = createRequire(import.meta.url);
+
+  function buildApp(hooks) {
+    const mod = { exports: {} };
+    const stubComponent = { __esModule: true, default: { render: () => vueMod.h('div') } };
+    const resultStub = {
+      __esModule: true,
+      default: {
+        props: ['resultData', 'selection'],
+        emits: ['download-main'],
+        setup(_props, { emit }) {
+          hooks.triggerDownloadMain = () => emit('download-main');
+          return () => vueMod.h('div', { 'data-result-stub': 'true' });
+        },
+      },
+    };
+    const cardStub = {
+      __esModule: true,
+      default: {
+        props: ['downloads'],
+        emits: ['handoff'],
+        setup(_props, { emit }) {
+          hooks.triggerHandoff = (id) => emit('handoff', id);
+          return () => vueMod.h('div', { 'data-download-card-stub': 'true' });
+        },
+      },
+    };
+    new Function('require', 'module', 'exports', compiled.code)((id) => {
+      hooks.loaded.push(id);
+      if (id === 'vue') return vueMod;
+      if (id === './components/ResultSection.vue') return resultStub;
+      if (id === './components/DownloadCard.vue') return cardStub;
+      if (id.startsWith('./components/')) return stubComponent;
+      if (id === './stores/video') return storeMod;
+      if (id === './composables/useVideoParser') return parser;
+      if (id === './composables/useVideoSelection') return selectionModule;
+      if (id === './composables/useMediaDownload') {
+        return {
+          __esModule: true,
+          useMediaDownload: () => hooks.mediaDownloadFactory(),
+        };
+      }
+      if (id === './utils/platforms') return platforms;
+      if (id === './utils/youtubeHelperCore') {
+        return {
+          __esModule: true,
+          cleanupLeftoverYouTubeOpfsTempFiles: () => hooks.cleanupOpfs(),
+        };
+      }
+      if (id === './ssr/initialState') return stateMod;
+      return req(id);
+    }, mod, mod.exports);
+    return mod.exports.default;
+  }
+
+  const prevNav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const prevSession = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  const prevDocEl = globalThis.document.documentElement;
+  const prevWin = globalThis.window;
+
+  const makeRenderer = () => {
+    const element = (type, text = '') => vueMod.markRaw({
+      type, text, props: {}, children: [], parent: null, style: {}, width: 0, height: 0,
+      getContext: () => ({ clearRect() {}, beginPath() {}, arc() {}, fill() {} }),
+      removeAttribute() {},
+    });
+    const portal = element('portal');
+    const detach = (n) => { if (n.parent) n.parent.children = n.parent.children.filter(c => c !== n); n.parent = null; };
+    const renderer = vueMod.createRenderer({
+      querySelector: () => portal,
+      createElement: element,
+      createText: (txt) => element('#text', txt),
+      createComment: (txt) => element('#comment', txt),
+      setText(n, txt) { n.text = txt; },
+      setElementText(n, txt) { n.text = txt; n.children = []; },
+      parentNode: (n) => n.parent,
+      nextSibling: () => null,
+      insert(n, parent) { detach(n); n.parent = parent; parent.children.push(n); },
+      remove: detach,
+      patchProp(n, k, _, v) { n.props[k] = v; },
+    });
+    return { element, renderer };
+  };
+
+  try {
+    globalThis.fetch = async () => Response.json({ schema_version: '1.0', code: 'OK', data: { platforms: [] } });
+    globalThis.document.documentElement = { lang: 'zh-CN', style: {}, classList: { toggle() {} } };
+    globalThis.window = {
+      ...prevWin,
+      innerWidth: 1280,
+      innerHeight: 800,
+      matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+      requestAnimationFrame: () => 1,
+      cancelAnimationFrame() {},
+      addEventListener() {},
+      removeEventListener() {},
+      localStorage: { getItem: () => null, setItem() {} },
+    };
+
+    // 1) Initial visit with throwing sessionStorage and no OPFS getDirectory loads none of the 3 lazy modules
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 Chrome/126.0.0.0', language: 'zh-CN' },
+    });
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      value: { getItem() { throw new Error('SecurityError'); } },
+    });
+    const hooksCold = {
+      loaded: [],
+      cleanupOpfs: async () => 0,
+      mediaDownloadFactory: () => ({}),
+    };
+    const ColdApp = buildApp(hooksCold);
+    const { element: coldEl, renderer: coldRenderer } = makeRenderer();
+    const coldRoot = coldEl('root');
+    const coldApp = coldRenderer.createApp(ColdApp);
+    const coldPinia = createPinia();
+    setActivePinia(coldPinia);
+    coldApp.use(coldPinia);
+    coldApp.mount(coldRoot);
+    await vueMod.nextTick();
+    await new Promise(r => setTimeout(r, 5));
+    assert.equal(hooksCold.loaded.includes('./composables/useMediaDownload'), false);
+    assert.equal(hooksCold.loaded.includes('./utils/youtubeHelperCore'), false);
+    assert.equal(hooksCold.loaded.includes('./components/DownloadCard.vue'), false);
+    storeMod.useVideoStore(coldPinia).setResult(fixture(base));
+    await vueMod.nextTick();
+    await new Promise(r => setTimeout(r, 5));
+    assert.equal(hooksCold.loaded.includes('./components/DownloadCard.vue'), true);
+    coldApp.unmount();
+
+    // 2) Saved downloads + OPFS support loads both modules cleanly and preserves synchronous userActivation on callbacks
+    let restoreCalls = 0;
+    let opfsCalls = 0;
+    let activationActive = false;
+    const syncActivations = [];
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        userAgent: 'Mozilla/5.0 Chrome/126.0.0.0',
+        language: 'zh-CN',
+        storage: { getDirectory: async () => ({}) },
+        get userActivation() { return { isActive: activationActive }; },
+      },
+    });
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      value: { getItem: (k) => (k === 'dokitool-downloads-v1' ? '[{"id":"1"}]' : null) },
+    });
+    const noop = () => {};
+    const hooksWarm = {
+      loaded: [],
+      cleanupOpfs: async () => { opfsCalls++; throw new Error('opfs denied'); },
+      mediaDownloadFactory: () => ({
+        restoreDownloads: async () => { restoreCalls++; },
+        downloadMainVideo: () => { syncActivations.push(['main', globalThis.navigator.userActivation.isActive]); },
+        downloadBackupVideo: noop,
+        downloadYouTubeSeparate: noop,
+        downloadVideoByIndex: noop,
+        downloadSelected: noop,
+        downloadAllVideos: noop,
+        downloadVideosAsZip: noop,
+        downloadAllMedia: noop,
+        downloadMusic: noop,
+        downloadLiveVideo: noop,
+        downloadLiveCover: noop,
+        downloadImage: noop,
+        handleCancelDownload: noop,
+        handleRetryDownload: noop,
+        handleRefreshDownload: noop,
+        handleQueryDownload: noop,
+        handleBrowserDownload: (id) => { syncActivations.push([`handoff:${id}`, globalThis.navigator.userActivation.isActive]); },
+        handleClearCompleted: noop,
+      }),
+    };
+    const WarmApp = buildApp(hooksWarm);
+    const { element: warmEl, renderer: warmRenderer } = makeRenderer();
+    const warmRoot = warmEl('root');
+    const warmApp = warmRenderer.createApp(WarmApp);
+    const warmPinia = createPinia();
+    setActivePinia(warmPinia);
+    warmApp.use(warmPinia);
+    warmApp.mount(warmRoot);
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(restoreCalls, 1);
+    assert.equal(opfsCalls, 1);
+
+    const store = storeMod.useVideoStore(warmPinia);
+    store.setResult(fixture(base));
+    store.addDownload({ filename: 'manual.mp4', status: 'manual', url: 'https://media.test/manual.mp4', nativeAvailable: true });
+    await new Promise(r => setTimeout(r, 10));
+    await vueMod.nextTick();
+
+    // Simulate transient user gesture that expires immediately after synchronous call stack unwinds
+    activationActive = true;
+    hooksWarm.triggerDownloadMain();
+    hooksWarm.triggerHandoff(store.downloads[0].id);
+    activationActive = false;
+    assert.deepEqual(syncActivations, [
+      ['main', true],
+      [`handoff:${store.downloads[0].id}`, true],
+    ]);
+    warmApp.unmount();
+  } finally {
+    globalThis.window = prevWin;
+    globalThis.document.documentElement = prevDocEl;
+    if (prevNav) Object.defineProperty(globalThis, 'navigator', prevNav);
+    else delete globalThis.navigator;
+    if (prevSession) Object.defineProperty(globalThis, 'sessionStorage', prevSession);
+    else delete globalThis.sessionStorage;
   }
 });
 

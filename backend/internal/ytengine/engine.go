@@ -41,9 +41,9 @@ const (
 
 var staleTempCleanupOnce sync.Once
 
-// OfficialSHA256Sums20261026 contains the official SHA2-256SUMS for yt-dlp 2026.10.26:
-// https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/SHA2-256SUMS
-var OfficialSHA256Sums20261026 = map[string]string{
+// OfficialSHA256Sums contains the official SHA2-256SUMS for PinnedVersion
+// (https://github.com/yt-dlp/yt-dlp/releases/download/<PinnedVersion>/SHA2-256SUMS).
+var OfficialSHA256Sums = map[string]string{
 	"e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3": "yt-dlp",
 	"767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795": "yt-dlp_linux",
 	"e87e9533e89fe5889abaa21f5114dfe7756d6aa6219b83551add04d48b18e483": "yt-dlp_linux_aarch64",
@@ -265,7 +265,7 @@ func NewDisabled(reason string) *Engine {
 }
 
 // VerifyBinary verifies that binaryPath is a regular executable file whose SHA-256
-// matches one of the allowed digests (defaulting to OfficialSHA256Sums20261026).
+// matches one of the allowed digests (defaulting to OfficialSHA256Sums).
 func VerifyBinary(binaryPath string, allowedHashes map[string]string) (string, string, string, error) {
 	trimmed := strings.TrimSpace(binaryPath)
 	if trimmed == "" {
@@ -299,7 +299,7 @@ func VerifyBinary(binaryPath string, allowedHashes map[string]string) (string, s
 
 	hashes := allowedHashes
 	if len(hashes) == 0 {
-		hashes = OfficialSHA256Sums20261026
+		hashes = OfficialSHA256Sums
 	}
 	asset, ok := hashes[strings.ToLower(digest)]
 	if !ok {
@@ -522,7 +522,7 @@ func NewFromEnv(getenv func(string) string, allowedURL func(string) bool) (*Engi
 	return New(Config{
 		GatePorts:      gatePorts,
 		BinaryPath:     getenv("DOKITOOL_YTDLP_BINARY"),
-		AllowedHashes:  OfficialSHA256Sums20261026,
+		AllowedHashes:  OfficialSHA256Sums,
 		AllowedURL:     allowedURL,
 		Resolver:       net.DefaultResolver,
 		MaxConcurrency: concurrency,

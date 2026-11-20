@@ -32,6 +32,7 @@ import (
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/zuiyou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
@@ -116,13 +117,13 @@ func TestYTDLPXConfiguration(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	hexSum := hex.EncodeToString(sum[:])
 
-	origAsset, hadOrig := ytengine.OfficialSHA256Sums20261026[hexSum]
-	ytengine.OfficialSHA256Sums20261026[hexSum] = "yt-dlp-cmd-test"
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-cmd-test"
 	defer func() {
 		if hadOrig {
-			ytengine.OfficialSHA256Sums20261026[hexSum] = origAsset
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
 		} else {
-			delete(ytengine.OfficialSHA256Sums20261026, hexSum)
+			delete(ytengine.OfficialSHA256Sums, hexSum)
 		}
 	}()
 
@@ -244,7 +245,7 @@ func TestYouTubeHelperConfiguration(t *testing.T) {
 	if denoBin == "" {
 		p, err := exec.LookPath("deno")
 		if err != nil || p == "" {
-			t.Fatal("deno v2.9.8 binary not found in DOKITOOL_DENO_BINARY or PATH")
+			t.Fatalf("deno v%s binary not found in DOKITOOL_DENO_BINARY or PATH", youtube.PinnedDenoVersion)
 		}
 		denoBin = p
 	}
@@ -331,13 +332,13 @@ func TestYTDLPSitesConfiguration(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	hexSum := hex.EncodeToString(sum[:])
 
-	origAsset, hadOrig := ytengine.OfficialSHA256Sums20261026[hexSum]
-	ytengine.OfficialSHA256Sums20261026[hexSum] = "yt-dlp-sites-cmd-test"
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-sites-cmd-test"
 	defer func() {
 		if hadOrig {
-			ytengine.OfficialSHA256Sums20261026[hexSum] = origAsset
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
 		} else {
-			delete(ytengine.OfficialSHA256Sums20261026, hexSum)
+			delete(ytengine.OfficialSHA256Sums, hexSum)
 		}
 	}()
 
@@ -478,13 +479,13 @@ func TestXTombstoneFallbackFlagAndConfiguration(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	hexSum := hex.EncodeToString(sum[:])
 
-	origAsset, hadOrig := ytengine.OfficialSHA256Sums20261026[hexSum]
-	ytengine.OfficialSHA256Sums20261026[hexSum] = "yt-dlp-tombstone-cmd-test"
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-tombstone-cmd-test"
 	defer func() {
 		if hadOrig {
-			ytengine.OfficialSHA256Sums20261026[hexSum] = origAsset
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
 		} else {
-			delete(ytengine.OfficialSHA256Sums20261026, hexSum)
+			delete(ytengine.OfficialSHA256Sums, hexSum)
 		}
 	}()
 
@@ -867,13 +868,13 @@ func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	hexSum := hex.EncodeToString(sum[:])
 
-	origAsset, hadOrig := ytengine.OfficialSHA256Sums20261026[hexSum]
-	ytengine.OfficialSHA256Sums20261026[hexSum] = "yt-dlp-stats-wire-test"
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-stats-wire-test"
 	defer func() {
 		if hadOrig {
-			ytengine.OfficialSHA256Sums20261026[hexSum] = origAsset
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
 		} else {
-			delete(ytengine.OfficialSHA256Sums20261026, hexSum)
+			delete(ytengine.OfficialSHA256Sums, hexSum)
 		}
 	}()
 

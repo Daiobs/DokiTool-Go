@@ -671,30 +671,100 @@ type parsedStreamEntry struct {
 	sigParam   string
 }
 
+type decodedFinalizeRequest struct {
+	videoID         string
+	playerID        string
+	title           string
+	author          string
+	duration        *float64
+	thumbnail       string
+	formats         []finalizeFormatInput
+	adaptiveFormats []finalizeFormatInput
+}
+
 // Finalize implements POST /api/youtube/finalize?schema_version=1.0.
 // It never makes any network request to googlevideo.com.
 func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified.Object, int) {
 	if h == nil || h.sandbox == nil {
 		return unified.ContractError("SERVICE_NOT_CONFIGURED", "YouTube 助手服务尚未配置", false), http.StatusServiceUnavailable
 	}
+	decoded, errPayload, errStatus := decodeFinalizeRequest(body)
+	if errPayload != nil {
+		return errPayload, errStatus
+	}
+
+	nowTime := h.now()
+	cachedPlayer, ok := h.lookupCachedPlayer(decoded.playerID, nowTime)
+	if !ok {
+		return unified.ContractError("INVALID_INPUT", "player_id 不在缓存中或已过期，请重新获取上下文", false), http.StatusBadRequest
+	}
+
+	totalEntries := len(decoded.formats) + len(decoded.adaptiveFormats)
+	if totalEntries == 0 || totalEntries > MaxFinalizeFormatEntries {
+		return unified.ContractError("INVALID_INPUT", "媒体流条目数量超出限制", false), http.StatusBadRequest
+	}
+	allInputs := make([]finalizeFormatInput, 0, totalEntries)
+	allInputs = append(allInputs, decoded.formats...)
+	allInputs = append(allInputs, decoded.adaptiveFormats...)
+
+	validatedEntries, errPayload, errStatus := validateFinalizeStreamEntries(allInputs, decoded.videoID)
+	if errPayload != nil {
+		return errPayload, errStatus
+	}
+
+	entries := filterMultiAudioStreamEntries(validatedEntries)
+	nChallenges, sigChallenges := collectFinalizeChallenges(entries)
+	nSolved, sigSolved, err := h.sandbox.Solve(ctx, cachedPlayer.PreprocessedPlayerJS, nChallenges, sigChallenges)
+	if err != nil {
+		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube 媒体签名挑战解密失败", false), http.StatusBadGateway
+	}
+
+	ytFormats, errPayload, errStatus := applySolvedChallengesToFormats(entries, nSolved, sigSolved)
+	if errPayload != nil {
+		return errPayload, errStatus
+	}
+
+	canonicalWatchURL := "https://www.youtube.com/watch?v=" + decoded.videoID
+	info := &ytengine.Info{
+		ID:         decoded.videoID,
+		Title:      decoded.title,
+		Uploader:   decoded.author,
+		Duration:   decoded.duration,
+		Thumbnail:  decoded.thumbnail,
+		WebpageURL: canonicalWatchURL,
+		Formats:    ytFormats,
+	}
+	opts := ytengine.AdaptOptions{
+		PlatformID:      "youtube",
+		ContentID:       decoded.videoID,
+		SourceURL:       canonicalWatchURL,
+		MaxEntries:      1,
+		AllowedMediaURL: AllowedMediaURL,
+		EnableDASHMux:   true,
+		EnableHLS:       false,
+	}
+	return buildFinalizeEnvelope(info, opts, nowTime.Unix(), debug)
+}
+
+func decodeFinalizeRequest(body []byte) (*decodedFinalizeRequest, unified.Object, int) {
 	if len(body) == 0 || len(body) > MaxFinalizeBodyBytes {
-		return unified.ContractError("INVALID_INPUT", "请求体大小超出限制或为空", false), http.StatusBadRequest
+		return nil, unified.ContractError("INVALID_INPUT", "请求体大小超出限制或为空", false), http.StatusBadRequest
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	var req finalizeRequest
 	if err := dec.Decode(&req); err != nil {
-		return unified.ContractError("INVALID_INPUT", "请求体格式无效或包含未允许的字段", false), http.StatusBadRequest
+		return nil, unified.ContractError("INVALID_INPUT", "请求体格式无效或包含未允许的字段", false), http.StatusBadRequest
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return unified.ContractError("INVALID_INPUT", "请求体包含多余的 JSON 数据", false), http.StatusBadRequest
+		return nil, unified.ContractError("INVALID_INPUT", "请求体包含多余的 JSON 数据", false), http.StatusBadRequest
 	}
 
 	videoID := strings.TrimSpace(req.VideoID)
 	if !youtubeIDPattern.MatchString(videoID) {
-		return unified.ContractError("INVALID_INPUT", "无效的 YouTube video_id", false), http.StatusBadRequest
+		return nil, unified.ContractError("INVALID_INPUT", "无效的 YouTube video_id", false), http.StatusBadRequest
 	}
 
 	resolvedTitle := videoID
@@ -719,64 +789,66 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		}
 	}
 
-	nowTime := h.now()
-	cachedPlayer, ok := h.lookupCachedPlayer(req.PlayerID, nowTime)
-	if !ok {
-		return unified.ContractError("INVALID_INPUT", "player_id 不在缓存中或已过期，请重新获取上下文", false), http.StatusBadRequest
+	return &decodedFinalizeRequest{
+		videoID:         videoID,
+		playerID:        req.PlayerID,
+		title:           resolvedTitle,
+		author:          resolvedAuthor,
+		duration:        resolvedDuration,
+		thumbnail:       resolvedThumbnail,
+		formats:         req.Formats,
+		adaptiveFormats: req.AdaptiveFormats,
+	}, nil, 0
+}
+
+func resolveFinalizeStreamURL(item finalizeFormatInput) (streamURL, sigChallenge, sigParam string, errPayload unified.Object) {
+	hasURL := item.URL != ""
+	hasCipher := item.SignatureCipher != ""
+	if hasURL == hasCipher {
+		return "", "", "", unified.ContractError("INVALID_INPUT", "媒体流条目必须且只能提供 url 或 signatureCipher 之一", false)
+	}
+	if !hasCipher {
+		return item.URL, "", "sig", nil
 	}
 
-	totalEntries := len(req.Formats) + len(req.AdaptiveFormats)
-	if totalEntries == 0 || totalEntries > MaxFinalizeFormatEntries {
-		return unified.ContractError("INVALID_INPUT", "媒体流条目数量超出限制", false), http.StatusBadRequest
+	cipherVals, err := url.ParseQuery(item.SignatureCipher)
+	if err != nil {
+		return "", "", "", unified.ContractError("INVALID_INPUT", "signatureCipher 格式无效", false)
 	}
+	urls := cipherVals["url"]
+	sigs := cipherVals["s"]
+	if len(urls) != 1 || strings.TrimSpace(urls[0]) == "" || len(sigs) != 1 || strings.TrimSpace(sigs[0]) == "" {
+		return "", "", "", unified.ContractError("INVALID_INPUT", "signatureCipher 缺少有效的 url 或 s 参数", false)
+	}
+	sigParam = "sig"
+	if spVals := cipherVals["sp"]; len(spVals) > 0 {
+		if len(spVals) != 1 || (spVals[0] != "sig" && spVals[0] != "signature") {
+			return "", "", "", unified.ContractError("INVALID_INPUT", "signatureCipher 包含非法的 sp 参数", false)
+		}
+		sigParam = spVals[0]
+	}
+	return strings.TrimSpace(urls[0]), strings.TrimSpace(sigs[0]), sigParam, nil
+}
 
-	allInputs := make([]finalizeFormatInput, 0, totalEntries)
-	allInputs = append(allInputs, req.Formats...)
-	allInputs = append(allInputs, req.AdaptiveFormats...)
-
-	validatedEntries := make([]parsedStreamEntry, 0, totalEntries)
+func validateFinalizeStreamEntries(allInputs []finalizeFormatInput, videoID string) ([]parsedStreamEntry, unified.Object, int) {
+	validatedEntries := make([]parsedStreamEntry, 0, len(allInputs))
 	expectedStreamID := ""
 
 	for _, item := range allInputs {
 		if item.Itag <= 0 || item.MimeType == "" {
-			return unified.ContractError("INVALID_INPUT", "媒体流条目缺少有效的 itag 或 mimeType", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体流条目缺少有效的 itag 或 mimeType", false), http.StatusBadRequest
 		}
-		hasURL := item.URL != ""
-		hasCipher := item.SignatureCipher != ""
-		if hasURL == hasCipher {
-			return unified.ContractError("INVALID_INPUT", "媒体流条目必须且只能提供 url 或 signatureCipher 之一", false), http.StatusBadRequest
+		streamURL, sigChallenge, sigParam, errPayload := resolveFinalizeStreamURL(item)
+		if errPayload != nil {
+			return nil, errPayload, http.StatusBadRequest
 		}
-
-		streamURL := item.URL
-		sigChallenge := ""
-		sigParam := "sig"
-		if hasCipher {
-			cipherVals, err := url.ParseQuery(item.SignatureCipher)
-			if err != nil {
-				return unified.ContractError("INVALID_INPUT", "signatureCipher 格式无效", false), http.StatusBadRequest
-			}
-			urls := cipherVals["url"]
-			sigs := cipherVals["s"]
-			if len(urls) != 1 || strings.TrimSpace(urls[0]) == "" || len(sigs) != 1 || strings.TrimSpace(sigs[0]) == "" {
-				return unified.ContractError("INVALID_INPUT", "signatureCipher 缺少有效的 url 或 s 参数", false), http.StatusBadRequest
-			}
-			streamURL = strings.TrimSpace(urls[0])
-			sigChallenge = strings.TrimSpace(sigs[0])
-			if spVals := cipherVals["sp"]; len(spVals) > 0 {
-				if len(spVals) != 1 || (spVals[0] != "sig" && spVals[0] != "signature") {
-					return unified.ContractError("INVALID_INPUT", "signatureCipher 包含非法的 sp 参数", false), http.StatusBadRequest
-				}
-				sigParam = spVals[0]
-			}
-		}
-
 		if !AllowGooglevideoPlaybackURL(streamURL) {
-			return unified.ContractError("INVALID_INPUT", "媒体链接必须为 https://*.googlevideo.com/videoplayback", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接必须为 https://*.googlevideo.com/videoplayback", false), http.StatusBadRequest
 		}
 
 		parsedU, err := url.Parse(streamURL)
 		if err != nil {
-			return unified.ContractError("INVALID_INPUT", "媒体链接解析失败", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接解析失败", false), http.StatusBadRequest
 		}
 		q := parsedU.Query()
 
@@ -788,26 +860,26 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		// or differs across streams in the same finalize request.
 		idVals := q["id"]
 		if len(idVals) != 1 || strings.TrimSpace(idVals[0]) == "" {
-			return unified.ContractError("INVALID_INPUT", "媒体链接缺少有效的 id 参数", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接缺少有效的 id 参数", false), http.StatusBadRequest
 		}
 		streamID := strings.TrimSpace(idVals[0])
 		if streamID != videoID && !opaquePlaybackIDPattern.MatchString(streamID) {
-			return unified.ContractError("INVALID_INPUT", "媒体链接参数 id 与 video_id 不一致", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 id 与 video_id 不一致", false), http.StatusBadRequest
 		}
 		if expectedStreamID == "" {
 			expectedStreamID = streamID
 		} else if streamID != expectedStreamID {
-			return unified.ContractError("INVALID_INPUT", "媒体链接参数 id 与 video_id 不一致", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 id 与 video_id 不一致", false), http.StatusBadRequest
 		}
 
 		if itagVals := q["itag"]; len(itagVals) != 1 || itagVals[0] != strconv.Itoa(item.Itag) {
-			return unified.ContractError("INVALID_INPUT", "媒体链接参数 itag 与条目不一致", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 itag 与条目不一致", false), http.StatusBadRequest
 		}
 
 		nVal := ""
 		if nVals := q["n"]; len(nVals) > 0 {
 			if len(nVals) != 1 || strings.TrimSpace(nVals[0]) == "" {
-				return unified.ContractError("INVALID_INPUT", "媒体链接参数 n 无效", false), http.StatusBadRequest
+				return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 n 无效", false), http.StatusBadRequest
 			}
 			nVal = strings.TrimSpace(nVals[0])
 		}
@@ -821,7 +893,10 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		})
 	}
 
-	entries := filterMultiAudioStreamEntries(validatedEntries)
+	return validatedEntries, nil, 0
+}
+
+func collectFinalizeChallenges(entries []parsedStreamEntry) ([]string, []string) {
 	var nChallenges []string
 	nSeen := make(map[string]bool)
 	var sigChallenges []string
@@ -836,12 +911,10 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 			sigChallenges = append(sigChallenges, entry.sChallenge)
 		}
 	}
+	return nChallenges, sigChallenges
+}
 
-	nSolved, sigSolved, err := h.sandbox.Solve(ctx, cachedPlayer.PreprocessedPlayerJS, nChallenges, sigChallenges)
-	if err != nil {
-		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube 媒体签名挑战解密失败", false), http.StatusBadGateway
-	}
-
+func applySolvedChallengesToFormats(entries []parsedStreamEntry, nSolved, sigSolved map[string]string) ([]ytengine.Format, unified.Object, int) {
 	ytFormats := make([]ytengine.Format, 0, len(entries))
 	itagCounts := make(map[int]int, len(entries))
 	for _, entry := range entries {
@@ -849,27 +922,27 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		if entry.nChallenge != "" {
 			solvedN := nSolved[entry.nChallenge]
 			if solvedN == "" {
-				return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube n 参数解密结果缺失", false), http.StatusBadGateway
+				return nil, unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube n 参数解密结果缺失", false), http.StatusBadGateway
 			}
 			updated, err := setURLQueryParamPreserveOrder(finalURL, "n", solvedN)
 			if err != nil {
-				return unified.ContractError("INVALID_INPUT", "媒体链接更新失败", false), http.StatusBadRequest
+				return nil, unified.ContractError("INVALID_INPUT", "媒体链接更新失败", false), http.StatusBadRequest
 			}
 			finalURL = updated
 		}
 		if entry.sChallenge != "" {
 			solvedSig := sigSolved[entry.sChallenge]
 			if solvedSig == "" {
-				return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube sig 参数解密结果缺失", false), http.StatusBadGateway
+				return nil, unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube sig 参数解密结果缺失", false), http.StatusBadGateway
 			}
 			updated, err := setURLQueryParamPreserveOrder(finalURL, entry.sigParam, solvedSig)
 			if err != nil {
-				return unified.ContractError("INVALID_INPUT", "媒体链接更新失败", false), http.StatusBadRequest
+				return nil, unified.ContractError("INVALID_INPUT", "媒体链接更新失败", false), http.StatusBadRequest
 			}
 			finalURL = updated
 		}
 		if !AllowGooglevideoPlaybackURL(finalURL) {
-			return unified.ContractError("INVALID_INPUT", "解密后的媒体链接不合法", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "解密后的媒体链接不合法", false), http.StatusBadRequest
 		}
 
 		itagCounts[entry.input.Itag]++
@@ -879,32 +952,14 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		}
 		yf, ok := convertToYTFormat(entry.input, formatID, finalURL)
 		if !ok {
-			return unified.ContractError("INVALID_INPUT", "媒体流 mimeType 或参数无效", false), http.StatusBadRequest
+			return nil, unified.ContractError("INVALID_INPUT", "媒体流 mimeType 或参数无效", false), http.StatusBadRequest
 		}
 		ytFormats = append(ytFormats, yf)
 	}
+	return ytFormats, nil, 0
+}
 
-	canonicalWatchURL := "https://www.youtube.com/watch?v=" + videoID
-	info := &ytengine.Info{
-		ID:         videoID,
-		Title:      resolvedTitle,
-		Uploader:   resolvedAuthor,
-		Duration:   resolvedDuration,
-		Thumbnail:  resolvedThumbnail,
-		WebpageURL: canonicalWatchURL,
-		Formats:    ytFormats,
-	}
-	opts := ytengine.AdaptOptions{
-		PlatformID:      "youtube",
-		ContentID:       videoID,
-		SourceURL:       canonicalWatchURL,
-		MaxEntries:      1,
-		AllowedMediaURL: AllowedMediaURL,
-		EnableDASHMux:   true,
-		EnableHLS:       false,
-	}
-
-	nowUnix := nowTime.Unix()
+func buildFinalizeEnvelope(info *ytengine.Info, opts ytengine.AdaptOptions, nowUnix int64, debug bool) (unified.Object, int) {
 	payload := ytengine.AdaptInfo(info, opts, nowUnix)
 	if err := unified.ValidateEnvelopeAt(payload, nowUnix); err != nil {
 		return unified.ContractError("INTERNAL_ERROR", "解析接口合同校验失败", false), http.StatusBadGateway

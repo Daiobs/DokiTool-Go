@@ -72,7 +72,7 @@ const copyTiming = async () => {
 
 // The panel owns presentation only. Folding never changes a transfer or its history.
 const preferenceKey = 'dokitool.download-panel'
-const expanded = ref(activeCount.value > 0)
+const expanded = ref(props.downloads.some((item) => isActive(item) || item.status === 'manual'))
 const manuallyCollapsed = ref(false)
 const hovered = ref(false)
 const focused = ref(false)
