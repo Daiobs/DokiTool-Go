@@ -17,7 +17,7 @@
 
 在将链接送入 `/api/parse` 前，建议先在本地完成轻量清洗：
 - 去除空行、`#` 注释行与完全重复的输入行；
-- 提前过滤掉 `youtube.com` / `youtu.be` 链接，以及平台明确不支持的二跳外部短链（如 X 的 `t.co`、Instagram 的 `instagr.am`、需登录展开的 `fb.watch`、抖音 `mix_id` 合集页）；
+- 提前过滤掉 `youtube.com` / `youtu.be` 链接，以及平台明确不支持的链接形式（如指向外部非推文页的 `t.co` 短链、需登录展开的 `fb.watch` 短链、抖音 `mix_id` 合集页）；
 - 读取已完成清单（`manifest.jsonl`），跳过 `status == "ok"` 的历史已完成项，实现幂等续跑。
 
 ---

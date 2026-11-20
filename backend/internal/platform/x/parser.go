@@ -3,15 +3,20 @@
 package x
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"log"
+	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -23,12 +28,22 @@ const (
 
 	TombstoneFallbackOff       = "off"
 	TombstoneFallbackFxTwitter = "fxtwitter"
+
+	tCoHost             = "t.co"
+	tCoExpandTimeout    = 5 * time.Second
+	tCoExpandMaxBytes   = 64 << 10 // 64 KiB
+	tCoInvalidTargetMsg = "该 t.co 短链未指向有效的 X / Twitter 帖子"
 )
 
 var (
-	tweetIDPattern    = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
-	screenNamePattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,30}$`)
-	reservedHandles   = map[string]bool{
+	tweetIDPattern            = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
+	screenNamePattern         = regexp.MustCompile(`^[A-Za-z0-9_]{1,30}$`)
+	tCoCodePattern            = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+	tCoMetaTagPattern         = regexp.MustCompile(`(?is)<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>`)
+	tCoHTMLAttrPattern        = regexp.MustCompile(`(?is)([a-zA-Z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+))`)
+	tCoMetaRefreshURLPattern  = regexp.MustCompile(`(?is)(?:^|;)\s*url\s*=\s*(.*)$`)
+	tCoLocationReplacePattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_$])(?:(?:window|document|self|top)\.)?location\.replace\(\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)')\s*\)`)
+	reservedHandles           = map[string]bool{
 		"home":          true,
 		"explore":       true,
 		"search":        true,
@@ -210,6 +225,284 @@ func extractTweetTarget(raw string) (string, string, string, int, bool) {
 	return tweetID, canonicalURL, selectedKind, selectedIndex, true
 }
 
+// AllowedTCoURL validates whether raw is a syntactically safe HTTP/HTTPS t.co
+// shortlink URL with exact host t.co, standard port, no userinfo, length <= 2048,
+// and a single-segment alphanumeric code of 1..32 characters.
+func AllowedTCoURL(raw string) bool {
+	_, ok := extractTCoCode(raw)
+	return ok
+}
+
+func extractTCoCode(raw string) (string, bool) {
+	if raw == "" || len(raw) > 2048 {
+		return "", false
+	}
+	for _, r := range raw {
+		if r <= 0x20 || r >= 0x7f || r == '\\' {
+			return "", false
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if !strings.EqualFold(u.Hostname(), tCoHost) {
+		return "", false
+	}
+	if port := u.Port(); port != "" {
+		if !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
+			return "", false
+		}
+	}
+	escapedPath := u.EscapedPath()
+	if !strings.HasPrefix(escapedPath, "/") || strings.Contains(escapedPath, "%") ||
+		strings.HasPrefix(escapedPath, "//") || strings.HasSuffix(escapedPath, "//") {
+		return "", false
+	}
+	code := strings.TrimSuffix(escapedPath[1:], "/")
+	if !tCoCodePattern.MatchString(code) {
+		return "", false
+	}
+	return code, true
+}
+
+func isTCoHostURL(raw string) bool {
+	sep := strings.Index(raw, "://")
+	if sep <= 0 {
+		return false
+	}
+	rest := raw[sep+3:]
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		rest = rest[:end]
+	}
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	host := rest
+	if h, _, err := net.SplitHostPort(rest); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return host == tCoHost || strings.HasSuffix(host, "."+tCoHost)
+}
+
+func (p *Parser) expandTCoURL(ctx context.Context, code string) (string, string, string, int, string, unified.Object, error) {
+	if p == nil || p.fetcher == nil {
+		return "", "", "", 0, "", unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), nil
+	}
+	reqURL := "https://" + tCoHost + "/" + code
+	hdr := make(http.Header)
+	hdr.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	hdr.Set("Accept-Language", "en-US,en;q=0.9")
+
+	hopCtx, cancel := context.WithTimeout(ctx, tCoExpandTimeout)
+	defer cancel()
+
+	resp, err := p.fetcher.Do(hopCtx, fetch.Request{
+		Method: http.MethodGet,
+		URL:    reqURL,
+		Header: hdr,
+		Policy: fetch.Policy{
+			Purpose:          "x_tco_expand",
+			AllowedURL:       AllowedTCoURL,
+			Timeout:          tCoExpandTimeout,
+			MaxBytes:         tCoExpandMaxBytes,
+			FollowRedirects:  false,
+			ReadRedirectBody: false,
+			AutoReferer:      false,
+			MaxRedirects:     0,
+		},
+	})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(ctxErr, context.Canceled) {
+			return "", "", "", 0, "", nil, ctxErr
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(hopCtx.Err(), context.DeadlineExceeded) {
+			return "", "", "", 0, "", unified.ContractError("UPSTREAM_TIMEOUT", "上游短链展开超时，请稍后重试", true), nil
+		}
+		if errors.Is(err, fetch.ErrLimit) || errors.Is(err, fetch.ErrPolicy) {
+			return "", "", "", 0, "", unified.ContractError("UPSTREAM_INVALID_RESPONSE", "上游短链响应异常或超出大小限制", false), nil
+		}
+		return "", "", "", 0, "", unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), nil
+	}
+
+	var candidate string
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		locations := resp.Header.Values("Location")
+		if len(locations) != 1 || strings.TrimSpace(locations[0]) == "" {
+			return "", "", "", 0, "", unified.ContractError("UPSTREAM_INVALID_RESPONSE", "上游短链重定向响应缺少有效目标", false), nil
+		}
+		candidate = strings.TrimSpace(locations[0])
+	case http.StatusOK:
+		if len(bytes.TrimSpace(resp.Body)) == 0 {
+			return "", "", "", 0, "", unified.ContractError("UPSTREAM_INVALID_RESPONSE", "上游短链响应为空", false), nil
+		}
+		candidate = extractTCoHTMLRedirectTarget(resp.Body)
+		if candidate == "" {
+			return "", "", "", 0, "", unified.ContractError("INVALID_INPUT", tCoInvalidTargetMsg, false), nil
+		}
+	case http.StatusNotFound, http.StatusGone:
+		return "", "", "", 0, "", unified.ContractError("CONTENT_UNAVAILABLE", "短链不存在或已失效", false), nil
+	case http.StatusTooManyRequests:
+		return "", "", "", 0, "", unified.ContractError("RATE_LIMITED", "上游访问频率受限，请稍后重试", true), nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", "", "", 0, "", unified.ContractError("UPSTREAM_BLOCKED", "该短链受访问限制，无法解析", false), nil
+	case http.StatusGatewayTimeout:
+		return "", "", "", 0, "", unified.ContractError("UPSTREAM_TIMEOUT", "上游短链展开超时，请稍后重试", true), nil
+	default:
+		if resp.StatusCode >= 500 {
+			return "", "", "", 0, "", unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), nil
+		}
+		return "", "", "", 0, "", unified.ContractError("UPSTREAM_INVALID_RESPONSE", "上游短链响应状态异常", false), nil
+	}
+
+	if _, _, _, ok := ExtractTweetTarget(candidate); !ok {
+		return "", "", "", 0, "", unified.ContractError("INVALID_INPUT", tCoInvalidTargetMsg, false), nil
+	}
+	tweetID, canonicalURL, selectedKind, selectedIndex, ok := extractTweetTarget(candidate)
+	if !ok {
+		return "", "", "", 0, "", unified.ContractError("INVALID_INPUT", tCoInvalidTargetMsg, false), nil
+	}
+	expandedSource := canonicalURL
+	if selectedKind != "" && selectedIndex > 0 {
+		expandedSource = fmt.Sprintf("%s/%s/%d", canonicalURL, selectedKind, selectedIndex)
+	}
+	return tweetID, canonicalURL, selectedKind, selectedIndex, expandedSource, nil, nil
+}
+
+func extractTCoHTMLRedirectTarget(body []byte) string {
+	htmlText := string(body)
+	for _, tag := range tCoMetaTagPattern.FindAllString(htmlText, -1) {
+		var isRefresh bool
+		var contentVal string
+		var hasContent bool
+		for _, attr := range tCoHTMLAttrPattern.FindAllStringSubmatch(tag, -1) {
+			name := attr[1]
+			val := attr[2]
+			if val == "" {
+				val = attr[3]
+			}
+			if val == "" {
+				val = attr[4]
+			}
+			if strings.EqualFold(name, "http-equiv") && strings.EqualFold(strings.TrimSpace(html.UnescapeString(val)), "refresh") {
+				isRefresh = true
+			} else if strings.EqualFold(name, "content") && !hasContent {
+				contentVal = val
+				hasContent = true
+			}
+		}
+		if isRefresh {
+			if hasContent {
+				if u := parseMetaRefreshURL(contentVal); u != "" {
+					return u
+				}
+			}
+			break
+		}
+	}
+
+	if m := tCoLocationReplacePattern.FindStringSubmatch(htmlText); len(m) == 3 {
+		rawLiteral := m[1]
+		if rawLiteral == "" {
+			rawLiteral = m[2]
+		}
+		if unescaped, ok := unescapeJSStringLiteral(rawLiteral); ok && unescaped != "" {
+			return unescaped
+		}
+	}
+	return ""
+}
+
+func parseMetaRefreshURL(content string) string {
+	unescaped := html.UnescapeString(content)
+	m := tCoMetaRefreshURLPattern.FindStringSubmatch(unescaped)
+	if len(m) != 2 {
+		return ""
+	}
+	target := strings.TrimSpace(m[1])
+	if len(target) > 0 && (target[0] == '\'' || target[0] == '"') {
+		quote := target[0]
+		rest := target[1:]
+		if end := strings.IndexByte(rest, quote); end >= 0 {
+			target = rest[:end]
+		} else {
+			target = rest
+		}
+	}
+	return strings.TrimSpace(target)
+}
+
+func unescapeJSStringLiteral(raw string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch != '\\' {
+			b.WriteByte(ch)
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return "", false
+		}
+		switch raw[i] {
+		case '\\', '/', '"', '\'':
+			b.WriteByte(raw[i])
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'v':
+			b.WriteByte('\v')
+		case 'x':
+			if i+2 >= len(raw) {
+				return "", false
+			}
+			v, err := strconv.ParseUint(raw[i+1:i+3], 16, 8)
+			if err != nil {
+				return "", false
+			}
+			b.WriteRune(rune(v))
+			i += 2
+		case 'u':
+			if i+4 >= len(raw) {
+				return "", false
+			}
+			u1, err := strconv.ParseUint(raw[i+1:i+5], 16, 16)
+			if err != nil {
+				return "", false
+			}
+			i += 4
+			r := rune(u1)
+			if utf16.IsSurrogate(r) && i+6 < len(raw) && raw[i+1] == '\\' && raw[i+2] == 'u' {
+				if u2, err2 := strconv.ParseUint(raw[i+3:i+7], 16, 16); err2 == nil {
+					if combined := utf16.DecodeRune(r, rune(u2)); combined != '\uFFFD' {
+						r = combined
+						i += 6
+					}
+				}
+			}
+			b.WriteRune(r)
+		default:
+			b.WriteByte(raw[i])
+		}
+	}
+	return strings.TrimSpace(b.String()), true
+}
+
 // AllowedTargetURL enforces that only canonical X status URLs reach ytengine.
 func AllowedTargetURL(raw string) bool {
 	_, canonical, _, ok := ExtractTweetTarget(raw)
@@ -289,12 +582,41 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	tweetID, canonicalURL, selectedKind, selectedIndex, ok := extractTweetTarget(source)
-	if !ok {
-		return unified.ContractError("INVALID_INPUT", "请输入有效的 X (Twitter) 推文链接", false), nil
-	}
-	if p == nil || p.engine == nil || !p.engine.Enabled() {
-		return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
+	var (
+		tweetID       string
+		canonicalURL  string
+		selectedKind  string
+		selectedIndex int
+		ok            bool
+	)
+	if isTCoHostURL(source) {
+		code, validTCo := extractTCoCode(source)
+		if !validTCo {
+			return unified.ContractError("INVALID_INPUT", "请输入有效的 X (Twitter) 推文链接", false), nil
+		}
+		if p == nil || p.fetcher == nil {
+			return unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), nil
+		}
+		if p.engine == nil || !p.engine.Enabled() {
+			return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
+		}
+		var errEnv unified.Object
+		var expandErr error
+		tweetID, canonicalURL, selectedKind, selectedIndex, source, errEnv, expandErr = p.expandTCoURL(ctx, code)
+		if expandErr != nil {
+			return nil, expandErr
+		}
+		if errEnv != nil {
+			return errEnv, nil
+		}
+	} else {
+		tweetID, canonicalURL, selectedKind, selectedIndex, ok = extractTweetTarget(source)
+		if !ok {
+			return unified.ContractError("INVALID_INPUT", "请输入有效的 X (Twitter) 推文链接", false), nil
+		}
+		if p == nil || p.engine == nil || !p.engine.Enabled() {
+			return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
+		}
 	}
 
 	// /photo/<N>: fetch photo list directly from public syndication without spawning yt-dlp.

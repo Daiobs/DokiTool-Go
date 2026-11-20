@@ -232,6 +232,12 @@ test('pasting another platform link while a specific platform is selected prompt
   assert.equal(parseHelpers.detectUrlPlatform('https://www.facebook.com/watch/?v=123'),'facebook');
   assert.equal(parseHelpers.detectUrlPlatform('https://fb.com/watch/?v=123'),null);
   assert.equal(parseHelpers.detectUrlPlatform('https://www.fb.com/watch/?v=123'),null);
+  assert.equal(parseHelpers.detectUrlPlatform('https://t.co/Zgzhvix8ES'),'x');
+  assert.equal(parseHelpers.detectUrlPlatform('http://T.CO/AbCd1234'),'x');
+  assert.equal(parseHelpers.detectUrlPlatform('https://nott.co/Zgzhvix8ES'),null);
+  assert.equal(parseHelpers.detectUrlPlatform('https://instagr.am/p/aye83DjauH/'),'instagram');
+  assert.equal(parseHelpers.detectUrlPlatform('https://www.instagr.am/reel/CTApqC8BGWd/'),'instagram');
+  assert.equal(parseHelpers.detectUrlPlatform('https://notinstagr.am/p/aye83DjauH/'),null);
 
   let fetchCount=0;
   globalThis.fetch=async()=>{fetchCount++;return Response.json(good());};
@@ -242,6 +248,33 @@ test('pasting another platform link while a specific platform is selected prompt
   assert.equal(fetchCount,0);
   assert.match(instance.parseError.value,/所有平台/);
   assert.equal(toasts.at(-1)?.[1],'error');
+
+  const tcoMismatch=harness('https://t.co/Zgzhvix8ES');
+  tcoMismatch.instance.selectPlatform('douyin');
+  await tcoMismatch.instance.parseVideo();
+  assert.equal(fetchCount,0);
+  assert.match(tcoMismatch.instance.parseError.value,/所有平台/);
+
+  const igShortMismatch=harness('https://instagr.am/p/aye83DjauH/');
+  igShortMismatch.instance.selectPlatform('douyin');
+  await igShortMismatch.instance.parseVideo();
+  assert.equal(fetchCount,0);
+  assert.match(igShortMismatch.instance.parseError.value,/所有平台/);
+
+  const tcoMatched=harness('https://t.co/Zgzhvix8ES');
+  tcoMatched.instance.selectPlatform('x');
+  globalThis.fetch=async()=>{fetchCount++;return Response.json(good({platform:'x'}));};
+  await tcoMatched.instance.parseVideo();
+  assert.equal(fetchCount,1);
+  assert.equal(tcoMatched.store.resultData?.platform,'x');
+
+  const igShortMatched=harness('https://instagr.am/p/aye83DjauH/');
+  igShortMatched.instance.selectPlatform('instagram');
+  globalThis.fetch=async()=>{fetchCount++;return Response.json(good({platform:'instagram'}));};
+  await igShortMatched.instance.parseVideo();
+  assert.equal(fetchCount,2);
+  assert.equal(igShortMatched.store.resultData?.platform,'instagram');
+  fetchCount=0;
 
   const ytMismatch=harness('https://youtu.be/I9JvDaciaFk');
   ytMismatch.instance.selectPlatform('douyin');

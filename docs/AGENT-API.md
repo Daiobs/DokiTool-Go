@@ -573,8 +573,8 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | HTTP 状态码 | `code` / `error.code` | `retryable` | 触发原因 | Agent 标准处置动作 |
 | --- | --- | --- | --- | --- |
 | **`401`** | `INVALID_INPUT` | `false` | `Authorization` 令牌错误、格式非法、超长（`> 1024 B`）、重复发送，或服务端未配置 `DOKITOOL_OWNER_TOKEN`（每次失败还会扣减单 IP 突发配额） | **立即中止整批任务并告警**；检查环境变量 `$DOKITOOL_OWNER_TOKEN` 与目标服务端配置，**严禁重试或继续遍历后续 URL**。 |
-| `400` / `405` / `409` / `410` | `INVALID_INPUT` | `false` | 缺少/非法 `url` 或 `item_id`、`/api/stats` 携带未知查询参数、`platform` 与链接不匹配、抖音合集 `mix_id`、小红书缺失 `xsec_token`、Facebook `fb.watch` 短链、`schema_version` 不匹配（`409`）、方法错误（`405`）、旧路径退役（`410`） | **不重试**；将该条输入标记为永久输入错误（`failed_permanent`）并继续处理下一条 URL。 |
-| `400` | `UNSUPPORTED_PLATFORM` | `false` | 链接域名不在支持目录（如 `t.co`、`instagr.am` 短链或未接入网站），或目标平台在当前实例未启用 | **不重试**；标记为不支持平台并跳过。 |
+| `400` / `405` / `409` / `410` | `INVALID_INPUT` | `false` | 缺少/非法 `url` 或 `item_id`、`/api/stats` 携带未知查询参数、`platform` 与链接不匹配、抖音合集 `mix_id`、小红书缺失 `xsec_token`、X `t.co` 短链未指向有效推文页、Facebook `fb.watch` 短链、`schema_version` 不匹配（`409`）、方法错误（`405`）、旧路径退役（`410`） | **不重试**；将该条输入标记为永久输入错误（`failed_permanent`）并继续处理下一条 URL。 |
+| `400` | `UNSUPPORTED_PLATFORM` | `false` | 链接域名不在支持目录（如未接入网站），或目标平台在当前实例未启用 | **不重试**；标记为不支持平台并跳过。 |
 | `404` | `NO_MEDIA` | `false` | 帖子公开存在但不含受支持媒体（如 X 纯文本推文、仅含不受支持流格式的作品） | **不重试**；标记为无媒体作品并跳过。 |
 | `404` | `CONTENT_UNAVAILABLE` | `false` | 作品已删除、不存在，或请求的 `item_id` 不存在（服务端会负缓存 `10s`） | **不重试**；标记为作品不可用并跳过。 |
 | `403` | `UPSTREAM_BLOCKED` | `false` | 作品私密、年龄受限、需登录查看（如 Instagram Stories、私密帖、未开回退的 X 受限推文）或触发上游页面风控 | **不在紧循环中重试**；标记为受限/风控阻塞并跳过。 |

@@ -1681,3 +1681,155 @@ func TestInstagramNativeFetchGoroutinePanicRecoversWithoutHanging(t *testing.T) 
 		}
 	}
 }
+
+func TestInstagrAmShortlinkRewriteAndRejectionBoundaries(t *testing.T) {
+	const now int64 = 1762300800
+
+	validShortlinks := []struct {
+		raw       string
+		wantID    string
+		wantCanon string
+	}{
+		{
+			raw:       "https://instagr.am/p/aye83DjauH/",
+			wantID:    "aye83DjauH",
+			wantCanon: "https://www.instagram.com/p/aye83DjauH/",
+		},
+		{
+			raw:       "http://instagr.am:80/p/aye83DjauH",
+			wantID:    "aye83DjauH",
+			wantCanon: "https://www.instagram.com/p/aye83DjauH/",
+		},
+		{
+			raw:       "https://www.instagr.am:443/reel/CTApqC8BGWd/?igsh=abc#1",
+			wantID:    "CTApqC8BGWd",
+			wantCanon: "https://www.instagram.com/reel/CTApqC8BGWd/",
+		},
+		{
+			raw:       "https://INSTAGR.AM/reels/CTApqC8BGWd",
+			wantID:    "CTApqC8BGWd",
+			wantCanon: "https://www.instagram.com/reel/CTApqC8BGWd/",
+		},
+		{
+			raw:       "https://www.instagr.am/tv/aye83DjauH/",
+			wantID:    "aye83DjauH",
+			wantCanon: "https://www.instagram.com/tv/aye83DjauH/",
+		},
+	}
+
+	for _, tc := range validShortlinks {
+		id, canon, ok := ExtractPostTarget(tc.raw)
+		if !ok || id != tc.wantID || canon != tc.wantCanon {
+			t.Fatalf("ExtractPostTarget(%q) = (%q, %q, %v), want (%q, %q, true)",
+				tc.raw, id, canon, ok, tc.wantID, tc.wantCanon)
+		}
+		if AllowedTargetURL(tc.raw) {
+			t.Fatalf("AllowedTargetURL(%q) = true, want false (must allow www.instagram.com only)", tc.raw)
+		}
+		if !AllowedTargetURL(canon) {
+			t.Fatalf("AllowedTargetURL(%q) = false, want true", canon)
+		}
+	}
+
+	if AllowedOutboundHost("instagr.am") || AllowedOutboundHost("www.instagr.am") {
+		t.Fatal("AllowedOutboundHost must not allow instagr.am")
+	}
+	if AllowedPageURL("https://instagr.am/p/aye83DjauH/embed/captioned/") ||
+		AllowedPageURL("https://www.instagr.am/p/aye83DjauH/embed/captioned/") {
+		t.Fatal("AllowedPageURL must not allow instagr.am")
+	}
+
+	// Verify Parse locally rewrites instagr.am to canonical www.instagram.com with zero extra network hops.
+	var extractCalls, fetchCalls atomic.Int32
+	var gotCanonURL string
+	p := NewWithFetcher(
+		&stubExtractor{
+			enabled: true,
+			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
+				extractCalls.Add(1)
+				gotCanonURL = rawURL
+				return &ytengine.Info{
+					ID:        "CTApqC8BGWd",
+					Title:     "Reel via instagr.am",
+					Uploader:  "instagram",
+					Thumbnail: "https://scontent-nrt1-1.cdninstagram.com/v/t51.2885-15/thumb.jpg",
+					Formats: []ytengine.Format{
+						{
+							FormatID: "0",
+							URL:      "https://scontent-nrt1-1.cdninstagram.com/o1/v/t16/f2/m69/reel720.mp4",
+							Ext:      "mp4",
+							Protocol: "https",
+							Width:    int64Ptr(720),
+							Height:   int64Ptr(1280),
+							Filesize: int64Ptr(2048000),
+						},
+					},
+				}, nil
+			},
+		},
+		nil,
+		fakeFetcher{
+			fn: func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				fetchCalls.Add(1)
+				t.Fatalf("unexpected outbound HTTP fetch on Reel shortlink: %s", req.URL)
+				return fetch.Response{}, nil
+			},
+		},
+	)
+
+	env, err := p.Parse(context.Background(), "https://www.instagr.am/reels/CTApqC8BGWd?igsh=xyz", now)
+	if err != nil {
+		t.Fatalf("Parse(instagr.am) returned Go error: %v", err)
+	}
+	if extractCalls.Load() != 1 || fetchCalls.Load() != 0 {
+		t.Fatalf("expected 1 ytengine call and 0 HTTP fetches, got extract=%d fetch=%d", extractCalls.Load(), fetchCalls.Load())
+	}
+	if gotCanonURL != "https://www.instagram.com/reel/CTApqC8BGWd/" {
+		t.Fatalf("ytengine received %q, want canonical www.instagram.com URL", gotCanonURL)
+	}
+	pub := unified.PublicView(env, false, now)
+	if err := unified.ValidateEnvelopeAt(pub, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+	if unified.Str(pub["code"]) != "OK" {
+		t.Fatalf("expected OK envelope, got %+v", pub)
+	}
+
+	// Rejected instagr.am inputs: subdomains, /<username>/p/<id>, /stories/, extra segments,
+	// non-standard ports, userinfo, unsafe chars, and >2048B inputs must all fail with 0 calls.
+	extractCalls.Store(0)
+	rejectedShortlinks := []string{
+		"https://foo.instagr.am/p/aye83DjauH/",
+		"https://m.instagr.am/p/aye83DjauH/",
+		"https://sub.www.instagr.am/p/aye83DjauH/",
+		"https://instagr.am./p/aye83DjauH/",
+		"https://instagr.am/someuser/p/aye83DjauH/",
+		"https://www.instagr.am/someuser/reel/CTApqC8BGWd/",
+		"https://instagr.am/p/aye83DjauH/extra",
+		"https://instagr.am/aye83DjauH",
+		"https://instagr.am/",
+		"https://instagr.am/stories/instagram/1234567890123456789/",
+		"https://www.instagr.am/stories/highlights/17900000000000000/",
+		"https://instagr.am:8443/p/aye83DjauH/",
+		"https://instagr.am:80/p/aye83DjauH/",
+		"http://instagr.am:443/p/aye83DjauH/",
+		"https://user:pass@instagr.am/p/aye83DjauH/",
+		"https://instagr.am/p/aye83\\DjauH/",
+		"https://instagr.am/p/aye83DjauH/?" + strings.Repeat("a", 2030),
+	}
+	for _, bad := range rejectedShortlinks {
+		if _, _, ok := ExtractPostTarget(bad); ok {
+			t.Fatalf("ExtractPostTarget(%q) unexpectedly succeeded", bad)
+		}
+		badEnv, err := p.Parse(context.Background(), bad, now)
+		if err != nil {
+			t.Fatalf("Parse(%q) returned Go error: %v", bad, err)
+		}
+		if unified.Str(badEnv["code"]) != "INVALID_INPUT" {
+			t.Fatalf("Parse(%q) code = %q, want INVALID_INPUT (%+v)", bad, unified.Str(badEnv["code"]), badEnv)
+		}
+	}
+	if extractCalls.Load() != 0 || fetchCalls.Load() != 0 {
+		t.Fatalf("rejected instagr.am inputs triggered outbound work: extract=%d fetch=%d", extractCalls.Load(), fetchCalls.Load())
+	}
+}

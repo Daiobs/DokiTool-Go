@@ -83,7 +83,7 @@ func ExtractPostTarget(raw string) (string, string, bool) {
 		}
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" {
+	if err != nil || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
 		return "", "", false
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -91,15 +91,17 @@ func ExtractPostTarget(raw string) (string, string, bool) {
 		return "", "", false
 	}
 	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || (scheme == "https" && n != 443) || (scheme == "http" && n != 80) {
+		if !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
 			return "", "", false
 		}
 	}
 
 	host := strings.ToLower(u.Hostname())
+	isShortDomain := false
 	switch host {
 	case "instagram.com", "www.instagram.com", "m.instagram.com":
+	case "instagr.am", "www.instagr.am":
+		isShortDomain = true
 	default:
 		return "", "", false
 	}
@@ -107,15 +109,23 @@ func ExtractPostTarget(raw string) (string, string, bool) {
 	segments := splitNonEmptyPath(u.EscapedPath())
 	var kind, shortcode string
 
-	switch {
-	case len(segments) >= 2 && isInstagramPostKind(segments[0]):
+	if isShortDomain {
+		if len(segments) != 2 || !isInstagramPostKind(segments[0]) {
+			return "", "", false
+		}
 		kind = normalizeKind(segments[0])
 		shortcode = segments[1]
-	case len(segments) >= 3 && isInstagramPostKind(segments[1]):
-		kind = normalizeKind(segments[1])
-		shortcode = segments[2]
-	default:
-		return "", "", false
+	} else {
+		switch {
+		case len(segments) >= 2 && isInstagramPostKind(segments[0]):
+			kind = normalizeKind(segments[0])
+			shortcode = segments[1]
+		case len(segments) >= 3 && isInstagramPostKind(segments[1]):
+			kind = normalizeKind(segments[1])
+			shortcode = segments[2]
+		default:
+			return "", "", false
+		}
 	}
 
 	if !shortcodePattern.MatchString(shortcode) {
