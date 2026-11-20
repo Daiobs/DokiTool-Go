@@ -2,8 +2,10 @@ import test, { after, before, describe } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { createServer } from "vite";
-import { createSSRApp, h, reactive, ref } from "vue";
+import { createRequire } from "node:module";
+import { createServer, transformWithEsbuild } from "vite";
+import { parse, compileScript } from "@vue/compiler-sfc";
+import { createSSRApp, createRenderer, h, markRaw, nextTick, reactive, ref } from "vue";
 import { renderToString } from "vue/server-renderer";
 
 import {
@@ -2628,7 +2630,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     }
   });
 
-  test("with helper v1.3.0 ready: renders single primary 合并保存 button (no 分开保存), streams 1080p mux & 仅音频 M4A via OPFS default path, and displays savePathLabel on DownloadCard", async () => {
+  test("with helper ready: renders slimmed status pill & dynamic primary download button (no 分开保存), streams 1080p mux & 仅音频 M4A via OPFS default path, and displays savePathLabel on DownloadCard", async () => {
     const env = setupEnvironment();
     const opfs = createMockOpfsEnvironment({ quota: 500_000_000 });
     const gmSaved = [];
@@ -2789,10 +2791,15 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       ]);
       assert.equal(env.store.resultData.extra.youtube_helper.status, "ready");
 
-      // 1. Default 360p (itag=18) -> updated top notice without 分开保存 or 受 2 倍码率限速
+      // 1. Default 360p (itag=18) -> slimmed top status capsule without full-row .rs-yt-helper-notice or 分开保存
       const html360 = await renderResultHtml(env.store, env.selection);
-      assert.ok(html360.includes("默认分块并发无损「合并保存」至浏览器默认下载目录"));
-      assert.ok(html360.includes("仅音频"));
+      assert.ok(
+        html360.includes(
+          `助手 v${YOUTUBE_HELPER_VERSION} 已就绪 · 自动合成原声`,
+        ),
+      );
+      assert.ok(!html360.includes("rs-yt-helper-notice"));
+      assert.ok(!html360.includes("rs-backup-split-actions"));
       assert.ok(!html360.includes("受 2 倍码率限速"));
       assert.ok(!html360.includes("分开保存"));
       assert.ok(html360.includes("下载视频"));
@@ -2810,18 +2817,20 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       assert.equal(env.clickedAnchors[0].href, itag18Url);
       assert.equal(env.clickedAnchors[0].target, "_blank");
 
-      // 2. Select 1080p60 split track (v-299) -> ResultSection renders ONLY 合并保存 (NO 分开保存) + keeps 仅音频
+      // 2. Select 1080p60 split track (v-299) -> ResultSection renders dynamic 下载 1080p 有声视频 + 预览无声 · 下载含音频 tag
       env.selection.choose({ variant_id: "v-299", source_id: "s-299" });
       const html1080 = await renderResultHtml(env.store, env.selection, false);
       assert.ok(html1080.includes("data-youtube-mux-save"));
-      assert.ok(html1080.includes("合并保存"));
+      assert.ok(html1080.includes("下载 1080p 有声视频"));
+      assert.ok(html1080.includes("1080p60（预览无声 · 下载含音频）"));
+      assert.ok(!html1080.includes("合并保存"));
       assert.ok(!html1080.includes("data-youtube-separate-save"));
       assert.ok(!html1080.includes("分开保存"));
 
       env.selection.choose({ variant_id: "v-140", source_id: "s-140" });
       const htmlAudioOnly = await renderResultHtml(env.store, env.selection, false);
       assert.ok(htmlAudioOnly.includes("data-youtube-audio-only-save"));
-      assert.ok(htmlAudioOnly.includes("仅音频"));
+      assert.ok(htmlAudioOnly.includes("下载音频 (M4A)"));
       env.selection.choose({ variant_id: "v-299", source_id: "s-299" });
 
       // Primary 合并保存 streams mux output into OPFS temp file named with task ID and hands off via <a download>
@@ -4252,5 +4261,548 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     });
     assert.equal(removedAfterUnlock, 2);
     assert.equal(opfs.files.size, 0);
+  });
+
+  test("Track 1 YouTube UI polish: result-oriented labels, combined estimated size, dynamic primary CTA, codec humanization, copy-url preservation, and genuine silent fallback", async () => {
+    const mediaSourcesMod = await vite.ssrLoadModule("/src/utils/mediaSources.ts");
+    const mediaContractMod = await vite.ssrLoadModule("/src/utils/mediaContract.ts");
+    const apiConfigMod = await vite.ssrLoadModule("/src/services/apiConfig.ts");
+    const ytHelperCoreMod = await vite.ssrLoadModule("/src/utils/youtubeHelperCore.js");
+    const sfcSource = await readFile(
+      new URL("../src/components/ResultSection.vue", import.meta.url),
+      "utf8",
+    );
+    const { descriptor } = parse(sfcSource);
+    const compiledScript = compileScript(descriptor, {
+      id: "yt-ui-polish-test",
+      inlineTemplate: true,
+      templateOptions: { compilerOptions: { hoistStatic: false } },
+    });
+    const cjsCode = await transformWithEsbuild(
+      compiledScript.content,
+      "ResultSection.js",
+      { loader: "js", format: "cjs" },
+    );
+    const cjsMod = { exports: {} };
+    const req = createRequire(import.meta.url);
+    new Function("require", "module", "exports", cjsCode.code)(
+      (id) =>
+        id === "./VideoPlaylist.vue"
+          ? { __esModule: true, default: { render: () => null } }
+          : id === "./AppIcon.vue"
+            ? { __esModule: true, default: { render: () => h("i") } }
+            : id === "../utils/mediaSources"
+              ? mediaSourcesMod
+              : id === "../utils/mediaContract"
+                ? mediaContractMod
+                : id === "../utils/youtubeHelperCore"
+                  ? ytHelperCoreMod
+                  : id === "../services/apiConfig"
+                    ? apiConfigMod
+                    : req(id),
+      cjsMod,
+      cjsMod.exports,
+    );
+    const ClientResultSection = cjsMod.exports.default;
+
+    const mountInteractiveResult = async (resultData, initialLocale = "zh-CN") => {
+      const store = reactive({ resultData, resultVersion: 1 });
+      const selection = markRaw(selectionMod.useVideoSelection({ videoStore: store }));
+      selection.syncResult();
+      const copied = [];
+      const mainDownloads = [];
+      const localeRef = ref(initialLocale);
+
+      const element = (type, text = "") =>
+        markRaw({
+          type,
+          text,
+          props: {},
+          children: [],
+          parent: null,
+          style: {},
+          dataset: {},
+          removeAttribute() {},
+          getAttribute(name) {
+            return this.props[name];
+          },
+        });
+      const detach = (node) => {
+        if (node.parent) {
+          node.parent.children = node.parent.children.filter((item) => item !== node);
+        }
+        node.parent = null;
+      };
+      const portal = element("portal");
+      const renderer = createRenderer({
+        querySelector: () => portal,
+        createElement: element,
+        createText: (text) => element("#text", text),
+        createComment: (text) => element("#comment", text),
+        setText(node, text) {
+          node.text = text;
+        },
+        setElementText(node, text) {
+          node.text = text;
+          node.children = [];
+        },
+        parentNode: (node) => node.parent,
+        nextSibling: (node) =>
+          node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+        insert(node, parent, anchor) {
+          detach(node);
+          node.parent = parent;
+          const idx = parent.children.indexOf(anchor);
+          parent.children.splice(idx < 0 ? parent.children.length : idx, 0, node);
+        },
+        remove: detach,
+        patchProp(node, key, _, value) {
+          node.props[key] = value;
+          if (key === "src") node.src = value;
+        },
+      });
+      const root = element("root");
+      const app = renderer.createApp({
+        render: () =>
+          h(ClientResultSection, {
+            resultData: store.resultData,
+            resultVersion: store.resultVersion,
+            locale: localeRef.value,
+            selection,
+            isDownloading: false,
+            resolvingIds: new Set(),
+            formatNumber: String,
+            formatDuration: String,
+            onSwitchVideo(choice) {
+              selection.choose(choice);
+            },
+            onCopyUrl(url) {
+              copied.push(url);
+            },
+            onDownloadMain() {
+              mainDownloads.push(selection.currentTarget.value?.variant?.id);
+            },
+          }),
+      });
+      app.mount(root);
+      await nextTick();
+      const hasClass = (node, cls) =>
+        String(node.props?.class || "")
+          .split(/\s+/)
+          .includes(cls);
+      const findAll = (node, pred) => [
+        ...(pred(node) ? [node] : []),
+        ...(node.children || []).flatMap((c) => findAll(c, pred)),
+      ];
+      const textOf = (node) =>
+        node ? [node.text || "", ...(node.children || []).map(textOf)].join("") : "";
+      return {
+        app,
+        store,
+        selection,
+        localeRef,
+        copied,
+        mainDownloads,
+        root,
+        findAll,
+        textOf,
+        byClass: (cls) => findAll(root, (n) => hasClass(n, cls)),
+      };
+    };
+
+    const url4k = makeItagUrl(401, 90_000_000);
+    const url2kWebm = makeItagUrl(271, 50_000_000);
+    const url1080 = makeItagUrl(299, 35_000_000);
+    const url720 = makeItagUrl(136, 18_000_000);
+    const urlAdaptive = makeItagUrl(398, 15_000_000);
+    const url360 = itag18Url;
+    const urlM4a = makeItagUrl(140, 7_000_000);
+    const urlOpusNoSize =
+      "https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?expire=1794238131&itag=251&id=o-AOdRLkc6ecTboXRtJhNBILt2v8AQeJUCoLbqEckV1dDI";
+    const urlAudioGeneric = makeItagUrl(139, 3_000_000);
+
+    const pairedData = {
+      platform: "youtube",
+      content_id: "I9JvDaciaFk",
+      source_url: "https://www.youtube.com/watch?v=I9JvDaciaFk",
+      title: "Sample 4K YouTube",
+      default_item_id: "yt-v1",
+      extra: {
+        youtube_helper: {
+          status: "ready",
+          version: YOUTUBE_HELPER_VERSION,
+          script_url: "/helper/dokitool-youtube.user.js",
+        },
+      },
+      items: [
+        {
+          id: "yt-v1",
+          type: "video",
+          state: "ready",
+          default: { variant_id: "v-360", source_id: "s-360", url: url360 },
+          variants: [
+            {
+              id: "v-4k",
+              label: "2026p60 (4K · 仅视频无声)",
+              metadata: {
+                width: 3840,
+                height: 2026,
+                fps: 60,
+                has_audio: false,
+                video_codec: "av01.0.13M.08",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-4k", url: url4k, size_bytes: 90_000_000 }],
+              },
+            },
+            {
+              id: "v-2k-webm",
+              label: "1440p60 (2K · 仅视频无声)",
+              metadata: {
+                width: 2560,
+                height: 1440,
+                fps: 60,
+                has_audio: false,
+                video_codec: "vp09.00.51.08",
+                container: "webm",
+                extension: "webm",
+                mime_type: "video/webm",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-2k", url: url2kWebm, size_bytes: 50_000_000 }],
+              },
+            },
+            {
+              id: "v-1080-crop",
+              label: "1012p60 (仅视频无声)",
+              metadata: {
+                width: 1920,
+                height: 1012,
+                fps: 60,
+                has_audio: false,
+                video_codec: "avc1.64002A",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-1080", url: url1080, size_bytes: 35_000_000 }],
+              },
+            },
+            {
+              id: "v-720",
+              label: "720p (仅视频无声)",
+              metadata: {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                has_audio: false,
+                video_codec: "avc1.4d401f",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-720", url: url720, size_bytes: 18_000_000 }],
+              },
+            },
+            {
+              id: "v-adaptive",
+              label: "自适应 (仅视频无声)",
+              metadata: {
+                has_audio: false,
+                video_codec: "avc1.42001E",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-adaptive", url: urlAdaptive }],
+              },
+            },
+            {
+              id: "v-360",
+              label: "360p (含音频)",
+              metadata: {
+                width: 640,
+                height: 360,
+                fps: 30,
+                has_audio: true,
+                video_codec: "avc1.42001E",
+                audio_codec: "mp4a.40.2",
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-360", url: url360, size_bytes: 12_000_000 }],
+              },
+            },
+            {
+              id: "v-m4a",
+              label: "仅音频 M4A (128 kbps)",
+              metadata: {
+                has_audio: true,
+                audio_codec: "mp4a.40.2",
+                container: "m4a",
+                extension: "m4a",
+                mime_type: "audio/mp4",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-m4a", url: urlM4a, size_bytes: 7_000_000 }],
+              },
+            },
+            {
+              id: "v-webm-audio",
+              label: "仅音频 WEBM (160 kbps)",
+              metadata: {
+                has_audio: true,
+                audio_codec: "opus",
+                container: "webm",
+                extension: "webm",
+                mime_type: "audio/webm",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-opus", url: urlOpusNoSize }],
+              },
+            },
+            {
+              id: "v-generic-audio",
+              label: "音轨",
+              metadata: {
+                has_audio: true,
+                audio_codec: "opus",
+                mime_type: "audio/ogg",
+                evidence: "upstream",
+              },
+              delivery: {
+                kind: "file",
+                sources: [{ id: "s-gen-audio", url: urlAudioGeneric, size_bytes: 3_000_000 }],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const view = await mountInteractiveResult(pairedData, "zh-CN");
+    try {
+      // Top dual-banner slimming: ready pill in header, no full-row .rs-yt-helper-notice
+      assert.equal(view.byClass("rs-yt-helper-notice").length, 0);
+      assert.equal(
+        view.textOf(view.byClass("rs-header-hint")[0]),
+        `助手 v${YOUTUBE_HELPER_VERSION} 已就绪 · 自动合成原声`,
+      );
+      // No "切 360p 听声" button and only 1 <video> element (zero dual-track <audio> sync element in stage)
+      assert.ok(!view.textOf(view.root).includes("切 360p"));
+      const stage = view.byClass("rs-video-stage")[0];
+      assert.equal(view.findAll(stage, (n) => n.type === "video").length, 1);
+      assert.equal(view.findAll(stage, (n) => n.type === "audio").length, 0);
+
+      // Open 画质选项 tab
+      const backupTab = view
+        .byClass("rs-tab")
+        .find((n) => view.textOf(n).includes("画质选项"));
+      backupTab.props.onClick();
+      await nextTick();
+
+      assert.equal(view.byClass("rs-backup-split-actions").length, 0);
+      assert.equal(view.textOf(view.byClass("rs-backup-playing")[0]), "当前已选");
+
+      const cardNames = view.byClass("rs-backup-name").map(view.textOf);
+      assert.ok(
+        cardNames.every((name) => !name.includes("仅视频无声")),
+        `paired YouTube quality list must not show 仅视频无声: ${JSON.stringify(cardNames)}`,
+      );
+      assert.deepEqual(cardNames, [
+        "约 97.0 MB · 2026p60 (4K)",
+        "50.0 MB · 1440p60 (2K)",
+        "约 42.0 MB · 1012p60",
+        "约 25.0 MB · 720p",
+        "大小未知 · 自适应",
+        "12.0 MB · 360p (含音频)",
+        "7.0 MB · 仅音频 M4A (128 kbps)",
+        "大小未知 · 仅音频 WEBM (160 kbps)",
+        "3.0 MB · 音轨",
+      ]);
+
+      // Codec tags show human-readable labels and retain raw codec string in title
+      const codecTags = view
+        .byClass("rs-backup-meta-tag")
+        .filter((n) => n.props.title);
+      assert.ok(
+        codecTags.some(
+          (n) => view.textOf(n) === "AV1" && n.props.title === "av01.0.13M.08",
+        ),
+      );
+      assert.ok(
+        codecTags.some(
+          (n) => view.textOf(n) === "VP9" && n.props.title === "vp09.00.51.08",
+        ),
+      );
+      assert.ok(
+        codecTags.some(
+          (n) => view.textOf(n) === "H.264" && n.props.title === "avc1.64002A",
+        ),
+      );
+      assert.ok(
+        codecTags.some(
+          (n) => view.textOf(n) === "AAC" && n.props.title === "mp4a.40.2",
+        ),
+      );
+      assert.ok(
+        codecTags.some(
+          (n) => view.textOf(n) === "Opus" && n.props.title === "opus",
+        ),
+      );
+
+      const primaryBtn = () => view.byClass("rs-btn--primary")[0];
+      const qualityTag = () => view.byClass("rs-quality-tag")[0];
+
+      // Dynamic primary CTA + .rs-quality-tag across tiers and audio formats
+      for (const [variantId, expectedBtnZh, expectedTagZh, expectedBtnEn] of [
+        [
+          "v-4k",
+          "下载 4K 有声视频",
+          "2026p60 · 4K（预览无声 · 下载含音频）",
+          "Download 4K Video with Audio",
+        ],
+        [
+          "v-2k-webm",
+          "下载 2K 有声视频",
+          "1440p60 · 2K（预览无声 · 下载含音频）",
+          "Download 2K Video with Audio",
+        ],
+        [
+          "v-1080-crop",
+          "下载 1080p 有声视频",
+          "1012p60（预览无声 · 下载含音频）",
+          "Download 1080p Video with Audio",
+        ],
+        [
+          "v-720",
+          "下载 720p 有声视频",
+          "720p（预览无声 · 下载含音频）",
+          "Download 720p Video with Audio",
+        ],
+        [
+          "v-adaptive",
+          "下载有声视频",
+          "自适应（预览无声 · 下载含音频）",
+          "Download Video with Audio",
+        ],
+        [
+          "v-m4a",
+          "下载音频 (M4A)",
+          "仅音频 M4A (128 kbps)",
+          "Download Audio (M4A)",
+        ],
+        [
+          "v-webm-audio",
+          "下载音频 (WEBM)",
+          "仅音频 WEBM (160 kbps)",
+          "Download Audio (WEBM)",
+        ],
+        [
+          "v-generic-audio",
+          "下载音频",
+          "音轨",
+          "Download Audio",
+        ],
+      ]) {
+        view.localeRef.value = "zh-CN";
+        view.selection.choose({ variant_id: variantId });
+        await nextTick();
+        assert.equal(view.textOf(primaryBtn()), expectedBtnZh);
+        assert.equal(view.textOf(qualityTag()), expectedTagZh);
+
+        view.localeRef.value = "en";
+        await nextTick();
+        assert.equal(view.textOf(primaryBtn()), expectedBtnEn);
+      }
+
+      // Copy URL button on split 4K stream remains clickable and emits copy-url with activeVideoUrl
+      view.localeRef.value = "zh-CN";
+      view.selection.choose({ variant_id: "v-4k", source_id: "s-4k" });
+      await nextTick();
+      const copyBtn = view.findAll(
+        view.root,
+        (n) => n.type === "button" && view.textOf(n) === "复制链接",
+      )[0];
+      assert.ok(copyBtn);
+      assert.equal(Boolean(copyBtn.props.disabled), false);
+      copyBtn.props.onClick();
+      assert.deepEqual(view.copied, [url4k]);
+
+      // Clicking primary download button still invokes download-main
+      primaryBtn().props.onClick();
+      assert.deepEqual(view.mainDownloads, ["v-4k"]);
+    } finally {
+      view.app.unmount();
+    }
+
+    // Genuine silent YouTube video (no paired audio track) -> honestly preserves 仅视频无声 and never promises audio
+    const genuineSilentData = {
+      ...pairedData,
+      items: [
+        {
+          id: "yt-silent",
+          type: "video",
+          state: "ready",
+          default: { variant_id: "v-4k", source_id: "s-4k", url: url4k },
+          variants: [pairedData.items[0].variants[0], pairedData.items[0].variants[2]],
+        },
+      ],
+      default_item_id: "yt-silent",
+    };
+    const silentView = await mountInteractiveResult(genuineSilentData, "zh-CN");
+    try {
+      const backupTab = silentView
+        .byClass("rs-tab")
+        .find((n) => silentView.textOf(n).includes("画质选项"));
+      backupTab.props.onClick();
+      await nextTick();
+      assert.deepEqual(
+        silentView.byClass("rs-backup-name").map(silentView.textOf),
+        [
+          "90.0 MB · 2026p60 (4K · 仅视频无声)",
+          "35.0 MB · 1012p60 (仅视频无声)",
+        ],
+      );
+      assert.equal(
+        silentView.textOf(silentView.byClass("rs-quality-tag")[0]),
+        "2026p60 (4K · 仅视频无声)",
+      );
+      assert.equal(
+        silentView.textOf(silentView.byClass("rs-btn--primary")[0]),
+        "下载视频",
+      );
+      assert.ok(
+        !silentView
+          .textOf(silentView.byClass("rs-quality-tag")[0])
+          .includes("下载含音频"),
+      );
+    } finally {
+      silentView.app.unmount();
+    }
   });
 });

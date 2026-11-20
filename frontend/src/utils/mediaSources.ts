@@ -1,5 +1,51 @@
 import type { Variant } from "../types/media";
 
+export function formatCodecLabel(rawCodec: unknown): string {
+  if (typeof rawCodec !== "string") return "";
+  const trimmed = rawCodec.trim();
+  if (!trimmed) return "";
+  const lower = trimmed.toLowerCase();
+  if (lower === "av1" || lower === "av01" || lower.startsWith("av01.")) {
+    return "AV1";
+  }
+  if (
+    lower === "h264" ||
+    lower === "h.264" ||
+    lower === "avc1" ||
+    lower.startsWith("avc1.") ||
+    lower === "avc3" ||
+    lower.startsWith("avc3.")
+  ) {
+    return "H.264";
+  }
+  if (
+    lower === "vp9" ||
+    lower.startsWith("vp9.") ||
+    lower === "vp09" ||
+    lower.startsWith("vp09.")
+  ) {
+    return "VP9";
+  }
+  if (
+    lower === "hevc" ||
+    lower === "h265" ||
+    lower === "h.265" ||
+    lower === "hev1" ||
+    lower.startsWith("hev1.") ||
+    lower === "hvc1" ||
+    lower.startsWith("hvc1.")
+  ) {
+    return "HEVC";
+  }
+  if (lower === "aac" || lower === "mp4a" || lower.startsWith("mp4a.")) {
+    return "AAC";
+  }
+  if (lower === "opus" || lower.startsWith("opus.")) {
+    return "Opus";
+  }
+  return trimmed;
+}
+
 /** Facts only: keep conflicting layers visible instead of inventing a combined ranking. */
 export function variantSpecifications(variant: Variant): string[] {
   if (variant.state === "deferred") return [];
@@ -15,7 +61,8 @@ export function variantSpecifications(variant: Variant): string[] {
       metadata.width && metadata.height ? `${metadata.width}×${metadata.height}` : metadata.width ? `${metadata.width}w` : "",
       metadata.fps ? `${metadata.fps} fps` : "",
       metadata.hdr_type ? hdrLabels[metadata.hdr_type] : "",
-      metadata.video_codec || "",
+      metadata.video_codec ? formatCodecLabel(metadata.video_codec) : "",
+      metadata.audio_codec ? formatCodecLabel(metadata.audio_codec) : "",
       metadata.audio_language || "",
       metadata.audio_channels ? `${metadata.audio_channels} ch` : "",
     ].filter(Boolean) : [],

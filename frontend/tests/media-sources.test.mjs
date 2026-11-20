@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { transformWithEsbuild } from 'vite';
 import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, h, markRaw, nextTick, reactive, ref } from 'vue';
+import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
 
 const require = createRequire(import.meta.url);
 let labels, contract, useVideoSelection, ResultSection;
@@ -20,6 +21,7 @@ before(async () => {
   }
   contract = modules['../utils/mediaContract'] = await load('../src/utils/mediaContract.ts');
   labels = modules['../utils/mediaSources'] = await load('../src/utils/mediaSources.ts');
+  modules['../utils/youtubeHelperCore'] = youtubeHelperCore;
   modules['../services/apiConfig'] = { apiConfig: { baseUrl: '' } };
   ({ useVideoSelection } = await load('../src/composables/useVideoSelection.ts'));
   const content = await readFile(new URL('../src/components/ResultSection.vue', import.meta.url), 'utf8');
@@ -347,7 +349,7 @@ test('compact quality cards preserve the server source, explicit versions and ac
     await view.click('精简展示');
     assert.equal(view.choices().length, 4);
     assert.equal(view.selection.currentTarget.value.url, url('h264-b'), 'collapsing keeps the exact explicit route');
-    assert.match(view.textOf(view.choices()[2]), /h264/);
+    assert.match(view.textOf(view.choices()[2]), /H\.264/);
     assert.deepEqual(value, snapshot, 'display grouping never mutates or removes domain variants');
   } finally { view.app.unmount(); }
 });
@@ -467,6 +469,55 @@ test('failed cover, video poster, avatar, and gallery images hide broken visuals
     assert.equal(view.elements('rs-author-avatar').length, 0);
     assert.equal(view.elements('rs-author-avatar-fb').length, 1);
     assert.equal(view.elements('rs-gallery-img').length, 0);
+  } finally {
+    view.app.unmount();
+  }
+});
+
+test('formatCodecLabel maps technical codec strings to human-readable labels while preserving raw codec in title attribute', async () => {
+  for (const [raw, expected] of [
+    ['av01.0.13M.08', 'AV1'],
+    ['av1', 'AV1'],
+    ['avc1.64002A', 'H.264'],
+    ['h264', 'H.264'],
+    ['vp09.00.51.08', 'VP9'],
+    ['vp9', 'VP9'],
+    ['vp9.2', 'VP9'],
+    ['hev1.1.6.L93.B0', 'HEVC'],
+    ['hvc1.1.6.L120.90', 'HEVC'],
+    ['hevc', 'HEVC'],
+    ['h265', 'HEVC'],
+    ['mp4a.40.2', 'AAC'],
+    ['opus', 'Opus'],
+    ['vp8', 'vp8'],
+    ['prores_422', 'prores_422'],
+    ['', ''],
+    [undefined, ''],
+  ]) {
+    assert.equal(labels.formatCodecLabel(raw), expected, `codec ${String(raw)} -> ${expected}`);
+  }
+
+  const av1Var = variant('v-av1', ['av1'], { width: 3840, height: 2160, video_codec: 'av01.0.13M.08' });
+  const h264Var = variant('v-h264', ['h264'], { width: 1920, height: 1080, video_codec: 'avc1.64002A' });
+  const aacVar = {
+    id: 'v-aac',
+    label: '仅音频 M4A (128 kbps)',
+    metadata: { has_audio: true, audio_codec: 'mp4a.40.2', container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4', evidence: 'upstream' },
+    delivery: { kind: 'file', sources: [{ id: 's-aac', url: 'https://media.example.test/audio.m4a' }] },
+  };
+  const view = await mount(data(item([av1Var, h264Var, aacVar], 'v-av1')));
+  try {
+    await view.click('画质选项');
+    const tags = view.elements('rs-backup-meta-tag');
+    const codecTags = tags.filter(node => node.props.title);
+    assert.deepEqual(
+      codecTags.map(node => ({ label: view.textOf(node), title: node.props.title })),
+      [
+        { label: 'AV1', title: 'av01.0.13M.08' },
+        { label: 'H.264', title: 'avc1.64002A' },
+        { label: 'AAC', title: 'mp4a.40.2' },
+      ],
+    );
   } finally {
     view.app.unmount();
   }
