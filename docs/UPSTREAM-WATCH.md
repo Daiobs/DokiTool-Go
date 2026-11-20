@@ -8,8 +8,8 @@ GitHub Actions 的 **Watch upstream updates**（[`.github/workflows/upstream-wat
 
 | 上游仓库 | 本地权威锁定与跨文件一致性校验范围 | 版本序比对规则 |
 | --- | --- | --- |
-| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | `backend/internal/ytengine/engine.go`（`const PinnedVersion` 与 `OfficialSHA256Sums*` 中的 `yt-dlp_linux` SHA-256）、`.github/workflows/gateway-isolation.yml`（下载 URL 版本与 `yt-dlp_linux` SHA-256） | 按 3/4 段零填充 CalVer `YYYY.MM.DD[.N]` 解析为 4 元整数元组 `(year, month, day, patch_or_0)` 与本地锁定版本比较 |
-| [denoland/deno](https://github.com/denoland/deno) | `backend/internal/platform/youtube/ejs_sandbox.go`（`PinnedDenoVersion` 与 `OfficialDenoSHA256Sums*` 中的 `deno-x86_64-unknown-linux-gnu` SHA-256）、`.github/workflows/release-build.yml`（`v{version}` 下载 URL、`deno {version}` 版本断言与 Linux x86_64 SHA-256）、`scripts/requirements-validation.txt`（`deno=={version}`） | 剥离上游正式版标签前导 `v`（如 `v2.9.8` → `2.9.8`）后按 3 段 SemVer 解析为 `(major, minor, patch)` 与本地锁定版本比较 |
+| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | `backend/internal/ytengine/engine.go`（`const PinnedVersion` 与 `OfficialSHA256Sums` 中的 `yt-dlp_linux` SHA-256）、`.github/workflows/gateway-isolation.yml`（下载 URL 版本与 `yt-dlp_linux` SHA-256） | 按 3/4 段零填充 CalVer `YYYY.MM.DD[.N]` 解析为 4 元整数元组 `(year, month, day, patch_or_0)` 与本地锁定版本比较 |
+| [denoland/deno](https://github.com/denoland/deno) | `backend/internal/platform/youtube/ejs_sandbox.go`（`PinnedDenoVersion` 与 `OfficialDenoSHA256Sums` 中的 `deno-x86_64-unknown-linux-gnu` SHA-256）、`.github/workflows/release-build.yml`（步骤标题、`v{version}` 下载 URL、`deno {version}` 版本断言与解压后 `deno` 的 Linux x86_64 SHA-256）、`scripts/requirements-validation.txt`（`deno=={version}`） | 剥离上游正式版标签前导 `v`（如 `v2.9.8` → `2.9.8`）后按 3 段 SemVer 解析为 `(major, minor, patch)` 与本地锁定版本比较 |
 
 汇总表与变更通知按版本序区分四种状态：
 - `upstream == locked`：`已对齐`
@@ -37,7 +37,53 @@ GitHub Actions 的 **Watch upstream updates**（[`.github/workflows/upstream-wat
 
 - **最小权限**：工作流仅授予 `contents: read` 与 `issues: write`，`actions/checkout` 显式设置 `persist-credentials: false`，且仅在 `Daiobs/DokiTool-Go` 的 `refs/heads/main` 分支运行。
 - **零外部依赖与防注入**：脚本仅使用 Python 3 标准库，禁用 HTTP 重定向（`NoRedirect`）防止转发 `GITHUB_TOKEN`，严格限制 API 域名为 `https://api.github.com` 且仅允许向 `Daiobs/DokiTool-Go` 的 Issues 端点发起受控写入；所有上游字符串（`tag_name`、Release 标题、时间戳）均经过 `safe_text` 转义，阻断 `@mention`、Markdown 链接/表格注入与 HTML 标签。
-- **不下载、不自动升级**：此检查绝对不会下载或执行任何上游二进制、压缩包或源码，也不会自动创建 PR、修改仓库文件或触发部署。升级 `yt-dlp` 或 `Deno` 时，维护者需在经人工审查的 PR 中同步更新全部 5 处锁定文件中的版本号与官方 SHA-256 摘要（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`），并通过全部离线与集成门禁。
+- **不下载、不自动升级**：此检查绝对不会下载或执行任何上游二进制、压缩包或源码，也不会自动创建 PR、修改仓库文件或触发部署。升级 `yt-dlp` 或 `Deno` 时，维护者可使用本地辅助脚本 [`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 同步更新全部 5 处锁定文件中的版本号与官方 SHA-256 摘要（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`），并在经人工审查的 PR 中通过全部离线与集成门禁后合并。
+
+## 使用 `scripts/bump-runtime-pins.py` 同步更新本地锁定
+
+[`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 仅使用 Python 3 标准库，直接复用 `scripts/check-upstream-updates.py` 的版本/哈希正则与 `verify_local_pin_consistency` 校验逻辑，支持单独或同时更新 `yt-dlp` 与 `Deno`：
+
+- **零二进制执行与原子化自检**：脚本绝不执行任何下载或本地二进制文件；写入前先在临时镜像目录对全部 5 处锁定文件执行 `verify_local_pin_consistency` 闭环自检，任一锚点未命中、摘要异常或写入失败均会 fail-closed 报错并保持/回滚工作区原文件不变。
+- **区分 Deno 归档哈希与内部可执行文件哈希**：`OfficialDenoSHA256Sums` 与 `release-build.yml` 锁定的是 `.zip` 解压后内部单一 `deno` 可执行文件本体的 SHA-256（而非外层 `.zip` 归档本身的 SHA-256）。`--deno-zip` 与 `--fetch-official` 均通过标准库 `zipfile` 在内存中校验成员路径（防 Zip Slip、符号链接、多成员与解压体积越界）并流式计算内部 `deno` 二进制摘要，不落盘解压可执行文件。
+- **治理边界**：脚本仅在维护者本地显式调用时修改工作区文件（`--dry-run` 不写盘），**绝不会自动 `git commit`、`git push`、创建 PR 或触发生产部署**；所有运行时版本升级仍必须经过人工代码审查、PR 门禁验证与正式发布 Issue 流程。
+
+常用命令示例：
+
+```bash
+# 1. 先用 --dry-run 预览 unified diff 与 5 文件一致性自检结果（零文件写入）
+python3 -B scripts/bump-runtime-pins.py \
+  --ytdlp-version 2026.11.15 \
+  --ytdlp-sums-file /path/to/SHA2-256SUMS \
+  --dry-run
+
+# 2. 离线显式输入模式（默认，零网络请求）：通过本地 SHA2-256SUMS 与官方 Deno .zip 同步更新
+python3 -B scripts/bump-runtime-pins.py \
+  --ytdlp-version 2026.11.15 \
+  --ytdlp-sums-file /path/to/SHA2-256SUMS \
+  --deno-version 2.10.1 \
+  --deno-zip deno-x86_64-unknown-linux-gnu=/path/to/deno-x86_64-unknown-linux-gnu.zip \
+  --deno-zip deno-aarch64-unknown-linux-gnu=/path/to/deno-aarch64-unknown-linux-gnu.zip \
+  --deno-zip deno-aarch64-apple-darwin=/path/to/deno-aarch64-apple-darwin.zip \
+  --deno-zip deno-x86_64-apple-darwin=/path/to/deno-x86_64-apple-darwin.zip
+
+# 离线模式也可直接传入已知的 64 位小写 SHA-256（Deno 需传解压后 deno 二进制本体的 SHA-256）
+python3 -B scripts/bump-runtime-pins.py \
+  --deno-version 2.10.1 \
+  --deno-sha256 deno-x86_64-unknown-linux-gnu=<64-hex> \
+  --deno-sha256 deno-aarch64-unknown-linux-gnu=<64-hex> \
+  --deno-sha256 deno-aarch64-apple-darwin=<64-hex> \
+  --deno-sha256 deno-x86_64-apple-darwin=<64-hex>
+
+# 3. 受控在线拉取模式（显式传入 --fetch-official，仅允许 HTTPS 访问 github.com /
+#    objects.githubusercontent.com / release-assets.githubusercontent.com 白名单宿主）
+python3 -B scripts/bump-runtime-pins.py \
+  --ytdlp-version 2026.11.15 \
+  --deno-version 2.10.1 \
+  --fetch-official \
+  --dry-run
+```
+
+更新完成后，请人工核对 `docs/go-migration/README.md` 及 `backend/internal/platform/youtube/ejs_sandbox.go` 中的 `PinnedEJSVersion` / solver 脚本摘要是否需要随 `yt-dlp` 同步调整，并运行完整 PR 门禁。
 
 ## 调度限制与本地维护验证
 
