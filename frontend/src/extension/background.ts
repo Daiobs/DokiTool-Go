@@ -1179,7 +1179,7 @@ export function createBackgroundController(
         () => fetchApiJson(parseEndpoint, settings, { method: "GET" }, signal),
         signal,
       );
-      return withTbvideoItems(validateMediaEnvelope(payload));
+      return withTbvideoItems(validateMediaEnvelope(payload, { apiOrigin }));
     };
 
     if (matched.platform === "youtube" && matched.youtubeVideoId) {
@@ -1281,7 +1281,7 @@ export function createBackgroundController(
       );
 
       const finalized = withTbvideoItems(
-        validateMediaEnvelope(finalizePayload),
+        validateMediaEnvelope(finalizePayload, { apiOrigin }),
       );
       const readyState: YouTubeHelperState = {
         status: "ready",
@@ -1336,7 +1336,9 @@ export function createBackgroundController(
       () => fetchApiJson(fullUrl, settings, { method: "GET" }, signal),
       signal,
     );
-    return withTbvideoItems(validateMediaEnvelope(payload));
+    return withTbvideoItems(
+      validateMediaEnvelope(payload, { apiOrigin: validated.origin }),
+    );
   };
 
   const hydrateDeferredMediaItems = async (

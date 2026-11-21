@@ -23,6 +23,7 @@ let extensionDownloadMod;
 let uiTargetHelpersMod;
 let offscreenMod;
 let backgroundMod;
+let mediaContractMod;
 let mediabunny;
 let JSZip;
 
@@ -42,6 +43,7 @@ async function bundleExtensionSuite() {
         export * as uiTargetHelpersMod from "./src/extension/uiTargetHelpers.ts";
         export * as offscreenMod from "./src/extension/offscreen.ts";
         export * as backgroundMod from "./src/extension/background.ts";
+        export * as mediaContractMod from "./src/utils/mediaContract.ts";
       `,
       resolveDir: FRONTEND_DIR,
       loader: "ts",
@@ -64,6 +66,7 @@ before(async () => {
   uiTargetHelpersMod = suite.uiTargetHelpersMod;
   offscreenMod = suite.offscreenMod;
   backgroundMod = suite.backgroundMod;
+  mediaContractMod = suite.mediaContractMod;
   mediabunny = suite.mediabunny;
   JSZip = suite.JSZip;
 });
@@ -4552,5 +4555,174 @@ test("Background Controller lifecycle: dynamic setBadgeText & setTitle across pa
     );
   } finally {
     bg.dispose();
+  }
+});
+
+test("MV3 Weibo relay regression: validateMediaEnvelope & background PARSE_URL/RESOLVE_LAZY_ITEM succeed when location.origin is chrome-extension://", async () => {
+  const prevLocationDesc = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  Object.defineProperty(globalThis, "location", {
+    value: { origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    configurable: true,
+    writable: true,
+  });
+
+  const weiboRelayEnvelope = {
+    schema_version: "1.0",
+    code: "OK",
+    data: {
+      platform: "weibo",
+      content_id: "1034:5339966948180025",
+      title: "微博中转测试视频",
+      source_url:
+        "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
+      generated_at: "2026-11-21T15:00:00Z",
+      cover: {
+        url: "https://wx4.sinaimg.cn/orj480/test-cover.jpg",
+        access: "direct",
+      },
+      author: {
+        name: "测试博主",
+        avatar: {
+          url: "https://tvax2.sinaimg.cn/crop.0.0.100.100/test-avatar.jpg",
+          access: "direct",
+        },
+      },
+      items: [
+        {
+          id: "video-1",
+          type: "video",
+          state: "ready",
+          cover: {
+            url: "/api/media/weibo?ticket=cover-relay-test",
+            access: "relay",
+          },
+          default: {
+            variant_id: "mp4_1080p",
+            url: "/api/media/weibo?ticket=test",
+            access: "relay",
+          },
+          variants: [
+            {
+              id: "mp4_1080p",
+              label: "1080P",
+              delivery: {
+                kind: "file",
+                sources: [
+                  {
+                    url: "/api/media/weibo?ticket=test",
+                    access: "relay",
+                    size_bytes: 1234567,
+                  },
+                ],
+              },
+              metadata: {
+                width: 1920,
+                height: 1080,
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+              },
+            },
+          ],
+        },
+      ],
+      attachments: [
+        {
+          id: "att-1",
+          kind: "audio",
+          label: "伴音",
+          resource: {
+            id: "att-res-1",
+            role: "audio",
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  url: "/api/media/weibo?ticket=audio-test",
+                  access: "relay",
+                },
+              ],
+            },
+          },
+        },
+      ],
+    },
+  };
+
+  let bg = null;
+  try {
+    // 1. Without apiOrigin context, chrome-extension:// location.origin must still fail closed
+    assert.throws(
+      () => mediaContractMod.validateMediaEnvelope(weiboRelayEnvelope),
+      /API origin 无效/,
+    );
+
+    // 2. With explicit apiOrigin context, validateMediaEnvelope succeeds across variants, default, cover & attachments
+    const validated = mediaContractMod.validateMediaEnvelope(
+      weiboRelayEnvelope,
+      { apiOrigin: "https://snap.dokitool.com" },
+    );
+    assert.equal(validated.platform, "weibo");
+    assert.equal(
+      validated.items[0].default?.url,
+      "/api/media/weibo?ticket=test",
+    );
+
+    // 3. Full background controller PARSE_URL & RESOLVE_ITEM with chrome-extension:// location.origin
+    const env = createMockMv3Environment();
+    const fetchCalls = [];
+    const mockFetch = async (url) => {
+      fetchCalls.push(String(url));
+      return new Response(JSON.stringify(weiboRelayEnvelope), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const extStorage = storage.createExtensionStorage();
+    bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: extStorage,
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+
+    const parseResp = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
+    });
+    assert.equal(
+      parseResp.ok,
+      true,
+      `PARSE_URL failed: ${parseResp.error || ""}`,
+    );
+    assert.equal(parseResp.data.media.platform, "weibo");
+    assert.equal(
+      parseResp.data.media.items[0].default?.url,
+      "/api/media/weibo?ticket=test",
+    );
+
+    const resolveResp = await env.chrome.runtime.sendMessage({
+      type: "RESOLVE_LAZY_ITEM",
+      resolveUrl:
+        "/api/resolve?platform=weibo&url=https%3A%2F%2Fweibo.com%2Ftv%2Fshow%2F1034%3A5339966948180025&item=video-1",
+    });
+    assert.equal(
+      resolveResp.ok,
+      true,
+      `RESOLVE_LAZY_ITEM failed: ${resolveResp.error || ""}`,
+    );
+    assert.equal(resolveResp.data.media.platform, "weibo");
+    assert.equal(fetchCalls.length, 2);
+  } finally {
+    bg?.dispose();
+    if (prevLocationDesc) {
+      Object.defineProperty(globalThis, "location", prevLocationDesc);
+    } else {
+      delete globalThis.location;
+    }
   }
 });

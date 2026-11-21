@@ -354,26 +354,37 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: false,
         };
       }
-      if (
-        segments.length >= 2 &&
-        ["video", "note", "slides"].includes(segments[0].toLowerCase()) &&
-        /^\d{1,25}$/.test(segments[1])
-      ) {
+      const vid = url.searchParams.get("vid")?.trim() ?? "";
+      if (/^\d{1,25}$/.test(vid)) {
         return {
-          dedupeKey: `douyin:item:${segments[1]}`,
+          dedupeKey: `douyin:item:${vid}`,
           isLikelyFeedOrHome: false,
         };
       }
       if (
+        segments.length >= 2 &&
+        ["video", "note", "slides"].includes(segments[0].toLowerCase())
+      ) {
+        const directMatch = /^(\d{1,25})(?:\.html)?$/i.exec(segments[1]);
+        if (directMatch) {
+          return {
+            dedupeKey: `douyin:item:${directMatch[1]}`,
+            isLikelyFeedOrHome: false,
+          };
+        }
+      }
+      if (
         segments.length >= 3 &&
         segments[0].toLowerCase() === "share" &&
-        ["video", "note", "slides"].includes(segments[1].toLowerCase()) &&
-        /^\d{1,25}$/.test(segments[2])
+        ["video", "note", "slides"].includes(segments[1].toLowerCase())
       ) {
-        return {
-          dedupeKey: `douyin:item:${segments[2]}`,
-          isLikelyFeedOrHome: false,
-        };
+        const shareMatch = /^(\d{1,25})(?:\.html)?$/i.exec(segments[2]);
+        if (shareMatch) {
+          return {
+            dedupeKey: `douyin:item:${shareMatch[1]}`,
+            isLikelyFeedOrHome: false,
+          };
+        }
       }
       if (host === "v.douyin.com" && segments.length >= 1) {
         return {
@@ -415,6 +426,16 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: false,
         };
       }
+      const bvidParam = url.searchParams.get("bvid")?.trim() ?? "";
+      if (/^BV[A-Za-z0-9]{10}$/i.test(bvidParam)) {
+        const rawId = `BV${bvidParam.slice(2)}`;
+        const rawPage = url.searchParams.get("p")?.trim() ?? "";
+        const page = /^[1-9]\d*$/.test(rawPage) ? rawPage : "1";
+        return {
+          dedupeKey: `bilibili:video:${rawId}:p=${page}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
       return {
         dedupeKey: fallbackDedupeKey(platform, url),
         isLikelyFeedOrHome: true,
@@ -434,20 +455,23 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: true,
         };
       }
-      // /explore/<noteId> or /discovery/item/<noteId> or /user/profile/<uid>/<noteId>
+      // /explore/<noteId>, /note/<noteId>, /item/<noteId>, /discovery/item/<noteId>, or /user/profile/<uid>/<noteId>
       let noteId = "";
-      if (segments.length >= 2 && segments[0] === "explore") {
+      if (
+        segments.length >= 2 &&
+        ["explore", "note", "item"].includes(segments[0].toLowerCase())
+      ) {
         noteId = segments[1];
       } else if (
         segments.length >= 3 &&
-        segments[0] === "discovery" &&
-        segments[1] === "item"
+        segments[0].toLowerCase() === "discovery" &&
+        segments[1].toLowerCase() === "item"
       ) {
         noteId = segments[2];
       } else if (
         segments.length >= 4 &&
-        segments[0] === "user" &&
-        segments[1] === "profile"
+        segments[0].toLowerCase() === "user" &&
+        segments[1].toLowerCase() === "profile"
       ) {
         noteId = segments[3];
       }
@@ -483,9 +507,10 @@ function analyzePlatformDetails(
       }
       if (
         segments.length === 2 &&
-        (segments[0] === "status" ||
-          segments[0] === "detail" ||
-          /^\d+$/.test(segments[0])) &&
+        ((host === "m.weibo.cn" &&
+          (segments[0] === "status" || segments[0] === "detail")) ||
+          ((host === "weibo.com" || host === "www.weibo.com") &&
+            /^\d+$/.test(segments[0]))) &&
         /^[A-Za-z0-9]{1,32}$/.test(segments[1])
       ) {
         return {
@@ -557,7 +582,9 @@ function analyzePlatformDetails(
     case "kuaishou": {
       if (
         segments.length >= 2 &&
-        segments[0] === "short-video" &&
+        ["short-video", "long-video", "photo"].includes(
+          segments[0].toLowerCase(),
+        ) &&
         /^[A-Za-z0-9_-]+$/.test(segments[1])
       ) {
         return {
@@ -567,8 +594,8 @@ function analyzePlatformDetails(
       }
       if (
         segments.length >= 3 &&
-        segments[0] === "fw" &&
-        segments[1] === "photo" &&
+        segments[0].toLowerCase() === "fw" &&
+        segments[1].toLowerCase() === "photo" &&
         /^[A-Za-z0-9_-]+$/.test(segments[2])
       ) {
         return {
@@ -617,15 +644,29 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: false,
         };
       }
-      if (host.endsWith("toutiaoimg.com") && segments.length >= 1) {
+      if (
+        segments.length >= 2 &&
+        segments[0].toLowerCase() === "is" &&
+        /^[A-Za-z0-9_-]{3,40}$/.test(segments[1])
+      ) {
         return {
-          dedupeKey: fallbackDedupeKey(platform, url),
+          dedupeKey: `toutiao:short:${segments[1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      const toutiaoQueryId =
+        url.searchParams.get("group_id")?.trim() ||
+        url.searchParams.get("item_id")?.trim() ||
+        "";
+      if (/^\d{1,25}$/.test(toutiaoQueryId)) {
+        return {
+          dedupeKey: `toutiao:item:${toutiaoQueryId}`,
           isLikelyFeedOrHome: false,
         };
       }
       return {
         dedupeKey: fallbackDedupeKey(platform, url),
-        isLikelyFeedOrHome: segments.length === 0 || segments[0] === "ch",
+        isLikelyFeedOrHome: true,
       };
     }
 
@@ -642,6 +683,13 @@ function analyzePlatformDetails(
             isLikelyFeedOrHome: false,
           };
         }
+      }
+      const pipixiaItemId = url.searchParams.get("item_id")?.trim() ?? "";
+      if (/^\d{1,25}$/.test(pipixiaItemId)) {
+        return {
+          dedupeKey: `pipixia:item:${pipixiaItemId}`,
+          isLikelyFeedOrHome: false,
+        };
       }
       if (segments.length >= 2 && segments[0] === "s") {
         return {
@@ -688,9 +736,22 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: false,
         };
       }
+      const detailIdx = segments.findIndex(
+        (seg) => seg.toLowerCase() === "detail",
+      );
+      if (
+        detailIdx >= 0 &&
+        segments[detailIdx + 1] &&
+        /^\d{1,25}$/.test(segments[detailIdx + 1])
+      ) {
+        return {
+          dedupeKey: `zuiyou:post:${segments[detailIdx + 1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
       if (
         segments.length >= 2 &&
-        ["post", "detail"].includes(segments[0].toLowerCase()) &&
+        segments[0].toLowerCase() === "post" &&
         /^\d{1,25}$/.test(segments[1])
       ) {
         return {
@@ -717,7 +778,7 @@ function analyzePlatformDetails(
       const watchV = url.searchParams.get("v")?.trim() ?? "";
       if (
         segments.length >= 1 &&
-        segments[0].toLowerCase() === "watch" &&
+        ["watch", "video.php"].includes(segments[0].toLowerCase()) &&
         /^\d{1,25}$/.test(watchV)
       ) {
         return {
@@ -725,47 +786,109 @@ function analyzePlatformDetails(
           isLikelyFeedOrHome: false,
         };
       }
+      if (
+        segments.length >= 3 &&
+        segments[0].toLowerCase() === "share" &&
+        ["v", "r"].includes(segments[1].toLowerCase()) &&
+        /^[A-Za-z0-9_-]{3,64}$/.test(segments[2])
+      ) {
+        return {
+          dedupeKey: `facebook:share:${segments[1].toLowerCase()}:${segments[2]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
       const reelIdx = segments.findIndex((s) =>
         ["reel", "videos"].includes(s.toLowerCase()),
       );
       if (reelIdx >= 0 && segments[reelIdx + 1]) {
+        const rawVideoSeg = segments[reelIdx + 1];
+        const videoId =
+          !/^\d+$/.test(rawVideoSeg) &&
+          segments[reelIdx + 2] &&
+          /^\d{1,25}$/.test(segments[reelIdx + 2])
+            ? segments[reelIdx + 2]
+            : rawVideoSeg;
         return {
-          dedupeKey: `facebook:video:${segments[reelIdx + 1]}`,
+          dedupeKey: `facebook:video:${videoId}`,
           isLikelyFeedOrHome: false,
         };
       }
-      const isFeed =
-        segments.length === 0 ||
-        segments[0].toLowerCase() === "home.php" ||
-        (segments.length === 1 && segments[0].toLowerCase() === "watch" && !watchV);
+      const postsIdx = segments.findIndex((s) => s.toLowerCase() === "posts");
+      if (postsIdx >= 1 && segments[postsIdx + 1]) {
+        return {
+          dedupeKey: `facebook:post:${segments[postsIdx + 1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      const storyFbid = url.searchParams.get("story_fbid")?.trim() ?? "";
+      if (
+        segments.length >= 1 &&
+        ["permalink.php", "story.php"].includes(segments[0].toLowerCase()) &&
+        /^[A-Za-z0-9_-]{3,80}$/.test(storyFbid)
+      ) {
+        return {
+          dedupeKey: `facebook:post:${storyFbid}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
       return {
         dedupeKey: fallbackDedupeKey(platform, url),
-        isLikelyFeedOrHome: isFeed,
+        isLikelyFeedOrHome: true,
       };
     }
 
     case "tumblr": {
       const postIdx = segments.findIndex((s) => s.toLowerCase() === "post");
-      if (postIdx >= 0 && segments[postIdx + 1] && /^\d+$/.test(segments[postIdx + 1])) {
+      if (
+        postIdx >= 0 &&
+        segments[postIdx + 1] &&
+        /^\d{1,25}$/.test(segments[postIdx + 1])
+      ) {
         return {
           dedupeKey: `tumblr:post:${segments[postIdx + 1]}`,
           isLikelyFeedOrHome: false,
         };
       }
-      if (segments.length >= 2 && /^\d{1,25}$/.test(segments[1])) {
+      if (
+        segments.length >= 4 &&
+        segments[0].toLowerCase() === "blog" &&
+        segments[1].toLowerCase() === "view" &&
+        /^\d{1,25}$/.test(segments[3])
+      ) {
+        return {
+          dedupeKey: `tumblr:post:${segments[3]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      const tumblrReservedRoots = new Set([
+        "dashboard",
+        "explore",
+        "following",
+        "likes",
+        "tagged",
+        "search",
+        "settings",
+        "inbox",
+        "messages",
+        "login",
+        "register",
+        "blog",
+        "communities",
+        "activity",
+      ]);
+      if (
+        segments.length >= 2 &&
+        !tumblrReservedRoots.has(segments[0].toLowerCase()) &&
+        /^\d{1,25}$/.test(segments[1])
+      ) {
         return {
           dedupeKey: `tumblr:post:${segments[1]}`,
           isLikelyFeedOrHome: false,
         };
       }
-      const isFeed =
-        segments.length === 0 ||
-        ["dashboard", "explore", "following", "likes", "tagged", "search"].includes(
-          segments[0].toLowerCase(),
-        );
       return {
         dedupeKey: fallbackDedupeKey(platform, url),
-        isLikelyFeedOrHome: isFeed,
+        isLikelyFeedOrHome: true,
       };
     }
   }
