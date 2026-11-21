@@ -1,0 +1,67 @@
+# DokiTool Chrome MV3 侧边栏原生扩展（`sidePanel` + `offscreen`）
+
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘或 YouTube 4K60 无损合流。
+
+---
+
+## 核心特性
+
+1. **后台保活落盘（关掉侧边栏不断流）**
+   - 媒体拉流、多线路顺序回退、HLS / 字节分片拼接、ZIP 打包与 Mediabunny 音视频无损合流均在独立的 `offscreen` 文档中写入浏览器私有文件系统（OPFS），完成后交由 `chrome.downloads` 落盘，并在收到终态事件（`complete` / `interrupted`）后权威回收 `Blob URL` 与 OPFS 临时文件。
+2. **内置免油猴 YouTube 4K60 无损合流**
+   - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
+3. **五种高频素材收集入口**
+   - **点击工具栏扩展图标**：一键展开侧边栏。
+   - **全局快捷键 `Alt+Shift+D`**：全屏看视频或刷信息流时直接呼出侧边栏并同步当前页（可在 `chrome://extensions/shortcuts` 自定义改键）。
+   - **网页右键双菜单（零 Content Script 注入）**：
+     - 「用 DokiTool 解析此链接」：展开侧边栏预览、选画质或勾选图集条目；
+     - 「用 DokiTool 极速下载（最高画质 / 全部图集）」：无需打开侧边栏，后台直接按画质偏好静默落盘，工具栏角标实时显示进度与完成状态。
+   - **跟随标签页自动同步**：仅在本地命中 14 个受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）。
+   - **批量链接队列模式**：粘贴整段多行分享文本，本地自动提取、过滤与去重受支持平台链接，按序解析并并发落盘到各自 `<安全标题>/` 子文件夹，单条失败不中断队列且支持一键重试。
+4. **Pixiv 式勾选与子文件夹无上限保存**
+   - 图集、实况照片（支持「视频 + 封面 / 仅视频 / 仅封面」三档过滤）与哔哩哔哩多 P 支持全选、反选与单项勾选。
+   - 默认按 `<可选前缀>/<安全标题>/001.jpg` 逐个流式落盘（无内存体积上限），同时保留 `500 MiB` 以内的一键 ZIP 打包按钮；下载完成后可一键「打开文件夹」在系统文件管理器中定位文件。
+
+---
+
+## 构建与在 Chrome 中加载
+
+环境要求：**Node.js `20+`**，桌面版 **Google Chrome `116+`**（支持 MV3 `sidePanel`、`offscreen` 与 `runtime.getContexts`）。
+
+### 1. 本地构建扩展产物
+
+```bash
+cd frontend
+npm ci
+npm run build:extension
+```
+
+构建完成后，独立产物输出至 `frontend/dist-extension/`（该目录受 `.gitignore` 与 `scripts/check-public-files.py` 双重门禁保护，绝不纳入 Git 提交），且构建脚本会自动执行 MV3 权限最小化、禁通配符与零远程脚本静态门禁校验。
+
+### 2. 在 Chrome 开发者模式中加载
+
+1. 在 Chrome 地址栏打开 `chrome://extensions/`；
+2. 打开右上角的 **「开发者模式」（Developer mode）** 开关；
+3. 点击左上角 **「加载已解压的扩展程序」（Load unpacked）**，选择仓库下的 `frontend/dist-extension` 目录；
+4. 建议点击浏览器右上角拼图图标，将 **「DokiTool 素材下载助手」** 固定（Pin）到工具栏。
+
+---
+
+## 配置专属 Bearer Token 与下载偏好
+
+点击侧边栏右上角的齿轮按钮打开 **设置抽屉**：
+
+- **后端地址**：默认连接线上 `https://snap.dokitool.com`；仅接受 `https://` 公开域名或本机调试回环地址 `http://127.0.0.1:<port>` / `http://localhost:<port>`（填写本机回环地址点击保存或测试时，浏览器会按需弹窗申请 `optional_host_permissions` 授权）。
+- **专属 Bearer Token**：
+  - 由用户本人粘贴保存于扩展隔离的 `chrome.storage.local`（绝不写入网页存储或会话存储）；
+  - 点击 **「测试连通性」** 会请求 `GET /api/platforms?schema_version=1.0`：凭据有效显示 `200 已就绪`；凭据错误或已停用明确返回 `401 认证凭据无效`；留空保存则进入匿名模式（完全省略 `Authorization` 请求头）；
+  - 若使用限定平台的受限密钥（如仅授权部分平台的 `friend` 密钥）解析未授权平台，侧边栏会原样展示服务端返回的 `当前凭据无权访问该平台`。
+- **下载偏好**：可配置默认子目录前缀（如 `DokiTool`，内置跨平台非法字符、路径穿越 `..` 与 Windows 保留设备名清洗）、默认批量保存方式（子文件夹逐个保存 / 打包 ZIP）、默认画质偏好（最高画质 / 1080p 优先 / 仅音频）以及是否自动跟随标签页。
+
+---
+
+## 安全与隐私边界
+
+- **零网页注入、零 `<all_urls>` 通配符**：`manifest.json` 不声明任何 `content_scripts`，不包含 `cookies`、`scripting`、`debugger`、`webRequestBlocking` 或未受限的 `declarativeNetRequest` 权限；`host_permissions` 仅列出 `https://snap.dokitool.com/*` 与 14 个平台显式媒体 CDN 域名。
+- **浏览隐私防火墙**：标签页 URL 先在扩展本地执行 14 平台域名与路径语法匹配；访问任何非支持网站、`chrome://`、`file://` 或内网页面时均静默忽略，**向后端发送 0 请求**。
+- **全链路无 Cookie 直连**：扩展发往后端 API 与各平台媒体 CDN 的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则剥离 `Cookie` 与扩展 `Origin` 头，绝不触碰浏览器已登录的站点账号状态，亦不影响用户正常网页浏览。
