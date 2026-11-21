@@ -440,6 +440,12 @@ func (h *Handler) serveCachedParse(
 	channel string,
 	wallStart time.Time,
 ) {
+	if res, ok := h.cache.getFresh(key, h.now()); ok {
+		h.stats.recordCacheHit(channel)
+		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
+		writeResponse(w, res)
+		return
+	}
 	h.cache.mu.Lock()
 	if res, ok := h.cache.getLocked(key, h.now()); ok {
 		h.cache.mu.Unlock()

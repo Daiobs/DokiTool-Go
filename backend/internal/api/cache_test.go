@@ -2386,3 +2386,159 @@ func TestUncachedParseAndResolveRecoverPanicsWithoutLeak(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCacheLockFreeReadHitsLazyLRUAndConcurrentRace(t *testing.T) {
+	baseTime := time.Unix(1793448000, 0).UTC()
+
+	t.Run("interleaved-read-hits-and-non-full-puts-evict-exact-lru", func(t *testing.T) {
+		pc, err := newParseCache(CacheConfig{
+			MaxEntries: 4,
+			MaxBytes:   1 << 20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mkKey := func(id string) cacheKey {
+			return cacheKey{route: "/api/parse", platform: "douyin", url: "https://www.douyin.com/video/" + id}
+		}
+		mkRes := func(id string) cachedResponse {
+			return cachedResponse{status: 200, code: "OK", body: []byte(`{"id":"` + id + `"}`)}
+		}
+		put := func(id string) {
+			pc.mu.Lock()
+			pc.putLocked(mkKey(id), mkRes(id), baseTime.Add(60*time.Second))
+			pc.mu.Unlock()
+		}
+
+		// Insert A(1), B(2), C(3) while cache is not yet full (3 < 4).
+		put("A")
+		put("B")
+		put("C")
+
+		// Pure RLock read hit on A (seq=4), then non-full put D (seq=5).
+		// True recency order from MRU to LRU is now: D(5), A(4), C(3), B(2).
+		if res, ok := pc.getFresh(mkKey("A"), baseTime); !ok || string(res.body) != `{"id":"A"}` {
+			t.Fatalf("expected getFresh(A) hit, got ok=%v res=%+v", ok, res)
+		}
+		put("D")
+
+		// Put E triggers 1 eviction -> must evict B(2), keeping E, D, A, C!
+		put("E")
+		if _, ok := pc.getFresh(mkKey("B"), baseTime); ok {
+			t.Fatal("expected true LRU entry B to be evicted")
+		}
+		for _, wantAlive := range []string{"E", "D", "A", "C"} {
+			if !pc.fresh(mkKey(wantAlive), baseTime) {
+				t.Fatalf("expected %s to remain cached after evicting B", wantAlive)
+			}
+		}
+
+		// Now C is the oldest untouched entry (seq=3), while A had seq=4, D had seq=5, E had seq=6.
+		// Put F triggers 1 eviction -> must evict C(3) in O(1), keeping F, E, D, A!
+		put("F")
+		if pc.fresh(mkKey("C"), baseTime) {
+			t.Fatal("expected next LRU entry C to be evicted")
+		}
+		for _, wantAlive := range []string{"F", "E", "D", "A"} {
+			if !pc.fresh(mkKey(wantAlive), baseTime) {
+				t.Fatalf("expected %s to remain cached after evicting C", wantAlive)
+			}
+		}
+
+		// Exact nanosecond expiry boundary under getFresh and fresh.
+		expAt := baseTime.Add(60 * time.Second)
+		if _, ok := pc.getFresh(mkKey("A"), expAt.Add(-time.Nanosecond)); !ok {
+			t.Fatal("expected getFresh to succeed 1ns before expiresAt")
+		}
+		if _, ok := pc.getFresh(mkKey("A"), expAt); ok {
+			t.Fatal("expected getFresh to return false at exact expiresAt boundary")
+		}
+		if pc.fresh(mkKey("A"), expAt) {
+			t.Fatal("expected fresh to return false at exact expiresAt boundary")
+		}
+	})
+
+	t.Run("concurrent-rlock-readers-proceed-while-shared-rlock-is-held-and-pass-race", func(t *testing.T) {
+		pc, err := newParseCache(CacheConfig{
+			MaxEntries: 16,
+			MaxBytes:   1 << 20,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hotKey := cacheKey{route: "/api/parse", platform: "douyin", url: "https://www.douyin.com/video/hot"}
+		pc.mu.Lock()
+		pc.putLocked(hotKey, cachedResponse{status: 200, code: "OK", body: []byte(`{"hot":true}`)}, baseTime.Add(time.Minute))
+		pc.mu.Unlock()
+
+		// Hold an explicit RLock while 16 concurrent readers call getFresh and fresh:
+		// if getFresh or fresh ever attempted Lock(), this would deadlock immediately.
+		pc.mu.RLock()
+		doneReaders := make(chan struct{})
+		go func() {
+			var rwg sync.WaitGroup
+			for i := 0; i < 16; i++ {
+				rwg.Add(1)
+				go func() {
+					defer rwg.Done()
+					for j := 0; j < 50; j++ {
+						if !pc.fresh(hotKey, baseTime) {
+							t.Errorf("fresh(hotKey) returned false")
+						}
+						if _, ok := pc.getFresh(hotKey, baseTime); !ok {
+							t.Errorf("getFresh(hotKey) returned false")
+						}
+					}
+				}()
+			}
+			rwg.Wait()
+			close(doneReaders)
+		}()
+		select {
+		case <-doneReaders:
+		case <-time.After(2 * time.Second):
+			pc.mu.RUnlock()
+			t.Fatal("concurrent getFresh/fresh blocked while RLock was held")
+		}
+		pc.mu.RUnlock()
+
+		// High-contention concurrent readers + writers + evictions under -race.
+		var wg sync.WaitGroup
+		for r := 0; r < 12; r++ {
+			wg.Add(1)
+			go func(readerID int) {
+				defer wg.Done()
+				for iter := 0; iter < 400; iter++ {
+					id := fmt.Sprintf("item-%d", (readerID+iter)%32)
+					k := cacheKey{route: "/api/parse", platform: "douyin", url: "https://www.douyin.com/video/" + id}
+					_, _ = pc.getFresh(k, baseTime.Add(time.Duration(iter%90)*time.Second))
+					_ = pc.fresh(k, baseTime)
+					_, _ = pc.stats()
+				}
+			}(r)
+		}
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func(writerID int) {
+				defer wg.Done()
+				for iter := 0; iter < 200; iter++ {
+					id := fmt.Sprintf("item-%d", (writerID*7+iter)%32)
+					k := cacheKey{route: "/api/parse", platform: "douyin", url: "https://www.douyin.com/video/" + id}
+					res := cachedResponse{status: 200, code: "OK", body: []byte(`{"id":"` + id + `"}`)}
+					pc.mu.Lock()
+					if iter%5 == 0 {
+						_, _ = pc.getLocked(k, baseTime.Add(time.Duration(iter%90)*time.Second))
+					}
+					pc.putLocked(k, res, baseTime.Add(60*time.Second))
+					pc.mu.Unlock()
+				}
+			}(w)
+		}
+		wg.Wait()
+
+		entries, usedBytes := pc.stats()
+		if entries < 0 || entries > 16 || usedBytes < 0 || usedBytes > (1<<20) {
+			t.Fatalf("cache bounds violated after concurrent race stress: entries=%d bytes=%d", entries, usedBytes)
+		}
+	})
+}
