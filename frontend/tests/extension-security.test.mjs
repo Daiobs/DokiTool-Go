@@ -1,15 +1,20 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, stop } from "esbuild";
+import JSZip from "jszip";
 import {
   buildExtension,
+  createDeterministicZipBuffer,
+  packageExtensionZip,
   verifyExtensionDist,
+  verifyExtensionZip,
 } from "../scripts/build-extension.mjs";
 
 let hostWhitelist;
@@ -918,6 +923,130 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
   } finally {
     await rm(prodOut, { recursive: true, force: true });
     await rm(devOut, { recursive: true, force: true });
+  }
+});
+
+test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-for-byte verification, and --dev-loopback refusal", async () => {
+  const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+  // 1. createDeterministicZipBuffer is OS/order/time-independent with fixed DOS timestamp & UTF-8 flag
+  const sampleA = [
+    { path: "z/file.txt", data: "hello world\n".repeat(40) },
+    { path: "a/alpha.json", data: '{"ok":true}\n' },
+    { path: "manifest.json", data: '{"manifest_version":3}\n' },
+  ];
+  const sampleB = [...sampleA].reverse();
+  const bufA = createDeterministicZipBuffer(sampleA);
+  const bufB = createDeterministicZipBuffer(sampleB);
+  assert.equal(sha256(bufA), sha256(bufB), "reversed input order must produce byte-identical ZIP");
+  assert.equal(bufA.readUInt32LE(0), 0x04034b50, "must begin with PKZIP local header magic");
+  assert.equal(bufA.readUInt16LE(6), 0x0800, "must set UTF-8 general-purpose bit flag");
+  assert.equal(bufA.readUInt16LE(10), 0x0000, "must pin fixed DOS time 00:00:00");
+  assert.equal(
+    bufA.readUInt16LE(12),
+    ((2026 - 1980) << 9) | (1 << 5) | 1,
+    "must pin fixed DOS date 2026-01-01",
+  );
+
+  // Verify entry order is strictly lexicographical by POSIX path
+  const parsedSample = await JSZip.loadAsync(bufA);
+  assert.deepEqual(Object.keys(parsedSample.files), [
+    "a/alpha.json",
+    "manifest.json",
+    "z/file.txt",
+  ]);
+
+  // 2. Full production buildExtension with zipOut + determinism across repeated packageExtensionZip calls
+  const tmpBase = await mkdtemp(join(tmpdir(), "dokitool-ext-zip-test-"));
+  const prodOut = join(tmpBase, "dist-extension");
+  const zipPath1 = join(tmpBase, "out", "dokitool-chrome-extension.zip");
+  const zipPath2 = join(tmpBase, "out", "dokitool-chrome-extension-repeat.zip");
+  const devOut = join(tmpBase, "dist-extension-dev");
+  const devZipPath = join(tmpBase, "out", "dev-loopback-forbidden.zip");
+  try {
+    const built = await buildExtension({
+      devLoopback: false,
+      outDir: prodOut,
+      zipOut: zipPath1,
+      quiet: true,
+    });
+    assert.ok(built.zip, "buildExtension with zipOut must return zip metadata");
+    assert.equal(existsSync(zipPath1), true);
+    assert.equal(built.zip.zipPath, resolve(zipPath1));
+    assert.ok(built.zip.sizeBytes > 0);
+    assert.match(built.zip.sha256, /^[0-9a-f]{64}$/);
+
+    // Verify ZIP has manifest.json directly at archive root (no wrapping folder) and matches every file byte-for-byte
+    const verified = await verifyExtensionZip(zipPath1, prodOut);
+    assert.equal(verified.sha256, built.zip.sha256);
+    assert.equal(verified.manifest.manifest_version, 3);
+    const parsedZip = await JSZip.loadAsync(await readFile(zipPath1));
+    assert.ok(parsedZip.files["manifest.json"], "manifest.json must sit directly at ZIP root");
+    assert.ok(parsedZip.files["background.js"], "background.js must sit directly at ZIP root");
+    assert.ok(parsedZip.files["sidepanel.html"], "sidepanel.html must sit directly at ZIP root");
+    assert.ok(parsedZip.files["offscreen.html"], "offscreen.html must sit directly at ZIP root");
+    assert.ok(parsedZip.files["icons/icon-128.png"], "icons/icon-128.png must sit at root icons/");
+
+    // Packaging the same built directory twice yields identical SHA-256
+    const repacked = await packageExtensionZip(prodOut, zipPath2);
+    assert.equal(
+      repacked.sha256,
+      built.zip.sha256,
+      "repeated packageExtensionZip calls must emit 100% identical SHA-256",
+    );
+
+    // 3. Security guard: devLoopback=true combined with zipOut MUST throw and refuse to emit a ZIP
+    await assert.rejects(
+      () =>
+        buildExtension({
+          devLoopback: true,
+          outDir: devOut,
+          zipOut: devZipPath,
+          quiet: true,
+        }),
+      /--dev-loopback/,
+    );
+    assert.equal(
+      existsSync(devZipPath),
+      false,
+      "dev-loopback refusal must not create a ZIP file",
+    );
+
+    // 4. verifyExtensionZip rejects a ZIP that wraps manifest.json in a subdirectory
+    const wrappedZipPath = join(tmpBase, "wrapped.zip");
+    const manifestBytes = await readFile(join(prodOut, "manifest.json"));
+    const wrappedBuf = createDeterministicZipBuffer([
+      { path: "dokitool-chrome-extension/manifest.json", data: manifestBytes },
+    ]);
+    await writeFile(wrappedZipPath, wrappedBuf);
+    await assert.rejects(
+      () => verifyExtensionZip(wrappedZipPath),
+      /manifest\.json directly at archive root/,
+    );
+
+    // 5. verifyExtensionZip rejects a ZIP containing a tampered production manifest (e.g. loopback host)
+    const badManifestZipPath = join(tmpBase, "bad-manifest.zip");
+    const badManifest = {
+      ...built.manifest,
+      host_permissions: [...built.manifest.host_permissions, "http://127.0.0.1/*"],
+    };
+    const badZipEntries = [];
+    for (const [name, entry] of Object.entries(parsedZip.files)) {
+      badZipEntries.push({
+        path: name,
+        data:
+          name === "manifest.json"
+            ? Buffer.from(JSON.stringify(badManifest, null, 2) + "\n", "utf8")
+            : await entry.async("nodebuffer"),
+      });
+    }
+    await writeFile(badManifestZipPath, createDeterministicZipBuffer(badZipEntries));
+    await assert.rejects(
+      () => verifyExtensionZip(badManifestZipPath),
+      /127\.0\.0\.1|localhost/,
+    );
+  } finally {
+    await rm(tmpBase, { recursive: true, force: true });
   }
 });
 
