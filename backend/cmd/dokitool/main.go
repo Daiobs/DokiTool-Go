@@ -15,10 +15,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
@@ -82,6 +85,9 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	}
+	if command == "hash-token" {
+		return runHashToken(args, os.Stdin, os.Stdout)
+	}
 	if command == "validate" {
 		body, err := io.ReadAll(io.LimitReader(os.Stdin, (8<<20)+1))
 		if err != nil {
@@ -107,7 +113,7 @@ func run(args []string) error {
 		return emit(c.Envelope())
 	}
 	if command != "serve" {
-		return fmt.Errorf("unknown command %q (serve, catalog, validate, version)", command)
+		return fmt.Errorf("unknown command %q (serve, catalog, validate, hash-token, version)", command)
 	}
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := flags.String("listen", "127.0.0.1:9082", "loopback API listener; use an authenticated edge for public traffic")
@@ -187,17 +193,22 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	ownerAuth, err := loadOwnerAuth(os.Getenv)
+	keyRegistry, err := api.LoadAPIKeyRegistry(os.Getenv, limits)
 	if err != nil {
 		return err
 	}
-	entry, err := api.WithAdmissionWithOwner(handler, control, *clientIdentity, os.Getenv("SNAP_INGRESS_KEY"), limits, ownerAuth)
+	entry, err := api.WithAdmissionWithRegistry(handler, control, *clientIdentity, os.Getenv("SNAP_INGRESS_KEY"), limits, keyRegistry)
 	if err != nil {
 		return err
 	}
 	server := &http.Server{Addr: *listen, Handler: entry, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+	stopKeyReload := startAPIKeySignalReloader(ctx, sighup, entry, os.Getenv, limits, log.Printf)
+	defer stopKeyReload()
 	stopStatsLog := handler.Stats().StartPeriodicLog(ctx, api.DefaultStatsLogInterval, log.Printf)
 	defer stopStatsLog()
 	done := make(chan error, 1)
@@ -286,6 +297,83 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 		return broker, broker, nil
 	default:
 		return nil, nil, errors.New("DOKITOOL_SHANGHAI_MODE must be off, direct or pull")
+	}
+}
+
+func runHashToken(args []string, stdin io.Reader, stdout io.Writer) error {
+	if len(args) > 0 {
+		return errors.New("hash-token reads from stdin; do not pass token in arguments")
+	}
+	if stdin == nil || stdout == nil {
+		return errors.New("missing hash-token streams")
+	}
+	rawBytes, err := io.ReadAll(io.LimitReader(stdin, bearer.MaxTokenBytes+3))
+	if err != nil {
+		return errors.New("failed to read token from stdin")
+	}
+	raw := string(rawBytes)
+	if strings.HasSuffix(raw, "\r\n") {
+		raw = raw[:len(raw)-2]
+	} else if strings.HasSuffix(raw, "\n") {
+		raw = raw[:len(raw)-1]
+	}
+	if err := bearer.ValidateToken(raw); err != nil {
+		return err
+	}
+	sum := bearer.Digest(raw)
+	_, err = fmt.Fprintf(stdout, "%x\n", sum)
+	return err
+}
+
+func reloadAPIKeysOnce(entry http.Handler, getenv func(string) string, limits api.AdmissionConfig, logf func(string, ...any)) bool {
+	next, err := api.LoadAPIKeyRegistry(getenv, limits)
+	if err != nil {
+		if logf != nil {
+			logf("dokitool: api keys reload rejected (keeping previous configuration): %v", err)
+		}
+		return false
+	}
+	if !api.ReloadAPIKeys(entry, next) {
+		return false
+	}
+	if logf != nil {
+		logf("dokitool: api keys reloaded (keys=%d)", next.Len())
+	}
+	return true
+}
+
+func startAPIKeySignalReloader(
+	ctx context.Context,
+	sigCh <-chan os.Signal,
+	entry http.Handler,
+	getenv func(string) string,
+	limits api.AdmissionConfig,
+	logf func(string, ...any),
+) func() {
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case _, ok := <-sigCh:
+				if !ok {
+					return
+				}
+				reloadAPIKeysOnce(entry, getenv, limits, logf)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stopCh)
+			<-doneCh
+		})
 	}
 }
 

@@ -18,12 +18,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
@@ -1353,3 +1357,425 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 		})
 	}
 }
+
+func TestDokitoolMainSubprocessHelper(t *testing.T) {
+	raw := os.Getenv("DOKITOOL_TEST_MAIN_ARGS")
+	if raw == "" {
+		return
+	}
+	os.Args = append([]string{"dokitool"}, strings.Split(raw, "\n")...)
+	main()
+}
+
+func TestHashTokenSubcommand(t *testing.T) {
+	canaryArg := "cli-arg-secret-token-never-echo-9876543210"
+	for _, badArgs := range [][]string{
+		{canaryArg},
+		{"--token=" + canaryArg},
+		{"-h"},
+	} {
+		var out bytes.Buffer
+		err := runHashToken(badArgs, strings.NewReader(""), &out)
+		if err == nil || err.Error() != "hash-token reads from stdin; do not pass token in arguments" {
+			t.Fatalf("runHashToken(%v) = %v, want exact argument rejection message", badArgs, err)
+		}
+		if strings.Contains(err.Error(), "cli-arg-secret") || out.Len() != 0 {
+			t.Fatalf("runHashToken leaked CLI secret or wrote stdout: err=%v out=%q", err, out.String())
+		}
+	}
+
+	minTok := strings.Repeat("A", bearer.MinTokenBytes)
+	maxTok := strings.Repeat("~", bearer.MaxTokenBytes)
+	sampleTok := randomHexToken(t, 24) // 48 hex chars
+
+	for _, tc := range []struct {
+		name  string
+		stdin string
+		want  string
+	}{
+		{"no-newline", sampleTok, fmt.Sprintf("%x\n", sha256.Sum256([]byte(sampleTok)))},
+		{"lf-newline", sampleTok + "\n", fmt.Sprintf("%x\n", sha256.Sum256([]byte(sampleTok)))},
+		{"crlf-newline", sampleTok + "\r\n", fmt.Sprintf("%x\n", sha256.Sum256([]byte(sampleTok)))},
+		{"min-32-bytes", minTok + "\n", fmt.Sprintf("%x\n", sha256.Sum256([]byte(minTok)))},
+		{"max-512-bytes-with-crlf", maxTok + "\r\n", fmt.Sprintf("%x\n", sha256.Sum256([]byte(maxTok)))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runHashToken(nil, strings.NewReader(tc.stdin), &out); err != nil {
+				t.Fatalf("runHashToken(%s) failed: %v", tc.name, err)
+			}
+			if out.String() != tc.want || len(strings.TrimSuffix(out.String(), "\n")) != 64 {
+				t.Fatalf("runHashToken(%s) = %q, want %q", tc.name, out.String(), tc.want)
+			}
+		})
+	}
+
+	canaryStdin := "stdin-secret-token-material-never-echo-1234"
+	for _, bad := range []struct {
+		name  string
+		stdin string
+	}{
+		{"empty", ""},
+		{"only-lf", "\n"},
+		{"short-31", canaryStdin[:31] + "\n"},
+		{"long-513", canaryStdin + strings.Repeat("x", 513-len(canaryStdin)) + "\n"},
+		{"double-lf", sampleTok + "\n\n"},
+		{"bare-cr", sampleTok + "\r"},
+		{"inner-space", canaryStdin[:20] + " " + canaryStdin[20:] + "\n"},
+		{"non-ascii", canaryStdin[:20] + "密" + canaryStdin[20:] + "\n"},
+	} {
+		t.Run("bad-"+bad.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := runHashToken(nil, strings.NewReader(bad.stdin), &out)
+			if err == nil {
+				t.Fatalf("expected invalid stdin %s to fail", bad.name)
+			}
+			if strings.Contains(err.Error(), "stdin-secret") || out.Len() != 0 {
+				t.Fatalf("hash-token error leaked secret or wrote stdout: err=%v out=%q", err, out.String())
+			}
+		})
+	}
+
+	// End-to-end subprocess verification (`dokitool hash-token`).
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDokitoolMainSubprocessHelper$")
+	cmd.Env = append(os.Environ(), "DOKITOOL_TEST_MAIN_ARGS=hash-token")
+	cmd.Stdin = strings.NewReader(sampleTok + "\n")
+	var subOut, subErr bytes.Buffer
+	cmd.Stdout = &subOut
+	cmd.Stderr = &subErr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("subprocess dokitool hash-token failed: err=%v stderr=%q", err, subErr.String())
+	}
+	wantPrefix := fmt.Sprintf("%x\n", sha256.Sum256([]byte(sampleTok)))
+	if !strings.HasPrefix(subOut.String(), wantPrefix) {
+		t.Fatalf("subprocess hash-token stdout = %q, want prefix %q", subOut.String(), wantPrefix)
+	}
+}
+
+func TestServeAPIKeysFileStartupValidationAndSIGHUPHotReload(t *testing.T) {
+	dir := t.TempDir()
+	manifestFile := filepath.Join(dir, "api-keys.json")
+	canaryShared := randomHexToken(t, 24)
+	canaryPlain := randomHexToken(t, 24)
+	sharedDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(canaryShared)))
+
+	// 1. Startup rejects invalid DOKITOOL_API_KEYS_FILE and system credential collisions before bind.
+	startupRejects := []struct {
+		name string
+		file string
+		env  map[string]string
+	}{
+		{
+			name: "missing-manifest-file",
+			env:  map[string]string{api.EnvAPIKeysFile: filepath.Join(dir, "does-not-exist.json")},
+		},
+		{
+			name: "plaintext-token-field",
+			file: fmt.Sprintf(`{"keys":[{"id":"bad","role":"agent","token":%q,"token_sha256":%q}]}`, canaryPlain, sharedDigest),
+		},
+		{
+			name: "collides-with-ingress-key",
+			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
+			env:  map[string]string{"SNAP_INGRESS_KEY": canaryShared},
+		},
+		{
+			name: "collides-with-media-signing-key",
+			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
+			env:  map[string]string{"SNAP_MEDIA_SIGNING_KEY": canaryShared},
+		},
+		{
+			name: "collides-with-shanghai-token",
+			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
+			env:  map[string]string{"DOKITOOL_SHANGHAI_TOKEN": canaryShared},
+		},
+		{
+			name: "collides-with-shanghai-pull-token",
+			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
+			env: map[string]string{
+				"DOKITOOL_SHANGHAI_MODE":       "pull",
+				"DOKITOOL_SHANGHAI_PULL_TOKEN": canaryShared,
+			},
+		},
+	}
+
+	for _, tc := range startupRejects {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.file != "" {
+				if err := os.WriteFile(manifestFile, []byte(tc.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, k := range []string{
+				"DOKITOOL_OWNER_TOKEN",
+				api.EnvAPIKeysFile,
+				"SNAP_INGRESS_KEY",
+				"SNAP_MEDIA_SIGNING_KEY",
+				"DOKITOOL_SHANGHAI_MODE",
+				"DOKITOOL_SHANGHAI_TOKEN",
+				"DOKITOOL_SHANGHAI_PULL_TOKEN",
+			} {
+				val := tc.env[k]
+				if k == api.EnvAPIKeysFile && val == "" && tc.file != "" {
+					val = manifestFile
+				}
+				t.Setenv(k, val)
+			}
+			occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+			occupied.Close()
+			if runErr == nil {
+				t.Fatalf("expected %s to fail startup before bind", tc.name)
+			}
+			for _, secret := range []string{canaryShared[:12], canaryPlain[:12], sharedDigest[:12], dir} {
+				if strings.Contains(runErr.Error(), secret) {
+					t.Fatalf("%s startup error leaked %q: %v", tc.name, secret, runErr)
+				}
+			}
+		})
+	}
+
+	// 2. End-to-end live subprocess SIGHUP hot-reload (valid reload preserving stats + invalid reload keeping old state).
+	if runtime.GOOS == "windows" {
+		return
+	}
+	ownerTok := randomHexToken(t, 24)
+	agentV1 := randomHexToken(t, 24)
+	agentV2 := randomHexToken(t, 24)
+	friendNew := randomHexToken(t, 24)
+	hexSum := func(s string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(s))) }
+
+	v1JSON := fmt.Sprintf(`{
+		"keys": [{
+			"id": "agent-bot",
+			"role": "agent",
+			"token_sha256": %q,
+			"concurrency": 4,
+			"rps": 100,
+			"burst": 100
+		}]
+	}`, hexSum(agentV1))
+	if err := os.WriteFile(manifestFile, []byte(v1JSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reserve an ephemeral loopback port >= 1024, release it, and launch dokitool serve.
+	probeLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr := probeLn.Addr().String()
+	_ = probeLn.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDokitoolMainSubprocessHelper$")
+	cmd.Env = append(os.Environ(),
+		"DOKITOOL_TEST_MAIN_ARGS="+strings.Join([]string{"serve", "-listen", listenAddr, "-client-identity", "direct"}, "\n"),
+		"DOKITOOL_OWNER_TOKEN="+ownerTok,
+		api.EnvAPIKeysFile+"="+manifestFile,
+	)
+	var logMu sync.Mutex
+	var logBuf bytes.Buffer
+	logWriter := writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logBuf.Write(p)
+	})
+	cmd.Stdout = logWriter
+	cmd.Stderr = logWriter
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start dokitool serve subprocess: %v", err)
+	}
+	var exited atomic.Bool
+	waitDone := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		exited.Store(true)
+		waitDone <- err
+	}()
+	t.Cleanup(func() {
+		if !exited.Load() && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			<-waitDone
+		}
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	doSubReq := func(path, tok string) (int, []byte, error) {
+		req, err := http.NewRequest(http.MethodGet, "http://"+listenAddr+path, nil)
+		if err != nil {
+			return 0, nil, err
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		return resp.StatusCode, b, err
+	}
+
+	// Wait for server readiness via /api/platforms?schema_version=1.0.
+	readyDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if code, _, reqErr := doSubReq("/api/platforms?schema_version=1.0", ""); reqErr == nil && code == http.StatusOK {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			logMu.Lock()
+			logs := logBuf.String()
+			logMu.Unlock()
+			t.Fatalf("dokitool serve subprocess did not become ready on %s; logs=%s", listenAddr, logs)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Send 2 invalid-input /api/parse requests with agentV1 so agent-bot records requests_total=2, errors=2 without any network call!
+	for i := 0; i < 2; i++ {
+		code, _, reqErr := doSubReq("/api/parse?schema_version=1.0&url=not-a-valid-url", agentV1)
+		if reqErr != nil || code != http.StatusBadRequest {
+			t.Fatalf("pre-reload agentV1 /api/parse got code=%d err=%v, want 400", code, reqErr)
+		}
+	}
+	// Agent role cannot read /api/stats (401 -> unauthorized=1, requests_total=3).
+	if code, _, reqErr := doSubReq("/api/stats", agentV1); reqErr != nil || code != http.StatusUnauthorized {
+		t.Fatalf("agentV1 /api/stats got code=%d err=%v, want 401", code, reqErr)
+	}
+
+	// Write V2 manifest (rotate agent-bot to agentV2 with concurrency=6, add friend-new) and send SIGHUP!
+	v2JSON := fmt.Sprintf(`{
+		"keys": [
+			{
+				"id": "agent-bot",
+				"role": "agent",
+				"token_sha256": %q,
+				"concurrency": 6,
+				"rps": 100,
+				"burst": 100
+			},
+			{
+				"id": "friend-new",
+				"role": "friend",
+				"token_sha256": %q,
+				"rps": 50,
+				"burst": 50
+			}
+		]
+	}`, hexSum(agentV2), hexSum(friendNew))
+	if err := os.WriteFile(manifestFile, []byte(v2JSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatalf("SIGHUP #1 failed: %v", err)
+	}
+
+	// Poll until reloaded (keys=3: implicit owner + agent-bot + friend-new).
+	reloadDeadline := time.Now().Add(3 * time.Second)
+	for {
+		logMu.Lock()
+		okReload := strings.Contains(logBuf.String(), "api keys reloaded (keys=3)")
+		logMu.Unlock()
+		if okReload {
+			break
+		}
+		if time.Now().After(reloadDeadline) {
+			logMu.Lock()
+			logs := logBuf.String()
+			logMu.Unlock()
+			t.Fatalf("timed out waiting for SIGHUP #1 reload log; logs=%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify agentV1 is now rejected (401), agentV2 and friendNew work, and agent-bot preserved its cumulative counters!
+	if code, _, _ := doSubReq("/api/parse?schema_version=1.0&url=not-a-valid-url", agentV1); code != http.StatusUnauthorized {
+		t.Fatalf("expected rotated-out agentV1 to get 401, got %d", code)
+	}
+	if code, _, _ := doSubReq("/api/parse?schema_version=1.0&url=not-a-valid-url", agentV2); code != http.StatusBadRequest {
+		t.Fatalf("expected rotated-in agentV2 to authenticate and reach handler (400), got %d", code)
+	}
+	if code, _, _ := doSubReq("/api/parse?schema_version=1.0&url=not-a-valid-url", friendNew); code != http.StatusBadRequest {
+		t.Fatalf("expected friend-new to authenticate and reach handler (400), got %d", code)
+	}
+
+	// Write an INVALID manifest containing a canary secret + digest and send SIGHUP #2 -> must keep V2 active!
+	badCanary := "reload-canary-secret-never-log-55555555"
+	badDigest := hexSum(badCanary)
+	badReloadJSON := fmt.Sprintf(`{"keys":[{"id":"agent-bot","role":"agent","token":%q,"token_sha256":%q}]}`, badCanary, badDigest)
+	if err := os.WriteFile(manifestFile, []byte(badReloadJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatalf("SIGHUP #2 failed: %v", err)
+	}
+	rejectDeadline := time.Now().Add(3 * time.Second)
+	for {
+		logMu.Lock()
+		sawReject := strings.Contains(logBuf.String(), "api keys reload rejected")
+		logMu.Unlock()
+		if sawReject {
+			break
+		}
+		if time.Now().After(rejectDeadline) {
+			logMu.Lock()
+			logs := logBuf.String()
+			logMu.Unlock()
+			t.Fatalf("timed out waiting for SIGHUP #2 rejection log; logs=%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// V2 keys remain active and cumulative stats are intact!
+	if code, _, _ := doSubReq("/api/parse?schema_version=1.0&url=not-a-valid-url", agentV2); code != http.StatusBadRequest {
+		t.Fatalf("agentV2 stopped working after rejected SIGHUP reload: %d", code)
+	}
+	stCode, stBody, stErr := doSubReq("/api/stats", ownerTok)
+	if stErr != nil || stCode != http.StatusOK {
+		t.Fatalf("owner /api/stats after SIGHUP #2 failed: code=%d err=%v", stCode, stErr)
+	}
+	var env struct {
+		Data api.StatsSnapshot `json:"data"`
+	}
+	if err := json.Unmarshal(stBody, &env); err != nil {
+		t.Fatal(err)
+	}
+	var gotAgent *api.APIKeyStatsSnapshot
+	for i := range env.Data.APIKeys {
+		if env.Data.APIKeys[i].ID == "agent-bot" {
+			gotAgent = &env.Data.APIKeys[i]
+		}
+	}
+	// Pre-reload: 2 errors + 1 unauthorized = 3; Post-reload #1: 1 error; Post-reload #2: 1 error => total=5, errors=4, unauthorized=1, concurrency_limit=6!
+	if gotAgent == nil || gotAgent.ConcurrencyLimit != 6 || gotAgent.RequestsTotal != 5 || gotAgent.Errors != 4 || gotAgent.Unauthorized != 1 {
+		t.Fatalf("unexpected agent-bot cumulative stats after SIGHUPs: %+v", gotAgent)
+	}
+
+	// Verify logs contain zero secrets, digests, or local paths, then gracefully shut down subprocess via SIGTERM.
+	logMu.Lock()
+	allLogs := logBuf.String()
+	logMu.Unlock()
+	for _, secret := range []string{ownerTok[:12], agentV1[:12], agentV2[:12], badCanary[:12], badDigest[:12], hexSum(agentV2)[:12], dir} {
+		if strings.Contains(allLogs, secret) {
+			t.Fatalf("server logs leaked secret/digest/path %q: %s", secret, allLogs)
+		}
+	}
+
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case waitErr := <-waitDone:
+		if waitErr != nil {
+			// go test exits 0 when main() returns cleanly on SIGTERM!
+			t.Fatalf("dokitool serve subprocess exited with error on SIGTERM: %v", waitErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dokitool serve subprocess did not shut down within 5s after SIGTERM")
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
