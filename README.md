@@ -28,6 +28,7 @@ DokiTool 是面向多平台的公开短视频、图集与实况照片无水印�
 - **浏览器直下，服务端仅解析**：Go 后端负责输入校验、上游页面/接口解析与统一媒体 v1（`schema_version=1.0`）契约输出；媒体文件由用户浏览器直接连接平台 CDN 下载（通过同源 Service Worker 流式落盘、缓冲拼接或原生附件移交）。**微博视频（`/api/media/weibo`）是唯一的服务端签名媒体流中转例外**。
 - **日本主解析 + 上海国内线路补充（抖音与可选哔哩哔哩）**：主后端承担全站路由与准入限流；上海 `shanghai-resolver` 通过出站 `pull` 模式（`v2` 协议）保持在线：默认认领抖音 `aweme_id` 提取国内 `*.douyinvod.com` 各档清晰度与 4K 原画候选，并在主后端显式开启 `DOKITOOL_SHANGHAI_BILIBILI`（默认关闭）时认领哔哩哔哩 `(bvid, cid)` 补充国内 `*.bilivideo.com` 播放地址，交回主后端合并后由前端并发测速择优下载；上海忙碌或超时时主后端无阻塞回退本地解析。
 - **YouTube 浏览器端取址与无损合并**：桌面浏览器安装同源用户脚本 `dokitool-youtube.user.js` 后，在客户端直接向 `www.youtube.com` 请求播放清单，交由服务端无权限 Deno `ejs` 沙箱解算签名挑战；`1080p` / `4K` 等分离音视频由脚本并发拉取 `googlevideo.com` 并在浏览器内用 Mediabunny 无损封装保存。
+- **Chrome MV3 原生侧边栏扩展（可选）**：桌面 Chrome 用户亦可通过 `cd frontend && npm run build:extension` 构建并加载原生扩展（`sidePanel` + `offscreen` 架构），支持关闭侧边栏后台保活落盘、右键极速下载、`Alt+Shift+D` 呼出、多链接批量队列与免油猴 YouTube 4K60 无损合流，且严格遵循零 Cookie、零 Content Script 与显式 CDN 白名单边界（详见 [docs/EXTENSION.md](docs/EXTENSION.md)）。
 
 ## 目录结构
 
@@ -115,6 +116,7 @@ go run ./cmd/dokitool serve
 - [docs/openapi.json](docs/openapi.json)：统一媒体 v1 与个人 Agent 通道的 OpenAPI `3.1.0` 规范文件
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：`dokitool` 与 `shanghai-resolver` 全部命令行启动参数及环境变量说明
 - [docs/DOWNLOADS.md](docs/DOWNLOADS.md)：浏览器流式下载、多线路测速、ZIP 打包上限、调试开关与应用内置浏览器提示说明
+- [docs/EXTENSION.md](docs/EXTENSION.md)：Chrome MV3 原生侧边栏扩展构建、加载、专属凭据配置与最小权限边界说明
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：生产发布流程（发布 Issue → 干净构建 → 清单核验 → systemd drop-in 与软链原子切换 → 冒烟与复测）
 - [docs/go-migration/rollback.md](docs/go-migration/rollback.md)：生产回滚操作流程与核验门禁
 - [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md)：抖音上海 `pull` 模式（`v2` 协议、3 worker、超时预算、回退与自动重启）设计说明

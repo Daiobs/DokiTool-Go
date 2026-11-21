@@ -44,7 +44,7 @@ def main():
         relative = PurePosixPath(name)
         if '\\' in name or relative.is_absolute() or '..' in relative.parts or relative.as_posix() != name:
             raise ValueError(f'Invalid relative path: {name}')
-        if any(part in {'.git', '.local', '.tools', 'node_modules', '__pycache__', 'artifacts', 'evidence', 'dist'} for part in relative.parts):
+        if any(part in {'.git', '.local', '.tools', 'node_modules', '__pycache__', 'artifacts', 'evidence', 'dist', 'dist-extension'} for part in relative.parts):
             raise ValueError(f'Local/generated directory in inventory: {name}')
         if relative.name.startswith('.env') and relative.name != '.env.example':
             raise ValueError(f'Only .env.example is allowed: {name}')

@@ -1,0 +1,302 @@
+:root {
+  color-scheme: dark;
+  --sp-bg-base: #0b1120;
+  --sp-bg-surface: #11192c;
+  --sp-bg-elevated: #17223b;
+  --sp-bg-hover: #1e2c4a;
+  --sp-bg-input: #0d1526;
+
+  --sp-border: rgba(148, 163, 184, 0.14);
+  --sp-border-strong: rgba(148, 163, 184, 0.24);
+  --sp-border-accent: rgba(99, 102, 241, 0.55);
+
+  --sp-text-primary: #f1f5f9;
+  --sp-text-secondary: #cbd5e1;
+  --sp-text-muted: #8b9bb4;
+
+  --sp-accent-start: #6366f1;
+  --sp-accent-end: #8b5cf6;
+  --sp-accent-soft: rgba(99, 102, 241, 0.14);
+  --sp-accent-glow: 0 6px 18px -4px rgba(99, 102, 241, 0.45);
+
+  --sp-success: #10b981;
+  --sp-success-soft: rgba(16, 185, 129, 0.14);
+  --sp-warning: #f59e0b;
+  --sp-warning-soft: rgba(245, 158, 11, 0.14);
+  --sp-danger: #ef4444;
+  --sp-danger-soft: rgba(239, 68, 68, 0.14);
+
+  --sp-radius-xs: 6px;
+  --sp-radius-sm: 8px;
+  --sp-radius-md: 10px;
+  --sp-radius-lg: 13px;
+  --sp-radius-pill: 999px;
+
+  --sp-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+  --sp-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+
+  --sp-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  max-width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background-color: var(--sp-bg-base);
+  color: var(--sp-text-primary);
+  font-family: var(--sp-font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Custom slim scrollbars for 320px-420px sidepanel */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.42);
+}
+
+/* Shared button primitives */
+.sp-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: var(--sp-radius-md);
+  border: 1px solid transparent;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: transform 140ms var(--sp-ease), box-shadow 160ms var(--sp-ease),
+    background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+}
+
+.sp-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.5);
+}
+
+.sp-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.sp-btn:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.sp-btn--primary {
+  background: linear-gradient(
+    135deg,
+    var(--sp-accent-start) 0%,
+    #7c3aed 52%,
+    var(--sp-accent-end) 100%
+  );
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: var(--sp-accent-glow);
+}
+
+.sp-btn--primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  box-shadow: 0 8px 22px -4px rgba(99, 102, 241, 0.58);
+}
+
+.sp-btn--secondary {
+  background: var(--sp-bg-elevated);
+  color: var(--sp-text-primary);
+  border-color: var(--sp-border-strong);
+}
+
+.sp-btn--secondary:hover:not(:disabled) {
+  background: var(--sp-bg-hover);
+  border-color: var(--sp-border-accent);
+}
+
+.sp-btn--ghost {
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--sp-text-secondary);
+  border-color: var(--sp-border);
+}
+
+.sp-btn--ghost:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--sp-text-primary);
+  border-color: var(--sp-border-strong);
+}
+
+.sp-btn--danger-ghost {
+  background: var(--sp-danger-soft);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.28);
+}
+
+.sp-btn--danger-ghost:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fecaca;
+}
+
+.sp-btn--sm {
+  padding: 5px 9px;
+  font-size: 11.5px;
+  border-radius: var(--sp-radius-sm);
+  gap: 4px;
+}
+
+.sp-btn--xs {
+  padding: 3px 7px;
+  font-size: 11px;
+  border-radius: var(--sp-radius-xs);
+  gap: 3px;
+}
+
+/* Shared input primitives */
+.sp-input,
+.sp-textarea {
+  width: 100%;
+  min-width: 0;
+  background: var(--sp-bg-input);
+  color: var(--sp-text-primary);
+  border: 1px solid var(--sp-border-strong);
+  border-radius: var(--sp-radius-md);
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  outline: none;
+  transition: border-color 150ms ease, box-shadow 150ms ease,
+    background-color 150ms ease;
+}
+
+.sp-input::placeholder,
+.sp-textarea::placeholder {
+  color: var(--sp-text-muted);
+}
+
+.sp-input:focus,
+.sp-textarea:focus {
+  border-color: var(--sp-accent-start);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.22);
+}
+
+/* Badges & pills */
+.sp-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: var(--sp-radius-pill);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.sp-badge--accent {
+  background: var(--sp-accent-soft);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.sp-badge--saved {
+  background: var(--sp-success-soft);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.32);
+}
+
+.sp-badge--warn {
+  background: var(--sp-warning-soft);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.sp-badge--muted {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--sp-text-secondary);
+  border: 1px solid var(--sp-border);
+}
+
+/* Spin animation */
+@keyframes spSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sp-spin {
+  animation: spSpin 0.85s linear infinite;
+}
+
+@keyframes spShimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.sp-truncate-1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sp-truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
