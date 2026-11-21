@@ -5,6 +5,8 @@ defineProps({
   locale: String
 })
 
+const emit = defineEmits(['open-extension'])
+
 const content = {
   'zh-CN': {
     version: '由Daiobs维护',
@@ -15,6 +17,7 @@ const content = {
     platforms: '支持平台',
     help: '帮助与支持',
     faq: '常见问题',
+    extension: 'Chrome 扩展下载',
     about: '关于我们',
     contact: '项目信息',
     starUs: '给我们 Star'
@@ -28,6 +31,7 @@ const content = {
     platforms: 'Platforms',
     help: 'Help & Support',
     faq: 'FAQ',
+    extension: 'Chrome Extension',
     about: 'About',
     contact: 'Project',
     starUs: 'Star Us'
@@ -116,6 +120,16 @@ const showProjectPromotions = false
                 <AppIcon class="fas fa-comments text-xs mr-2"></AppIcon>
                 {{ getContent(locale).faq }}
               </a>
+            </li>
+            <li>
+              <button
+                type="button"
+                data-extension-modal-trigger="footer"
+                @click="emit('open-extension')"
+                class="footer-link bg-transparent border-0 cursor-pointer"
+              >
+                {{ getContent(locale).extension }}
+              </button>
             </li>
             <li>
               <a href="#ours" class="footer-link">

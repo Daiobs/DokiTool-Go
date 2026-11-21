@@ -65,6 +65,18 @@ test('the real server-rendered homepage has no body teleports to hydrate', async
   assert.match(rendered, /data-initial-url/);
 });
 
+test('SSR homepage exposes Chrome extension triggers without mounting modal markup or body teleports', async () => {
+  const { renderHome } = await import(new URL('../.ssg/entry-server.mjs', import.meta.url));
+  const rendered = await renderHome();
+  for (const doc of [html, rendered]) {
+    assert.match(doc, /data-extension-modal-trigger="header"/);
+    assert.match(doc, /data-extension-modal-trigger="footer"/);
+    assert.ok(doc.includes('Chrome 扩展'), 'SSR homepage must render Chrome 扩展 entry label');
+    assert.doesNotMatch(doc, /<!--teleport (?:start|end|anchor)/);
+    assert.doesNotMatch(doc, /role="dialog"|extension-modal-title|data-extension-zip-link/);
+  }
+});
+
 test('early theme code honors stored preference and works when storage is blocked', () => {
   const bootstrap = html.match(/<script id="dokitool-theme-bootstrap">([\s\S]*?)<\/script>/)?.[1];
   assert.ok(bootstrap);
