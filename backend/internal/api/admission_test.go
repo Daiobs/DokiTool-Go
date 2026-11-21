@@ -1227,3 +1227,44 @@ func TestUncachedResolveUsesDedicatedResolvePoolWithoutTouchingParse(t *testing.
 		t.Fatal("slow-platform /api/resolve must route to SlowParse, not Resolve")
 	}
 }
+
+func TestAuthContextHelpersPropagateIDAndRole(t *testing.T) {
+	if IsOwnerRequest(nil) || AuthKeyIDFromContext(nil) != "" || AuthRoleFromContext(nil) != "" {
+		t.Fatal("nil context must report unauthenticated")
+	}
+	anonCtx := context.Background()
+	if IsOwnerRequest(anonCtx) || AuthKeyIDFromContext(anonCtx) != "" || AuthRoleFromContext(anonCtx) != "" {
+		t.Fatal("anonymous context must report empty key id and role")
+	}
+	ownerCtx := WithOwnerRequest(anonCtx)
+	if !IsOwnerRequest(ownerCtx) || AuthKeyIDFromContext(ownerCtx) != "owner" || AuthRoleFromContext(ownerCtx) != RoleOwner {
+		t.Fatalf("unexpected WithOwnerRequest context metadata: owner=%v id=%q role=%q", IsOwnerRequest(ownerCtx), AuthKeyIDFromContext(ownerCtx), AuthRoleFromContext(ownerCtx))
+	}
+
+	tok := randomPrintableToken(t, 48)
+	manifest := fmt.Sprintf(`{"keys":[{"id":"ci-agent","role":"agent","token_sha256":%q}]}`, sha256HexOf(tok))
+	reg, err := ParseAPIKeyRegistry([]byte(manifest), true, OwnerAuth{}, DefaultAdmissionConfig(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotID, gotRole string
+	var gotIsOwner bool
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID = AuthKeyIDFromContext(r.Context())
+		gotRole = AuthRoleFromContext(r.Context())
+		gotIsOwner = IsOwnerRequest(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	entry, err := WithAdmissionWithRegistry(next, nil, "caddy", testEdgeKey, DefaultAdmissionConfig(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := edgeRequest("/api/platforms?schema_version=1.0", "198.51.100.77")
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if w := call(entry, req); w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	if !gotIsOwner || gotID != "ci-agent" || gotRole != RoleAgent {
+		t.Fatalf("downstream context got isOwner=%v id=%q role=%q", gotIsOwner, gotID, gotRole)
+	}
+}

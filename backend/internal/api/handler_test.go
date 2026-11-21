@@ -440,3 +440,61 @@ func TestFBWatchLocalHintZeroOutboundAndNotFound404(t *testing.T) {
 		t.Fatalf("unexpected tumblr 404 payload: %v", tbPayload)
 	}
 }
+
+func TestHandlerDefenseInDepthPlatformScopeAndStatsOwnerOnly(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("douyin", src, now, ""), nil
+		}),
+		"bilibili": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("bilibili", src, now, ""), nil
+		}),
+	}, func() time.Time { return time.Unix(1793448000, 0) }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetYouTubeHelper(&countingYouTubeHelper{})
+
+	tok := randomPrintableToken(t, 48)
+	manifest := `{
+		"keys": [{
+			"id": "direct-friend",
+			"role": "friend",
+			"token_sha256": "` + sha256HexOf(tok) + `",
+			"platforms": ["douyin"]
+		}]
+	}`
+	reg, err := ParseAPIKeyRegistry([]byte(manifest), true, OwnerAuth{}, DefaultAdmissionConfig(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	friendKey := reg.byID["direct-friend"]
+	ctx := withAuthenticatedKey(context.Background(), friendKey, false)
+
+	// 1. Direct Handler.ServeHTTP(/api/stats) with non-owner role rejects with 401 and explicit retryable:false.
+	wStats := httptest.NewRecorder()
+	h.ServeHTTP(wStats, httptest.NewRequest(http.MethodGet, "/api/stats", nil).WithContext(ctx))
+	if wStats.Code != http.StatusUnauthorized || !strings.Contains(wStats.Body.String(), "当前凭据无权访问统计接口") || !strings.Contains(wStats.Body.String(), `"retryable":false`) {
+		t.Fatalf("direct /api/stats with friend role got %d %s", wStats.Code, wStats.Body.String())
+	}
+
+	// 2. Direct Handler.ServeHTTP(/api/parse) rejects disallowed bilibili with 401 and explicit retryable:false, and allows douyin with 200.
+	wDisallowed := httptest.NewRecorder()
+	h.ServeHTTP(wDisallowed, httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/BV1xx411c7mD"), nil).WithContext(ctx))
+	if wDisallowed.Code != http.StatusUnauthorized || !strings.Contains(wDisallowed.Body.String(), "当前凭据无权访问该平台") || !strings.Contains(wDisallowed.Body.String(), `"retryable":false`) {
+		t.Fatalf("direct /api/parse disallowed bilibili got %d %s", wDisallowed.Code, wDisallowed.Body.String())
+	}
+
+	wYT := httptest.NewRecorder()
+	h.ServeHTTP(wYT, httptest.NewRequest(http.MethodGet, "/api/youtube/context?schema_version=1.0", nil).WithContext(ctx))
+	if wYT.Code != http.StatusUnauthorized || !strings.Contains(wYT.Body.String(), "当前凭据无权访问该平台") || !strings.Contains(wYT.Body.String(), `"retryable":false`) {
+		t.Fatalf("direct /api/youtube/context disallowed got %d %s", wYT.Code, wYT.Body.String())
+	}
+
+	wAllowed := httptest.NewRecorder()
+	h.ServeHTTP(wAllowed, httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/7100000000000000001"), nil).WithContext(ctx))
+	if wAllowed.Code != http.StatusOK {
+		t.Fatalf("direct /api/parse allowed douyin got %d %s", wAllowed.Code, wAllowed.Body.String())
+	}
+}

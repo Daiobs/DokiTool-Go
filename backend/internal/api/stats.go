@@ -426,6 +426,7 @@ type StatsSnapshot struct {
 	Requests       RequestStatsSnapshot       `json:"requests"`
 	Cache          CacheStatsSnapshot         `json:"cache"`
 	Admission      AdmissionStatsSnapshot     `json:"admission"`
+	APIKeys        []APIKeyStatsSnapshot      `json:"api_keys"`
 	YTDLP          ytengine.SlotStatsSnapshot `json:"ytdlp"`
 	Shanghai       shresolver.StatsSnapshot   `json:"shanghai"`
 	ParseLatencyMS LatencyStatsSnapshot       `json:"parse_latency_ms"`
@@ -574,6 +575,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			Requests: RequestStatsSnapshot{
 				ByPlatformCodeChannel: make([]PlatformOutcomeCount, 0),
 			},
+			APIKeys:  make([]APIKeyStatsSnapshot, 0),
 			Shanghai: shresolver.StatsSnapshot{Mode: "off"},
 		}
 	}
@@ -638,8 +640,10 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 
 	var admSnap AdmissionStatsSnapshot
+	apiKeys := make([]APIKeyStatsSnapshot, 0)
 	if admSrc != nil {
 		admSnap = admSrc.statsSnapshot()
+		apiKeys = admSrc.apiKeysStatsSnapshot()
 	}
 
 	var ytdlpSnap ytengine.SlotStatsSnapshot
@@ -667,6 +671,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		},
 		Cache:     cacheSnap,
 		Admission: admSnap,
+		APIKeys:   apiKeys,
 		YTDLP:     ytdlpSnap,
 		Shanghai:  shSnap,
 		ParseLatencyMS: LatencyStatsSnapshot{
@@ -860,6 +865,10 @@ func (s *Stats) StartPeriodicLog(ctx context.Context, interval time.Duration, lo
 func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
 	if !IsOwnerRequest(r.Context()) {
 		rejectUnauthorized(w, r, statsRoute)
+		return
+	}
+	if AuthRoleFromContext(r.Context()) != RoleOwner {
+		rejectUnauthorizedWithMessage(w, r, statsRoute, "当前凭据无权访问统计接口")
 		return
 	}
 	if r.Method != http.MethodGet {
