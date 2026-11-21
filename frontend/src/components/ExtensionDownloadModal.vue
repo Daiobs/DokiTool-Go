@@ -155,11 +155,11 @@ onUnmounted(() => {
         @click.self="emit('close')"
       >
         <div
-          class="theme-colors relative w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+          class="theme-colors relative w-full max-w-xl max-h-[92vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
         >
-          <div class="p-6 sm:p-7">
+          <div class="p-5 sm:p-6">
             <div class="flex items-start justify-between gap-4">
-              <div class="space-y-2">
+              <div class="space-y-1.5">
                 <span
                   class="inline-flex items-center gap-1.5 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300"
                 >
@@ -209,11 +209,11 @@ onUnmounted(() => {
               </button>
             </div>
 
-            <p class="mt-3 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+            <p class="mt-2.5 text-sm leading-relaxed text-slate-600 dark:text-slate-300">
               {{ copy.subtitle }}
             </p>
 
-            <div class="mt-5 rounded-xl border border-indigo-200/70 bg-indigo-50/60 p-4 dark:border-indigo-500/25 dark:bg-indigo-950/30">
+            <div class="mt-4 rounded-xl border border-indigo-200/70 bg-indigo-50/60 p-3.5 dark:border-indigo-500/25 dark:bg-indigo-950/30">
               <a
                 href="/helper/dokitool-chrome-extension.zip"
                 download="dokitool-chrome-extension.zip"
@@ -241,13 +241,13 @@ onUnmounted(() => {
               </p>
             </div>
 
-            <div class="mt-6">
+            <div class="mt-4">
               <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
                 {{ copy.guideTitle }}
               </h3>
 
-              <ol class="mt-3 space-y-3">
-                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 dark:border-slate-800 dark:bg-slate-800/50">
+              <ol class="mt-2.5 space-y-2.5">
+                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
                     1
                   </span>
@@ -261,7 +261,7 @@ onUnmounted(() => {
                   </div>
                 </li>
 
-                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 dark:border-slate-800 dark:bg-slate-800/50">
+                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
                     2
                   </span>
@@ -320,7 +320,7 @@ onUnmounted(() => {
                   </div>
                 </li>
 
-                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 dark:border-slate-800 dark:bg-slate-800/50">
+                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
                     3
                   </span>
@@ -336,7 +336,7 @@ onUnmounted(() => {
               </ol>
             </div>
 
-            <div class="mt-5 space-y-1.5 border-t border-slate-200 pt-4 text-xs leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400">
+            <div class="mt-4 space-y-1 border-t border-slate-200 pt-3 text-xs leading-relaxed text-slate-500 dark:border-slate-800 dark:text-slate-400">
               <p>
                 <span class="font-medium text-slate-700 dark:text-slate-300">{{ copy.updateLabel }}</span>
                 {{ copy.updateNote }}
