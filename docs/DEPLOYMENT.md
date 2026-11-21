@@ -43,6 +43,7 @@
 
 1. **后端平滑切换**：在 `dokitool-go.service.d/` 下新增更高编号的 drop-in 配置文件（先以空 `ExecStart=` 清空旧定义，再指向 `<releases_root>/<target_sha>/bin/dokitool` 并保持原有启动参数不变；既有环境变量、密钥引用与运行时隔离 drop-in 保持原状不触碰）。执行 `systemctl daemon-reload`，排空在途请求后停止旧进程、确认本地回环监听端口释放，再启动新服务并确认处于 `active (running)`。
    - 若本次发布涉及上海端 `dokitool-sh-pull.service` 的二进制或守护策略更新（如 `Restart=on-failure` drop-in），同样以独立编号 drop-in 更新并执行 `daemon-reload` 与重启。
+   - **多密钥鉴权配置与 `SIGHUP` 热重载（可选）**：若启用 `DOKITOOL_API_KEYS_FILE`（脱敏示例见 `ops/examples/api-keys.example.json`，建议宿主机文件权限设为 `0600`，并通过 `printf '%s' "$TOKEN" | ./dokitool hash-token` 离线从标准输入生成 SHA-256 摘要，完整规范见 [CONFIGURATION.md](CONFIGURATION.md)），可在 systemd unit / drop-in 中配置可选的 `ExecReload=/bin/kill -HUP $MAINPID`。日常增删密钥、停用单把密钥（`enabled: false`）或调整 `agent` / `friend` 角色配额与 `platforms` 平台白名单时，执行 `systemctl reload dokitool-go`（或 `kill -HUP <MainPID>`）即可无损原子热重载，无需重启主进程或中断在途请求（若新文件校验失败，主进程仅记录脱敏告警并继续保留原活动密钥表）。
 2. **前端软链原子切换**：在同一父目录下创建指向 `<new_release>/frontend/dist` 的临时符号链接，再通过 `ln -sfn <new_dist> <frontend_symlink>.tmp && mv -T <frontend_symlink>.tmp <frontend_symlink>` 原子替换 Caddy 静态根目录软链。整个切换过程不清空站点存储、不强制注销客户端已激活的下载 Service Worker。
 3. 若任一环节异常，立即按 [go-migration/rollback.md](go-migration/rollback.md) 移除新增 drop-in 并原子切回上一版软链。
 
@@ -84,7 +85,7 @@ Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下
 
 前后端统一围绕 `schema_version=1.0` 契约协同发布：
 
-- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（需个人通道令牌）、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
+- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（严格仅限 `owner` 角色 Bearer 凭据访问；`agent` / `friend` 角色凭据及密钥未授权平台请求均返回 HTTP `401 INVALID_INPUT`，通过鉴权的新鲜缓存命中走零槽位缓存快路径，详见 [API.md](API.md) 与 [AGENT-API.md](AGENT-API.md)）、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
 - **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 通过本地回环 `reverse_proxy`（附带 `X-DokiTool-Client-IP` 与 `X-DokiTool-Edge-Key` 边缘认证头；Caddy 直连访客时传 `{remote_host}`，若前置 CDN 或负载均衡器则须在全局 `servers` 块配置 `trusted_proxies` 并改传 `{client_ip}`，避免所有访客共享代理节点限流配额）向 `dokitool` 转发显式白名单路由（流式中转 `/api/media/weibo` 独立前置并启用 `flush_interval -1`，公开接口采用 `@api path ...` 逐条列举，上海拉取控制面 `@shanghai path /internal/shanghai/claim /internal/shanghai/result` 置于 `@source` 拦截 `/internal/*` 之前），未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
 - 已退役的旧 `/api/short_videos`、`/api/douyin` 等兼容路径固定返回 JSON 版本提示错误（`410`），不得回退为 SPA HTML。接口契约与 Schema 校验规则详见 [API.md](API.md) 与 [schema/unified-v1/README.md](schema/unified-v1/README.md)。
 
