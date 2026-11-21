@@ -56,6 +56,7 @@ import {
   type ExtensionDownloadTask,
   type ExtensionRpcResponse,
   type ExtensionSettings,
+  type ExtensionThemeMode,
   type OffscreenDownloadSpec,
   type OffscreenSegmentSpec,
   type OffscreenZipEntrySpec,
@@ -63,13 +64,87 @@ import {
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
 } from "./protocol";
+import { normalizeExtensionThemeMode } from "./storage";
 import { PLATFORM_DOMAIN_SPECS } from "./urlMatcher";
 
 export const MAX_EXTENSION_ZIP_BYTES = 500 * 1024 * 1024;
 export const PORT_RECONNECT_DELAY_MS = 250;
+export const EXTENSION_THEME_CACHE_KEY = "dokitool_ext_theme_v1" as const;
 
 export type LivePhotoSaveFilter = "both" | "motion" | "video" | "image";
 export type MediaLayoutKind = "single" | "album" | "multi_video" | "mixed";
+
+// ============================================================================
+// SidePanel Theme Sync Helpers (Zero-Flash Boot + Authoritative Storage Sync)
+// ============================================================================
+
+export function readCachedExtensionTheme(): ExtensionThemeMode {
+  try {
+    if (typeof localStorage !== "undefined") {
+      return normalizeExtensionThemeMode(
+        localStorage.getItem(EXTENSION_THEME_CACHE_KEY),
+      );
+    }
+  } catch {
+    // Ignore storage access restrictions
+  }
+  return "system";
+}
+
+export function applyExtensionTheme(
+  theme: ExtensionThemeMode | unknown,
+  options?: {
+    persistCache?: boolean;
+    rootElement?: HTMLElement | null;
+  },
+): ExtensionThemeMode {
+  const normalized = normalizeExtensionThemeMode(theme);
+  const root =
+    options?.rootElement !== undefined
+      ? options.rootElement
+      : typeof document !== "undefined"
+        ? document.documentElement
+        : null;
+
+  if (root && root.dataset) {
+    if (normalized === "light" || normalized === "dark") {
+      root.dataset.theme = normalized;
+    } else {
+      delete root.dataset.theme;
+    }
+  }
+
+  if (options?.persistCache !== false) {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(EXTENSION_THEME_CACHE_KEY, normalized);
+      }
+    } catch {
+      // Ignore storage access restrictions
+    }
+  }
+
+  return normalized;
+}
+
+export function applyCachedExtensionTheme(
+  rootElement?: HTMLElement | null,
+): ExtensionThemeMode {
+  const cached = readCachedExtensionTheme();
+  return applyExtensionTheme(cached, {
+    persistCache: false,
+    rootElement,
+  });
+}
+
+export function getNextExtensionTheme(
+  current: ExtensionThemeMode | unknown,
+): ExtensionThemeMode {
+  const normalized = normalizeExtensionThemeMode(current);
+  if (normalized === "system") return "light";
+  if (normalized === "light") return "dark";
+  return "system";
+}
 
 // ============================================================================
 // Minimal Chrome MV3 Runtime Facade (zero `@types/chrome` dependency)

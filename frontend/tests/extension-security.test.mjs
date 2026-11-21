@@ -652,6 +652,7 @@ test("storage & protocol: token isolation, autoFollowTab transition, LRU 200 cap
     batchSaveMode: "subfolder",
     qualityPreference: "best",
     autoFollowTab: false,
+    theme: "system",
   });
   const anonHeaders = storage.buildApiAuthHeaders(initial, {
     Accept: "application/json",

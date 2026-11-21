@@ -10,9 +10,12 @@ import type {
   ConnectionCheckResult,
   ExtensionSettings,
   ExtensionSettingsPatch,
+  ExtensionThemeMode,
   QualityPreference,
 } from "../protocol";
+import { normalizeExtensionThemeMode } from "../storage";
 import {
+  applyExtensionTheme,
   requestLoopbackOriginPermissionOnGesture,
   sendSidePanelRequest,
 } from "../uiTargetHelpers";
@@ -39,7 +42,9 @@ const draftSubfolderPrefix = ref<string>("");
 const draftBatchSaveMode = ref<BatchSaveMode>("subfolder");
 const draftQualityPreference = ref<QualityPreference>("best");
 const draftAutoFollowTab = ref<boolean>(false);
+const draftTheme = ref<ExtensionThemeMode>("system");
 const autoFollowExplicitlyTouched = ref<boolean>(false);
+let themePreviewActive = false;
 
 const showToken = ref<boolean>(false);
 const testingConnection = ref<boolean>(false);
@@ -57,6 +62,8 @@ function syncDraftFromProps() {
   draftBatchSaveMode.value = props.settings.batchSaveMode || "subfolder";
   draftQualityPreference.value = props.settings.qualityPreference || "best";
   draftAutoFollowTab.value = Boolean(props.settings.autoFollowTab);
+  draftTheme.value = normalizeExtensionThemeMode(props.settings.theme);
+  themePreviewActive = false;
   autoFollowExplicitlyTouched.value = false;
   localError.value = "";
   if (props.connection) {
@@ -66,11 +73,32 @@ function syncDraftFromProps() {
   }
 }
 
+function restoreThemeIfPreviewed() {
+  if (!themePreviewActive) return;
+  themePreviewActive = false;
+  applyExtensionTheme(normalizeExtensionThemeMode(props.settings.theme), {
+    persistCache: false,
+  });
+}
+
+function handleSelectTheme(mode: ExtensionThemeMode) {
+  draftTheme.value = mode;
+  themePreviewActive = true;
+  applyExtensionTheme(mode, { persistCache: false });
+}
+
+function handleRequestClose() {
+  restoreThemeIfPreviewed();
+  emit("close");
+}
+
 watch(
   () => props.open,
-  (isOpen) => {
+  (isOpen, wasOpen) => {
     if (isOpen) {
       syncDraftFromProps();
+    } else if (wasOpen) {
+      restoreThemeIfPreviewed();
     }
   },
   { immediate: true },
@@ -217,6 +245,7 @@ async function handleSaveSettingsClick() {
       subfolderPrefix: draftSubfolderPrefix.value,
       batchSaveMode: draftBatchSaveMode.value,
       qualityPreference: draftQualityPreference.value,
+      theme: draftTheme.value,
       ...(autoFollowExplicitlyTouched.value
         ? { autoFollowTab: draftAutoFollowTab.value }
         : {}),
@@ -243,6 +272,8 @@ async function handleSaveSettingsClick() {
       }
     });
 
+    themePreviewActive = false;
+    applyExtensionTheme(rpc.data.settings.theme);
     emit("saved", rpc.data.settings);
     emit("notify", { message: "扩展偏好与凭据已保存", tone: "success" });
     emit("close");
@@ -253,7 +284,7 @@ async function handleSaveSettingsClick() {
 
 function onKeydown(event: KeyboardEvent) {
   if (props.open && event.key === "Escape") {
-    emit("close");
+    handleRequestClose();
   }
 }
 
@@ -264,6 +295,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  restoreThemeIfPreviewed();
   if (typeof window !== "undefined") {
     window.removeEventListener("keydown", onKeydown);
   }
@@ -278,7 +310,7 @@ onUnmounted(() => {
       role="dialog"
       aria-modal="true"
       aria-label="扩展设置与鉴权配置"
-      @click.self="emit('close')"
+      @click.self="handleRequestClose"
     >
       <div class="sp-drawer-panel">
         <div class="sp-drawer-hd">
@@ -290,7 +322,7 @@ onUnmounted(() => {
             type="button"
             class="sp-drawer-close"
             aria-label="关闭设置抽屉"
-            @click="emit('close')"
+            @click="handleRequestClose"
           >
             ✕
           </button>
@@ -399,6 +431,47 @@ onUnmounted(() => {
 
           <div class="sp-divider" />
 
+          <!-- Theme Appearance -->
+          <div class="sp-field">
+            <span class="sp-field__label">外观主题</span>
+            <div
+              class="sp-choice-grid sp-choice-grid--3"
+              role="radiogroup"
+              aria-label="外观主题"
+            >
+              <button
+                type="button"
+                role="radio"
+                :aria-checked="draftTheme === 'system'"
+                class="sp-choice-btn sp-theme-choice"
+                :class="{ 'sp-choice-btn--on': draftTheme === 'system' }"
+                @click="handleSelectTheme('system')"
+              >
+                跟随系统
+              </button>
+              <button
+                type="button"
+                role="radio"
+                :aria-checked="draftTheme === 'light'"
+                class="sp-choice-btn sp-theme-choice"
+                :class="{ 'sp-choice-btn--on': draftTheme === 'light' }"
+                @click="handleSelectTheme('light')"
+              >
+                浅色
+              </button>
+              <button
+                type="button"
+                role="radio"
+                :aria-checked="draftTheme === 'dark'"
+                class="sp-choice-btn sp-theme-choice"
+                :class="{ 'sp-choice-btn--on': draftTheme === 'dark' }"
+                @click="handleSelectTheme('dark')"
+              >
+                深色
+              </button>
+            </div>
+          </div>
+
           <!-- Subfolder Prefix -->
           <div class="sp-field">
             <label class="sp-field__label" for="sp-prefix-input">
@@ -503,7 +576,7 @@ onUnmounted(() => {
           <button
             type="button"
             class="sp-btn sp-btn--ghost"
-            @click="emit('close')"
+            @click="handleRequestClose"
           >
             取消
           </button>
@@ -526,7 +599,7 @@ onUnmounted(() => {
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(5, 8, 18, 0.72);
+  background: var(--sp-backdrop);
   backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
   display: flex;
@@ -542,7 +615,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--sp-shadow-drawer);
 }
 
 .sp-drawer-hd {
@@ -576,9 +649,16 @@ onUnmounted(() => {
   height: 28px;
   border-radius: var(--sp-radius-sm);
   border: 1px solid var(--sp-border);
-  background: rgba(148, 163, 184, 0.08);
+  background: var(--sp-ghost-bg);
   color: var(--sp-text-secondary);
   cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.sp-drawer-close:hover {
+  background: var(--sp-ghost-bg-hover);
+  color: var(--sp-text-primary);
+  border-color: var(--sp-border-strong);
 }
 
 .sp-drawer-body {
@@ -614,7 +694,7 @@ onUnmounted(() => {
 .sp-field__reset {
   border: none;
   background: transparent;
-  color: #a5b4fc;
+  color: var(--sp-accent-text);
   font-family: inherit;
   font-size: 11px;
   font-weight: 600;
@@ -639,11 +719,11 @@ onUnmounted(() => {
 }
 
 .sp-field__hint--err {
-  color: #fca5a5;
+  color: var(--sp-danger-text);
 }
 
 .sp-field__hint--warn {
-  color: #fcd34d;
+  color: var(--sp-warning-text);
 }
 
 .sp-token-box {
@@ -670,6 +750,11 @@ onUnmounted(() => {
   cursor: pointer;
 }
 
+.sp-token-box__eye:hover {
+  color: var(--sp-text-primary);
+  border-color: var(--sp-border-strong);
+}
+
 .sp-conn-row {
   display: flex;
   align-items: center;
@@ -689,14 +774,14 @@ onUnmounted(() => {
 
 .sp-conn-banner--ok {
   background: var(--sp-success-soft);
-  border: 1px solid rgba(16, 185, 129, 0.34);
-  color: #6ee7b7;
+  border: 1px solid var(--sp-success-border);
+  color: var(--sp-success-text);
 }
 
 .sp-conn-banner--err {
   background: var(--sp-danger-soft);
-  border: 1px solid rgba(239, 68, 68, 0.36);
-  color: #fca5a5;
+  border: 1px solid var(--sp-danger-border);
+  color: var(--sp-danger-text);
 }
 
 .sp-divider {
@@ -733,10 +818,15 @@ onUnmounted(() => {
   transition: all 140ms ease;
 }
 
+.sp-choice-btn:hover {
+  border-color: var(--sp-border-accent);
+  color: var(--sp-text-primary);
+}
+
 .sp-choice-btn--on {
-  background: rgba(99, 102, 241, 0.18);
-  border-color: #6366f1;
-  color: #e0e7ff;
+  background: var(--sp-accent-soft-strong);
+  border-color: var(--sp-accent-start);
+  color: var(--sp-accent-text-strong);
 }
 
 .sp-switch-row {
@@ -762,7 +852,7 @@ onUnmounted(() => {
   height: 22px;
   border-radius: 999px;
   border: 1px solid var(--sp-border-strong);
-  background: var(--sp-bg-elevated);
+  background: var(--sp-switch-off-bg);
   padding: 2px;
   cursor: pointer;
   flex-shrink: 0;
@@ -772,8 +862,8 @@ onUnmounted(() => {
 }
 
 .sp-switch--on {
-  background: linear-gradient(135deg, #6366f1, #8b5cf6);
-  border-color: #818cf8;
+  background: linear-gradient(135deg, var(--sp-accent-start), var(--sp-accent-end));
+  border-color: var(--sp-accent-start);
 }
 
 .sp-switch__thumb {
@@ -781,6 +871,7 @@ onUnmounted(() => {
   height: 16px;
   border-radius: 50%;
   background: #ffffff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.25);
   transform: translateX(0);
   transition: transform 160ms var(--sp-ease);
 }
