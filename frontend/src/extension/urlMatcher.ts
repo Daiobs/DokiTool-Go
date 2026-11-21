@@ -875,8 +875,12 @@ function analyzePlatformDetails(
         "blog",
         "communities",
         "activity",
+        "page",
+        "day",
+        "archive",
       ]);
       if (
+        (host === "tumblr.com" || host === "www.tumblr.com") &&
         segments.length >= 2 &&
         !tumblrReservedRoots.has(segments[0].toLowerCase()) &&
         /^\d{1,25}$/.test(segments[1])

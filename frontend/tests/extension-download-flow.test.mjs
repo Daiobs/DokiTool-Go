@@ -4726,3 +4726,165 @@ test("MV3 Weibo relay regression: validateMediaEnvelope & background PARSE_URL/R
     }
   }
 });
+
+test("background badge & tooltip: late cancelled callback does not wipe terminal failed '!' or completed '✓' indicators", async () => {
+  const env = createMockMv3Environment({ autoCompleteDownloads: false });
+  env.chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "OFFSCREEN_START_TASK") {
+      sendResponse({ ok: true, data: { accepted: true } });
+      return true;
+    }
+    if (msg?.type === "OFFSCREEN_CANCEL_TASK") {
+      sendResponse({ ok: true, data: { cancelled: true } });
+      return true;
+    }
+    if (msg?.type === "RELEASE_BLOB") {
+      sendResponse({ ok: true, data: { released: true } });
+      return true;
+    }
+    return false;
+  });
+  const extStorage = storage.createExtensionStorage();
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    badgeSuccessDurationMs: 60,
+    fetchImpl: async () => new Response("{}", { status: 200 }),
+  });
+
+  const lastBadgeText = () =>
+    [...env.badgeHistory].reverse().find((e) => e.kind === "text")?.text;
+  const lastBadgeTitle = () =>
+    [...env.badgeHistory].reverse().find((e) => e.kind === "title")?.title;
+
+  try {
+    await bg.init();
+
+    // Case 1: Task 2 cancelled while Task 1 fails -> delayed OFFSCREEN_TASK_ERROR(cancelled) must NOT wipe "!"
+    const enq1 = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "视频 A",
+          platform: "douyin",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://v26-cold.douyinvod.com/a.mp4"],
+            filename: "a.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+        {
+          title: "视频 B",
+          platform: "douyin",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://v26-cold.douyinvod.com/b.mp4"],
+            filename: "b.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+      ],
+    });
+    assert.equal(enq1.ok, true);
+    const [taskA, taskB] = enq1.data.taskIds;
+
+    // Cancel Task B first
+    const cancelRes = await env.chrome.runtime.sendMessage({
+      type: "CANCEL_TASK",
+      taskId: taskB,
+    });
+    assert.equal(cancelRes.ok, true);
+
+    // Task A fails -> badge="!" and failed tooltip
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskA,
+      error: "CDN 403",
+    });
+    assert.equal(lastBadgeText(), "!");
+    assert.match(lastBadgeTitle() || "", /失败/);
+
+    // Delayed Offscreen cancelled error for Task B arrives -> must NOT wipe "!" or title!
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskB,
+      error: "已取消",
+      cancelled: true,
+    });
+    assert.equal(lastBadgeText(), "!");
+    assert.match(lastBadgeTitle() || "", /失败/);
+
+    // Explicit clear MUST still reset badge & title cleanly
+    await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+    assert.equal(lastBadgeText(), "");
+    assert.equal(lastBadgeTitle(), backgroundMod.DEFAULT_ACTION_TITLE);
+
+    // Case 2: Task C completes ("✓") while cancelled Task D sends late OFFSCREEN_TASK_ERROR(cancelled)
+    const enq2 = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "视频 C",
+          platform: "x",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://video.twimg.com/c.mp4"],
+            filename: "c.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+        {
+          title: "视频 D",
+          platform: "x",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://video.twimg.com/d.mp4"],
+            filename: "d.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+      ],
+    });
+    const [taskC, taskD] = enq2.data.taskIds;
+    await env.chrome.runtime.sendMessage({ type: "CANCEL_TASK", taskId: taskD });
+
+    const handoff = await env.chrome.runtime.sendMessage({
+      type: "HANDOFF_BLOB_DOWNLOAD",
+      taskId: taskC,
+      blobUrl: "blob:chrome-extension://ext/c",
+      filename: "c.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 1024,
+    });
+    assert.equal(handoff.ok, true);
+    env.emitDownloadChanged({
+      id: handoff.data.chromeDownloadId,
+      state: { current: "complete" },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(lastBadgeText(), "✓");
+    assert.match(lastBadgeTitle() || "", /已完成/);
+
+    // Delayed cancel callback for Task D must preserve "✓" and its auto-clear timer
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskD,
+      error: "已取消",
+      cancelled: true,
+    });
+    assert.equal(lastBadgeText(), "✓");
+    assert.match(lastBadgeTitle() || "", /已完成/);
+
+    // Wait for scheduled auto-clear timer to reset cleanly to idle
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(lastBadgeText(), "");
+    assert.equal(lastBadgeTitle(), backgroundMod.DEFAULT_ACTION_TITLE);
+  } finally {
+    bg.dispose();
+  }
+});

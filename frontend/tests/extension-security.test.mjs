@@ -1217,16 +1217,38 @@ test("urlMatcher P1/P2/P3 hardening: positive feed suppression, backend-supporte
   assert.equal(fbVideoPhp?.dedupeKey, fbWatch?.dedupeKey);
   assert.equal(fbVideoPhp?.isLikelyFeedOrHome, false);
 
-  // 2) Tumblr www.tumblr.com/blog/view/<blog>/<id>
+  // 2) Tumblr www.tumblr.com/blog/view/<blog>/<id> & subdomain pagination/archive filtering
   const tumblrBlogView = urlMatcher.matchSupportedPlatformUrl(
     "https://www.tumblr.com/blog/view/maskofthedragon/626907179849564160",
   );
   const tumblrPost = urlMatcher.matchSupportedPlatformUrl(
     "https://maskofthedragon.tumblr.com/post/626907179849564160/mona",
   );
+  const tumblrRootBlogPost = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.tumblr.com/maskofthedragon/626907179849564160/mona",
+  );
   assert.equal(tumblrBlogView?.dedupeKey, "tumblr:post:626907179849564160");
   assert.equal(tumblrBlogView?.dedupeKey, tumblrPost?.dedupeKey);
+  assert.equal(tumblrRootBlogPost?.dedupeKey, tumblrPost?.dedupeKey);
   assert.equal(tumblrBlogView?.isLikelyFeedOrHome, false);
+  assert.equal(tumblrRootBlogPost?.isLikelyFeedOrHome, false);
+  for (const tumblrNonWorkUrl of [
+    "https://staff.tumblr.com/page/2",
+    "https://staff.tumblr.com/day/2026/01/01",
+    "https://staff.tumblr.com/archive/2026",
+    "https://www.tumblr.com/page/2",
+    "https://www.tumblr.com/day/2026",
+    "https://www.tumblr.com/archive/2026",
+  ]) {
+    const nonWork = urlMatcher.matchSupportedPlatformUrl(tumblrNonWorkUrl);
+    assert.ok(nonWork, `expected Tumblr host match for ${tumblrNonWorkUrl}`);
+    assert.equal(nonWork.platform, "tumblr");
+    assert.equal(
+      nonWork.isLikelyFeedOrHome,
+      true,
+      `expected isLikelyFeedOrHome=true for ${tumblrNonWorkUrl}`,
+    );
+  }
 
   // 3) Pipixia ?item_id=<id>
   const ppxQuery = urlMatcher.matchSupportedPlatformUrl(

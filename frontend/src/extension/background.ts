@@ -732,6 +732,15 @@ export function createBackgroundController(
     terminalOutcome?: "completed" | "failed" | "clear",
   ): void => {
     if (disposed || !chromeApi.action) return;
+    // Preserve terminal "!" / "✓" indicators when a late cancel/abort callback
+    // invokes `updateBadge()` without an explicit terminal outcome while idle.
+    if (
+      countActiveTasks() === 0 &&
+      terminalOutcome === undefined &&
+      (lastActionBadgeText === "!" || lastActionBadgeText === "✓")
+    ) {
+      return;
+    }
     const indicator = computeActionIndicator(getOrderedTasks(), terminalOutcome);
 
     if (badgeClearTimer !== null) {
@@ -2571,9 +2580,8 @@ export function createBackgroundController(
 
       case "OFFSCREEN_TASK_ERROR": {
         const task = tasks.get(msg.taskId);
-        if (task && task.status !== "completed") {
-          const isCancelled =
-            msg.cancelled === true || task.status === "cancelled";
+        if (task && task.status !== "completed" && task.status !== "cancelled") {
+          const isCancelled = msg.cancelled === true;
           tasks.set(msg.taskId, {
             ...task,
             status: isCancelled ? "cancelled" : "failed",
