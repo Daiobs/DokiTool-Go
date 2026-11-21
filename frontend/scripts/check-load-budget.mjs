@@ -28,19 +28,22 @@ const mediaDownloadChunkKey = manifest[mediaDownloadKey]
   ? mediaDownloadKey
   : Object.keys(manifest).find(key => manifest[key].name === 'useMediaDownload');
 const downloadCardKey = 'src/components/DownloadCard.vue';
+const extensionModalKey = 'src/components/ExtensionDownloadModal.vue';
 assert.ok(manifest[resultKey]?.isDynamicEntry, 'Result UI must remain an independent async chunk');
 assert.ok(zipKey && manifest[zipKey].isDynamicEntry, 'ZIP must remain an independent async chunk');
 assert.ok(youtubeHelperChunkKey && manifest[youtubeHelperChunkKey]?.isDynamicEntry, 'YouTube helper core must remain an independent async chunk');
 assert.ok(mediaDownloadChunkKey && manifest[mediaDownloadChunkKey]?.isDynamicEntry, 'Media download composable must remain an independent async chunk');
 assert.ok(manifest[downloadCardKey]?.isDynamicEntry, 'Download card UI must remain an independent async chunk');
+assert.ok(manifest[extensionModalKey]?.isDynamicEntry, 'Extension download modal must remain an independent async chunk');
 assert.ok(!keys.has(resultKey) && !keys.has(zipKey), 'Result UI/ZIP must not be in the initial static import graph');
 assert.ok(
   !keys.has(youtubeHelperKey) &&
     !keys.has(youtubeHelperChunkKey) &&
     !keys.has(mediaDownloadKey) &&
     !keys.has(mediaDownloadChunkKey) &&
-    !keys.has(downloadCardKey),
-  'youtubeHelperCore, useMediaDownload, and DownloadCard must not be in the initial static import graph',
+    !keys.has(downloadCardKey) &&
+    !keys.has(extensionModalKey),
+  'youtubeHelperCore, useMediaDownload, DownloadCard, and ExtensionDownloadModal must not be in the initial static import graph',
 );
 const assetNames = await readdir(new URL('assets/', dist));
 assert.ok(!assetNames.some(name => /\.(woff2?|ttf|otf)$/i.test(name)), 'UI must not regain external font dependencies');

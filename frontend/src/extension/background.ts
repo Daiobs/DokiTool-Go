@@ -111,6 +111,15 @@ export type ChromeRuntimeMessageListener = (
   sendResponse: (response?: unknown) => void,
 ) => boolean | void;
 
+export interface ChromeActionLike {
+  setBadgeText(details: { text: string; tabId?: number }): Promise<void> | void;
+  setBadgeBackgroundColor(details: {
+    color: string | [number, number, number, number];
+    tabId?: number;
+  }): Promise<void> | void;
+  setTitle?(details: { title: string; tabId?: number }): Promise<void> | void;
+}
+
 export interface ChromeBackgroundApi {
   runtime: {
     id?: string;
@@ -217,13 +226,7 @@ export interface ChromeBackgroundApi {
       addListener(listener: (delta: ChromeDownloadDelta) => void): void;
     };
   };
-  action?: {
-    setBadgeText(details: { text: string; tabId?: number }): Promise<void> | void;
-    setBadgeBackgroundColor(details: {
-      color: string | [number, number, number, number];
-      tabId?: number;
-    }): Promise<void> | void;
-  };
+  action?: ChromeActionLike;
   permissions?: {
     contains?(permissions: {
       origins?: string[];
@@ -255,6 +258,172 @@ export interface BackgroundController {
   handleRuntimeMessage: ChromeRuntimeMessageListener;
   waitForIdle(): Promise<void>;
   dispose(): void;
+}
+
+export const DEFAULT_ACTION_TITLE = "打开 DokiTool 侧边栏" as const;
+
+export interface ActionIndicatorState {
+  badgeText: string;
+  badgeColor?: string;
+  title: string;
+  shouldScheduleClear: boolean;
+}
+
+const ACTION_STAGE_LABELS: Readonly<
+  Partial<Record<ExtensionDownloadTask["status"], string>>
+> = {
+  queued: "排队中",
+  parsing: "解析中",
+  downloading: "下载中",
+  muxing: "合流中",
+  saving: "保存中",
+};
+
+function clampActivePercent(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(99, Math.round(raw)));
+}
+
+function formatActionSpeed(bytesPerSecond: unknown): string {
+  if (
+    typeof bytesPerSecond !== "number" ||
+    !Number.isFinite(bytesPerSecond) ||
+    bytesPerSecond <= 0
+  ) {
+    return "";
+  }
+  if (bytesPerSecond >= 1_000_000) {
+    return `${(bytesPerSecond / 1_000_000).toFixed(1)} MB/s`;
+  }
+  if (bytesPerSecond >= 1_000) {
+    return `${Math.round(bytesPerSecond / 1_000)} KB/s`;
+  }
+  return `${Math.round(bytesPerSecond)} B/s`;
+}
+
+function truncateActionTaskTitle(raw: string | undefined, maxChars = 28): string {
+  const cleaned = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+  if (!cleaned) return "下载任务";
+  const chars = Array.from(cleaned);
+  if (chars.length <= maxChars) return cleaned;
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join("")}…`;
+}
+
+export function computeActionIndicator(
+  tasks: ExtensionDownloadTask[],
+  terminalOutcome?: "completed" | "failed" | "clear",
+): ActionIndicatorState {
+  const activeTasks = Array.isArray(tasks)
+    ? tasks.filter((t) => ACTIVE_TASK_STATUSES.has(t.status))
+    : [];
+  const activeCount = activeTasks.length;
+
+  if (activeCount === 1) {
+    const task = activeTasks[0];
+    const isProgressStage =
+      task.status === "downloading" ||
+      task.status === "muxing" ||
+      task.status === "saving";
+    const pct = clampActivePercent(task.percent);
+    const hasMeasurablePct = isProgressStage && pct >= 1;
+    const badgeText = hasMeasurablePct ? `${pct}%` : "1";
+    const stageLabel = ACTION_STAGE_LABELS[task.status] ?? "下载中";
+    const pctPart = hasMeasurablePct ? ` ${pct}%` : "";
+    const speedText = formatActionSpeed(task.speed);
+    const speedPart = speedText ? ` (${speedText})` : "";
+    const shortTitle = truncateActionTaskTitle(task.title || task.filename, 28);
+    return {
+      badgeText,
+      badgeColor: "#6366f1",
+      title: `DokiTool · ${stageLabel}${pctPart}${speedPart}\n${shortTitle}`,
+      shouldScheduleClear: false,
+    };
+  }
+
+  if (activeCount > 1) {
+    const allHaveTotal = activeTasks.every(
+      (t) => typeof t.total === "number" && Number.isFinite(t.total) && t.total > 0,
+    );
+    let aggPct: number;
+    if (allHaveTotal) {
+      let sumLoaded = 0;
+      let sumTotal = 0;
+      for (const t of activeTasks) {
+        const safeTotal = t.total;
+        const hasLoaded =
+          typeof t.loaded === "number" &&
+          Number.isFinite(t.loaded) &&
+          t.loaded > 0;
+        const safeLoaded = hasLoaded
+          ? Math.min(t.loaded, safeTotal)
+          : (clampActivePercent(t.percent) / 100) * safeTotal;
+        sumLoaded += safeLoaded;
+        sumTotal += safeTotal;
+      }
+      aggPct = sumTotal > 0 ? clampActivePercent((sumLoaded / sumTotal) * 100) : 0;
+    } else {
+      const sumPct = activeTasks.reduce(
+        (acc, t) => acc + clampActivePercent(t.percent),
+        0,
+      );
+      aggPct = clampActivePercent(sumPct / activeCount);
+    }
+
+    const totalSpeed = activeTasks.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.speed === "number" && Number.isFinite(t.speed) && t.speed > 0
+          ? t.speed
+          : 0),
+      0,
+    );
+    const speedText = formatActionSpeed(totalSpeed);
+    const speedPart = speedText ? ` (${speedText})` : "";
+
+    const topTask =
+      activeTasks.find(
+        (t) =>
+          t.status === "downloading" ||
+          t.status === "muxing" ||
+          t.status === "saving",
+      ) ?? activeTasks[0];
+    const topPct = clampActivePercent(topTask.percent);
+    const topTitle = truncateActionTaskTitle(
+      topTask.title || topTask.filename,
+      28,
+    );
+
+    return {
+      badgeText: aggPct >= 1 ? `${aggPct}%` : String(activeCount),
+      badgeColor: "#6366f1",
+      title: `DokiTool · 后台下载中 ${activeCount} 个任务 · 总进度 ${aggPct}%${speedPart}\n当前：${topTitle} (${topPct}%)`,
+      shouldScheduleClear: false,
+    };
+  }
+
+  if (terminalOutcome === "completed") {
+    return {
+      badgeText: "✓",
+      badgeColor: "#10b981",
+      title: "DokiTool · 后台下载已完成（点击打开侧边栏查看）",
+      shouldScheduleClear: true,
+    };
+  }
+
+  if (terminalOutcome === "failed") {
+    return {
+      badgeText: "!",
+      badgeColor: "#ef4444",
+      title: "DokiTool · 有后台任务失败（点击打开侧边栏查看或重试）",
+      shouldScheduleClear: false,
+    };
+  }
+
+  return {
+    badgeText: "",
+    title: DEFAULT_ACTION_TITLE,
+    shouldScheduleClear: false,
+  };
 }
 
 const ACTIVE_TASK_STATUSES = new Set<ExtensionDownloadTask["status"]>([
@@ -458,6 +627,9 @@ export function createBackgroundController(
   let offscreenIdleTimer: ReturnType<typeof setTimeout> | null = null;
   let badgeClearTimer: ReturnType<typeof setTimeout> | null = null;
   let tabSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastActionBadgeText: string | null = null;
+  let lastActionBadgeColor: string | null = null;
+  let lastActionTitle: string | null = null;
 
   let currentTabSync: TabSyncState | null = null;
   let initialTabSyncPromise: Promise<void> | null = null;
@@ -559,51 +731,51 @@ export function createBackgroundController(
   const updateBadge = (
     terminalOutcome?: "completed" | "failed" | "clear",
   ): void => {
-    if (!chromeApi.action) return;
-    const activeCount = countActiveTasks();
-
-    if (activeCount > 0) {
-      if (badgeClearTimer !== null) {
-        clearTimeout(badgeClearTimer);
-        badgeClearTimer = null;
-      }
-      void chromeApi.action.setBadgeBackgroundColor({ color: "#6366f1" });
-      void chromeApi.action.setBadgeText({ text: String(activeCount) });
+    if (disposed || !chromeApi.action) return;
+    // Preserve terminal "!" / "✓" indicators when a late cancel/abort callback
+    // invokes `updateBadge()` without an explicit terminal outcome while idle.
+    if (
+      countActiveTasks() === 0 &&
+      terminalOutcome === undefined &&
+      (lastActionBadgeText === "!" || lastActionBadgeText === "✓")
+    ) {
       return;
     }
+    const indicator = computeActionIndicator(getOrderedTasks(), terminalOutcome);
 
-    if (terminalOutcome === "completed") {
-      if (badgeClearTimer !== null) {
-        clearTimeout(badgeClearTimer);
-      }
-      void chromeApi.action.setBadgeBackgroundColor({ color: "#10b981" });
-      void chromeApi.action.setBadgeText({ text: "✓" });
+    if (badgeClearTimer !== null) {
+      clearTimeout(badgeClearTimer);
+      badgeClearTimer = null;
+    }
+
+    if (
+      indicator.badgeColor !== undefined &&
+      indicator.badgeColor !== lastActionBadgeColor
+    ) {
+      lastActionBadgeColor = indicator.badgeColor;
+      void chromeApi.action.setBadgeBackgroundColor({
+        color: indicator.badgeColor,
+      });
+    }
+
+    if (indicator.badgeText !== lastActionBadgeText) {
+      lastActionBadgeText = indicator.badgeText;
+      void chromeApi.action.setBadgeText({ text: indicator.badgeText });
+    }
+
+    if (indicator.title !== lastActionTitle) {
+      lastActionTitle = indicator.title;
+      void chromeApi.action.setTitle?.({ title: indicator.title });
+    }
+
+    if (indicator.shouldScheduleClear) {
       badgeClearTimer = setTimeout(() => {
         badgeClearTimer = null;
-        if (countActiveTasks() === 0) {
-          void chromeApi.action?.setBadgeText({ text: "" });
+        if (!disposed && countActiveTasks() === 0) {
+          updateBadge("clear");
         }
       }, badgeSuccessDurationMs);
       (badgeClearTimer as { unref?: () => void })?.unref?.();
-      return;
-    }
-
-    if (terminalOutcome === "failed") {
-      if (badgeClearTimer !== null) {
-        clearTimeout(badgeClearTimer);
-        badgeClearTimer = null;
-      }
-      void chromeApi.action.setBadgeBackgroundColor({ color: "#ef4444" });
-      void chromeApi.action.setBadgeText({ text: "!" });
-      return;
-    }
-
-    if (terminalOutcome === "clear") {
-      if (badgeClearTimer !== null) {
-        clearTimeout(badgeClearTimer);
-        badgeClearTimer = null;
-      }
-      void chromeApi.action.setBadgeText({ text: "" });
     }
   };
 
@@ -1016,7 +1188,7 @@ export function createBackgroundController(
         () => fetchApiJson(parseEndpoint, settings, { method: "GET" }, signal),
         signal,
       );
-      return withTbvideoItems(validateMediaEnvelope(payload));
+      return withTbvideoItems(validateMediaEnvelope(payload, { apiOrigin }));
     };
 
     if (matched.platform === "youtube" && matched.youtubeVideoId) {
@@ -1118,7 +1290,7 @@ export function createBackgroundController(
       );
 
       const finalized = withTbvideoItems(
-        validateMediaEnvelope(finalizePayload),
+        validateMediaEnvelope(finalizePayload, { apiOrigin }),
       );
       const readyState: YouTubeHelperState = {
         status: "ready",
@@ -1173,7 +1345,9 @@ export function createBackgroundController(
       () => fetchApiJson(fullUrl, settings, { method: "GET" }, signal),
       signal,
     );
-    return withTbvideoItems(validateMediaEnvelope(payload));
+    return withTbvideoItems(
+      validateMediaEnvelope(payload, { apiOrigin: validated.origin }),
+    );
   };
 
   const hydrateDeferredMediaItems = async (
@@ -1854,6 +2028,7 @@ export function createBackgroundController(
         chromeDownloadId: downloadId,
         updatedAt: nowFn(),
       });
+      updateBadge();
       await broadcastTasksUpdated();
     }
 
@@ -2397,6 +2572,7 @@ export function createBackgroundController(
             speed: msg.speed,
             updatedAt: nowFn(),
           });
+          updateBadge();
           await broadcastTasksUpdated();
         }
         return okRpc({ received: true });
@@ -2404,9 +2580,8 @@ export function createBackgroundController(
 
       case "OFFSCREEN_TASK_ERROR": {
         const task = tasks.get(msg.taskId);
-        if (task && task.status !== "completed") {
-          const isCancelled =
-            msg.cancelled === true || task.status === "cancelled";
+        if (task && task.status !== "completed" && task.status !== "cancelled") {
+          const isCancelled = msg.cancelled === true;
           tasks.set(msg.taskId, {
             ...task,
             status: isCancelled ? "cancelled" : "failed",
@@ -2587,6 +2762,7 @@ export function createBackgroundController(
     if (first?.id !== undefined) {
       scheduleTabSyncEvaluation(first.id, first.url, true);
     }
+    updateBadge(countActiveTasks() === 0 ? "clear" : undefined);
   };
 
   return {

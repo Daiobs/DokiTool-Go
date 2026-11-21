@@ -1,7 +1,7 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +23,7 @@ let extensionDownloadMod;
 let uiTargetHelpersMod;
 let offscreenMod;
 let backgroundMod;
+let mediaContractMod;
 let mediabunny;
 let JSZip;
 
@@ -42,6 +43,7 @@ async function bundleExtensionSuite() {
         export * as uiTargetHelpersMod from "./src/extension/uiTargetHelpers.ts";
         export * as offscreenMod from "./src/extension/offscreen.ts";
         export * as backgroundMod from "./src/extension/background.ts";
+        export * as mediaContractMod from "./src/utils/mediaContract.ts";
       `,
       resolveDir: FRONTEND_DIR,
       loader: "ts",
@@ -64,6 +66,7 @@ before(async () => {
   uiTargetHelpersMod = suite.uiTargetHelpersMod;
   offscreenMod = suite.offscreenMod;
   backgroundMod = suite.backgroundMod;
+  mediaContractMod = suite.mediaContractMod;
   mediabunny = suite.mediabunny;
   JSZip = suite.JSZip;
 });
@@ -548,6 +551,9 @@ function createMockMv3Environment({
       },
       setBadgeBackgroundColor({ color }) {
         badgeHistory.push({ kind: "color", color });
+      },
+      setTitle({ title }) {
+        badgeHistory.push({ kind: "title", title });
       },
     },
     permissions: {
@@ -2958,6 +2964,7 @@ test("P1-4 & P2-5: Mixed image + video posts (1img+1vid, 2img+1vid, 2vid+1img, L
     batchSaveMode: "subfolder",
     qualityPreference: "best",
     autoFollowTab: true,
+    theme: "system",
   };
 
   const mixedCases = [
@@ -3738,4 +3745,1146 @@ test("P2-2, P2-3, P2-4 & P2-5: quick-download batchSaveMode=zip, concurrent YouT
 
   offscreenCtrl?.dispose();
   bg.dispose();
+});
+
+// ============================================================================
+// Theme Persistence, Migration, Zero-Flash Sync & SidePanel UI Controls
+// ============================================================================
+
+test("SidePanel Theme: storage defaults, persistence, migration fallback, zero-flash cache helper, and Header/Settings UI", async () => {
+  const localArea = storage.createMemoryStorageArea();
+  const extStorage = storage.createExtensionStorage({ local: localArea });
+
+  // 1) Default theme is "system"
+  assert.equal(storage.DEFAULT_EXTENSION_SETTINGS.theme, "system");
+  const initial = await extStorage.getSettings();
+  assert.equal(initial.theme, "system");
+
+  // 2) Persist light -> dark -> system via updateSettings
+  for (const mode of ["light", "dark", "system"]) {
+    const saved = await extStorage.updateSettings({ theme: mode });
+    assert.equal(saved.theme, mode);
+    const reloaded = await extStorage.getSettings();
+    assert.equal(reloaded.theme, mode);
+  }
+
+  // 3) Seamless migration: missing or corrupt stored theme falls back to "system"
+  //    without losing existing bearerToken, apiBaseUrl, subfolderPrefix, or autoFollowTab!
+  await localArea.set({
+    [storage.STORAGE_KEYS.SETTINGS]: {
+      apiBaseUrl: "https://api.example.com",
+      bearerToken: "doki_existing_token_999",
+      subfolderPrefix: "MyClips",
+      batchSaveMode: "zip",
+      qualityPreference: "1080p",
+      autoFollowTab: true,
+      autoFollowExplicitlySet: true,
+    },
+  });
+  const migratedMissing = await extStorage.getSettings();
+  assert.equal(migratedMissing.theme, "system");
+  assert.equal(migratedMissing.bearerToken, "doki_existing_token_999");
+  assert.equal(migratedMissing.apiBaseUrl, "https://api.example.com");
+  assert.equal(migratedMissing.subfolderPrefix, "MyClips");
+  assert.equal(migratedMissing.batchSaveMode, "zip");
+  assert.equal(migratedMissing.qualityPreference, "1080p");
+  assert.equal(migratedMissing.autoFollowTab, true);
+
+  await localArea.set({
+    [storage.STORAGE_KEYS.SETTINGS]: {
+      apiBaseUrl: "https://api.example.com",
+      bearerToken: "doki_existing_token_999",
+      theme: "neon-corrupt",
+    },
+  });
+  const migratedCorrupt = await extStorage.getSettings();
+  assert.equal(migratedCorrupt.theme, "system");
+  assert.equal(migratedCorrupt.bearerToken, "doki_existing_token_999");
+  assert.equal(migratedCorrupt.apiBaseUrl, "https://api.example.com");
+
+  const sanitizedPatch = await extStorage.updateSettings({ theme: "invalid-mode" });
+  assert.equal(sanitizedPatch.theme, "system");
+  assert.equal(sanitizedPatch.bearerToken, "doki_existing_token_999");
+
+  // 4) Zero-flash HTML & MV3 CSP contract: sidepanel.html has no hardcoded dark class and zero inline <script>
+  const sidepanelHtml = readFileSync(
+    join(FRONTEND_DIR, "src", "extension", "sidepanel.html"),
+    "utf8",
+  );
+  assert.match(sidepanelHtml, /<html lang="zh-CN">/);
+  assert.equal(sidepanelHtml.includes('class="dark"'), false);
+  assert.equal(/<script\b(?![^>]*\bsrc\s*=)[^>]*>/i.test(sidepanelHtml), false);
+
+  // 5) applyExtensionTheme / applyCachedExtensionTheme / getNextExtensionTheme
+  const fakeStorage = new Map();
+  const origLocalStorage = globalThis.localStorage;
+  const origDocument = globalThis.document;
+  const fakeRoot = { dataset: {} };
+  globalThis.localStorage = {
+    getItem: (k) => (fakeStorage.has(k) ? fakeStorage.get(k) : null),
+    setItem: (k, v) => {
+      fakeStorage.set(k, String(v));
+    },
+    removeItem: (k) => fakeStorage.delete(k),
+  };
+  globalThis.document = { documentElement: fakeRoot };
+
+  try {
+    assert.equal(uiTargetHelpersMod.getNextExtensionTheme("system"), "light");
+    assert.equal(uiTargetHelpersMod.getNextExtensionTheme("light"), "dark");
+    assert.equal(uiTargetHelpersMod.getNextExtensionTheme("dark"), "system");
+
+    uiTargetHelpersMod.applyExtensionTheme("light");
+    assert.equal(fakeRoot.dataset.theme, "light");
+    assert.equal(
+      fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+      "light",
+    );
+
+    uiTargetHelpersMod.applyExtensionTheme("dark");
+    assert.equal(fakeRoot.dataset.theme, "dark");
+    assert.equal(
+      fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+      "dark",
+    );
+
+    // Preview with persistCache:false does NOT overwrite localStorage cache
+    uiTargetHelpersMod.applyExtensionTheme("light", { persistCache: false });
+    assert.equal(fakeRoot.dataset.theme, "light");
+    assert.equal(
+      fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+      "dark",
+    );
+
+    // applyCachedExtensionTheme restores cached "dark" synchronously on boot
+    delete fakeRoot.dataset.theme;
+    const restored = uiTargetHelpersMod.applyCachedExtensionTheme();
+    assert.equal(restored, "dark");
+    assert.equal(fakeRoot.dataset.theme, "dark");
+
+    // "system" deletes data-theme attribute so live prefers-color-scheme takes over
+    uiTargetHelpersMod.applyExtensionTheme("system");
+    assert.equal("theme" in fakeRoot.dataset, false);
+    assert.equal(
+      fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+      "system",
+    );
+
+    // 6) SidePanelHeader quick theme cycle button tooltips & emit
+    const SidePanelHeader = await loadSidePanelSfc(
+      "../src/extension/components/SidePanelHeader.vue",
+    );
+    let cycleEmits = 0;
+    const headerView = mountSfcTree(
+      SidePanelHeader,
+      {
+        settings: { ...storage.DEFAULT_EXTENSION_SETTINGS, theme: "system" },
+        connection: null,
+        mode: "single",
+        batchUrlCount: 0,
+      },
+      {
+        onCycleTheme: () => {
+          cycleEmits += 1;
+        },
+      },
+    );
+    try {
+      await headerView.flush();
+      const findThemeBtn = () =>
+        headerView.findAll(
+          (node) =>
+            node.type === "button" &&
+            typeof node.props.class === "string" &&
+            node.props.class.includes("sp-theme-btn"),
+        )[0];
+
+      assert.equal(
+        findThemeBtn()?.props.title,
+        "主题：跟随系统（点击切换为浅色）",
+      );
+      await headerView.fire(findThemeBtn(), "onClick");
+      assert.equal(cycleEmits, 1);
+
+      headerView.propsRef.value = {
+        ...headerView.propsRef.value,
+        settings: { ...storage.DEFAULT_EXTENSION_SETTINGS, theme: "light" },
+      };
+      await headerView.flush();
+      assert.equal(findThemeBtn()?.props.title, "主题：浅色（点击切换为深色）");
+
+      headerView.propsRef.value = {
+        ...headerView.propsRef.value,
+        settings: { ...storage.DEFAULT_EXTENSION_SETTINGS, theme: "dark" },
+      };
+      await headerView.flush();
+      assert.equal(
+        findThemeBtn()?.props.title,
+        "主题：深色（点击切换为跟随系统）",
+      );
+    } finally {
+      headerView.unmount();
+    }
+
+    // 7) SidePanelSettings 3-way segmented control: live preview, restore on cancel, persist on save
+    const SidePanelSettings = await loadSidePanelSfc(
+      "../src/extension/components/SidePanelSettings.vue",
+    );
+    const savedPatches = [];
+    const savedEvents = [];
+    const origChrome = globalThis.chrome;
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(req, cb) {
+          if (req?.type === "UPDATE_SETTINGS") {
+            savedPatches.push(req.patch);
+            cb?.({
+              ok: true,
+              data: {
+                settings: {
+                  ...storage.DEFAULT_EXTENSION_SETTINGS,
+                  ...req.patch,
+                },
+              },
+            });
+            return;
+          }
+          cb?.({
+            ok: true,
+            data: {
+              ok: true,
+              status: 200,
+              authMode: "anonymous",
+              platformCount: 14,
+              message: "200 OK",
+              checkedAt: Date.now(),
+            },
+          });
+        },
+      },
+    };
+
+    uiTargetHelpersMod.applyExtensionTheme("dark");
+    const settingsView = mountSfcTree(
+      SidePanelSettings,
+      {
+        open: true,
+        settings: { ...storage.DEFAULT_EXTENSION_SETTINGS, theme: "dark" },
+        connection: null,
+      },
+      {
+        onSaved: (next) => savedEvents.push(next),
+        onClose: () => {
+          settingsView.propsRef.value = {
+            ...settingsView.propsRef.value,
+            open: false,
+          };
+        },
+      },
+    );
+    try {
+      await settingsView.flush();
+      assert.match(settingsView.textOf(), /外观主题/);
+      const lightChoice = settingsView.findAll(
+        (node) =>
+          node.type === "button" &&
+          typeof node.props.class === "string" &&
+          node.props.class.includes("sp-theme-choice") &&
+          settingsView.textOf(node).trim() === "浅色",
+      )[0];
+      assert.ok(lightChoice, "renders 浅色 theme option");
+
+      // Click 浅色 -> live previews light theme without persisting cache yet
+      await settingsView.fire(lightChoice, "onClick");
+      assert.equal(fakeRoot.dataset.theme, "light");
+      assert.equal(
+        fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+        "dark",
+      );
+
+      // Click 取消 -> closes and restores saved "dark" theme
+      const cancelBtn = settingsView.findAll(
+        (node) =>
+          node.type === "button" && settingsView.textOf(node).trim() === "取消",
+      )[0];
+      await settingsView.fire(cancelBtn, "onClick");
+      assert.equal(fakeRoot.dataset.theme, "dark");
+
+      // Reopen, select 浅色, click 保存设置 -> sends UPDATE_SETTINGS { theme: "light" } and persists cache
+      settingsView.propsRef.value = {
+        ...settingsView.propsRef.value,
+        open: true,
+      };
+      await settingsView.flush();
+      const lightChoice2 = settingsView.findAll(
+        (node) =>
+          node.type === "button" &&
+          typeof node.props.class === "string" &&
+          node.props.class.includes("sp-theme-choice") &&
+          settingsView.textOf(node).trim() === "浅色",
+      )[0];
+      await settingsView.fire(lightChoice2, "onClick");
+      const saveBtn = settingsView.findAll(
+        (node) =>
+          node.type === "button" &&
+          settingsView.textOf(node).trim() === "保存设置",
+      )[0];
+      await settingsView.fire(saveBtn, "onClick");
+      await new Promise((r) => setTimeout(r, 15));
+      assert.equal(savedPatches.length, 1);
+      assert.equal(savedPatches[0].theme, "light");
+      assert.equal(savedEvents[0]?.theme, "light");
+      assert.equal(fakeRoot.dataset.theme, "light");
+      assert.equal(
+        fakeStorage.get(uiTargetHelpersMod.EXTENSION_THEME_CACHE_KEY),
+        "light",
+      );
+    } finally {
+      settingsView.unmount();
+      globalThis.chrome = origChrome;
+    }
+  } finally {
+    globalThis.localStorage = origLocalStorage;
+    globalThis.document = origDocument;
+  }
+});
+
+// ============================================================================
+// Dynamic Action Tooltip (chrome.action.setTitle) & Percentage Badge Tests
+// ============================================================================
+
+test("computeActionIndicator: pure state computation for single, multi-task aggregate, and terminal outcomes", () => {
+  const mkTask = (overrides) => ({
+    taskId: "t1",
+    title: "测试视频标题",
+    filename: "test.mp4",
+    platform: "bilibili",
+    status: "downloading",
+    statusText: "下载中",
+    percent: 0,
+    loaded: 0,
+    total: 0,
+    speed: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  });
+
+  // Idle / clear
+  const idle = backgroundMod.computeActionIndicator([]);
+  assert.deepEqual(idle, {
+    badgeText: "",
+    title: backgroundMod.DEFAULT_ACTION_TITLE,
+    shouldScheduleClear: false,
+  });
+
+  // Single task: queued / parsing / 0% downloading -> badge "1"
+  const parsing = backgroundMod.computeActionIndicator([
+    mkTask({ status: "parsing", percent: 0, title: "抖音极速解析任务" }),
+  ]);
+  assert.equal(parsing.badgeText, "1");
+  assert.equal(parsing.badgeColor, "#6366f1");
+  assert.equal(parsing.title, "DokiTool · 解析中\n抖音极速解析任务");
+  assert.equal(parsing.shouldScheduleClear, false);
+
+  // Single task: downloading 64% at 4.2 MB/s
+  const downloading = backgroundMod.computeActionIndicator([
+    mkTask({
+      status: "downloading",
+      percent: 64,
+      speed: 4_200_000,
+      title: "超清晰4K航拍风景纪录片",
+    }),
+  ]);
+  assert.equal(downloading.badgeText, "64%");
+  assert.equal(downloading.badgeColor, "#6366f1");
+  assert.equal(
+    downloading.title,
+    "DokiTool · 下载中 64% (4.2 MB/s)\n超清晰4K航拍风景纪录片",
+  );
+
+  // Single task: KB/s speed formatting, 100% clamped to 99%, long title truncated <= 28 chars
+  const longTitle =
+    "这是一个非常非常非常非常非常非常非常非常长的视频标题超过二十八个字符";
+  const savingLong = backgroundMod.computeActionIndicator([
+    mkTask({
+      status: "saving",
+      percent: 100,
+      speed: 680_000,
+      title: longTitle,
+    }),
+  ]);
+  assert.equal(savingLong.badgeText, "99%");
+  assert.match(savingLong.title, /^DokiTool · 保存中 99% \(680 KB\/s\)\n/);
+  const secondLine = savingLong.title.split("\n")[1];
+  assert.ok(Array.from(secondLine).length <= 28, "truncated title <= 28 chars");
+  assert.ok(secondLine.endsWith("…"));
+
+  // Multi-task byte-weighted aggregate (all active tasks have total > 0)
+  // Task 1: 10 MB / 100 MB (10%), speed 2 MB/s; Task 2: 200 MB / 300 MB (67%), speed 3 MB/s
+  // Byte-weighted: 210 / 400 = 52.5% -> 53%, total speed 5.0 MB/s
+  const multiByteWeighted = backgroundMod.computeActionIndicator([
+    mkTask({
+      taskId: "t1",
+      title: "第一集",
+      status: "downloading",
+      percent: 10,
+      loaded: 10_000_000,
+      total: 100_000_000,
+      speed: 2_000_000,
+    }),
+    mkTask({
+      taskId: "t2",
+      title: "第二集",
+      status: "downloading",
+      percent: 67,
+      loaded: 200_000_000,
+      total: 300_000_000,
+      speed: 3_000_000,
+    }),
+  ]);
+  assert.equal(multiByteWeighted.badgeText, "53%");
+  assert.equal(multiByteWeighted.badgeColor, "#6366f1");
+  assert.equal(
+    multiByteWeighted.title,
+    "DokiTool · 后台下载中 2 个任务 · 总进度 53% (5.0 MB/s)\n当前：第一集 (10%)",
+  );
+
+  // Multi-task arithmetic mean fallback when any active task lacks total > 0
+  const multiMean = backgroundMod.computeActionIndicator([
+    mkTask({
+      taskId: "t1",
+      title: "分片流A",
+      status: "downloading",
+      percent: 20,
+      total: 0,
+      speed: 500_000,
+    }),
+    mkTask({
+      taskId: "t2",
+      title: "合流B",
+      status: "muxing",
+      percent: 60,
+      total: 1000,
+      loaded: 600,
+      speed: 0,
+    }),
+  ]);
+  assert.equal(multiMean.badgeText, "40%");
+  assert.equal(
+    multiMean.title,
+    "DokiTool · 后台下载中 2 个任务 · 总进度 40% (500 KB/s)\n当前：分片流A (20%)",
+  );
+
+  // Multi-task indeterminate 0% shows active count
+  const multiZero = backgroundMod.computeActionIndicator([
+    mkTask({ taskId: "t1", status: "queued", percent: 0, total: 0 }),
+    mkTask({ taskId: "t2", status: "parsing", percent: 0, total: 0 }),
+  ]);
+  assert.equal(multiZero.badgeText, "2");
+
+  // Terminal completed / failed / clear
+  const done = backgroundMod.computeActionIndicator(
+    [mkTask({ status: "completed", percent: 100 })],
+    "completed",
+  );
+  assert.deepEqual(done, {
+    badgeText: "✓",
+    badgeColor: "#10b981",
+    title: "DokiTool · 后台下载已完成（点击打开侧边栏查看）",
+    shouldScheduleClear: true,
+  });
+
+  const failed = backgroundMod.computeActionIndicator(
+    [mkTask({ status: "failed" })],
+    "failed",
+  );
+  assert.deepEqual(failed, {
+    badgeText: "!",
+    badgeColor: "#ef4444",
+    title: "DokiTool · 有后台任务失败（点击打开侧边栏查看或重试）",
+    shouldScheduleClear: false,
+  });
+
+  const cleared = backgroundMod.computeActionIndicator([], "clear");
+  assert.deepEqual(cleared, {
+    badgeText: "",
+    title: backgroundMod.DEFAULT_ACTION_TITLE,
+    shouldScheduleClear: false,
+  });
+});
+
+test("Background Controller lifecycle: dynamic setBadgeText & setTitle across parsing -> downloading -> muxing -> saving -> completed -> idle reset, multi-task, deduplication, and failed", async () => {
+  const env = createMockMv3Environment({ autoCompleteDownloads: false });
+
+  // Gate parse API response so we can observe the real "parsing" badge ("1") + tooltip before download starts
+  let releaseParseGate = () => {};
+  const parseGate = new Promise((r) => {
+    releaseParseGate = r;
+  });
+  let parseStarted = false;
+  let startedTaskId = "";
+
+  const mockFetch = async (url) => {
+    if (String(url).includes("/api/parse")) {
+      parseStarted = true;
+      await parseGate;
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: {
+            platform: "bilibili",
+            content_id: "BV1actionTest",
+            title: "B站4K测试视频",
+            source_url: "https://www.bilibili.com/video/BV1actionTest",
+            items: [
+              {
+                id: "v1",
+                type: "video",
+                title: "B站4K测试视频",
+                variants: [
+                  {
+                    id: "var-4k",
+                    label: "4K",
+                    metadata: {
+                      extension: "mp4",
+                      width: 3840,
+                      height: 2160,
+                      has_audio: true,
+                    },
+                    delivery: {
+                      kind: "file",
+                      sources: [
+                        {
+                          url: "https://upos-sz-mirrorcos.bilivideo.com/4k.mp4",
+                          size_bytes: 100_000_000,
+                        },
+                      ],
+                    },
+                  },
+                ],
+                default: {
+                  variant_id: "var-4k",
+                  url: "https://upos-sz-mirrorcos.bilivideo.com/4k.mp4",
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  // Stub offscreen message responder so we drive exact OFFSCREEN_TASK_PROGRESS / HANDOFF_BLOB_DOWNLOAD ticks deterministically
+  env.chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "OFFSCREEN_START_TASK") {
+      startedTaskId = msg.taskId;
+      sendResponse({ ok: true, data: { accepted: true } });
+      return true;
+    }
+    if (msg?.type === "RELEASE_BLOB") {
+      sendResponse({ ok: true, data: { released: true } });
+      return true;
+    }
+    return false;
+  });
+
+  const extStorage = storage.createExtensionStorage();
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    fetchImpl: mockFetch,
+    badgeSuccessDurationMs: 45,
+  });
+
+  try {
+    // 1) init() sets idle badge "" & DEFAULT_ACTION_TITLE
+    await bg.init();
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      backgroundMod.DEFAULT_ACTION_TITLE,
+    );
+
+    // 2) Single-task full lifecycle: parsing ("1") -> downloading ("42%" + speed) -> dedup -> muxing ("85%") -> saving ("99%") -> completed ("✓") -> idle reset
+    env.badgeHistory.length = 0;
+    env.emitContextMenuClick(
+      {
+        menuItemId: protocol.CONTEXT_MENU_QUICK_DOWNLOAD_ID,
+        linkUrl: "https://www.bilibili.com/video/BV1actionTest",
+      },
+      { id: 1, windowId: 10 },
+    );
+
+    for (let i = 0; i < 50 && !parseStarted; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(parseStarted, true, "quick-download entered parsing phase");
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "1",
+      "parsing phase displays badge '1'",
+    );
+    assert.match(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title ?? "",
+      /^DokiTool · 解析中\n/,
+      "parsing phase displays 解析中 tooltip",
+    );
+
+    // Release parse gate -> task starts downloading in offscreen
+    releaseParseGate();
+    for (let i = 0; i < 50 && !startedTaskId; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const taskId = startedTaskId;
+    assert.ok(taskId, "offscreen task started");
+
+    // Progress: downloading 42% at 4.2 MB/s
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 42,
+      loaded: 42_000_000,
+      total: 100_000_000,
+      speed: 4_200_000,
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "42%",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 下载中 42% (4.2 MB/s)\nB站4K测试视频",
+    );
+
+    // Identical rapid progress tick MUST NOT spam setBadgeText / setBadgeBackgroundColor / setTitle!
+    const historyLenBeforeDup = env.badgeHistory.length;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 42,
+      loaded: 42_050_000,
+      total: 100_000_000,
+      speed: 4_200_000,
+    });
+    assert.equal(
+      env.badgeHistory.length,
+      historyLenBeforeDup,
+      "Identical indicator values must be deduplicated without spamming Chrome IPC",
+    );
+
+    // Progress: muxing 85%
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在无损合流...",
+      percent: 85,
+      loaded: 85_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "85%",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 合流中 85%\nB站4K测试视频",
+    );
+
+    // Handoff -> saving 99%
+    const handoff = await env.chrome.runtime.sendMessage({
+      type: "HANDOFF_BLOB_DOWNLOAD",
+      taskId,
+      blobUrl: "blob:chrome-extension://test/1",
+      filename: "B站4K测试视频.mp4",
+      sizeBytes: 100_000_000,
+    });
+    assert.equal(handoff.ok, true);
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "99%",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 保存中 99%\nB站4K测试视频",
+    );
+
+    // Complete -> badge "✓", color "#10b981", completed title
+    env.emitDownloadChanged({
+      id: handoff.data.chromeDownloadId,
+      state: { current: "complete" },
+    });
+    await bg.waitForIdle();
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "✓",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "color").at(-1)?.color,
+      "#10b981",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 后台下载已完成（点击打开侧边栏查看）",
+    );
+
+    // After badgeSuccessDurationMs, BOTH badge "" and title DEFAULT_ACTION_TITLE reset!
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      backgroundMod.DEFAULT_ACTION_TITLE,
+    );
+
+    // 3) Multi-task concurrent aggregate percentage & total speed tooltip + failed state
+    env.badgeHistory.length = 0;
+    const multiEnq = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "多任务一",
+          platform: "bilibili",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://upos-sz-mirrorcos.bilivideo.com/a.mp4"],
+            filename: "a.mp4",
+            sizeBytes: 10_000_000,
+          },
+        },
+        {
+          title: "多任务二",
+          platform: "bilibili",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://upos-sz-mirrorcos.bilivideo.com/b.mp4"],
+            filename: "b.mp4",
+            sizeBytes: 30_000_000,
+          },
+        },
+      ],
+    });
+    const [m1, m2] = multiEnq.data.taskIds;
+    await new Promise((r) => setTimeout(r, 15));
+
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId: m1,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 50,
+      loaded: 5_000_000,
+      total: 10_000_000,
+      speed: 1_500_000,
+    });
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId: m2,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 50,
+      loaded: 15_000_000,
+      total: 30_000_000,
+      speed: 2_500_000,
+    });
+
+    // Aggregate: 20MB / 40MB = 50%, total speed 4.0 MB/s
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "50%",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 后台下载中 2 个任务 · 总进度 50% (4.0 MB/s)\n当前：多任务一 (50%)",
+    );
+
+    // Fail both tasks -> badge "!", color "#ef4444", failed title
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: m1,
+      error: "network error 1",
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "50%",
+    );
+
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: m2,
+      error: "network error 2",
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "!",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "color").at(-1)?.color,
+      "#ef4444",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      "DokiTool · 有后台任务失败（点击打开侧边栏查看或重试）",
+    );
+
+    // CLEAR_FINISHED_TASKS resets BOTH badge "" and title DEFAULT_ACTION_TITLE
+    await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "",
+    );
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title,
+      backgroundMod.DEFAULT_ACTION_TITLE,
+    );
+  } finally {
+    bg.dispose();
+  }
+});
+
+test("MV3 Weibo relay regression: validateMediaEnvelope & background PARSE_URL/RESOLVE_LAZY_ITEM succeed when location.origin is chrome-extension://", async () => {
+  const prevLocationDesc = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "location",
+  );
+  Object.defineProperty(globalThis, "location", {
+    value: { origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    configurable: true,
+    writable: true,
+  });
+
+  const weiboRelayEnvelope = {
+    schema_version: "1.0",
+    code: "OK",
+    data: {
+      platform: "weibo",
+      content_id: "1034:5339966948180025",
+      title: "微博中转测试视频",
+      source_url:
+        "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
+      generated_at: "2026-11-21T15:00:00Z",
+      cover: {
+        url: "https://wx4.sinaimg.cn/orj480/test-cover.jpg",
+        access: "direct",
+      },
+      author: {
+        name: "测试博主",
+        avatar: {
+          url: "https://tvax2.sinaimg.cn/crop.0.0.100.100/test-avatar.jpg",
+          access: "direct",
+        },
+      },
+      items: [
+        {
+          id: "video-1",
+          type: "video",
+          state: "ready",
+          cover: {
+            url: "/api/media/weibo?ticket=cover-relay-test",
+            access: "relay",
+          },
+          default: {
+            variant_id: "mp4_1080p",
+            url: "/api/media/weibo?ticket=test",
+            access: "relay",
+          },
+          variants: [
+            {
+              id: "mp4_1080p",
+              label: "1080P",
+              delivery: {
+                kind: "file",
+                sources: [
+                  {
+                    url: "/api/media/weibo?ticket=test",
+                    access: "relay",
+                    size_bytes: 1234567,
+                  },
+                ],
+              },
+              metadata: {
+                width: 1920,
+                height: 1080,
+                container: "mp4",
+                extension: "mp4",
+                mime_type: "video/mp4",
+              },
+            },
+          ],
+        },
+      ],
+      attachments: [
+        {
+          id: "att-1",
+          kind: "audio",
+          label: "伴音",
+          resource: {
+            id: "att-res-1",
+            role: "audio",
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  url: "/api/media/weibo?ticket=audio-test",
+                  access: "relay",
+                },
+              ],
+            },
+          },
+        },
+      ],
+    },
+  };
+
+  let bg = null;
+  try {
+    // 1. Without apiOrigin context, chrome-extension:// location.origin must still fail closed
+    assert.throws(
+      () => mediaContractMod.validateMediaEnvelope(weiboRelayEnvelope),
+      /API origin 无效/,
+    );
+
+    // 2. With explicit apiOrigin context, validateMediaEnvelope succeeds across variants, default, cover & attachments
+    const validated = mediaContractMod.validateMediaEnvelope(
+      weiboRelayEnvelope,
+      { apiOrigin: "https://snap.dokitool.com" },
+    );
+    assert.equal(validated.platform, "weibo");
+    assert.equal(
+      validated.items[0].default?.url,
+      "/api/media/weibo?ticket=test",
+    );
+
+    // 3. Full background controller PARSE_URL & RESOLVE_ITEM with chrome-extension:// location.origin
+    const env = createMockMv3Environment();
+    const fetchCalls = [];
+    const mockFetch = async (url) => {
+      fetchCalls.push(String(url));
+      return new Response(JSON.stringify(weiboRelayEnvelope), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const extStorage = storage.createExtensionStorage();
+    bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: extStorage,
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+
+    const parseResp = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
+    });
+    assert.equal(
+      parseResp.ok,
+      true,
+      `PARSE_URL failed: ${parseResp.error || ""}`,
+    );
+    assert.equal(parseResp.data.media.platform, "weibo");
+    assert.equal(
+      parseResp.data.media.items[0].default?.url,
+      "/api/media/weibo?ticket=test",
+    );
+
+    const resolveResp = await env.chrome.runtime.sendMessage({
+      type: "RESOLVE_LAZY_ITEM",
+      resolveUrl:
+        "/api/resolve?platform=weibo&url=https%3A%2F%2Fweibo.com%2Ftv%2Fshow%2F1034%3A5339966948180025&item=video-1",
+    });
+    assert.equal(
+      resolveResp.ok,
+      true,
+      `RESOLVE_LAZY_ITEM failed: ${resolveResp.error || ""}`,
+    );
+    assert.equal(resolveResp.data.media.platform, "weibo");
+    assert.equal(fetchCalls.length, 2);
+  } finally {
+    bg?.dispose();
+    if (prevLocationDesc) {
+      Object.defineProperty(globalThis, "location", prevLocationDesc);
+    } else {
+      delete globalThis.location;
+    }
+  }
+});
+
+test("background badge & tooltip: late cancelled callback does not wipe terminal failed '!' or completed '✓' indicators", async () => {
+  const env = createMockMv3Environment({ autoCompleteDownloads: false });
+  env.chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "OFFSCREEN_START_TASK") {
+      sendResponse({ ok: true, data: { accepted: true } });
+      return true;
+    }
+    if (msg?.type === "OFFSCREEN_CANCEL_TASK") {
+      sendResponse({ ok: true, data: { cancelled: true } });
+      return true;
+    }
+    if (msg?.type === "RELEASE_BLOB") {
+      sendResponse({ ok: true, data: { released: true } });
+      return true;
+    }
+    return false;
+  });
+  const extStorage = storage.createExtensionStorage();
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    badgeSuccessDurationMs: 60,
+    fetchImpl: async () => new Response("{}", { status: 200 }),
+  });
+
+  const lastBadgeText = () =>
+    [...env.badgeHistory].reverse().find((e) => e.kind === "text")?.text;
+  const lastBadgeTitle = () =>
+    [...env.badgeHistory].reverse().find((e) => e.kind === "title")?.title;
+
+  try {
+    await bg.init();
+
+    // Case 1: Task 2 cancelled while Task 1 fails -> delayed OFFSCREEN_TASK_ERROR(cancelled) must NOT wipe "!"
+    const enq1 = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "视频 A",
+          platform: "douyin",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://v26-cold.douyinvod.com/a.mp4"],
+            filename: "a.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+        {
+          title: "视频 B",
+          platform: "douyin",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://v26-cold.douyinvod.com/b.mp4"],
+            filename: "b.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+      ],
+    });
+    assert.equal(enq1.ok, true);
+    const [taskA, taskB] = enq1.data.taskIds;
+
+    // Cancel Task B first
+    const cancelRes = await env.chrome.runtime.sendMessage({
+      type: "CANCEL_TASK",
+      taskId: taskB,
+    });
+    assert.equal(cancelRes.ok, true);
+
+    // Task A fails -> badge="!" and failed tooltip
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskA,
+      error: "CDN 403",
+    });
+    assert.equal(lastBadgeText(), "!");
+    assert.match(lastBadgeTitle() || "", /失败/);
+
+    // Delayed Offscreen cancelled error for Task B arrives -> must NOT wipe "!" or title!
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskB,
+      error: "已取消",
+      cancelled: true,
+    });
+    assert.equal(lastBadgeText(), "!");
+    assert.match(lastBadgeTitle() || "", /失败/);
+
+    // Explicit clear MUST still reset badge & title cleanly
+    await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+    assert.equal(lastBadgeText(), "");
+    assert.equal(lastBadgeTitle(), backgroundMod.DEFAULT_ACTION_TITLE);
+
+    // Case 2: Task C completes ("✓") while cancelled Task D sends late OFFSCREEN_TASK_ERROR(cancelled)
+    const enq2 = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "视频 C",
+          platform: "x",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://video.twimg.com/c.mp4"],
+            filename: "c.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+        {
+          title: "视频 D",
+          platform: "x",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://video.twimg.com/d.mp4"],
+            filename: "d.mp4",
+            mimeType: "video/mp4",
+          },
+        },
+      ],
+    });
+    const [taskC, taskD] = enq2.data.taskIds;
+    await env.chrome.runtime.sendMessage({ type: "CANCEL_TASK", taskId: taskD });
+
+    const handoff = await env.chrome.runtime.sendMessage({
+      type: "HANDOFF_BLOB_DOWNLOAD",
+      taskId: taskC,
+      blobUrl: "blob:chrome-extension://ext/c",
+      filename: "c.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 1024,
+    });
+    assert.equal(handoff.ok, true);
+    env.emitDownloadChanged({
+      id: handoff.data.chromeDownloadId,
+      state: { current: "complete" },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(lastBadgeText(), "✓");
+    assert.match(lastBadgeTitle() || "", /已完成/);
+
+    // Delayed cancel callback for Task D must preserve "✓" and its auto-clear timer
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId: taskD,
+      error: "已取消",
+      cancelled: true,
+    });
+    assert.equal(lastBadgeText(), "✓");
+    assert.match(lastBadgeTitle() || "", /已完成/);
+
+    // Wait for scheduled auto-clear timer to reset cleanly to idle
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(lastBadgeText(), "");
+    assert.equal(lastBadgeTitle(), backgroundMod.DEFAULT_ACTION_TITLE);
+  } finally {
+    bg.dispose();
+  }
 });

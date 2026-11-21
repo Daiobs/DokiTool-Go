@@ -361,8 +361,9 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 <style scoped>
 .sp-downloads {
   flex-shrink: 0;
-  background: rgba(13, 21, 38, 0.96);
+  background: var(--sp-bg-drawer-bar);
   border-top: 1px solid var(--sp-border-strong);
+  box-shadow: var(--sp-shadow-drawer-bar);
   display: flex;
   flex-direction: column;
   z-index: 25;
@@ -419,25 +420,25 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 }
 
 .sp-dl-count--active {
-  background: rgba(99, 102, 241, 0.22);
-  color: #c7d2fe;
-  border: 1px solid rgba(129, 140, 248, 0.4);
+  background: var(--sp-accent-soft-strong);
+  color: var(--sp-accent-text-strong);
+  border: 1px solid var(--sp-accent-border);
 }
 
 .sp-dl-count--done {
   background: var(--sp-success-soft);
-  color: #6ee7b7;
+  color: var(--sp-success-text);
 }
 
 .sp-dl-count--err {
   background: var(--sp-danger-soft);
-  color: #fca5a5;
+  color: var(--sp-danger-text);
 }
 
 .sp-downloads__speed {
   font-family: var(--sp-font-mono);
   font-size: 10.5px;
-  color: #a5b4fc;
+  color: var(--sp-accent-text);
   white-space: nowrap;
 }
 
@@ -450,7 +451,7 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 
 .sp-clear-btn {
   border: 1px solid var(--sp-border);
-  background: rgba(148, 163, 184, 0.08);
+  background: var(--sp-ghost-bg);
   color: var(--sp-text-secondary);
   border-radius: var(--sp-radius-xs);
   padding: 2px 7px;
@@ -458,10 +459,12 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
   font-size: 10.5px;
   font-weight: 600;
   cursor: pointer;
+  transition: all 140ms ease;
 }
 
 .sp-clear-btn:hover {
   color: var(--sp-text-primary);
+  background: var(--sp-ghost-bg-hover);
   border-color: var(--sp-border-strong);
 }
 
@@ -470,12 +473,18 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
   height: 24px;
   border-radius: 6px;
   border: none;
-  background: rgba(148, 163, 184, 0.08);
+  background: var(--sp-ghost-bg);
   color: var(--sp-text-secondary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.sp-chevron-btn:hover {
+  background: var(--sp-ghost-bg-hover);
+  color: var(--sp-text-primary);
 }
 
 .sp-downloads__list {
@@ -500,7 +509,7 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 }
 
 .sp-task--failed {
-  border-color: rgba(239, 68, 68, 0.34);
+  border-color: var(--sp-danger-border);
 }
 
 .sp-task__row1 {
@@ -515,7 +524,7 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
   font-weight: 600;
   padding: 1px 5px;
   border-radius: 4px;
-  background: rgba(148, 163, 184, 0.12);
+  background: var(--sp-muted-pill-bg);
   color: var(--sp-text-secondary);
   flex-shrink: 0;
 }
@@ -537,27 +546,27 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 }
 
 .sp-task__chip--active {
-  background: rgba(99, 102, 241, 0.18);
-  color: #a5b4fc;
+  background: var(--sp-accent-soft);
+  color: var(--sp-accent-text);
 }
 
 .sp-task__chip--mux {
-  background: rgba(139, 92, 246, 0.24);
-  color: #ddd6fe;
+  background: var(--sp-violet-soft);
+  color: var(--sp-violet-text);
 }
 
 .sp-task__chip--done {
   background: var(--sp-success-soft);
-  color: #6ee7b7;
+  color: var(--sp-success-text);
 }
 
 .sp-task__chip--err {
   background: var(--sp-danger-soft);
-  color: #fca5a5;
+  color: var(--sp-danger-text);
 }
 
 .sp-task__chip--muted {
-  background: rgba(148, 163, 184, 0.14);
+  background: var(--sp-muted-pill-bg);
   color: var(--sp-text-muted);
 }
 
@@ -565,28 +574,28 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
   width: 100%;
   height: 4px;
   border-radius: 999px;
-  background: var(--sp-bg-base);
+  background: var(--sp-track-bg);
   overflow: hidden;
 }
 
 .sp-task__progress-fill {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #6366f1, #8b5cf6);
+  background: linear-gradient(90deg, var(--sp-accent-start), var(--sp-accent-end));
   transition: width 160ms linear;
 }
 
 .sp-task__progress-fill--done {
-  background: #10b981;
+  background: var(--sp-success);
 }
 
 .sp-task__progress-fill--indeterminate {
   width: 100% !important;
   background: linear-gradient(
     90deg,
-    rgba(99, 102, 241, 0.2) 0%,
-    #818cf8 50%,
-    rgba(99, 102, 241, 0.2) 100%
+    var(--sp-accent-soft) 0%,
+    var(--sp-accent-solid) 50%,
+    var(--sp-accent-soft) 100%
   );
   background-size: 200% 100%;
   animation: spShimmer 1.3s linear infinite;
@@ -609,7 +618,7 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 }
 
 .sp-task__err-text {
-  color: #fca5a5;
+  color: var(--sp-danger-text);
   white-space: normal;
   word-break: break-word;
 }

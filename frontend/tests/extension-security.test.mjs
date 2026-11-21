@@ -1,15 +1,20 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, stop } from "esbuild";
+import JSZip from "jszip";
 import {
   buildExtension,
+  createDeterministicZipBuffer,
+  packageExtensionZip,
   verifyExtensionDist,
+  verifyExtensionZip,
 } from "../scripts/build-extension.mjs";
 
 let hostWhitelist;
@@ -652,6 +657,7 @@ test("storage & protocol: token isolation, autoFollowTab transition, LRU 200 cap
     batchSaveMode: "subfolder",
     qualityPreference: "best",
     autoFollowTab: false,
+    theme: "system",
   });
   const anonHeaders = storage.buildApiAuthHeaders(initial, {
     Accept: "application/json",
@@ -920,6 +926,130 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
   }
 });
 
+test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-for-byte verification, and --dev-loopback refusal", async () => {
+  const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+  // 1. createDeterministicZipBuffer is OS/order/time-independent with fixed DOS timestamp & UTF-8 flag
+  const sampleA = [
+    { path: "z/file.txt", data: "hello world\n".repeat(40) },
+    { path: "a/alpha.json", data: '{"ok":true}\n' },
+    { path: "manifest.json", data: '{"manifest_version":3}\n' },
+  ];
+  const sampleB = [...sampleA].reverse();
+  const bufA = createDeterministicZipBuffer(sampleA);
+  const bufB = createDeterministicZipBuffer(sampleB);
+  assert.equal(sha256(bufA), sha256(bufB), "reversed input order must produce byte-identical ZIP");
+  assert.equal(bufA.readUInt32LE(0), 0x04034b50, "must begin with PKZIP local header magic");
+  assert.equal(bufA.readUInt16LE(6), 0x0800, "must set UTF-8 general-purpose bit flag");
+  assert.equal(bufA.readUInt16LE(10), 0x0000, "must pin fixed DOS time 00:00:00");
+  assert.equal(
+    bufA.readUInt16LE(12),
+    ((2026 - 1980) << 9) | (1 << 5) | 1,
+    "must pin fixed DOS date 2026-01-01",
+  );
+
+  // Verify entry order is strictly lexicographical by POSIX path
+  const parsedSample = await JSZip.loadAsync(bufA);
+  assert.deepEqual(Object.keys(parsedSample.files), [
+    "a/alpha.json",
+    "manifest.json",
+    "z/file.txt",
+  ]);
+
+  // 2. Full production buildExtension with zipOut + determinism across repeated packageExtensionZip calls
+  const tmpBase = await mkdtemp(join(tmpdir(), "dokitool-ext-zip-test-"));
+  const prodOut = join(tmpBase, "dist-extension");
+  const zipPath1 = join(tmpBase, "out", "dokitool-chrome-extension.zip");
+  const zipPath2 = join(tmpBase, "out", "dokitool-chrome-extension-repeat.zip");
+  const devOut = join(tmpBase, "dist-extension-dev");
+  const devZipPath = join(tmpBase, "out", "dev-loopback-forbidden.zip");
+  try {
+    const built = await buildExtension({
+      devLoopback: false,
+      outDir: prodOut,
+      zipOut: zipPath1,
+      quiet: true,
+    });
+    assert.ok(built.zip, "buildExtension with zipOut must return zip metadata");
+    assert.equal(existsSync(zipPath1), true);
+    assert.equal(built.zip.zipPath, resolve(zipPath1));
+    assert.ok(built.zip.sizeBytes > 0);
+    assert.match(built.zip.sha256, /^[0-9a-f]{64}$/);
+
+    // Verify ZIP has manifest.json directly at archive root (no wrapping folder) and matches every file byte-for-byte
+    const verified = await verifyExtensionZip(zipPath1, prodOut);
+    assert.equal(verified.sha256, built.zip.sha256);
+    assert.equal(verified.manifest.manifest_version, 3);
+    const parsedZip = await JSZip.loadAsync(await readFile(zipPath1));
+    assert.ok(parsedZip.files["manifest.json"], "manifest.json must sit directly at ZIP root");
+    assert.ok(parsedZip.files["background.js"], "background.js must sit directly at ZIP root");
+    assert.ok(parsedZip.files["sidepanel.html"], "sidepanel.html must sit directly at ZIP root");
+    assert.ok(parsedZip.files["offscreen.html"], "offscreen.html must sit directly at ZIP root");
+    assert.ok(parsedZip.files["icons/icon-128.png"], "icons/icon-128.png must sit at root icons/");
+
+    // Packaging the same built directory twice yields identical SHA-256
+    const repacked = await packageExtensionZip(prodOut, zipPath2);
+    assert.equal(
+      repacked.sha256,
+      built.zip.sha256,
+      "repeated packageExtensionZip calls must emit 100% identical SHA-256",
+    );
+
+    // 3. Security guard: devLoopback=true combined with zipOut MUST throw and refuse to emit a ZIP
+    await assert.rejects(
+      () =>
+        buildExtension({
+          devLoopback: true,
+          outDir: devOut,
+          zipOut: devZipPath,
+          quiet: true,
+        }),
+      /--dev-loopback/,
+    );
+    assert.equal(
+      existsSync(devZipPath),
+      false,
+      "dev-loopback refusal must not create a ZIP file",
+    );
+
+    // 4. verifyExtensionZip rejects a ZIP that wraps manifest.json in a subdirectory
+    const wrappedZipPath = join(tmpBase, "wrapped.zip");
+    const manifestBytes = await readFile(join(prodOut, "manifest.json"));
+    const wrappedBuf = createDeterministicZipBuffer([
+      { path: "dokitool-chrome-extension/manifest.json", data: manifestBytes },
+    ]);
+    await writeFile(wrappedZipPath, wrappedBuf);
+    await assert.rejects(
+      () => verifyExtensionZip(wrappedZipPath),
+      /manifest\.json directly at archive root/,
+    );
+
+    // 5. verifyExtensionZip rejects a ZIP containing a tampered production manifest (e.g. loopback host)
+    const badManifestZipPath = join(tmpBase, "bad-manifest.zip");
+    const badManifest = {
+      ...built.manifest,
+      host_permissions: [...built.manifest.host_permissions, "http://127.0.0.1/*"],
+    };
+    const badZipEntries = [];
+    for (const [name, entry] of Object.entries(parsedZip.files)) {
+      badZipEntries.push({
+        path: name,
+        data:
+          name === "manifest.json"
+            ? Buffer.from(JSON.stringify(badManifest, null, 2) + "\n", "utf8")
+            : await entry.async("nodebuffer"),
+      });
+    }
+    await writeFile(badManifestZipPath, createDeterministicZipBuffer(badZipEntries));
+    await assert.rejects(
+      () => verifyExtensionZip(badManifestZipPath),
+      /127\.0\.0\.1|localhost/,
+    );
+  } finally {
+    await rm(tmpBase, { recursive: true, force: true });
+  }
+});
+
 test("check-public-files.py: strictly rejects frontend/dist-extension/* from public inventory", async () => {
   const repoRoot = resolve(
     fileURLToPath(new URL("../..", import.meta.url)),
@@ -983,4 +1113,189 @@ test("check-public-files.py: strictly rejects frontend/dist-extension/* from pub
   } finally {
     await rm(tmpRepo, { recursive: true, force: true });
   }
+});
+
+test("urlMatcher P1/P2/P3 hardening: positive feed suppression, backend-supported work URLs, and canonical dedupeKey parity", () => {
+  // P1: Non-work/profile/login/feed pages on facebook, tumblr, and toutiao must return isLikelyFeedOrHome: true
+  const p1FeedCases = [
+    ["facebook", "https://www.facebook.com/"],
+    ["facebook", "https://www.facebook.com/home.php"],
+    ["facebook", "https://www.facebook.com/watch"],
+    ["facebook", "https://www.facebook.com/friends"],
+    ["facebook", "https://www.facebook.com/marketplace/"],
+    ["facebook", "https://www.facebook.com/login/"],
+    ["facebook", "https://www.facebook.com/notifications"],
+    ["facebook", "https://www.facebook.com/groups"],
+    ["facebook", "https://www.facebook.com/groups/123456789/"],
+    ["facebook", "https://www.facebook.com/messages"],
+    ["facebook", "https://www.facebook.com/settings"],
+    ["facebook", "https://fb.watch/"],
+    ["tumblr", "https://www.tumblr.com/"],
+    ["tumblr", "https://www.tumblr.com/maskofthedragon"],
+    ["tumblr", "https://maskofthedragon.tumblr.com/"],
+    ["tumblr", "https://www.tumblr.com/blog/view/maskofthedragon"],
+    ["tumblr", "https://www.tumblr.com/tagged/2024"],
+    ["tumblr", "https://www.tumblr.com/search/12345"],
+    ["tumblr", "https://www.tumblr.com/login"],
+    ["toutiao", "https://www.toutiao.com/"],
+    ["toutiao", "https://www.toutiao.com/ch/news_tech/"],
+    ["toutiao", "https://www.toutiao.com/c/user/token/MS4wLjAB/"],
+  ];
+
+  for (const [expectedPlatform, url] of p1FeedCases) {
+    const matched = urlMatcher.matchSupportedPlatformUrl(url);
+    assert.ok(matched, `expected platform match for ${url}`);
+    assert.equal(matched.platform, expectedPlatform, `platform mismatch for ${url}`);
+    assert.equal(
+      matched.isLikelyFeedOrHome,
+      true,
+      `P1: expected isLikelyFeedOrHome=true for ${url}`,
+    );
+  }
+
+  // P1 positive work URLs on facebook, tumblr, and toutiao must remain isLikelyFeedOrHome: false
+  const p1WorkCases = [
+    ["facebook", "https://www.facebook.com/someuser/posts/10159876543210/", "facebook:post:10159876543210"],
+    ["facebook", "https://www.facebook.com/groups/12345/posts/67890/", "facebook:post:67890"],
+    ["facebook", "https://www.facebook.com/permalink.php?story_fbid=pfbid02abcXYZ&id=100", "facebook:post:pfbid02abcXYZ"],
+    ["tumblr", "https://www.tumblr.com/maskofthedragon/626907179849564160/mona", "tumblr:post:626907179849564160"],
+    ["toutiao", "https://m.toutiao.com/is/iAbCdEfG/", "toutiao:short:iAbCdEfG"],
+  ];
+  for (const [expectedPlatform, url, expectedKey] of p1WorkCases) {
+    const matched = urlMatcher.matchSupportedPlatformUrl(url);
+    assert.ok(matched, `expected match for ${url}`);
+    assert.equal(matched.platform, expectedPlatform);
+    assert.equal(matched.isLikelyFeedOrHome, false, `expected work URL for ${url}`);
+    assert.equal(matched.dedupeKey, expectedKey, `dedupeKey mismatch for ${url}`);
+  }
+
+  // P2: Backend-supported work URLs that previously false-flagged isLikelyFeedOrHome: true
+  const p2WorkCases = [
+    ["xiaohongshu", "https://www.xiaohongshu.com/note/66aabbccdd11223344556677", "xiaohongshu:note:66aabbccdd11223344556677"],
+    ["xiaohongshu", "https://www.xiaohongshu.com/item/66aabbccdd11223344556677", "xiaohongshu:note:66aabbccdd11223344556677"],
+    ["kuaishou", "https://www.kuaishou.com/long-video/3xngkmw8vacriqu", "kuaishou:item:3xngkmw8vacriqu"],
+    ["kuaishou", "https://m.kuaishou.com/photo/3xngkmw8vacriqu", "kuaishou:item:3xngkmw8vacriqu"],
+    ["douyin", "https://www.douyin.com/video/7704056737233449610.html", "douyin:item:7704056737233449610"],
+    ["douyin", "https://www.douyin.com/share/video/?vid=7704056737233449610", "douyin:item:7704056737233449610"],
+    ["bilibili", "https://www.bilibili.com/festival/2024?bvid=BV1uv411q7Mv", "bilibili:video:BV1uv411q7Mv:p=1"],
+    ["bilibili", "https://www.bilibili.com/list/watchlater?bvid=BV1uv411q7Mv&p=2", "bilibili:video:BV1uv411q7Mv:p=2"],
+    ["toutiao", "https://www.toutiao.com/?group_id=7501991960077500979", "toutiao:item:7501991960077500979"],
+    ["toutiao", "https://www.toutiao.com/?item_id=7501991960077500979", "toutiao:item:7501991960077500979"],
+  ];
+
+  for (const [expectedPlatform, url, expectedKey] of p2WorkCases) {
+    const matched = urlMatcher.matchSupportedPlatformUrl(url);
+    assert.ok(matched, `P2: expected match for ${url}`);
+    assert.equal(matched.platform, expectedPlatform);
+    assert.equal(
+      matched.isLikelyFeedOrHome,
+      false,
+      `P2: expected isLikelyFeedOrHome=false for ${url}`,
+    );
+    assert.equal(matched.dedupeKey, expectedKey, `P2: dedupeKey mismatch for ${url}`);
+  }
+
+  // P3: Canonical dedupeKey polish
+  // 1) Facebook /share/v/<id>, /share/r/<id>, /video.php?v=<id>
+  const fbShareV = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.facebook.com/share/v/1AbCdEfGhI/?mibextid=wwXIfr",
+  );
+  const fbShareR = urlMatcher.matchSupportedPlatformUrl(
+    "https://m.facebook.com/share/r/1ZyXwVuTsR/",
+  );
+  const fbVideoPhp = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.facebook.com/video.php?v=401590806345712",
+  );
+  const fbWatch = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.facebook.com/watch/?v=401590806345712",
+  );
+  assert.equal(fbShareV?.dedupeKey, "facebook:share:v:1AbCdEfGhI");
+  assert.equal(fbShareV?.isLikelyFeedOrHome, false);
+  assert.equal(fbShareR?.dedupeKey, "facebook:share:r:1ZyXwVuTsR");
+  assert.equal(fbShareR?.isLikelyFeedOrHome, false);
+  assert.equal(fbVideoPhp?.dedupeKey, "facebook:video:401590806345712");
+  assert.equal(fbVideoPhp?.dedupeKey, fbWatch?.dedupeKey);
+  assert.equal(fbVideoPhp?.isLikelyFeedOrHome, false);
+
+  // 2) Tumblr www.tumblr.com/blog/view/<blog>/<id> & subdomain pagination/archive filtering
+  const tumblrBlogView = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.tumblr.com/blog/view/maskofthedragon/626907179849564160",
+  );
+  const tumblrPost = urlMatcher.matchSupportedPlatformUrl(
+    "https://maskofthedragon.tumblr.com/post/626907179849564160/mona",
+  );
+  const tumblrRootBlogPost = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.tumblr.com/maskofthedragon/626907179849564160/mona",
+  );
+  assert.equal(tumblrBlogView?.dedupeKey, "tumblr:post:626907179849564160");
+  assert.equal(tumblrBlogView?.dedupeKey, tumblrPost?.dedupeKey);
+  assert.equal(tumblrRootBlogPost?.dedupeKey, tumblrPost?.dedupeKey);
+  assert.equal(tumblrBlogView?.isLikelyFeedOrHome, false);
+  assert.equal(tumblrRootBlogPost?.isLikelyFeedOrHome, false);
+  for (const tumblrNonWorkUrl of [
+    "https://staff.tumblr.com/page/2",
+    "https://staff.tumblr.com/day/2026/01/01",
+    "https://staff.tumblr.com/archive/2026",
+    "https://www.tumblr.com/page/2",
+    "https://www.tumblr.com/day/2026",
+    "https://www.tumblr.com/archive/2026",
+  ]) {
+    const nonWork = urlMatcher.matchSupportedPlatformUrl(tumblrNonWorkUrl);
+    assert.ok(nonWork, `expected Tumblr host match for ${tumblrNonWorkUrl}`);
+    assert.equal(nonWork.platform, "tumblr");
+    assert.equal(
+      nonWork.isLikelyFeedOrHome,
+      true,
+      `expected isLikelyFeedOrHome=true for ${tumblrNonWorkUrl}`,
+    );
+  }
+
+  // 3) Pipixia ?item_id=<id>
+  const ppxQuery = urlMatcher.matchSupportedPlatformUrl(
+    "https://h5.pipix.com/?item_id=7385813877985909043",
+  );
+  const ppxPath = urlMatcher.matchSupportedPlatformUrl(
+    "https://h5.pipix.com/item/7385813877985909043",
+  );
+  assert.equal(ppxQuery?.dedupeKey, "pipixia:item:7385813877985909043");
+  assert.equal(ppxQuery?.dedupeKey, ppxPath?.dedupeKey);
+  assert.equal(ppxQuery?.isLikelyFeedOrHome, false);
+
+  // 4) Zuiyou nested /detail/<id>
+  const zuiyouNested = urlMatcher.matchSupportedPlatformUrl(
+    "https://share.izuiyou.com/hybrid/detail/163566379",
+  );
+  const zuiyouPid = urlMatcher.matchSupportedPlatformUrl(
+    "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
+  );
+  assert.equal(zuiyouNested?.dedupeKey, "zuiyou:post:163566379");
+  assert.equal(zuiyouNested?.dedupeKey, zuiyouPid?.dedupeKey);
+  assert.equal(zuiyouNested?.isLikelyFeedOrHome, false);
+
+  // 5) Weibo: /detail/<id> and /status/<id> restricted strictly to m.weibo.cn
+  const mWeiboDetail = urlMatcher.matchSupportedPlatformUrl(
+    "https://m.weibo.cn/detail/5012345678901234",
+  );
+  const mWeiboStatus = urlMatcher.matchSupportedPlatformUrl(
+    "https://m.weibo.cn/status/5012345678901234",
+  );
+  const pcWeiboUidMid = urlMatcher.matchSupportedPlatformUrl(
+    "https://weibo.com/1234567890/OqAbCdEfG",
+  );
+  const pcWeiboDetailRejected = urlMatcher.matchSupportedPlatformUrl(
+    "https://weibo.com/detail/5012345678901234",
+  );
+  const pcWeiboStatusRejected = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.weibo.com/status/5012345678901234",
+  );
+  assert.equal(mWeiboDetail?.dedupeKey, "weibo:status:5012345678901234");
+  assert.equal(mWeiboDetail?.isLikelyFeedOrHome, false);
+  assert.equal(mWeiboStatus?.dedupeKey, "weibo:status:5012345678901234");
+  assert.equal(mWeiboStatus?.isLikelyFeedOrHome, false);
+  assert.equal(pcWeiboUidMid?.dedupeKey, "weibo:status:OqAbCdEfG");
+  assert.equal(pcWeiboUidMid?.isLikelyFeedOrHome, false);
+  assert.equal(pcWeiboDetailRejected?.isLikelyFeedOrHome, true);
+  assert.notEqual(pcWeiboDetailRejected?.dedupeKey, "weibo:status:5012345678901234");
+  assert.equal(pcWeiboStatusRejected?.isLikelyFeedOrHome, true);
+  assert.notEqual(pcWeiboStatusRejected?.dedupeKey, "weibo:status:5012345678901234");
 });

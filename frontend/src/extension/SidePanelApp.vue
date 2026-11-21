@@ -25,8 +25,11 @@ import {
   consumePendingIntent,
 } from "./storage";
 import {
+  applyExtensionTheme,
   createSidePanelBroadcastBridge,
+  getNextExtensionTheme,
   mergeEnqueuedTasks,
+  readCachedExtensionTheme,
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
 import {
@@ -42,7 +45,10 @@ const viewMode = ref<PanelViewMode>("single");
 const settingsOpen = ref<boolean>(false);
 const downloadsExpanded = ref<boolean>(false);
 
-const settings = ref<ExtensionSettings>({ ...DEFAULT_EXTENSION_SETTINGS });
+const settings = ref<ExtensionSettings>({
+  ...DEFAULT_EXTENSION_SETTINGS,
+  theme: readCachedExtensionTheme(),
+});
 const connection = ref<ConnectionCheckResult | null>(null);
 const tabSync = ref<TabSyncState | null>(null);
 const tasks = ref<ExtensionDownloadTask[]>([]);
@@ -328,6 +334,7 @@ async function handlePendingIntent(intent: PendingPanelIntent | null) {
 
 function applySnapshot(snapshot: ExtensionStateSnapshot) {
   settings.value = { ...snapshot.settings };
+  applyExtensionTheme(snapshot.settings.theme);
   tasks.value = [...snapshot.tasks];
   savedWorkFingerprints.value = [...snapshot.savedWorkFingerprints];
   if (snapshot.connection !== undefined) {
@@ -385,8 +392,28 @@ async function handleToggleAutoFollowHeader() {
   }
 }
 
+async function handleCycleThemeHeader() {
+  const prevTheme = settings.value.theme;
+  const nextTheme = getNextExtensionTheme(prevTheme);
+  settings.value = { ...settings.value, theme: nextTheme };
+  applyExtensionTheme(nextTheme);
+  const rpc = await sendSidePanelRequest({
+    type: "UPDATE_SETTINGS",
+    patch: { theme: nextTheme },
+  });
+  if (rpc.ok) {
+    settings.value = { ...rpc.data.settings };
+    applyExtensionTheme(rpc.data.settings.theme);
+  } else {
+    settings.value = { ...settings.value, theme: prevTheme };
+    applyExtensionTheme(prevTheme);
+    showToast(rpc.error || "切换主题失败", "error");
+  }
+}
+
 function handleSettingsSaved(nextSettings: ExtensionSettings) {
   settings.value = { ...nextSettings };
+  applyExtensionTheme(nextSettings.theme);
   if (settings.value.autoFollowTab) {
     evaluateTabSync(tabSync.value);
   } else {
@@ -587,6 +614,7 @@ onUnmounted(() => {
       :connection="connection"
       :batch-url-count="batchUrlPreviewCount"
       @toggle-auto-follow="handleToggleAutoFollowHeader"
+      @cycle-theme="handleCycleThemeHeader"
       @open-settings="settingsOpen = true"
     />
 
@@ -836,18 +864,14 @@ onUnmounted(() => {
   gap: 8px;
   padding: 7px 9px;
   border-radius: var(--sp-radius-md);
-  background: linear-gradient(
-    135deg,
-    rgba(99, 102, 241, 0.2),
-    rgba(139, 92, 246, 0.16)
-  );
-  border: 1px solid rgba(129, 140, 248, 0.45);
+  background: var(--sp-sync-banner-bg);
+  border: 1px solid var(--sp-border-accent);
   min-width: 0;
 }
 
 .sp-sync-banner__text {
   font-size: 11.5px;
-  color: #e0e7ff;
+  color: var(--sp-accent-text-strong);
   line-height: 1.35;
   min-width: 0;
 }
@@ -862,7 +886,7 @@ onUnmounted(() => {
 .sp-sync-banner__dismiss {
   border: none;
   background: transparent;
-  color: #a5b4fc;
+  color: var(--sp-accent-text);
   font-size: 11px;
   cursor: pointer;
   padding: 2px 4px;
@@ -880,21 +904,21 @@ onUnmounted(() => {
 }
 
 .sp-hint-strip--feed {
-  background: rgba(99, 102, 241, 0.1);
-  border: 1px solid rgba(99, 102, 241, 0.25);
-  color: #c7d2fe;
+  background: var(--sp-accent-soft);
+  border: 1px solid var(--sp-accent-border);
+  color: var(--sp-accent-text-strong);
 }
 
 .sp-hint-strip__dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #818cf8;
+  background: var(--sp-accent-solid);
   flex-shrink: 0;
 }
 
 .sp-hint-strip--idle {
-  background: rgba(148, 163, 184, 0.06);
+  background: var(--sp-subtle-bg);
   border: 1px solid var(--sp-border);
   color: var(--sp-text-muted);
 }
@@ -911,6 +935,7 @@ onUnmounted(() => {
   background: var(--sp-bg-surface);
   border: 1px solid var(--sp-border);
   border-radius: var(--sp-radius-md);
+  box-shadow: var(--sp-shadow-card);
   padding: 8px;
 }
 
@@ -933,7 +958,7 @@ onUnmounted(() => {
   height: 20px;
   border-radius: 50%;
   border: none;
-  background: rgba(148, 163, 184, 0.14);
+  background: var(--sp-muted-pill-bg);
   color: var(--sp-text-secondary);
   font-size: 10px;
   cursor: pointer;
@@ -943,7 +968,7 @@ onUnmounted(() => {
 }
 
 .sp-url-bar__clear:hover {
-  background: rgba(148, 163, 184, 0.28);
+  background: var(--sp-ghost-bg-hover);
   color: var(--sp-text-primary);
 }
 
@@ -965,14 +990,15 @@ onUnmounted(() => {
   border-radius: var(--sp-radius-md);
   background: var(--sp-bg-surface);
   border: 1px solid var(--sp-border);
+  box-shadow: var(--sp-shadow-card);
 }
 
 .sp-loading-card__spinner {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  border: 2.2px solid rgba(129, 140, 248, 0.25);
-  border-top-color: #818cf8;
+  border: 2.2px solid var(--sp-accent-border);
+  border-top-color: var(--sp-accent-solid);
   flex-shrink: 0;
 }
 
@@ -993,7 +1019,7 @@ onUnmounted(() => {
   padding: 9px 10px;
   border-radius: var(--sp-radius-md);
   background: var(--sp-danger-soft);
-  border: 1px solid rgba(239, 68, 68, 0.36);
+  border: 1px solid var(--sp-danger-border);
   display: flex;
   flex-direction: column;
   gap: 7px;
@@ -1002,7 +1028,7 @@ onUnmounted(() => {
 .sp-error-card__msg {
   font-size: 12px;
   font-weight: 600;
-  color: #fecaca;
+  color: var(--sp-danger-text-strong);
   word-break: break-word;
 }
 
@@ -1015,7 +1041,7 @@ onUnmounted(() => {
 .sp-empty-guide {
   padding: 12px;
   border-radius: var(--sp-radius-md);
-  background: rgba(17, 25, 44, 0.55);
+  background: var(--sp-bg-empty);
   border: 1px dashed var(--sp-border-strong);
   display: flex;
   flex-direction: column;
@@ -1058,12 +1084,12 @@ onUnmounted(() => {
   max-width: calc(100vw - 24px);
   padding: 6px 12px;
   border-radius: var(--sp-radius-pill);
-  background: rgba(23, 34, 59, 0.96);
+  background: var(--sp-bg-toast);
   border: 1px solid var(--sp-border-strong);
   color: var(--sp-text-primary);
   font-size: 11.5px;
   font-weight: 600;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--sp-shadow-toast);
   z-index: 90;
   white-space: nowrap;
   overflow: hidden;
@@ -1072,13 +1098,13 @@ onUnmounted(() => {
 }
 
 .sp-toast--success {
-  border-color: rgba(16, 185, 129, 0.45);
-  color: #6ee7b7;
+  border-color: var(--sp-success-border);
+  color: var(--sp-success-text);
 }
 
 .sp-toast--error {
-  border-color: rgba(239, 68, 68, 0.5);
-  color: #fca5a5;
+  border-color: var(--sp-danger-border);
+  color: var(--sp-danger-text);
 }
 
 .sp-toast-enter-active,

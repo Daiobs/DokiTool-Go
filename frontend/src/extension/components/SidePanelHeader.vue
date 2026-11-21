@@ -3,7 +3,9 @@ import { computed } from "vue";
 import type {
   ConnectionCheckResult,
   ExtensionSettings,
+  ExtensionThemeMode,
 } from "../protocol";
+import { normalizeExtensionThemeMode } from "../storage";
 
 export type PanelViewMode = "single" | "batch";
 
@@ -17,8 +19,35 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "update:mode", next: PanelViewMode): void;
   (e: "toggle-auto-follow"): void;
+  (e: "cycle-theme"): void;
   (e: "open-settings"): void;
 }>();
+
+const currentTheme = computed<ExtensionThemeMode>(() =>
+  normalizeExtensionThemeMode(props.settings.theme),
+);
+
+const themeToggleMeta = computed<{
+  title: string;
+  ariaLabel: string;
+}>(() => {
+  if (currentTheme.value === "light") {
+    return {
+      title: "主题：浅色（点击切换为深色）",
+      ariaLabel: "切换主题，当前浅色",
+    };
+  }
+  if (currentTheme.value === "dark") {
+    return {
+      title: "主题：深色（点击切换为跟随系统）",
+      ariaLabel: "切换主题，当前深色",
+    };
+  }
+  return {
+    title: "主题：跟随系统（点击切换为浅色）",
+    ariaLabel: "切换主题，当前跟随系统",
+  };
+});
 
 const authStatus = computed<{
   tone: "ready" | "anon" | "error";
@@ -82,6 +111,70 @@ const authStatus = computed<{
         >
           <span class="sp-auth-pill__dot" />
           <span class="sp-auth-pill__text">{{ authStatus.label }}</span>
+        </button>
+
+        <button
+          type="button"
+          class="sp-icon-btn sp-theme-btn"
+          :title="themeToggleMeta.title"
+          :aria-label="themeToggleMeta.ariaLabel"
+          @click="emit('cycle-theme')"
+        >
+          <!-- Light mode: Sun -->
+          <svg
+            v-if="currentTheme === 'light'"
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.9"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="4" />
+            <line x1="12" y1="2.5" x2="12" y2="4.5" />
+            <line x1="12" y1="19.5" x2="12" y2="21.5" />
+            <line x1="4.93" y1="4.93" x2="6.34" y2="6.34" />
+            <line x1="17.66" y1="17.66" x2="19.07" y2="19.07" />
+            <line x1="2.5" y1="12" x2="4.5" y2="12" />
+            <line x1="19.5" y1="12" x2="21.5" y2="12" />
+            <line x1="4.93" y1="19.07" x2="6.34" y2="17.66" />
+            <line x1="17.66" y1="6.34" x2="19.07" y2="4.93" />
+          </svg>
+          <!-- Dark mode: Moon -->
+          <svg
+            v-else-if="currentTheme === 'dark'"
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.9"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+          </svg>
+          <!-- System mode: Monitor -->
+          <svg
+            v-else
+            viewBox="0 0 24 24"
+            width="15"
+            height="15"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.9"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="2.5" y="3.5" width="19" height="13" rx="2" />
+            <line x1="8" y1="20.5" x2="16" y2="20.5" />
+            <line x1="12" y1="16.5" x2="12" y2="20.5" />
+          </svg>
         </button>
 
         <button
@@ -157,10 +250,11 @@ const authStatus = computed<{
 <style scoped>
 .sp-header {
   flex-shrink: 0;
-  background: rgba(17, 25, 44, 0.92);
+  background: var(--sp-bg-header);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--sp-border);
+  box-shadow: var(--sp-shadow-header);
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
@@ -172,8 +266,9 @@ const authStatus = computed<{
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
+  flex-wrap: nowrap;
 }
 
 .sp-brand {
@@ -181,19 +276,24 @@ const authStatus = computed<{
   align-items: center;
   gap: 7px;
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .sp-brand__logo {
   width: 26px;
   height: 26px;
   border-radius: 8px;
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  background: linear-gradient(
+    135deg,
+    var(--sp-accent-start) 0%,
+    var(--sp-accent-end) 100%
+  );
   color: #ffffff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  box-shadow: 0 3px 10px rgba(99, 102, 241, 0.4);
+  box-shadow: var(--sp-logo-shadow);
 }
 
 .sp-brand__name {
@@ -207,8 +307,9 @@ const authStatus = computed<{
 .sp-header__actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
+  flex-shrink: 1;
 }
 
 .sp-auth-pill {
@@ -218,7 +319,7 @@ const authStatus = computed<{
   padding: 4px 8px;
   border-radius: var(--sp-radius-pill);
   border: 1px solid var(--sp-border);
-  background: rgba(148, 163, 184, 0.08);
+  background: var(--sp-ghost-bg);
   color: var(--sp-text-secondary);
   font-family: inherit;
   font-size: 11px;
@@ -230,7 +331,7 @@ const authStatus = computed<{
 
 .sp-auth-pill:hover {
   border-color: var(--sp-border-strong);
-  background: rgba(148, 163, 184, 0.14);
+  background: var(--sp-ghost-bg-hover);
 }
 
 .sp-auth-pill__dot {
@@ -238,29 +339,29 @@ const authStatus = computed<{
   height: 6.5px;
   border-radius: 50%;
   flex-shrink: 0;
-  background: #94a3b8;
+  background: var(--sp-dot-idle);
 }
 
 .sp-auth-pill--ready {
-  background: rgba(16, 185, 129, 0.12);
-  border-color: rgba(16, 185, 129, 0.28);
-  color: #6ee7b7;
+  background: var(--sp-success-soft);
+  border-color: var(--sp-success-border);
+  color: var(--sp-success-text);
 }
 
 .sp-auth-pill--ready .sp-auth-pill__dot {
-  background: #10b981;
-  box-shadow: 0 0 6px rgba(16, 185, 129, 0.7);
+  background: var(--sp-success);
+  box-shadow: 0 0 6px var(--sp-success-glow);
 }
 
 .sp-auth-pill--error {
-  background: rgba(239, 68, 68, 0.14);
-  border-color: rgba(239, 68, 68, 0.34);
-  color: #fca5a5;
+  background: var(--sp-danger-soft);
+  border-color: var(--sp-danger-border);
+  color: var(--sp-danger-text);
 }
 
 .sp-auth-pill--error .sp-auth-pill__dot {
-  background: #ef4444;
-  box-shadow: 0 0 6px rgba(239, 68, 68, 0.7);
+  background: var(--sp-danger);
+  box-shadow: 0 0 6px var(--sp-danger-glow);
 }
 
 .sp-auth-pill__text {
@@ -274,20 +375,26 @@ const authStatus = computed<{
   height: 28px;
   border-radius: var(--sp-radius-sm);
   border: 1px solid var(--sp-border);
-  background: rgba(148, 163, 184, 0.08);
+  background: var(--sp-ghost-bg);
   color: var(--sp-text-secondary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
+  padding: 0;
   transition: all 150ms ease;
 }
 
 .sp-icon-btn:hover {
   color: var(--sp-text-primary);
-  background: rgba(148, 163, 184, 0.16);
+  background: var(--sp-ghost-bg-hover);
   border-color: var(--sp-border-strong);
+}
+
+.sp-icon-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sp-focus-ring);
 }
 
 .sp-header__bar {
@@ -301,7 +408,7 @@ const authStatus = computed<{
 .sp-seg {
   display: inline-flex;
   align-items: center;
-  background: var(--sp-bg-base);
+  background: var(--sp-seg-bg);
   border: 1px solid var(--sp-border);
   border-radius: var(--sp-radius-sm);
   padding: 2px;
@@ -334,16 +441,16 @@ const authStatus = computed<{
 }
 
 .sp-seg__btn--active {
-  background: var(--sp-bg-elevated);
+  background: var(--sp-seg-active-bg);
   color: var(--sp-text-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--sp-shadow-xs);
 }
 
 .sp-seg__count {
   padding: 0 5px;
   border-radius: 999px;
-  background: rgba(99, 102, 241, 0.25);
-  color: #c7d2fe;
+  background: var(--sp-accent-soft-strong);
+  color: var(--sp-accent-text-strong);
   font-size: 10px;
   font-weight: 700;
 }
@@ -355,7 +462,7 @@ const authStatus = computed<{
   padding: 5px 9px;
   border-radius: var(--sp-radius-sm);
   border: 1px solid var(--sp-border);
-  background: rgba(148, 163, 184, 0.06);
+  background: var(--sp-subtle-bg);
   color: var(--sp-text-muted);
   font-family: inherit;
   font-size: 11.5px;
@@ -375,18 +482,18 @@ const authStatus = computed<{
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: rgba(148, 163, 184, 0.45);
+  background: var(--sp-dot-idle);
   transition: all 150ms ease;
 }
 
 .sp-follow-pill--on {
-  background: rgba(99, 102, 241, 0.15);
-  border-color: rgba(99, 102, 241, 0.42);
-  color: #c7d2fe;
+  background: var(--sp-accent-soft);
+  border-color: var(--sp-border-accent);
+  color: var(--sp-accent-text-strong);
 }
 
 .sp-follow-pill--on .sp-follow-pill__indicator {
-  background: #818cf8;
-  box-shadow: 0 0 7px rgba(129, 140, 248, 0.85);
+  background: var(--sp-accent-solid);
+  box-shadow: var(--sp-accent-dot-glow);
 }
 </style>

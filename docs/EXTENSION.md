@@ -21,29 +21,52 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
 4. **Pixiv 式勾选与子文件夹无上限保存**
    - 图集、实况照片（支持「视频 + 封面 / 仅视频 / 仅封面」三档过滤）与哔哩哔哩多 P 支持全选、反选与单项勾选。
    - 默认按 `<可选前缀>/<安全标题>/001.jpg` 逐个流式落盘（无内存体积上限），同时保留 `500 MiB` 以内的一键 ZIP 打包按钮；下载完成后可一键「打开文件夹」在系统文件管理器中定位文件。
+5. **浅色 / 深色 / 跟随系统主题切换与动态工具栏状态**
+   - 侧边栏支持 **浅色（Light）/ 深色（Dark）/ 跟随系统（System）** 三态主题切换，即时持久化保存且与系统深浅色联动。
+   - 后台下载或极速下载进行时，扩展工具栏图标实时更新 **百分比进度角标（Badge）** 与 **动态悬停提示（Tooltip）**，无需展开侧边栏即可一眼掌握当前任务进度与完成状态。
 
 ---
 
-## 构建与在 Chrome 中加载
+## 安装与在 Chrome 中加载
 
-环境要求：**Node.js `20+`**，桌面版 **Google Chrome `116+`**（支持 MV3 `sidePanel`、`offscreen` 与 `runtime.getContexts`）。
+环境要求：桌面版 **Google Chrome `116+`** 或 **Microsoft Edge `116+`**（支持 MV3 `sidePanel`、`offscreen` 与 `runtime.getContexts`）。
 
-### 1. 本地构建扩展产物
+### 方式一：直接下载预构建压缩包（推荐普通用户）
+
+匿名开箱即用，无需登录或配置 Token（如需接入专属配额，可在安装后通过扩展设置页按需绑定 Bearer Key）：
+
+1. **下载并解压扩展包**：
+   - 从线上站点直接下载：[`https://snap.dokitool.com/helper/dokitool-chrome-extension.zip`](https://snap.dokitool.com/helper/dokitool-chrome-extension.zip)（也可在 DokiTool 首页顶部导航或页脚点击 **「Chrome 扩展」** 弹窗一键下载），或前往本仓库 GitHub Releases 下载同名附件 `dokitool-chrome-extension.zip`；
+   - 解压压缩包（macOS 双击 / Windows 右键「全部解压缩」）。压缩包根目录直接包含 `manifest.json`（无多余嵌套外层目录），解压得到的文件夹即可直接加载。
+2. **打开扩展页并开启开发者模式**：
+   - 在 Chrome 地址栏打开 `chrome://extensions/`；
+   - 打开右上角的 **「开发者模式」（Developer mode）** 开关。
+3. **直接拖入文件夹完成加载**：
+   - 将第 1 步解压出的文件夹**直接拖进 `chrome://extensions/` 页面**（或点击左上角 **「加载已解压的扩展程序」（Load unpacked）** 选中该文件夹）；
+   - 建议点击浏览器右上角拼图图标，将 **「DokiTool 素材下载助手」** 固定（Pin）到工具栏，随时一键呼出侧边栏。
+
+> **后续更新**：下载新版 `dokitool-chrome-extension.zip` 解压覆盖原文件夹，然后在 `chrome://extensions/` 点击扩展卡片上的刷新按钮即可，已保存的偏好、主题与设置不会丢失。
+
+### 方式二：开发者本地源码构建
+
+环境要求额外需要 **Node.js `20+`**：
 
 ```bash
 cd frontend
 npm ci
+
+# 1. 构建未打包的本地调试目录 -> frontend/dist-extension/
 npm run build:extension
+
+# 2. 构建确定性可分发压缩包 -> frontend/dist/helper/dokitool-chrome-extension.zip
+npm run build:extension:zip
 ```
 
-构建完成后，独立产物输出至 `frontend/dist-extension/`（该目录受 `.gitignore` 与 `scripts/check-public-files.py` 双重门禁保护，绝不纳入 Git 提交），且构建脚本会自动执行 MV3 权限最小化、禁通配符与零远程脚本静态门禁校验。
-
-### 2. 在 Chrome 开发者模式中加载
-
-1. 在 Chrome 地址栏打开 `chrome://extensions/`；
-2. 打开右上角的 **「开发者模式」（Developer mode）** 开关；
-3. 点击左上角 **「加载已解压的扩展程序」（Load unpacked）**，选择仓库下的 `frontend/dist-extension` 目录；
-4. 建议点击浏览器右上角拼图图标，将 **「DokiTool 素材下载助手」** 固定（Pin）到工具栏。
+说明：
+- `npm run build:extension` 输出独立未打包产物至 `frontend/dist-extension/`（该目录受 `.gitignore` 与 `scripts/check-public-files.py` 双重门禁保护，绝不纳入 Git 提交），并在构建后自动执行 MV3 权限最小化、禁通配符与零远程脚本静态门禁校验；
+- `npm run build:extension:zip`（以及完整生产构建 `npm run build`）会使用零外部依赖的确定性 PKZIP 2.0 写入器（固定时间戳 `2026-01-01 00:00:00`、UTF-8 编码标志与 POSIX 词典序）生成根目录直出 `manifest.json` 的 `frontend/dist/helper/dokitool-chrome-extension.zip`，并执行全量字节级校验；
+- 出于安全边界，`--dev-loopback` 测试构建模式严格拒绝配合 `--zip-out` 打包为可分发压缩包。
+- 本地构建完成后，按上文步骤在 `chrome://extensions/` 加载 `frontend/dist-extension` 目录即可。
 
 ---
 

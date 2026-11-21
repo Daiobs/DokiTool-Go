@@ -160,6 +160,8 @@ jobs:
 
           find frontend/dist -type d -exec chmod 0755 {} +
           find frontend/dist -type f -exec chmod 0644 {} +
+          cp frontend/dist/helper/dokitool-chrome-extension.zip "$OUT_DIR/dokitool-chrome-extension.zip"
+          chmod 0644 "$OUT_DIR/dokitool-chrome-extension.zip"
           LC_ALL=C tar \
             --sort=name \
             --mtime='UTC 2026-01-01 00:00:00' \
@@ -190,7 +192,7 @@ jobs:
               return h.hexdigest()
 
           artifacts = {}
-          for name in ("dokitool", "shanghai-resolver", "frontend-dist.tar.gz"):
+          for name in ("dokitool", "shanghai-resolver", "frontend-dist.tar.gz", "dokitool-chrome-extension.zip"):
               fpath = out_dir / name
               artifacts[name] = {
                   "sha256": sha256_file(fpath),
@@ -247,6 +249,7 @@ jobs:
             ${{ runner.temp }}/release-out/dokitool
             ${{ runner.temp }}/release-out/shanghai-resolver
             ${{ runner.temp }}/release-out/frontend-dist.tar.gz
+            ${{ runner.temp }}/release-out/dokitool-chrome-extension.zip
             ${{ runner.temp }}/release-out/release-manifest.json
 
       - name: Publish prerelease with verified artifacts and manifest
@@ -279,6 +282,7 @@ jobs:
             "$OUT_DIR/dokitool" \
             "$OUT_DIR/shanghai-resolver" \
             "$OUT_DIR/frontend-dist.tar.gz" \
+            "$OUT_DIR/dokitool-chrome-extension.zip" \
             "$OUT_DIR/release-manifest.json" \
             --prerelease \
             --target "$TARGET_SHA" \

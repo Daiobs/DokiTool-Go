@@ -331,6 +331,7 @@ function handleRetryFailed() {
   background: var(--sp-bg-surface);
   border: 1px solid var(--sp-border);
   border-radius: var(--sp-radius-lg);
+  box-shadow: var(--sp-shadow-card);
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -386,9 +387,9 @@ function handleRetryFailed() {
 .sp-plat-pill {
   padding: 1.5px 6px;
   border-radius: 5px;
-  background: rgba(99, 102, 241, 0.12);
-  border: 1px solid rgba(99, 102, 241, 0.24);
-  color: #c7d2fe;
+  background: var(--sp-accent-soft);
+  border: 1px solid var(--sp-accent-border);
+  color: var(--sp-accent-text-strong);
   font-size: 10.5px;
   font-weight: 600;
 }
@@ -423,7 +424,7 @@ function handleRetryFailed() {
 .sp-extracted-row__plat {
   font-size: 10px;
   font-weight: 600;
-  color: #a5b4fc;
+  color: var(--sp-accent-text);
   background: var(--sp-accent-soft);
   padding: 1px 5px;
   border-radius: 4px;
@@ -449,7 +450,7 @@ function handleRetryFailed() {
 }
 
 .sp-extracted-row__rm:hover {
-  color: #fca5a5;
+  color: var(--sp-danger-text);
 }
 
 .sp-pref-hint {
@@ -459,7 +460,7 @@ function handleRetryFailed() {
   gap: 6px;
   padding: 6px 8px;
   border-radius: var(--sp-radius-sm);
-  background: rgba(148, 163, 184, 0.06);
+  background: var(--sp-subtle-bg);
   border: 1px dashed var(--sp-border-strong);
   min-width: 0;
 }
@@ -473,7 +474,7 @@ function handleRetryFailed() {
 .sp-pref-hint__edit {
   border: none;
   background: transparent;
-  color: #a5b4fc;
+  color: var(--sp-accent-text);
   font-family: inherit;
   font-size: 11px;
   font-weight: 600;
@@ -508,13 +509,13 @@ function handleRetryFailed() {
   width: 100%;
   height: 6px;
   border-radius: 999px;
-  background: var(--sp-bg-base);
+  background: var(--sp-track-bg);
   overflow: hidden;
 }
 
 .sp-batch-progress__bar {
   height: 100%;
-  background: linear-gradient(90deg, #6366f1, #10b981);
+  background: linear-gradient(90deg, var(--sp-accent-start), var(--sp-success));
   border-radius: 999px;
   transition: width 220ms ease;
 }

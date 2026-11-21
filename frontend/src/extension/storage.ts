@@ -4,6 +4,7 @@ import { sanitizeSubfolderPrefix } from "./filenameSanitizer";
 export type BatchSaveMode = "subfolder" | "zip";
 export type QualityPreference = "best" | "1080p" | "audio";
 export type PanelIntentMode = "inspect" | "quick-download";
+export type ExtensionThemeMode = "system" | "light" | "dark";
 
 export interface ExtensionSettings {
   apiBaseUrl: string;
@@ -12,6 +13,7 @@ export interface ExtensionSettings {
   batchSaveMode: BatchSaveMode;
   qualityPreference: QualityPreference;
   autoFollowTab: boolean;
+  theme: ExtensionThemeMode;
 }
 
 export type ExtensionSettingsPatch = Partial<ExtensionSettings>;
@@ -39,6 +41,7 @@ export const DEFAULT_EXTENSION_SETTINGS: Readonly<ExtensionSettings> =
     batchSaveMode: "subfolder",
     qualityPreference: "best",
     autoFollowTab: false,
+    theme: "system",
   });
 
 export const SAVED_WORK_LRU_LIMIT = 200 as const;
@@ -163,6 +166,18 @@ function isPanelIntentMode(value: unknown): value is PanelIntentMode {
   return value === "inspect" || value === "quick-download";
 }
 
+export function isExtensionThemeMode(
+  value: unknown,
+): value is ExtensionThemeMode {
+  return value === "system" || value === "light" || value === "dark";
+}
+
+export function normalizeExtensionThemeMode(
+  value: unknown,
+): ExtensionThemeMode {
+  return isExtensionThemeMode(value) ? value : "system";
+}
+
 function normalizeStoredSettings(raw: unknown): StoredSettingsInternal {
   const obj =
     typeof raw === "object" && raw !== null
@@ -203,6 +218,8 @@ function normalizeStoredSettings(raw: unknown): StoredSettingsInternal {
     autoFollowTab = false;
   }
 
+  const theme = normalizeExtensionThemeMode(obj.theme);
+
   return {
     apiBaseUrl,
     bearerToken,
@@ -210,6 +227,7 @@ function normalizeStoredSettings(raw: unknown): StoredSettingsInternal {
     batchSaveMode,
     qualityPreference,
     autoFollowTab,
+    theme,
     autoFollowExplicitlySet,
   };
 }
@@ -222,6 +240,7 @@ function toPublicSettings(internal: StoredSettingsInternal): ExtensionSettings {
     batchSaveMode: internal.batchSaveMode,
     qualityPreference: internal.qualityPreference,
     autoFollowTab: internal.autoFollowTab,
+    theme: internal.theme,
   };
 }
 
@@ -441,6 +460,11 @@ export function createExtensionStorage(
             }
           }
 
+          const nextTheme: ExtensionThemeMode =
+            patch.theme !== undefined
+              ? normalizeExtensionThemeMode(patch.theme)
+              : current.theme;
+
           const updated: StoredSettingsInternal = {
             apiBaseUrl: nextApiBaseUrl,
             bearerToken: nextToken,
@@ -448,6 +472,7 @@ export function createExtensionStorage(
             batchSaveMode: nextBatchMode,
             qualityPreference: nextQuality,
             autoFollowTab: nextAutoFollow,
+            theme: nextTheme,
             autoFollowExplicitlySet: nextExplicit,
           };
 

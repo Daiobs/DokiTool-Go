@@ -195,12 +195,15 @@ export function deliveryRoutes(
   return routes;
 }
 
-function validateSources(value: unknown): asserts value is Source[] {
+function validateSources(
+  value: unknown,
+  context: TargetContext = {},
+): asserts value is Source[] {
   if (!Array.isArray(value) || !value.length) fail("来源不能为空");
   const sources = value as Source[];
   sources.forEach((source) => {
     if (!object(source) || !identity(source.url)) fail("来源无效");
-    sourceRoutes(source);
+    sourceRoutes(source, context);
     if (source.id !== undefined && !identity(source.id)) fail("来源 ID 无效");
     if (sources.length > 1 && !source.id) fail("多来源必须有 ID");
     if (
@@ -295,14 +298,17 @@ function validateCapabilityMetadata(value: unknown, role?: Resource["role"]): vo
   )
     fail("无音频资源不能声明音轨语言");
 }
-function validateDelivery(delivery: Delivery): void {
+function validateDelivery(
+  delivery: Delivery,
+  context: TargetContext = {},
+): void {
   if (!object(delivery)) fail("缺少交付结构");
   if (
     delivery.kind === "file" ||
     delivery.kind === "hls" ||
     delivery.kind === "dash"
   ) {
-    validateSources(delivery.sources);
+    validateSources(delivery.sources, context);
     if (
       delivery.kind !== "file" &&
       !["single", "adaptive"].includes(delivery.scope)
@@ -327,7 +333,7 @@ function validateDelivery(delivery: Delivery): void {
       ...delivery.pieces,
     ];
     chunks.forEach((chunk) => {
-      validateSources(chunk.sources);
+      validateSources(chunk.sources, context);
       if (
         chunk.byte_range &&
         (!Number.isInteger(chunk.byte_range.start) ||
@@ -367,7 +373,7 @@ function validateDelivery(delivery: Delivery): void {
         !["file", "hls", "dash", "segments"].includes(resource.delivery?.kind)
       )
         fail("组合只允许叶资源");
-      validateDelivery(resource.delivery);
+      validateDelivery(resource.delivery, context);
       validateCapabilityMetadata(resource.metadata, resource.role);
     });
     const roles = delivery.resources.map((resource) => resource.role);
@@ -564,7 +570,10 @@ export function resourceSource(
       )
     : undefined;
 }
-export function validateMediaEnvelope(value: unknown): UnifiedMedia {
+export function validateMediaEnvelope(
+  value: unknown,
+  context: TargetContext = {},
+): UnifiedMedia {
   if (!object(value) || value.schema_version !== "1.0")
     return fail("接口已更新，请刷新页面");
   if (value.code !== "OK")
@@ -616,7 +625,7 @@ export function validateMediaEnvelope(value: unknown): UnifiedMedia {
       !("default" in item)
     )
       fail("条目结构无效");
-    if (item.cover) validateSources([item.cover]);
+    if (item.cover) validateSources([item.cover], context);
     if (item.state === "deferred") {
       if (
         item.default !== null ||
@@ -657,7 +666,7 @@ export function validateMediaEnvelope(value: unknown): UnifiedMedia {
           fail("待解析版本无效");
         return;
       }
-      validateDelivery(variant.delivery);
+      validateDelivery(variant.delivery, context);
       validateCapabilityMetadata(variant.metadata, item.type === "audio" ? "audio" : item.type === "image" ? "image" : undefined);
       if (
         sourcesOf(variant.delivery).some((source) => source.expires_at) &&
@@ -677,7 +686,10 @@ export function validateMediaEnvelope(value: unknown): UnifiedMedia {
         fail("空默认缺少原因");
     } else {
       if (item.default_unavailable_reason) fail("非空默认不能附失败原因");
-      const target = getDefaultDownloadTarget(item, { now: generated });
+      const target = getDefaultDownloadTarget(item, {
+        ...context,
+        now: generated,
+      });
       if (target.kind !== "file") fail("默认引用或来源无效");
     }
     const higher = item.higher_quality_variants || [];
@@ -704,10 +716,10 @@ export function validateMediaEnvelope(value: unknown): UnifiedMedia {
     )
       fail("分组引用无效");
   for (const attachment of media.attachments || []) {
-    validateDelivery(attachment.resource.delivery);
+    validateDelivery(attachment.resource.delivery, context);
     validateCapabilityMetadata(attachment.resource.metadata, attachment.resource.role);
   }
-  if (media.cover) validateSources([media.cover]);
-  if (media.author?.avatar) validateSources([media.author.avatar]);
+  if (media.cover) validateSources([media.cover], context);
+  if (media.author?.avatar) validateSources([media.author.avatar], context);
   return media;
 }

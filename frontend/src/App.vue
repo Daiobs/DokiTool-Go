@@ -82,6 +82,10 @@ const ToastContainer = defineAsyncComponent(() =>
 const ProgressModal = defineAsyncComponent(() =>
   import("./components/ProgressModal.vue"),
 );
+const ExtensionDownloadModal = defineAsyncComponent(() =>
+  import("./components/ExtensionDownloadModal.vue"),
+);
+const showExtensionModal = ref(false);
 const loadDownloadCard = () => import("./components/DownloadCard.vue");
 const DownloadCard = defineAsyncComponent(loadDownloadCard);
 
@@ -388,6 +392,11 @@ onUnmounted(() => {
     <!-- Body teleports are created after hydration; the static page has no
          teleport targets, so Vue must not hydrate them against body content. -->
     <ProgressModal v-if="isReady && videoStore.showProgress" />
+    <ExtensionDownloadModal
+      v-if="isReady && showExtensionModal"
+      :locale="locale"
+      @close="showExtensionModal = false"
+    />
     <DownloadCard
       v-if="videoStore.downloads.length > 0"
       :downloads="videoStore.downloads"
@@ -417,6 +426,7 @@ onUnmounted(() => {
       :locale="locale"
       @toggle-theme="toggleTheme"
       @set-locale="setLocale"
+      @open-extension="showExtensionModal = true"
     />
 
     <main class="max-w-7xl mx-auto px-4 pb-8 pt-0 relative z-10">
@@ -480,6 +490,9 @@ onUnmounted(() => {
       <FaqSection :locale="locale" />
     </main>
 
-    <FooterSection :locale="locale" />
+    <FooterSection
+      :locale="locale"
+      @open-extension="showExtensionModal = true"
+    />
   </div>
 </template>
