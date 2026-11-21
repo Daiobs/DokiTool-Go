@@ -441,6 +441,7 @@ test("urlMatcher: matches all 14 platforms & shortlinks and strictly blocks non-
     ["douyin", "https://www.iesdouyin.com/share/video/7704056737233449610/"],
     ["kuaishou", "https://www.kuaishou.com/short-video/3xngkmw8vacriqu"],
     ["kuaishou", "https://v.kuaishou.com/f/X-123abc"],
+    ["kuaishou", "https://v.kuaishou.com/abcXYZ"],
     ["bilibili", "https://www.bilibili.com/video/BV1uv411q7Mv?p=2&spm_id_from=333"],
     ["bilibili", "https://b23.tv/abcDEF1"],
     [
@@ -580,6 +581,56 @@ test("urlMatcher: extractSupportedUrlsFromText extracts, filters, and deduplicat
   assert.equal(extracted.items[1].url, "http://xhslink.com/o/ATlAvhS71F8");
   assert.equal(extracted.duplicateCount, 2);
   assert.equal(extracted.ignoredLineCount, 2);
+});
+
+test("urlMatcher P2-1: Kuaishou shortlink v.kuaishou.com/<code> & strictly lowercase TRACKING_QUERY_PARAMS (?share_Copy_Link=1 stripping)", () => {
+  assert.ok(urlMatcher.TRACKING_QUERY_PARAMS instanceof Set);
+  assert.ok(urlMatcher.TRACKING_QUERY_PARAMS.size > 0);
+  for (const param of urlMatcher.TRACKING_QUERY_PARAMS) {
+    assert.equal(
+      param,
+      param.toLowerCase(),
+      `TRACKING_QUERY_PARAMS entry must be strictly lowercase: ${param}`,
+    );
+  }
+  assert.equal(urlMatcher.TRACKING_QUERY_PARAMS.has("share_copy_link"), true);
+  assert.equal(urlMatcher.TRACKING_QUERY_PARAMS.has("share_Copy_Link"), false);
+
+  // v.kuaishou.com/<code> resolves to work shortlink (isLikelyFeedOrHome: false)
+  const ksShort = urlMatcher.matchSupportedPlatformUrl(
+    "https://v.kuaishou.com/abcXYZ?share_Copy_Link=1",
+  );
+  assert.ok(ksShort);
+  assert.equal(ksShort.platform, "kuaishou");
+  assert.equal(ksShort.dedupeKey, "kuaishou:short:abcXYZ");
+  assert.equal(ksShort.isLikelyFeedOrHome, false);
+
+  // Root v.kuaishou.com/ with empty path remains feed/home
+  const ksRoot = urlMatcher.matchSupportedPlatformUrl("https://v.kuaishou.com/");
+  assert.ok(ksRoot);
+  assert.equal(ksRoot.isLikelyFeedOrHome, true);
+
+  // Mixed-case ?share_Copy_Link=1 stripped in fallbackDedupeKey & batch deduplication
+  const withShareCopy = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.toutiao.com/custom/page?id=99&share_Copy_Link=1",
+  );
+  const cleanUrl = urlMatcher.matchSupportedPlatformUrl(
+    "https://www.toutiao.com/custom/page?id=99",
+  );
+  assert.ok(withShareCopy && cleanUrl);
+  assert.equal(withShareCopy.dedupeKey, cleanUrl.dedupeKey);
+  assert.equal(withShareCopy.dedupeKey.includes("share_Copy_Link"), false);
+
+  const batchDeduped = urlMatcher.extractSupportedUrlsFromText(
+    [
+      "https://www.toutiao.com/custom/page?id=99&share_Copy_Link=1",
+      "https://www.toutiao.com/custom/page?id=99",
+      "https://v.kuaishou.com/abcXYZ",
+      "https://v.kuaishou.com/abcXYZ?share_Copy_Link=1",
+    ].join("\n"),
+  );
+  assert.equal(batchDeduped.items.length, 2);
+  assert.equal(batchDeduped.duplicateCount, 2);
 });
 
 test("storage & protocol: token isolation, autoFollowTab transition, LRU 200 cap, and atomic intent consume", async () => {

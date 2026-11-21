@@ -46,7 +46,6 @@ const emit = defineEmits<{
     e: "enqueue-downloads",
     payload: { items: EnqueueDownloadItem[]; groupBatchId?: string },
   ): void;
-  (e: "resolve-lazy-item", item: MediaItem): Promise<MediaItem | null> | void;
   (e: "refresh-parse"): void;
   (
     e: "notify",
@@ -138,6 +137,7 @@ function isItemCheckable(item: MediaItem): boolean {
 }
 
 const checklistPool = computed<MediaItem[]>(() => {
+  if (layoutKind.value === "mixed") return props.media.items;
   if (layoutKind.value === "album") return albumItems.value;
   if (layoutKind.value === "multi_video") return visibleEpisodes.value;
   return [];
@@ -286,14 +286,16 @@ function chooseQualityOption(opt: SidePanelQualityOption) {
 const previewCoverUrl = computed<string>(() => {
   const itemCover = safeSourceUrl(activeItem.value?.cover);
   if (itemCover) return itemCover;
-  const mediaCover = safeSourceUrl(props.media.cover);
-  if (mediaCover) return mediaCover;
   if (activeItem.value?.type === "image") {
-    return safeAssetUrl(activeSelectedOption.value?.directUrl || "");
+    const directImg = safeAssetUrl(activeSelectedOption.value?.directUrl || "");
+    if (directImg) return directImg;
   }
   if (activeItem.value?.type === "live_photo") {
-    return safeAssetUrl(resolveLiveResourceUrl(activeItem.value, "image"));
+    const liveImg = safeAssetUrl(resolveLiveResourceUrl(activeItem.value, "image"));
+    if (liveImg) return liveImg;
   }
+  const mediaCover = safeSourceUrl(props.media.cover);
+  if (mediaCover) return mediaCover;
   return "";
 });
 
@@ -379,8 +381,31 @@ async function handleCopyDirectLink() {
 
 function handleSinglePrimaryDownload() {
   const item = activeItem.value;
+  if (!item || !readyItem(item)) return;
+  if (layoutKind.value === "mixed" && item.type === "live_photo") {
+    try {
+      const idx = Math.max(0, checklistPool.value.findIndex((c) => c.id === item.id));
+      const items = buildChecklistSubfolderEnqueueItems({
+        media: props.media,
+        entries: [{ item, ordinalIndex: idx + 1 }],
+        totalCount: checklistPool.value.length,
+        settings: props.settings,
+        livePhotoFilter: livePhotoFilter.value,
+        workFingerprint: props.workFingerprint,
+      });
+      if (items.length > 0) {
+        emit("enqueue-downloads", { items });
+      }
+    } catch (err) {
+      emit("notify", {
+        message: err instanceof Error ? err.message : "构建下载任务失败",
+        tone: "error",
+      });
+    }
+    return;
+  }
   const opt = activeSelectedOption.value;
-  if (!item || !opt || !opt.downloadable) return;
+  if (!opt || !opt.downloadable) return;
   try {
     const enqueueItem = buildSingleDownloadEnqueueItem({
       media: props.media,
@@ -399,7 +424,7 @@ function handleSinglePrimaryDownload() {
 }
 
 // ============================================================================
-// Album / LivePhoto / Multi-P Helpers
+// Album / LivePhoto / Multi-P / Mixed Helpers
 // ============================================================================
 
 function resolveLiveResourceUrl(
@@ -411,7 +436,9 @@ function resolveLiveResourceUrl(
     (v): v is ReadyVariant => readyVariant(v) && v.delivery.kind === "pair",
   );
   if (!pairVar || pairVar.delivery.kind !== "pair") return "";
-  const res = pairVar.delivery.resources.find((r) => r.role === role);
+  const res = pairVar.delivery.resources.find((r) =>
+    role === "motion" ? r.role === "motion" || r.role === "video" : r.role === "image",
+  );
   const src = res ? resourceSource(res, targetContext.value) : undefined;
   if (!src) return "";
   try {
@@ -419,6 +446,33 @@ function resolveLiveResourceUrl(
   } catch {
     return "";
   }
+}
+
+function mixedItemTypeBadge(item: MediaItem): {
+  text: string;
+  tone: "video" | "image" | "live" | "audio";
+} {
+  if (item.type === "live_photo") {
+    return { text: "LIVE", tone: "live" };
+  }
+  if (item.type === "image") {
+    return { text: "图片", tone: "image" };
+  }
+  if (item.type === "audio") {
+    return { text: "音频", tone: "audio" };
+  }
+  return { text: "视频", tone: "video" };
+}
+
+function mixedItemDisplayTitle(item: MediaItem, idx: number): string {
+  const rawTitle = item.title?.trim();
+  if (rawTitle && rawTitle !== props.media.title?.trim()) {
+    return rawTitle;
+  }
+  if (item.type === "live_photo") return `实况照片 #${idx + 1}`;
+  if (item.type === "image") return `高清图片 #${idx + 1}`;
+  if (item.type === "audio") return `独立音频 #${idx + 1}`;
+  return `视频片段 #${idx + 1}`;
 }
 
 function resolveAlbumThumbUrl(item: MediaItem): string {
@@ -545,6 +599,9 @@ const subfolderBatchLabel = computed(() => {
   }
   const sel = checkedCount.value;
   const tot = checklistPool.value.length;
+  if (layoutKind.value === "mixed") {
+    return `按标题存子文件夹 · 已选条目 (${sel}/${tot})`;
+  }
   if (layoutKind.value === "multi_video") {
     return `按标题存子文件夹 · 已选分P (${sel}/${tot})`;
   }
@@ -731,6 +788,9 @@ async function handleBatchZipSave() {
           <span v-if="layoutKind === 'album' && albumItems.length > 1" class="sp-badge sp-badge--accent">
             {{ platformBadgeText }} · {{ albumItems.length }} 项图集
           </span>
+          <span v-else-if="layoutKind === 'mixed'" class="sp-badge sp-badge--accent">
+            {{ platformBadgeText }} · {{ media.items.length }} 项混排
+          </span>
           <span
             v-if="isSaved"
             class="sp-badge sp-badge--saved"
@@ -799,18 +859,27 @@ async function handleBatchZipSave() {
         </button>
       </div>
 
-      <!-- Compact current-episode quick save strip in multi-video mode -->
+      <!-- Compact current-episode / current-item quick save strip in multi-video or mixed mode -->
       <div
-        v-else-if="layoutKind === 'multi_video' && activeItem && readyItem(activeItem)"
+        v-else-if="(layoutKind === 'multi_video' || layoutKind === 'mixed') && activeItem && readyItem(activeItem)"
         class="sp-cta-row sp-cta-row--compact"
       >
         <button
           type="button"
           class="sp-btn sp-btn--ghost sp-btn--sm sp-cta-row__main"
-          :disabled="!activeSelectedOption || !activeSelectedOption.downloadable"
+          :disabled="
+            activeItem.type !== 'live_photo' &&
+            (!activeSelectedOption || !activeSelectedOption.downloadable)
+          "
           @click="handleSinglePrimaryDownload"
         >
-          <span class="sp-truncate-1">仅下当前集：{{ singlePrimaryCtaText }}</span>
+          <span class="sp-truncate-1">
+            {{
+              layoutKind === "mixed"
+                ? `仅下当前项：${singlePrimaryCtaText}`
+                : `仅下当前集：${singlePrimaryCtaText}`
+            }}
+          </span>
         </button>
         <button
           type="button"
@@ -1146,9 +1215,211 @@ async function handleBatchZipSave() {
       </div>
     </div>
 
-    <!-- Clickable Quality / Track Variant Cards (for Single Video/Audio/Image or Active Multi-P Episode) -->
+    <!-- Mixed Image + Video Carousel Checklist (e.g. Instagram Carousels & X Mixed Tweets) -->
+    <div v-if="layoutKind === 'mixed'" class="sp-panel-card">
+      <div v-if="hasLivePhotos" class="sp-live-bar">
+        <span class="sp-live-bar__label">实况保存：</span>
+        <div class="sp-live-pills" role="radiogroup" aria-label="实况照片保存模式">
+          <button
+            type="button"
+            class="sp-live-pill"
+            :class="{ 'sp-live-pill--on': livePhotoFilter === 'both' }"
+            @click="livePhotoFilter = 'both'"
+          >
+            实况视频+封面全下
+          </button>
+          <button
+            type="button"
+            class="sp-live-pill"
+            :class="{ 'sp-live-pill--on': livePhotoFilter === 'motion' }"
+            @click="livePhotoFilter = 'motion'"
+          >
+            仅实况视频
+          </button>
+          <button
+            type="button"
+            class="sp-live-pill"
+            :class="{ 'sp-live-pill--on': livePhotoFilter === 'image' }"
+            @click="livePhotoFilter = 'image'"
+          >
+            仅静态图
+          </button>
+        </div>
+      </div>
+
+      <div class="sp-checklist-hd">
+        <div class="sp-checklist-hd__title">
+          <span>混排条目列表</span>
+          <span class="sp-checklist-hd__count">
+            已选 {{ checkedCount }} / {{ checkableTotalCount }}
+          </span>
+        </div>
+        <div class="sp-checklist-hd__btns">
+          <button type="button" class="sp-mini-link" @click="selectAllChecklist">
+            全选
+          </button>
+          <button type="button" class="sp-mini-link" @click="invertChecklist">
+            反选
+          </button>
+        </div>
+      </div>
+
+      <div class="sp-ep-list sp-mixed-list">
+        <div
+          v-for="(item, idx) in checklistPool"
+          :key="item.id"
+          class="sp-ep-row sp-mixed-row"
+          :class="{
+            'sp-ep-row--active': activeItem?.id === item.id,
+            'sp-ep-row--disabled': item.state === 'unavailable',
+          }"
+        >
+          <button
+            type="button"
+            class="sp-ep-row__check"
+            :class="{ 'sp-ep-row__check--on': checkedIds.has(item.id) }"
+            :disabled="item.state === 'unavailable'"
+            role="checkbox"
+            :aria-checked="checkedIds.has(item.id)"
+            @click.stop="toggleCheckItem(item)"
+          >
+            <svg
+              v-if="checkedIds.has(item.id)"
+              viewBox="0 0 16 16"
+              width="10"
+              height="10"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
+            </svg>
+          </button>
+
+          <button
+            type="button"
+            class="sp-ep-row__body sp-mixed-row__body"
+            :disabled="item.state === 'unavailable'"
+            @click="handleSelectEpisode(item)"
+          >
+            <span class="sp-mixed-row__thumb">
+              <img
+                v-if="resolveAlbumThumbUrl(item)"
+                :src="resolveAlbumThumbUrl(item)"
+                :alt="`第 ${idx + 1} 项缩略图`"
+                referrerpolicy="no-referrer"
+                loading="lazy"
+                class="sp-mixed-row__thumb-img"
+                @error="markUrlBroken(resolveAlbumThumbUrl(item))"
+              />
+              <span v-else class="sp-mixed-row__thumb-idx">
+                {{ String(idx + 1).padStart(2, "0") }}
+              </span>
+            </span>
+
+            <span class="sp-ep-row__p">
+              {{ String(idx + 1).padStart(2, "0") }}
+            </span>
+
+            <span
+              class="sp-mixed-type"
+              :class="`sp-mixed-type--${mixedItemTypeBadge(item).tone}`"
+            >
+              {{ mixedItemTypeBadge(item).text }}
+            </span>
+
+            <span class="sp-ep-row__title sp-truncate-1">
+              {{ mixedItemDisplayTitle(item, idx) }}
+            </span>
+
+            <span v-if="resolvingItemIds.has(item.id)" class="sp-ep-row__tag sp-ep-row__tag--loading">
+              解析中...
+            </span>
+            <span
+              v-else-if="item.state === 'deferred'"
+              class="sp-ep-row__tag sp-ep-row__tag--lazy"
+            >
+              按需解析
+            </span>
+            <span
+              v-else-if="item.state === 'unavailable'"
+              class="sp-ep-row__tag sp-ep-row__tag--err"
+            >
+              不可用
+            </span>
+            <span v-else-if="item.duration_ms" class="sp-ep-row__dur">
+              {{ formatDurationMs(item.duration_ms) }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="sp-batch-actions">
+        <button
+          type="button"
+          class="sp-btn sp-batch-actions__subfolder"
+          :class="
+            settings.batchSaveMode === 'subfolder' || !zipPreviewDecision.ok
+              ? 'sp-btn--primary'
+              : 'sp-btn--secondary'
+          "
+          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
+          title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
+          @click="handleBatchSubfolderSave"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+          </svg>
+          <span class="sp-truncate-1">{{ subfolderBatchLabel }}</span>
+        </button>
+
+        <div class="sp-batch-actions__subrow">
+          <button
+            type="button"
+            class="sp-btn sp-btn--sm sp-batch-actions__zip"
+            :class="
+              settings.batchSaveMode === 'zip' && zipPreviewDecision.ok
+                ? 'sp-btn--primary'
+                : 'sp-btn--ghost'
+            "
+            :disabled="
+              checkedCount === 0 ||
+              Boolean(batchPreparingProgress) ||
+              !zipPreviewDecision.ok
+            "
+            :title="
+              zipPreviewDecision.ok
+                ? '将已选混排条目无压缩打包为单个 ZIP 文件保存'
+                : zipPreviewDecision.reason
+            "
+            @click="handleBatchZipSave"
+          >
+            <span>打包 ZIP ({{ checkedCount }})</span>
+          </button>
+
+          <button
+            type="button"
+            class="sp-btn sp-btn--ghost sp-btn--sm"
+            :disabled="!directCopyCandidateUrl"
+            @click="handleCopyDirectLink"
+          >
+            {{ copiedDirectLink ? "已复制" : "复制直链" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clickable Quality / Track Variant Cards (for Single Video/Audio/Image, Active Multi-P Episode, or Active Video/Audio Item in Mixed Post) -->
     <div
-      v-if="layoutKind !== 'album' && activeQualityOptions.length > 0"
+      v-if="
+        layoutKind !== 'album' &&
+        (layoutKind !== 'mixed' ||
+          activeItem?.type === 'video' ||
+          activeItem?.type === 'audio') &&
+        activeQualityOptions.length > 0
+      "
       class="sp-panel-card"
     >
       <div class="sp-section-hd">
@@ -1818,6 +2089,65 @@ async function handleBatchZipSave() {
 .sp-ep-row__tag--err {
   background: var(--sp-danger-soft);
   color: #fca5a5;
+}
+
+/* Mixed Carousel Rows */
+.sp-mixed-row__thumb {
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #060913;
+  border: 1px solid var(--sp-border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.sp-mixed-row__thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.sp-mixed-row__thumb-idx {
+  font-family: var(--sp-font-mono);
+  font-size: 9.5px;
+  color: var(--sp-text-muted);
+}
+
+.sp-mixed-type {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+
+.sp-mixed-type--video {
+  background: rgba(99, 102, 241, 0.2);
+  color: #c7d2fe;
+  border: 1px solid rgba(129, 140, 248, 0.35);
+}
+
+.sp-mixed-type--image {
+  background: rgba(16, 185, 129, 0.14);
+  color: #6ee7b7;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.sp-mixed-type--live {
+  background: linear-gradient(135deg, #6366f1, #ec4899);
+  color: #ffffff;
+}
+
+.sp-mixed-type--audio {
+  background: rgba(236, 72, 153, 0.16);
+  color: #f9a8d4;
+  border: 1px solid rgba(244, 114, 182, 0.3);
 }
 
 /* Variant Cards */

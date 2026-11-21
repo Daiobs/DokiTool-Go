@@ -293,6 +293,7 @@ interface ActiveSlotMeta {
 }
 
 interface PendingBlobEntry {
+  slotKey: string;
   taskId: string;
   blobUrl: string;
   opfsTempName?: string;
@@ -328,6 +329,7 @@ export interface YouTubeExtensionBridge {
   releaseBlob(params: { taskId?: string; blobUrl: string }): boolean;
   releaseBlobsForTask(taskId: string): number;
   getPendingBlobCount(): number;
+  getActiveSlotCount(): number;
   dispose(): void;
 }
 
@@ -368,9 +370,21 @@ export function createYouTubeExtensionBridge(
   const nowFn = options.now ?? (() => Date.now());
 
   const activeSlots = new Map<string, ActiveSlotMeta>();
+  const finishedSlots = new Set<string>();
   const pendingBlobs = new Map<string, PendingBlobEntry>();
   let slotCounter = 0;
   let disposed = false;
+
+  const pruneSlotIfSettled = (slotKey: string): void => {
+    if (!finishedSlots.has(slotKey)) return;
+    const stillPending = Array.from(pendingBlobs.values()).some(
+      (entry) => entry.slotKey === slotKey,
+    );
+    if (!stillPending) {
+      activeSlots.delete(slotKey);
+      finishedSlots.delete(slotKey);
+    }
+  };
 
   const resolveSlotMeta = (
     cleanFilename: string,
@@ -427,6 +441,7 @@ export function createYouTubeExtensionBridge(
     });
 
     pendingBlobs.set(blobUrl, {
+      slotKey: slotMeta.slotKey,
       taskId: slotMeta.taskId,
       blobUrl,
       opfsTempName: params.tempName,
@@ -446,6 +461,7 @@ export function createYouTubeExtensionBridge(
       await releasePromise;
     } finally {
       pendingBlobs.delete(blobUrl);
+      pruneSlotIfSettled(slotMeta.slotKey);
       try {
         urlApi.revokeObjectURL(blobUrl);
       } catch {
@@ -571,23 +587,8 @@ export function createYouTubeExtensionBridge(
           mode: result.mode,
         };
       } finally {
-        // Keep slot alive if a blob handoff is still waiting on RELEASE_BLOB after abort race
-        const stillPending = Array.from(pendingBlobs.values()).some(
-          (entry) => entry.taskId === params.taskId,
-        );
-        if (!stillPending) {
-          activeSlots.delete(slotKey);
-        } else {
-          // Schedule deferred slot map cleanup once pending blobs for this task clear
-          setTimeout(() => {
-            const anyLeft = Array.from(pendingBlobs.values()).some(
-              (entry) => entry.taskId === params.taskId,
-            );
-            if (!anyLeft) {
-              activeSlots.delete(slotKey);
-            }
-          }, 0);
-        }
+        finishedSlots.add(slotKey);
+        pruneSlotIfSettled(slotKey);
       }
     },
 
@@ -633,21 +634,8 @@ export function createYouTubeExtensionBridge(
           mode: result.mode,
         };
       } finally {
-        const stillPending = Array.from(pendingBlobs.values()).some(
-          (entry) => entry.taskId === params.taskId,
-        );
-        if (!stillPending) {
-          activeSlots.delete(slotKey);
-        } else {
-          setTimeout(() => {
-            const anyLeft = Array.from(pendingBlobs.values()).some(
-              (entry) => entry.taskId === params.taskId,
-            );
-            if (!anyLeft) {
-              activeSlots.delete(slotKey);
-            }
-          }, 0);
-        }
+        finishedSlots.add(slotKey);
+        pruneSlotIfSettled(slotKey);
       }
     },
 
@@ -657,6 +645,7 @@ export function createYouTubeExtensionBridge(
         return false;
       }
       pendingBlobs.delete(params.blobUrl);
+      pruneSlotIfSettled(entry.slotKey);
       entry.resolve();
       return true;
     },
@@ -666,6 +655,7 @@ export function createYouTubeExtensionBridge(
       for (const [blobUrl, entry] of Array.from(pendingBlobs.entries())) {
         if (entry.taskId === taskId) {
           pendingBlobs.delete(blobUrl);
+          pruneSlotIfSettled(entry.slotKey);
           entry.resolve();
           count += 1;
         }
@@ -677,6 +667,10 @@ export function createYouTubeExtensionBridge(
       return pendingBlobs.size;
     },
 
+    getActiveSlotCount(): number {
+      return activeSlots.size;
+    },
+
     dispose(): void {
       if (disposed) return;
       disposed = true;
@@ -685,6 +679,7 @@ export function createYouTubeExtensionBridge(
       }
       pendingBlobs.clear();
       activeSlots.clear();
+      finishedSlots.clear();
       unmount();
     },
   };

@@ -53,6 +53,7 @@ import {
   isBackgroundBroadcast,
   type BackgroundToSidePanelBroadcast,
   type EnqueueDownloadItem,
+  type ExtensionDownloadTask,
   type ExtensionRpcResponse,
   type ExtensionSettings,
   type OffscreenDownloadSpec,
@@ -67,8 +68,8 @@ import { PLATFORM_DOMAIN_SPECS } from "./urlMatcher";
 export const MAX_EXTENSION_ZIP_BYTES = 500 * 1024 * 1024;
 export const PORT_RECONNECT_DELAY_MS = 250;
 
-export type LivePhotoSaveFilter = "both" | "motion" | "image";
-export type MediaLayoutKind = "single" | "album" | "multi_video";
+export type LivePhotoSaveFilter = "both" | "motion" | "video" | "image";
+export type MediaLayoutKind = "single" | "album" | "multi_video" | "mixed";
 
 // ============================================================================
 // Minimal Chrome MV3 Runtime Facade (zero `@types/chrome` dependency)
@@ -773,7 +774,7 @@ export function buildSidePanelQualityOptions(
       directUrl = routes[0] ?? "";
     } else if (variant.delivery.kind === "pair") {
       const motionRes = variant.delivery.resources.find(
-        (r) => r.role === "motion",
+        (r) => r.role === "motion" || r.role === "video",
       );
       const motionSrc = motionRes ? resourceSource(motionRes, ctx) : undefined;
       if (motionSrc) {
@@ -855,95 +856,97 @@ export function buildSidePanelQualityOptions(
     });
   }
 
-  // Surface standalone audio attachments (e.g., Douyin/Kuaishou BGM or YouTube audio track if not already in variants)
+  // Surface standalone audio attachments on video/audio items (e.g., Douyin/Kuaishou BGM or YouTube audio track if not already in variants)
   const hasVariantAudioOption = options.some(
     (opt) => opt.downloadable && opt.isAudioOnly,
   );
-  for (const att of attachments) {
-    if (
-      (att.role === "background_audio" || att.resource?.role === "audio") &&
-      att.resource?.delivery?.kind === "file"
-    ) {
-      // Avoid duplicating an identical YouTube audio source URL already listed in variants
-      const avail = availableSources(att.resource.delivery.sources);
-      const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
-      if (!primarySrc) continue;
-      let attUrl = "";
-      let attRoutes: string[] = [];
-      try {
-        attRoutes = deliveryRoutes(att.resource.delivery.sources, ctx);
-        attUrl = attRoutes[0] || sourceUrl(primarySrc, ctx);
-      } catch {
-        continue;
+  if (item.type === "video" || item.type === "audio") {
+    for (const att of attachments) {
+      if (
+        (att.role === "background_audio" || att.resource?.role === "audio") &&
+        att.resource?.delivery?.kind === "file"
+      ) {
+        // Avoid duplicating an identical YouTube audio source URL already listed in variants
+        const avail = availableSources(att.resource.delivery.sources);
+        const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
+        if (!primarySrc) continue;
+        let attUrl = "";
+        let attRoutes: string[] = [];
+        try {
+          attRoutes = deliveryRoutes(att.resource.delivery.sources, ctx);
+          attUrl = attRoutes[0] || sourceUrl(primarySrc, ctx);
+        } catch {
+          continue;
+        }
+        if (!attUrl) continue;
+        if (hasVariantAudioOption && options.some((o) => o.directUrl === attUrl)) {
+          continue;
+        }
+
+        const syntheticVariant: ReadyVariant = {
+          id: `att-${att.id}`,
+          state: "ready",
+          label: att.title?.trim() ? `原声 · ${att.title.trim()}` : "独立原声音频",
+          metadata: att.resource.metadata,
+          delivery: att.resource.delivery,
+        };
+        const syntheticItem: ReadyItem = {
+          id: `${item.id}-att-${att.id}`,
+          type: "audio",
+          title: att.title || media.title,
+          variants: [syntheticVariant],
+          default: null,
+          default_unavailable_reason: "processing_required",
+        };
+        const attTarget = getDownloadTarget(
+          syntheticItem,
+          {
+            variant_id: syntheticVariant.id,
+            ...(primarySrc.id ? { source_id: primarySrc.id } : {}),
+          },
+          ctx,
+        );
+        if (attTarget.kind !== "file") continue;
+
+        const { ext: resolvedExt, formatMime } = resolveVariantExtension({
+          variant: syntheticVariant,
+          itemType: "audio",
+          primaryUrl: attUrl,
+          platform: media.platform,
+        });
+
+        options.push({
+          key: `attachment:${att.id}`,
+          kind: "attachment",
+          variant: syntheticVariant,
+          attachment: att,
+          source: primarySrc,
+          downloadTarget: attTarget,
+          downloadable: true,
+          titleLabel: syntheticVariant.label || "原声音频",
+          specs: variantSpecifications(syntheticVariant),
+          audioBadge: {
+            text: `提取音频 · ${resolvedExt.toUpperCase()}`,
+            tone: "track",
+          },
+          sizeLabel: formatMediaSize(primarySrc.size_bytes, "zh-CN"),
+          sizeBytes: parsePositiveSafeBytes(primarySrc.size_bytes),
+          isAudioOnly: true,
+          effectiveHasAudio: true,
+          shortEdge: 0,
+          fps: 0,
+          bitrateBps: Number(
+            att.resource.metadata?.audio_bitrate_bps ||
+              att.resource.metadata?.bitrate_bps ||
+              0,
+          ),
+          muxPair: null,
+          resolvedExt,
+          formatMime,
+          directUrl: attUrl,
+          routes: attRoutes,
+        });
       }
-      if (!attUrl) continue;
-      if (hasVariantAudioOption && options.some((o) => o.directUrl === attUrl)) {
-        continue;
-      }
-
-      const syntheticVariant: ReadyVariant = {
-        id: `att-${att.id}`,
-        state: "ready",
-        label: att.title?.trim() ? `原声 · ${att.title.trim()}` : "独立原声音频",
-        metadata: att.resource.metadata,
-        delivery: att.resource.delivery,
-      };
-      const syntheticItem: ReadyItem = {
-        id: `${item.id}-att-${att.id}`,
-        type: "audio",
-        title: att.title || media.title,
-        variants: [syntheticVariant],
-        default: null,
-        default_unavailable_reason: "processing_required",
-      };
-      const attTarget = getDownloadTarget(
-        syntheticItem,
-        {
-          variant_id: syntheticVariant.id,
-          ...(primarySrc.id ? { source_id: primarySrc.id } : {}),
-        },
-        ctx,
-      );
-      if (attTarget.kind !== "file") continue;
-
-      const { ext: resolvedExt, formatMime } = resolveVariantExtension({
-        variant: syntheticVariant,
-        itemType: "audio",
-        primaryUrl: attUrl,
-        platform: media.platform,
-      });
-
-      options.push({
-        key: `attachment:${att.id}`,
-        kind: "attachment",
-        variant: syntheticVariant,
-        attachment: att,
-        source: primarySrc,
-        downloadTarget: attTarget,
-        downloadable: true,
-        titleLabel: syntheticVariant.label || "原声音频",
-        specs: variantSpecifications(syntheticVariant),
-        audioBadge: {
-          text: `提取音频 · ${resolvedExt.toUpperCase()}`,
-          tone: "track",
-        },
-        sizeLabel: formatMediaSize(primarySrc.size_bytes, "zh-CN"),
-        sizeBytes: parsePositiveSafeBytes(primarySrc.size_bytes),
-        isAudioOnly: true,
-        effectiveHasAudio: true,
-        shortEdge: 0,
-        fps: 0,
-        bitrateBps: Number(
-          att.resource.metadata?.audio_bitrate_bps ||
-            att.resource.metadata?.bitrate_bps ||
-            0,
-        ),
-        muxPair: null,
-        resolvedExt,
-        formatMime,
-        directUrl: attUrl,
-        routes: attRoutes,
-      });
     }
   }
 
@@ -1112,6 +1115,97 @@ export function buildPrimarySingleCtaLabel(params: {
 // Media Layout Classification & Enqueue Builders (Subfolder & Batch ZIP)
 // ============================================================================
 
+const TASK_STATUS_PROGRESSION: Readonly<
+  Record<ExtensionDownloadTask["status"], number>
+> = {
+  queued: 0,
+  parsing: 1,
+  downloading: 2,
+  muxing: 2,
+  saving: 3,
+  completed: 4,
+  failed: 4,
+  cancelled: 4,
+};
+
+function pickFresherTask(
+  existingTask: ExtensionDownloadTask,
+  addedTask: ExtensionDownloadTask,
+): ExtensionDownloadTask {
+  if (existingTask.updatedAt !== addedTask.updatedAt) {
+    return existingTask.updatedAt > addedTask.updatedAt
+      ? { ...existingTask }
+      : { ...addedTask };
+  }
+  const existingRank = TASK_STATUS_PROGRESSION[existingTask.status] ?? 0;
+  const addedRank = TASK_STATUS_PROGRESSION[addedTask.status] ?? 0;
+  if (existingRank !== addedRank) {
+    return existingRank > addedRank ? { ...existingTask } : { ...addedTask };
+  }
+  if (existingTask.loaded !== addedTask.loaded) {
+    return existingTask.loaded > addedTask.loaded
+      ? { ...existingTask }
+      : { ...addedTask };
+  }
+  return { ...existingTask };
+}
+
+/**
+ * Merges newly enqueued tasks returned by `ENQUEUE_DOWNLOADS` / `ENQUEUE_BATCH_URLS`
+ * with the SidePanel's existing task list without clobbering active/completed tasks
+ * or regressing tasks that already received a fresher `Port` `TASKS_UPDATED` broadcast.
+ */
+export function mergeEnqueuedTasks(
+  existing: ExtensionDownloadTask[],
+  added: ExtensionDownloadTask[],
+): ExtensionDownloadTask[] {
+  if (!Array.isArray(added) || added.length === 0) {
+    return Array.isArray(existing) ? existing.map((t) => ({ ...t })) : [];
+  }
+  if (!Array.isArray(existing) || existing.length === 0) {
+    const deduped: ExtensionDownloadTask[] = [];
+    const seen = new Map<string, number>();
+    for (const item of added) {
+      const idx = seen.get(item.taskId);
+      if (idx !== undefined) {
+        deduped[idx] = pickFresherTask(deduped[idx], item);
+      } else {
+        seen.set(item.taskId, deduped.length);
+        deduped.push({ ...item });
+      }
+    }
+    return deduped;
+  }
+
+  const existingIds = new Set(existing.map((t) => t.taskId));
+  const addedById = new Map<string, ExtensionDownloadTask>();
+  const prepended: ExtensionDownloadTask[] = [];
+
+  for (const candidate of added) {
+    const prevAdded = addedById.get(candidate.taskId);
+    if (prevAdded) {
+      const fresher = pickFresherTask(prevAdded, candidate);
+      addedById.set(candidate.taskId, fresher);
+      const pIdx = prepended.findIndex((p) => p.taskId === candidate.taskId);
+      if (pIdx >= 0) {
+        prepended[pIdx] = fresher;
+      }
+      continue;
+    }
+    addedById.set(candidate.taskId, { ...candidate });
+    if (!existingIds.has(candidate.taskId)) {
+      prepended.push({ ...candidate });
+    }
+  }
+
+  const mergedExisting = existing.map((task) => {
+    const matchingAdded = addedById.get(task.taskId);
+    return matchingAdded ? pickFresherTask(task, matchingAdded) : { ...task };
+  });
+
+  return [...prepended, ...mergedExisting];
+}
+
 export function classifyMediaLayout(media: UnifiedMedia | null): MediaLayoutKind {
   if (!media || !Array.isArray(media.items) || media.items.length === 0) {
     return "single";
@@ -1119,13 +1213,16 @@ export function classifyMediaLayout(media: UnifiedMedia | null): MediaLayoutKind
   const albumItems = media.items.filter(
     (it) => it.type === "image" || it.type === "live_photo",
   );
+  const videoOrAudioItems = media.items.filter(
+    (it) => it.type === "video" || it.type === "audio",
+  );
+  if (albumItems.length > 0 && videoOrAudioItems.length > 0) {
+    return "mixed";
+  }
   const hasLivePhoto = albumItems.some((it) => it.type === "live_photo");
   if (albumItems.length > 1 || hasLivePhoto) {
     return "album";
   }
-  const videoOrAudioItems = media.items.filter(
-    (it) => it.type === "video" || it.type === "audio",
-  );
   const nonAlbumGroups = (media.groups ?? []).filter((g) => g.kind !== "album");
   if (videoOrAudioItems.length > 1 || nonAlbumGroups.length > 0) {
     return "multi_video";
@@ -1415,14 +1512,16 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       );
       if (pairVariant && pairVariant.delivery.kind === "pair") {
         const motionRes = pairVariant.delivery.resources.find(
-          (r) => r.role === "motion",
+          (r) => r.role === "motion" || r.role === "video",
         );
         const imageRes = pairVariant.delivery.resources.find(
           (r) => r.role === "image",
         );
 
         if (
-          (livePhotoFilter === "both" || livePhotoFilter === "motion") &&
+          (livePhotoFilter === "both" ||
+            livePhotoFilter === "motion" ||
+            livePhotoFilter === "video") &&
           motionRes
         ) {
           const probe = buildLeafResourceSpec({

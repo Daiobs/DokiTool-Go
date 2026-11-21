@@ -113,7 +113,9 @@ const trackedBatchTasks = computed<ExtensionDownloadTask[]>(() => {
       (t) => t.groupBatchId === props.activeBatchGroupId,
     );
   }
-  const latestBatchTask = props.tasks.find((t) => Boolean(t.groupBatchId));
+  const latestBatchTask = props.tasks.find((t) =>
+    Boolean(t.groupBatchId?.startsWith("batch-")),
+  );
   if (!latestBatchTask?.groupBatchId) return [];
   return props.tasks.filter(
     (t) => t.groupBatchId === latestBatchTask.groupBatchId,

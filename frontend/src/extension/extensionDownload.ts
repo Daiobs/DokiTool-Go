@@ -62,7 +62,7 @@ export const ARCHIVE_LIMIT_ERROR =
 export const DEFAULT_OFFSCREEN_CONCURRENCY = 3;
 export const DEFAULT_PROGRESS_THROTTLE_MS = 150;
 
-export type LivePhotoSaveMode = "both" | "video" | "image";
+export type LivePhotoSaveMode = "both" | "video" | "motion" | "image";
 
 export class ExtensionDownloadError extends Error {
   code?: string;
@@ -201,7 +201,45 @@ export function selectVariantByPreference(
   const context: TargetContext = { apiOrigin };
   const readyVariants = item.variants.filter(readyVariant);
 
-  // 1. Standalone audio preference ("audio")
+  // 1. Image / LivePhoto items always resolve as visual items even when qualityPreference === "audio"
+  if (item.type === "live_photo") {
+    for (const variant of readyVariants) {
+      if (variant.delivery.kind === "pair") {
+        const target = getDownloadTarget(
+          item,
+          { variant_id: variant.id },
+          context,
+        );
+        if ("variant" in target) {
+          return { variant, target, isAudioOnly: false };
+        }
+      }
+    }
+  }
+
+  if (item.type === "image" || item.type === "live_photo") {
+    const defTarget = getDefaultDownloadTarget(item, context);
+    if ("variant" in defTarget) {
+      return {
+        variant: defTarget.variant,
+        target: defTarget,
+        isAudioOnly: false,
+      };
+    }
+    for (const variant of readyVariants) {
+      const target = getDownloadTarget(
+        item,
+        { variant_id: variant.id },
+        context,
+      );
+      if ("variant" in target) {
+        return { variant, target, isAudioOnly: false };
+      }
+    }
+    return null;
+  }
+
+  // 2. Standalone audio preference ("audio")
   if (qualityPreference === "audio") {
     const audioPlans: Array<{
       plan: SelectedVariantPlan;
@@ -296,44 +334,6 @@ export function selectVariantByPreference(
       return audioPlans[0].plan;
     }
     // Fall through to default/best when the work has no standalone audio stream
-  }
-
-  // 2. Image / LivePhoto items
-  if (item.type === "live_photo") {
-    for (const variant of readyVariants) {
-      if (variant.delivery.kind === "pair") {
-        const target = getDownloadTarget(
-          item,
-          { variant_id: variant.id },
-          context,
-        );
-        if ("variant" in target) {
-          return { variant, target, isAudioOnly: false };
-        }
-      }
-    }
-  }
-
-  if (item.type === "image" || item.type === "live_photo") {
-    const defTarget = getDefaultDownloadTarget(item, context);
-    if ("variant" in defTarget) {
-      return {
-        variant: defTarget.variant,
-        target: defTarget,
-        isAudioOnly: false,
-      };
-    }
-    for (const variant of readyVariants) {
-      const target = getDownloadTarget(
-        item,
-        { variant_id: variant.id },
-        context,
-      );
-      if ("variant" in target) {
-        return { variant, target, isAudioOnly: false };
-      }
-    }
-    return null;
   }
 
   // 3. Video (and fallback audio) ranking for "best" and "1080p"
@@ -766,6 +766,7 @@ export function buildEnqueueItemsForMedia(
 
   const leaves: PreparedLeafItem[] = [];
   const totalCount = Math.max(media.items.length, candidateItems.length);
+  const usedItemNumbers = new Set<number>();
 
   for (let i = 0; i < candidateItems.length; i++) {
     const item = candidateItems[i];
@@ -826,8 +827,20 @@ export function buildEnqueueItemsForMedia(
       throw new Error("未找到可下载的清晰度或媒体来源");
     }
 
-    const itemNumber =
-      typeof item.index === "number" && item.index >= 1 ? item.index : i + 1;
+    const rawIndex =
+      typeof item.index === "number" &&
+      Number.isInteger(item.index) &&
+      item.index >= 1
+        ? item.index
+        : i + 1;
+    let itemNumber = rawIndex;
+    if (usedItemNumbers.has(itemNumber)) {
+      itemNumber = i + 1;
+      while (usedItemNumbers.has(itemNumber)) {
+        itemNumber += 1;
+      }
+    }
+    usedItemNumbers.add(itemNumber);
     const distinctEpisodeTitle =
       item.title?.trim() && item.title.trim() !== media.title?.trim()
         ? item.title.trim()
@@ -873,7 +886,10 @@ export function buildEnqueueItemsForMedia(
             }),
           );
         }
-      } else if (livePhotoMode === "video" && motionRes) {
+      } else if (
+        (livePhotoMode === "video" || livePhotoMode === "motion") &&
+        motionRes
+      ) {
         leaves.push(
           prepareResourceLeaf({
             resource: motionRes,
@@ -1445,6 +1461,7 @@ export interface OffscreenDownloadExecutor {
   getActiveTaskCount(): number;
   getPendingBlobCount(): number;
   getActiveOpfsTempNames(): ReadonlySet<string>;
+  getActiveDynamicAllowedOrigins(): string[] | undefined;
   waitForIdle(): Promise<void>;
   dispose(): void;
 }
@@ -1480,7 +1497,20 @@ export function createOffscreenDownloadExecutor(
 
   let tempSeq = 0;
   let activeRunningCount = 0;
-  let currentDynamicAllowedOrigins: string[] | undefined;
+  const activeDynamicAllowedOriginsByTask = new Map<string, string[]>();
+
+  const getUnionDynamicAllowedOrigins = (): string[] | undefined => {
+    if (activeDynamicAllowedOriginsByTask.size === 0) {
+      return undefined;
+    }
+    const merged = new Set<string>();
+    for (const origins of activeDynamicAllowedOriginsByTask.values()) {
+      for (const origin of origins) {
+        if (origin) merged.add(origin);
+      }
+    }
+    return merged.size > 0 ? Array.from(merged) : undefined;
+  };
 
   const waitQueue: QueuedTaskEntry[] = [];
   const activeTaskEntries = new Map<string, QueuedTaskEntry>();
@@ -1497,7 +1527,7 @@ export function createOffscreenDownloadExecutor(
     now: nowFn,
     mediabunnyImpl: options.mediabunnyImpl,
     muxConfig: options.youtubeMuxConfig,
-    extraAllowedOrigins: () => currentDynamicAllowedOrigins,
+    extraAllowedOrigins: getUnionDynamicAllowedOrigins,
   });
 
   const notifyIfIdle = () => {
@@ -2489,8 +2519,10 @@ export function createOffscreenDownloadExecutor(
       throw new ExtensionDownloadError("缺少 YouTube 媒体流地址");
     }
     assertWhitelisted(url, spec);
-    const prevAllowed = currentDynamicAllowedOrigins;
-    currentDynamicAllowedOrigins = getAllowedOriginsForSpec(spec);
+    activeDynamicAllowedOriginsByTask.set(
+      taskId,
+      getAllowedOriginsForSpec(spec),
+    );
     const reportProgress = createProgressReporter(taskId, "downloading");
 
     try {
@@ -2511,7 +2543,7 @@ export function createOffscreenDownloadExecutor(
         },
       });
     } finally {
-      currentDynamicAllowedOrigins = prevAllowed;
+      activeDynamicAllowedOriginsByTask.delete(taskId);
       notifyIfIdle();
     }
   };
@@ -2528,8 +2560,10 @@ export function createOffscreenDownloadExecutor(
     assertWhitelisted(mux.videoUrl, spec);
     assertWhitelisted(mux.audioUrl, spec);
 
-    const prevAllowed = currentDynamicAllowedOrigins;
-    currentDynamicAllowedOrigins = getAllowedOriginsForSpec(spec);
+    activeDynamicAllowedOriginsByTask.set(
+      taskId,
+      getAllowedOriginsForSpec(spec),
+    );
     const reportProgress = createProgressReporter(taskId, "muxing");
 
     try {
@@ -2553,7 +2587,7 @@ export function createOffscreenDownloadExecutor(
         },
       });
     } finally {
-      currentDynamicAllowedOrigins = prevAllowed;
+      activeDynamicAllowedOriginsByTask.delete(taskId);
       notifyIfIdle();
     }
   };
@@ -2737,6 +2771,10 @@ export function createOffscreenDownloadExecutor(
       return activeOpfsNames;
     },
 
+    getActiveDynamicAllowedOrigins(): string[] | undefined {
+      return getUnionDynamicAllowedOrigins();
+    },
+
     waitForIdle(): Promise<void> {
       if (
         activeRunningCount === 0 &&
@@ -2763,6 +2801,7 @@ export function createOffscreenDownloadExecutor(
         pending.resolve();
       }
       pendingBlobs.clear();
+      activeDynamicAllowedOriginsByTask.clear();
       youtubeBridge.dispose();
       notifyIfIdle();
     },

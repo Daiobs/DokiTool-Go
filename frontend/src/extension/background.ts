@@ -249,7 +249,7 @@ export interface BackgroundControllerDeps {
 
 export interface BackgroundController {
   init(): Promise<void>;
-  syncDynamicDnrRules(): Promise<ExtensionDnrRule[]>;
+  syncDynamicDnrRules(extraOrigins?: string[]): Promise<ExtensionDnrRule[]>;
   ensureOffscreenDocument(): Promise<void>;
   getSnapshot(): Promise<ExtensionStateSnapshot>;
   handleRuntimeMessage: ChromeRuntimeMessageListener;
@@ -454,11 +454,13 @@ export function createBackgroundController(
   const sidePanelPorts = new Set<ChromePortLike>();
   let offscreenPort: ChromePortLike | null = null;
   let offscreenDocumentOpen = false;
+  let inFlightOffscreenRpcs = 0;
   let offscreenIdleTimer: ReturnType<typeof setTimeout> | null = null;
   let badgeClearTimer: ReturnType<typeof setTimeout> | null = null;
   let tabSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
   let currentTabSync: TabSyncState | null = null;
+  let initialTabSyncPromise: Promise<void> | null = null;
   let lastBroadcastTabKey = "";
   let lastConnectionCheck: ConnectionCheckResult | null = null;
 
@@ -609,14 +611,26 @@ export function createBackgroundController(
   // 1. Dynamic DNR Rule Synchronization
   // ==========================================================================
 
-  const syncDynamicDnrRules = (): Promise<ExtensionDnrRule[]> => {
+  const syncDynamicDnrRules = (
+    extraOrigins?: string[],
+  ): Promise<ExtensionDnrRule[]> => {
     const run = async (): Promise<ExtensionDnrRule[]> => {
       const extensionId = chromeApi.runtime.id || "dokitool-ext";
       const settings = await storage.getSettings();
+      const originsSet = new Set<string>();
       const validated = validateApiBaseUrl(settings.apiBaseUrl);
-      const extraApiOrigins =
-        validated.ok && !validated.isLoopback ? [validated.origin] : [];
-      const rules = buildExtensionDnrRules(extensionId, { extraApiOrigins });
+      if (validated.ok && !validated.isLoopback) {
+        originsSet.add(validated.origin);
+      }
+      for (const candidate of extraOrigins ?? []) {
+        const extraValidated = validateApiBaseUrl(candidate);
+        if (extraValidated.ok && !extraValidated.isLoopback) {
+          originsSet.add(extraValidated.origin);
+        }
+      }
+      const rules = buildExtensionDnrRules(extensionId, {
+        extraApiOrigins: Array.from(originsSet),
+      });
 
       if (chromeApi.declarativeNetRequest?.updateDynamicRules) {
         await chromeApi.declarativeNetRequest.updateDynamicRules({
@@ -678,24 +692,26 @@ export function createBackgroundController(
     }
   };
 
+  const isOffscreenIdle = (): boolean =>
+    countActiveTasks() === 0 &&
+    pendingBlobDownloads.size === 0 &&
+    inFlightOffscreenRpcs === 0;
+
   const scheduleOffscreenIdleCloseIfIdle = () => {
     clearOffscreenIdleTimer();
-    if (disposed) return;
-    if (countActiveTasks() > 0 || pendingBlobDownloads.size > 0) {
+    if (disposed || !isOffscreenIdle()) {
       return;
     }
     offscreenIdleTimer = setTimeout(() => {
       offscreenIdleTimer = null;
-      if (
-        disposed ||
-        countActiveTasks() > 0 ||
-        pendingBlobDownloads.size > 0
-      ) {
+      if (disposed || !isOffscreenIdle()) {
         return;
       }
       void (async () => {
         try {
-          await chromeApi.offscreen?.closeDocument();
+          if (offscreenDocumentOpen || (await hasOpenOffscreenContext())) {
+            await chromeApi.offscreen?.closeDocument();
+          }
         } catch {
           // Ignore if already closed
         } finally {
@@ -775,25 +791,37 @@ export function createBackgroundController(
     options?: { skipEnsure?: boolean },
   ): Promise<OffscreenResponseMap[T]> => {
     clearOffscreenIdleTimer();
-    if (!options?.skipEnsure) {
-      await ensureOffscreenDocument();
+    const isNonTaskRpc =
+      req.type === "OFFSCREEN_YOUTUBE_PLAYER" || req.type === "OFFSCREEN_PING";
+    if (isNonTaskRpc) {
+      inFlightOffscreenRpcs += 1;
     }
-    const raw = (await chromeApi.runtime.sendMessage(req)) as
-      | ExtensionRpcResponse<OffscreenResponseMap[T]>
-      | undefined;
-    if (!raw || typeof raw !== "object" || !("ok" in raw)) {
-      throw new Error("Offscreen 执行器未响应");
+    try {
+      if (!options?.skipEnsure) {
+        await ensureOffscreenDocument();
+      }
+      const raw = (await chromeApi.runtime.sendMessage(req)) as
+        | ExtensionRpcResponse<OffscreenResponseMap[T]>
+        | undefined;
+      if (!raw || typeof raw !== "object" || !("ok" in raw)) {
+        throw new Error("Offscreen 执行器未响应");
+      }
+      if (!raw.ok) {
+        const err = new Error(raw.error || "Offscreen 请求失败") as Error & {
+          code?: string;
+          status?: number;
+        };
+        err.code = raw.code;
+        err.status = raw.status;
+        throw err;
+      }
+      return raw.data;
+    } finally {
+      if (isNonTaskRpc) {
+        inFlightOffscreenRpcs = Math.max(0, inFlightOffscreenRpcs - 1);
+        scheduleOffscreenIdleCloseIfIdle();
+      }
     }
-    if (!raw.ok) {
-      const err = new Error(raw.error || "Offscreen 请求失败") as Error & {
-        code?: string;
-        status?: number;
-      };
-      err.code = raw.code;
-      err.status = raw.status;
-      throw err;
-    }
-    return raw.data;
   };
 
   const sendReleaseBlobToOffscreen = async (params: {
@@ -902,16 +930,7 @@ export function createBackgroundController(
     }
 
     if (!validated.isLoopback && chromeApi.declarativeNetRequest) {
-      const extId = chromeApi.runtime.id || "dokitool-ext";
-      const rules = buildExtensionDnrRules(extId, {
-        extraApiOrigins: [validated.origin],
-      });
-      await chromeApi.declarativeNetRequest
-        .updateDynamicRules({
-          removeRuleIds: [...EXTENSION_DNR_RULE_IDS],
-          addRules: rules,
-        })
-        .catch(() => {});
+      await syncDynamicDnrRules([validated.origin]).catch(() => []);
     }
 
     const endpoint = `${validated.origin}/api/platforms?schema_version=1.0`;
@@ -1222,8 +1241,13 @@ export function createBackgroundController(
 
     const settings = await storage.getSettings();
     const enrichedSpec = await enrichSpecAllowedOrigins(spec, settings);
+    const latestBeforeStart = tasks.get(taskId);
+    if (!latestBeforeStart || latestBeforeStart.status === "cancelled") {
+      scheduleOffscreenIdleCloseIfIdle();
+      return;
+    }
     const updatedTask: ExtensionDownloadTask = {
-      ...task,
+      ...latestBeforeStart,
       status: enrichedSpec.kind === "youtube_mux" ? "muxing" : "downloading",
       statusText:
         enrichedSpec.kind === "youtube_mux"
@@ -1236,12 +1260,24 @@ export function createBackgroundController(
     updateBadge();
     await broadcastTasksUpdated();
 
+    if (tasks.get(taskId)?.status === "cancelled") {
+      scheduleOffscreenIdleCloseIfIdle();
+      return;
+    }
+
     try {
       await sendToOffscreen({
         type: "OFFSCREEN_START_TASK",
         taskId,
         spec: enrichedSpec,
       });
+      if (tasks.get(taskId)?.status === "cancelled") {
+        void sendToOffscreen(
+          { type: "OFFSCREEN_CANCEL_TASK", taskId },
+          { skipEnsure: true },
+        ).catch(() => {});
+        scheduleOffscreenIdleCloseIfIdle();
+      }
     } catch (err) {
       const current = tasks.get(taskId);
       if (!current || current.status === "cancelled") return;
@@ -1423,6 +1459,7 @@ export function createBackgroundController(
         loaded: 0,
         total: firstSpec.sizeBytes ?? 0,
         speed: 0,
+        chromeDownloadId: undefined,
         error: undefined,
         updatedAt: nowFn(),
         retryPayload: { kind: "spec", spec: firstSpec },
@@ -1834,6 +1871,30 @@ export function createBackgroundController(
   // 6. Privacy-Gated Active Tab Sync (`matchSupportedPlatformUrl` Locally Only!)
   // ==========================================================================
 
+  const queryActiveTab = async (): Promise<ChromeTabLike | undefined> => {
+    if (!chromeApi.tabs?.query) return undefined;
+    try {
+      const focused = await chromeApi.tabs.query({
+        active: true,
+        lastFocusedWindow: true,
+      });
+      if (focused && focused.length > 0) {
+        return focused[0];
+      }
+    } catch {
+      // Fall through to currentWindow fallback
+    }
+    try {
+      const current = await chromeApi.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+      return current?.[0];
+    } catch {
+      return undefined;
+    }
+  };
+
   const evaluateTabSyncState = (
     tabId: number,
     rawUrl: string | undefined,
@@ -1866,8 +1927,19 @@ export function createBackgroundController(
       : `${tabId}:unsupported`;
 
     if (immediate) {
-      currentTabSync = evaluateTabSyncState(tabId, rawUrl);
-      lastBroadcastTabKey = syncKey;
+      if (tabSyncTimer !== null) {
+        clearTimeout(tabSyncTimer);
+        tabSyncTimer = null;
+      }
+      const nextSync = evaluateTabSyncState(tabId, rawUrl);
+      currentTabSync = nextSync;
+      if (sidePanelPorts.size > 0 && syncKey !== lastBroadcastTabKey) {
+        lastBroadcastTabKey = syncKey;
+        broadcastToSidePanels({
+          type: "TAB_SYNC_UPDATED",
+          tabSync: nextSync,
+        });
+      }
       return;
     }
 
@@ -1889,16 +1961,30 @@ export function createBackgroundController(
       const nextKey = nextSync.matched
         ? `${nextSync.tabId}:${nextSync.matched.dedupeKey}:${nextSync.matched.isLikelyFeedOrHome ? "feed" : "work"}`
         : `${nextSync.tabId}:unsupported`;
-      if (nextKey === lastBroadcastTabKey) {
-        return;
+      if (sidePanelPorts.size > 0 && nextKey !== lastBroadcastTabKey) {
+        lastBroadcastTabKey = nextKey;
+        broadcastToSidePanels({
+          type: "TAB_SYNC_UPDATED",
+          tabSync: nextSync,
+        });
       }
-      lastBroadcastTabKey = nextKey;
-      broadcastToSidePanels({
-        type: "TAB_SYNC_UPDATED",
-        tabSync: nextSync,
-      });
     }, delayMs);
     (tabSyncTimer as { unref?: () => void })?.unref?.();
+  };
+
+  const ensureInitialTabSync = async (): Promise<void> => {
+    if (currentTabSync !== null || disposed) return;
+    if (!initialTabSyncPromise) {
+      initialTabSyncPromise = (async () => {
+        const first = await queryActiveTab();
+        if (!disposed && currentTabSync === null && first?.id !== undefined) {
+          scheduleTabSyncEvaluation(first.id, first.url, true);
+        }
+      })().finally(() => {
+        initialTabSyncPromise = null;
+      });
+    }
+    await initialTabSyncPromise;
   };
 
   // ==========================================================================
@@ -1986,7 +2072,7 @@ export function createBackgroundController(
         kind: "url",
         url: matched.url,
         qualityPreference: settings.qualityPreference,
-        batchSaveMode: "subfolder",
+        batchSaveMode: settings.batchSaveMode,
         subfolderPrefix: settings.subfolderPrefix,
       },
     });
@@ -1997,7 +2083,7 @@ export function createBackgroundController(
       placeholderTaskId: placeholderId,
       matched,
       qualityPreference: settings.qualityPreference,
-      batchSaveMode: "subfolder",
+      batchSaveMode: settings.batchSaveMode,
       subfolderPrefix: settings.subfolderPrefix,
       forceSubfolder: false,
     });
@@ -2045,18 +2131,20 @@ export function createBackgroundController(
 
     void trackBackgroundJob(
       (async () => {
+        let targetTab = tab;
         let candidateUrl = tab?.url?.trim() || "";
-        if (!candidateUrl && chromeApi.tabs?.query) {
-          const activeTabs = await chromeApi.tabs
-            .query({ active: true, currentWindow: true })
-            .catch(() => []);
-          candidateUrl = activeTabs[0]?.url?.trim() || "";
+        if (!candidateUrl) {
+          const activeTab = await queryActiveTab();
+          if (activeTab) {
+            targetTab = targetTab ?? activeTab;
+            candidateUrl = activeTab.url?.trim() || "";
+          }
         }
         const matched = candidateUrl
           ? matchSupportedPlatformUrl(candidateUrl)
           : null;
-        if (tab?.id !== undefined) {
-          scheduleTabSyncEvaluation(tab.id, candidateUrl, true);
+        if (targetTab?.id !== undefined) {
+          scheduleTabSyncEvaluation(targetTab.id, candidateUrl, true);
         }
         if (matched && !matched.isLikelyFeedOrHome) {
           await emitInspectIntent(matched.url);
@@ -2070,6 +2158,9 @@ export function createBackgroundController(
   // ==========================================================================
 
   const getSnapshot = async (): Promise<ExtensionStateSnapshot> => {
+    if (currentTabSync === null) {
+      await ensureInitialTabSync();
+    }
     const [settings, savedWorks, pendingIntent] = await Promise.all([
       storage.getSettings(),
       storage.getSavedWorks(),
@@ -2199,6 +2290,7 @@ export function createBackgroundController(
             percent: 0,
             loaded: 0,
             speed: 0,
+            chromeDownloadId: undefined,
             error: undefined,
             unwhitelistedHost: undefined,
             updatedAt: nowFn(),
@@ -2224,6 +2316,7 @@ export function createBackgroundController(
           percent: 0,
           loaded: 0,
           speed: 0,
+          chromeDownloadId: undefined,
           error: undefined,
           unwhitelistedHost: undefined,
           updatedAt: nowFn(),
@@ -2490,19 +2583,9 @@ export function createBackgroundController(
       syncDynamicDnrRules().catch(() => []),
       registerContextMenus().catch(() => {}),
     ]);
-    if (chromeApi.tabs?.query) {
-      try {
-        const activeTabs = await chromeApi.tabs.query({
-          active: true,
-          currentWindow: true,
-        });
-        const first = activeTabs[0];
-        if (first?.id !== undefined) {
-          scheduleTabSyncEvaluation(first.id, first.url, true);
-        }
-      } catch {
-        // Ignore
-      }
+    const first = await queryActiveTab();
+    if (first?.id !== undefined) {
+      scheduleTabSyncEvaluation(first.id, first.url, true);
     }
   };
 

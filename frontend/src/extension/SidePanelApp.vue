@@ -26,6 +26,7 @@ import {
 } from "./storage";
 import {
   createSidePanelBroadcastBridge,
+  mergeEnqueuedTasks,
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
 import {
@@ -465,7 +466,7 @@ async function handleEnqueueDownloads(payload: {
     showToast(rpc.error || "提交下载任务失败", "error");
     return;
   }
-  tasks.value = [...rpc.data.tasks];
+  tasks.value = mergeEnqueuedTasks(tasks.value, rpc.data.tasks);
   downloadsExpanded.value = true;
   showToast(
     payload.items.length > 1
@@ -491,7 +492,7 @@ async function handleSubmitBatchUrls(urls: string[]) {
       return;
     }
     activeBatchGroupId.value = rpc.data.groupBatchId;
-    tasks.value = [...rpc.data.tasks];
+    tasks.value = mergeEnqueuedTasks(tasks.value, rpc.data.tasks);
     downloadsExpanded.value = true;
     showToast(`已启动 ${urls.length} 条链接后台批量队列`, "success");
   } finally {

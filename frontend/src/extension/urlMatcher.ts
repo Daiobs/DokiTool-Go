@@ -133,7 +133,7 @@ export interface BatchUrlExtractResult {
 const HOSTNAME_SYNTAX = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
-const TRACKING_QUERY_PARAMS = new Set([
+export const TRACKING_QUERY_PARAMS: ReadonlySet<string> = new Set([
   "spm",
   "spm_id_from",
   "vd_source",
@@ -146,7 +146,7 @@ const TRACKING_QUERY_PARAMS = new Set([
   "share_from",
   "share_session_id",
   "share_tag",
-  "share_Copy_Link",
+  "share_copy_link",
   "uniquekey",
   "timestamp",
   "fbclid",
@@ -583,6 +583,12 @@ function analyzePlatformDetails(
       ) {
         return {
           dedupeKey: `kuaishou:share:${segments[1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      if (host === "v.kuaishou.com" && segments.length >= 1) {
+        return {
+          dedupeKey: `kuaishou:short:${segments[0]}`,
           isLikelyFeedOrHome: false,
         };
       }
