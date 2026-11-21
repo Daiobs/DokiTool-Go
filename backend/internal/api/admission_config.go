@@ -24,8 +24,8 @@ const (
 	MaxSlowParseQueueSize     = 1024
 	MaxSlowParseConcurrency   = 64
 
-	MinOwnerTokenBytes      = 32
-	MaxOwnerTokenBytes      = 512
+	MinOwnerTokenBytes      = bearer.MinTokenBytes
+	MaxOwnerTokenBytes      = bearer.MaxTokenBytes
 	MaxOwnerAuthHeaderBytes = 1024
 
 	DefaultOwnerConcurrency = 8
@@ -51,13 +51,8 @@ func NewOwnerAuth(token string) (OwnerAuth, error) {
 	if token == "" {
 		return OwnerAuth{}, nil
 	}
-	if len(token) < MinOwnerTokenBytes || len(token) > MaxOwnerTokenBytes {
+	if err := bearer.ValidateToken(token); err != nil {
 		return OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN must be empty or 32–512 printable ASCII characters without whitespace")
-	}
-	for i := 0; i < len(token); i++ {
-		if token[i] < 33 || token[i] > 126 {
-			return OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN must be empty or 32–512 printable ASCII characters without whitespace")
-		}
 	}
 	return OwnerAuth{
 		enabled: true,
@@ -87,11 +82,6 @@ func (o OwnerAuth) String() string {
 
 func (o OwnerAuth) GoString() string {
 	return o.String()
-}
-
-func (o OwnerAuth) verifyHeader(values []string) bool {
-	match := bearer.VerifyHeader(values, o.digest, MaxOwnerAuthHeaderBytes)
-	return o.enabled && match
 }
 
 // PoolConfig separates a visitor's abuse budget from the service capacity.

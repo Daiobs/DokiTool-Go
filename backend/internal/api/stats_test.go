@@ -1234,3 +1234,30 @@ doneTicks:
 		t.Fatalf("tick 0 missing expected bounded outcome tokens: %q", captured[0])
 	}
 }
+
+func TestStatsSnapshotAPIKeysNonNilWhenNilOrUnconfigured(t *testing.T) {
+	nilSnap := (*Stats)(nil).Snapshot()
+	if nilSnap.APIKeys == nil || len(nilSnap.APIKeys) != 0 {
+		t.Fatalf("nil Stats.Snapshot().APIKeys must be non-nil empty slice, got %#v", nilSnap.APIKeys)
+	}
+	rawNil, err := json.Marshal(nilSnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawNil), `"api_keys":[]`) {
+		t.Fatalf("nil Stats.Snapshot() did not serialize api_keys as []: %s", string(rawNil))
+	}
+
+	emptyStats := NewStats(nil)
+	emptySnap := emptyStats.Snapshot()
+	if emptySnap.APIKeys == nil || len(emptySnap.APIKeys) != 0 {
+		t.Fatalf("unattached Stats.Snapshot().APIKeys must be non-nil empty slice, got %#v", emptySnap.APIKeys)
+	}
+	rawEmpty, err := json.Marshal(emptySnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawEmpty), `"api_keys":[]`) {
+		t.Fatalf("unattached Stats.Snapshot() did not serialize api_keys as []: %s", string(rawEmpty))
+	}
+}

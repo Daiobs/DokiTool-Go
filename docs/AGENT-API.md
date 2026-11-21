@@ -1,8 +1,9 @@
 # Agent 接口调用指南（Personal Agent Channel）
 
-本文档面向命令行脚本、后台任务与自动化 Agent，说明如何使用私有令牌（`DOKITOOL_OWNER_TOKEN`）调用 DokiTool 统一媒体 v1（`schema_version=1.0`）接口完成高吞吐解析、状态观测与直链提取。
+本文档面向命令行脚本、后台任务与自动化 Agent，说明如何使用 Bearer 鉴权凭据（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的多角色密钥：`owner` / `agent` / `friend`）调用 DokiTool 统一媒体 v1（`schema_version=1.0`）接口完成高吞吐解析、状态观测与直链提取。
 
 - 完整的批量下载工程实践与标准库可运行示例脚本见 [docs/AGENT-BATCH-DOWNLOAD.md](AGENT-BATCH-DOWNLOAD.md) 与 [examples/agent_batch_download.py](../examples/agent_batch_download.py)。
+- 多密钥 SHA-256 注册表配置规范、角色默认值及 `SIGHUP` 热重载说明见 [docs/CONFIGURATION.md](CONFIGURATION.md)，脱敏配置文件示例见 [ops/examples/api-keys.example.json](../ops/examples/api-keys.example.json)。
 - 机器可读 OpenAPI `3.1.0` 契约见 [docs/openapi.json](openapi.json)；底层 JSON Schema 真值见 [docs/schema/unified-v1/unified-v1.schema.json](schema/unified-v1/unified-v1.schema.json)。
 
 ---
@@ -22,7 +23,7 @@
    - 在默认未开启 `DOKITOOL_YTDLP_YOUTUBE_ENABLED` 的服务端上，对 YouTube 链接调用 `GET /api/parse` 会直接返回 HTTP `503`（`code: "SERVICE_NOT_CONFIGURED"`）；即便在自建实例上开启服务端提取器，`*.googlevideo.com` 媒体直链通常绑定服务端出口 IP，异地客户端直连下载仍会被拒绝。Agent 批量任务应在输入阶段直接过滤或跳过 YouTube 链接。
 2. **微博（`weibo`）**：
    - 微博不在主批量支持范围内：DokiTool 注册的微博能力仅为 `["video"]`（不支持纯图片微博图文提取；非视频微博状态帖会返回 `404 CONTENT_UNAVAILABLE` 或因上游状态接口访客限制返回 `403 UPSTREAM_BLOCKED`），且微博响应不进入服务端短时解析缓存。
-   - **携带有效 Owner Token 解析微博时的精确服务端行为**：与匿名网页访客返回本站 `/api/media/weibo?ticket=...` 同源中转票据不同，携带有效 `DOKITOOL_OWNER_TOKEN` 调用 `/api/parse` 解析公开微博视频（例如 `https://weibo.com/tv/show/1034:...`）时，服务端走 `PrepareOwner` 分支，**不签发任何本站中转票据**，而是直接返回原始 CDN 直链（视频流位于 `f.video.weibocdn.com`，封面与头像位于 `*.sinaimg.cn`，`access` 省略即 `"direct"`）。
+   - **携带有效 Bearer 凭据解析微博时的精确服务端行为**：与匿名网页访客返回本站 `/api/media/weibo?ticket=...` 同源中转票据不同，携带任一有效 Bearer 密钥（`owner`、`agent` 或 `friend` 角色，且未受密钥 `platforms` 白名单拦截）调用 `/api/parse` 解析公开微博视频（例如 `https://weibo.com/tv/show/1034:...`）时，服务端走 `PrepareOwner` 分支，**不签发任何本站中转票据**，而是直接返回原始 CDN 直链（视频流位于 `f.video.weibocdn.com`，封面与头像位于 `*.sinaimg.cn`，`access` 省略即 `"direct"`）。
    - **直连下载微博原始 CDN 链接的 `Referer` 实测要求**：微博音视频与图片 CDN 均校验 `Referer` 防盗链。若客户端确需直连下载返回的 `*.weibocdn.com` 或 `*.sinaimg.cn` 原始直链，**必须附带请求头 `Referer: https://weibo.com/`（无需且不应携带任何 `Cookie`，严禁转发 `Authorization` 头）**。对公开微博视频帖与图片帖原始 CDN 直链执行只读 `Range: bytes=0-1023` 的实测结果如下：
 
      | 资源类型 | 原始 CDN 主机名 | Case A：无 `Referer`、无 `Cookie` | Case B：`Referer: https://weibo.com/`、无 `Cookie` |
@@ -37,7 +38,9 @@
 
 ### 2.1 读取与传递令牌
 
-服务端通过环境变量 `DOKITOOL_OWNER_TOKEN` 配置个人通道令牌（留空表示关闭个人通道；非空时须为 `32–512` 字节、不含空白或控制字符的可打印 ASCII 字符串，服务端仅在内存中保存其 SHA-256 摘要并执行常量时间比对）。
+服务端支持两类并存的 Bearer 鉴权凭据来源（令牌须为 `32–512` 字节、不含空白或控制字符的可打印 ASCII 字符串，服务端仅保存 SHA-256 摘要并执行无提前退出的常量时间扫描）：
+1. **环境变量 `DOKITOOL_OWNER_TOKEN`**：非空时自动创建隐式 `id: "owner"`（`role: "owner"`）密钥；
+2. **多密钥配置文件 `DOKITOOL_API_KEYS_FILE`**：最多支持 `64` 把密钥（含隐式 `"owner"`），支持 `owner`、`agent`、`friend` 三种角色、按密钥独立并发池与速率限流、可选 `platforms` 平台白名单以及 `SIGHUP` 原子热重载（配置 Schema、离线 `printf '%s' "$TOKEN" | ./dokitool hash-token` 生成方式见 [docs/CONFIGURATION.md](CONFIGURATION.md) 与 [ops/examples/api-keys.example.json](../ops/examples/api-keys.example.json)）。
 
 客户端应始终从环境变量读取令牌，并通过 **`Authorization: Bearer <token>` 请求头**发送：
 
@@ -59,10 +62,10 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 > **关键行为（客户端必须特殊处理）**：
 > 当请求附带了 `Authorization` 头（或在强制要求鉴权的 `GET /api/stats` 上缺失 `Authorization` 头），且出现以下任一情形时：
-> 1. 令牌内容错误（与服务端 `DOKITOOL_OWNER_TOKEN` 不匹配）；
+> 1. 令牌内容错误，或命中已停用密钥（`enabled: false`）；
 > 2. 格式畸形（非 `"Bearer "` 前缀、空令牌、含空白字符或非可打印 ASCII 字节）；
 > 3. `Authorization` 请求头长度超过 **`1024` 字节**，或同一请求发送了多个 `Authorization` 头；
-> 4. 服务端未配置或已关闭个人通道（`DOKITOOL_OWNER_TOKEN` 为空）；
+> 4. 服务端未配置任何已启用的 Bearer 凭据（`DOKITOOL_OWNER_TOKEN` 与 `DOKITOOL_API_KEYS_FILE` 均未启用匹配密钥）；
 >
 > 服务端**绝不会静默降级为匿名请求**，而是执行以下两步固定动作：
 > 1. **计入匿名单 IP 限流预算**：每次失败尝试都会向该来源客户端 IP（IPv6 按 `/64` 前缀聚合）的匿名解析单 IP 令牌桶扣减 1 个令牌（默认 **`Burst=4`**，恢复速率 **`0.2/s`**，即每 5 秒恢复 1 个令牌；不消耗全局匿名配额或并发槽位）。
@@ -80,6 +83,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 >      }
 >      ```
 >    - 同一 IP 连续第 5 次及之后的无效鉴权请求会被单 IP 令牌桶直接拦截，转为返回 **HTTP `429 Too Many Requests`**（`code: "RATE_LIMITED"`，附带 `Retry-After: 5` 响应头及 `error.retry_after_seconds: 5`）。
+> - **已认证密钥的角色或平台白名单越权（同样返回 HTTP `401`）**：若令牌本身合法且已启用，但（a）使用 `agent` 或 `friend` 角色密钥访问仅限 `owner` 的 `GET /api/stats`，或（b）密钥配置了 `platforms` 白名单却请求未授权平台的 `/api/parse`、`/api/resolve` 或 YouTube 助手接口，服务端会校验该密钥自身的快读速率桶（高频洪泛时返回 `429`）、累加该密钥的 `unauthorized` 计数并返回 HTTP `401`（`code: "INVALID_INPUT"`，`error.retryable: false`），不扣减匿名单 IP 令牌桶。
 
 **Agent 实现铁律**：判断错误类型时**必须优先检查 HTTP 状态码是否为 `401`**，不能只看 JSON 里的 `code == "INVALID_INPUT"`。收到 HTTP `401` 代表令牌配置错误或服务端未开启个人通道，Agent 必须**立即终止整个批处理任务并告警**，切勿将其当作单条分享链接格式错误跳过并继续请求后续 URL。
 
@@ -91,7 +95,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.1 `GET /api/parse` — 解析分享链接或分享口令文本
 
-- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（推荐 Agent 始终携带以进入独立 `owner` 并发池；不带时命中进程内新鲜缓存走轻量的 `Catalog` 池，未命中缓存走匿名快/慢解析池限流）。
+- **认证**：可选 `Authorization: Bearer <token>`（支持 `owner`、`agent`、`friend` 三种角色；携带时先校验可选 `platforms` 白名单〔不允许则返回 HTTP `401`〕，命中进程内新鲜缓存时直接走零槽位缓存快路径，未命中缓存时进入该密钥独立的并发池与等待队列；不带时命中新鲜缓存走匿名 `Catalog` 池，未命中走匿名快/慢解析池限流）。
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
@@ -210,7 +214,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 当 `/api/parse` 返回多 P 合集（`data.groups[*].kind == "multipart"`）时，非首集条目通常处于 `state: "deferred"` 状态，不含 `variants`，但提供 API 相对路径 **`item.resolve_url`**（例如 `"/api/resolve?schema_version=1.0&platform=bilibili&url=...&item_id=..."`）。
 
-- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（Agent 调用时应继续携带同一请求头以进入 `owner` 池；不带时命中进程内新鲜缓存走轻量的 `Catalog` 池，未命中缓存时纯 Go 平台走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，海外慢解析平台走慢解析池）。
+- **认证**：可选 `Authorization: Bearer <token>`（支持 `owner`、`agent`、`friend` 角色；Agent 调用时应继续携带同一请求头，命中新鲜缓存走零槽位缓存快路径，未命中进入该密钥独立池；不带时命中新鲜缓存走匿名 `Catalog` 池，未命中缓存时纯 Go 平台走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，海外慢解析平台走慢解析池）。
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
@@ -223,7 +227,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.3 `GET /api/platforms` — 查询当前实例已启用的平台目录
 
-- **认证**：可选 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`（携带有效令牌时走 `owner` 池；不带时走 `CATALOG` 池）。
+- **认证**：可选 `Authorization: Bearer <token>`（携带有效 `owner` / `agent` / `friend` 密钥时走零槽位快读路径，不占用密钥并发槽位；不带时走匿名 `CATALOG` 池）。
 - **查询参数**：`schema_version=1.0`（**必填**，缺失或不匹配返回 HTTP `409`；其他未定义的查询参数会被忽略）。
 - **成功响应（HTTP `200 OK`）示例**：
   ```json
@@ -254,9 +258,9 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.4 `GET /api/stats` — 查询进程内只读运行统计快照
 
-提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `owner` 三池排队与拒绝计数、`yt-dlp` 并发槽位等待直方图、抖音上海通道工作状态及端到端解析耗时直方图。仅统计聚合计数器，不含任何 URL、IP 或令牌内容。
+提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `owner` 三池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`yt-dlp` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态及端到端解析耗时直方图。仅统计聚合计数器与密钥标识，不含任何 URL、IP、明文令牌或摘要内容。
 
-- **认证**：**强制要求** `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`。缺失、错误、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或服务端未配置 `DOKITOOL_OWNER_TOKEN` 时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）。**通过鉴权的 `/api/stats` 请求不占用 `owner` 并发槽位，也不计入 `requests` 解析统计**。
+- **认证**：**严格要求 `owner` 角色 Bearer 凭据**（`DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥）。缺失、错误、已停用（`enabled: false`）、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或未配置任何启用密钥时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）；携带合法 `agent` 或 `friend` 角色密钥访问时同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥 `unauthorized` 计数，不扣减匿名单 IP 配额）。**通过 `owner` 鉴权的 `/api/stats` 请求不占用并发槽位，也不计入 `requests` 解析统计**。
 - **HTTP 方法与查询参数**：
   - 仅允许 `GET`（通过鉴权的非 `GET` 请求返回 HTTP `405 INVALID_INPUT` 及 `Allow: GET` 头）。
   - 查询参数 `schema_version` **可选**：不带查询串（`GET /api/stats`）或携带 `?schema_version=1.0` 均返回同一结构；若标量 `schema_version` 传入非 `"1.0"` 的其他值（包括空值）则返回 HTTP `409 INVALID_INPUT`；携带任何其他查询键（包括 `?token=...`、`schema_version[]=`）、空 `&` 段或末尾裸 `?`（`/api/stats?`）均返回 HTTP `400 INVALID_INPUT`。
@@ -490,13 +494,64 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
             }
           }
         }
-      }
+      },
+      "api_keys": [
+        {
+          "id": "owner",
+          "role": "owner",
+          "enabled": true,
+          "active": 2,
+          "slow_active": 0,
+          "queued": 0,
+          "concurrency_limit": 8,
+          "slow_concurrency_limit": 0,
+          "queue_limit": 256,
+          "requests_total": 80,
+          "ok": 80,
+          "errors": 0,
+          "cache_hits": 14,
+          "rate_limited": 0,
+          "unauthorized": 0,
+          "waited": 5,
+          "granted": 5,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 640,
+          "wait_ms_max": 210
+        },
+        {
+          "id": "agent-bot",
+          "role": "agent",
+          "enabled": true,
+          "active": 0,
+          "slow_active": 0,
+          "queued": 0,
+          "concurrency_limit": 4,
+          "slow_concurrency_limit": 1,
+          "queue_limit": 128,
+          "requests_total": 20,
+          "ok": 20,
+          "errors": 0,
+          "cache_hits": 4,
+          "rate_limited": 0,
+          "unauthorized": 0,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        }
+      ]
     }
   }
   ```
 - **核心统计字段说明**：
-  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 14 个内置平台 ID 加 `"unknown"`（共 15 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`。
-  - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数。
+  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 14 个内置平台 ID 加 `"unknown"`（共 15 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
+  - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（`admission.owner` 汇总 `owner` 角色池快照，保持向后兼容）。
+  - `api_keys[*]`：按配置顺序返回每把已注册 API 密钥（最多 `64` 项，未配置时为空数组 `[]`；已停用密钥仍以 `enabled: false` 保留在列表中，绝不返回令牌或 SHA-256 摘要）的实时并发与累计指标，包含固定 22 个字段：`id`、`role`（`"owner"` / `"agent"` / `"friend"`）、`enabled`、`active`、`slow_active`、`queued`、`concurrency_limit`、`slow_concurrency_limit`、`queue_limit`、`requests_total`、`ok`、`errors`、`cache_hits`（零槽位缓存快路径命中次数）、`rate_limited`、`unauthorized`（角色或平台白名单拦截次数）、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`。`SIGHUP` 热重载时，相同 `id` 的密钥自动延续累计计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
   - 直方图（`HistogramSnapshot`）：`buckets` 键集合固定为 `<=10`、`<=50`、`<=100`、`<=250`、`<=500`、`<=1000`、`<=2500`、`<=5000`、`<=10000`、`<=30000`、`+Inf`（单位毫秒，采用 Prometheus 风格的**累积上界桶**，单调不减且 `buckets["+Inf"] == count`）。
 
@@ -572,7 +627,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 | HTTP 状态码 | `code` / `error.code` | `retryable` | 触发原因 | Agent 标准处置动作 |
 | --- | --- | --- | --- | --- |
-| **`401`** | `INVALID_INPUT` | `false` | `Authorization` 令牌错误、格式非法、超长（`> 1024 B`）、重复发送，或服务端未配置 `DOKITOOL_OWNER_TOKEN`（每次失败还会扣减单 IP 突发配额） | **立即中止整批任务并告警**；检查环境变量 `$DOKITOOL_OWNER_TOKEN` 与目标服务端配置，**严禁重试或继续遍历后续 URL**。 |
+| **`401`** | `INVALID_INPUT` | `false` | `Authorization` 令牌错误、命中已停用密钥（`enabled: false`）、格式非法、超长（`> 1024 B`）、重复发送、服务端未启用任何密钥（上述情形还会扣减匿名单 IP 突发配额），或合法 `agent` / `friend` 密钥调用 `/api/stats`、或密钥请求超出其 `platforms` 平台白名单 | **立即中止任务或核查密钥权限范围**：若为无效凭据或 `/api/stats` 角色不符，检查环境变量与目标服务端配置，**严禁对同一无效凭据循环重试**；若为 `platforms` 白名单限制，仅向允许平台发送请求。 |
 | `400` / `405` / `409` / `410` | `INVALID_INPUT` | `false` | 缺少/非法 `url` 或 `item_id`、`/api/stats` 携带未知查询参数、`platform` 与链接不匹配、抖音合集 `mix_id`、小红书缺失 `xsec_token`、X `t.co` 短链未指向有效推文页、Facebook `fb.watch` 短链、`schema_version` 不匹配（`409`）、方法错误（`405`）、旧路径退役（`410`） | **不重试**；将该条输入标记为永久输入错误（`failed_permanent`）并继续处理下一条 URL。 |
 | `400` | `UNSUPPORTED_PLATFORM` | `false` | 链接域名不在支持目录（如未接入网站），或目标平台在当前实例未启用 | **不重试**；标记为不支持平台并跳过。 |
 | `404` | `NO_MEDIA` | `false` | 帖子公开存在但不含受支持媒体（如 X 纯文本推文、仅含不受支持流格式的作品） | **不重试**；标记为无媒体作品并跳过。 |
@@ -589,16 +644,17 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 ## 6. 并发控制、服务端排队、缓存与直链 TTL
 
-### 6.1 个人通道并发池与服务端排队机制
+### 6.1 按密钥隔离并发池、非队头阻塞慢解析上限与服务端排队
 
-通过 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN` 验证的 `/api/parse`、`/api/resolve` 与 `/api/platforms` 请求进入独立的 `owner` 准入池，与匿名公网流量（`fast`、`resolve`、`slow`、`catalog` 等限流池）完全隔离：
+通过 `Authorization: Bearer <token>` 验证的请求按命中的 API 密钥进入各自独立的执行池（`keyPool`），不仅与匿名公网流量（`fast`、`resolve`、`slow`、`catalog` 等限流池）完全隔离，不同 `agent` / `friend` / `owner` 密钥之间也互不抢占配额：
 
-- **默认容量与上限**：
-  - 最大同时在途请求数 `DOKITOOL_OWNER_CONCURRENCY`：默认 **`8`**（可配置范围 `1..32`）。
-  - 内存 FIFO 等待队列容量 `DOKITOOL_OWNER_QUEUE_SIZE`：默认 **`256`**（可配置范围 `0..4096`）。
-  - 单请求最长排队等待时间 `DOKITOOL_OWNER_QUEUE_WAIT`：默认 **`60s`**（可配置范围 `0s..120s`）。
-- **排队与 `429` 触发条件**：当正在执行的个人请求达到 `DOKITOOL_OWNER_CONCURRENCY` 时，新到达的个人请求不会立即报错，而是进入 FIFO 队列按到达顺序等待空槽。只有当**队列已满（`queued >= 256`）**或**请求在队列中等待满 `60s` 仍未获槽**时，服务端才会返回 HTTP `429`（`Retry-After: 1`，`error.retry_after_seconds: 1`）。
-- **客户端超时配置建议**：单次解析本身最长耗时预算为 `45s`。若客户端发起的并发数可能超过 `DOKITOOL_OWNER_CONCURRENCY`，建议将客户端对 `/api/parse` 的 HTTP 读取超时设为 **`90s–115s`**，避免请求在服务端队列中正常排到槽位前被客户端提前断开（断开会记入 `/api/stats` 的 `admission.owner.canceled`）。
+- **角色默认容量与上限**（完整参数范围见 [docs/CONFIGURATION.md](CONFIGURATION.md)）：
+  - **`owner` 角色**（含隐式 `DOKITOOL_OWNER_TOKEN`）：默认总并发 `DOKITOOL_OWNER_CONCURRENCY = 8`（`1..32`），`slow_concurrency = 0`（共享总并发），不限速率（`rps = 0`），FIFO 队列 `DOKITOOL_OWNER_QUEUE_SIZE = 256`（`0..4096`），最长等待 `DOKITOOL_OWNER_QUEUE_WAIT = 60s`（`0s..120s`）。
+  - **`agent` 角色**：默认总并发 `4`（`1..32`），慢解析子并发 `slow_concurrency = 1`（`0..24`），速率 `rps = 5.0`、`burst = 16`，队列容量 `128`，最长等待 `45s`。
+  - **`friend` 角色**：默认总并发 `2`（`1..16`），慢解析子并发 `slow_concurrency = 1`（`0..16`），速率 `rps = 1.0`、`burst = 6`，队列容量 `16`，最长等待 `15s`。
+- **非队头阻塞（Non-HOL-Blocking）慢解析子并发**：当某密钥的 `slow_concurrency` 已被海外 `yt-dlp` 慢解析请求占满、但总 `concurrency` 仍有空闲槽位时，后续到达的抖音、哔哩哔哩等纯 Go 快解析请求**不会**被队列前方的慢解析请求阻塞，而是直接获槽执行。
+- **排队与 `429` 触发条件**：当未命中缓存的请求超出该密钥的令牌桶速率（`rps > 0` 时），或队列已满、或在队列中等待超过 `queue_wait` 仍未获槽时，服务端返回 HTTP `429`（携带 `Retry-After` 头与 `error.retry_after_seconds`）。
+- **客户端超时配置建议**：单次解析本身最长耗时预算为 `45s`。若客户端发起的并发数可能超过所持密钥的 `concurrency` 上限，建议将客户端对 `/api/parse` 的 HTTP 读取超时设为 **`45s + queue_wait + 10s` 余量**（例如 `owner` 默认 `60s` 排队时设为 **`90s–115s`**），避免请求在服务端队列中正常排到槽位前被客户端提前断开（断开会记入 `/api/stats` 对应密钥的 `canceled`）。
 
 ### 6.2 下游共享资源与推荐客户端并发度
 
@@ -613,9 +669,10 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 > **提示**：解析与 CDN 媒体文件下载可以流水线解耦——例如保持 `4` 个并发协程调用 `/api/parse`，拿到直链后立即交给 `4–8` 个独立的 CDN 下载协程流式落盘。
 
-### 6.3 服务端短时解析缓存（`DOKITOOL_PARSE_CACHE`）
+### 6.3 服务端短时解析缓存（`DOKITOOL_PARSE_CACHE`）与零槽位缓存快路径
 
-- **默认启用**：主后端内置上限为 `4096` 条、`64 MiB` 的 LRU 结果缓存及同键并发请求合并（`singleflight`）。相同 `(route, platform, normalized_url, item_id, debug)` 的并发或短时重复请求只会访问一次上游平台。
+- **默认启用**：主后端内置上限为 `4096` 条、`64 MiB` 的并发读锁（`RWMutex`）LRU 结果缓存及同键并发请求合并（`singleflight`）。相同 `(route, platform, normalized_url, item_id, debug)` 的并发或短时重复请求只会访问一次上游平台。
+- **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：携带有效 Bearer 密钥请求 `GET /api/parse` 或 `GET /api/resolve` 时，若目标平台通过该密钥的 `platforms` 白名单校验且进程内缓存存在未过期条目，服务端仅校验该密钥的快读速率桶（`rps > 0` 时为 `max(rps*4, 20.0)` / `max(burst*4, 64)`；`rps == 0` 不限速），在纯读锁下直接返回缓存响应并累加该密钥的 `cache_hits`，**占用 `0` 个 `keyPool` 并发槽位**——即使该密钥的全部并发槽位正被慢上游解析占满，新鲜缓存命中仍能毫秒级即时返回。
 - **动态 TTL（`10s..180s`）**：
   - 若响应内包含任何 `expires_at`，缓存寿命取 **`min(180s, earliest_expires_at - now - 60s)`**；若扣除 `60s` 安全余量后不足 `10s`，则不写入缓存，确保缓存绝不返回即将过期的直链。
   - 若响应不含 `expires_at`，成功响应缓存 **`60s`**。

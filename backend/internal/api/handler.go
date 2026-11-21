@@ -119,6 +119,53 @@ func (h *Handler) HasCachedYouTubeContext() bool {
 	return false
 }
 
+func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, string, bool) {
+	if h == nil || h.catalog == nil || h.cache == nil || h.cache.cfg.Disabled {
+		return cacheKey{}, "", false
+	}
+	if path != "/api/parse" && path != "/api/resolve" {
+		return cacheKey{}, "", false
+	}
+	if version, ok := queryValue(rawQuery, "schema_version"); !ok || version != unified.SchemaVersion {
+		return cacheKey{}, "", false
+	}
+	input, scalar := queryValue(rawQuery, "url")
+	source := InputURL(input)
+	if !scalar || source == "" || !h.catalog.ValidInputURL(source) {
+		return cacheKey{}, "", false
+	}
+	platform := h.catalog.PlatformForURL(source)
+	if platform == "" || h.adapters[platform] == nil {
+		return cacheKey{}, "", false
+	}
+	requested, requestedScalar := queryValue(rawQuery, "platform")
+	if !queryPresent(rawQuery, "platform") {
+		requested, requestedScalar = "all", true
+	}
+	if !requestedScalar || (requested != "all" && (requested != platform || !h.catalog.Has(requested))) {
+		return cacheKey{}, "", false
+	}
+	if !cacheableRequest(platform, source) {
+		return cacheKey{}, "", false
+	}
+	itemID := ""
+	if path == "/api/resolve" {
+		id, ok := queryValue(rawQuery, "item_id")
+		if !ok || id == "" || len(id) > 256 {
+			return cacheKey{}, "", false
+		}
+		itemID = id
+	}
+	debug, _ := queryValue(rawQuery, "debug")
+	return cacheKey{
+		route:    path,
+		platform: platform,
+		url:      normalizeCacheURL(platform, source),
+		itemID:   itemID,
+		debug:    debug == "1",
+	}, platform, true
+}
+
 // HasFreshCachedParse reports whether a GET /api/parse or /api/resolve request
 // would be answered from a fresh cache entry. Admission then charges the cheap
 // catalog budget instead of a parse token, so revisiting or re-downloading an
@@ -126,50 +173,39 @@ func (h *Handler) HasCachedYouTubeContext() bool {
 // pre-cache validation guards and cache key derivation in ServeHTTP so invalid
 // requests never masquerade as cache hits, and it never mutates the cache.
 func (h *Handler) HasFreshCachedParse(path, rawQuery string) bool {
-	if h == nil || h.catalog == nil || h.cache == nil || h.cache.cfg.Disabled {
+	ck, _, ok := h.deriveCacheableParseKey(path, rawQuery)
+	return ok && h.cache.fresh(ck, h.now())
+}
+
+// tryServeFreshCachedParse serves an authenticated GET /api/parse or /api/resolve
+// directly from parseCache under RLock without acquiring a keyPool concurrency slot.
+// If the entry expired at the exact nanosecond boundary, it returns false without
+// writing to w so admission falls through into keyPool slot acquisition.
+func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Request, key *apiKeyEntry, wallStart time.Time) bool {
+	if r.Method != http.MethodGet {
 		return false
 	}
-	if path != "/api/parse" && path != "/api/resolve" {
+	ck, platform, ok := h.deriveCacheableParseKey(r.URL.EscapedPath(), r.URL.RawQuery)
+	if !ok {
 		return false
 	}
-	if version, ok := queryValue(rawQuery, "schema_version"); !ok || version != unified.SchemaVersion {
+	if key != nil && !key.AllowsPlatform(platform) {
+		key.recordUnauthorized()
+		h.stats.RecordParse(platform, OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
+		rejectUnauthorizedWithMessage(w, r, parser, "当前凭据无权访问该平台")
+		return true
+	}
+	res, fresh := h.cache.getFresh(ck, h.now())
+	if !fresh {
 		return false
 	}
-	input, scalar := queryValue(rawQuery, "url")
-	source := InputURL(input)
-	if !scalar || source == "" || !h.catalog.ValidInputURL(source) {
-		return false
+	h.stats.recordCacheHit(ChannelOwner)
+	h.stats.RecordParse(platform, res.code, ChannelOwner, time.Since(wallStart))
+	if key != nil {
+		key.recordCachedParseStatus(res.status)
 	}
-	platform := h.catalog.PlatformForURL(source)
-	if platform == "" || h.adapters[platform] == nil {
-		return false
-	}
-	requested, requestedScalar := queryValue(rawQuery, "platform")
-	if !queryPresent(rawQuery, "platform") {
-		requested, requestedScalar = "all", true
-	}
-	if !requestedScalar || (requested != "all" && (requested != platform || !h.catalog.Has(requested))) {
-		return false
-	}
-	if !cacheableRequest(platform, source) {
-		return false
-	}
-	itemID := ""
-	if path == "/api/resolve" {
-		id, ok := queryValue(rawQuery, "item_id")
-		if !ok || id == "" || len(id) > 256 {
-			return false
-		}
-		itemID = id
-	}
-	debug, _ := queryValue(rawQuery, "debug")
-	return h.cache.fresh(cacheKey{
-		route:    path,
-		platform: platform,
-		url:      normalizeCacheURL(platform, source),
-		itemID:   itemID,
-		debug:    debug == "1",
-	}, h.now())
+	writeResponse(w, res)
+	return true
 }
 
 // ParsePlatform reports the registered catalog platform matched by a scalar url
@@ -309,7 +345,11 @@ func contractErrorForStatus(status int, message string) unified.Object {
 	case 504:
 		code = "UPSTREAM_TIMEOUT"
 	}
-	return unified.ContractError(code, message, status == 429 || status == 502 || status == 504)
+	out := unified.ContractError(code, message, status == 429 || status == 502 || status == 504)
+	if status == http.StatusUnauthorized {
+		unified.Map(out["error"])["retryable"] = false
+	}
+	return out
 }
 
 func sendError(w http.ResponseWriter, status int, message string) {
@@ -394,6 +434,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 400, "链接与所选平台不匹配，请切换对应平台或选择自动识别")
 		return
 	}
+	if !authAllowsPlatform(r.Context(), platform) {
+		if authKey, viaAdm := authKeyFromContext(r.Context()); authKey != nil && !viaAdm {
+			authKey.recordUnauthorized()
+		}
+		h.stats.RecordParse(platform, OutcomeUnauthorized, channel, time.Since(wallStart))
+		sendError(w, http.StatusUnauthorized, "当前凭据无权访问该平台")
+		return
+	}
 	itemID, scalarID := queryValue(r.URL.RawQuery, "item_id")
 	if path == "/api/resolve" && (!scalarID || itemID == "" || len(itemID) > 256) {
 		h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
@@ -440,10 +488,22 @@ func (h *Handler) serveCachedParse(
 	channel string,
 	wallStart time.Time,
 ) {
+	if res, ok := h.cache.getFresh(key, h.now()); ok {
+		h.stats.recordCacheHit(channel)
+		if authKey, _ := authKeyFromContext(r.Context()); authKey != nil {
+			authKey.counters.cacheHits.Add(1)
+		}
+		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
+		writeResponse(w, res)
+		return
+	}
 	h.cache.mu.Lock()
 	if res, ok := h.cache.getLocked(key, h.now()); ok {
 		h.cache.mu.Unlock()
 		h.stats.recordCacheHit(channel)
+		if authKey, _ := authKeyFromContext(r.Context()); authKey != nil {
+			authKey.counters.cacheHits.Add(1)
+		}
 		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
@@ -664,6 +724,13 @@ func (h *Handler) youtubeFinalizeReadTimeout() time.Duration {
 func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 	if h.youtubeHelper == nil {
 		sendError(w, 404, "接口不存在")
+		return
+	}
+	if !authAllowsPlatform(r.Context(), "youtube") {
+		if authKey, viaAdm := authKeyFromContext(r.Context()); authKey != nil && !viaAdm {
+			authKey.recordUnauthorized()
+		}
+		sendError(w, http.StatusUnauthorized, "当前凭据无权访问该平台")
 		return
 	}
 	switch r.URL.EscapedPath() {

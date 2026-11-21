@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Offline validator for docs/openapi.json, ops/examples/snap.caddy, and examples/agent_batch_download.py.
+"""Offline validator for docs/openapi.json, ops/examples/{snap.caddy,api-keys.example.json}, and examples/agent_batch_download.py.
 
 Performs zero external network requests. Verifies:
 1. OpenAPI 3.1.0 top-level metadata, paths, parameters, status codes, headers, and BearerAuth security;
 2. Every internal $ref resolves cleanly with zero external/network $refs;
 3. Exact structural & enum parity between docs/openapi.json and docs/schema/unified-v1/unified-v1.schema.json,
-   backend/config/platforms.json, and the GET /api/stats StatsSnapshot contract;
+   backend/config/platforms.json, and the GET /api/stats StatsSnapshot & APIKeyStatsSnapshot contracts;
 4. Draft 2020-12 JSON Schema validity and fixture conformance (via jsonschema when installed,
    required when --require-jsonschema is passed in CI);
-5. Caddy example per-path @api whitelist parity and 404 JSON catch-all ordering in ops/examples/snap.caddy;
+5. Caddy example per-path @api whitelist parity and 404 JSON catch-all ordering in ops/examples/snap.caddy,
+   plus schema/role/digest/platform-scope validity of ops/examples/api-keys.example.json;
 6. Syntax compilation, stdlib-only import hygiene, 4-step extension determination priority order,
    and loopback 206 Range resume + manifest idempotency of examples/agent_batch_download.py.
 """
@@ -36,6 +37,7 @@ OPENAPI_PATH = ROOT / "docs/openapi.json"
 AGENT_API_DOC_PATH = ROOT / "docs/AGENT-API.md"
 DEPLOYMENT_DOC_PATH = ROOT / "docs/DEPLOYMENT.md"
 CADDY_EXAMPLE_PATH = ROOT / "ops/examples/snap.caddy"
+API_KEYS_EXAMPLE_PATH = ROOT / "ops/examples/api-keys.example.json"
 UNIFIED_SCHEMA_PATH = ROOT / "docs/schema/unified-v1/unified-v1.schema.json"
 PLATFORMS_PATH = ROOT / "backend/config/platforms.json"
 EXAMPLES_DIR = ROOT / "docs/schema/unified-v1/examples"
@@ -85,6 +87,32 @@ EXPECTED_HISTOGRAM_BUCKETS = [
     "<=10", "<=50", "<=100", "<=250", "<=500",
     "<=1000", "<=2500", "<=5000", "<=10000", "<=30000", "+Inf",
 ]
+EXPECTED_API_KEY_ROLES = ["owner", "agent", "friend"]
+EXPECTED_API_KEY_STATS_REQUIRED = [
+    "id",
+    "role",
+    "enabled",
+    "active",
+    "slow_active",
+    "queued",
+    "concurrency_limit",
+    "slow_concurrency_limit",
+    "queue_limit",
+    "requests_total",
+    "ok",
+    "errors",
+    "cache_hits",
+    "rate_limited",
+    "unauthorized",
+    "waited",
+    "granted",
+    "timeout",
+    "full",
+    "canceled",
+    "wait_ms_total",
+    "wait_ms_max",
+]
+EMPTY_STRING_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 def require(condition: bool, message: str) -> None:
@@ -345,11 +373,44 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         "ShanghaiStatsSnapshot must require by_platform.{douyin,bilibili}",
     )
     require(
+        comp_schemas["APIKeyRole"]["enum"] == EXPECTED_API_KEY_ROLES,
+        "APIKeyRole enum must equal ['owner', 'agent', 'friend']",
+    )
+    api_key_snap = comp_schemas.get("APIKeyStatsSnapshot") or {}
+    api_key_props = api_key_snap.get("properties") or {}
+    require(
+        api_key_snap.get("additionalProperties") is False
+        and len(EXPECTED_API_KEY_STATS_REQUIRED) == 22
+        and api_key_snap.get("required") == EXPECTED_API_KEY_STATS_REQUIRED
+        and list(api_key_props.keys()) == EXPECTED_API_KEY_STATS_REQUIRED,
+        "APIKeyStatsSnapshot must require the exact 22 fields with additionalProperties=false",
+    )
+    require(
+        api_key_props["id"].get("type") == "string"
+        and api_key_props["id"].get("pattern") == "^[a-z0-9][a-z0-9_-]{0,31}$"
+        and api_key_props["role"].get("$ref") == "#/components/schemas/APIKeyRole"
+        and api_key_props["enabled"].get("type") == "boolean",
+        "APIKeyStatsSnapshot id/role/enabled schema mismatch",
+    )
+    for int_field in EXPECTED_API_KEY_STATS_REQUIRED[3:]:
+        require(
+            api_key_props[int_field].get("type") == "integer"
+            and api_key_props[int_field].get("minimum") == 0,
+            f"APIKeyStatsSnapshot.{int_field} must be integer with minimum=0",
+        )
+    require(
         comp_schemas["StatsSnapshot"]["required"] == [
             "started_at", "generated_at", "uptime_seconds",
-            "requests", "cache", "admission", "ytdlp", "shanghai", "parse_latency_ms",
+            "requests", "cache", "admission", "ytdlp", "shanghai", "parse_latency_ms", "api_keys",
         ],
         "StatsSnapshot required fields mismatch",
+    )
+    api_keys_prop = comp_schemas["StatsSnapshot"]["properties"].get("api_keys") or {}
+    require(
+        api_keys_prop.get("type") == "array"
+        and api_keys_prop.get("maxItems") == 64
+        and (api_keys_prop.get("items") or {}).get("$ref") == "#/components/schemas/APIKeyStatsSnapshot",
+        "StatsSnapshot.api_keys must be maxItems=64 array of APIKeyStatsSnapshot",
     )
     return ref_count
 
@@ -441,45 +502,101 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "queue_waits": 0, "queue_granted": 0, "queue_timeouts": 0,
         "queue_wait_ms_total": 0, "queue_wait_ms_max": 0,
     }
+    sample_api_key = {
+        "id": "agent-bot",
+        "role": "agent",
+        "enabled": True,
+        "active": 0,
+        "slow_active": 0,
+        "queued": 0,
+        "concurrency_limit": 4,
+        "slow_concurrency_limit": 1,
+        "queue_limit": 128,
+        "requests_total": 1,
+        "ok": 1,
+        "errors": 0,
+        "cache_hits": 1,
+        "rate_limited": 0,
+        "unauthorized": 0,
+        "waited": 0,
+        "granted": 0,
+        "timeout": 0,
+        "full": 0,
+        "canceled": 0,
+        "wait_ms_total": 0,
+        "wait_ms_max": 0,
+    }
+    base_stats_data = {
+        "started_at": "2026-11-15T00:00:00Z",
+        "generated_at": "2026-11-15T00:05:00Z",
+        "uptime_seconds": 300,
+        "requests": {
+            "total": 1,
+            "by_channel": {"anonymous": 0, "owner": 1},
+            "by_platform_code_channel": [
+                {"platform": "douyin", "code": "OK", "channel": "owner", "count": 1},
+            ],
+        },
+        "cache": {
+            "enabled": True, "entries": 1, "bytes": 512, "max_entries": 4096, "max_bytes": 67108864,
+            "total": zero_cache_ch,
+            "by_channel": {"anonymous": zero_cache_ch, "owner": zero_cache_ch},
+        },
+        "admission": {"fast": zero_pool, "slow": zero_pool, "owner": zero_pool},
+        "ytdlp": {
+            "enabled": True, "active": 0, "waiting": 0, "concurrency_limit": 2,
+            "total": zero_slot,
+            "by_channel": {"anonymous": zero_slot, "owner": zero_slot},
+        },
+        "shanghai": {
+            "enabled": True, "mode": "pull", "waiting_workers": 3, "queued_tasks": 0, "pending_tasks": 0,
+            "total": zero_sh,
+            "by_channel": {"anonymous": zero_sh, "owner": zero_sh},
+            "by_platform": {"douyin": zero_sh, "bilibili": zero_sh},
+        },
+        "parse_latency_ms": {
+            "total": zero_hist,
+            "by_channel": {"anonymous": zero_hist, "owner": zero_hist},
+        },
+        "api_keys": [sample_api_key],
+    }
     require(not list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
-        "data": {
-            "started_at": "2026-11-15T00:00:00Z",
-            "generated_at": "2026-11-15T00:05:00Z",
-            "uptime_seconds": 300,
-            "requests": {
-                "total": 1,
-                "by_channel": {"anonymous": 0, "owner": 1},
-                "by_platform_code_channel": [
-                    {"platform": "douyin", "code": "OK", "channel": "owner", "count": 1},
-                ],
-            },
-            "cache": {
-                "enabled": True, "entries": 1, "bytes": 512, "max_entries": 4096, "max_bytes": 67108864,
-                "total": zero_cache_ch,
-                "by_channel": {"anonymous": zero_cache_ch, "owner": zero_cache_ch},
-            },
-            "admission": {"fast": zero_pool, "slow": zero_pool, "owner": zero_pool},
-            "ytdlp": {
-                "enabled": True, "active": 0, "waiting": 0, "concurrency_limit": 2,
-                "total": zero_slot,
-                "by_channel": {"anonymous": zero_slot, "owner": zero_slot},
-            },
-            "shanghai": {
-                "enabled": True, "mode": "pull", "waiting_workers": 3, "queued_tasks": 0, "pending_tasks": 0,
-                "total": zero_sh,
-                "by_channel": {"anonymous": zero_sh, "owner": zero_sh},
-                "by_platform": {"douyin": zero_sh, "bilibili": zero_sh},
-            },
-            "parse_latency_ms": {
-                "total": zero_hist,
-                "by_channel": {"anonymous": zero_hist, "owner": zero_hist},
-            },
-        },
-    })), "Valid /api/stats payload rejected")
+        "data": base_stats_data,
+    })), "Valid /api/stats payload with api_keys rejected")
+    require(not list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "api_keys": []},
+    })), "Valid /api/stats payload with empty api_keys=[] rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {k: v for k, v in base_stats_data.items() if k != "api_keys"},
+    }))), "Missing api_keys field in /api/stats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "api_keys": None},
+    }))), "Null api_keys in /api/stats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "api_keys": [{**sample_api_key, "token_sha256": "1" * 64}]},
+    }))), "Unknown property in APIKeyStatsSnapshot must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "api_keys": [{**sample_api_key, "role": "admin"}]},
+    }))), "Invalid role in APIKeyStatsSnapshot must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "api_keys": [{**sample_api_key, "id": "Bad_ID"}]},
+    }))), "Invalid id pattern in APIKeyStatsSnapshot must be rejected")
 
-    return {"enabled": True, "validated_fixtures": len(fixture_files) + 5 + validate_doc_json_blocks(
+    return {"enabled": True, "validated_fixtures": len(fixture_files) + 11 + validate_doc_json_blocks(
         success_val, failure_val, catalog_val, stats_val, unauth_val, ratelimit_val
     )}
 
@@ -593,6 +710,130 @@ def check_caddy_whitelist() -> int:
         "docs/DEPLOYMENT.md must document updating the Caddy @api whitelist when adding new API paths",
     )
     return len(api_paths)
+
+
+def check_api_keys_example(platforms_cfg: list[dict]) -> int:
+    require(API_KEYS_EXAMPLE_PATH.is_file(), f"Missing API keys example: {API_KEYS_EXAMPLE_PATH}")
+    raw_bytes = API_KEYS_EXAMPLE_PATH.read_bytes()
+    require(len(raw_bytes) <= 64 * 1024, "ops/examples/api-keys.example.json must not exceed 64 KiB")
+    doc = json.loads(raw_bytes.decode("utf-8"))
+    require(
+        isinstance(doc, dict) and set(doc.keys()) == {"keys"},
+        "ops/examples/api-keys.example.json must be a JSON object with only the 'keys' field",
+    )
+    keys = doc["keys"]
+    require(
+        isinstance(keys, list) and 1 <= len(keys) <= 64,
+        "ops/examples/api-keys.example.json 'keys' must be a non-empty array of <= 64 entries",
+    )
+
+    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
+    valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms)
+    require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
+
+    allowed_fields = {
+        "id", "role", "enabled", "token_sha256",
+        "concurrency", "slow_concurrency", "rps", "burst",
+        "queue_size", "queue_wait", "platforms",
+    }
+    id_re = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    hex64_re = re.compile(r"^[0-9a-fA-F]{64}$")
+    seen_ids: set[str] = set()
+    seen_digests: set[str] = set()
+
+    for idx, entry in enumerate(keys):
+        require(isinstance(entry, dict), f"api-keys.example.json keys[{idx}] must be an object")
+        unknown = set(entry.keys()) - allowed_fields
+        require(not unknown, f"api-keys.example.json keys[{idx}] contains unknown fields: {sorted(unknown)}")
+
+        kid = entry.get("id")
+        require(isinstance(kid, str) and bool(id_re.fullmatch(kid)), f"Invalid key id at keys[{idx}]: {kid!r}")
+        require(kid not in seen_ids, f"Duplicate key id in api-keys.example.json: {kid!r}")
+        seen_ids.add(kid)
+
+        role = entry.get("role")
+        require(role in EXPECTED_API_KEY_ROLES, f"Invalid role at keys[{idx}]: {role!r}")
+
+        if "enabled" in entry:
+            require(isinstance(entry["enabled"], bool), f"keys[{idx}].enabled must be a boolean")
+
+        digest = entry.get("token_sha256")
+        require(
+            isinstance(digest, str) and bool(hex64_re.fullmatch(digest)),
+            f"keys[{idx}].token_sha256 must be 64 hex chars",
+        )
+        norm_digest = digest.lower()
+        require(
+            norm_digest != ("0" * 64) and norm_digest != EMPTY_STRING_SHA256,
+            f"keys[{idx}].token_sha256 must not be all-zero or empty-string SHA-256",
+        )
+        require(norm_digest not in seen_digests, f"Duplicate token_sha256 at keys[{idx}]")
+        seen_digests.add(norm_digest)
+
+        role_bounds = {
+            "owner": (32, 24, 1000.0, 1000, 4096, 120.0, True),
+            "agent": (32, 24, 1000.0, 1000, 4096, 120.0, False),
+            "friend": (16, 16, 100.0, 200, 512, 60.0, False),
+        }[role]
+        max_conc, max_slow, max_rps, max_burst, max_qsize, max_qwait_s, allow_zero_rps = role_bounds
+
+        conc = entry.get("concurrency")
+        if conc is not None:
+            require(
+                isinstance(conc, int) and not isinstance(conc, bool) and 1 <= conc <= max_conc,
+                f"keys[{idx}].concurrency must be an integer in 1..{max_conc}",
+            )
+        if "slow_concurrency" in entry:
+            sconc = entry["slow_concurrency"]
+            eff_conc = conc if conc is not None else (8 if role == "owner" else (4 if role == "agent" else 2))
+            require(
+                isinstance(sconc, int) and not isinstance(sconc, bool) and 0 <= sconc <= min(max_slow, eff_conc),
+                f"keys[{idx}].slow_concurrency must satisfy 0 <= slow_concurrency <= min({max_slow}, concurrency)",
+            )
+        if "rps" in entry:
+            rps = entry["rps"]
+            require(
+                isinstance(rps, (int, float)) and not isinstance(rps, bool),
+                f"keys[{idx}].rps must be a number",
+            )
+            if allow_zero_rps and rps == 0:
+                require(entry.get("burst", 0) == 0, f"keys[{idx}].burst must be 0 when rps == 0")
+            else:
+                require(0 < float(rps) <= max_rps, f"keys[{idx}].rps out of bounds for role {role}")
+        if "burst" in entry:
+            burst = entry["burst"]
+            require(
+                isinstance(burst, int) and not isinstance(burst, bool),
+                f"keys[{idx}].burst must be an integer",
+            )
+            if not (allow_zero_rps and entry.get("rps", 0) == 0 and burst == 0):
+                require(1 <= burst <= max_burst, f"keys[{idx}].burst must be in 1..{max_burst}")
+        if "queue_size" in entry:
+            qsize = entry["queue_size"]
+            require(
+                isinstance(qsize, int) and not isinstance(qsize, bool) and 0 <= qsize <= max_qsize,
+                f"keys[{idx}].queue_size must be in 0..{max_qsize}",
+            )
+        if "queue_wait" in entry:
+            qwait = entry["queue_wait"]
+            m_dur = re.fullmatch(r"^(\d+(?:\.\d+)?)(ms|s|m)$", qwait) if isinstance(qwait, str) else None
+            require(m_dur is not None, f"keys[{idx}].queue_wait must be a valid Go duration string: {qwait!r}")
+            val = float(m_dur.group(1))
+            unit = m_dur.group(2)
+            secs = val / 1000.0 if unit == "ms" else (val * 60.0 if unit == "m" else val)
+            require(0.0 <= secs <= max_qwait_s, f"keys[{idx}].queue_wait out of bounds for role {role}")
+
+        if "platforms" in entry:
+            plats = entry["platforms"]
+            require(isinstance(plats, list) and len(plats) >= 1, f"keys[{idx}].platforms must be a non-empty list")
+            require(len(plats) == len(set(plats)), f"keys[{idx}].platforms must not contain duplicates")
+            for plat in plats:
+                require(
+                    isinstance(plat, str) and plat in valid_platforms,
+                    f"keys[{idx}].platforms contains invalid platform {plat!r}",
+                )
+
+    return len(keys)
 
 
 def check_batch_downloader_behavior() -> dict:
@@ -939,6 +1180,7 @@ def main(argv: list[str] | None = None) -> int:
     js_report = check_with_jsonschema(spec, require_installed=args.require_jsonschema)
     check_python_scripts()
     caddy_paths = check_caddy_whitelist()
+    api_keys_count = check_api_keys_example(platforms_cfg)
     batch_report = check_batch_downloader_behavior()
 
     summary = {
@@ -949,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
         "agent_api_json_examples": doc_blocks,
         "jsonschema_draft2020_12": js_report,
         "caddy_whitelisted_paths": caddy_paths,
+        "api_keys_example_entries": api_keys_count,
         "example_script_compiled": True,
         "batch_downloader_tests": batch_report,
         "passed": True,

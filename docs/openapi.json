@@ -4,7 +4,7 @@
   "info": {
     "title": "DokiTool Unified Media & Personal Agent API",
     "summary": "Unified Media v1 (schema_version=1.0) parsing, lazy item resolution, platform catalog, and owner telemetry API.",
-    "description": "Machine-readable contract for DokiTool's public Unified Media v1 endpoints and Personal Agent Channel (authenticated exclusively via `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`). Never pass the owner token in query parameters: query-parameter tokens are ignored without error on `/api/parse`, `/api/resolve`, and `/api/platforms` (treating the request as an anonymous visitor while leaking the secret into access logs and shell history), and rejected on `/api/stats`. Never forward `Authorization` or `Cookie` headers to third-party media CDNs.",
+    "description": "Machine-readable contract for DokiTool's public Unified Media v1 endpoints and Bearer API Channels (`Authorization: Bearer <token>`, supporting both `DOKITOOL_OWNER_TOKEN` and named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` across `owner`, `agent`, and `friend` roles). Never pass tokens in query parameters: query-parameter tokens are ignored without error on `/api/parse`, `/api/resolve`, and `/api/platforms` (treating the request as an anonymous visitor while leaking the secret into access logs and shell history), and rejected on `/api/stats`. Never forward `Authorization` or `Cookie` headers to third-party media CDNs.",
     "version": "1.0.0",
     "license": {
       "name": "MIT",
@@ -22,7 +22,7 @@
       "get": {
         "operationId": "listPlatforms",
         "summary": "List enabled media platforms and capabilities",
-        "description": "Returns the active platform catalog for this server instance.",
+        "description": "Returns the active platform catalog for this server instance. Accepts anonymous requests as well as `owner`, `agent`, and `friend` Bearer keys (authenticated calls use the zero-slot fast-read path without consuming per-key concurrency slots).",
         "security": [
           {},
           {
@@ -70,7 +70,7 @@
       "get": {
         "operationId": "parseMedia",
         "summary": "Parse a share URL or share text into Unified Media v1 items",
-        "description": "Extracts normalized media items, variants, and direct CDN delivery sources for a supported public post. When authenticated with `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`, requests use the isolated owner concurrency pool with FIFO queueing instead of the anonymous per-IP rate limiter. Tokens passed in query parameters (e.g. `?token=...`) are ignored without error and processed as anonymous visitor requests.",
+        "description": "Extracts normalized media items, variants, and direct CDN delivery sources for a supported public post. Accepts optional Bearer credentials (`DOKITOOL_OWNER_TOKEN` or named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` with `owner`, `agent`, or `friend` roles): each key uses an isolated per-key execution pool (`concurrency`, `slow_concurrency`, rate bucket, and FIFO queue) instead of the anonymous per-IP rate limiter, enforces optional per-key `platforms` scope (returning HTTP 401 `INVALID_INPUT` for disallowed platforms), and serves fresh in-process cache hits via the post-auth zero-slot cache fast-path without consuming per-key concurrency slots. Tokens passed in query parameters (e.g. `?token=...`) are ignored without error and processed as anonymous visitor requests.",
         "security": [
           {},
           {
@@ -142,7 +142,7 @@
       "get": {
         "operationId": "resolveDeferredItem",
         "summary": "Lazily resolve a deferred multipart item (e.g. Bilibili P2..Pn)",
-        "description": "Resolves a specific `deferred` item using the exact `resolve_url` parameters (`url`, `item_id`, `platform`) returned by `/api/parse`.",
+        "description": "Resolves a specific `deferred` item using the exact `resolve_url` parameters (`url`, `item_id`, `platform`) returned by `/api/parse`. Accepts optional `owner`, `agent`, and `friend` Bearer credentials (`DOKITOOL_OWNER_TOKEN` or `DOKITOOL_API_KEYS_FILE`), enforcing optional per-key `platforms` scope (HTTP 401 `INVALID_INPUT` when disallowed), serving fresh cache hits via the post-auth zero-slot cache fast-path without consuming per-key concurrency slots, and isolating uncached resolutions in the caller key's pool.",
         "security": [
           {},
           {
@@ -216,8 +216,8 @@
     "/api/stats": {
       "get": {
         "operationId": "getStats",
-        "summary": "Read in-process aggregate runtime telemetry snapshot (owner token required)",
-        "description": "Returns bounded-cardinality aggregate request, cache, admission queue, yt-dlp slot, Shanghai resolver, and parse latency metrics. Strictly requires `Authorization: Bearer $DOKITOOL_OWNER_TOKEN`; authenticated calls do not consume an owner concurrency slot or increment parse request counters, and any unrecognized query parameter or trailing bare `?` returns HTTP 400 (`INVALID_INPUT`).",
+        "summary": "Read in-process aggregate runtime telemetry snapshot (owner role required)",
+        "description": "Returns bounded-cardinality aggregate request, cache, admission queue, per-key API key pool (`api_keys`), yt-dlp slot, Shanghai resolver, and parse latency metrics. Strictly requires an `owner`-role Bearer credential (`DOKITOOL_OWNER_TOKEN` or an `owner`-role key in `DOKITOOL_API_KEYS_FILE`); valid `agent` or `friend` keys receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`) without charging the anonymous IP bucket, while missing, disabled, or invalid tokens return HTTP 401 and charge the anonymous per-IP burst bucket. Authenticated `owner` calls do not consume a concurrency slot or increment parse request counters, and any unrecognized query parameter or trailing bare `?` returns HTTP 400 (`INVALID_INPUT`).",
         "security": [
           {
             "BearerAuth": []
@@ -266,7 +266,7 @@
       "BearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Personal Agent Channel bearer token read from environment variable `DOKITOOL_OWNER_TOKEN` (32-512 printable non-whitespace ASCII bytes; total `Authorization` header <= 1024 bytes). Invalid, malformed, duplicate, or oversized headers—or requests when `DOKITOOL_OWNER_TOKEN` is unset—return HTTP 401 (`code: \"INVALID_INPUT\"`) and consume the anonymous per-IP burst bucket (`Burst=4`, `0.2/s`), turning repeated failures into HTTP 429 (`code: \"RATE_LIMITED\"`). Tokens in query parameters (e.g. `?token=...`) are never accepted: on `/api/parse`, `/api/resolve`, and `/api/platforms` they are ignored without error and processed as anonymous visitor requests (while exposing the secret in logs and shell history); only `/api/stats` rejects extra query parameters with HTTP 400 (`INVALID_INPUT`) once authenticated."
+        "description": "Bearer API credential read from `DOKITOOL_OWNER_TOKEN` (implicit `id: \"owner\"`, `role: \"owner\"`) or named SHA-256 keys configured in `DOKITOOL_API_KEYS_FILE` (`owner`, `agent`, and `friend` roles; up to 64 total keys; 32-512 printable non-whitespace ASCII bytes; total `Authorization` header <= 1024 bytes). Invalid, disabled (`enabled: false`), malformed, duplicate, or oversized headers—or requests when no matching enabled key exists—return HTTP 401 (`code: \"INVALID_INPUT\"`) and consume the anonymous per-IP burst bucket (`Burst=4`, `0.2/s`), turning repeated failures into HTTP 429 (`code: \"RATE_LIMITED\"`). Valid `agent` or `friend` keys calling `/api/stats`, or keys requesting a platform outside their per-key `platforms` allowlist, also receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`, guarded by the per-key fast-read bucket without charging the anonymous IP bucket). Tokens in query parameters (e.g. `?token=...`) are never accepted: on `/api/parse`, `/api/resolve`, and `/api/platforms` they are ignored without error and processed as anonymous visitor requests (while exposing the secret in logs and shell history); only `/api/stats` rejects extra query parameters with HTTP 400 (`INVALID_INPUT`) once authenticated."
       }
     },
     "headers": {
@@ -364,7 +364,7 @@
         }
       },
       "UnauthorizedFailure": {
-        "description": "Invalid, malformed, duplicate, or oversized (> 1024 B) `Authorization` header, missing header on `/api/stats`, or `DOKITOOL_OWNER_TOKEN` disabled on server. Always returns JSON `code: \"INVALID_INPUT\"` (`error.code: \"INVALID_INPUT\"`) and deducts 1 token from the anonymous per-IP burst bucket (`Burst=4`, recovery `0.2/s`), turning repeated failures into HTTP 429.",
+        "description": "Invalid, disabled (`enabled: false`), malformed, duplicate, or oversized (> 1024 B) `Authorization` header, missing header on `/api/stats`, non-`owner` (`agent` / `friend`) key calling `/api/stats`, or request for a platform outside the caller key's `platforms` allowlist. Always returns JSON `code: \"INVALID_INPUT\"` (`error.code: \"INVALID_INPUT\"`, `error.retryable: false`); unauthenticated/invalid token attempts deduct 1 token from the anonymous per-IP burst bucket (`Burst=4`, recovery `0.2/s`), while role/platform denials on valid keys charge the key's fast-read bucket.",
         "content": {
           "application/json": {
             "schema": {
@@ -2274,7 +2274,7 @@
           "owner": {
             "type": "integer",
             "minimum": 0,
-            "description": "Cumulative parse/resolve requests authenticated via DOKITOOL_OWNER_TOKEN."
+            "description": "Cumulative parse/resolve requests authenticated via Bearer API credentials (DOKITOOL_OWNER_TOKEN or DOKITOOL_API_KEYS_FILE)."
           }
         }
       },
@@ -2861,6 +2861,152 @@
           }
         }
       },
+      "APIKeyRole": {
+        "type": "string",
+        "description": "Access role assigned to a configured Bearer API key.",
+        "enum": [
+          "owner",
+          "agent",
+          "friend"
+        ]
+      },
+      "APIKeyStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "role",
+          "enabled",
+          "active",
+          "slow_active",
+          "queued",
+          "concurrency_limit",
+          "slow_concurrency_limit",
+          "queue_limit",
+          "requests_total",
+          "ok",
+          "errors",
+          "cache_hits",
+          "rate_limited",
+          "unauthorized",
+          "waited",
+          "granted",
+          "timeout",
+          "full",
+          "canceled",
+          "wait_ms_total",
+          "wait_ms_max"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+            "description": "Stable identifier of the configured API key (\"owner\" for the implicit DOKITOOL_OWNER_TOKEN key)."
+          },
+          "role": {
+            "$ref": "#/components/schemas/APIKeyRole"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this API key is currently enabled for authentication."
+          },
+          "active": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently holding an execution slot in this key's pool."
+          },
+          "slow_active": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Slow-engine (yt-dlp or YouTube helper) requests currently holding an execution slot in this key's pool."
+          },
+          "queued": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently waiting in this key's FIFO queue."
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured total concurrency slot limit for this key."
+          },
+          "slow_concurrency_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured slow-engine concurrency sub-limit for this key (0 means uncapped up to concurrency_limit)."
+          },
+          "queue_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured FIFO wait queue capacity for this key."
+          },
+          "requests_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative authenticated parse/resolve, platform-denied, and role-denied requests attributed to this key."
+          },
+          "ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative parser requests completed with HTTP status < 400 for this key."
+          },
+          "errors": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative parser requests completed with HTTP status >= 400 for this key."
+          },
+          "cache_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative parse/resolve requests served via the post-auth zero-slot cache fast-path for this key."
+          },
+          "rate_limited": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests rejected with HTTP 429 by this key's rate bucket or queue limits."
+          },
+          "unauthorized": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests rejected with HTTP 401 due to role restriction (/api/stats) or per-key platform allowlist."
+          },
+          "waited": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests that entered this key's FIFO wait queue."
+          },
+          "granted": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests that acquired an execution slot before timeout."
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests rejected with HTTP 429 after queue_wait expired."
+          },
+          "full": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests rejected immediately with HTTP 429 because this key's queue was full (or disabled)."
+          },
+          "canceled": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests canceled due to caller disconnect."
+          },
+          "wait_ms_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative milliseconds spent waiting in this key's queue by granted or timed-out requests."
+          },
+          "wait_ms_max": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum observed single-request queue wait in milliseconds for this key."
+          }
+        }
+      },
       "StatsSnapshot": {
         "type": "object",
         "additionalProperties": false,
@@ -2873,7 +3019,8 @@
           "admission",
           "ytdlp",
           "shanghai",
-          "parse_latency_ms"
+          "parse_latency_ms",
+          "api_keys"
         ],
         "properties": {
           "started_at": {
@@ -2906,6 +3053,14 @@
           },
           "parse_latency_ms": {
             "$ref": "#/components/schemas/LatencyStatsSnapshot"
+          },
+          "api_keys": {
+            "type": "array",
+            "maxItems": 64,
+            "description": "Per-key configuration and runtime telemetry for configured Bearer API keys (empty array when none configured; never exposes tokens or digests).",
+            "items": {
+              "$ref": "#/components/schemas/APIKeyStatsSnapshot"
+            }
           }
         }
       },

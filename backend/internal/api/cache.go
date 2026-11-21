@@ -1,12 +1,15 @@
 package api
 
 import (
+	"cmp"
 	"container/list"
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
@@ -126,10 +129,12 @@ type cachedResponse struct {
 }
 
 type cacheEntry struct {
-	key       cacheKey
-	res       cachedResponse
-	expiresAt time.Time
-	size      int64
+	key         cacheKey
+	res         cachedResponse
+	expiresAt   time.Time
+	size        int64
+	promotedSeq uint64
+	lastHitSeq  atomic.Uint64
 }
 
 type inflightCall struct {
@@ -141,7 +146,8 @@ type inflightCall struct {
 }
 
 type parseCache struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
+	hitSeq     atomic.Uint64
 	cfg        CacheConfig
 	lru        *list.List
 	entries    map[cacheKey]*list.Element
@@ -165,6 +171,39 @@ func cacheEntrySize(key cacheKey, res cachedResponse) int64 {
 	return int64(len(key.route) + len(key.platform) + len(key.url) + len(key.itemID) + len(res.retryAfter) + len(res.body))
 }
 
+func storeHitSeqMonotonic(dst *atomic.Uint64, seq uint64) {
+	for {
+		prev := dst.Load()
+		if seq <= prev || dst.CompareAndSwap(prev, seq) {
+			return
+		}
+	}
+}
+
+// getFresh performs a pure read-lock lookup, recording a monotonic hit sequence
+// number atomically without taking an exclusive lock or mutating the LRU list.
+// Expired entries return false and are lazily evicted under Lock() on miss/write.
+func (c *parseCache) getFresh(key cacheKey, now time.Time) (cachedResponse, bool) {
+	if c == nil || c.cfg.Disabled {
+		return cachedResponse{}, false
+	}
+	c.mu.RLock()
+	elem, ok := c.entries[key]
+	if !ok {
+		c.mu.RUnlock()
+		return cachedResponse{}, false
+	}
+	entry := elem.Value.(*cacheEntry)
+	if !now.Before(entry.expiresAt) {
+		c.mu.RUnlock()
+		return cachedResponse{}, false
+	}
+	storeHitSeqMonotonic(&entry.lastHitSeq, c.hitSeq.Add(1))
+	res := entry.res
+	c.mu.RUnlock()
+	return res, true
+}
+
 func (c *parseCache) getLocked(key cacheKey, now time.Time) (cachedResponse, bool) {
 	if c == nil || c.cfg.Disabled {
 		return cachedResponse{}, false
@@ -178,6 +217,9 @@ func (c *parseCache) getLocked(key cacheKey, now time.Time) (cachedResponse, boo
 		c.removeElementLocked(elem)
 		return cachedResponse{}, false
 	}
+	seq := c.hitSeq.Add(1)
+	storeHitSeqMonotonic(&entry.lastHitSeq, seq)
+	entry.promotedSeq = entry.lastHitSeq.Load()
 	c.lru.MoveToFront(elem)
 	return entry.res, true
 }
@@ -188,10 +230,46 @@ func (c *parseCache) fresh(key cacheKey, now time.Time) bool {
 	if c == nil || c.cfg.Disabled {
 		return false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
 	elem, ok := c.entries[key]
-	return ok && now.Before(elem.Value.(*cacheEntry).expiresAt)
+	if !ok {
+		c.mu.RUnlock()
+		return false
+	}
+	fresh := now.Before(elem.Value.(*cacheEntry).expiresAt)
+	c.mu.RUnlock()
+	return fresh
+}
+
+// reconcileLRULocked refreshes promotedSeq from atomic read-hit sequences and
+// re-links c.lru in strictly descending recency order (MRU at Front, LRU at Back).
+// Because c.lru is maintained in descending promotedSeq order and lastHitSeq >= promotedSeq,
+// reconciliation only runs during eviction when c.lru.Back() itself has unpromoted read hits.
+func (c *parseCache) reconcileLRULocked() {
+	n := c.lru.Len()
+	if n <= 1 {
+		if front := c.lru.Front(); front != nil {
+			entry := front.Value.(*cacheEntry)
+			if seq := entry.lastHitSeq.Load(); seq > entry.promotedSeq {
+				entry.promotedSeq = seq
+			}
+		}
+		return
+	}
+	elems := make([]*list.Element, 0, n)
+	for e := c.lru.Front(); e != nil; e = e.Next() {
+		entry := e.Value.(*cacheEntry)
+		if seq := entry.lastHitSeq.Load(); seq > entry.promotedSeq {
+			entry.promotedSeq = seq
+		}
+		elems = append(elems, e)
+	}
+	slices.SortStableFunc(elems, func(a, b *list.Element) int {
+		return cmp.Compare(b.Value.(*cacheEntry).promotedSeq, a.Value.(*cacheEntry).promotedSeq)
+	})
+	for _, e := range elems {
+		c.lru.MoveToBack(e)
+	}
 }
 
 func (c *parseCache) putLocked(key cacheKey, res cachedResponse, expiresAt time.Time) {
@@ -210,14 +288,25 @@ func (c *parseCache) putLocked(key cacheKey, res cachedResponse, expiresAt time.
 		if back == nil {
 			return
 		}
+		backEntry := back.Value.(*cacheEntry)
+		if backEntry.lastHitSeq.Load() > backEntry.promotedSeq {
+			c.reconcileLRULocked()
+			back = c.lru.Back()
+			if back == nil {
+				return
+			}
+		}
 		c.removeElementLocked(back)
 	}
+	seq := c.hitSeq.Add(1)
 	entry := &cacheEntry{
-		key:       key,
-		res:       res,
-		expiresAt: expiresAt,
-		size:      size,
+		key:         key,
+		res:         res,
+		expiresAt:   expiresAt,
+		size:        size,
+		promotedSeq: seq,
 	}
+	entry.lastHitSeq.Store(seq)
 	elem := c.lru.PushFront(entry)
 	c.entries[key] = elem
 	c.totalBytes += size
@@ -256,8 +345,8 @@ func (c *parseCache) stats() (entries int, totalBytes int64) {
 	if c == nil {
 		return 0, 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.lru.Len(), c.totalBytes
 }
 
@@ -265,8 +354,8 @@ func (c *parseCache) configSnapshot() (enabled bool, entries int, totalBytes int
 	if c == nil {
 		return false, 0, 0, 0, 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return !c.cfg.Disabled, c.lru.Len(), c.totalBytes, c.cfg.MaxEntries, c.cfg.MaxBytes
 }
 

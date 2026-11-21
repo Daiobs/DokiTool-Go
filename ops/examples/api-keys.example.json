@@ -1,0 +1,33 @@
+{
+  "keys": [
+    {
+      "id": "agent-bot",
+      "role": "agent",
+      "enabled": true,
+      "token_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "concurrency": 4,
+      "slow_concurrency": 1,
+      "rps": 5.0,
+      "burst": 16,
+      "queue_size": 128,
+      "queue_wait": "45s"
+    },
+    {
+      "id": "friend-demo",
+      "role": "friend",
+      "enabled": true,
+      "token_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "concurrency": 2,
+      "slow_concurrency": 1,
+      "rps": 1.0,
+      "burst": 6,
+      "queue_size": 16,
+      "queue_wait": "15s",
+      "platforms": [
+        "douyin",
+        "bilibili",
+        "xiaohongshu"
+      ]
+    }
+  ]
+}

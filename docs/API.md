@@ -11,6 +11,7 @@
 | `GET /api/parse` | `schema_version=1.0`（必填）；`url` 为分享 URL 或包含 URL 的分享文本（必填）；可选 `platform` 为目录中的平台 ID（`all` 或省略时自动按域名识别）；可选 `debug=1` 返回规范化全量版本。 |
 | `GET /api/resolve` | `schema_version=1.0`（必填）；使用后端给出的 `resolve_url`，携带原分享 `url`、`platform` 与不透明的 `item_id`（必填，长度 `<= 256`）解析指定分集；同样支持 `debug=1`。客户端不能从 ID 拼平台参数或借用其他分 P 的地址。 |
 | `GET /api/platforms` | `schema_version=1.0`（必填）；返回当前已启用平台的公开目录。 |
+| `GET /api/stats` | 可选 `schema_version=1.0`；仅限 `owner` 角色 Bearer 凭据访问（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥），返回进程内请求、缓存、准入池与各 API 密钥池（`data.api_keys`）运行统计快照；`agent` / `friend` 角色密钥访问时返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。 |
 | `GET /api/youtube/context` | `schema_version=1.0`（必填）；在启用 `DOKITOOL_YOUTUBE_HELPER` 时返回当前缓存的 YouTube `player_id`、`signature_timestamp` 与固定客户端参数，供同源用户脚本在浏览器端请求播放清单。未启用时返回 `404`。 |
 | `POST /api/youtube/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收浏览器端用户脚本提交的流清单载荷（`<= 512 KiB`），在无权限 Deno `ejs` 沙箱内完成签名解算并返回标准统一媒体 v1 结果。未启用时返回 `404`。 |
 
@@ -21,6 +22,10 @@ curl --get 'https://snap.example.com/api/parse' \
 ```
 
 上面是格式示例，不是有效平台样本。分享 token、签名参数必须保持完整；不要把实际 token 或返回的签名 URL 写进公开日志、Issue 和夹具。
+
+**Bearer 多密钥角色隔离与鉴权后零槽位缓存快路径**：`/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口可选携带 `Authorization: Bearer <token>`（支持 `DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥及 `DOKITOOL_API_KEYS_FILE` 中的 `owner` / `agent` / `friend` 角色密钥，每把密钥拥有独立的并发池、慢解析子并发上限 `slow_concurrency`、速率桶与 FIFO 队列；配置与 `SIGHUP` 热重载见 [CONFIGURATION.md](CONFIGURATION.md)）：
+- **角色与平台白名单边界**：`/api/stats` 严格仅允许 `owner` 角色访问（`agent` / `friend` 密钥访问返回 HTTP `401`）；若密钥配置了 `platforms` 平台白名单，请求白名单外的平台（无论缓存命中与否）同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
+- **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：通过鉴权与平台白名单校验后，命中进程内新鲜缓存的 `GET /api/parse` 与 `GET /api/resolve` 请求，以及 `GET /api/platforms` 与命中缓存的 `GET /api/youtube/context` 请求，仅校验该密钥的快读速率桶即直接返回响应，**占用 `0` 个密钥并发槽位**，不会因该密钥并发池被慢请求占满而排队阻塞。
 
 目录响应为 `{"schema_version":"1.0","code":"OK","data":{"platforms":[...]}}`。每个平台包含 `id/name/site_url/capabilities`，可选 `icon`；不会返回内部文件路径。唯一注册源是 `backend/config/platforms.json`，同时供后端路由、CLI 导出和前端构建快照使用。运行中的页面也会获取目录，失败时保留构建快照。没有专用展示图标的新平台使用通用图标，不影响解析。
 
@@ -119,7 +124,7 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 
 | 业务错误码 | HTTP 状态码 | 触发场景与契约语义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | `400` / `405` / `409` / `410` | 缺少或非法的 `url` / `item_id`；链接与显式指定的 `platform` 不匹配；缺少或不匹配的 `schema_version`（`409`）；不支持的 HTTP 方法（`405`）；已退役旧路径（`410`）；以及特定短链或链接形态限制（如 X `t.co` 短链受控单跳展开后未指向有效 X / Twitter 推文页，Facebook `fb.watch` 短链需登录展开提示先在浏览器打开并复制 `facebook.com` 完整视频链接，抖音 `mix_id` 合集链接、小红书缺失 `xsec_token` 同属此类）。 |
+| `INVALID_INPUT` | `400` / `401` / `405` / `409` / `410` | 缺少或非法的 `url` / `item_id`；链接与显式指定的 `platform` 不匹配；缺少或不匹配的 `schema_version`（`409`）；不支持的 HTTP 方法（`405`）；已退役旧路径（`410`）；无效/已停用/畸形 `Authorization` 头、`/api/stats` 缺失凭据或由非 `owner`（`agent` / `friend`）凭据调用、或 Bearer 密钥请求超出其 `platforms` 平台白名单（均为 HTTP `401`，`retryable: false`）；以及特定短链或链接形态限制（如 X `t.co` 短链受控单跳展开后未指向有效 X / Twitter 推文页，Facebook `fb.watch` 短链需登录展开提示先在浏览器打开并复制 `facebook.com` 完整视频链接，抖音 `mix_id` 合集链接、小红书缺失 `xsec_token` 同属此类）。 |
 | `UNSUPPORTED_PLATFORM` | `400` | 输入包含合法的 `http(s)` 公开域名链接，但该域名不属于任何当前已启用的平台（例如未接入站点，或当前实例未启用的可选平台域名），或查询参数显式传入了未注册的 `platform` ID。 |
 | `UPSTREAM_BLOCKED` | `403` | 上游平台拒绝匿名公开读取或要求登录验证：<br>• **X 受限推文（`TweetTombstone`）**：年龄限制、敏感内容或需登录查看的推文在默认配置（`-x-tombstone-fallback=off`）下返回 `403 UPSTREAM_BLOCKED`；若服务端显式启用 `-x-tombstone-fallback=fxtwitter`，则在遇到 `TweetTombstone` 时向 `api.fxtwitter.com` 查询公开元数据，仍被拒绝或不可读时保持失败关闭。<br>• **Facebook / Instagram 登录与权限限制**：Facebook 私密/年龄受限视频，以及 Instagram Stories（`/stories/`）、私密长短码链接与需登录查看的帖子均返回 `403 UPSTREAM_BLOCKED`。 |
 | `NO_MEDIA` | `404` | 目标内容公开可访问，但作品本身不包含任何受支持的媒体资源：例如 **X 纯文本推文**（无视频也无图片）、仅含不受支持流格式的视频，或空图文帖。 |
