@@ -522,6 +522,7 @@
     "frontend/src/components/AppIcon.vue",
     "frontend/src/components/BrandWordmark.vue",
     "frontend/src/components/DownloadCard.vue",
+    "frontend/src/components/ExtensionDownloadModal.vue",
     "frontend/src/components/FaqSection.vue",
     "frontend/src/components/FooterSection.vue",
     "frontend/src/components/HeaderNav.vue",
