@@ -1,7 +1,7 @@
 <script setup>
 import AppIcon from "../AppIcon.vue";
 import VideoPlaylist from "../VideoPlaylist.vue";
-import { t } from "./resultI18n";
+import { t, formatBilibiliDashTitle } from "./resultI18n";
 
 defineProps({
   hasVideo: Boolean,
@@ -209,26 +209,14 @@ const EXT_ICON_PATH =
       class="rs-bili-dash-callout"
       data-bilibili-dash-callout
       role="region"
-      :aria-label="
-        t(
-          locale,
-          bilibiliDashSummary.tierCount === 1
-            ? 'biliDashTitleOne'
-            : 'biliDashTitle',
-        ).replace('{count}', String(bilibiliDashSummary.tierCount))
-      "
+      :aria-label="formatBilibiliDashTitle(bilibiliDashSummary, locale)"
     >
       <div class="rs-bili-dash-body">
         <div class="rs-bili-dash-head">
           <span class="rs-bili-dash-title">
             <AppIcon class="fas fa-bolt rs-bili-dash-bolt" />
             <span>{{
-              t(
-                locale,
-                bilibiliDashSummary.tierCount === 1
-                  ? "biliDashTitleOne"
-                  : "biliDashTitle",
-              ).replace("{count}", String(bilibiliDashSummary.tierCount))
+              formatBilibiliDashTitle(bilibiliDashSummary, locale)
             }}</span>
           </span>
           <div class="rs-bili-dash-specs">

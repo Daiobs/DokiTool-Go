@@ -1,6 +1,6 @@
 # DokiTool Chrome MV3 侧边栏原生扩展（`sidePanel` + `offscreen`）
 
-DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站高码率 DASH 无损合流。
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
 
 ---
 
@@ -10,11 +10,11 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
    - 媒体拉流、多线路顺序回退、HLS / 字节分片拼接、ZIP 打包与 Mediabunny 音视频无损合流均在独立的 `offscreen` 文档中写入浏览器私有文件系统（OPFS），完成后交由 `chrome.downloads` 落盘，并在收到终态事件（`complete` / `interrupted`）后权威回收 `Blob URL` 与 OPFS 临时文件。
 2. **内置免油猴 YouTube 4K60 无损合流**
    - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
-3. **内置 B 站高码率 DASH 无损合流（1080P AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
+3. **内置 B 站 1080P（免登录）DASH 无损合流（AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
    - **DNR Rule `1004` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则 `1004`，仅对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com` / `akamaized.net` 的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头，解决纯网页端无法携带 B 站防盗链 Referer 的限制，且绝不干扰浏览器正常标签页访问。
-   - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 高码率 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
+   - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
    - **独立 M4A、画质记忆与多 P 无缝衔接**：侧边栏顶部 `<video>` 预览继续使用 `durl` 渐进式 MP4 秒开播放；画质列表完整呈现各档位分辨率、编解码（同分辨率默认优先 `H.264` 兼顾全平台硬解与剪辑软件兼容，同时保留 `HEVC` / `AV1` 自由切换）与估算体积；选择「仅音频」时直接下载 `30280` 独立 `.m4a`；支持 B 站多 P 勾选批量合流与右键「极速下载」。
-   - **零 Cookie、零服务端媒体中转**：服务端仅并行解析返回官方优先 CDN 地址（自动过滤未知第三方 PCDN，优先国内加速节点），全部 `.m4s` 媒体流量由用户本机扩展直连拉取；严格遵守零 Cookie 原则，免登录稳定支持至 **1080P（AVC/HEVC/AV1）+ 30280 AAC**，绝不读取或采集浏览器已登录的 B 站 Cookie。
+   - **零 Cookie、零服务端媒体中转**：服务端仅并行解析返回官方优先 CDN 地址（自动过滤未知第三方 PCDN，优先国内加速节点），全部 `.m4s` 媒体流量由用户本机扩展直连拉取；严格遵守零 Cookie 原则，免登录支持 **1080P（免登录，AVC/HEVC/AV1）+ 30280 AAC**，绝不读取或采集浏览器已登录的 B 站 Cookie。
 4. **五种高频素材收集入口**
    - **点击工具栏扩展图标**：一键展开侧边栏。
    - **全局快捷键 `Alt+Shift+D`**：全屏看视频或刷信息流时直接呼出侧边栏并同步当前页（可在 `chrome://extensions/shortcuts` 自定义改键）。

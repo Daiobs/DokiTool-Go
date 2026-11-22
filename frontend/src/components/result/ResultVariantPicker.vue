@@ -5,7 +5,13 @@ import {
   formatCodecLabel,
   variantSpecifications,
 } from "../../utils/mediaSources";
-import { t, qualityBitrates, formatBitrate } from "./resultI18n";
+import {
+  t,
+  qualityBitrates,
+  formatBitrate,
+  formatBilibiliDashTitle,
+  formatBilibiliDashSummaryAll,
+} from "./resultI18n";
 
 const props = defineProps({
   locale: String,
@@ -60,7 +66,11 @@ const allOtherOptionsAreBilibiliMux = computed(
 const otherVersionsSummaryLabel = computed(() => {
   const count = String(props.otherQualityOptions.length);
   if (allOtherOptionsAreBilibiliMux.value) {
-    return t(props.locale, "biliDashSummaryAll").replace("{count}", count);
+    return formatBilibiliDashSummaryAll(
+      props.bilibiliDashSummary,
+      count,
+      props.locale,
+    );
   }
   if (hasBilibiliMuxOtherOptions.value) {
     return t(props.locale, "biliDashSummaryMixed").replace("{count}", count);
@@ -120,14 +130,7 @@ defineExpose({ focusFirstOption });
     >
       <div class="rs-bili-dash-quality-head">
         <AppIcon class="fas fa-bolt rs-bili-dash-quality-bolt" />
-        <span>{{
-          t(
-            locale,
-            bilibiliDashSummary.tierCount === 1
-              ? "biliDashTitleOne"
-              : "biliDashTitle",
-          ).replace("{count}", String(bilibiliDashSummary.tierCount))
-        }}</span>
+        <span>{{ formatBilibiliDashTitle(bilibiliDashSummary, locale) }}</span>
       </div>
       <div
         v-if="bilibiliDashSummary.specText"
