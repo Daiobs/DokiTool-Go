@@ -112,6 +112,7 @@ export interface MediaRefreshContext {
   itemId: string;
   variantId?: string;
   attachmentId?: string;
+  resourceRole?: "motion" | "video" | "image";
   resolveUrl?: string;
   expiresAtMs?: number;
 }

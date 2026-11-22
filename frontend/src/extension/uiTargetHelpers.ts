@@ -1764,11 +1764,18 @@ function buildRefreshContextForResource(params: {
       : delivery.sources;
   const avail = availableSources(sources, now);
   const expiresAtMs = computeEarliestExpiresAtMs(avail.length ? avail : sources);
+  const resourceRole =
+    resource.role === "image" ||
+    resource.role === "motion" ||
+    resource.role === "video"
+      ? resource.role
+      : undefined;
   return {
     parseUrl,
     platform: media.platform,
     itemId: item.id,
     ...(variantId ? { variantId } : {}),
+    ...(resourceRole ? { resourceRole } : {}),
     ...(resolveUrl ? { resolveUrl } : {}),
     ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
   };

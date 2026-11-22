@@ -1749,6 +1749,76 @@ export function createBackgroundController(
               ),
             };
           }
+        } else if (targetVariant.delivery.kind === "pair") {
+          const matchedRes =
+            (ctx.resourceRole
+              ? targetVariant.delivery.resources.find(
+                  (r) => r.role === ctx.resourceRole,
+                )
+              : undefined) ??
+            targetVariant.delivery.resources.find(
+              (r) => r.role === "motion" || r.role === "video",
+            ) ??
+            targetVariant.delivery.resources[0];
+          if (matchedRes?.delivery.kind === "file") {
+            const avail = availableSources(matchedRes.delivery.sources, now);
+            const routes = deliveryRoutes(avail, targetCtx);
+            if (routes.length > 0) {
+              const expiresAtMs = computeEarliestExpiresAtMs(avail);
+              const sizeBytes = avail[0]?.size_bytes ?? originalSpec.sizeBytes;
+              return {
+                ...basePreserved,
+                kind: "direct_file",
+                apiOrigin,
+                routes,
+                ...(sizeBytes ? { sizeBytes } : {}),
+                refreshContext: buildNextRefreshContext(expiresAtMs),
+              };
+            }
+          } else if (matchedRes?.delivery.kind === "hls") {
+            const avail = availableSources(matchedRes.delivery.sources, now);
+            const routes = deliveryRoutes(avail, targetCtx);
+            if (routes.length > 0) {
+              const expiresAtMs = computeEarliestExpiresAtMs(avail);
+              return {
+                ...basePreserved,
+                kind: "hls",
+                apiOrigin,
+                routes,
+                refreshContext: buildNextRefreshContext(expiresAtMs),
+              };
+            }
+          } else if (matchedRes?.delivery.kind === "segments") {
+            const rebuilt = buildEnqueueItemsForMedia(freshMedia, {
+              apiOrigin,
+              itemIds: [targetItem.id],
+              variantSelections: {
+                [targetItem.id]: { variant_id: targetVariant.id },
+              },
+              sourceUrl: ctx.parseUrl,
+              now,
+            });
+            const matchedEntry =
+              (ctx.resourceRole
+                ? rebuilt.find(
+                    (entry) =>
+                      entry.spec.refreshContext?.resourceRole ===
+                      ctx.resourceRole,
+                  )
+                : undefined) ?? rebuilt[0];
+            if (matchedEntry?.spec.segments) {
+              return {
+                ...basePreserved,
+                kind: "segments",
+                apiOrigin,
+                routes: matchedEntry.spec.routes,
+                segments: matchedEntry.spec.segments,
+                refreshContext: buildNextRefreshContext(
+                  matchedEntry.spec.refreshContext?.expiresAtMs,
+                ),
+              };
+            }
+          }
         }
       }
     }
@@ -1761,7 +1831,13 @@ export function createBackgroundController(
       sourceUrl: ctx.parseUrl,
       now,
     });
-    const rebuiltSpec = rebuiltItems[0]?.spec;
+    const rebuiltSpec =
+      (ctx.resourceRole
+        ? rebuiltItems.find(
+            (entry) =>
+              entry.spec.refreshContext?.resourceRole === ctx.resourceRole,
+          )?.spec
+        : undefined) ?? rebuiltItems[0]?.spec;
     if (!rebuiltSpec) {
       throw new Error("重新解析后未找到可用下载源");
     }
@@ -2930,12 +3006,7 @@ export function createBackgroundController(
         if (retryPayload.kind === "spec") {
           const refreshCtx = retryPayload.spec.refreshContext;
           const isExpired = isSpecExpiredForDispatch(retryPayload.spec);
-          const failedByExpiry =
-            task.lastErrorCode === "MEDIA_URL_EXPIRED" ||
-            task.lastErrorHttpStatus === 403 ||
-            task.lastErrorHttpStatus === 410 ||
-            (typeof task.error === "string" &&
-              /HTTP\s*(?:403|410)\b|签名链接已过期/i.test(task.error));
+          const failedByExpiry = task.lastErrorCode === "MEDIA_URL_EXPIRED";
           const needsManualRefresh = Boolean(
             refreshCtx && (isExpired || failedByExpiry),
           );
@@ -3075,10 +3146,7 @@ export function createBackgroundController(
         if (task && task.status !== "completed" && task.status !== "cancelled") {
           const isCancelled = msg.cancelled === true;
           const isExpiredError =
-            !isCancelled &&
-            (msg.code === "MEDIA_URL_EXPIRED" ||
-              msg.httpStatus === 403 ||
-              msg.httpStatus === 410);
+            !isCancelled && msg.code === "MEDIA_URL_EXPIRED";
           const specPayload =
             task.retryPayload?.kind === "spec"
               ? task.retryPayload.spec

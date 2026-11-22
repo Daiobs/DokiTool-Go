@@ -5289,7 +5289,7 @@ test("Bilibili DASH ranking & enqueue builders: best/1080p prefer H.264 > HEVC >
     "dash-80-hevc",
   );
 
-  // 4) Equal resolution & fps: 1080p DASH H.264 beats 1080p durl (isDirectFile must not block higher-bitrate/codec DASH)
+  // 4) Equal resolution & fps: 1080p DASH H.264 beats 1080p durl (isDirectFile must not block 1080p no-login DASH)
   const equalResItem = {
     ...item,
     variants: [
@@ -7983,6 +7983,285 @@ test("[M2 Part B] Expired signed URL auto re-parse refresh: pre-start expires_at
       const snap = await bg.getSnapshot();
       assert.equal(snap.tasks[0].status, "completed");
       assert.equal(snap.tasks[0].filename, "DokiTool/002_第二集.mp4");
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      offscreenCtrl?.dispose();
+      bg.dispose();
+    }
+  }
+
+  // 5) Mixed-route failure [HTTP 500, HTTP 403] must NOT be classified as MEDIA_URL_EXPIRED
+  //    and must NOT falsely trigger automatic or manual /api/parse refresh
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    let parseCalls = 0;
+    const route500 = "https://upos-sz-mirrorcos.bilivideo.com/mixed-route-500.mp4";
+    const route403 = "https://upos-sz-mirrorhw.bilivideo.com/mixed-route-403.mp4";
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      if (s.includes("/api/parse")) {
+        parseCalls += 1;
+        throw new Error("mixed [500, 403] failure must never call /api/parse");
+      }
+      if (s === route500) {
+        return new Response("Internal Error", { status: 500 });
+      }
+      if (s === route403) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      throw new Error(`Unexpected URL: ${s}`);
+    };
+
+    let offscreenCtrl = null;
+    const env = createMockMv3Environment({
+      autoCompleteDownloads: true,
+      async spawnOffscreenHook() {
+        if (!offscreenCtrl) {
+          offscreenCtrl = offscreenMod.createOffscreenController({
+            chrome: env.chrome,
+            fetchImpl: mockFetch,
+            opfsStorage: opfs.storage,
+            webLocks: opfs.locks,
+            urlApi,
+          });
+        }
+      },
+    });
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: storage.createExtensionStorage(),
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+    try {
+      const rpc = await env.chrome.runtime.sendMessage({
+        type: "ENQUEUE_DOWNLOADS",
+        items: [
+          {
+            title: "混合错误路由不误触发重解析",
+            platform: "bilibili",
+            spec: {
+              kind: "direct_file",
+              apiOrigin: "https://snap.dokitool.com",
+              routes: [route500, route403],
+              filename: "DokiTool/mixed-err.mp4",
+              mimeType: "video/mp4",
+              refreshContext: {
+                parseUrl: "https://www.bilibili.com/video/BV1Refresh01",
+                platform: "bilibili",
+                itemId: "BV1Refresh01-p1",
+                variantId: "durl-64",
+              },
+            },
+          },
+        ],
+      });
+      assert.equal(rpc.ok, true);
+      const taskId = rpc.data.taskIds[0];
+      await bg.waitForIdle();
+      await offscreenCtrl?.executor.waitForIdle();
+
+      const snap1 = await bg.getSnapshot();
+      assert.equal(parseCalls, 0, "mixed [500, 403] must not trigger auto-refresh");
+      assert.equal(snap1.tasks[0].status, "failed");
+      assert.notEqual(snap1.tasks[0].lastErrorCode, "MEDIA_URL_EXPIRED");
+
+      // Manual RETRY_TASK must also NOT spuriously trigger /api/parse when not expired
+      const retryRpc = await env.chrome.runtime.sendMessage({
+        type: "RETRY_TASK",
+        taskId,
+      });
+      assert.equal(retryRpc.ok, true);
+      await bg.waitForIdle();
+      await offscreenCtrl?.executor.waitForIdle();
+      assert.equal(parseCalls, 0, "manual retry of mixed [500, 403] must not falsely re-parse");
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      offscreenCtrl?.dispose();
+      bg.dispose();
+    }
+  }
+
+  // 6) Expired live_photo (delivery.kind === "pair") cover image preserves resourceRole="image"
+  //    on refresh and downloads fresh .jpg bytes rather than motion .mp4 bytes into .jpg filename
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const fetchedUrls = [];
+    const savedBlobs = new Map();
+    let parseCalls = 0;
+
+    const staleCoverUrl = "https://sns-webpic-qc.xhscdn.com/stale-cover.jpg";
+    const freshCoverUrl = "https://sns-webpic-qc.xhscdn.com/fresh-cover.jpg";
+    const freshMotionUrl = "https://sns-video-bd.xhscdn.com/fresh-motion.mp4";
+    const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+
+    const liveMediaPayload = {
+      schema_version: "1.0",
+      code: "OK",
+      data: {
+        platform: "xiaohongshu",
+        content_id: "66778899aabbccddeeff0011",
+        title: "实况刷新测试",
+        source_url: "https://www.xiaohongshu.com/explore/66778899aabbccddeeff0011",
+        generated_at: "2026-11-22T00:00:00Z",
+        default_item_id: "live-1",
+        items: [
+          {
+            id: "live-1",
+            type: "live_photo",
+            index: 1,
+            title: "实况1",
+            default: null,
+            default_unavailable_reason: "processing_required",
+            variants: [
+              {
+                id: "live-pair-1",
+                delivery: {
+                  kind: "pair",
+                  resources: [
+                    {
+                      id: "motion",
+                      role: "motion",
+                      metadata: { container: "mp4", extension: "mp4", mime_type: "video/mp4" },
+                      delivery: {
+                        kind: "file",
+                        sources: [
+                          {
+                            id: "m1",
+                            url: freshMotionUrl,
+                            expires_at: "2099-01-01T00:00:00Z",
+                          },
+                        ],
+                      },
+                    },
+                    {
+                      id: "cover",
+                      role: "image",
+                      metadata: { container: "jpg", extension: "jpg", mime_type: "image/jpeg" },
+                      delivery: {
+                        kind: "file",
+                        sources: [
+                          {
+                            id: "i1",
+                            url: freshCoverUrl,
+                            expires_at: "2099-01-01T00:00:00Z",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    // Confirm buildEnqueueItemsForMedia tags both live_photo leaves with distinct resourceRole
+    const builtPairItems = extensionDownloadMod.buildEnqueueItemsForMedia(
+      liveMediaPayload.data,
+      {
+        apiOrigin: "https://snap.dokitool.com",
+        livePhotoMode: "both",
+        subfolderPrefix: "DokiTool",
+      },
+    );
+    assert.equal(builtPairItems.length, 2);
+    assert.equal(builtPairItems[0].spec.refreshContext?.resourceRole, "motion");
+    assert.equal(builtPairItems[1].spec.refreshContext?.resourceRole, "image");
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      fetchedUrls.push(s);
+      if (s.includes("/api/parse")) {
+        parseCalls += 1;
+        return new Response(JSON.stringify(liveMediaPayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (s === freshCoverUrl) {
+        return new Response(jpegBytes, {
+          status: 200,
+          headers: { "Content-Type": "image/jpeg", "Content-Length": String(jpegBytes.byteLength) },
+        });
+      }
+      throw new Error(`Unexpected URL in live_photo refresh test: ${s}`);
+    };
+
+    let offscreenCtrl = null;
+    const env = createMockMv3Environment({
+      autoCompleteDownloads: true,
+      async spawnOffscreenHook() {
+        if (!offscreenCtrl) {
+          offscreenCtrl = offscreenMod.createOffscreenController({
+            chrome: env.chrome,
+            fetchImpl: mockFetch,
+            opfsStorage: opfs.storage,
+            webLocks: opfs.locks,
+            urlApi,
+          });
+        }
+      },
+    });
+    const origDownload = env.chrome.downloads.download;
+    env.chrome.downloads.download = async (opts) => {
+      const blob = urlApi.activeBlobs.get(opts.url);
+      if (blob) {
+        savedBlobs.set(opts.filename, new Uint8Array(await blob.arrayBuffer()));
+      }
+      return origDownload(opts);
+    };
+
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: storage.createExtensionStorage(),
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+    try {
+      const rpc = await env.chrome.runtime.sendMessage({
+        type: "ENQUEUE_DOWNLOADS",
+        items: [
+          {
+            title: "实况封面图",
+            platform: "xiaohongshu",
+            spec: {
+              kind: "direct_file",
+              apiOrigin: "https://snap.dokitool.com",
+              routes: [staleCoverUrl],
+              filename: "DokiTool/001_cover.jpg",
+              mimeType: "image/jpeg",
+              refreshContext: {
+                parseUrl: "https://www.xiaohongshu.com/explore/66778899aabbccddeeff0011",
+                platform: "xiaohongshu",
+                itemId: "live-1",
+                variantId: "live-pair-1",
+                resourceRole: "image",
+                expiresAtMs: Date.now() - 60_000,
+              },
+            },
+          },
+        ],
+      });
+      assert.equal(rpc.ok, true);
+      await bg.waitForIdle();
+      await offscreenCtrl?.executor.waitForIdle();
+
+      const snap = await bg.getSnapshot();
+      assert.equal(parseCalls, 1);
+      assert.equal(
+        fetchedUrls.includes(freshCoverUrl),
+        true,
+        `must download fresh cover image URL; task=${JSON.stringify(snap.tasks[0])}`,
+      );
+      assert.equal(fetchedUrls.includes(freshMotionUrl), false, "must NEVER download motion video into .jpg cover");
+      assert.equal(fetchedUrls.includes(staleCoverUrl), false, "pre-start expiry must skip stale URL");
+      assert.deepEqual(savedBlobs.get("DokiTool/001_cover.jpg"), jpegBytes);
       assert.equal(opfs.files.size, 0);
     } finally {
       offscreenCtrl?.dispose();

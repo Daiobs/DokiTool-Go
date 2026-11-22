@@ -769,11 +769,18 @@ function prepareResourceLeaf(params: {
           : "mp4";
   const mimeType = resource.metadata?.mime_type;
 
+  const resourceRole =
+    resource.role === "image" ||
+    resource.role === "motion" ||
+    resource.role === "video"
+      ? resource.role
+      : undefined;
   const withExpiry = (sources: Source[]): MediaRefreshContext | undefined => {
     if (!baseRefreshContext) return undefined;
     const expiresAtMs = computeEarliestExpiresAtMs(sources);
     return {
       ...baseRefreshContext,
+      ...(resourceRole ? { resourceRole } : {}),
       ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
     };
   };
