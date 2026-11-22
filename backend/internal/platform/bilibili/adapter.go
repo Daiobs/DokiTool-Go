@@ -3,17 +3,19 @@ package bilibili
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
 func adapt(raw object, sourceURL string, now int64) object {
-	data, _ := adaptWithShanghai(raw, sourceURL, now, nil)
+	data, _ := adaptWithOptions(raw, sourceURL, now, nil, false)
 	return data
 }
 
-func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *ShanghaiPlay) (object, bool) {
+func adaptWithOptions(raw object, sourceURL string, now int64, shPlay *ShanghaiPlay, enableDASH bool) (object, bool) {
 	raw = unified.Clone(raw)
 	raw["author"] = pick(raw["user"], object{})
 	data := unified.WorkMetadata("bilibili", raw, sourceURL)
@@ -23,6 +25,7 @@ func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *Shanghai
 	items, partIDs := array{}, array{}
 	known := map[string]bool{}
 	matchedShanghai := false
+	var bestAudioAttachment object
 	for i, value := range unified.Slice(child(raw, "extra", "pages")) {
 		page := unified.Map(value)
 		number := intValue(pick(page["page"], i+1))
@@ -36,7 +39,7 @@ func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *Shanghai
 			item["duration_ms"] = int64(unified.PHPRound(duration*1000, 0))
 		}
 		if number == current {
-			vars, matched := variantsWithShanghai(raw, bvid, number, page["cid"], now, shPlay)
+			vars, matched, bestAudio := variantsWithOptions(raw, bvid, number, page["cid"], now, shPlay, enableDASH)
 			if len(vars) == 0 {
 				delete(item, "resolve_url")
 				item["state"] = "unavailable"
@@ -45,6 +48,14 @@ func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *Shanghai
 				item["variants"] = vars
 				if matched {
 					matchedShanghai = true
+				}
+				if enableDASH && bestAudio != nil {
+					bestAudioAttachment = object{
+						"id":       "bilibili-audio-" + bvid + "-p" + strconv.FormatInt(current, 10),
+						"role":     "background_audio",
+						"title":    "原声音频 (M4A)",
+						"resource": unified.Clone(bestAudio),
+					}
 				}
 			}
 		} else {
@@ -93,22 +104,27 @@ func adaptWithShanghai(raw object, sourceURL string, now int64, shPlay *Shanghai
 		}
 	}
 	data["items"], data["groups"] = items, groups
+	if bestAudioAttachment != nil {
+		attachments := append(array{}, unified.Slice(data["attachments"])...)
+		attachments = append(attachments, bestAudioAttachment)
+		data["attachments"] = attachments
+	}
 	return data, matchedShanghai
 }
 
-func variantsWithShanghai(raw object, bvid string, page int64, cid any, now int64, shPlay *ShanghaiPlay) (array, bool) {
+func variantsWithOptions(raw object, bvid string, page int64, cid any, now int64, shPlay *ShanghaiPlay, enableDASH bool) (array, bool, object) {
 	if shPlay != nil {
 		if cidInt, ok := parsePositiveCID(cid); !ok || shPlay.BVID != bvid || shPlay.CID != cidInt {
 			shPlay = nil
 		}
 	}
 	if raw["private_error"] != nil {
-		return array{}, false
+		return array{}, false, nil
 	}
 	play := unified.Map(raw["private_play"])
 	if len(play) == 0 {
 		sources := append(array{object{"url": raw["url"]}}, unified.Slice(raw["video_backup"])...)
-		return unified.FileVariants(array{object{"url": raw["url"], "sources": sources, "label": pick(raw["quality"], "规格未知")}}, now), false
+		return unified.FileVariants(array{object{"url": raw["url"], "sources": sources, "label": pick(raw["quality"], "规格未知")}}, now), false, nil
 	}
 	result := array{}
 	matchedAny := false
@@ -160,6 +176,15 @@ func variantsWithShanghai(raw object, bvid string, page int64, cid any, now int6
 			pieces = append(pieces, piece)
 		}
 		result = append(result, object{"id": "segments", "delivery": object{"kind": "segments", "pieces": pieces, "join": "remux", "output": output()}})
+	}
+
+	if enableDASH {
+		dashVariants, dashMatched, bestAudio := adaptDASHModern(play, now, shPlay, len(result) > 0)
+		result = append(result, dashVariants...)
+		if dashMatched {
+			matchedAny = true
+		}
+		return result, matchedAny, bestAudio
 	}
 
 	type dashAudioOption struct {
@@ -234,7 +259,371 @@ func variantsWithShanghai(raw object, bvid string, page int64, cid any, now int6
 			}
 		}
 	}
-	return result, matchedAny
+	return result, matchedAny, nil
+}
+
+func bilibiliDashHostTier(raw string) (int, bool) {
+	host, ok := httpsDirectHost(raw)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case hasSubdomain(host, ".bilivideo.com") && strings.HasPrefix(host, "upos-"):
+		return 0, true
+	case hasSubdomain(host, ".bilivideo.com"):
+		return 1, true
+	case hasSubdomain(host, ".akamaized.net"):
+		return 2, true
+	case hasSubdomain(host, ".bilivideo.cn"):
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// filterAndSortBilibiliDashURLs keeps only official Bilibili HTTPS CDN hosts,
+// dropping unknown third-party PCDN domains, IP literals, non-HTTPS URLs,
+// userinfo, and fragments. URLs are deduplicated and ordered by tier:
+// Tier 1: upos-*.bilivideo.com -> other *.bilivideo.com -> *.akamaized.net;
+// Tier 2: *.bilivideo.cn.
+func filterAndSortBilibiliDashURLs(primary any, backups array) array {
+	var buckets [4]array
+	seen := map[string]bool{}
+	add := func(candidate any) {
+		raw, ok := candidate.(string)
+		if !ok || raw == "" || seen[raw] {
+			return
+		}
+		tier, allowed := bilibiliDashHostTier(raw)
+		if !allowed {
+			return
+		}
+		seen[raw] = true
+		buckets[tier] = append(buckets[tier], raw)
+	}
+	add(primary)
+	for _, b := range backups {
+		add(b)
+	}
+	total := len(buckets[0]) + len(buckets[1]) + len(buckets[2]) + len(buckets[3])
+	if total == 0 {
+		return nil
+	}
+	out := make(array, 0, total)
+	for i := range buckets {
+		out = append(out, buckets[i]...)
+	}
+	return out
+}
+
+func dashAudioIDRank(id int64) int {
+	switch id {
+	case 30280:
+		return 3
+	case 30232:
+		return 2
+	case 30216:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func dashVideoCodecRank(codecFam string) int {
+	switch codecFam {
+	case "avc":
+		return 3
+	case "hevc":
+		return 2
+	case "av1":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func dashVariantCodecKey(codecs string, codecID int64) string {
+	fam := dashCodecFamily(codecs, codecID)
+	var b strings.Builder
+	for i := 0; i < len(fam); i++ {
+		c := fam[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+		}
+	}
+	if b.Len() > 0 {
+		return b.String()
+	}
+	if codecID > 0 {
+		return "c" + strconv.FormatInt(codecID, 10)
+	}
+	return "unknown"
+}
+
+func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool) (array, bool, object) {
+	type dashAudioCandidate struct {
+		raw       object
+		resource  object
+		isMP4A    bool
+		idRank    int
+		bandwidth int64
+	}
+	var bestAudio *dashAudioCandidate
+	for _, value := range unified.Slice(child(play, "dash", "audio")) {
+		rawAudio := unified.Map(value)
+		if rawAudio == nil {
+			continue
+		}
+		resource := dashTrack(rawAudio, "audio", now)
+		if resource == nil {
+			continue
+		}
+		fam := dashCodecFamily(unified.Str(rawAudio["codecs"]), intValue(rawAudio["codecid"]))
+		cand := dashAudioCandidate{
+			raw:       rawAudio,
+			resource:  resource,
+			isMP4A:    fam == "mp4a",
+			idRank:    dashAudioIDRank(intValue(rawAudio["id"])),
+			bandwidth: intValue(rawAudio["bandwidth"]),
+		}
+		if bestAudio == nil ||
+			(cand.isMP4A != bestAudio.isMP4A && cand.isMP4A) ||
+			(cand.isMP4A == bestAudio.isMP4A && (cand.idRank > bestAudio.idRank || (cand.idRank == bestAudio.idRank && cand.bandwidth > bestAudio.bandwidth))) {
+			picked := cand
+			bestAudio = &picked
+		}
+	}
+
+	audioMatched := false
+	if bestAudio != nil && shPlay != nil {
+		var shURLs []string
+		for _, shTrack := range shPlay.DashAudio {
+			if dashTrackMatch(shTrack, bestAudio.raw) {
+				shURLs = append(shURLs, shTrack.URLs...)
+			}
+		}
+		shURLs = filterShanghaiURLsAt(shURLs, now)
+		if len(shURLs) > 0 {
+			delivery := unified.Map(bestAudio.resource["delivery"])
+			if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+				delivery["sources"] = merged
+				audioMatched = true
+			}
+		}
+	}
+
+	type dashVideoKey struct {
+		qn       int64
+		codecKey string
+	}
+	type dashVideoCandidate struct {
+		raw       object
+		resource  object
+		qn        int64
+		codecKey  string
+		codecRank int
+		pixels    int64
+		bandwidth int64
+	}
+	byKey := make(map[dashVideoKey]int)
+	videos := make([]dashVideoCandidate, 0)
+	for _, value := range unified.Slice(child(play, "dash", "video")) {
+		rawVideo := unified.Map(value)
+		if rawVideo == nil {
+			continue
+		}
+		qn := intValue(rawVideo["id"])
+		if qn <= 0 {
+			continue
+		}
+		resource := dashTrack(rawVideo, "video", now)
+		if resource == nil {
+			continue
+		}
+		codecID := intValue(rawVideo["codecid"])
+		codecKey := dashVariantCodecKey(unified.Str(rawVideo["codecs"]), codecID)
+		w, h := intValue(rawVideo["width"]), intValue(rawVideo["height"])
+		pixels := int64(0)
+		if w > 0 && h > 0 {
+			pixels = w * h
+		}
+		cand := dashVideoCandidate{
+			raw:       rawVideo,
+			resource:  resource,
+			qn:        qn,
+			codecKey:  codecKey,
+			codecRank: dashVideoCodecRank(codecKey),
+			pixels:    pixels,
+			bandwidth: intValue(rawVideo["bandwidth"]),
+		}
+		key := dashVideoKey{qn: qn, codecKey: codecKey}
+		if idx, exists := byKey[key]; exists {
+			if cand.bandwidth > videos[idx].bandwidth {
+				videos[idx] = cand
+			}
+			continue
+		}
+		byKey[key] = len(videos)
+		videos = append(videos, cand)
+	}
+
+	if len(videos) == 0 {
+		return nil, false, nil
+	}
+
+	sort.SliceStable(videos, func(i, j int) bool {
+		a, b := videos[i], videos[j]
+		if a.qn != b.qn {
+			return a.qn > b.qn
+		}
+		if a.codecRank != b.codecRank {
+			return a.codecRank > b.codecRank
+		}
+		if a.pixels != b.pixels {
+			return a.pixels > b.pixels
+		}
+		if a.bandwidth != b.bandwidth {
+			return a.bandwidth > b.bandwidth
+		}
+		return a.codecKey < b.codecKey
+	})
+
+	if bestAudio == nil {
+		if hasDURL {
+			return nil, false, nil
+		}
+		out := make(array, 0, len(videos))
+		for _, v := range videos {
+			id := "dash-" + strconv.FormatInt(v.qn, 10) + "-" + v.codecKey
+			out = append(out, object{"id": id, "state": "deferred", "reason": object{"code": "MISSING_AUDIO_TRACK", "message": "未取得可确认的完整音视频组合，暂不可下载"}})
+		}
+		return out, false, nil
+	}
+
+	out := make(array, 0, len(videos))
+	matchedAny := false
+	audioMeta := unified.Map(bestAudio.resource["metadata"])
+	for _, v := range videos {
+		videoMatched := false
+		if shPlay != nil {
+			var shURLs []string
+			for _, shTrack := range shPlay.DashVideo {
+				if dashTrackMatch(shTrack, v.raw) {
+					shURLs = append(shURLs, shTrack.URLs...)
+				}
+			}
+			shURLs = filterShanghaiURLsAt(shURLs, now)
+			if len(shURLs) > 0 {
+				delivery := unified.Map(v.resource["delivery"])
+				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+					delivery["sources"] = merged
+					videoMatched = true
+				}
+			}
+		}
+		id := "dash-" + strconv.FormatInt(v.qn, 10) + "-" + v.codecKey
+		variant := object{
+			"id": id,
+			"delivery": object{
+				"kind":      "mux",
+				"resources": array{unified.Clone(v.resource), unified.Clone(bestAudio.resource)},
+				"output":    output(),
+			},
+			"metadata": buildMuxVariantMetadata(unified.Map(v.resource["metadata"]), audioMeta),
+		}
+		label := qualityLabel(v.qn)
+		if label == "" {
+			if h := intValue(v.raw["height"]); h > 0 {
+				label = strconv.FormatInt(h, 10) + "p"
+			}
+		}
+		if label != "" {
+			variant["label"] = label
+		}
+		out = append(out, variant)
+		if videoMatched || audioMatched {
+			matchedAny = true
+		}
+	}
+	return out, matchedAny, bestAudio.resource
+}
+
+func dashTrack(raw object, role string, now int64) object {
+	sourceInputs := filterAndSortBilibiliDashURLs(pick(raw["baseUrl"], raw["base_url"], ""), unified.Slice(pick(raw["backupUrl"], raw["backup_url"])))
+	sources := unified.Sources(sourceInputs, now)
+	if len(sources) == 0 {
+		return nil
+	}
+	resource := object{"id": role, "role": role, "delivery": object{"kind": "file", "sources": sources}}
+	metadata := object{"evidence": "upstream"}
+	if role == "video" {
+		union(metadata, unified.VideoFacts(raw))
+		if metadata["fps"] == nil {
+			for _, field := range []string{"fps", "frameRate", "frame_rate", "video_fps"} {
+				if s, ok := raw[field].(string); ok {
+					if fps, ok := unified.FrameRate(strings.TrimSpace(s)); ok {
+						metadata["fps"] = fps
+						break
+					}
+				}
+			}
+		}
+		if metadata["hdr_type"] == nil && (intValue(raw["id"]) == 125 || intValue(raw["id"]) == 126) {
+			metadata["hdr_type"] = "hdr_unknown"
+			if intValue(raw["id"]) == 126 {
+				metadata["hdr_type"] = "dolby_vision"
+			}
+		}
+		for _, field := range []string{"width", "height"} {
+			if n, ok := unified.Numeric(raw[field]); ok && n > 0 {
+				metadata[field] = intValue(raw[field])
+			}
+		}
+		if codec, ok := unified.Text(raw["codecs"]); ok && codec != "0" {
+			metadata["video_codec"] = codec
+		}
+		if bandwidth, ok := unified.Numeric(raw["bandwidth"]); ok && bandwidth > 0 {
+			metadata["video_bitrate_bps"] = intValue(raw["bandwidth"])
+		}
+		delete(metadata, "has_audio")
+	} else {
+		union(metadata, unified.AudioFacts(raw))
+		metadata["has_audio"] = true
+		metadata["container"] = "m4a"
+		metadata["extension"] = "m4a"
+		metadata["mime_type"] = "audio/mp4"
+		if codec, ok := unified.Text(raw["codecs"]); ok && codec != "0" {
+			metadata["audio_codec"] = codec
+		}
+		if bandwidth, ok := unified.Numeric(raw["bandwidth"]); ok && bandwidth > 0 {
+			metadata["audio_bitrate_bps"] = intValue(raw["bandwidth"])
+		}
+	}
+	if len(metadata) > 1 {
+		resource["metadata"] = metadata
+	}
+	return resource
+}
+
+func buildMuxVariantMetadata(videoMeta, audioMeta object) object {
+	meta := object{
+		"has_audio": true,
+		"container": "mp4",
+		"extension": "mp4",
+		"mime_type": "video/mp4",
+		"evidence":  "upstream",
+	}
+	for _, field := range []string{"width", "height", "fps", "hdr_type", "video_codec", "video_bitrate_bps"} {
+		if v, exists := videoMeta[field]; exists && v != nil {
+			meta[field] = unified.CloneValue(v)
+		}
+	}
+	for _, field := range []string{"audio_codec", "audio_bitrate_bps", "audio_channels", "audio_language", "audio_language_role", "sample_rate_hz"} {
+		if v, exists := audioMeta[field]; exists && v != nil {
+			meta[field] = unified.CloneValue(v)
+		}
+	}
+	return meta
 }
 
 func partSources(part object) array {

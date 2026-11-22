@@ -432,6 +432,17 @@ func MediaURLDeadline(raw string) (int64, bool) {
 	if !AllowedBrowserFetchURL(raw) {
 		return 0, false
 	}
+	return parseMediaURLDeadline(raw)
+}
+
+func bilibiliMediaURLDeadline(raw string) (int64, bool) {
+	if _, ok := bilibiliDashHostTier(raw); !ok {
+		return 0, false
+	}
+	return parseMediaURLDeadline(raw)
+}
+
+func parseMediaURLDeadline(raw string) (int64, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.RawQuery == "" {
 		return 0, false
@@ -493,9 +504,12 @@ func ValidateShanghaiMediaURL(raw string, requireDeadline bool) (int64, bool) {
 	return exp, ok
 }
 
-// FetchShanghaiPlay queries Bilibili's official non-VIP playurl endpoint for
-// (bvid, cid) without cookies, validates every candidate URL against https://*.bilivideo.com
-// (discarding any non-conforming URL), and returns the bounded domestic stream set.
+// FetchShanghaiPlay queries Bilibili's official non-VIP playurl endpoints
+// (html5 durl and DASH try_look=1) in parallel for (bvid, cid) without cookies,
+// validates every candidate URL against https://*.bilivideo.com (prioritizing
+// upos-*.bilivideo.com and discarding any non-conforming URL), and returns the
+// bounded domestic stream set. Partial failure is tolerated when at least one
+// validated domestic route is obtained.
 func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string, cid int64) (*ShanghaiPlay, error) {
 	if executor == nil || !ValidBVID(bvid) || !ValidCID(cid) {
 		return nil, errInvalidShanghaiInput
@@ -516,7 +530,91 @@ func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string
 			timeout = rem
 		}
 	}
-	req := playRequest(bvid, cid, timeout)
+
+	type playFetchResult struct {
+		data object
+		err  error
+	}
+	dashCh := make(chan playFetchResult, 1)
+	dashReq := dashPlayRequest(bvid, cid, timeout)
+	go func() {
+		sent := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("bilibili: shanghai dash fetch goroutine panic recovered: panic_type=%T", recovered)
+			}
+			if !sent {
+				dashCh <- playFetchResult{err: errShanghaiPlayFailed}
+			}
+		}()
+		data, err := fetchShanghaiPlayData(ctx, executor, dashReq)
+		sent = true
+		dashCh <- playFetchResult{data: data, err: err}
+	}()
+
+	durlData, durlErr := fetchShanghaiPlayData(ctx, executor, playRequest(bvid, cid, timeout))
+	var dashRes playFetchResult
+	select {
+	case dashRes = <-dashCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	out := &ShanghaiPlay{
+		BVID: bvid,
+		CID:  cid,
+	}
+
+	if durlErr == nil && len(durlData) > 0 {
+		rawDURL := unified.Slice(durlData["durl"])
+		qn := intValue(durlData["quality"])
+		if len(rawDURL) > 0 && len(rawDURL) <= MaxShanghaiDURLPieces && qn > 0 && strictInteger(durlData["quality"], qn) {
+			pieces := make([]ShanghaiDURLPiece, 0, len(rawDURL))
+			allPiecesValid := true
+			for _, entry := range rawDURL {
+				part := unified.Map(entry)
+				if part == nil {
+					allPiecesValid = false
+					break
+				}
+				urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]), false)
+				if len(urls) == 0 {
+					allPiecesValid = false
+					break
+				}
+				pieces = append(pieces, ShanghaiDURLPiece{URLs: urls})
+			}
+			if allPiecesValid && len(pieces) == len(rawDURL) {
+				out.DURLQuality = qn
+				out.DURLPieces = pieces
+			}
+		}
+	}
+
+	if dashRes.err == nil && len(dashRes.data) > 0 {
+		out.DashVideo = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "video")))
+		out.DashAudio = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "audio")))
+	}
+	if len(out.DashVideo) == 0 && durlErr == nil && len(durlData) > 0 {
+		out.DashVideo = extractShanghaiDashTracks(unified.Slice(child(durlData, "dash", "video")))
+	}
+	if len(out.DashAudio) == 0 && durlErr == nil && len(durlData) > 0 {
+		out.DashAudio = extractShanghaiDashTracks(unified.Slice(child(durlData, "dash", "audio")))
+	}
+
+	if !out.HasAnyRoute() {
+		if durlErr != nil && dashRes.err != nil {
+			return nil, durlErr
+		}
+		return nil, errShanghaiPlayFailed
+	}
+	return out, nil
+}
+
+func fetchShanghaiPlayData(ctx context.Context, executor fetch.Executor, req fetch.Request) (object, error) {
 	resp, err := executor.Do(ctx, req)
 	if err != nil {
 		return nil, err
@@ -532,43 +630,7 @@ func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string
 	if len(playData) == 0 {
 		return nil, errShanghaiPlayFailed
 	}
-
-	out := &ShanghaiPlay{
-		BVID: bvid,
-		CID:  cid,
-	}
-
-	rawDURL := unified.Slice(playData["durl"])
-	qn := intValue(playData["quality"])
-	if len(rawDURL) > 0 && len(rawDURL) <= MaxShanghaiDURLPieces && qn > 0 && strictInteger(playData["quality"], qn) {
-		pieces := make([]ShanghaiDURLPiece, 0, len(rawDURL))
-		allPiecesValid := true
-		for _, entry := range rawDURL {
-			part := unified.Map(entry)
-			if part == nil {
-				allPiecesValid = false
-				break
-			}
-			urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]))
-			if len(urls) == 0 {
-				allPiecesValid = false
-				break
-			}
-			pieces = append(pieces, ShanghaiDURLPiece{URLs: urls})
-		}
-		if allPiecesValid && len(pieces) == len(rawDURL) {
-			out.DURLQuality = qn
-			out.DURLPieces = pieces
-		}
-	}
-
-	out.DashVideo = extractShanghaiDashTracks(unified.Slice(child(playData, "dash", "video")))
-	out.DashAudio = extractShanghaiDashTracks(unified.Slice(child(playData, "dash", "audio")))
-
-	if !out.HasAnyRoute() {
-		return nil, errShanghaiPlayFailed
-	}
-	return out, nil
+	return playData, nil
 }
 
 func extractShanghaiDashTracks(entries array) []ShanghaiDashTrack {
@@ -593,7 +655,7 @@ func extractShanghaiDashTracks(entries array) []ShanghaiDashTrack {
 		codecs := sanitizeASCIIField(unified.Str(raw["codecs"]), 64)
 		primary := pick(raw["baseUrl"], raw["base_url"], "")
 		backups := unified.Slice(pick(raw["backupUrl"], raw["backup_url"]))
-		urls := collectValidDomesticURLs(primary, backups)
+		urls := collectValidDomesticURLs(primary, backups, true)
 		if len(urls) == 0 {
 			continue
 		}
@@ -607,13 +669,10 @@ func extractShanghaiDashTracks(entries array) []ShanghaiDashTrack {
 	return tracks
 }
 
-func collectValidDomesticURLs(primary any, backups array) []string {
-	var out []string
+func collectValidDomesticURLs(primary any, backups array, prioritizeUPOS bool) []string {
+	var upos, other []string
 	seen := map[string]bool{}
 	add := func(candidate any) {
-		if len(out) >= MaxShanghaiTrackURLs {
-			return
-		}
 		raw, ok := candidate.(string)
 		if !ok || raw == "" || seen[raw] {
 			return
@@ -624,11 +683,34 @@ func collectValidDomesticURLs(primary any, backups array) []string {
 			return
 		}
 		seen[raw] = true
-		out = append(out, raw)
+		if prioritizeUPOS {
+			if host, ok := httpsDirectHost(raw); ok && strings.HasPrefix(host, "upos-") {
+				upos = append(upos, raw)
+				return
+			}
+		}
+		other = append(other, raw)
 	}
 	add(primary)
 	for _, b := range backups {
 		add(b)
+	}
+	total := len(upos) + len(other)
+	if total == 0 {
+		return nil
+	}
+	out := make([]string, 0, min(total, MaxShanghaiTrackURLs))
+	for _, u := range upos {
+		if len(out) >= MaxShanghaiTrackURLs {
+			return out
+		}
+		out = append(out, u)
+	}
+	for _, u := range other {
+		if len(out) >= MaxShanghaiTrackURLs {
+			return out
+		}
+		out = append(out, u)
 	}
 	return out
 }

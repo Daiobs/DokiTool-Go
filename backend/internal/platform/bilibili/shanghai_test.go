@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,13 +133,15 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 		bvid      = "BV1234567890"
 		cid       = int64(101)
 		wantPlay  = "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=3&player=3&qn=112&bvid=BV1234567890&cid=101&platform=html5&high_quality=1"
+		wantDash  = "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=4048&qn=120&fourk=1&try_look=1&bvid=BV1234567890&cid=101"
 		goodDURL  = "https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=1800007200&upsig=dom1"
 		goodBack  = "https://cn-sh-ct-01-02.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=1800007200&upsig=dom2"
+		uposDashV = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=1800007200&upsig=dv_upos"
 		goodDashV = "https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=1800007200&upsig=dv1"
-		goodDashA = "https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=1800007200&upsig=da1"
+		goodDashA = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=1800007200&upsig=da1"
 	)
 
-	body := `{
+	durlBody := `{
 		"code": 0,
 		"data": {
 			"quality": 64,
@@ -152,43 +155,99 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 					"` + goodBack + `",
 					"` + goodDURL + `"
 				]
-			}],
+			}]
+		}
+	}`
+	dashBody := `{
+		"code": 0,
+		"data": {
+			"quality": 80,
 			"dash": {
 				"video": [
-					{"id": 80, "codecid": 7, "codecs": "avc1.640028", "baseUrl": "` + goodDashV + `", "backupUrl": ["https://evilbilivideo.com/v.m4s?deadline=1800007200"]},
+					{
+						"id": 80, "codecid": 7, "codecs": "avc1.640028",
+						"baseUrl": "https://w9e959o.edge.mountaintoys.cn/pcdn.m4s?deadline=1800007200",
+						"backupUrl": [
+							"https://xy123.mcdn.bilivideo.cn/mcdn.m4s?deadline=1800007200",
+							"` + goodDashV + `",
+							"` + uposDashV + `",
+							"https://evilbilivideo.com/v.m4s?deadline=1800007200",
+							"` + uposDashV + `"
+						]
+					},
 					{"id": 64, "codecid": 7, "codecs": "avc1.64001F", "baseUrl": "http://cn-http.bilivideo.com/v.m4s?deadline=1800007200"}
 				],
 				"audio": [
-					{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "base_url": "` + goodDashA + `"}
+					{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "base_url": "` + goodDashA + `", "backup_url": ["https://w9e959o.edge.mountaintoys.cn/a.m4s?deadline=1800007200"]}
 				]
 			}
 		}
 	}`
 
-	var called int
-	exec := shanghaiTestExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
-		called++
-		if req.Method != http.MethodGet || req.URL != wantPlay {
-			t.Fatalf("unexpected Shanghai playurl request: method=%s url=%s", req.Method, req.URL)
+	// Verify both html5 durl and DASH try_look=1 run concurrently inside FetchShanghaiPlay.
+	durlEntered := make(chan struct{})
+	dashEntered := make(chan struct{})
+	bothEntered := make(chan struct{})
+	go func() {
+		<-durlEntered
+		<-dashEntered
+		close(bothEntered)
+	}()
+
+	var playCalls, dashCalls atomic.Int32
+	exec := shanghaiTestExecutor(func(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+		if req.Method != http.MethodGet {
+			return fetch.Response{}, errors.New("unexpected method: " + req.Method)
 		}
 		if req.Policy.FollowRedirects {
-			t.Fatal("Shanghai playurl request must not follow redirects")
+			return fetch.Response{}, errors.New("Shanghai playurl request must not follow redirects")
 		}
 		if req.Header.Get("Cookie") != "" {
-			t.Fatal("Shanghai playurl request must not carry Cookie")
+			return fetch.Response{}, errors.New("Shanghai playurl request must not carry Cookie")
 		}
-		if req.Policy.AllowedURL == nil || !req.Policy.AllowedURL(wantPlay) || req.Policy.AllowedURL("https://www.bilibili.com/video/BV1234567890") {
-			t.Fatal("Shanghai playurl request AllowedURL policy is not pinned to official API endpoints")
+		if req.Policy.AllowedURL == nil || !req.Policy.AllowedURL(req.URL) || req.Policy.AllowedURL("https://www.bilibili.com/video/BV1234567890") {
+			return fetch.Response{}, errors.New("Shanghai playurl request AllowedURL policy is not pinned to official API endpoints")
 		}
-		return fetch.Response{StatusCode: http.StatusOK, Body: []byte(body)}, nil
+		switch req.Policy.Purpose {
+		case "bilibili-play":
+			if req.URL != wantPlay {
+				return fetch.Response{}, errors.New("unexpected durl URL: " + req.URL)
+			}
+			playCalls.Add(1)
+			close(durlEntered)
+			select {
+			case <-bothEntered:
+			case <-time.After(1500 * time.Millisecond):
+				return fetch.Response{}, errors.New("durl and dash did not execute concurrently")
+			case <-ctx.Done():
+				return fetch.Response{}, ctx.Err()
+			}
+			return fetch.Response{StatusCode: http.StatusOK, Body: []byte(durlBody)}, nil
+		case "bilibili-play-dash":
+			if req.URL != wantDash || req.Header.Get("Referer") != "https://www.bilibili.com/" || req.Header.Get("User-Agent") != desktopUA {
+				return fetch.Response{}, errors.New("unexpected dash request: " + req.URL)
+			}
+			dashCalls.Add(1)
+			close(dashEntered)
+			select {
+			case <-bothEntered:
+			case <-time.After(1500 * time.Millisecond):
+				return fetch.Response{}, errors.New("durl and dash did not execute concurrently")
+			case <-ctx.Done():
+				return fetch.Response{}, ctx.Err()
+			}
+			return fetch.Response{StatusCode: http.StatusOK, Body: []byte(dashBody)}, nil
+		default:
+			return fetch.Response{}, errors.New("unexpected purpose: " + req.Policy.Purpose)
+		}
 	})
 
 	got, err := FetchShanghaiPlay(context.Background(), exec, bvid, cid)
 	if err != nil {
 		t.Fatalf("FetchShanghaiPlay failed: %v", err)
 	}
-	if called != 1 {
-		t.Fatalf("called = %d, want 1", called)
+	if playCalls.Load() != 1 || dashCalls.Load() != 1 {
+		t.Fatalf("playCalls=%d dashCalls=%d, want 1 and 1", playCalls.Load(), dashCalls.Load())
 	}
 	if got.BVID != bvid || got.CID != cid || got.DURLQuality != 64 || len(got.DURLPieces) != 1 {
 		t.Fatalf("unexpected DURL summary: %+v", got)
@@ -196,11 +255,50 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 	if len(got.DURLPieces[0].URLs) != 2 || got.DURLPieces[0].URLs[0] != goodDURL || got.DURLPieces[0].URLs[1] != goodBack {
 		t.Fatalf("unexpected filtered DURL URLs: %v", got.DURLPieces[0].URLs)
 	}
-	if len(got.DashVideo) != 1 || got.DashVideo[0].ID != 80 || len(got.DashVideo[0].URLs) != 1 || got.DashVideo[0].URLs[0] != goodDashV {
+	// upos-*.bilivideo.com must be prioritized ahead of cn-*.bilivideo.com, while PCDN and *.bilivideo.cn are dropped.
+	if len(got.DashVideo) != 1 || got.DashVideo[0].ID != 80 || len(got.DashVideo[0].URLs) != 2 ||
+		got.DashVideo[0].URLs[0] != uposDashV || got.DashVideo[0].URLs[1] != goodDashV {
 		t.Fatalf("unexpected filtered DashVideo: %+v", got.DashVideo)
 	}
 	if len(got.DashAudio) != 1 || got.DashAudio[0].ID != 30280 || len(got.DashAudio[0].URLs) != 1 || got.DashAudio[0].URLs[0] != goodDashA {
 		t.Fatalf("unexpected filtered DashAudio: %+v", got.DashAudio)
+	}
+
+	// Partial failure #1: durl fails while dash succeeds -> still returns DASH routes!
+	durlFailsExec := shanghaiTestExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if req.Policy.Purpose == "bilibili-play" {
+			return fetch.Response{StatusCode: http.StatusBadGateway}, nil
+		}
+		return fetch.Response{StatusCode: http.StatusOK, Body: []byte(dashBody)}, nil
+	})
+	dashOnlyGot, err := FetchShanghaiPlay(context.Background(), durlFailsExec, bvid, cid)
+	if err != nil {
+		t.Fatalf("expected DASH-only partial success when durl fails, got err=%v", err)
+	}
+	if len(dashOnlyGot.DURLPieces) != 0 || len(dashOnlyGot.DashVideo) != 1 || len(dashOnlyGot.DashAudio) != 1 {
+		t.Fatalf("unexpected DASH-only partial result: %+v", dashOnlyGot)
+	}
+
+	// Partial failure #2: dash fails (or panics) while durl succeeds -> still returns DURL routes!
+	var logBuf shanghaiLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+	dashPanicsExec := shanghaiTestExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if req.Policy.Purpose == "bilibili-play-dash" {
+			panic("shanghai-dash-panic-secret")
+		}
+		return fetch.Response{StatusCode: http.StatusOK, Body: []byte(durlBody)}, nil
+	})
+	durlOnlyGot, err := FetchShanghaiPlay(context.Background(), dashPanicsExec, bvid, cid)
+	if err != nil {
+		t.Fatalf("expected DURL-only partial success when dash panics, got err=%v", err)
+	}
+	if durlOnlyGot.DURLQuality != 64 || len(durlOnlyGot.DURLPieces) != 1 || len(durlOnlyGot.DashVideo) != 0 {
+		t.Fatalf("unexpected DURL-only partial result: %+v", durlOnlyGot)
+	}
+	if strings.Contains(logBuf.String(), "shanghai-dash-panic-secret") {
+		t.Fatalf("panic recovery log leaked secret: %q", logBuf.String())
 	}
 
 	// All invalid URLs -> FetchShanghaiPlay returns error rather than empty play.

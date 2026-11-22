@@ -3,11 +3,15 @@ package bilibili
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -252,5 +256,588 @@ func TestConcurrentParseKeepsPartSelectionIsolated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestDASHPlayRequestPolicyAndHeaders(t *testing.T) {
+	req := dashPlayRequest("BV1GJ411x7h7", int64(101), 15*time.Second)
+	wantURL := "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=4048&qn=120&fourk=1&try_look=1&bvid=BV1GJ411x7h7&cid=101"
+	if req.URL != wantURL {
+		t.Fatalf("dashPlayRequest URL = %q, want %q", req.URL, wantURL)
+	}
+	if req.Method != http.MethodGet {
+		t.Fatalf("method = %q, want GET", req.Method)
+	}
+	if req.Header.Get("User-Agent") != desktopUA {
+		t.Fatalf("User-Agent = %q, want desktopUA", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("Referer") != "https://www.bilibili.com/" {
+		t.Fatalf("Referer = %q, want https://www.bilibili.com/", req.Header.Get("Referer"))
+	}
+	if req.Header.Get("Accept-Encoding") != "gzip,deflate" {
+		t.Fatalf("Accept-Encoding = %q, want gzip,deflate", req.Header.Get("Accept-Encoding"))
+	}
+	for _, forbidden := range []string{"Cookie", "Authorization"} {
+		if req.Header.Get(forbidden) != "" {
+			t.Fatalf("dashPlayRequest must not send %s header", forbidden)
+		}
+	}
+	if req.Policy.Purpose != "bilibili-play-dash" || req.Policy.FollowRedirects || req.Policy.MaxBytes > 8<<20 || req.Policy.Timeout != 15*time.Second {
+		t.Fatalf("unexpected dashPlayRequest policy: %+v", req.Policy)
+	}
+	if req.Policy.AllowedURL == nil || !req.Policy.AllowedURL(wantURL) || req.Policy.AllowedURL("https://www.bilibili.com/video/BV1GJ411x7h7/") {
+		t.Fatal("dashPlayRequest AllowedURL is not pinned to AllowedAPIURL")
+	}
+}
+
+func TestFilterAndSortBilibiliDashURLs(t *testing.T) {
+	const (
+		pcdn     = "https://w9e959o.edge.mountaintoys.cn/upgcxcode/101.m4s?deadline=1800007200"
+		mcdnCN   = "https://xy123x45x67x89xy.mcdn.bilivideo.cn/v1/resource/101.m4s?deadline=1800007200"
+		akamai   = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/101.m4s?deadline=1800007200"
+		cnEdge   = "https://cn-sh-ct-01-02.bilivideo.com/upgcxcode/101.m4s?deadline=1800007200"
+		upos1    = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-a.m4s?deadline=1800007200"
+		upos2    = "https://upos-sz-mirroraliov.bilivideo.com/upgcxcode/101-b.m4s?deadline=1800007200"
+		httpBad  = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101.m4s?deadline=1800007200"
+		ipBad    = "https://127.0.0.1/upgcxcode/101.m4s?deadline=1800007200"
+		ipv6Bad  = "https://[::1]/upgcxcode/101.m4s?deadline=1800007200"
+		userBad  = "https://user:pass@upos-sz-mirrorcosov.bilivideo.com/101.m4s"
+		fragBad  = "https://upos-sz-mirrorcosov.bilivideo.com/101.m4s#frag"
+		portBad  = "https://upos-sz-mirrorcosov.bilivideo.com:8443/101.m4s"
+		apexCom  = "https://bilivideo.com/101.m4s"
+		apexCN   = "https://bilivideo.cn/101.m4s"
+		apexAkam = "https://akamaized.net/101.m4s"
+		spoof    = "https://evilbilivideo.com/101.m4s"
+	)
+
+	got := filterAndSortBilibiliDashURLs(pcdn, array{
+		mcdnCN,
+		akamai,
+		httpBad,
+		ipBad,
+		ipv6Bad,
+		userBad,
+		fragBad,
+		portBad,
+		apexCom,
+		apexCN,
+		apexAkam,
+		spoof,
+		cnEdge,
+		upos1,
+		upos2,
+		upos1, // duplicate
+		mcdnCN,
+	})
+
+	want := []string{upos1, upos2, cnEdge, akamai, mcdnCN}
+	if len(got) != len(want) {
+		t.Fatalf("filtered len = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if unified.Str(got[i]) != want[i] {
+			t.Fatalf("got[%d] = %q, want %q (all=%v)", i, unified.Str(got[i]), want[i], got)
+		}
+	}
+
+	if none := filterAndSortBilibiliDashURLs(pcdn, array{httpBad, ipBad, spoof}); len(none) != 0 {
+		t.Fatalf("expected nil/empty when all URLs invalid, got %v", none)
+	}
+}
+
+func TestWithDASHParallelNonCartesianAdaptationAndAttachments(t *testing.T) {
+	if (*Parser)(nil).WithDASH(true) != nil {
+		t.Fatal("(*Parser)(nil).WithDASH(true) must return nil")
+	}
+
+	const (
+		now        int64 = 1800000000
+		dl         int64 = 1800007200
+		bvid             = "BV1234567890"
+		durlURL          = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-1-64.mp4?deadline=1800007200"
+		v80AVCLo         = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc-lo.m4s?deadline=1800007200"
+		v80AVCHi         = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc-hi.m4s?deadline=1800007200"
+		v80AVCMCDN       = "https://xy123.mcdn.bilivideo.cn/upgcxcode/101-80-avc-hi.m4s?deadline=1800007200"
+		v80HEVC          = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/101-80-hevc.m4s?deadline=1800007200"
+		v80AV1           = "https://cn-sh-ct-01.bilivideo.com/upgcxcode/101-80-av1.m4s?deadline=1800007200"
+		v64AVC           = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64-avc.m4s?deadline=1800007200"
+		v32AVC           = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-32-avc.m4s?deadline=1800007200"
+		a30280           = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+		a30232           = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30232.m4s?deadline=1800007200"
+		a30216           = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30216.m4s?deadline=1800007200"
+		aFLAC            = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30251.m4s?deadline=1800007200"
+		pcdnURL          = "https://w9e959o.edge.mountaintoys.cn/upgcxcode/101-pcdn.m4s?deadline=1800007200"
+	)
+
+	durlJSON, _ := json.Marshal(map[string]any{
+		"code": 0,
+		"data": map[string]any{
+			"quality": 64,
+			"format":  "mp4720",
+			"durl": []map[string]any{{
+				"url":    durlURL,
+				"width":  1280,
+				"height": 720,
+				"size":   5242880,
+				"length": 60000,
+			}},
+		},
+	})
+
+	dashJSON, _ := json.Marshal(map[string]any{
+		"code": 0,
+		"data": map[string]any{
+			"quality": 80,
+			"dash": map[string]any{
+				"video": []map[string]any{
+					// Deliberately unsorted + duplicate (80, avc) + PCDN baseUrl!
+					{"id": 32, "codecid": 7, "codecs": "avc1.64001E", "width": 852, "height": 480, "frameRate": "30000/1001", "bandwidth": 600000, "baseUrl": v32AVC},
+					{"id": 80, "codecid": 13, "codecs": "av01.0.08M.08", "width": 1920, "height": 1080, "frameRate": "29.412", "bandwidth": 1500000, "baseUrl": v80AV1},
+					{"id": 80, "codecid": 7, "codecs": "avc1.640028", "width": 1920, "height": 1080, "frameRate": "29.412", "bandwidth": 1800000, "baseUrl": v80AVCLo},
+					{"id": 80, "codecid": 12, "codecs": "hev1.1.6.L120.90", "width": 1920, "height": 1080, "frame_rate": "30000/1001", "bandwidth": 1900000, "baseUrl": pcdnURL, "backupUrl": []string{v80HEVC}},
+					{"id": 80, "codecid": 7, "codecs": "avc1.640028", "width": 1920, "height": 1080, "frameRate": "29.412", "bandwidth": 2630000, "baseUrl": pcdnURL, "backupUrl": []string{v80AVCMCDN, v80AVCHi}},
+					{"id": 64, "codecid": 7, "codecs": "avc1.64001F", "width": 1280, "height": 720, "frameRate": "30", "bandwidth": 1200000, "baseUrl": v64AVC},
+				},
+				"audio": []map[string]any{
+					{"id": 30216, "codecid": 0, "codecs": "mp4a.40.2", "bandwidth": 65000, "baseUrl": a30216},
+					{"id": 30251, "codecid": 0, "codecs": "fLaC", "bandwidth": 900000, "baseUrl": aFLAC},
+					{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "bandwidth": 203000, "baseUrl": pcdnURL, "backupUrl": []string{a30280}},
+					{"id": 30232, "codecid": 0, "codecs": "mp4a.40.2", "bandwidth": 134000, "baseUrl": a30232},
+				},
+			},
+		},
+	})
+
+	// 1. Default New(executor) makes zero DASH requests and emits zero attachments.
+	var defaultDashCalls atomic.Int32
+	defaultExec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: durlJSON}, nil
+		case "bilibili-play-dash":
+			defaultDashCalls.Add(1)
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: dashJSON}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+	defaultEnv, err := New(defaultExec).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("default Parse failed: %v", err)
+	}
+	if defaultDashCalls.Load() != 0 {
+		t.Fatalf("default New(executor) unexpectedly issued %d DASH calls", defaultDashCalls.Load())
+	}
+	if unified.Map(defaultEnv["data"])["attachments"] != nil {
+		t.Fatal("default New(executor) unexpectedly emitted attachments")
+	}
+
+	// 2. WithDASH(true) executes playRequest and dashPlayRequest concurrently!
+	playEntered := make(chan struct{})
+	dashEntered := make(chan struct{})
+	bothEntered := make(chan struct{})
+	go func() {
+		<-playEntered
+		<-dashEntered
+		close(bothEntered)
+	}()
+
+	parallelExec := executorFunc(func(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			close(playEntered)
+			select {
+			case <-bothEntered:
+			case <-time.After(1500 * time.Millisecond):
+				return fetch.Response{}, errors.New("playRequest and dashPlayRequest did not run in parallel")
+			case <-ctx.Done():
+				return fetch.Response{}, ctx.Err()
+			}
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: durlJSON}, nil
+		case "bilibili-play-dash":
+			close(dashEntered)
+			select {
+			case <-bothEntered:
+			case <-time.After(1500 * time.Millisecond):
+				return fetch.Response{}, errors.New("playRequest and dashPlayRequest did not run in parallel")
+			case <-ctx.Done():
+				return fetch.Response{}, ctx.Err()
+			}
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: dashJSON}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+
+	rawEnv, err := New(parallelExec).WithDASH(true).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("WithDASH(true) Parse failed: %v", err)
+	}
+	if err := unified.ValidateEnvelopeAt(rawEnv, now); err != nil {
+		t.Fatalf("raw envelope validation failed: %v", err)
+	}
+
+	pubEnv, err := PreparePublic(context.Background(), "bilibili", rawEnv, now)
+	if err != nil {
+		t.Fatalf("PreparePublic failed: %v", err)
+	}
+	if err := unified.ValidateEnvelopeAt(pubEnv, now); err != nil {
+		t.Fatalf("PreparePublic envelope validation failed: %v", err)
+	}
+
+	normalView := unified.PublicView(pubEnv, false, now)
+	debugView := unified.PublicView(pubEnv, true, now)
+	if err := unified.ValidateEnvelopeAt(normalView, now); err != nil {
+		t.Fatalf("PublicView(normal) validation failed: %v", err)
+	}
+	if err := unified.ValidateEnvelopeAt(debugView, now); err != nil {
+		t.Fatalf("PublicView(debug) validation failed: %v", err)
+	}
+
+	// Verify debug view has 1 durl + 5 deduplicated DASH mux variants (NOT 6x4=24!).
+	debugData := unified.Map(debugView["data"])
+	debugItem := unified.Map(unified.Slice(debugData["items"])[0])
+	debugVariants := unified.Slice(debugItem["variants"])
+	if len(debugVariants) != 6 {
+		t.Fatalf("debug variants len = %d, want 6 (1 durl + 5 deduped mux)", len(debugVariants))
+	}
+
+	wantMuxIDs := []string{"dash-80-avc", "dash-80-hevc", "dash-80-av1", "dash-64-avc", "dash-32-avc"}
+	wantLabels := []string{"1080p", "1080p", "1080p", "720p", "480p"}
+	for i, wantID := range wantMuxIDs {
+		v := unified.Map(debugVariants[i+1])
+		if gotID := unified.Str(v["id"]); gotID != wantID {
+			t.Fatalf("mux[%d].id = %q, want %q", i, gotID, wantID)
+		}
+		if gotLabel := unified.Str(v["label"]); gotLabel != wantLabels[i] {
+			t.Fatalf("mux[%d].label = %q, want %q", i, gotLabel, wantLabels[i])
+		}
+		delivery := unified.Map(v["delivery"])
+		if unified.Str(delivery["kind"]) != "mux" {
+			t.Fatalf("mux[%d].delivery.kind = %q, want mux", i, unified.Str(delivery["kind"]))
+		}
+		resources := unified.Slice(delivery["resources"])
+		if len(resources) != 2 {
+			t.Fatalf("mux[%d].resources len = %d, want 2", i, len(resources))
+		}
+		vidRes := unified.Map(resources[0])
+		audRes := unified.Map(resources[1])
+		vidMeta := unified.Map(vidRes["metadata"])
+		audMeta := unified.Map(audRes["metadata"])
+		varMeta := unified.Map(v["metadata"])
+
+		// Video resource must never carry has_audio or audio fields.
+		if vidMeta["has_audio"] != nil || vidMeta["audio_codec"] != nil || vidMeta["audio_bitrate_bps"] != nil {
+			t.Fatalf("mux[%d] video resource leaked audio metadata: %v", i, vidMeta)
+		}
+		// Audio resource must carry only audio metadata (30280 mp4a m4a).
+		if audMeta["has_audio"] != true || unified.Str(audMeta["audio_codec"]) != "mp4a.40.2" ||
+			intValue(audMeta["audio_bitrate_bps"]) != 203000 ||
+			unified.Str(audMeta["container"]) != "m4a" || unified.Str(audMeta["extension"]) != "m4a" || unified.Str(audMeta["mime_type"]) != "audio/mp4" {
+			t.Fatalf("mux[%d] unexpected audio metadata: %v", i, audMeta)
+		}
+		if audMeta["width"] != nil || audMeta["height"] != nil || audMeta["video_codec"] != nil {
+			t.Fatalf("mux[%d] audio resource leaked video metadata: %v", i, audMeta)
+		}
+		// Combined variant metadata must expose both video and audio facts cleanly.
+		if varMeta["has_audio"] != true || unified.Str(varMeta["container"]) != "mp4" ||
+			unified.Str(varMeta["extension"]) != "mp4" || unified.Str(varMeta["mime_type"]) != "video/mp4" ||
+			unified.Str(varMeta["evidence"]) != "upstream" ||
+			unified.Str(varMeta["audio_codec"]) != "mp4a.40.2" || intValue(varMeta["audio_bitrate_bps"]) != 203000 {
+			t.Fatalf("mux[%d] unexpected combined metadata: %v", i, varMeta)
+		}
+	}
+
+	// Verify dash-80-avc kept the higher-bandwidth duplicate (2630000), filtered out PCDN,
+	// sorted upos-*.bilivideo.com before *.mcdn.bilivideo.cn, and annotated expires_at on both!
+	avc80 := unified.Map(debugVariants[1])
+	if gotBW := intValue(unified.Map(avc80["metadata"])["video_bitrate_bps"]); gotBW != 2630000 {
+		t.Fatalf("dash-80-avc video_bitrate_bps = %d, want 2630000 (highest bandwidth duplicate)", gotBW)
+	}
+	if gotFPS, ok := unified.Numeric(unified.Map(avc80["metadata"])["fps"]); !ok || math.Abs(gotFPS-29.412) > 0.001 {
+		t.Fatalf("dash-80-avc fps = %v, want 29.412", unified.Map(avc80["metadata"])["fps"])
+	}
+	avc80VidSrcs := unified.Slice(unified.Map(unified.Map(unified.Slice(unified.Map(avc80["delivery"])["resources"])[0])["delivery"])["sources"])
+	if len(avc80VidSrcs) != 2 ||
+		unified.Str(unified.Map(avc80VidSrcs[0])["url"]) != v80AVCHi ||
+		unified.Str(unified.Map(avc80VidSrcs[1])["url"]) != v80AVCMCDN {
+		t.Fatalf("dash-80-avc video sources = %v, want [upos, mcdn.bilivideo.cn]", avc80VidSrcs)
+	}
+	wantExp := time.Unix(dl, 0).UTC().Format(time.RFC3339)
+	if unified.Str(unified.Map(avc80VidSrcs[0])["browser_fetch"]) != "allowed" || unified.Str(unified.Map(avc80VidSrcs[0])["expires_at"]) != wantExp {
+		t.Fatalf("upos source annotations = %v", avc80VidSrcs[0])
+	}
+	if unified.Map(avc80VidSrcs[1])["browser_fetch"] != nil || unified.Str(unified.Map(avc80VidSrcs[1])["expires_at"]) != wantExp {
+		t.Fatalf("bilivideo.cn source should get expires_at without browser_fetch=allowed, got %v", avc80VidSrcs[1])
+	}
+
+	// Verify dash-80-hevc parsed fraction frame_rate "30000/1001" AND annotated expires_at on *.akamaized.net!
+	hevc80 := unified.Map(debugVariants[2])
+	if gotFPS, ok := unified.Numeric(unified.Map(hevc80["metadata"])["fps"]); !ok || math.Abs(gotFPS-30000.0/1001.0) > 0.001 {
+		t.Fatalf("dash-80-hevc fps = %v, want 30000/1001", unified.Map(hevc80["metadata"])["fps"])
+	}
+	hevcSrc0 := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(unified.Map(hevc80["delivery"])["resources"])[0])["delivery"])["sources"])[0])
+	if unified.Str(hevcSrc0["url"]) != v80HEVC || unified.Str(hevcSrc0["expires_at"]) != wantExp || hevcSrc0["browser_fetch"] != nil {
+		t.Fatalf("akamaized.net source annotations = %v", hevcSrc0)
+	}
+
+	// Verify default points to durl file and higher_quality_variants contains the three 1080p mux variants!
+	normalItem := unified.Map(unified.Slice(unified.Map(normalView["data"])["items"])[0])
+	if unified.Str(unified.Map(normalItem["default"])["url"]) != durlURL {
+		t.Fatalf("default.url = %q, want durl %q", unified.Str(unified.Map(normalItem["default"])["url"]), durlURL)
+	}
+	higher := unified.Slice(normalItem["higher_quality_variants"])
+	if len(higher) != 3 {
+		t.Fatalf("higher_quality_variants len = %d (%v), want 3 (1080p avc/hevc/av1)", len(higher), higher)
+	}
+	for i, wantID := range []string{"dash-80-avc", "dash-80-hevc", "dash-80-av1"} {
+		entry := unified.Map(higher[i])
+		reqs := unified.Slice(entry["requires"])
+		if unified.Str(entry["variant_id"]) != wantID || len(reqs) != 1 || unified.Str(reqs[0]) != "mux" {
+			t.Fatalf("higher[%d] = %v, want {variant_id:%s, requires:[mux]}", i, entry, wantID)
+		}
+	}
+
+	// Verify top-level attachments contains the standalone M4A audio attachment with expires_at!
+	attachments := unified.Slice(unified.Map(normalView["data"])["attachments"])
+	if len(attachments) != 1 {
+		t.Fatalf("attachments len = %d, want 1", len(attachments))
+	}
+	att := unified.Map(attachments[0])
+	if unified.Str(att["id"]) != "bilibili-audio-"+bvid+"-p1" || unified.Str(att["role"]) != "background_audio" || unified.Str(att["title"]) != "原声音频 (M4A)" {
+		t.Fatalf("unexpected audio attachment: %v", att)
+	}
+	attSrc0 := unified.Map(unified.Slice(unified.Map(unified.Map(att["resource"])["delivery"])["sources"])[0])
+	if unified.Str(attSrc0["url"]) != a30280 || unified.Str(attSrc0["expires_at"]) != wantExp {
+		t.Fatalf("unexpected audio attachment source: %v", attSrc0)
+	}
+}
+
+func TestWithDASHResilientDegradation(t *testing.T) {
+	const now int64 = 1800000000
+	const (
+		durlURL = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-1-64.mp4?deadline=1800007200"
+		vidURL  = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		audURL  = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+	)
+	durlBody := `{"code":0,"data":{"quality":64,"durl":[{"url":"` + durlURL + `","width":1280,"height":720}]}}`
+	dashOKBody := `{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2000000,"baseUrl":"` + vidURL + `"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":192000,"baseUrl":"` + audURL + `"}]}}}`
+
+	// 1. DASH failure cases must silently preserve durl untouched.
+	var logBuf shanghaiLockedLogBuffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	dashFailCases := []struct {
+		name string
+		fn   func() (fetch.Response, error)
+	}{
+		{"network-error", func() (fetch.Response, error) { return fetch.Response{}, errors.New("dial timeout") }},
+		{"non-zero-code", func() (fetch.Response, error) { return fetch.Response{StatusCode: 200, Body: []byte(`{"code":-412}`)}, nil }},
+		{"empty-dash", func() (fetch.Response, error) { return fetch.Response{StatusCode: 200, Body: []byte(`{"code":0,"data":{"dash":{"video":[],"audio":[]}}}`)}, nil }},
+		{"pcdn-only-dash", func() (fetch.Response, error) {
+			return fetch.Response{StatusCode: 200, Body: []byte(`{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"https://x.edge.mountaintoys.cn/v.m4s"}],"audio":[{"id":30280,"baseUrl":"https://x.edge.mountaintoys.cn/a.m4s"}]}}}`)}, nil
+		}},
+		{"goroutine-panic", func() (fetch.Response, error) { panic("dash-panic-secret-value") }},
+	}
+	for _, tc := range dashFailCases {
+		t.Run("dash-fails/"+tc.name, func(t *testing.T) {
+			exec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-view":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+				case "bilibili-play":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+				case "bilibili-play-dash":
+					return tc.fn()
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+				}
+			})
+			env, err := New(exec).WithDASH(true).Parse(context.Background(), testURL, now)
+			if err != nil {
+				t.Fatalf("Parse failed on %s: %v", tc.name, err)
+			}
+			if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+				t.Fatalf("ValidateEnvelopeAt failed on %s: %v", tc.name, err)
+			}
+			data := unified.Map(env["data"])
+			if data["attachments"] != nil {
+				t.Fatalf("expected no attachments on fallback %s, got %v", tc.name, data["attachments"])
+			}
+			item := unified.Map(unified.Slice(data["items"])[0])
+			if unified.Str(unified.Map(item["default"])["url"]) != durlURL || len(unified.Slice(item["variants"])) != 1 {
+				t.Fatalf("expected clean durl fallback on %s, got item=%v", tc.name, item)
+			}
+		})
+	}
+	if strings.Contains(logBuf.String(), "dash-panic-secret-value") {
+		t.Fatalf("DASH panic recovery log leaked secret: %q", logBuf.String())
+	}
+
+	// 2. When html5 durl fails while DASH succeeds, play is synthesized so DASH still works!
+	t.Run("durl-fails-dash-succeeds", func(t *testing.T) {
+		exec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.Policy.Purpose {
+			case "bilibili-view":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			case "bilibili-play":
+				return fetch.Response{StatusCode: 502, URL: req.URL}, nil
+			case "bilibili-play-dash":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashOKBody)}, nil
+			default:
+				return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+			}
+		})
+		env, err := New(exec).WithDASH(true).Parse(context.Background(), testURL, now)
+		if err != nil {
+			t.Fatalf("Parse failed when durl failed and dash succeeded: %v", err)
+		}
+		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		data := unified.Map(env["data"])
+		item := unified.Map(unified.Slice(data["items"])[0])
+		if item["default"] != nil || unified.Str(item["default_unavailable_reason"]) != "processing_required" {
+			t.Fatalf("expected null default with processing_required, got item=%v", item)
+		}
+		variants := unified.Slice(item["variants"])
+		if len(variants) != 1 || unified.Str(unified.Map(variants[0])["id"]) != "dash-80-avc" {
+			t.Fatalf("expected single dash-80-avc mux variant, got %v", variants)
+		}
+		if len(unified.Slice(data["attachments"])) != 1 {
+			t.Fatalf("expected standalone audio attachment, got %v", data["attachments"])
+		}
+	})
+
+	// 3. Audio fallback: when no mp4a track exists, selects highest bandwidth valid audio track.
+	t.Run("audio-fallback-non-mp4a", func(t *testing.T) {
+		dashNonMP4A := `{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2000000,"baseUrl":"` + vidURL + `"}],"audio":[{"id":30250,"codecs":"ec-3","bandwidth":384000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/a-low.m4s?deadline=1800007200"},{"id":30251,"codecs":"fLaC","bandwidth":900000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/a-hi.m4s?deadline=1800007200"}]}}}`
+		exec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.Policy.Purpose {
+			case "bilibili-view":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			case "bilibili-play":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+			case "bilibili-play-dash":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashNonMP4A)}, nil
+			default:
+				return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+			}
+		})
+		env, err := New(exec).WithDASH(true).Parse(context.Background(), testURL, now)
+		if err != nil {
+			t.Fatalf("Parse failed: %v", err)
+		}
+		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		att := unified.Map(unified.Slice(unified.Map(env["data"])["attachments"])[0])
+		attSrc := unified.Map(unified.Slice(unified.Map(unified.Map(att["resource"])["delivery"])["sources"])[0])
+		if unified.Str(attSrc["url"]) != "https://upos-sz-mirrorcosov.bilivideo.com/a-hi.m4s?deadline=1800007200" {
+			t.Fatalf("expected highest-bandwidth fallback audio track, got %v", attSrc)
+		}
+	})
+
+	// 4. Context cancellation stops cleanly without blocking.
+	t.Run("context-canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		exec := executorFunc(func(reqCtx context.Context, req fetch.Request) (fetch.Response, error) {
+			if req.Policy.Purpose == "bilibili-view" {
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			}
+			cancel()
+			<-reqCtx.Done()
+			return fetch.Response{}, reqCtx.Err()
+		})
+		payload, err := New(exec).WithDASH(true).Parse(ctx, testURL, now)
+		if !errors.Is(err, context.Canceled) || payload != nil {
+			t.Fatalf("expected context.Canceled with nil payload, got payload=%v err=%v", payload, err)
+		}
+	})
+}
+
+type staticPendingShanghaiResolver struct {
+	play    *ShanghaiPlay
+	matched atomic.Bool
+}
+
+func (r *staticPendingShanghaiResolver) ResolveBilibili(context.Context, string, int64) (*ShanghaiPlay, error) {
+	return r.play, nil
+}
+
+func (r *staticPendingShanghaiResolver) ResolveBilibiliPending(context.Context, string, int64) (*ShanghaiPlay, func(bool), error) {
+	return r.play, func(m bool) { r.matched.Store(m) }, nil
+}
+
+func TestWithDASHShanghaiRouteMerge(t *testing.T) {
+	const (
+		now     int64 = 1800000000
+		shDURL        = "https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		jpDURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		shVid80       = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		jpVid80       = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		shAud         = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+		jpAud         = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+	)
+
+	jpExec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"` + jpDURL + `","width":1280,"height":720}]}}`)}, nil
+		case "bilibili-play-dash":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(`{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2200000,"baseUrl":"` + jpVid80 + `"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":192000,"baseUrl":"` + jpAud + `"}]}}}`)}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+
+	shRes := &staticPendingShanghaiResolver{
+		play: &ShanghaiPlay{
+			BVID:        "BV1234567890",
+			CID:         101,
+			DURLQuality: 64,
+			DURLPieces:  []ShanghaiDURLPiece{{URLs: []string{shDURL}}},
+			DashVideo:   []ShanghaiDashTrack{{ID: 80, CodecID: 7, Codecs: "avc1.640028", URLs: []string{shVid80}}},
+			DashAudio:   []ShanghaiDashTrack{{ID: 30280, Codecs: "mp4a.40.2", URLs: []string{shAud}}},
+		},
+	}
+
+	env, err := NewWithShanghai(jpExec, shRes).WithDASH(true).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+	if !shRes.matched.Load() {
+		t.Fatal("expected Shanghai finish(true) on DASH+DURL match")
+	}
+
+	data := unified.Map(env["data"])
+	item := unified.Map(unified.Slice(data["items"])[0])
+	variants := unified.Slice(item["variants"])
+	if len(variants) != 2 {
+		t.Fatalf("variants len = %d, want 2", len(variants))
+	}
+	muxRes := unified.Slice(unified.Map(unified.Map(variants[1])["delivery"])["resources"])
+	vidSrcs := unified.Slice(unified.Map(unified.Map(muxRes[0])["delivery"])["sources"])
+	audSrcs := unified.Slice(unified.Map(unified.Map(muxRes[1])["delivery"])["sources"])
+	if len(vidSrcs) != 2 || unified.Str(unified.Map(vidSrcs[0])["url"]) != shVid80 || unified.Str(unified.Map(vidSrcs[1])["url"]) != jpVid80 {
+		t.Fatalf("unexpected merged DASH video sources: %v", vidSrcs)
+	}
+	if len(audSrcs) != 2 || unified.Str(unified.Map(audSrcs[0])["url"]) != shAud || unified.Str(unified.Map(audSrcs[1])["url"]) != jpAud {
+		t.Fatalf("unexpected merged DASH audio sources: %v", audSrcs)
+	}
+	attSrcs := unified.Slice(unified.Map(unified.Map(unified.Map(unified.Slice(data["attachments"])[0])["resource"])["delivery"])["sources"])
+	if len(attSrcs) != 2 || unified.Str(unified.Map(attSrcs[0])["url"]) != shAud || unified.Str(unified.Map(attSrcs[1])["url"]) != jpAud {
+		t.Fatalf("unexpected merged audio attachment sources: %v", attSrcs)
 	}
 }

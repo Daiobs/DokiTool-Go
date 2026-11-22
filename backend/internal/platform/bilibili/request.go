@@ -63,6 +63,24 @@ func playRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
 	return apiRequest("bilibili-play", "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=3&player=3&qn=112&bvid="+bvid+"&cid="+url.QueryEscape(stringValue(cid))+"&platform=html5&high_quality=1", timeout)
 }
 
+func dashPlayRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
+	return fetch.Request{
+		URL:    "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=4048&qn=120&fourk=1&try_look=1&bvid=" + bvid + "&cid=" + url.QueryEscape(stringValue(cid)),
+		Method: http.MethodGet,
+		Header: http.Header{
+			"User-Agent":      {desktopUA},
+			"Referer":         {"https://www.bilibili.com/"},
+			"Accept-Encoding": {"gzip,deflate"},
+		},
+		Policy: fetch.Policy{
+			Purpose:    "bilibili-play-dash",
+			AllowedURL: AllowedAPIURL,
+			Timeout:    timeout,
+			MaxBytes:   8 << 20,
+		},
+	}
+}
+
 func apiRequest(purpose, raw string, timeout time.Duration) fetch.Request {
 	return fetch.Request{URL: raw, Method: http.MethodGet, Header: http.Header{"User-Agent": {""}, "Accept-Encoding": {"gzip,deflate"}},
 		Policy: fetch.Policy{Purpose: purpose, AllowedURL: AllowedAPIURL, Timeout: timeout, MaxBytes: 8 << 20}}

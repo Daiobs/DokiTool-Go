@@ -976,6 +976,7 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 
 	var jpPlayCalls atomic.Int64
 	var shPlayCalls atomic.Int64
+	var shDashCalls atomic.Int64
 
 	var h *bilibiliShanghaiHarness
 	jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
@@ -999,7 +1000,11 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
 	})
 	shExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
-		shPlayCalls.Add(1)
+		if req.Policy.Purpose == "bilibili-play-dash" {
+			shDashCalls.Add(1)
+		} else {
+			shPlayCalls.Add(1)
+		}
 		u, _ := url.Parse(req.URL)
 		cid := u.Query().Get("cid")
 		// Shanghai URL expires in 90s -> earliest_expires_at - now - 60s = 30s cache TTL!
@@ -1066,8 +1071,8 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 	// At +35s (> 30s earliest-expiry TTL, even though < 60s default and < 180s max!): must expire and re-fetch!
 	h.advanceClock(15 * time.Second)
 	code, _ = h.doAPI(resolveURL, "198.51.100.10", "")
-	if code != http.StatusOK || jpPlayCalls.Load() != callsBeforeHit+1 || shPlayCalls.Load() != 3 {
-		t.Fatalf("expected cache expiry at +35s (>30s earliest-expiry TTL), jpCalls=%d shCalls=%d", jpPlayCalls.Load(), shPlayCalls.Load())
+	if code != http.StatusOK || jpPlayCalls.Load() != callsBeforeHit+1 || shPlayCalls.Load() != 3 || shDashCalls.Load() != 3 {
+		t.Fatalf("expected cache expiry at +35s (>30s earliest-expiry TTL), jpCalls=%d shPlayCalls=%d shDashCalls=%d", jpPlayCalls.Load(), shPlayCalls.Load(), shDashCalls.Load())
 	}
 
 	snap := h.stats()
