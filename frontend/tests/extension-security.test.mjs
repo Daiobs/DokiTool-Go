@@ -1299,3 +1299,46 @@ test("urlMatcher P1/P2/P3 hardening: positive feed suppression, backend-supporte
   assert.equal(pcWeiboStatusRejected?.isLikelyFeedOrHome, true);
   assert.notEqual(pcWeiboStatusRejected?.dedupeKey, "weibo:status:5012345678901234");
 });
+
+test("Bilibili DASH security boundary: hostWhitelist & DNR Rule 1004 permit official DASH CDNs with zero Cookie + Bilibili Referer while rejecting third-party PCDN", () => {
+  // Official Bilibili DASH CDNs allowed
+  for (const allowedUrl of [
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/56-1-100024.m4s",
+    "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56-1-30280.m4s",
+    "https://xy123x45x67x89xy.mcdn.bilivideo.cn/v1/resource/56-1-100024.m4s",
+    "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/12/34/56-1-100024.m4s",
+  ]) {
+    const res = hostWhitelist.isWhitelistedMediaUrl(allowedUrl);
+    assert.equal(res.allowed, true, `official Bilibili DASH URL must be allowed: ${allowedUrl}`);
+  }
+
+  // Third-party PCDN & non-standard hosts strictly rejected
+  for (const blockedUrl of [
+    "https://w9e959o.edge.mountaintoys.cn/v1/resource/56-1-100024.m4s",
+    "https://112-23-45-67.pcdn.example.net/stream.m4s",
+    "https://183.240.12.34/stream.m4s",
+    "https://upos-sz-mirrorcos.bilivideo.com:8443/stream.m4s",
+  ]) {
+    const res = hostWhitelist.isWhitelistedMediaUrl(blockedUrl);
+    assert.equal(res.allowed, false, `PCDN/non-standard URL must be blocked: ${blockedUrl}`);
+  }
+
+  // DNR Rule 1004 injects Referer: https://www.bilibili.com/, removes Origin & Cookie, and pins initiatorDomains
+  const rules = dnrRules.buildExtensionDnrRules("abcdefghijklmnopabcdefghijklmnop");
+  const biliRule = rules.find((r) => r.id === 1004);
+  assert.ok(biliRule, "DNR Rule 1004 must exist for Bilibili DASH");
+  assert.deepEqual(biliRule.condition.initiatorDomains, [
+    "abcdefghijklmnopabcdefghijklmnop",
+  ]);
+  for (const domain of ["bilivideo.com", "bilivideo.cn", "hdslb.com", "akamaized.net"]) {
+    assert.ok(
+      biliRule.condition.requestDomains.includes(domain),
+      `DNR Rule 1004 must cover ${domain}`,
+    );
+  }
+  assert.deepEqual(biliRule.action.requestHeaders, [
+    { header: "Referer", operation: "set", value: "https://www.bilibili.com/" },
+    { header: "Origin", operation: "remove" },
+    { header: "Cookie", operation: "remove" },
+  ]);
+});

@@ -19,6 +19,7 @@ let tmpBundleDir = "";
 let protocol;
 let storage;
 let youtubeBridgeMod;
+let dashMuxEngineMod;
 let extensionDownloadMod;
 let uiTargetHelpersMod;
 let offscreenMod;
@@ -39,6 +40,7 @@ async function bundleExtensionSuite() {
         export * as protocol from "./src/extension/protocol.ts";
         export * as storage from "./src/extension/storage.ts";
         export * as youtubeBridgeMod from "./src/extension/youtubeExtensionBridge.ts";
+        export * as dashMuxEngineMod from "./src/extension/dashMuxEngine.ts";
         export * as extensionDownloadMod from "./src/extension/extensionDownload.ts";
         export * as uiTargetHelpersMod from "./src/extension/uiTargetHelpers.ts";
         export * as offscreenMod from "./src/extension/offscreen.ts";
@@ -62,6 +64,7 @@ before(async () => {
   protocol = suite.protocol;
   storage = suite.storage;
   youtubeBridgeMod = suite.youtubeBridgeMod;
+  dashMuxEngineMod = suite.dashMuxEngineMod;
   extensionDownloadMod = suite.extensionDownloadMod;
   uiTargetHelpersMod = suite.uiTargetHelpersMod;
   offscreenMod = suite.offscreenMod;
@@ -4886,5 +4889,1125 @@ test("background badge & tooltip: late cancelled callback does not wipe terminal
     assert.equal(lastBadgeTitle(), backgroundMod.DEFAULT_ACTION_TITLE);
   } finally {
     bg.dispose();
+  }
+});
+
+// ============================================================================
+// Generic Lossless DASH Mux Engine (Bilibili 1080p AVC/HEVC/AV1 + AAC + M4A)
+// ============================================================================
+
+async function createSyntheticDashTrackBuffers(codec = "avc") {
+  let videoCfg;
+  if (codec === "avc") {
+    const avcC = new Uint8Array([
+      1, 0x42, 0xc0, 0x1e, 0xff, 0xe1, 0x00, 0x09, 0x67, 0x42, 0xc0, 0x1e, 0xd9,
+      0x03, 0xc8, 0x40, 0x00, 0x01, 0x00, 0x04, 0x68, 0xcb, 0x83, 0xcb,
+    ]);
+    videoCfg = {
+      codec: "avc1.42c01e",
+      codedWidth: 1920,
+      codedHeight: 1080,
+      description: avcC,
+    };
+  } else if (codec === "hevc") {
+    const hvcC = new Uint8Array(23);
+    hvcC[0] = 1;
+    hvcC[1] = 1;
+    hvcC[12] = 93;
+    hvcC[21] = 0xff;
+    videoCfg = {
+      codec: "hvc1.1.6.L93.B0",
+      codedWidth: 1920,
+      codedHeight: 1080,
+      description: hvcC,
+    };
+  } else {
+    videoCfg = {
+      codec: "av01.0.08M.08",
+      codedWidth: 1920,
+      codedHeight: 1080,
+      description: new Uint8Array([0x81, 0x08, 0x0c, 0x00]),
+    };
+  }
+
+  const videoTarget = new mediabunny.BufferTarget();
+  const videoOut = new mediabunny.Output({
+    format: new mediabunny.Mp4OutputFormat({ fastStart: "fragmented" }),
+    target: videoTarget,
+  });
+  const videoSrc = new mediabunny.EncodedVideoPacketSource(codec);
+  videoOut.addVideoTrack(videoSrc);
+  await videoOut.start();
+  for (let i = 0; i < 6; i++) {
+    const nal = new Uint8Array(1024);
+    new DataView(nal.buffer).setUint32(0, 1020);
+    nal[4] = i === 0 ? 0x65 : 0x41;
+    await videoSrc.add(
+      new mediabunny.EncodedPacket(
+        nal,
+        i === 0 ? "key" : "delta",
+        i * 0.04,
+        0.04,
+      ),
+      i === 0 ? { decoderConfig: videoCfg } : undefined,
+    );
+  }
+  videoSrc.close();
+  await videoOut.finalize();
+
+  const audioTarget = new mediabunny.BufferTarget();
+  const audioOut = new mediabunny.Output({
+    format: new mediabunny.Mp4OutputFormat({ fastStart: "fragmented" }),
+    target: audioTarget,
+  });
+  const audioSrc = new mediabunny.EncodedAudioPacketSource("aac");
+  audioOut.addAudioTrack(audioSrc);
+  await audioOut.start();
+  for (let i = 0; i < 6; i++) {
+    const frame = new Uint8Array(512);
+    frame[0] = 0xde;
+    await audioSrc.add(
+      new mediabunny.EncodedPacket(frame, "key", i * 0.04, 0.04),
+      i === 0
+        ? {
+            decoderConfig: {
+              codec: "mp4a.40.2",
+              numberOfChannels: 2,
+              sampleRate: 48000,
+              description: new Uint8Array([0x11, 0x90]),
+            },
+          }
+        : undefined,
+    );
+  }
+  audioSrc.close();
+  await audioOut.finalize();
+
+  return {
+    videoBytes: new Uint8Array(videoTarget.buffer),
+    audioBytes: new Uint8Array(audioTarget.buffer),
+  };
+}
+
+function buildSampleBilibiliDashMedia({ multiP = false } = {}) {
+  const makeDashVariant = ({
+    id,
+    label,
+    width,
+    height,
+    fps,
+    videoCodec,
+    videoBitrate,
+    audioBitrate = 200_000,
+    videoUrls,
+    audioUrls,
+  }) => ({
+    id,
+    label,
+    metadata: {
+      width,
+      height,
+      fps,
+      video_codec: videoCodec,
+      video_bitrate_bps: videoBitrate,
+      audio_codec: "mp4a.40.2",
+      audio_bitrate_bps: audioBitrate,
+      has_audio: true,
+      container: "mp4",
+      extension: "mp4",
+      mime_type: "video/mp4",
+      evidence: "upstream",
+    },
+    delivery: {
+      kind: "mux",
+      output: { container: "mp4", extension: "mp4", mime_type: "video/mp4" },
+      resources: [
+        {
+          id: "video",
+          role: "video",
+          metadata: {
+            width,
+            height,
+            fps,
+            video_codec: videoCodec,
+            video_bitrate_bps: videoBitrate,
+            evidence: "upstream",
+          },
+          delivery: {
+            kind: "file",
+            sources: videoUrls.map((url, idx) => ({
+              id: `v-${idx + 1}`,
+              url,
+            })),
+          },
+        },
+        {
+          id: "audio",
+          role: "audio",
+          metadata: {
+            has_audio: true,
+            audio_codec: "mp4a.40.2",
+            audio_bitrate_bps: audioBitrate,
+            container: "m4a",
+            extension: "m4a",
+            mime_type: "audio/mp4",
+            evidence: "upstream",
+          },
+          delivery: {
+            kind: "file",
+            sources: audioUrls.map((url, idx) => ({
+              id: `a-${idx + 1}`,
+              url,
+            })),
+          },
+        },
+      ],
+    },
+  });
+
+  const makeItem = (index, titleSuffix) => ({
+    id: `p${index}`,
+    index,
+    type: "video",
+    title: titleSuffix,
+    duration_ms: 120_000,
+    source_url: `https://www.bilibili.com/video/BV1GJ411x7h7?p=${index}`,
+    variants: [
+      // Deliberately put AV1 and HEVC BEFORE H.264 to verify codec ranking (H.264 > HEVC > AV1)!
+      makeDashVariant({
+        id: "dash-80-av1",
+        label: "1080p",
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        videoCodec: "av01.0.08M.08",
+        videoBitrate: 1_800_000,
+        videoUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-1080-av1.m4s`,
+        ],
+        audioUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-30280.m4s`,
+        ],
+      }),
+      makeDashVariant({
+        id: "dash-80-hevc",
+        label: "1080p",
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        videoCodec: "hev1.1.6.L120.90",
+        videoBitrate: 2_200_000,
+        videoUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-1080-hevc.m4s`,
+        ],
+        audioUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-30280.m4s`,
+        ],
+      }),
+      makeDashVariant({
+        id: "dash-80-avc",
+        label: "1080p",
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        videoCodec: "avc1.640032",
+        videoBitrate: 2_600_000,
+        videoUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-1080-avc-1.m4s`,
+          `https://upos-sz-mirrorali.bilivideo.com/p${index}-1080-avc-2.m4s`,
+        ],
+        audioUrls: [
+          `https://upos-sz-mirrorcos.bilivideo.com/p${index}-30280-1.m4s`,
+          `https://upos-sz-mirrorali.bilivideo.com/p${index}-30280-2.m4s`,
+        ],
+      }),
+      {
+        id: "durl-64",
+        label: "720p",
+        metadata: {
+          width: 1280,
+          height: 720,
+          has_audio: true,
+          container: "mp4",
+          extension: "mp4",
+          mime_type: "video/mp4",
+        },
+        delivery: {
+          kind: "file",
+          sources: [
+            {
+              id: "durl-1",
+              url: `https://upos-sz-mirrorcos.bilivideo.com/p${index}-durl-720p.mp4`,
+              size_bytes: 51_900_000,
+            },
+          ],
+        },
+      },
+    ],
+    default: {
+      variant_id: "durl-64",
+      source_id: "durl-1",
+      url: `https://upos-sz-mirrorcos.bilivideo.com/p${index}-durl-720p.mp4`,
+    },
+    higher_quality_variants: [
+      { variant_id: "dash-80-av1", requires: ["mux"] },
+      { variant_id: "dash-80-hevc", requires: ["mux"] },
+      { variant_id: "dash-80-avc", requires: ["mux"] },
+    ],
+  });
+
+  const items = multiP
+    ? [makeItem(1, "第一集 序幕"), makeItem(2, "第二集 正片")]
+    : [makeItem(1, "B站1080P DASH无损合流测试")];
+
+  return {
+    platform: "bilibili",
+    content_id: "BV1GJ411x7h7",
+    title: "B站1080P DASH无损合流测试",
+    source_url: "https://www.bilibili.com/video/BV1GJ411x7h7",
+    default_item_id: "p1",
+    items,
+    attachments: [
+      {
+        id: "bilibili-audio-BV1GJ411x7h7-p1",
+        role: "background_audio",
+        title: "原声音频 (M4A)",
+        resource: {
+          id: "audio",
+          role: "audio",
+          metadata: {
+            has_audio: true,
+            audio_codec: "mp4a.40.2",
+            audio_bitrate_bps: 200_000,
+            container: "m4a",
+            extension: "m4a",
+            mime_type: "audio/mp4",
+            evidence: "upstream",
+          },
+          delivery: {
+            kind: "file",
+            sources: [
+              {
+                id: "aud-1",
+                url: "https://upos-sz-mirrorcos.bilivideo.com/p1-30280-1.m4s",
+              },
+              {
+                id: "aud-2",
+                url: "https://upos-sz-mirrorali.bilivideo.com/p1-30280-2.m4s",
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+}
+
+test("Bilibili DASH ranking & enqueue builders: best/1080p prefer H.264 > HEVC > AV1 DASH mux, audio picks M4A, multi-P subfolder & ZIP fallback", () => {
+  const media = buildSampleBilibiliDashMedia();
+  const item = media.items[0];
+  const apiOrigin = "https://snap.dokitool.com";
+
+  // 1) "best" picks 1080p H.264 DASH mux over HEVC/AV1 and over 720p durl
+  const bestPlan = extensionDownloadMod.selectVariantByPreference(
+    item,
+    media.attachments,
+    "best",
+    apiOrigin,
+  );
+  assert.ok(bestPlan);
+  assert.equal(bestPlan.variant.id, "dash-80-avc");
+  assert.ok(bestPlan.dashMux);
+  assert.equal(bestPlan.dashMux.outputContainer, "mp4");
+  assert.deepEqual(bestPlan.dashMux.videoRoutes, [
+    "https://upos-sz-mirrorcos.bilivideo.com/p1-1080-avc-1.m4s",
+    "https://upos-sz-mirrorali.bilivideo.com/p1-1080-avc-2.m4s",
+  ]);
+  assert.deepEqual(bestPlan.dashMux.audioRoutes, [
+    "https://upos-sz-mirrorcos.bilivideo.com/p1-30280-1.m4s",
+    "https://upos-sz-mirrorali.bilivideo.com/p1-30280-2.m4s",
+  ]);
+
+  // 2) "1080p" also picks 1080p H.264 DASH mux (even if a 4K DASH variant exists)
+  const itemWith4k = {
+    ...item,
+    variants: [
+      {
+        ...item.variants[2],
+        id: "dash-120-avc",
+        label: "4K",
+        metadata: {
+          ...item.variants[2].metadata,
+          width: 3840,
+          height: 2160,
+          video_bitrate_bps: 8_000_000,
+        },
+      },
+      ...item.variants,
+    ],
+  };
+  assert.equal(
+    extensionDownloadMod.selectVariantByPreference(
+      itemWith4k,
+      media.attachments,
+      "best",
+      apiOrigin,
+    )?.variant.id,
+    "dash-120-avc",
+  );
+  assert.equal(
+    extensionDownloadMod.selectVariantByPreference(
+      itemWith4k,
+      media.attachments,
+      "1080p",
+      apiOrigin,
+    )?.variant.id,
+    "dash-80-avc",
+  );
+
+  // 3) Codec tiebreaker when H.264 absent: HEVC beats AV1 even when AV1 appears first
+  const noH264Item = {
+    ...item,
+    variants: item.variants.filter((v) => v.id !== "dash-80-avc"),
+  };
+  assert.equal(
+    extensionDownloadMod.selectVariantByPreference(
+      noH264Item,
+      media.attachments,
+      "best",
+      apiOrigin,
+    )?.variant.id,
+    "dash-80-hevc",
+  );
+
+  // 4) Equal resolution & fps: 1080p DASH H.264 beats 1080p durl (isDirectFile must not block higher-bitrate/codec DASH)
+  const equalResItem = {
+    ...item,
+    variants: [
+      {
+        id: "durl-80",
+        label: "1080p",
+        metadata: {
+          width: 1920,
+          height: 1080,
+          fps: 30,
+          has_audio: true,
+          container: "mp4",
+          extension: "mp4",
+          mime_type: "video/mp4",
+        },
+        delivery: {
+          kind: "file",
+          sources: [
+            {
+              id: "d80",
+              url: "https://upos-sz-mirrorcos.bilivideo.com/p1-durl-1080p.mp4",
+            },
+          ],
+        },
+      },
+      item.variants[2], // dash-80-avc (2.6 Mbps)
+    ],
+    default: {
+      variant_id: "durl-80",
+      source_id: "d80",
+      url: "https://upos-sz-mirrorcos.bilivideo.com/p1-durl-1080p.mp4",
+    },
+  };
+  assert.equal(
+    extensionDownloadMod.selectVariantByPreference(
+      equalResItem,
+      media.attachments,
+      "best",
+      apiOrigin,
+    )?.variant.id,
+    "dash-80-avc",
+  );
+
+  // 5) "audio" preference picks background_audio M4A attachment -> direct_file .m4a
+  const audioPlan = extensionDownloadMod.selectVariantByPreference(
+    item,
+    media.attachments,
+    "audio",
+    apiOrigin,
+  );
+  assert.ok(audioPlan);
+  assert.equal(audioPlan.isAudioOnly, true);
+  assert.equal(audioPlan.target.kind, "file");
+  const audioEnqueue = extensionDownloadMod.buildEnqueueItemsForMedia(media, {
+    apiOrigin,
+    qualityPreference: "audio",
+  });
+  assert.equal(audioEnqueue.length, 1);
+  assert.equal(audioEnqueue[0].spec.kind, "direct_file");
+  assert.ok(audioEnqueue[0].spec.filename.endsWith(".m4a"));
+
+  // 6) Explicit variantSelection can target dash-80-av1 directly
+  const explicitEnqueue = extensionDownloadMod.buildEnqueueItemsForMedia(media, {
+    apiOrigin,
+    variantSelections: { p1: { variant_id: "dash-80-av1" } },
+  });
+  assert.equal(explicitEnqueue.length, 1);
+  assert.equal(explicitEnqueue[0].spec.kind, "dash_mux");
+  assert.match(explicitEnqueue[0].spec.dashMux.videoRoutes[0], /1080-av1\.m4s/);
+
+  // 7) Multi-P Bilibili with batchSaveMode="zip" falls back safely to subfolder dash_mux items (never crashes!)
+  const multiPMedia = buildSampleBilibiliDashMedia({ multiP: true });
+  const multiEnqueue = extensionDownloadMod.buildEnqueueItemsForMedia(
+    multiPMedia,
+    {
+      apiOrigin,
+      qualityPreference: "best",
+      batchSaveMode: "zip",
+      subfolderPrefix: "DokiTool",
+    },
+  );
+  assert.equal(multiEnqueue.length, 2);
+  assert.equal(multiEnqueue[0].spec.kind, "dash_mux");
+  assert.equal(multiEnqueue[1].spec.kind, "dash_mux");
+  assert.match(multiEnqueue[0].spec.filename, /^DokiTool\/.*\/001_.*\.mp4$/);
+  assert.match(multiEnqueue[1].spec.filename, /^DokiTool\/.*\/002_.*\.mp4$/);
+
+  // 8) Checklist subfolder builder produces dash_mux items & checklist ZIP builder declines gracefully
+  const settings = {
+    ...storage.DEFAULT_EXTENSION_SETTINGS,
+    apiBaseUrl: apiOrigin,
+    qualityPreference: "best",
+  };
+  const checklistEntries = multiPMedia.items.map((it, idx) => ({
+    item: it,
+    ordinalIndex: idx + 1,
+  }));
+  const subItems = uiTargetHelpersMod.buildChecklistSubfolderEnqueueItems({
+    media: multiPMedia,
+    entries: checklistEntries,
+    totalCount: 2,
+    settings,
+    livePhotoFilter: "both",
+  });
+  assert.equal(subItems.length, 2);
+  assert.equal(subItems[0].spec.kind, "dash_mux");
+  assert.equal(subItems[1].spec.kind, "dash_mux");
+
+  const zipDecision = uiTargetHelpersMod.buildChecklistZipEnqueueItem({
+    media: multiPMedia,
+    entries: checklistEntries,
+    totalCount: 2,
+    settings,
+    livePhotoFilter: "both",
+  });
+  assert.equal(zipDecision.ok, false);
+  assert.match(zipDecision.reason, /DASH/);
+});
+
+test("Bilibili DASH SidePanel UI: buildSidePanelQualityOptions & SidePanelResult.vue render DASH 合流 badge, H.264/HEVC/AV1, 约 XX MB, keep durl <video> preview, disable 复制直链, and enqueue dash_mux", async () => {
+  const SidePanelResult = await loadSidePanelSfc(
+    "../src/extension/components/SidePanelResult.vue",
+  );
+  const media = buildSampleBilibiliDashMedia();
+  const apiOrigin = "https://snap.dokitool.com";
+  const settings = {
+    ...storage.DEFAULT_EXTENSION_SETTINGS,
+    apiBaseUrl: apiOrigin,
+    qualityPreference: "best",
+  };
+
+  // Verify buildSidePanelQualityOptions details first
+  const options = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    media,
+    media.items[0],
+    apiOrigin,
+  );
+  const avcOpt = options.find((o) => o.variant.id === "dash-80-avc");
+  const hevcOpt = options.find((o) => o.variant.id === "dash-80-hevc");
+  const av1Opt = options.find((o) => o.variant.id === "dash-80-av1");
+  const durlOpt = options.find((o) => o.variant.id === "durl-64");
+  const audioOpt = options.find((o) => o.kind === "attachment");
+
+  assert.ok(avcOpt && avcOpt.downloadable && avcOpt.isDashMux);
+  assert.ok(hevcOpt && hevcOpt.downloadable && hevcOpt.isDashMux);
+  assert.ok(av1Opt && av1Opt.downloadable && av1Opt.isDashMux);
+  assert.ok(durlOpt && durlOpt.downloadable && !durlOpt.isDashMux);
+  assert.ok(audioOpt && audioOpt.downloadable && audioOpt.isAudioOnly);
+
+  // Estimated size = Math.round(((2_600_000 + 200_000) * 120_000) / 8000) = 42_000_000 -> "约 42.0 MB"
+  assert.equal(avcOpt.sizeBytes, 42_000_000);
+  assert.equal(avcOpt.sizeLabel, "约 42.0 MB");
+  assert.equal(avcOpt.audioBadge?.text, "DASH 合流");
+  assert.equal(avcOpt.directUrl, "");
+  assert.equal(audioOpt.sizeLabel, "约 3.0 MB");
+
+  // Preferred option under "best" & "1080p" is H.264 DASH; under "audio" is M4A attachment
+  assert.equal(
+    uiTargetHelpersMod.selectPreferredQualityOption(
+      options,
+      media.items[0],
+      "best",
+      media,
+      apiOrigin,
+    )?.variant.id,
+    "dash-80-avc",
+  );
+  assert.equal(
+    uiTargetHelpersMod.selectPreferredQualityOption(
+      options,
+      media.items[0],
+      "audio",
+      media,
+      apiOrigin,
+    )?.kind,
+    "attachment",
+  );
+
+  // Mount real SidePanelResult.vue SFC
+  const emittedEnqueues = [];
+  const view = mountSfcTree(
+    SidePanelResult,
+    {
+      media,
+      workFingerprint: "bilibili:BV1GJ411x7h7",
+      isSaved: false,
+      settings,
+      resolvingItemIds: new Set(),
+    },
+    {
+      onEnqueueDownloads: (payload) => emittedEnqueues.push(payload),
+    },
+  );
+
+  try {
+    await view.flush();
+    const text = view.textOf();
+
+    // Renders DASH 合流 badge, H.264 / HEVC / AV1, 30 fps, 约 42.0 MB estimated size, and audio attachment
+    assert.ok(text.includes("DASH 合流"), "renders DASH 合流 badge");
+    assert.ok(text.includes("H.264"), "renders H.264 codec chip");
+    assert.ok(text.includes("HEVC"), "renders HEVC codec chip");
+    assert.ok(text.includes("AV1"), "renders AV1 codec chip");
+    assert.ok(text.includes("30 fps"), "renders fps chip");
+    assert.ok(text.includes("约 42.0 MB"), "renders estimated DASH size");
+    assert.ok(text.includes("原声音频 (M4A)"), "renders standalone M4A audio option");
+
+    // Top <video> stage stays bound to playable durl MP4 URL while 1080p DASH is selected!
+    const stageVideos = view.findAll((n) => n.type === "video");
+    assert.equal(stageVideos.length, 1);
+    assert.equal(
+      stageVideos[0].props.src,
+      "https://upos-sz-mirrorcos.bilivideo.com/p1-durl-720p.mp4",
+    );
+
+    // Primary CTA clearly says "下载 1080p 无损合流 (MP4)"
+    const mainBtn = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__main"),
+    )[0];
+    assert.ok(mainBtn);
+    assert.ok(
+      view.textOf(mainBtn).includes("下载 1080p 无损合流 (MP4)"),
+      `expected primary CTA label, got: ${view.textOf(mainBtn)}`,
+    );
+
+    // 复制直链 button is disabled with explanatory tooltip for dash_mux
+    const copyBtn = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__copy"),
+    )[0];
+    assert.ok(copyBtn);
+    assert.equal(copyBtn.props.disabled, true);
+    assert.equal(copyBtn.props.title, "音视频分离流需经扩展无损合流");
+
+    // Clicking primary CTA enqueues kind: "dash_mux" with H.264 video + 30280 audio routes
+    await view.fire(mainBtn, "onClick");
+    assert.equal(emittedEnqueues.length, 1);
+    assert.equal(emittedEnqueues[0].items.length, 1);
+    assert.equal(emittedEnqueues[0].items[0].spec.kind, "dash_mux");
+    assert.deepEqual(emittedEnqueues[0].items[0].spec.dashMux.videoRoutes, [
+      "https://upos-sz-mirrorcos.bilivideo.com/p1-1080-avc-1.m4s",
+      "https://upos-sz-mirrorali.bilivideo.com/p1-1080-avc-2.m4s",
+    ]);
+
+    // Switching to 720p durl re-enables 复制直链
+    const durlBtn = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-variant-card") &&
+        view.textOf(n).includes("720p"),
+    )[0];
+    await view.fire(durlBtn, "onClick");
+    const copyBtnAfterDurl = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__copy"),
+    )[0];
+    assert.equal(copyBtnAfterDurl.props.disabled, false);
+
+    // Switching to standalone M4A audio attachment updates CTA and enqueues direct_file .m4a
+    const audioBtn = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-variant-card") &&
+        view.textOf(n).includes("原声音频 (M4A)"),
+    )[0];
+    await view.fire(audioBtn, "onClick");
+    const mainBtnAfterAudio = view.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__main"),
+    )[0];
+    assert.ok(
+      view.textOf(mainBtnAfterAudio).includes("下载音频 (M4A)"),
+      `expected audio CTA label, got: ${view.textOf(mainBtnAfterAudio)}`,
+    );
+    await view.fire(mainBtnAfterAudio, "onClick");
+    assert.equal(emittedEnqueues.length, 2);
+    assert.equal(emittedEnqueues[1].items[0].spec.kind, "direct_file");
+    assert.ok(emittedEnqueues[1].items[0].spec.filename.endsWith(".m4a"));
+  } finally {
+    view.unmount();
+  }
+});
+
+test("executeDashMux & runDashMuxToOpfs: real mediabunny lossless MP4 mux (H.264/HEVC/AV1 + AAC), multi-route fallback, UNWHITELISTED_CDN PCDN rejection, abort cleanup, and 0 OPFS residue", async () => {
+  // 1) Test H.264 (with multi-route fallback + truncation recovery), HEVC, and AV1 real lossless muxing
+  for (const codec of ["avc", "hevc", "av1"]) {
+    const { videoBytes, audioBytes } =
+      await createSyntheticDashTrackBuffers(codec);
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const progressEvents = [];
+    const errors = [];
+    const handoffs = [];
+    const observedFetches = [];
+    const opfsSnapshotAtHandoff = [];
+
+    const mockFetch = async (url, init) => {
+      observedFetches.push({
+        url: String(url),
+        credentials: init?.credentials,
+        referrerPolicy: init?.referrerPolicy,
+      });
+      if (String(url).includes("video-bad-403.m4s")) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      if (String(url).includes("audio-truncated.m4s")) {
+        // Declares Content-Length larger than actual body -> triggers truncation guard & fallback!
+        const partial = audioBytes.slice(0, Math.floor(audioBytes.length / 2));
+        return new Response(partial, {
+          status: 200,
+          headers: {
+            "Content-Type": "audio/mp4",
+            "Content-Length": String(audioBytes.length + 500),
+          },
+        });
+      }
+      if (String(url).includes(`video-${codec}.m4s`)) {
+        return new Response(videoBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(videoBytes.length),
+          },
+        });
+      }
+      if (String(url).includes("audio-ok.m4s")) {
+        return new Response(audioBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "audio/mp4",
+            "Content-Length": String(audioBytes.length),
+          },
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: mockFetch,
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      mediabunnyImpl: mediabunny,
+      onProgress(msg) {
+        progressEvents.push(msg);
+      },
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        handoffs.push(msg);
+        opfsSnapshotAtHandoff.push(...opfs.files.keys());
+        // Read muxed MP4 right before releasing
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        assert.ok(blob, `${codec}: blob present during handoff`);
+        assert.equal(blob.type, "video/mp4");
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        // Release authoritatively
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        // Attach bytes for outer assertion
+        msg._verifiedBytes = bytes;
+        return { chromeDownloadId: 101 };
+      },
+    });
+
+    try {
+      executor.startTask(`dash-${codec}`, {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: [
+          `https://upos-sz-mirrorcos.bilivideo.com/video-${codec}.m4s`,
+        ],
+        filename: `DokiTool/bili-${codec}.mp4`,
+        mimeType: "video/mp4",
+        dashMux: {
+          videoRoutes:
+            codec === "avc"
+              ? [
+                  "https://upos-sz-mirrorcos.bilivideo.com/video-bad-403.m4s",
+                  `https://upos-sz-mirrorali.bilivideo.com/video-${codec}.m4s`,
+                ]
+              : [`https://upos-sz-mirrorcos.bilivideo.com/video-${codec}.m4s`],
+          audioRoutes:
+            codec === "avc"
+              ? [
+                  "https://upos-sz-mirrorcos.bilivideo.com/audio-truncated.m4s",
+                  "https://upos-sz-mirrorali.bilivideo.com/audio-ok.m4s",
+                ]
+              : ["https://upos-sz-mirrorcos.bilivideo.com/audio-ok.m4s"],
+          outputContainer: "mp4",
+        },
+      });
+
+      await executor.waitForIdle();
+
+      assert.equal(errors.length, 0, `${codec}: zero errors`);
+      assert.equal(handoffs.length, 1, `${codec}: single handoff`);
+
+      // All fetches strictly omit credentials & referrer
+      for (const req of observedFetches) {
+        assert.equal(req.credentials, "omit");
+        assert.equal(req.referrerPolicy, "no-referrer");
+      }
+
+      // Intermediate dokitool-ext-dash-v-* and dokitool-ext-dash-a-* MUST ALREADY be deleted before handoff!
+      assert.equal(
+        opfsSnapshotAtHandoff.length,
+        1,
+        `${codec}: only 1 output OPFS temp file exists during handoff (both intermediate track files cleaned)`,
+      );
+      assert.equal(
+        opfsSnapshotAtHandoff.some((n) => n.includes("-dash-v-") || n.includes("-dash-a-")),
+        false,
+        `${codec}: no intermediate dash-v/dash-a temp files remain at handoff`,
+      );
+
+      // After RELEASE_BLOB, ZERO OPFS files and ZERO Blob URLs remain!
+      assert.equal(opfs.files.size, 0, `${codec}: 0 OPFS residue after release`);
+      assert.equal(executor.getActiveOpfsTempNames().size, 0);
+      assert.equal(urlApi.activeBlobs.size, 0);
+
+      // Verify progress lifecycle: downloading (0-82%) -> muxing (82-98%, speed=0) -> saving (99%)
+      const statuses = progressEvents.map((e) => e.status);
+      const firstDl = statuses.indexOf("downloading");
+      const firstMux = statuses.indexOf("muxing");
+      const firstSave = statuses.indexOf("saving");
+      assert.ok(firstDl >= 0 && firstMux > firstDl && firstSave > firstMux);
+      const muxEvents = progressEvents.filter((e) => e.status === "muxing");
+      assert.ok(muxEvents.every((e) => e.percent >= 82 && e.percent <= 98));
+      assert.ok(muxEvents.every((e) => e.speed === 0));
+      assert.equal(muxEvents[0].statusText, "无损合流中...");
+
+      // Verify real MP4 container boxes (`ftyp` + `moov`) AND readable tracks via mediabunny!
+      const mergedBytes = handoffs[0]._verifiedBytes;
+      const latin1 = new TextDecoder("latin1").decode(mergedBytes);
+      assert.ok(latin1.includes("ftyp"), `${codec}: output MP4 contains ftyp box`);
+      assert.ok(latin1.includes("moov"), `${codec}: output MP4 contains moov box`);
+
+      const verifyIn = new mediabunny.Input({
+        source: new mediabunny.BufferSource(mergedBytes),
+        formats: mediabunny.ALL_FORMATS,
+      });
+      const [vTrack, aTrack] = await Promise.all([
+        verifyIn.getPrimaryVideoTrack(),
+        verifyIn.getPrimaryAudioTrack(),
+      ]);
+      assert.ok(vTrack, `${codec}: output MP4 has video track`);
+      assert.ok(aTrack, `${codec}: output MP4 has audio track`);
+      assert.equal(await vTrack.getCodec(), codec);
+      assert.equal(await aTrack.getCodec(), "aac");
+      verifyIn.dispose();
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 2) BufferTarget fallback when OPFS is absent (opfsStorage: null)
+  {
+    const { videoBytes, audioBytes } =
+      await createSyntheticDashTrackBuffers("avc");
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let handoffBytes = null;
+    let execNoOpfs;
+    execNoOpfs = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (url) =>
+        new Response(String(url).includes("v.m4s") ? videoBytes : audioBytes, {
+          status: 200,
+          headers: { "Content-Type": "video/mp4" },
+        }),
+      opfsStorage: null,
+      webLocks: null,
+      urlApi,
+      mediabunnyImpl: mediabunny,
+      onError(e) {
+        errors.push(e);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handoffBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          execNoOpfs.releaseBlob({ taskId: msg.taskId, blobUrl: msg.blobUrl });
+        }, 0);
+      },
+    });
+    try {
+      execNoOpfs.startTask("dash-no-opfs", {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/v.m4s"],
+        filename: "no-opfs.mp4",
+        mimeType: "video/mp4",
+        dashMux: {
+          videoRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/v.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/a.m4s"],
+          outputContainer: "mp4",
+        },
+      });
+      await execNoOpfs.waitForIdle();
+      assert.equal(errors.length, 0);
+      assert.ok(handoffBytes && handoffBytes.byteLength > 0);
+      const ascii = new TextDecoder("latin1").decode(handoffBytes);
+      assert.ok(ascii.includes("ftyp") && ascii.includes("moov"));
+    } finally {
+      execNoOpfs.dispose();
+    }
+  }
+
+  // 3) Unwhitelisted third-party PCDN rejection (UNWHITELISTED_CDN) without network request & 0 OPFS residue
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    const fetchedUrls = [];
+    const execPcdn = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (url, init) => {
+        fetchedUrls.push(String(url));
+        // Stall audio fetch until aborted by sibling video UNWHITELISTED_CDN failure
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      mediabunnyImpl: mediabunny,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload() {
+        throw new Error("must not handoff unwhitelisted PCDN");
+      },
+    });
+    try {
+      execPcdn.startTask("dash-pcdn-reject", {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://w9e959o.edge.mountaintoys.cn/pcdn-video.m4s"],
+        filename: "pcdn.mp4",
+        dashMux: {
+          videoRoutes: ["https://w9e959o.edge.mountaintoys.cn/pcdn-video.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/audio.m4s"],
+          outputContainer: "mp4",
+        },
+      });
+      await execPcdn.waitForIdle();
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].code, "UNWHITELISTED_CDN");
+      assert.equal(errors[0].unwhitelistedHost, "w9e959o.edge.mountaintoys.cn");
+      assert.equal(
+        fetchedUrls.some((u) => u.includes("mountaintoys.cn")),
+        false,
+        "unwhitelisted PCDN host must never be fetched",
+      );
+      assert.equal(opfs.files.size, 0, "0 OPFS temp files left after PCDN rejection");
+      assert.equal(execPcdn.getActiveOpfsTempNames().size, 0);
+    } finally {
+      execPcdn.dispose();
+    }
+  }
+
+  // 4) Abort during download AND abort mid-mux leave 0 OPFS temp files behind!
+  {
+    const { videoBytes, audioBytes } =
+      await createSyntheticDashTrackBuffers("avc");
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    const createdTempNames = [];
+
+    // 4a) Mid-mux abort directly via runDashMuxToOpfs
+    const abortCtrl = new AbortController();
+    let muxErr = null;
+    try {
+      await dashMuxEngineMod.runDashMuxToOpfs({
+        taskId: "dash-abort-mux",
+        spec: {
+          videoRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/v.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/a.m4s"],
+          outputContainer: "mp4",
+        },
+        signal: abortCtrl.signal,
+        mediabunnyMod: mediabunny,
+        async openOpfsSink(tid, _mime, tag) {
+          const dir = await opfs.storage.getDirectory();
+          const name = `${protocol.EXTENSION_OPFS_TEMP_PREFIX}${tag ? `${tag}-` : ""}${tid}-${createdTempNames.length}.tmp`;
+          createdTempNames.push(name);
+          const handle = await dir.getFileHandle(name, { create: true });
+          const rawWritable = await handle.createWritable();
+          let closed = false;
+          return {
+            tempName: name,
+            rawWritable,
+            async write(chunk) {
+              await rawWritable.write(chunk);
+            },
+            markWritableClosed() {
+              closed = true;
+            },
+            async closeAndGetBlob() {
+              if (!closed) {
+                closed = true;
+                await rawWritable.close();
+              }
+              return handle.getFile();
+            },
+            async cleanup() {
+              if (!closed) {
+                await rawWritable.abort?.();
+              }
+              await dir.removeEntry(name).catch(() => {});
+            },
+          };
+        },
+        async fetchTrackToOpfs({ role }) {
+          const dir = await opfs.storage.getDirectory();
+          const tag = role === "video" ? "dash-v" : "dash-a";
+          const name = `${protocol.EXTENSION_OPFS_TEMP_PREFIX}${tag}-abort-${createdTempNames.length}.tmp`;
+          createdTempNames.push(name);
+          const handle = await dir.getFileHandle(name, { create: true });
+          const writable = await handle.createWritable();
+          const data = role === "video" ? videoBytes : audioBytes;
+          await writable.write(data);
+          await writable.close();
+          const blob = await handle.getFile();
+          return {
+            blob,
+            byteLength: data.byteLength,
+            sink: {
+              tempName: name,
+              async write() {},
+              async closeAndGetBlob() {
+                return blob;
+              },
+              async cleanup() {
+                await dir.removeEntry(name).catch(() => {});
+              },
+            },
+          };
+        },
+        onProgress(update) {
+          if (update.status === "muxing" && !abortCtrl.signal.aborted) {
+            abortCtrl.abort();
+          }
+        },
+      });
+    } catch (err) {
+      muxErr = err;
+    }
+    assert.ok(muxErr, "mid-mux abort rejects cleanly");
+    assert.equal(muxErr.code, "USER_CANCELLED");
+    assert.equal(muxErr.cancelled, true);
+    assert.ok(
+      createdTempNames.some((n) => n.includes("dokitool-ext-dash-v-")) &&
+        createdTempNames.some((n) => n.includes("dokitool-ext-dash-a-")),
+      "intermediate track names use dokitool-ext-dash-v/a prefix",
+    );
+    assert.equal(opfs.files.size, 0, "0 OPFS files left after mid-mux abort");
+
+    // 4b) Mid-download abort via executor.cancelTask
+    let fetchStartedCount = 0;
+    const execAbort = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (_url, init) => {
+        fetchStartedCount += 1;
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      mediabunnyImpl: mediabunny,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload() {
+        throw new Error("must not handoff cancelled task");
+      },
+    });
+    try {
+      execAbort.startTask("dash-cancel-dl", {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/v.m4s"],
+        filename: "cancelled.mp4",
+        dashMux: {
+          videoRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/v.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/a.m4s"],
+          outputContainer: "mp4",
+        },
+      });
+      for (let i = 0; i < 40 && fetchStartedCount < 2; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      assert.equal(fetchStartedCount, 2, "video and audio download concurrently");
+      execAbort.cancelTask("dash-cancel-dl");
+      await execAbort.waitForIdle();
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].cancelled, true);
+      assert.equal(errors[0].code, "USER_CANCELLED");
+      assert.equal(opfs.files.size, 0, "0 OPFS files left after mid-download cancel");
+      assert.equal(execAbort.getActiveOpfsTempNames().size, 0);
+    } finally {
+      execAbort.dispose();
+    }
   }
 });

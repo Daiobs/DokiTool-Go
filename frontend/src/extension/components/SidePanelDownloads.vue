@@ -93,7 +93,10 @@ function formatStatusChip(task: ExtensionDownloadTask): {
     case "downloading":
       return { label: "下载中", tone: "active" };
     case "muxing":
-      return { label: "4K合流中", tone: "mux" };
+      return {
+        label: task.platform === "youtube" ? "4K合流中" : "无损合流中",
+        tone: "mux",
+      };
     case "saving":
       return { label: "落盘中", tone: "active" };
     case "completed":
