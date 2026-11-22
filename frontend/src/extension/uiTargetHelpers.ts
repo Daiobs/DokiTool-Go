@@ -929,6 +929,124 @@ export function findBestStandaloneAudioForYouTube(
   };
 }
 
+export function mergeMediaAttachmentsById(
+  existing: Attachment[] | undefined,
+  incoming: Attachment[] | undefined,
+): Attachment[] | undefined {
+  const base = existing ?? [];
+  const next = incoming ?? [];
+  if (!base.length && !next.length) return undefined;
+  if (!next.length) return existing;
+  const merged = [...base];
+  const indexById = new Map<string, number>();
+  for (let i = 0; i < merged.length; i++) {
+    const id = typeof merged[i]?.id === "string" ? merged[i].id : "";
+    if (id) indexById.set(id, i);
+  }
+  for (const att of next) {
+    if (!att) continue;
+    const id = typeof att.id === "string" ? att.id : "";
+    if (id && indexById.has(id)) {
+      merged[indexById.get(id)!] = att;
+    } else {
+      if (id) indexById.set(id, merged.length);
+      merged.push(att);
+    }
+  }
+  return merged;
+}
+
+export function isAttachmentApplicableToItem(
+  att: Attachment | null | undefined,
+  item: Pick<MediaItem, "id">,
+): boolean {
+  const attId = typeof att?.id === "string" ? att.id.trim() : "";
+  if (attId.startsWith("bilibili-audio-")) {
+    return attId === `bilibili-audio-${item.id}`;
+  }
+  return true;
+}
+
+function resolveItemScopedAudioAttachments(
+  media: Pick<UnifiedMedia, "platform" | "attachments">,
+  item: ReadyItem,
+  ctx: { apiOrigin: string },
+): Attachment[] {
+  const scoped: Attachment[] = [];
+  const seenPrimaryUrls = new Set<string>();
+  const expectedBiliAudioId = `bilibili-audio-${item.id}`;
+
+  for (const att of media.attachments ?? []) {
+    if (!isAttachmentApplicableToItem(att, item)) continue;
+    if (
+      (att.role === "background_audio" || att.resource?.role === "audio") &&
+      att.resource?.delivery?.kind === "file"
+    ) {
+      scoped.push(att);
+      const avail = availableSources(att.resource.delivery.sources);
+      const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
+      if (primarySrc) {
+        try {
+          const url = sourceUrl(primarySrc, ctx);
+          if (url) seenPrimaryUrls.add(url);
+        } catch {
+          // Ignore invalid source URL during dedupe check
+        }
+      }
+    }
+  }
+
+  // Fallback / authoritative episode audio: if this item carries ready DASH mux
+  // variants with a role:"audio" file leaf, surface the episode's own best M4A
+  // audio leaf even when media.attachments hasn't been merged for this part yet.
+  let bestMuxAudioLeaf: Resource | null = null;
+  let bestMuxAudioBitrate = -1;
+  let bestMuxAudioUrl = "";
+  for (const variant of item.variants) {
+    if (!readyVariant(variant) || variant.delivery.kind !== "mux") continue;
+    for (const res of variant.delivery.resources) {
+      if (res.role !== "audio" || res.delivery.kind !== "file") continue;
+      const avail = availableSources(res.delivery.sources);
+      const primarySrc = avail[0] ?? res.delivery.sources[0];
+      if (!primarySrc) continue;
+      let url = "";
+      try {
+        url = sourceUrl(primarySrc, ctx);
+      } catch {
+        continue;
+      }
+      if (!url) continue;
+      const bitrate = Number(
+        res.metadata?.audio_bitrate_bps || res.metadata?.bitrate_bps || 0,
+      );
+      if (!bestMuxAudioLeaf || bitrate > bestMuxAudioBitrate) {
+        bestMuxAudioLeaf = res;
+        bestMuxAudioBitrate = bitrate;
+        bestMuxAudioUrl = url;
+      }
+    }
+  }
+
+  if (
+    bestMuxAudioLeaf &&
+    bestMuxAudioUrl &&
+    !seenPrimaryUrls.has(bestMuxAudioUrl) &&
+    !scoped.some((att) => att.id === expectedBiliAudioId)
+  ) {
+    scoped.push({
+      id:
+        media.platform === "bilibili"
+          ? expectedBiliAudioId
+          : `mux-audio-${item.id}`,
+      role: "background_audio",
+      title: "原声音频 (M4A)",
+      resource: bestMuxAudioLeaf,
+    });
+  }
+
+  return scoped;
+}
+
 export function buildSidePanelQualityOptions(
   media: UnifiedMedia,
   item: MediaItem | null | undefined,
@@ -1164,7 +1282,12 @@ export function buildSidePanelQualityOptions(
     (opt) => opt.downloadable && opt.isAudioOnly,
   );
   if (item.type === "video" || item.type === "audio") {
-    for (const att of attachments) {
+    const scopedAudioAttachments = resolveItemScopedAudioAttachments(
+      media,
+      item,
+      ctx,
+    );
+    for (const att of scopedAudioAttachments) {
       if (
         (att.role === "background_audio" || att.resource?.role === "audio") &&
         att.resource?.delivery?.kind === "file"

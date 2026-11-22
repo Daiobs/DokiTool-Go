@@ -29,6 +29,7 @@ import {
   createSidePanelBroadcastBridge,
   getNextExtensionTheme,
   mergeEnqueuedTasks,
+  mergeMediaAttachmentsById,
   readCachedExtensionTheme,
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
@@ -459,11 +460,16 @@ function handleLazyItemResolve(
         rpc.data.media.items[0] ??
         null;
       if (resolvedItem && activeMedia.value) {
+        const mergedAttachments = mergeMediaAttachmentsById(
+          activeMedia.value.attachments,
+          rpc.data.media.attachments,
+        );
         activeMedia.value = {
           ...activeMedia.value,
           items: activeMedia.value.items.map((old) =>
             old.id === item.id ? resolvedItem : old,
           ),
+          ...(mergedAttachments ? { attachments: mergedAttachments } : {}),
         };
       }
       return resolvedItem;

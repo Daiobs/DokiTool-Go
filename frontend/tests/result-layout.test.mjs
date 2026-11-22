@@ -691,3 +691,114 @@ test('Bilibili DASH mux variants preserve durl default, surface Chrome extension
     view.app.unmount();
   }
 });
+
+test('Bilibili DASH audio attachment suppresses broken web <audio>/direct download in Music tab and guides to Chrome extension', async () => {
+  const durlP1 = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/p1_720p.mp4';
+  const durlP2 = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/p2_720p.mp4';
+  const m4sAudioP1 = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/p1_30280.m4s';
+  const biliAudioAttachment = {
+    id: 'bilibili-audio-BV1GJ411x7h7-p1',
+    role: 'background_audio',
+    title: '原声音频 (M4A)',
+    resource: {
+      id: 'audio-30280',
+      role: 'audio',
+      metadata: {
+        audio_codec: 'mp4a.40.2',
+        audio_bitrate_bps: 315000,
+        container: 'm4a',
+        extension: 'm4a',
+        mime_type: 'audio/mp4',
+        has_audio: true,
+        evidence: 'upstream',
+      },
+      delivery: { kind: 'file', sources: [{ id: 'a1', url: m4sAudioP1 }] },
+    },
+  };
+  const biliMultiData = {
+    platform: 'bilibili',
+    content_id: 'BV1GJ411x7h7',
+    title: 'B站分P音频测试',
+    source_url: 'https://www.bilibili.com/video/BV1GJ411x7h7',
+    items: [
+      {
+        id: 'BV1GJ411x7h7-p1',
+        type: 'video',
+        title: 'P1',
+        default: { variant_id: 'durl-p1', url: durlP1 },
+        variants: [fileVariant('durl-p1', durlP1, { width: 1280, height: 720, has_audio: true })],
+      },
+      {
+        id: 'BV1GJ411x7h7-p2',
+        type: 'video',
+        title: 'P2 无DASH',
+        default: { variant_id: 'durl-p2', url: durlP2 },
+        variants: [fileVariant('durl-p2', durlP2, { width: 1280, height: 720, has_audio: true })],
+      },
+    ],
+    default_item_id: 'BV1GJ411x7h7-p1',
+    attachments: [biliAudioAttachment],
+    author: { name: 'UP主', id: '42' },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: biliMultiData });
+
+  const view = await mount(biliMultiData);
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  let openExtensionCalls = 0;
+  let downloadMusicCalls = 0;
+  view.state.value = {
+    ...view.state.value,
+    onOpenExtension() { openExtensionCalls++; },
+    onDownloadMusic() { downloadMusicCalls++; },
+  };
+  await view.flush();
+
+  try {
+    // 1. P1 Music tab shows Chrome extension CTA instead of raw <audio> or HTTP-403 direct download
+    await view.tab('音乐');
+    assert.equal(view.elements('rs-music-player').length, 0, 'must NOT render broken <audio> for Referer-protected Bilibili .m4s');
+    const guides = view.elements('rs-bili-audio-guide');
+    assert.equal(guides.length, 1);
+    assert.ok(textOf(guides[0]).includes('来源头'));
+    const cta = view.elements('rs-bili-audio-cta')[0];
+    assert.ok(cta);
+    assert.equal(cta.props['data-bilibili-dash-audio-cta'], '');
+    assert.ok(textOf(cta).includes('安装 Chrome 扩展保存原声 M4A'));
+    cta.props.onClick();
+    await view.flush();
+    assert.equal(openExtensionCalls, 1);
+    assert.equal(downloadMusicCalls, 0, 'must NEVER trigger direct download-music on Bilibili DASH audio');
+
+    // 2. English locale renders English copy
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.ok(textOf(view.elements('rs-bili-audio-cta')[0]).includes('Get Chrome Extension for M4A Audio'));
+
+    // 3. Switching to P2 (durl-only) hides P1's part-scoped bilibili-audio attachment & falls back from Music tab
+    view.state.value = { ...view.state.value, locale: 'zh-CN' };
+    view.state.value.selection.selectIndex(1);
+    await view.flush();
+    assert.equal(
+      view.elements('rs-tab').some(node => textOf(node) === '音乐'),
+      false,
+      'P2 without DASH must not inherit P1 bilibili-audio-* tab',
+    );
+    assert.equal(view.elements('rs-bili-audio-guide').length, 0);
+
+    // 4. Non-Bilibili background_audio attachment (e.g. Douyin BGM) still renders native <audio> & Download button
+    view.state.value = { ...view.state.value, resultVersion: 2, resultData: video };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    await view.tab('音乐');
+    assert.equal(view.elements('rs-bili-audio-guide').length, 0);
+    assert.equal(view.elements('rs-music-player').length, 1);
+    assert.equal(view.elements('rs-music-player')[0].props.src, 'https://media.test/music.mp3');
+    const musicDownloadBtn = view.elements('rs-music')[0].children.find(c => hasClass(c, 'rs-btn--primary'));
+    assert.ok(musicDownloadBtn);
+    musicDownloadBtn.props.onClick();
+    await view.flush();
+    assert.equal(downloadMusicCalls, 1);
+  } finally {
+    view.app.unmount();
+  }
+});

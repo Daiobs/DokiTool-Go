@@ -86,6 +86,9 @@ const content: Record<string, Record<string, string>> = {
       "该高码率 DASH 档位需附带 B 站来源头并本地无损合流，安装 DokiTool Chrome 扩展即可一键保存",
     biliDashOpenGuide: "打开扩展安装指引",
     biliDashMuxCap: "DASH 无损合流",
+    biliDashAudioExplain:
+      "该 B 站独立 DASH 音轨需附带 B 站来源头才能读取，网页直连会被拒绝；安装 DokiTool Chrome 扩展即可零 Cookie 一键保存原声 M4A。",
+    biliDashAudioCta: "安装 Chrome 扩展保存原声 M4A",
   },
   en: {
     resultTitle: "Result",
@@ -175,6 +178,9 @@ const content: Record<string, Record<string, string>> = {
       "This high-bitrate DASH tier requires Bilibili referer headers and local lossless muxing. Install the DokiTool Chrome Extension to save it in one click.",
     biliDashOpenGuide: "Open Extension Guide",
     biliDashMuxCap: "DASH Lossless Mux",
+    biliDashAudioExplain:
+      "This standalone Bilibili DASH audio track requires Bilibili referer headers and cannot be fetched directly in the web page. Install the DokiTool Chrome Extension for cookie-free one-click M4A saving.",
+    biliDashAudioCta: "Get Chrome Extension for M4A Audio",
   },
 };
 

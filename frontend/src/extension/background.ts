@@ -1,5 +1,10 @@
 import { withTbvideoItems } from "../services/tbvideo";
-import type { MediaItem, UnifiedMedia, YouTubeHelperState } from "../types/media";
+import type {
+  Attachment,
+  MediaItem,
+  UnifiedMedia,
+  YouTubeHelperState,
+} from "../types/media";
 import { readyItem, validateMediaEnvelope } from "../utils/mediaContract";
 import {
   MIN_YOUTUBE_HELPER_VERSION,
@@ -1359,6 +1364,15 @@ export function createBackgroundController(
       return media;
     }
     const hydratedItems: MediaItem[] = [];
+    const mergedAttachments: Attachment[] = [...(media.attachments ?? [])];
+    const attachmentIdxById = new Map<string, number>();
+    for (let i = 0; i < mergedAttachments.length; i++) {
+      const id =
+        typeof mergedAttachments[i]?.id === "string"
+          ? mergedAttachments[i].id
+          : "";
+      if (id) attachmentIdxById.set(id, i);
+    }
     for (const item of media.items) {
       if (signal?.aborted) {
         throw new DOMException("Aborted", "AbortError");
@@ -1371,6 +1385,16 @@ export function createBackgroundController(
         );
         const matchedItem = resolvedMedia.items.find((c) => c.id === item.id);
         hydratedItems.push(matchedItem && readyItem(matchedItem) ? matchedItem : item);
+        for (const att of resolvedMedia.attachments ?? []) {
+          if (!att) continue;
+          const id = typeof att.id === "string" ? att.id : "";
+          if (id && attachmentIdxById.has(id)) {
+            mergedAttachments[attachmentIdxById.get(id)!] = att;
+          } else {
+            if (id) attachmentIdxById.set(id, mergedAttachments.length);
+            mergedAttachments.push(att);
+          }
+        }
       } else {
         hydratedItems.push(item);
       }
@@ -1378,6 +1402,7 @@ export function createBackgroundController(
     return {
       ...media,
       items: hydratedItems,
+      ...(mergedAttachments.length ? { attachments: mergedAttachments } : {}),
     };
   };
 

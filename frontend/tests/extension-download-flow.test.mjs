@@ -6187,4 +6187,373 @@ test("Bilibili CDN quirks: allows ISOBMFF binary mislabeled as application/json,
       executor.dispose();
     }
   }
+
+  // 3) P2 hardening: crafted payload starting with '{' followed by 'ftyp' (e.g. '{"a"ftyp...')
+  //    mislabeled as application/json must STILL be rejected and never treated as ISOBMFF.
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    const crafted = new TextEncoder().encode('{"a"ftypisom0000}');
+
+    const executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async () =>
+        new Response(crafted, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload() {
+        throw new Error("crafted JSON payload must not be handed off");
+      },
+    });
+    try {
+      executor.startTask("reject-crafted-json-ftyp", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/crafted-json.m4s"],
+        filename: "crafted.m4a",
+        mimeType: "audio/mp4",
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 1);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+});
+
+test("Multi-P Bilibili audio isolation: scopes bilibili-audio-* strictly per episode, merges lazy-resolved attachments, and synthesizes episode M4A from mux audio leaf", async () => {
+  const makePartMuxVariant = (partNum, audioUrl, videoUrl) => ({
+    id: `dash-80-avc-p${partNum}`,
+    label: "1080p",
+    metadata: {
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      video_codec: "avc1.640032",
+      audio_codec: "mp4a.40.2",
+      has_audio: true,
+      container: "mp4",
+      extension: "mp4",
+      mime_type: "video/mp4",
+    },
+    delivery: {
+      kind: "mux",
+      output: { container: "mp4", extension: "mp4", mime_type: "video/mp4" },
+      resources: [
+        {
+          id: `video-p${partNum}`,
+          role: "video",
+          metadata: { width: 1920, height: 1080, video_codec: "avc1.640032" },
+          delivery: { kind: "file", sources: [{ id: `v${partNum}`, url: videoUrl }] },
+        },
+        {
+          id: `audio-p${partNum}`,
+          role: "audio",
+          metadata: {
+            audio_codec: "mp4a.40.2",
+            audio_bitrate_bps: 315000,
+            container: "m4a",
+            extension: "m4a",
+            mime_type: "audio/mp4",
+            has_audio: true,
+          },
+          delivery: { kind: "file", sources: [{ id: `a${partNum}`, url: audioUrl }] },
+        },
+      ],
+    },
+  });
+
+  const makePartDurlVariant = (partNum, durlUrl) => ({
+    id: `durl-64-p${partNum}`,
+    label: "720p",
+    metadata: {
+      width: 1280,
+      height: 720,
+      video_codec: "avc1.64001F",
+      audio_codec: "mp4a.40.2",
+      has_audio: true,
+      container: "mp4",
+      extension: "mp4",
+      mime_type: "video/mp4",
+    },
+    delivery: { kind: "file", sources: [{ id: `d${partNum}`, url: durlUrl }] },
+  });
+
+  const p1AudioUrl = "https://upos-sz-mirrorcos.bilivideo.com/p1_audio_30280.m4s";
+  const p2AudioUrl = "https://upos-sz-mirrorcos.bilivideo.com/p2_audio_30280.m4s";
+  const p1DurlUrl = "https://upos-sz-mirrorcos.bilivideo.com/p1_720p.mp4";
+  const p2DurlUrl = "https://upos-sz-mirrorcos.bilivideo.com/p2_720p.mp4";
+  const p3DurlUrl = "https://upos-sz-mirrorcos.bilivideo.com/p3_720p.mp4";
+
+  const p1Item = {
+    id: "BV1MultiP001-p1",
+    type: "video",
+    index: 1,
+    title: "第一集",
+    default: { variant_id: "durl-64-p1", source_id: "d1", url: p1DurlUrl },
+    variants: [
+      makePartDurlVariant(1, p1DurlUrl),
+      makePartMuxVariant(1, p1AudioUrl, "https://upos-sz-mirrorcos.bilivideo.com/p1_1080p.m4s"),
+    ],
+  };
+  const p2Item = {
+    id: "BV1MultiP001-p2",
+    type: "video",
+    index: 2,
+    title: "第二集",
+    default: { variant_id: "durl-64-p2", source_id: "d2", url: p2DurlUrl },
+    variants: [
+      makePartDurlVariant(2, p2DurlUrl),
+      makePartMuxVariant(2, p2AudioUrl, "https://upos-sz-mirrorcos.bilivideo.com/p2_1080p.m4s"),
+    ],
+  };
+  const p3DurlOnlyItem = {
+    id: "BV1MultiP001-p3",
+    type: "video",
+    index: 3,
+    title: "第三集无DASH",
+    default: { variant_id: "durl-64-p3", source_id: "d3", url: p3DurlUrl },
+    variants: [makePartDurlVariant(3, p3DurlUrl)],
+  };
+
+  const p1Attachment = {
+    id: "bilibili-audio-BV1MultiP001-p1",
+    role: "background_audio",
+    title: "原声音频 (M4A)",
+    resource: {
+      id: "audio-p1",
+      role: "audio",
+      metadata: {
+        audio_codec: "mp4a.40.2",
+        audio_bitrate_bps: 315000,
+        container: "m4a",
+        extension: "m4a",
+        mime_type: "audio/mp4",
+        has_audio: true,
+      },
+      delivery: { kind: "file", sources: [{ id: "a1", url: p1AudioUrl }] },
+    },
+  };
+  const p2Attachment = {
+    id: "bilibili-audio-BV1MultiP001-p2",
+    role: "background_audio",
+    title: "原声音频 (M4A)",
+    resource: {
+      id: "audio-p2",
+      role: "audio",
+      metadata: {
+        audio_codec: "mp4a.40.2",
+        audio_bitrate_bps: 315000,
+        container: "m4a",
+        extension: "m4a",
+        mime_type: "audio/mp4",
+        has_audio: true,
+      },
+      delivery: { kind: "file", sources: [{ id: "a2", url: p2AudioUrl }] },
+    },
+  };
+
+  // 1) Even BEFORE media.attachments merges P2's attachment (only P1's attachment is present),
+  //    SidePanel quality options & audio preference MUST NEVER leak P1's audio into P2 or P3!
+  const unmergedMedia = {
+    platform: "bilibili",
+    content_id: "BV1MultiP001",
+    title: "多P测试合集",
+    source_url: "https://www.bilibili.com/video/BV1MultiP001",
+    default_item_id: p1Item.id,
+    items: [p1Item, p2Item, p3DurlOnlyItem],
+    attachments: [p1Attachment],
+  };
+
+  const p1Opts = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    unmergedMedia,
+    p1Item,
+    "https://snap.dokitool.com",
+  );
+  const p1AudioOpts = p1Opts.filter((o) => o.isAudioOnly);
+  assert.equal(p1AudioOpts.length, 1);
+  assert.equal(p1AudioOpts[0].directUrl, p1AudioUrl);
+
+  const p2OptsUnmerged = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    unmergedMedia,
+    p2Item,
+    "https://snap.dokitool.com",
+  );
+  const p2AudioOptsUnmerged = p2OptsUnmerged.filter((o) => o.isAudioOnly);
+  assert.equal(p2AudioOptsUnmerged.length, 1, "P2 synthesizes its own M4A from its mux audio leaf");
+  assert.equal(p2AudioOptsUnmerged[0].directUrl, p2AudioUrl, "P2 must use P2 audio URL, never P1");
+  assert.equal(p2AudioOptsUnmerged[0].key, "attachment:bilibili-audio-BV1MultiP001-p2");
+
+  const p3Opts = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    unmergedMedia,
+    p3DurlOnlyItem,
+    "https://snap.dokitool.com",
+  );
+  assert.equal(
+    p3Opts.filter((o) => o.isAudioOnly).length,
+    0,
+    "durl-only P3 must never inherit P1's bilibili-audio attachment",
+  );
+
+  // 2) After merging P2's attachment via mergeMediaAttachmentsById, keys remain identical & deduplicated
+  const mergedAttachments = uiTargetHelpersMod.mergeMediaAttachmentsById(
+    unmergedMedia.attachments,
+    [p2Attachment],
+  );
+  assert.equal(mergedAttachments.length, 2);
+  const mergedMedia = { ...unmergedMedia, attachments: mergedAttachments };
+  const p2OptsMerged = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    mergedMedia,
+    p2Item,
+    "https://snap.dokitool.com",
+  );
+  const p2AudioOptsMerged = p2OptsMerged.filter((o) => o.isAudioOnly);
+  assert.equal(p2AudioOptsMerged.length, 1, "merged P2 attachment must not duplicate synthesized audio");
+  assert.equal(p2AudioOptsMerged[0].directUrl, p2AudioUrl);
+  assert.equal(p2AudioOptsMerged[0].key, p2AudioOptsUnmerged[0].key);
+
+  // 3) buildEnqueueItemsForMedia with qualityPreference === "audio" routes P1->p1Audio, P2->p2Audio, P3->p3Durl
+  for (const mediaCandidate of [unmergedMedia, mergedMedia]) {
+    const audioBatch = extensionDownloadMod.buildEnqueueItemsForMedia(mediaCandidate, {
+      apiOrigin: "https://snap.dokitool.com",
+      qualityPreference: "audio",
+      batchSaveMode: "subfolder",
+      subfolderPrefix: "DokiTool",
+      forceSubfolder: true,
+    });
+    assert.equal(audioBatch.length, 3);
+    assert.equal(audioBatch[0].spec.kind, "direct_file");
+    assert.equal(audioBatch[0].spec.routes[0], p1AudioUrl);
+    assert.match(audioBatch[0].spec.filename, /\.m4a$/);
+    assert.equal(audioBatch[1].spec.kind, "direct_file");
+    assert.equal(audioBatch[1].spec.routes[0], p2AudioUrl, "P2 batch audio must download P2 audio bytes, never P1");
+    assert.match(audioBatch[1].spec.filename, /\.m4a$/);
+    assert.equal(audioBatch[2].spec.kind, "direct_file");
+    assert.equal(audioBatch[2].spec.routes[0], p3DurlUrl, "durl-only P3 must fall back to P3 video, never P1 audio");
+    assert.match(audioBatch[2].spec.filename, /\.mp4$/);
+  }
+
+  // 4) Background SW hydrateDeferredMediaItems merges resolved P2 attachments and downloads P1 & P2 distinct audio URLs
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const fetchedMediaUrls = [];
+    const { audioBytes: p1Bytes } = await createSyntheticDashTrackBuffers("avc");
+    const p2Bytes = new Uint8Array(p1Bytes.byteLength + 16);
+    p2Bytes.set(p1Bytes, 0);
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      if (s.includes("/api/resolve") && s.includes("item=BV1MultiP001-p2")) {
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "OK",
+            data: {
+              platform: "bilibili",
+              content_id: "BV1MultiP001",
+              title: "多P测试合集",
+              source_url: "https://www.bilibili.com/video/BV1MultiP001/?p=2",
+              default_item_id: p2Item.id,
+              items: [
+                { id: p1Item.id, type: "video", state: "deferred", index: 1, title: p1Item.title, default: null, default_unavailable_reason: "needs_resolve", resolve_url: "/api/resolve?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1MultiP001%2F%3Fp%3D1&item=BV1MultiP001-p1" },
+                p2Item,
+              ],
+              attachments: [p2Attachment],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (s.includes("/api/parse")) {
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "OK",
+            data: {
+              platform: "bilibili",
+              content_id: "BV1MultiP001",
+              title: "多P测试合集",
+              source_url: "https://www.bilibili.com/video/BV1MultiP001",
+              default_item_id: p1Item.id,
+              items: [
+                p1Item,
+                { id: p2Item.id, type: "video", state: "deferred", index: 2, title: p2Item.title, default: null, default_unavailable_reason: "needs_resolve", resolve_url: "/api/resolve?url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1MultiP001%2F%3Fp%3D2&item=BV1MultiP001-p2" },
+              ],
+              attachments: [p1Attachment],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (s === p1AudioUrl) {
+        fetchedMediaUrls.push(s);
+        return new Response(p1Bytes, { status: 200, headers: { "Content-Type": "audio/mp4" } });
+      }
+      if (s === p2AudioUrl) {
+        fetchedMediaUrls.push(s);
+        return new Response(p2Bytes, { status: 200, headers: { "Content-Type": "audio/mp4" } });
+      }
+      throw new Error(`Unexpected URL in multi-P test: ${s}`);
+    };
+
+    let offscreenCtrl = null;
+    const env = createMockMv3Environment({
+      autoCompleteDownloads: true,
+      async spawnOffscreenHook() {
+        if (!offscreenCtrl) {
+          offscreenCtrl = offscreenMod.createOffscreenController({
+            chrome: env.chrome,
+            fetchImpl: mockFetch,
+            opfsStorage: opfs.storage,
+            webLocks: opfs.locks,
+            urlApi,
+          });
+        }
+      },
+    });
+    const extStorage = storage.createExtensionStorage();
+    await extStorage.updateSettings({
+      qualityPreference: "audio",
+      batchSaveMode: "subfolder",
+      subfolderPrefix: "DokiTool",
+    });
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: extStorage,
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+    try {
+      const rpc = await env.chrome.runtime.sendMessage({
+        type: "ENQUEUE_BATCH_URLS",
+        urls: ["https://www.bilibili.com/video/BV1MultiP001"],
+        qualityPreference: "audio",
+        batchSaveMode: "subfolder",
+      });
+      assert.equal(rpc.ok, true);
+      await bg.waitForIdle();
+      await offscreenCtrl?.executor.waitForIdle();
+      const stateRpc = await env.chrome.runtime.sendMessage({ type: "GET_INITIAL_STATE" });
+      assert.deepEqual(
+        fetchedMediaUrls.sort(),
+        [p1AudioUrl, p2AudioUrl].sort(),
+        `tasks=${JSON.stringify(stateRpc?.data?.tasks)}`,
+      );
+      assert.equal(env.downloadCalls.length, 2);
+      assert.ok(env.downloadCalls.every((d) => d.filename.endsWith(".m4a")));
+    } finally {
+      offscreenCtrl?.dispose();
+      bg.dispose();
+    }
+  }
 });

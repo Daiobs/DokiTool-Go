@@ -417,13 +417,14 @@ export function selectVariantByPreference(
       });
     }
 
-    for (const att of attachments ?? []) {
+    const seenAttachmentAudioUrls = new Set<string>();
+    const appendAttachmentAudioPlan = (att: Attachment) => {
       if (
         (att?.role === "background_audio" || att?.resource?.role === "audio") &&
         att.resource?.delivery?.kind === "file"
       ) {
         const avail = availableSources(att.resource.delivery.sources);
-        if (!avail.length) continue;
+        if (!avail.length) return;
         const syntheticVariant: ReadyVariant = {
           id: att.id || `att-${att.resource.id || "audio"}`,
           state: "ready",
@@ -444,7 +445,11 @@ export function selectVariantByPreference(
           { variant_id: syntheticVariant.id },
           context,
         );
-        if (!("variant" in target)) continue;
+        if (!("variant" in target)) return;
+        if (target.kind === "file" && target.url) {
+          if (seenAttachmentAudioUrls.has(target.url)) return;
+          seenAttachmentAudioUrls.add(target.url);
+        }
         const ext = (
           syntheticVariant.metadata?.extension ||
           syntheticVariant.metadata?.container ||
@@ -459,6 +464,34 @@ export function selectVariantByPreference(
             syntheticVariant.metadata?.audio_bitrate_bps ||
             syntheticVariant.metadata?.bitrate_bps ||
             0,
+        });
+      }
+    };
+
+    for (const att of attachments ?? []) {
+      const attId = typeof att?.id === "string" ? att.id.trim() : "";
+      // Part-scoped Bilibili DASH audio attachments must strictly match this episode's item.id
+      if (
+        attId.startsWith("bilibili-audio-") &&
+        attId !== `bilibili-audio-${item.id}`
+      ) {
+        continue;
+      }
+      appendAttachmentAudioPlan(att);
+    }
+
+    // Authoritative fallback: also inspect this episode's own ready mux variants'
+    // audio leaf so multi-P Bilibili (or any DASH mux episode) always picks its own
+    // part-specific audio stream even if media.attachments only holds another part.
+    for (const variant of readyVariants) {
+      if (variant.delivery.kind !== "mux") continue;
+      for (const res of variant.delivery.resources) {
+        if (res.role !== "audio" || res.delivery.kind !== "file") continue;
+        appendAttachmentAudioPlan({
+          id: `mux-audio-${item.id}`,
+          role: "background_audio",
+          title: "原声音频 (M4A)",
+          resource: res,
         });
       }
     }
@@ -2079,10 +2112,33 @@ export function createOffscreenDownloadExecutor(
 
   const hasIsoBmffBoxHeader = (bytes: Uint8Array): boolean => {
     if (bytes.byteLength < 8) return false;
+    // Reject obvious JSON/HTML/whitespace leading bytes before reading big-endian boxSize
+    const first = bytes[0];
+    if (
+      first === 0x7b || // '{'
+      first === 0x5b || // '['
+      first === 0x22 || // '"'
+      first === 0x3c || // '<'
+      first === 0x20 || // ' '
+      first === 0x09 || // '\t'
+      first === 0x0a || // '\n'
+      first === 0x0d // '\r'
+    ) {
+      return false;
+    }
     const boxSize =
       ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
     if (boxSize !== 1 && boxSize < 8) return false;
     const boxType = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    // Structural header boxes (ftyp/styp/sidx/free/skip/wide) never exceed 64 MiB
+    if (
+      boxType !== "mdat" &&
+      boxType !== "moov" &&
+      boxType !== "moof" &&
+      boxSize > 64 * 1024 * 1024
+    ) {
+      return false;
+    }
     return (
       boxType === "ftyp" ||
       boxType === "styp" ||
