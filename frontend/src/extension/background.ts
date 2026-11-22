@@ -1,12 +1,33 @@
 import { withTbvideoItems } from "../services/tbvideo";
-import type { MediaItem, UnifiedMedia, YouTubeHelperState } from "../types/media";
-import { readyItem, validateMediaEnvelope } from "../utils/mediaContract";
+import type {
+  Attachment,
+  MediaItem,
+  ReadyVariant,
+  Resource,
+  UnifiedMedia,
+  YouTubeHelperState,
+} from "../types/media";
+import {
+  availableSources,
+  deliveryRoutes,
+  readyItem,
+  readyVariant,
+  sourceUrl,
+  validateMediaEnvelope,
+  type TargetContext,
+} from "../utils/mediaContract";
 import {
   MIN_YOUTUBE_HELPER_VERSION,
   YOUTUBE_HELPER_SCRIPT_URL,
   YOUTUBE_HELPER_VERSION,
+  selectYouTubeMuxPair,
   type YouTubeHelperContextResponse,
 } from "../utils/youtubeHelperCore";
+import {
+  computeEarliestExpiresAtMs,
+  extractDashMuxSpec,
+  extractVariantEarliestExpiresAtMs,
+} from "./dashMuxSpec";
 import {
   EXTENSION_DNR_RULE_IDS,
   buildExtensionDnrRules,
@@ -46,6 +67,7 @@ import {
   type ExtensionStateSnapshot,
   type HandOffBlobDownloadResult,
   type MatchedPlatformUrl,
+  type MediaRefreshContext,
   type OffscreenDownloadSpec,
   type OffscreenResponseMap,
   type OffscreenToBackgroundMessage,
@@ -1359,6 +1381,15 @@ export function createBackgroundController(
       return media;
     }
     const hydratedItems: MediaItem[] = [];
+    const mergedAttachments: Attachment[] = [...(media.attachments ?? [])];
+    const attachmentIdxById = new Map<string, number>();
+    for (let i = 0; i < mergedAttachments.length; i++) {
+      const id =
+        typeof mergedAttachments[i]?.id === "string"
+          ? mergedAttachments[i].id
+          : "";
+      if (id) attachmentIdxById.set(id, i);
+    }
     for (const item of media.items) {
       if (signal?.aborted) {
         throw new DOMException("Aborted", "AbortError");
@@ -1370,7 +1401,23 @@ export function createBackgroundController(
           signal,
         );
         const matchedItem = resolvedMedia.items.find((c) => c.id === item.id);
-        hydratedItems.push(matchedItem && readyItem(matchedItem) ? matchedItem : item);
+        hydratedItems.push(
+          matchedItem && readyItem(matchedItem)
+            ? matchedItem.resolve_url
+              ? matchedItem
+              : { ...matchedItem, resolve_url: item.resolve_url }
+            : item,
+        );
+        for (const att of resolvedMedia.attachments ?? []) {
+          if (!att) continue;
+          const id = typeof att.id === "string" ? att.id : "";
+          if (id && attachmentIdxById.has(id)) {
+            mergedAttachments[attachmentIdxById.get(id)!] = att;
+          } else {
+            if (id) attachmentIdxById.set(id, mergedAttachments.length);
+            mergedAttachments.push(att);
+          }
+        }
       } else {
         hydratedItems.push(item);
       }
@@ -1378,6 +1425,7 @@ export function createBackgroundController(
     return {
       ...media,
       items: hydratedItems,
+      ...(mergedAttachments.length ? { attachments: mergedAttachments } : {}),
     };
   };
 
@@ -1406,15 +1454,506 @@ export function createBackgroundController(
     };
   };
 
+  const isSpecExpiredForDispatch = (spec: OffscreenDownloadSpec): boolean => {
+    const exp = spec.refreshContext?.expiresAtMs;
+    return (
+      typeof exp === "number" &&
+      Number.isFinite(exp) &&
+      exp <= nowFn() + 5_000
+    );
+  };
+
+  const refreshSpecFromContext = async (
+    originalSpec: OffscreenDownloadSpec,
+    settings: ExtensionSettings,
+    signal?: AbortSignal,
+  ): Promise<OffscreenDownloadSpec> => {
+    const ctx = originalSpec.refreshContext;
+    if (!ctx) {
+      throw new Error("缺少可重新解析的媒体上下文");
+    }
+
+    const validated = validateApiBaseUrl(settings.apiBaseUrl);
+    const apiOrigin = validated.ok ? validated.origin : originalSpec.apiOrigin;
+    const now = nowFn();
+    const targetCtx: TargetContext = { apiOrigin, now };
+
+    let freshMedia: UnifiedMedia;
+    if (ctx.resolveUrl && ctx.resolveUrl.startsWith("/api/resolve?")) {
+      freshMedia = await resolveLazyItemInternal(ctx.resolveUrl, settings, signal);
+    } else if (ctx.parseUrl) {
+      const matched = matchSupportedPlatformUrl(ctx.parseUrl);
+      if (!matched) {
+        throw new Error("刷新链接不在受支持平台白名单内");
+      }
+      freshMedia = await parseSupportedUrlInternal(matched, settings, signal);
+      const deferredMatch = freshMedia.items.find(
+        (it) =>
+          it.id === ctx.itemId &&
+          it.state === "deferred" &&
+          Boolean(it.resolve_url),
+      );
+      if (
+        deferredMatch &&
+        deferredMatch.state === "deferred" &&
+        deferredMatch.resolve_url
+      ) {
+        const resolvedPart = await resolveLazyItemInternal(
+          deferredMatch.resolve_url,
+          settings,
+          signal,
+        );
+        const resolvedItem = resolvedPart.items.find((it) => it.id === ctx.itemId);
+        if (resolvedItem && readyItem(resolvedItem)) {
+          freshMedia = {
+            ...freshMedia,
+            items: freshMedia.items.map((it) =>
+              it.id === ctx.itemId
+                ? resolvedItem.resolve_url
+                  ? resolvedItem
+                  : { ...resolvedItem, resolve_url: deferredMatch.resolve_url }
+                : it,
+            ),
+            attachments: [
+              ...(freshMedia.attachments ?? []),
+              ...(resolvedPart.attachments ?? []),
+            ],
+          };
+        }
+      }
+    } else {
+      throw new Error("缺少可重新解析的媒体链接");
+    }
+
+    const targetItem =
+      freshMedia.items.find((it) => it.id === ctx.itemId) ??
+      (freshMedia.items.length === 1 ? freshMedia.items[0] : undefined);
+    if (!targetItem || !readyItem(targetItem)) {
+      throw new Error("重新解析后未找到对应的就绪媒体条目");
+    }
+
+    const buildNextRefreshContext = (
+      expiresAtMs?: number,
+    ): MediaRefreshContext => {
+      const { expiresAtMs: _staleExp, ...baseCtx } = ctx;
+      const nextResolveUrl =
+        targetItem.resolve_url?.trim() || baseCtx.resolveUrl;
+      return {
+        ...baseCtx,
+        ...(nextResolveUrl ? { resolveUrl: nextResolveUrl } : {}),
+        ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+      };
+    };
+
+    const stripTransportFields = (
+      base: OffscreenDownloadSpec,
+    ): Omit<
+      OffscreenDownloadSpec,
+      "segments" | "youtubeMux" | "dashMux" | "zipEntries" | "sizeBytes"
+    > => {
+      const {
+        segments: _s,
+        youtubeMux: _y,
+        dashMux: _d,
+        zipEntries: _z,
+        sizeBytes: _sz,
+        ...rest
+      } = base;
+      return rest;
+    };
+
+    const basePreserved = stripTransportFields(originalSpec);
+
+    // 1) Attachment-targeted refresh (e.g. standalone Bilibili M4A or BGM)
+    if (ctx.attachmentId) {
+      const expectedBiliId = `bilibili-audio-${targetItem.id}`;
+      let audioRes: Resource | undefined = freshMedia.attachments?.find(
+        (att) =>
+          att &&
+          (att.id === ctx.attachmentId ||
+            (ctx.attachmentId!.startsWith("bilibili-audio-") &&
+              att.id === expectedBiliId)) &&
+          att.resource?.delivery?.kind === "file",
+      )?.resource;
+
+      if (
+        !audioRes &&
+        (ctx.attachmentId.startsWith("bilibili-audio-") ||
+          ctx.attachmentId.startsWith("mux-audio-"))
+      ) {
+        for (const v of targetItem.variants) {
+          if (!readyVariant(v) || v.delivery.kind !== "mux") continue;
+          const leaf = v.delivery.resources.find(
+            (r) => r.role === "audio" && r.delivery.kind === "file",
+          );
+          if (leaf) {
+            audioRes = leaf;
+            break;
+          }
+        }
+      }
+
+      if (audioRes && audioRes.delivery.kind === "file") {
+        const avail = availableSources(audioRes.delivery.sources, now);
+        const routes = deliveryRoutes(avail, targetCtx);
+        if (routes.length > 0) {
+          const expiresAtMs = computeEarliestExpiresAtMs(avail);
+          const sizeBytes = avail[0]?.size_bytes ?? originalSpec.sizeBytes;
+          return {
+            ...basePreserved,
+            kind: "direct_file",
+            apiOrigin,
+            routes,
+            ...(sizeBytes ? { sizeBytes } : {}),
+            refreshContext: buildNextRefreshContext(expiresAtMs),
+          };
+        }
+      }
+    }
+
+    // 2) Variant-targeted refresh
+    if (ctx.variantId) {
+      const targetVariant = targetItem.variants.find(
+        (v): v is ReadyVariant => readyVariant(v) && v.id === ctx.variantId,
+      );
+      if (targetVariant) {
+        if (targetVariant.delivery.kind === "mux") {
+          const dashMux = extractDashMuxSpec(targetVariant, targetCtx);
+          if (dashMux) {
+            const expiresAtMs = extractVariantEarliestExpiresAtMs(
+              targetVariant,
+              now,
+            );
+            const sizeBytes =
+              (dashMux.videoSize || 0) + (dashMux.audioSize || 0) ||
+              originalSpec.sizeBytes;
+            return {
+              ...basePreserved,
+              kind: "dash_mux",
+              apiOrigin,
+              routes: dashMux.videoRoutes,
+              mimeType: originalSpec.mimeType || "video/mp4",
+              ...(sizeBytes ? { sizeBytes } : {}),
+              dashMux,
+              refreshContext: buildNextRefreshContext(expiresAtMs),
+            };
+          }
+        } else if (targetVariant.delivery.kind === "file") {
+          const avail = availableSources(targetVariant.delivery.sources, now);
+          const routes = deliveryRoutes(avail, targetCtx);
+          if (routes.length > 0) {
+            if (
+              originalSpec.kind === "youtube_mux" &&
+              targetVariant.metadata?.has_audio === false
+            ) {
+              const pair = selectYouTubeMuxPair(
+                targetVariant,
+                targetItem.variants,
+                freshMedia.attachments,
+              );
+              if (pair.ok) {
+                const videoUrl = routes[0];
+                const audioUrl = sourceUrl(pair.audioSource, targetCtx);
+                const expiresAtMs = computeEarliestExpiresAtMs([
+                  avail[0],
+                  pair.audioSource,
+                ]);
+                const sizeBytes =
+                  (avail[0]?.size_bytes || 0) +
+                    (pair.audioSource.size_bytes || 0) ||
+                  originalSpec.sizeBytes;
+                return {
+                  ...basePreserved,
+                  kind: "youtube_mux",
+                  apiOrigin,
+                  routes: [videoUrl],
+                  ...(sizeBytes ? { sizeBytes } : {}),
+                  youtubeMux: {
+                    videoUrl,
+                    audioUrl,
+                    ...(avail[0]?.size_bytes
+                      ? { videoSize: avail[0].size_bytes }
+                      : {}),
+                    ...(pair.audioSource.size_bytes
+                      ? { audioSize: pair.audioSource.size_bytes }
+                      : {}),
+                    outputContainer: pair.outputContainer,
+                  },
+                  refreshContext: buildNextRefreshContext(expiresAtMs),
+                };
+              }
+            }
+
+            const finalRoutes = [...routes];
+            if (
+              targetItem.type === "video" &&
+              (freshMedia.platform === "zuiyou" ||
+                freshMedia.platform === "pipigx") &&
+              targetItem.tbvideo?.platform === freshMedia.platform
+            ) {
+              const srcId = avail[0]?.id;
+              const tbCand =
+                srcId && Object.hasOwn(targetItem.tbvideo.sources, srcId)
+                  ? targetItem.tbvideo.sources[srcId]
+                  : Object.values(targetItem.tbvideo.sources)[0];
+              if (tbCand && !finalRoutes.includes(tbCand)) {
+                finalRoutes.push(tbCand);
+              }
+            }
+            const expiresAtMs = computeEarliestExpiresAtMs(avail);
+            const sizeBytes = avail[0]?.size_bytes ?? originalSpec.sizeBytes;
+            return {
+              ...basePreserved,
+              kind:
+                originalSpec.kind === "youtube_direct"
+                  ? "youtube_direct"
+                  : "direct_file",
+              apiOrigin,
+              routes: finalRoutes,
+              ...(sizeBytes ? { sizeBytes } : {}),
+              refreshContext: buildNextRefreshContext(expiresAtMs),
+            };
+          }
+        } else if (targetVariant.delivery.kind === "hls") {
+          const avail = availableSources(targetVariant.delivery.sources, now);
+          const routes = deliveryRoutes(avail, targetCtx);
+          if (routes.length > 0) {
+            const expiresAtMs = computeEarliestExpiresAtMs(avail);
+            return {
+              ...basePreserved,
+              kind: "hls",
+              apiOrigin,
+              routes,
+              refreshContext: buildNextRefreshContext(expiresAtMs),
+            };
+          }
+        } else if (targetVariant.delivery.kind === "segments") {
+          const rebuilt = buildEnqueueItemsForMedia(freshMedia, {
+            apiOrigin,
+            itemIds: [targetItem.id],
+            variantSelections: {
+              [targetItem.id]: { variant_id: targetVariant.id },
+            },
+            sourceUrl: ctx.parseUrl,
+            now,
+          });
+          if (rebuilt.length > 0 && rebuilt[0].spec.segments) {
+            return {
+              ...basePreserved,
+              kind: "segments",
+              apiOrigin,
+              routes: rebuilt[0].spec.routes,
+              segments: rebuilt[0].spec.segments,
+              refreshContext: buildNextRefreshContext(
+                rebuilt[0].spec.refreshContext?.expiresAtMs,
+              ),
+            };
+          }
+        } else if (targetVariant.delivery.kind === "pair") {
+          const matchedRes =
+            (ctx.resourceRole
+              ? targetVariant.delivery.resources.find(
+                  (r) => r.role === ctx.resourceRole,
+                )
+              : undefined) ??
+            targetVariant.delivery.resources.find(
+              (r) => r.role === "motion" || r.role === "video",
+            ) ??
+            targetVariant.delivery.resources[0];
+          if (matchedRes?.delivery.kind === "file") {
+            const avail = availableSources(matchedRes.delivery.sources, now);
+            const routes = deliveryRoutes(avail, targetCtx);
+            if (routes.length > 0) {
+              const expiresAtMs = computeEarliestExpiresAtMs(avail);
+              const sizeBytes = avail[0]?.size_bytes ?? originalSpec.sizeBytes;
+              return {
+                ...basePreserved,
+                kind: "direct_file",
+                apiOrigin,
+                routes,
+                ...(sizeBytes ? { sizeBytes } : {}),
+                refreshContext: buildNextRefreshContext(expiresAtMs),
+              };
+            }
+          } else if (matchedRes?.delivery.kind === "hls") {
+            const avail = availableSources(matchedRes.delivery.sources, now);
+            const routes = deliveryRoutes(avail, targetCtx);
+            if (routes.length > 0) {
+              const expiresAtMs = computeEarliestExpiresAtMs(avail);
+              return {
+                ...basePreserved,
+                kind: "hls",
+                apiOrigin,
+                routes,
+                refreshContext: buildNextRefreshContext(expiresAtMs),
+              };
+            }
+          } else if (matchedRes?.delivery.kind === "segments") {
+            const rebuilt = buildEnqueueItemsForMedia(freshMedia, {
+              apiOrigin,
+              itemIds: [targetItem.id],
+              variantSelections: {
+                [targetItem.id]: { variant_id: targetVariant.id },
+              },
+              sourceUrl: ctx.parseUrl,
+              now,
+            });
+            const matchedEntry =
+              (ctx.resourceRole
+                ? rebuilt.find(
+                    (entry) =>
+                      entry.spec.refreshContext?.resourceRole ===
+                      ctx.resourceRole,
+                  )
+                : undefined) ?? rebuilt[0];
+            if (matchedEntry?.spec.segments) {
+              return {
+                ...basePreserved,
+                kind: "segments",
+                apiOrigin,
+                routes: matchedEntry.spec.routes,
+                segments: matchedEntry.spec.segments,
+                refreshContext: buildNextRefreshContext(
+                  matchedEntry.spec.refreshContext?.expiresAtMs,
+                ),
+              };
+            }
+          }
+        }
+      }
+    }
+
+    // 3) Fallback by quality preference when exact variant/attachment changed upstream
+    const rebuiltItems = buildEnqueueItemsForMedia(freshMedia, {
+      apiOrigin,
+      qualityPreference: ctx.attachmentId ? "audio" : settings.qualityPreference,
+      itemIds: [targetItem.id],
+      sourceUrl: ctx.parseUrl,
+      now,
+    });
+    const rebuiltSpec =
+      (ctx.resourceRole
+        ? rebuiltItems.find(
+            (entry) =>
+              entry.spec.refreshContext?.resourceRole === ctx.resourceRole,
+          )?.spec
+        : undefined) ?? rebuiltItems[0]?.spec;
+    if (!rebuiltSpec) {
+      throw new Error("重新解析后未找到可用下载源");
+    }
+    return {
+      ...basePreserved,
+      kind: rebuiltSpec.kind,
+      apiOrigin,
+      routes: rebuiltSpec.routes,
+      ...(rebuiltSpec.sizeBytes ? { sizeBytes: rebuiltSpec.sizeBytes } : {}),
+      ...(rebuiltSpec.segments ? { segments: rebuiltSpec.segments } : {}),
+      ...(rebuiltSpec.youtubeMux ? { youtubeMux: rebuiltSpec.youtubeMux } : {}),
+      ...(rebuiltSpec.dashMux ? { dashMux: rebuiltSpec.dashMux } : {}),
+      refreshContext: buildNextRefreshContext(
+        rebuiltSpec.refreshContext?.expiresAtMs,
+      ),
+    };
+  };
+
   const dispatchSpecTaskToOffscreen = async (
     taskId: string,
     spec: OffscreenDownloadSpec,
+    dispatchOpts?: { forceRefresh?: boolean; skipAutoRefresh?: boolean },
   ): Promise<void> => {
     const task = tasks.get(taskId);
     if (!task || task.status === "cancelled") return;
 
     const settings = await storage.getSettings();
-    const enrichedSpec = await enrichSpecAllowedOrigins(spec, settings);
+    let effectiveSpec = spec;
+
+    const refreshCtx = effectiveSpec.refreshContext;
+    const shouldForceRefresh = Boolean(dispatchOpts?.forceRefresh && refreshCtx);
+    const shouldAutoPreRefresh = Boolean(
+      !dispatchOpts?.skipAutoRefresh &&
+        !shouldForceRefresh &&
+        refreshCtx &&
+        isSpecExpiredForDispatch(effectiveSpec) &&
+        (task.autoRefreshCount ?? 0) < 1,
+    );
+
+    if (shouldForceRefresh || shouldAutoPreRefresh) {
+      const refreshController = new AbortController();
+      parseAbortControllers.set(taskId, refreshController);
+      const currentBeforeRefresh = tasks.get(taskId);
+      if (!currentBeforeRefresh || currentBeforeRefresh.status === "cancelled") {
+        parseAbortControllers.delete(taskId);
+        scheduleOffscreenIdleCloseIfIdle();
+        return;
+      }
+      const nextRefreshCount = shouldAutoPreRefresh
+        ? (currentBeforeRefresh.autoRefreshCount ?? 0) + 1
+        : currentBeforeRefresh.autoRefreshCount;
+      tasks.set(taskId, {
+        ...currentBeforeRefresh,
+        status: "parsing",
+        statusText: "签名链接已过期，正在自动重新解析...",
+        percent: 0,
+        loaded: 0,
+        speed: 0,
+        error: undefined,
+        ...(nextRefreshCount !== undefined
+          ? { autoRefreshCount: nextRefreshCount }
+          : {}),
+        updatedAt: nowFn(),
+      });
+      updateBadge();
+      await broadcastTasksUpdated();
+
+      try {
+        effectiveSpec = await refreshSpecFromContext(
+          effectiveSpec,
+          settings,
+          refreshController.signal,
+        );
+      } catch (err) {
+        const afterErr = tasks.get(taskId);
+        if (!afterErr) return;
+        const cancelled =
+          afterErr.status === "cancelled" ||
+          refreshController.signal.aborted ||
+          (err instanceof Error && err.name === "AbortError");
+        if (cancelled) {
+          tasks.set(taskId, {
+            ...afterErr,
+            status: "cancelled",
+            statusText: "已取消",
+            speed: 0,
+            error: undefined,
+            updatedAt: nowFn(),
+          });
+          updateBadge();
+        } else {
+          const msg =
+            err instanceof Error && err.message
+              ? err.message
+              : "重新解析下载链接失败";
+          tasks.set(taskId, {
+            ...afterErr,
+            status: "failed",
+            statusText: "刷新链接失败",
+            speed: 0,
+            error: msg,
+            lastErrorCode: "MEDIA_URL_EXPIRED",
+            updatedAt: nowFn(),
+          });
+          updateBadge("failed");
+        }
+        await broadcastTasksUpdated();
+        scheduleOffscreenIdleCloseIfIdle();
+        notifyIfCompletelyIdle();
+        return;
+      } finally {
+        parseAbortControllers.delete(taskId);
+      }
+    }
+
+    const enrichedSpec = await enrichSpecAllowedOrigins(effectiveSpec, settings);
     const latestBeforeStart = tasks.get(taskId);
     if (!latestBeforeStart || latestBeforeStart.status === "cancelled") {
       scheduleOffscreenIdleCloseIfIdle();
@@ -1426,7 +1965,10 @@ export function createBackgroundController(
       statusText:
         enrichedSpec.kind === "youtube_mux"
           ? "正在准备 4K 无损合流..."
-          : "正在准备下载...",
+          : enrichedSpec.kind === "dash_mux"
+            ? "正在准备音视频无损合流..."
+            : "正在准备下载...",
+      total: enrichedSpec.sizeBytes ?? latestBeforeStart.total,
       updatedAt: nowFn(),
       retryPayload: { kind: "spec", spec: enrichedSpec },
     };
@@ -1484,8 +2026,10 @@ export function createBackgroundController(
     for (let i = items.length - 1; i >= 0; i--) {
       const item = items[i];
       const taskId = nextId("task");
+      const mergedRefreshContext = item.spec.refreshContext ?? item.refreshContext;
       const enrichedSpec: OffscreenDownloadSpec = {
         ...item.spec,
+        ...(mergedRefreshContext ? { refreshContext: mergedRefreshContext } : {}),
         extraAllowedOrigins: Array.from(
           new Set([...(item.spec.extraAllowedOrigins ?? []), ...extraOrigins]),
         ),
@@ -1608,6 +2152,8 @@ export function createBackgroundController(
         subfolderPrefix,
         forceSubfolder,
         extraAllowedOrigins,
+        sourceUrl: matched.url,
+        now: nowFn(),
       });
 
       const spawnedIds: string[] = [];
@@ -2458,15 +3004,26 @@ export function createBackgroundController(
         }
         const retryPayload = task.retryPayload;
         if (retryPayload.kind === "spec") {
+          const refreshCtx = retryPayload.spec.refreshContext;
+          const isExpired = isSpecExpiredForDispatch(retryPayload.spec);
+          const failedByExpiry = task.lastErrorCode === "MEDIA_URL_EXPIRED";
+          const needsManualRefresh = Boolean(
+            refreshCtx && (isExpired || failedByExpiry),
+          );
           const resetTask: ExtensionDownloadTask = {
             ...task,
-            status: "queued",
-            statusText: "重新排队下载...",
+            status: needsManualRefresh ? "parsing" : "queued",
+            statusText: needsManualRefresh
+              ? "签名链接已过期，正在自动重新解析..."
+              : "重新排队下载...",
             percent: 0,
             loaded: 0,
             speed: 0,
             chromeDownloadId: undefined,
             error: undefined,
+            lastErrorCode: undefined,
+            lastErrorHttpStatus: undefined,
+            autoRefreshCount: needsManualRefresh ? 1 : 0,
             unwhitelistedHost: undefined,
             updatedAt: nowFn(),
           };
@@ -2474,7 +3031,13 @@ export function createBackgroundController(
           updateBadge();
           await broadcastTasksUpdated();
           void trackBackgroundJob(
-            dispatchSpecTaskToOffscreen(req.taskId, retryPayload.spec),
+            dispatchSpecTaskToOffscreen(
+              req.taskId,
+              retryPayload.spec,
+              needsManualRefresh
+                ? { forceRefresh: true, skipAutoRefresh: true }
+                : undefined,
+            ),
           );
           return okRpc({ task: resetTask });
         }
@@ -2582,6 +3145,44 @@ export function createBackgroundController(
         const task = tasks.get(msg.taskId);
         if (task && task.status !== "completed" && task.status !== "cancelled") {
           const isCancelled = msg.cancelled === true;
+          const isExpiredError =
+            !isCancelled && msg.code === "MEDIA_URL_EXPIRED";
+          const specPayload =
+            task.retryPayload?.kind === "spec"
+              ? task.retryPayload.spec
+              : undefined;
+          if (
+            isExpiredError &&
+            specPayload?.refreshContext &&
+            (task.autoRefreshCount ?? 0) < 1
+          ) {
+            const nextRefreshCount = (task.autoRefreshCount ?? 0) + 1;
+            tasks.set(msg.taskId, {
+              ...task,
+              status: "parsing",
+              statusText: "签名链接已过期，正在自动重新解析...",
+              percent: 0,
+              loaded: 0,
+              speed: 0,
+              error: undefined,
+              lastErrorCode: msg.code ?? "MEDIA_URL_EXPIRED",
+              ...(msg.httpStatus !== undefined
+                ? { lastErrorHttpStatus: msg.httpStatus }
+                : {}),
+              autoRefreshCount: nextRefreshCount,
+              updatedAt: nowFn(),
+            });
+            updateBadge();
+            await broadcastTasksUpdated();
+            void trackBackgroundJob(
+              dispatchSpecTaskToOffscreen(msg.taskId, specPayload, {
+                forceRefresh: true,
+                skipAutoRefresh: true,
+              }),
+            );
+            return okRpc({ received: true });
+          }
+
           tasks.set(msg.taskId, {
             ...task,
             status: isCancelled ? "cancelled" : "failed",
@@ -2589,9 +3190,13 @@ export function createBackgroundController(
               ? "已取消"
               : msg.code === "UNWHITELISTED_CDN"
                 ? "未授权媒体域名"
-                : "下载失败",
+                : msg.code === "OPFS_QUOTA_EXCEEDED"
+                  ? "存储空间不足"
+                  : "下载失败",
             speed: 0,
             error: isCancelled ? undefined : msg.error,
+            lastErrorCode: isCancelled ? undefined : msg.code,
+            lastErrorHttpStatus: isCancelled ? undefined : msg.httpStatus,
             ...(msg.unwhitelistedHost
               ? { unwhitelistedHost: msg.unwhitelistedHost }
               : {}),

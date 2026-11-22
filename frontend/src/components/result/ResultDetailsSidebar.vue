@@ -31,12 +31,15 @@ const props = defineProps({
   showAllQualityVariants: Boolean,
   unavailableQualityReason: String,
   higherQualityNotice: Boolean,
+  isBilibili: Boolean,
+  bilibiliDashSummary: { type: Object, default: null },
 });
 
 const emit = defineEmits([
   "update:active-tab",
   "toggle-show-all-qualities",
   "select-quality",
+  "open-extension",
   "copy-text",
   "download-music",
   "mark-image-broken",
@@ -72,8 +75,68 @@ const stats = computed(() =>
     ),
   })),
 );
+const EXT_ICON_PATH =
+  "M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z";
+
+const isBilibiliDashAudio = (attachment) =>
+  Boolean(
+    props.isBilibili &&
+      typeof attachment?.id === "string" &&
+      attachment.id.startsWith("bilibili-audio-"),
+  );
+
+const visibleAttachments = computed(() => {
+  const currentId = props.currentItem?.id;
+  const list = props.attachments.filter((att) => {
+    if (
+      isBilibiliDashAudio(att) &&
+      currentId &&
+      att.id !== `bilibili-audio-${currentId}`
+    ) {
+      return false;
+    }
+    return true;
+  });
+
+  if (
+    props.isBilibili &&
+    currentId &&
+    !list.some((att) => att?.id === `bilibili-audio-${currentId}`) &&
+    props.currentItem?.state !== "deferred" &&
+    props.currentItem?.state !== "unavailable" &&
+    Array.isArray(props.currentItem?.variants)
+  ) {
+    let bestAudioLeaf = null;
+    let bestBitrate = -1;
+    for (const variant of props.currentItem.variants) {
+      if (variant?.state === "deferred" || variant?.delivery?.kind !== "mux") {
+        continue;
+      }
+      for (const res of variant.delivery.resources || []) {
+        if (res?.role !== "audio" || res?.delivery?.kind !== "file") continue;
+        const bitrate = Number(
+          res.metadata?.audio_bitrate_bps || res.metadata?.bitrate_bps || 0,
+        );
+        if (!bestAudioLeaf || bitrate > bestBitrate) {
+          bestAudioLeaf = res;
+          bestBitrate = bitrate;
+        }
+      }
+    }
+    if (bestAudioLeaf) {
+      list.push({
+        id: `bilibili-audio-${currentId}`,
+        role: "background_audio",
+        title: "原声音频 (M4A)",
+        resource: bestAudioLeaf,
+      });
+    }
+  }
+  return list;
+});
+
 const allTags = computed(() => props.resultData?.tags || []);
-const hasMusic = computed(() => props.attachments.length > 0);
+const hasMusic = computed(() => visibleAttachments.value.length > 0);
 const playCountNote = computed(() =>
   props.locale === "en"
     ? "The platform did not provide verified counts."
@@ -147,6 +210,7 @@ const tabs = computed(() => [
 
 const attachmentUrl = (attachment) =>
   !props.isYouTubeHelperBlocked &&
+  !isBilibiliDashAudio(attachment) &&
   attachment.resource.delivery.kind === "file"
     ? urlOf(resourceSource(attachment.resource))
     : "";
@@ -277,6 +341,12 @@ watch(
   },
   { flush: "post" },
 );
+
+watch(hasMusic, (available) => {
+  if (!available && props.activeTab === "music") {
+    emit("update:active-tab", "info");
+  }
+});
 
 watch(
   [infoCards, author, tabs, () => props.activeTab, () => props.locale],
@@ -423,10 +493,13 @@ onUnmounted(() => {
         :show-all-quality-variants="showAllQualityVariants"
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
+        :is-bilibili="isBilibili"
+        :bilibili-dash-summary="bilibiliDashSummary"
         :display-variant-label="displayVariantLabel"
         :format-option-size="formatOptionSize"
         @select-quality="emit('select-quality', $event)"
         @toggle-show-all="emit('toggle-show-all-qualities')"
+        @open-extension="emit('open-extension')"
       />
 
       <div v-if="activeTab === 'tags'" class="rs-tab-panel">
@@ -443,37 +516,69 @@ onUnmounted(() => {
 
       <div v-if="activeTab === 'music'" class="rs-tab-panel">
         <div
-          v-for="attachment in attachments"
+          v-for="attachment in visibleAttachments"
           :key="attachment.id"
           class="rs-music"
         >
           <div class="rs-music-title">
             {{ attachment.title || t(locale, "unknownMusic") }}
           </div>
-          <div class="rs-music-artist">
-            {{ attachment.author?.name || "" }}
+          <div v-if="attachment.author?.name" class="rs-music-artist">
+            {{ attachment.author.name }}
           </div>
-          <audio
-            v-if="
-              attachment.role === 'background_audio' &&
-              attachmentUrl(attachment)
-            "
-            :src="attachmentUrl(attachment)"
-            controls
-            class="rs-music-player"
-          />
-          <p v-else-if="!attachmentUrl(attachment)" class="rs-stat-note">
-            该附件暂不支持直接播放
-          </p>
-          <button
-            @click="emit('download-music', attachment)"
-            class="rs-btn rs-btn--primary rs-btn--sm rs-btn--block"
-            :disabled="isYouTubeHelperBlocked"
+          <div
+            v-if="isBilibiliDashAudio(attachment)"
+            class="rs-bili-audio-guide"
+            data-bilibili-dash-audio-guide
+            role="status"
           >
-            <AppIcon class="fas fa-download" />{{
-              locale === "en" ? "Download" : "下载附件"
-            }}
-          </button>
+            <p class="rs-bili-audio-guide-text">
+              {{ t(locale, "biliDashAudioExplain") }}
+            </p>
+            <button
+              type="button"
+              class="rs-btn rs-btn--primary rs-btn--sm rs-btn--block rs-bili-audio-cta"
+              data-bilibili-dash-audio-cta
+              @click="emit('open-extension')"
+            >
+              <svg
+                class="rs-bili-audio-ext-icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path :d="EXT_ICON_PATH" />
+              </svg>
+              <span>{{ t(locale, "biliDashAudioCta") }}</span>
+            </button>
+          </div>
+          <template v-else>
+            <audio
+              v-if="
+                attachment.role === 'background_audio' &&
+                attachmentUrl(attachment)
+              "
+              :src="attachmentUrl(attachment)"
+              controls
+              class="rs-music-player"
+            />
+            <p v-else-if="!attachmentUrl(attachment)" class="rs-stat-note">
+              该附件暂不支持直接播放
+            </p>
+            <button
+              @click="emit('download-music', attachment)"
+              class="rs-btn rs-btn--primary rs-btn--sm rs-btn--block"
+              :disabled="isYouTubeHelperBlocked"
+            >
+              <AppIcon class="fas fa-download" />{{
+                locale === "en" ? "Download" : "下载附件"
+              }}
+            </button>
+          </template>
         </div>
       </div>
     </div>
@@ -841,6 +946,40 @@ onUnmounted(() => {
   width: 100%;
   height: 2.25rem;
   border-radius: 999px;
+}
+.rs-bili-audio-guide {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: var(--r-md);
+  background: linear-gradient(
+    135deg,
+    rgba(108, 92, 231, 0.08) 0%,
+    rgba(168, 85, 247, 0.05) 100%
+  );
+  border: 1px solid rgba(108, 92, 231, 0.22);
+  text-align: left;
+}
+:global(.dark) .rs-bili-audio-guide {
+  background: linear-gradient(
+    135deg,
+    rgba(129, 140, 248, 0.14) 0%,
+    rgba(168, 85, 247, 0.08) 100%
+  );
+  border-color: rgba(129, 140, 248, 0.32);
+}
+.rs-bili-audio-guide-text {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.55;
+  color: var(--c-fg-2);
+}
+.rs-bili-audio-ext-icon {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex-shrink: 0;
 }
 
 .rs-btn {

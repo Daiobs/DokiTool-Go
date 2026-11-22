@@ -7,9 +7,11 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
-// PreparePublic annotates direct Bilibili CDN media sources (https://*.bilivideo.com)
-// with browser_fetch="allowed" and deadline-derived expires_at at the public API
-// boundary while keeping frozen PHP baseline outputs untouched.
+// PreparePublic annotates direct Bilibili CDN media sources:
+// https://*.bilivideo.com receives browser_fetch="allowed", and validated
+// official Bilibili CDN URLs (*.bilivideo.com, *.bilivideo.cn, *.akamaized.net)
+// receive deadline-derived expires_at at the public API boundary while keeping
+// frozen PHP baseline outputs untouched.
 func PreparePublic(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
 	if platform != "bilibili" || payload["code"] != "OK" {
 		return payload, nil
@@ -76,14 +78,13 @@ func annotateBilibiliDelivery(delivery unified.Object) {
 				continue
 			}
 			rawURL := unified.Str(source["url"])
-			if !AllowedBrowserFetchURL(rawURL) {
-				continue
-			}
-			if source["browser_fetch"] == nil || source["browser_fetch"] == "unknown" {
-				source["browser_fetch"] = "allowed"
+			if AllowedBrowserFetchURL(rawURL) {
+				if source["browser_fetch"] == nil || source["browser_fetch"] == "unknown" {
+					source["browser_fetch"] = "allowed"
+				}
 			}
 			if source["expires_at"] == nil {
-				if exp, ok := MediaURLDeadline(rawURL); ok {
+				if exp, ok := bilibiliMediaURLDeadline(rawURL); ok {
 					source["expires_at"] = time.Unix(exp, 0).UTC().Format(time.RFC3339)
 				}
 			}

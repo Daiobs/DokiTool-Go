@@ -70,6 +70,7 @@ export type OffscreenDownloadKind =
   | "direct_file"
   | "youtube_direct"
   | "youtube_mux"
+  | "dash_mux"
   | "hls"
   | "segments"
   | "batch_zip";
@@ -89,12 +90,31 @@ export interface OffscreenYouTubeMuxSpec {
   outputContainer: "mp4" | "webm";
 }
 
+export interface OffscreenDashMuxSpec {
+  videoRoutes: string[];
+  audioRoutes: string[];
+  videoSize?: number;
+  audioSize?: number;
+  outputContainer: "mp4";
+}
+
 export interface OffscreenZipEntrySpec {
   entryName: string;
   routes: string[];
   mimeType?: string;
   sizeBytes?: number;
   segments?: OffscreenSegmentSpec[];
+}
+
+export interface MediaRefreshContext {
+  parseUrl: string;
+  platform: string;
+  itemId: string;
+  variantId?: string;
+  attachmentId?: string;
+  resourceRole?: "motion" | "video" | "image";
+  resolveUrl?: string;
+  expiresAtMs?: number;
 }
 
 export interface OffscreenDownloadSpec {
@@ -107,7 +127,9 @@ export interface OffscreenDownloadSpec {
   extraAllowedOrigins?: string[];
   segments?: OffscreenSegmentSpec[];
   youtubeMux?: OffscreenYouTubeMuxSpec;
+  dashMux?: OffscreenDashMuxSpec;
   zipEntries?: OffscreenZipEntrySpec[];
+  refreshContext?: MediaRefreshContext;
 }
 
 export type ExtensionTaskStatus =
@@ -147,6 +169,9 @@ export interface ExtensionDownloadTask {
   total: number;
   speed: number;
   error?: string;
+  lastErrorCode?: string;
+  lastErrorHttpStatus?: number;
+  autoRefreshCount?: number;
   unwhitelistedHost?: string;
   fallbackUrl?: string;
   chromeDownloadId?: number;
@@ -160,6 +185,7 @@ export interface EnqueueDownloadItem {
   platform: string;
   workFingerprint?: string;
   fallbackUrl?: string;
+  refreshContext?: MediaRefreshContext;
   spec: OffscreenDownloadSpec;
 }
 
@@ -338,6 +364,7 @@ export type OffscreenToBackgroundMessage =
       taskId: string;
       error: string;
       code?: string;
+      httpStatus?: number;
       cancelled?: boolean;
       unwhitelistedHost?: string;
       fallbackUrl?: string;

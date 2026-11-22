@@ -29,6 +29,7 @@ import {
   createSidePanelBroadcastBridge,
   getNextExtensionTheme,
   mergeEnqueuedTasks,
+  mergeMediaAttachmentsById,
   readCachedExtensionTheme,
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
@@ -454,16 +455,27 @@ function handleLazyItemResolve(
         showToast(rpc.error || "分集解析失败", "error");
         return null;
       }
-      const resolvedItem =
+      const rawResolvedItem =
         rpc.data.media.items.find((cand) => cand.id === item.id) ??
         rpc.data.media.items[0] ??
         null;
+      const resolvedItem: MediaItem | null =
+        rawResolvedItem &&
+        (!rawResolvedItem.state || rawResolvedItem.state === "ready") &&
+        !rawResolvedItem.resolve_url
+          ? { ...rawResolvedItem, resolve_url: resolveUrl }
+          : rawResolvedItem;
       if (resolvedItem && activeMedia.value) {
+        const mergedAttachments = mergeMediaAttachmentsById(
+          activeMedia.value.attachments,
+          rpc.data.media.attachments,
+        );
         activeMedia.value = {
           ...activeMedia.value,
           items: activeMedia.value.items.map((old) =>
             old.id === item.id ? resolvedItem : old,
           ),
+          ...(mergedAttachments ? { attachments: mergedAttachments } : {}),
         };
       }
       return resolvedItem;

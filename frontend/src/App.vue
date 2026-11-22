@@ -455,6 +455,7 @@ onUnmounted(() => {
         :format-duration="formatDuration"
         :resolving-ids="videoStore.resolvingItems"
         @refresh-item="resolveSelectedItem"
+        @open-extension="showExtensionModal = true"
         @install-youtube-helper="markWaitingForYouTubeHelperInstall"
         @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"

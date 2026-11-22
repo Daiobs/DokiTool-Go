@@ -149,7 +149,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	douyinParser, bilibiliParser := newShanghaiParsers(executor, japan, shanghai)
+	bilibiliDASH, err := parseBilibiliDASH(os.Getenv)
+	if err != nil {
+		return err
+	}
+	douyinParser, bilibiliParser := newShanghaiParsers(executor, japan, shanghai, bilibiliDASH)
 	pipigxSave, err := enableTBVideo("DOKITOOL_TBVIDEO_REWRITE_PIPIGX")
 	if err != nil {
 		return err
@@ -239,7 +243,19 @@ func parseShanghaiBilibili(getenv func(string) string) (bool, error) {
 	return enabled, nil
 }
 
-func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai douyin.OriginalResolver) (*douyin.Parser, *bilibili.Parser) {
+func parseBilibiliDASH(getenv func(string) string) (bool, error) {
+	raw := getenv("DOKITOOL_BILIBILI_DASH")
+	if raw == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("DOKITOOL_BILIBILI_DASH must be a boolean")
+	}
+	return enabled, nil
+}
+
+func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai douyin.OriginalResolver, bilibiliDASH bool) (*douyin.Parser, *bilibili.Parser) {
 	douyinParser := douyin.New(executor, japan)
 	bilibiliParser := bilibili.New(executor)
 	if shanghai != nil {
@@ -250,7 +266,7 @@ func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai do
 			}
 		}
 	}
-	return douyinParser, bilibiliParser
+	return douyinParser, bilibiliParser.WithDASH(bilibiliDASH)
 }
 
 // An existing #27 endpoint remains opt-in for direct mode. Pull never invokes that endpoint.
@@ -375,26 +391,6 @@ func startAPIKeySignalReloader(
 			<-doneCh
 		})
 	}
-}
-
-func loadOwnerAuth(getenv func(string) string) (api.OwnerAuth, error) {
-	auth, err := api.LoadOwnerAuth(getenv)
-	if err != nil || !auth.Enabled() {
-		return auth, err
-	}
-	ownerToken := getenv("DOKITOOL_OWNER_TOKEN")
-	for _, key := range []string{
-		"SNAP_INGRESS_KEY",
-		"SNAP_MEDIA_SIGNING_KEY",
-		"DOKITOOL_SHANGHAI_TOKEN",
-		"DOKITOOL_SHANGHAI_PULL_TOKEN",
-	} {
-		other := getenv(key)
-		if other != "" && subtle.ConstantTimeCompare([]byte(ownerToken), []byte(other)) == 1 {
-			return api.OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN requires a dedicated credential")
-		}
-	}
-	return auth, nil
 }
 
 func newXHSExecutor(mode string) (fetch.Executor, error) {

@@ -62,13 +62,14 @@
 
 ### 2. 抖音上海通道、解析缓存与平台启用开关
 
-源码定义：`backend/cmd/dokitool/main.go`、`backend/internal/api/cache.go`、`backend/internal/platform/ytgeneric/sites.go`
+源码定义：`backend/cmd/dokitool/main.go`、`backend/cmd/shanghai-resolver/main.go`、`backend/internal/api/cache.go`、`backend/internal/platform/ytgeneric/sites.go`
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_SHANGHAI_MODE` | 控制主后端上海解析通道的工作模式（禁用、历史直连模式或出站拉取模式） | 否 |
 | `DOKITOOL_SHANGHAI_ENDPOINT` | 历史上海直连模式下主后端请求的远端解析端点地址（拉取模式下必须留空） | 否 |
 | `DOKITOOL_SHANGHAI_BILIBILI` | 控制主后端在启用上海解析通道时是否开启哔哩哔哩国内线路并行解析与合并 | 否 |
+| `DOKITOOL_BILIBILI_DASH` | 控制 `dokitool` 主后端与 `shanghai-resolver` 上海节点是否开启哔哩哔哩免登录 DASH（1080P 视频轨与独立 M4A 音频轨）并行解析与合并；默认关闭（`false`），关闭时两端均严格仅发送原有单次 `durl` 请求，传入非布尔值时进程在监听前即报错退出 | 否 |
 | `DOKITOOL_PARSE_CACHE` | 控制主后端是否启用 `/api/parse` 与 `/api/resolve` 进程内短时结果缓存及同键并发请求合并 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
@@ -77,6 +78,11 @@
 | `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
 | `DOKITOOL_YTDLP_SITES` | 按逗号分隔指定启用的长尾海外平台标识集合（含未知标识或空项时拒绝启动；已退役标识静默忽略） | 否 |
 | `DOKITOOL_YOUTUBE_HELPER` | 控制是否启用 YouTube 浏览器助手上下文与签名结算接口（启用时在启动阶段校验运行时与脚本文件摘要） | 否 |
+
+> **`DOKITOOL_BILIBILI_DASH` 灰度启用与回滚说明**：
+> - **默认安全态（`false` 或未设置）**：`dokitool` 与 `shanghai-resolver` 均严格只发原有的单次 `html5 durl` 请求（零额外 `fnval=4048&try_look=1` 上游请求）；即使上海节点已先开启 `DOKITOOL_BILIBILI_DASH=true`，只要主后端仍为 `false`，主后端会自动忽略上海回传的 DASH 轨道、仅保留原有 `durl` 线路。
+> - **灰度开启顺序**：若已启用 `DOKITOOL_SHANGHAI_BILIBILI=true`，可先在 `shanghai-resolver`（支持拉取模式与历史直连模式）或同步在 `dokitool` 与 `shanghai-resolver` 中设置 `DOKITOOL_BILIBILI_DASH=true` 并重启；仅部署单机主后端时只需在 `dokitool` 设置 `DOKITOOL_BILIBILI_DASH=true` 即可。当 `durl` 正常返回而并行 DASH 请求超时，系统会在短宽限窗口（主后端 `2.5s`、上海节点 `1.2s`）后自动取消慢速 DASH 请求并零报错回退至 `720P durl`。
+> - **快速回滚**：将 `DOKITOOL_BILIBILI_DASH` 置为 `false`（或移除该环境变量）并重启对应进程即可立即恢复单次 `durl` 请求模式，无需回退代码版本。
 
 ### 3. 外部提取器、任务网关与签名解算沙箱
 

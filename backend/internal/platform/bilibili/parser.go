@@ -5,6 +5,7 @@ package bilibili
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -15,9 +16,15 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
+// defaultDASHGraceTimeout bounds how long Parse waits for the parallel DASH
+// playurl response once html5 durl has already returned a usable stream.
+const defaultDASHGraceTimeout = 2500 * time.Millisecond
+
 type Parser struct {
-	executor fetch.Executor
-	shanghai ShanghaiResolver
+	executor         fetch.Executor
+	shanghai         ShanghaiResolver
+	enableDASH       bool
+	dashGraceTimeout time.Duration
 }
 
 func New(executor fetch.Executor) *Parser { return &Parser{executor: executor} }
@@ -30,6 +37,35 @@ func NewWithShanghai(executor fetch.Executor, shanghai ShanghaiResolver) *Parser
 		shanghai = nil
 	}
 	return &Parser{executor: executor, shanghai: shanghai}
+}
+
+// WithDASH enables or disables parallel zero-cookie DASH playurl fetching
+// (fnval=4048&try_look=1) and non-Cartesian DASH adaptation. New defaults to
+// disabled to preserve the frozen PHP baseline wire contract.
+func (p *Parser) WithDASH(enabled bool) *Parser {
+	if p == nil {
+		return nil
+	}
+	p.enableDASH = enabled
+	return p
+}
+
+// WithDASHGraceTimeout overrides the grace window for waiting on the parallel
+// DASH playurl response after html5 durl succeeds. Non-positive durations fall
+// back to defaultDASHGraceTimeout.
+func (p *Parser) WithDASHGraceTimeout(d time.Duration) *Parser {
+	if p == nil {
+		return nil
+	}
+	p.dashGraceTimeout = d
+	return p
+}
+
+func (p *Parser) effectiveDASHGraceTimeout() time.Duration {
+	if p != nil && p.dashGraceTimeout > 0 {
+		return p.dashGraceTimeout
+	}
+	return defaultDASHGraceTimeout
 }
 
 var partNumber = regexp.MustCompile(`^[1-9][0-9]{0,5}$`)
@@ -63,7 +99,7 @@ func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Ob
 			return nil, err
 		}
 	}
-	data, matched := adaptWithShanghai(raw, input, now, shPlay)
+	data, matched := adaptWithOptions(raw, input, now, shPlay, p != nil && p.enableDASH)
 	if finish != nil {
 		finish(matched)
 	}
@@ -168,10 +204,69 @@ func (p *Parser) parseLegacyWithShanghai(parent context.Context, source string) 
 			shCall = startShanghaiCall(parent, p.shanghai, bvid, cidInt)
 		}
 	}
-	play := p.apiRequest(ctx, playRequest(bvid, selected["cid"], remaining(ctx, 20*time.Second)))
+	playTimeout := remaining(ctx, 20*time.Second)
+	var dashCh chan object
+	var cancelDash context.CancelFunc
+	if p.enableDASH {
+		var dashCtx context.Context
+		dashCtx, cancelDash = context.WithCancel(ctx)
+		defer cancelDash()
+		dashCh = make(chan object, 1)
+		dashReq := dashPlayRequest(bvid, selected["cid"], playTimeout)
+		go func() {
+			sent := false
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("bilibili: dash playurl goroutine panic recovered: panic_type=%T", recovered)
+				}
+				if !sent {
+					dashCh <- nil
+				}
+			}()
+			res := p.apiRequest(dashCtx, dashReq)
+			sent = true
+			dashCh <- res
+		}()
+	}
+	play := p.apiRequest(ctx, playRequest(bvid, selected["cid"], playTimeout))
 	if err := parent.Err(); err != nil {
 		shCall.abort()
 		return nil, nil, err
+	}
+	var dashPlay object
+	if dashCh != nil {
+		if hasUsableDURL(play) {
+			select {
+			case dashPlay = <-dashCh:
+			default:
+				graceTimer := time.NewTimer(p.effectiveDASHGraceTimeout())
+				defer graceTimer.Stop()
+				select {
+				case dashPlay = <-dashCh:
+				case <-graceTimer.C:
+					cancelDash()
+				case <-parent.Done():
+					cancelDash()
+					shCall.abort()
+					return nil, nil, parent.Err()
+				}
+			}
+		} else {
+			select {
+			case dashPlay = <-dashCh:
+			case <-parent.Done():
+				cancelDash()
+				shCall.abort()
+				return nil, nil, parent.Err()
+			}
+		}
+	}
+	if err := parent.Err(); err != nil {
+		shCall.abort()
+		return nil, nil, err
+	}
+	if p.enableDASH {
+		play = mergeDASHPlay(play, dashPlay)
 	}
 	return buildResponse(detail, bvid, requested, selected, play), shCall, nil
 }
@@ -294,9 +389,80 @@ func legacyError(code int64, message string) object {
 	return unified.ContractError(contractCode, message, contractCode == "RATE_LIMITED" || contractCode == "UPSTREAM_TIMEOUT" || contractCode == "UPSTREAM_UNAVAILABLE")
 }
 
-func quality(play object) string {
+func hasUsableDURL(play object) bool {
+	if play == nil || !strictInteger(play["code"], 0) {
+		return false
+	}
+	durl := unified.Slice(child(play, "data", "durl"))
+	if len(durl) == 0 {
+		return false
+	}
+	firstPart := unified.Map(durl[0])
+	return firstPart != nil && unified.MediaURL(firstPart["url"]) != ""
+}
+
+func mergeDASHPlay(play, dashPlay object) object {
+	dashData := validDASHPlayData(dashPlay)
+	if dashData == nil {
+		return play
+	}
+	dash := unified.Map(dashData["dash"])
+	if !strictInteger(play["code"], 0) || unified.Map(play["data"]) == nil {
+		synthesized := unified.Clone(dashPlay)
+		if synthesized == nil {
+			synthesized = object{"code": int64(0), "data": unified.Clone(dashData)}
+		}
+		return synthesized
+	}
+	merged := unified.Clone(play)
+	playData := unified.Map(merged["data"])
+	playData["dash"] = unified.Clone(dash)
+	if intValue(playData["quality"]) <= 0 && intValue(dashData["quality"]) > 0 {
+		playData["quality"] = dashData["quality"]
+	}
+	return merged
+}
+
+func validDASHPlayData(dashPlay object) object {
+	if dashPlay == nil || !strictInteger(dashPlay["code"], 0) {
+		return nil
+	}
+	dashData := unified.Map(dashPlay["data"])
+	if dashData == nil {
+		return nil
+	}
+	dash := unified.Map(dashData["dash"])
+	if dash == nil {
+		return nil
+	}
+	if !hasValidDASHTrack(unified.Slice(dash["video"])) || !hasValidDASHTrack(unified.Slice(dash["audio"])) {
+		return nil
+	}
+	return dashData
+}
+
+func hasValidDASHTrack(entries array) bool {
+	for _, entry := range entries {
+		raw := unified.Map(entry)
+		if raw == nil {
+			continue
+		}
+		primary := pick(raw["baseUrl"], raw["base_url"], "")
+		backups := unified.Slice(pick(raw["backupUrl"], raw["backup_url"]))
+		if len(filterAndSortBilibiliDashURLs(primary, backups)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func qualityLabel(qn int64) string {
 	labels := map[int64]string{6: "240p", 16: "360p", 32: "480p", 64: "720p", 74: "720p60", 80: "1080p", 112: "1080p+", 116: "1080p60", 120: "4K", 125: "HDR", 126: "Dolby Vision", 127: "8K"}
-	if label := labels[intValue(play["quality"])]; label != "" {
+	return labels[qn]
+}
+
+func quality(play object) string {
+	if label := qualityLabel(intValue(play["quality"])); label != "" {
 		return label
 	}
 	return "unknown"

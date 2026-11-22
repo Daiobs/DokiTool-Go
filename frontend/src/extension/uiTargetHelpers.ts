@@ -29,6 +29,7 @@ import {
   sourceRoutes,
   sourceUrl,
   type DownloadTarget,
+  type TargetContext,
 } from "../utils/mediaContract";
 import { mediaExtension } from "../utils/mediaDelivery";
 import {
@@ -41,6 +42,11 @@ import {
   selectYouTubeMuxPair,
   type YouTubeMuxPairResult,
 } from "../utils/youtubeHelperCore";
+import {
+  computeEarliestExpiresAtMs,
+  extractDashMuxSpec,
+  extractVariantEarliestExpiresAtMs,
+} from "./dashMuxSpec";
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
@@ -57,6 +63,8 @@ import {
   type ExtensionRpcResponse,
   type ExtensionSettings,
   type ExtensionThemeMode,
+  type MediaRefreshContext,
+  type OffscreenDashMuxSpec,
   type OffscreenDownloadSpec,
   type OffscreenSegmentSpec,
   type OffscreenZipEntrySpec,
@@ -572,13 +580,111 @@ export interface SidePanelQualityOption {
   isAudioOnly: boolean;
   effectiveHasAudio: boolean;
   shortEdge: number;
+  pixelArea: number;
   fps: number;
   bitrateBps: number;
+  videoCodec: string;
   muxPair: ExtractedYouTubeMuxPair | null;
+  isDashMux: boolean;
+  dashMux: OffscreenDashMuxSpec | null;
   resolvedExt: string;
   formatMime?: string;
   directUrl: string;
   routes: string[];
+}
+
+function uiVideoCodecPreferenceRank(rawCodec: unknown): number {
+  if (typeof rawCodec !== "string") return 0;
+  const lower = rawCodec.trim().toLowerCase();
+  if (!lower) return 0;
+  if (
+    lower === "h264" ||
+    lower === "h.264" ||
+    lower === "avc" ||
+    lower === "avc1" ||
+    lower.startsWith("avc1.") ||
+    lower === "avc3" ||
+    lower.startsWith("avc3.")
+  ) {
+    return 3;
+  }
+  if (
+    lower === "hevc" ||
+    lower === "h265" ||
+    lower === "h.265" ||
+    lower === "hev1" ||
+    lower.startsWith("hev1.") ||
+    lower === "hvc1" ||
+    lower.startsWith("hvc1.")
+  ) {
+    return 2;
+  }
+  if (lower === "av1" || lower === "av01" || lower.startsWith("av01.")) {
+    return 1;
+  }
+  return 0;
+}
+
+function estimateDashMuxByteTotals(
+  variant: ReadyVariant,
+  dashMux: OffscreenDashMuxSpec,
+  itemDurationMs?: number,
+): { exactBytes: number; estimatedBytes: number } {
+  const vExact = parsePositiveSafeBytes(dashMux.videoSize);
+  const aExact = parsePositiveSafeBytes(dashMux.audioSize);
+  if (vExact > 0 && aExact > 0) {
+    return { exactBytes: vExact + aExact, estimatedBytes: 0 };
+  }
+
+  const vResMeta =
+    variant.delivery.kind === "mux"
+      ? variant.delivery.resources.find((r) => r.role === "video")?.metadata
+      : undefined;
+  const aResMeta =
+    variant.delivery.kind === "mux"
+      ? variant.delivery.resources.find((r) => r.role === "audio")?.metadata
+      : undefined;
+
+  const durationMs =
+    Number(
+      variant.metadata?.duration_ms ||
+        vResMeta?.duration_ms ||
+        aResMeta?.duration_ms ||
+        itemDurationMs ||
+        0,
+    ) || 0;
+  const videoBps =
+    Number(
+      variant.metadata?.video_bitrate_bps ||
+        vResMeta?.video_bitrate_bps ||
+        vResMeta?.bitrate_bps ||
+        0,
+    ) || 0;
+  const audioBps =
+    Number(
+      variant.metadata?.audio_bitrate_bps ||
+        aResMeta?.audio_bitrate_bps ||
+        aResMeta?.bitrate_bps ||
+        0,
+    ) || 0;
+  const combinedBps =
+    videoBps + audioBps || Number(variant.metadata?.bitrate_bps || 0) || 0;
+
+  const estimatedBytes =
+    combinedBps > 0 && durationMs > 0
+      ? Math.round((combinedBps * durationMs) / 8000)
+      : 0;
+  return {
+    exactBytes: vExact + aExact,
+    estimatedBytes,
+  };
+}
+
+function formatApproxSizeLabel(bytes: number): string {
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    return formatMediaSize(0, "zh-CN");
+  }
+  return `约 ${formatMediaSize(bytes, "zh-CN")}`;
 }
 
 function inferVideoExtFromUrl(
@@ -626,12 +732,20 @@ export function resolveVariantExtension(params: {
   platform?: string;
   hasTbvideo?: boolean;
   muxPair?: ExtractedYouTubeMuxPair | null;
+  dashMux?: OffscreenDashMuxSpec | null;
 }): { ext: string; formatMime?: string } {
-  const { variant, itemType, primaryUrl, platform, hasTbvideo, muxPair } = params;
+  const { variant, itemType, primaryUrl, platform, hasTbvideo, muxPair, dashMux } =
+    params;
   if (muxPair) {
     return {
       ext: muxPair.outputExtension,
       formatMime: muxPair.outputMimeType,
+    };
+  }
+  if (dashMux) {
+    return {
+      ext: dashMux.outputContainer,
+      formatMime: "video/mp4",
     };
   }
   const delivery = variant.delivery;
@@ -765,14 +879,134 @@ export function findBestStandaloneAudioForYouTube(
   };
 }
 
+export function mergeMediaAttachmentsById(
+  existing: Attachment[] | undefined,
+  incoming: Attachment[] | undefined,
+): Attachment[] | undefined {
+  const base = existing ?? [];
+  const next = incoming ?? [];
+  if (!base.length && !next.length) return undefined;
+  if (!next.length) return existing;
+  const merged = [...base];
+  const indexById = new Map<string, number>();
+  for (let i = 0; i < merged.length; i++) {
+    const id = typeof merged[i]?.id === "string" ? merged[i].id : "";
+    if (id) indexById.set(id, i);
+  }
+  for (const att of next) {
+    if (!att) continue;
+    const id = typeof att.id === "string" ? att.id : "";
+    if (id && indexById.has(id)) {
+      merged[indexById.get(id)!] = att;
+    } else {
+      if (id) indexById.set(id, merged.length);
+      merged.push(att);
+    }
+  }
+  return merged;
+}
+
+export function isAttachmentApplicableToItem(
+  att: Attachment | null | undefined,
+  item: Pick<MediaItem, "id">,
+): boolean {
+  const attId = typeof att?.id === "string" ? att.id.trim() : "";
+  if (attId.startsWith("bilibili-audio-")) {
+    return attId === `bilibili-audio-${item.id}`;
+  }
+  return true;
+}
+
+function resolveItemScopedAudioAttachments(
+  media: Pick<UnifiedMedia, "platform" | "attachments">,
+  item: ReadyItem,
+  ctx: TargetContext & { apiOrigin: string },
+): Attachment[] {
+  const scoped: Attachment[] = [];
+  const seenPrimaryUrls = new Set<string>();
+  const expectedBiliAudioId = `bilibili-audio-${item.id}`;
+
+  for (const att of media.attachments ?? []) {
+    if (!isAttachmentApplicableToItem(att, item)) continue;
+    if (
+      (att.role === "background_audio" || att.resource?.role === "audio") &&
+      att.resource?.delivery?.kind === "file"
+    ) {
+      scoped.push(att);
+      const avail = availableSources(att.resource.delivery.sources, ctx.now);
+      const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
+      if (primarySrc) {
+        try {
+          const url = sourceUrl(primarySrc, ctx);
+          if (url) seenPrimaryUrls.add(url);
+        } catch {
+          // Ignore invalid source URL during dedupe check
+        }
+      }
+    }
+  }
+
+  // Fallback / authoritative episode audio: if this item carries ready DASH mux
+  // variants with a role:"audio" file leaf, surface the episode's own best M4A
+  // audio leaf even when media.attachments hasn't been merged for this part yet.
+  let bestMuxAudioLeaf: Resource | null = null;
+  let bestMuxAudioBitrate = -1;
+  let bestMuxAudioUrl = "";
+  for (const variant of item.variants) {
+    if (!readyVariant(variant) || variant.delivery.kind !== "mux") continue;
+    for (const res of variant.delivery.resources) {
+      if (res.role !== "audio" || res.delivery.kind !== "file") continue;
+      const avail = availableSources(res.delivery.sources, ctx.now);
+      const primarySrc = avail[0];
+      if (!primarySrc) continue;
+      let url = "";
+      try {
+        url = sourceUrl(primarySrc, ctx);
+      } catch {
+        continue;
+      }
+      if (!url) continue;
+      const bitrate = Number(
+        res.metadata?.audio_bitrate_bps || res.metadata?.bitrate_bps || 0,
+      );
+      if (!bestMuxAudioLeaf || bitrate > bestMuxAudioBitrate) {
+        bestMuxAudioLeaf = res;
+        bestMuxAudioBitrate = bitrate;
+        bestMuxAudioUrl = url;
+      }
+    }
+  }
+
+  if (
+    bestMuxAudioLeaf &&
+    bestMuxAudioUrl &&
+    !seenPrimaryUrls.has(bestMuxAudioUrl) &&
+    !scoped.some((att) => att.id === expectedBiliAudioId)
+  ) {
+    scoped.push({
+      id:
+        media.platform === "bilibili"
+          ? expectedBiliAudioId
+          : `mux-audio-${item.id}`,
+      role: "background_audio",
+      title: "原声音频 (M4A)",
+      resource: bestMuxAudioLeaf,
+    });
+  }
+
+  return scoped;
+}
+
 export function buildSidePanelQualityOptions(
   media: UnifiedMedia,
   item: MediaItem | null | undefined,
   rawApiOrigin: string,
+  options?: { now?: number },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
   const apiOrigin = resolveSafeApiOrigin(rawApiOrigin);
-  const ctx = { apiOrigin };
+  const ctx: TargetContext & { apiOrigin: string } =
+    options?.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
   const attachments = media.attachments ?? [];
   const isYouTube = media.platform === "youtube";
 
@@ -788,13 +1022,13 @@ export function buildSidePanelQualityOptions(
     }
   }
 
-  const options: SidePanelQualityOption[] = [];
+  const qualityOptions: SidePanelQualityOption[] = [];
 
   for (const variant of item.variants) {
     if (!readyVariant(variant)) continue;
     const primarySource =
       variant.delivery.kind === "file"
-        ? availableSources(variant.delivery.sources)[0] ??
+        ? availableSources(variant.delivery.sources, ctx.now)[0] ??
           variant.delivery.sources[0] ??
           null
         : null;
@@ -807,22 +1041,32 @@ export function buildSidePanelQualityOptions(
       },
       ctx,
     );
-    const downloadable = ["file", "hls", "segments", "pair"].includes(
-      target.kind,
-    );
+    const dashMux = extractDashMuxSpec(variant, ctx);
+    const isDashMux = Boolean(dashMux);
+    const downloadable =
+      ["file", "hls", "segments", "pair"].includes(target.kind) || isDashMux;
     const resolvedSource = target.kind === "file" ? target.source : primarySource;
     const muxPair = muxPairsByVariantId.get(variant.id) ?? null;
+    const videoLeafMeta =
+      variant.delivery.kind === "mux"
+        ? variant.delivery.resources.find((r) => r.role === "video")?.metadata
+        : undefined;
     const meta = variant.metadata ?? {};
     const isAudioOnly = isStandaloneAudioMetadata(meta, item.type);
     const effectiveHasAudio =
       isAudioOnly ||
       Boolean(muxPair) ||
+      isDashMux ||
       meta.has_audio === true ||
       (item.type === "video" && meta.has_audio !== false);
 
     let directUrl = "";
     let routes: string[] = [];
-    if (target.kind === "file") {
+    if (isDashMux && dashMux) {
+      // Do NOT expose a broken video-only .m4s URL as directUrl
+      directUrl = "";
+      routes = dashMux.videoRoutes;
+    } else if (target.kind === "file") {
       directUrl = target.url;
       const tbCandidate =
         item.type === "video" &&
@@ -869,6 +1113,7 @@ export function buildSidePanelQualityOptions(
       platform: media.platform,
       hasTbvideo: Boolean(item.tbvideo?.vid),
       muxPair,
+      dashMux,
     });
 
     const rawLabel = variantLabel(variant, "zh-CN");
@@ -882,6 +1127,8 @@ export function buildSidePanelQualityOptions(
         text: `独立音频 · ${resolvedExt.toUpperCase()}`,
         tone: "track",
       };
+    } else if (isDashMux) {
+      audioBadge = { text: "DASH 合流", tone: "mux" };
     } else if (muxPair) {
       audioBadge = { text: "4K/高画质自动合流原声", tone: "mux" };
     } else if (item.type === "video") {
@@ -891,20 +1138,62 @@ export function buildSidePanelQualityOptions(
           : { text: "音画合一", tone: "audio" };
     }
 
-    const sizeBytes = muxPair
-      ? parsePositiveSafeBytes(resolvedSource?.size_bytes) +
-        parsePositiveSafeBytes(muxPair.audioSource.size_bytes)
-      : parsePositiveSafeBytes(resolvedSource?.size_bytes);
+    let sizeBytes = 0;
+    let sizeLabel = "";
+    if (isDashMux && dashMux) {
+      const { exactBytes, estimatedBytes } = estimateDashMuxByteTotals(
+        variant,
+        dashMux,
+        item.duration_ms,
+      );
+      if (exactBytes > 0 && estimatedBytes === 0) {
+        sizeBytes = exactBytes;
+        sizeLabel = formatMediaSize(exactBytes, "zh-CN");
+      } else if (estimatedBytes > 0) {
+        sizeBytes = estimatedBytes;
+        sizeLabel = formatApproxSizeLabel(estimatedBytes);
+      } else if (exactBytes > 0) {
+        sizeBytes = exactBytes;
+        sizeLabel = formatMediaSize(exactBytes, "zh-CN");
+      } else {
+        sizeLabel = formatMediaSize(0, "zh-CN");
+      }
+    } else if (muxPair) {
+      sizeBytes =
+        parsePositiveSafeBytes(resolvedSource?.size_bytes) +
+        parsePositiveSafeBytes(muxPair.audioSource.size_bytes);
+      sizeLabel = isYouTube
+        ? formatYouTubeMuxOptionSize(
+            { variant, source: resolvedSource },
+            muxPairsByVariantId,
+            "zh-CN",
+          )
+        : formatMediaSize(sizeBytes, "zh-CN");
+    } else {
+      sizeBytes = parsePositiveSafeBytes(resolvedSource?.size_bytes);
+      sizeLabel = isYouTube
+        ? formatYouTubeMuxOptionSize(
+            { variant, source: resolvedSource },
+            muxPairsByVariantId,
+            "zh-CN",
+          )
+        : formatMediaSize(resolvedSource?.size_bytes, "zh-CN");
+    }
 
-    const sizeLabel = isYouTube
-      ? formatYouTubeMuxOptionSize(
-          { variant, source: resolvedSource },
-          muxPairsByVariantId,
-          "zh-CN",
-        )
-      : formatMediaSize(resolvedSource?.size_bytes, "zh-CN");
+    const effW = Number(meta.width || videoLeafMeta?.width || 0) || 0;
+    const effH = Number(meta.height || videoLeafMeta?.height || 0) || 0;
+    const effShortEdge =
+      effW > 0 && effH > 0
+        ? Math.min(effW, effH)
+        : inferEffectiveShortEdge(variant);
+    const effPixelArea =
+      effW > 0 && effH > 0 ? effW * effH : effShortEdge * effShortEdge;
+    const effFps = Number(meta.fps || videoLeafMeta?.fps || 0) || 0;
+    const effVideoCodec = String(
+      meta.video_codec || videoLeafMeta?.video_codec || "",
+    ).trim();
 
-    options.push({
+    qualityOptions.push({
       key: `variant:${variant.id}`,
       kind: "variant",
       variant,
@@ -918,12 +1207,21 @@ export function buildSidePanelQualityOptions(
       sizeBytes,
       isAudioOnly,
       effectiveHasAudio,
-      shortEdge: inferEffectiveShortEdge(variant),
-      fps: Number(meta.fps || 0),
+      shortEdge: effShortEdge,
+      pixelArea: effPixelArea,
+      fps: effFps,
       bitrateBps: Number(
-        meta.bitrate_bps || meta.video_bitrate_bps || meta.audio_bitrate_bps || 0,
+        meta.bitrate_bps ||
+          meta.video_bitrate_bps ||
+          videoLeafMeta?.video_bitrate_bps ||
+          videoLeafMeta?.bitrate_bps ||
+          meta.audio_bitrate_bps ||
+          0,
       ),
+      videoCodec: effVideoCodec,
       muxPair,
+      isDashMux,
+      dashMux,
       resolvedExt,
       formatMime,
       directUrl,
@@ -931,19 +1229,24 @@ export function buildSidePanelQualityOptions(
     });
   }
 
-  // Surface standalone audio attachments on video/audio items (e.g., Douyin/Kuaishou BGM or YouTube audio track if not already in variants)
-  const hasVariantAudioOption = options.some(
+  // Surface standalone audio attachments on video/audio items (e.g., Bilibili 30280 AAC M4A, Douyin/Kuaishou BGM, or YouTube audio track)
+  const hasVariantAudioOption = qualityOptions.some(
     (opt) => opt.downloadable && opt.isAudioOnly,
   );
   if (item.type === "video" || item.type === "audio") {
-    for (const att of attachments) {
+    const scopedAudioAttachments = resolveItemScopedAudioAttachments(
+      media,
+      item,
+      ctx,
+    );
+    for (const att of scopedAudioAttachments) {
       if (
         (att.role === "background_audio" || att.resource?.role === "audio") &&
         att.resource?.delivery?.kind === "file"
       ) {
         // Avoid duplicating an identical YouTube audio source URL already listed in variants
-        const avail = availableSources(att.resource.delivery.sources);
-        const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
+        const avail = availableSources(att.resource.delivery.sources, ctx.now);
+        const primarySrc = avail[0];
         if (!primarySrc) continue;
         let attUrl = "";
         let attRoutes: string[] = [];
@@ -954,14 +1257,24 @@ export function buildSidePanelQualityOptions(
           continue;
         }
         if (!attUrl) continue;
-        if (hasVariantAudioOption && options.some((o) => o.directUrl === attUrl)) {
+        if (
+          hasVariantAudioOption &&
+          qualityOptions.some((o) => o.directUrl === attUrl)
+        ) {
           continue;
         }
+
+        const rawAttTitle = att.title?.trim() || "";
+        const attLabel = rawAttTitle
+          ? rawAttTitle.startsWith("原声") || rawAttTitle.startsWith("仅音频")
+            ? rawAttTitle
+            : `原声 · ${rawAttTitle}`
+          : "仅音频 (M4A)";
 
         const syntheticVariant: ReadyVariant = {
           id: `att-${att.id}`,
           state: "ready",
-          label: att.title?.trim() ? `原声 · ${att.title.trim()}` : "独立原声音频",
+          label: attLabel,
           metadata: att.resource.metadata,
           delivery: att.resource.delivery,
         };
@@ -990,7 +1303,27 @@ export function buildSidePanelQualityOptions(
           platform: media.platform,
         });
 
-        options.push({
+        const attExactBytes = parsePositiveSafeBytes(primarySrc.size_bytes);
+        const attBitrate = Number(
+          att.resource.metadata?.audio_bitrate_bps ||
+            att.resource.metadata?.bitrate_bps ||
+            0,
+        );
+        const attDurationMs = Number(
+          att.resource.metadata?.duration_ms || item.duration_ms || 0,
+        );
+        const attEstBytes =
+          !attExactBytes && attBitrate > 0 && attDurationMs > 0
+            ? Math.round((attBitrate * attDurationMs) / 8000)
+            : 0;
+        const attSizeLabel =
+          attExactBytes > 0
+            ? formatMediaSize(attExactBytes, "zh-CN")
+            : attEstBytes > 0
+              ? formatApproxSizeLabel(attEstBytes)
+              : formatMediaSize(0, "zh-CN");
+
+        qualityOptions.push({
           key: `attachment:${att.id}`,
           kind: "attachment",
           variant: syntheticVariant,
@@ -1004,18 +1337,18 @@ export function buildSidePanelQualityOptions(
             text: `提取音频 · ${resolvedExt.toUpperCase()}`,
             tone: "track",
           },
-          sizeLabel: formatMediaSize(primarySrc.size_bytes, "zh-CN"),
-          sizeBytes: parsePositiveSafeBytes(primarySrc.size_bytes),
+          sizeLabel: attSizeLabel,
+          sizeBytes: attExactBytes || attEstBytes,
           isAudioOnly: true,
           effectiveHasAudio: true,
           shortEdge: 0,
+          pixelArea: 0,
           fps: 0,
-          bitrateBps: Number(
-            att.resource.metadata?.audio_bitrate_bps ||
-              att.resource.metadata?.bitrate_bps ||
-              0,
-          ),
+          bitrateBps: attBitrate,
+          videoCodec: "",
           muxPair: null,
+          isDashMux: false,
+          dashMux: null,
           resolvedExt,
           formatMime,
           directUrl: attUrl,
@@ -1025,7 +1358,7 @@ export function buildSidePanelQualityOptions(
     }
   }
 
-  return options;
+  return qualityOptions;
 }
 
 function compareVideoQualityDesc(
@@ -1039,6 +1372,9 @@ function compareVideoQualityDesc(
   if (a.shortEdge !== b.shortEdge) {
     return b.shortEdge - a.shortEdge;
   }
+  if (a.pixelArea !== b.pixelArea) {
+    return b.pixelArea - a.pixelArea;
+  }
   if (a.fps !== b.fps) {
     return b.fps - a.fps;
   }
@@ -1047,6 +1383,12 @@ function compareVideoQualityDesc(
   const bMp4 = b.resolvedExt === "mp4" ? 1 : 0;
   if (aMp4 !== bMp4) {
     return bMp4 - aMp4;
+  }
+  // Prefer H.264 (AVC) > HEVC > AV1 > other codecs at identical resolution, FPS & container
+  const aCodecRank = uiVideoCodecPreferenceRank(a.videoCodec);
+  const bCodecRank = uiVideoCodecPreferenceRank(b.videoCodec);
+  if (aCodecRank !== bCodecRank) {
+    return bCodecRank - aCodecRank;
   }
   if (a.bitrateBps !== b.bitrateBps) {
     return b.bitrateBps - a.bitrateBps;
@@ -1176,6 +1518,16 @@ export function buildPrimarySingleCtaLabel(params: {
       ? `${tier}${fpsSuffix}`
       : tier || option.titleLabel;
 
+  if (option.isDashMux) {
+    const labelTier =
+      option.titleLabel && /1080p\+/i.test(option.titleLabel)
+        ? option.titleLabel
+        : tierWithFps;
+    return labelTier && labelTier !== "画质未知"
+      ? `下载 ${labelTier} 无损合流 (${extUpper})`
+      : `下载无损合流 (${extUpper})`;
+  }
+
   if (option.muxPair || option.effectiveHasAudio) {
     return tierWithFps && tierWithFps !== "画质未知"
       ? `下载 ${tierWithFps} 有声视频 (${extUpper})`
@@ -1196,11 +1548,11 @@ const TASK_STATUS_PROGRESSION: Readonly<
   queued: 0,
   parsing: 1,
   downloading: 2,
-  muxing: 2,
-  saving: 3,
-  completed: 4,
-  failed: 4,
-  cancelled: 4,
+  muxing: 3,
+  saving: 4,
+  completed: 5,
+  failed: 5,
+  cancelled: 5,
 };
 
 function pickFresherTask(
@@ -1340,15 +1692,106 @@ function buildSegmentsSpecFromDelivery(
   });
 }
 
+function buildRefreshContextForOption(params: {
+  media: UnifiedMedia;
+  item: MediaItem;
+  option: SidePanelQualityOption;
+  now?: number;
+}): MediaRefreshContext | undefined {
+  const { media, item, option, now } = params;
+  const parseUrl = item.source_url?.trim() || media.source_url?.trim() || "";
+  const resolveUrl =
+    item.state !== "unavailable" && item.resolve_url?.trim()
+      ? item.resolve_url.trim()
+      : undefined;
+  if (!parseUrl && !resolveUrl) {
+    return undefined;
+  }
+
+  let expiresAtMs: number | undefined;
+  if (option.muxPair) {
+    expiresAtMs = computeEarliestExpiresAtMs([
+      option.muxPair.videoSource,
+      option.muxPair.audioSource,
+    ]);
+  } else if (
+    option.kind === "attachment" &&
+    option.attachment?.resource.delivery.kind === "file"
+  ) {
+    const avail = availableSources(option.attachment.resource.delivery.sources, now);
+    expiresAtMs = computeEarliestExpiresAtMs(
+      avail.length ? avail : option.attachment.resource.delivery.sources,
+    );
+  } else {
+    expiresAtMs = extractVariantEarliestExpiresAtMs(option.variant, now);
+  }
+
+  return {
+    parseUrl,
+    platform: media.platform,
+    itemId: item.id,
+    ...(option.kind === "attachment" && option.attachment?.id
+      ? { attachmentId: option.attachment.id }
+      : { variantId: option.variant.id }),
+    ...(resolveUrl ? { resolveUrl } : {}),
+    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+  };
+}
+
+function buildRefreshContextForResource(params: {
+  media: UnifiedMedia;
+  item: MediaItem;
+  variantId?: string;
+  resource: Resource;
+  now?: number;
+}): MediaRefreshContext | undefined {
+  const { media, item, variantId, resource, now } = params;
+  const parseUrl = item.source_url?.trim() || media.source_url?.trim() || "";
+  const resolveUrl =
+    item.state !== "unavailable" && item.resolve_url?.trim()
+      ? item.resolve_url.trim()
+      : undefined;
+  if (!parseUrl && !resolveUrl) {
+    return undefined;
+  }
+  const delivery = resource.delivery;
+  const sources =
+    delivery.kind === "segments"
+      ? [
+          ...(delivery.init?.sources ?? []),
+          ...delivery.pieces.flatMap((p) => p.sources),
+        ]
+      : delivery.sources;
+  const avail = availableSources(sources, now);
+  const expiresAtMs = computeEarliestExpiresAtMs(avail.length ? avail : sources);
+  const resourceRole =
+    resource.role === "image" ||
+    resource.role === "motion" ||
+    resource.role === "video"
+      ? resource.role
+      : undefined;
+  return {
+    parseUrl,
+    platform: media.platform,
+    itemId: item.id,
+    ...(variantId ? { variantId } : {}),
+    ...(resourceRole ? { resourceRole } : {}),
+    ...(resolveUrl ? { resolveUrl } : {}),
+    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+  };
+}
+
 export function buildSpecFromOption(params: {
   media: UnifiedMedia;
   option: SidePanelQualityOption;
   filename: string;
   apiOrigin: string;
+  refreshContext?: MediaRefreshContext;
 }): OffscreenDownloadSpec {
-  const { media, option, filename } = params;
+  const { media, option, filename, refreshContext } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
+  const refreshField = refreshContext ? { refreshContext } : {};
 
   if (option.muxPair) {
     const videoUrl = sourceUrl(option.muxPair.videoSource, { apiOrigin });
@@ -1364,6 +1807,7 @@ export function buildSpecFromOption(params: {
       mimeType: option.muxPair.outputMimeType,
       ...(totalSize > 0 ? { sizeBytes: totalSize } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
       youtubeMux: {
         videoUrl,
         audioUrl,
@@ -1375,6 +1819,23 @@ export function buildSpecFromOption(params: {
           : {}),
         outputContainer: option.muxPair.outputContainer,
       },
+    };
+  }
+
+  if (option.dashMux) {
+    const exactDashBytes =
+      parsePositiveSafeBytes(option.dashMux.videoSize) +
+      parsePositiveSafeBytes(option.dashMux.audioSize);
+    return {
+      kind: "dash_mux",
+      apiOrigin,
+      routes: option.dashMux.videoRoutes,
+      filename,
+      mimeType: "video/mp4",
+      ...(exactDashBytes > 0 ? { sizeBytes: exactDashBytes } : {}),
+      ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
+      dashMux: option.dashMux,
     };
   }
 
@@ -1390,6 +1851,7 @@ export function buildSpecFromOption(params: {
       filename,
       ...(option.formatMime ? { mimeType: option.formatMime } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
     };
   }
 
@@ -1405,6 +1867,7 @@ export function buildSpecFromOption(params: {
       segments,
       ...(option.formatMime ? { mimeType: option.formatMime } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
     };
   }
 
@@ -1424,6 +1887,7 @@ export function buildSpecFromOption(params: {
     ...(option.formatMime ? { mimeType: option.formatMime } : {}),
     ...(option.sizeBytes > 0 ? { sizeBytes: option.sizeBytes } : {}),
     ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+    ...refreshField,
   };
 }
 
@@ -1448,11 +1912,18 @@ export function buildSingleDownloadEnqueueItem(params: {
     ext: option.resolvedExt,
   });
 
+  const refreshContext = buildRefreshContextForOption({
+    media,
+    item,
+    option,
+  });
+
   const spec = buildSpecFromOption({
     media,
     option,
     filename,
     apiOrigin,
+    refreshContext,
   });
 
   return {
@@ -1460,6 +1931,7 @@ export function buildSingleDownloadEnqueueItem(params: {
     platform: media.platform,
     ...(workFingerprint ? { workFingerprint } : {}),
     fallbackUrl: option.directUrl || media.source_url,
+    ...(refreshContext ? { refreshContext } : {}),
     spec,
   };
 }
@@ -1613,12 +2085,25 @@ export function buildChecklistSubfolderEnqueueItems(params: {
             stem: livePhotoFilter === "both" ? "live" : undefined,
             ext: probe.ext,
           });
+          const motionRefreshContext = buildRefreshContextForResource({
+            media,
+            item,
+            variantId: pairVariant.id,
+            resource: motionRes,
+          });
           out.push({
             title: `${subfolder} #${ordinalIndex} (实况视频)`,
             platform: media.platform,
             ...(workFingerprint ? { workFingerprint } : {}),
             fallbackUrl: probe.primaryUrl || media.source_url,
-            spec: { ...probe.spec, filename: motionFilename },
+            ...(motionRefreshContext ? { refreshContext: motionRefreshContext } : {}),
+            spec: {
+              ...probe.spec,
+              filename: motionFilename,
+              ...(motionRefreshContext
+                ? { refreshContext: motionRefreshContext }
+                : {}),
+            },
           });
         }
 
@@ -1640,12 +2125,25 @@ export function buildChecklistSubfolderEnqueueItems(params: {
             stem: livePhotoFilter === "both" ? "cover" : undefined,
             ext: probe.ext,
           });
+          const imageRefreshContext = buildRefreshContextForResource({
+            media,
+            item,
+            variantId: pairVariant.id,
+            resource: imageRes,
+          });
           out.push({
             title: `${subfolder} #${ordinalIndex} (实况封面)`,
             platform: media.platform,
             ...(workFingerprint ? { workFingerprint } : {}),
             fallbackUrl: probe.primaryUrl || media.source_url,
-            spec: { ...probe.spec, filename: imageFilename },
+            ...(imageRefreshContext ? { refreshContext: imageRefreshContext } : {}),
+            spec: {
+              ...probe.spec,
+              filename: imageFilename,
+              ...(imageRefreshContext
+                ? { refreshContext: imageRefreshContext }
+                : {}),
+            },
           });
         }
         continue;
@@ -1681,11 +2179,18 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       ext: chosen.resolvedExt,
     });
 
+    const refreshContext = buildRefreshContextForOption({
+      media,
+      item,
+      option: chosen,
+    });
+
     const spec = buildSpecFromOption({
       media,
       option: chosen,
       filename,
       apiOrigin,
+      refreshContext,
     });
 
     out.push({
@@ -1693,6 +2198,7 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       platform: media.platform,
       ...(workFingerprint ? { workFingerprint } : {}),
       fallbackUrl: chosen.directUrl || media.source_url,
+      ...(refreshContext ? { refreshContext } : {}),
       spec,
     });
   }
@@ -1743,6 +2249,13 @@ export function buildChecklistZipEnqueueItem(params: {
         ok: false,
         reason:
           "YouTube 4K/高画质分离流需使用「按标题存子文件夹」逐集无损合流（零内存上限）",
+      };
+    }
+    if (sub.spec.kind === "dash_mux") {
+      return {
+        ok: false,
+        reason:
+          "DASH 音视频分离流需使用「按标题存子文件夹」逐集无损合流（零内存上限）",
       };
     }
     if (sub.spec.kind === "hls") {

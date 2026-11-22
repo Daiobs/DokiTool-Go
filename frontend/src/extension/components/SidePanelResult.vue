@@ -310,17 +310,25 @@ const previewVideoUrl = computed<string>(() => {
   const chosen = activeSelectedOption.value;
   if (!chosen) return "";
 
-  // On YouTube, if the user selected a 4K/1080p video-only adaptive stream (`muxPair`),
-  // prefer an inline-playable muxed stream (e.g. 360p with audio) for smooth preview if available
-  if (props.media.platform === "youtube" && chosen.muxPair) {
-    const muxedPlayable = activeQualityOptions.value.find(
+  // If the user selected a split adaptive/DASH mux option (YouTube muxPair or generic DASH dashMux),
+  // keep the top <video> stage bound to the best inline-playable `kind: "file"` stream (e.g. Bilibili durl or YouTube muxed)
+  if ((props.media.platform === "youtube" && chosen.muxPair) || chosen.isDashMux) {
+    const defaultVarId = readyItem(item) ? item.default?.variant_id : undefined;
+    const playableFileCandidates = activeQualityOptions.value.filter(
       (o) =>
         !o.isAudioOnly &&
         !o.muxPair &&
-        o.variant.metadata?.has_audio === true &&
+        !o.isDashMux &&
+        (props.media.platform === "youtube"
+          ? o.variant.metadata?.has_audio === true
+          : o.variant.metadata?.has_audio !== false) &&
         o.downloadTarget.kind === "file" &&
-        safeAssetUrl(o.directUrl),
+        Boolean(safeAssetUrl(o.directUrl)),
     );
+    const preferredDefault = defaultVarId
+      ? playableFileCandidates.find((o) => o.variant.id === defaultVarId)
+      : undefined;
+    const muxedPlayable = preferredDefault ?? playableFileCandidates[0];
     if (muxedPlayable) {
       return safeAssetUrl(muxedPlayable.directUrl);
     }
@@ -350,7 +358,14 @@ const singlePrimaryCtaText = computed(() =>
   }),
 );
 
+const isDashMuxSelected = computed<boolean>(() =>
+  Boolean(activeSelectedOption.value?.isDashMux),
+);
+
 const directCopyCandidateUrl = computed<string>(() => {
+  if (isDashMuxSelected.value) {
+    return "";
+  }
   if (activeSelectedOption.value?.directUrl) {
     return activeSelectedOption.value.directUrl;
   }
@@ -362,6 +377,12 @@ const directCopyCandidateUrl = computed<string>(() => {
   }
   return props.media.source_url || "";
 });
+
+const directCopyButtonTitle = computed<string>(() =>
+  isDashMuxSelected.value
+    ? "音视频分离流需经扩展无损合流"
+    : "复制当前选中画质直链到剪贴板",
+);
 
 async function handleCopyDirectLink() {
   const url = directCopyCandidateUrl.value;
@@ -651,9 +672,19 @@ async function prepareResolvedChecklistEntries(): Promise<
           current: i + 1,
           total: deferredList.length,
         };
-        const resolved = await requestLazyResolvePromise(deferredList[i].item);
+        const deferredItem = deferredList[i].item;
+        const resolved = await requestLazyResolvePromise(deferredItem);
         if (resolved && readyItem(resolved)) {
-          resolvedById.set(resolved.id, resolved);
+          const originalResolveUrl =
+            deferredItem.state !== "unavailable"
+              ? deferredItem.resolve_url
+              : undefined;
+          resolvedById.set(
+            resolved.id,
+            !resolved.resolve_url && originalResolveUrl
+              ? { ...resolved, resolve_url: originalResolveUrl }
+              : resolved,
+          );
         }
       }
     } finally {
@@ -773,11 +804,11 @@ async function handleBatchZipSave() {
             {{ durationLabel }}
           </span>
           <span
-            v-if="activeSelectedOption?.muxPair"
+            v-if="activeSelectedOption?.muxPair || activeSelectedOption?.isDashMux"
             class="sp-stage__chip sp-stage__chip--mux"
             title="下载时由后台 Offscreen Mediabunny 自动无损合成音视频轨"
           >
-            下载自动无损合流原声
+            {{ activeSelectedOption?.isDashMux ? "DASH 无损合流" : "下载自动无损合流原声" }}
           </span>
         </div>
       </div>
@@ -852,7 +883,7 @@ async function handleBatchZipSave() {
           type="button"
           class="sp-btn sp-btn--secondary sp-cta-row__copy"
           :disabled="!directCopyCandidateUrl"
-          title="复制当前选中画质直链到剪贴板"
+          :title="directCopyButtonTitle"
           @click="handleCopyDirectLink"
         >
           <span>{{ copiedDirectLink ? "已复制" : "复制直链" }}</span>
@@ -885,6 +916,7 @@ async function handleBatchZipSave() {
           type="button"
           class="sp-btn sp-btn--ghost sp-btn--sm"
           :disabled="!directCopyCandidateUrl"
+          :title="directCopyButtonTitle"
           @click="handleCopyDirectLink"
         >
           {{ copiedDirectLink ? "已复制" : "复制直链" }}
