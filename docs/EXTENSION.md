@@ -1,6 +1,6 @@
 # DokiTool Chrome MV3 侧边栏原生扩展（`sidePanel` + `offscreen`）
 
-DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘或 YouTube 4K60 无损合流。
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站高码率 DASH 无损合流。
 
 ---
 
@@ -10,7 +10,12 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
    - 媒体拉流、多线路顺序回退、HLS / 字节分片拼接、ZIP 打包与 Mediabunny 音视频无损合流均在独立的 `offscreen` 文档中写入浏览器私有文件系统（OPFS），完成后交由 `chrome.downloads` 落盘，并在收到终态事件（`complete` / `interrupted`）后权威回收 `Blob URL` 与 OPFS 临时文件。
 2. **内置免油猴 YouTube 4K60 无损合流**
    - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
-3. **五种高频素材收集入口**
+3. **内置 B 站高码率 DASH 无损合流（1080P AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
+   - **DNR Rule `1004` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则 `1004`，仅对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com` / `akamaized.net` 的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头，解决纯网页端无法携带 B 站防盗链 Referer 的限制，且绝不干扰浏览器正常标签页访问。
+   - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 高码率 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
+   - **独立 M4A、画质记忆与多 P 无缝衔接**：侧边栏顶部 `<video>` 预览继续使用 `durl` 渐进式 MP4 秒开播放；画质列表完整呈现各档位分辨率、编解码（同分辨率默认优先 `H.264` 兼顾全平台硬解与剪辑软件兼容，同时保留 `HEVC` / `AV1` 自由切换）与估算体积；选择「仅音频」时直接下载 `30280` 独立 `.m4a`；支持 B 站多 P 勾选批量合流与右键「极速下载」。
+   - **零 Cookie、零服务端媒体中转**：服务端仅并行解析返回官方优先 CDN 地址（自动过滤未知第三方 PCDN，优先国内加速节点），全部 `.m4s` 媒体流量由用户本机扩展直连拉取；严格遵守零 Cookie 原则，免登录稳定支持至 **1080P（AVC/HEVC/AV1）+ 30280 AAC**，绝不读取或采集浏览器已登录的 B 站 Cookie。
+4. **五种高频素材收集入口**
    - **点击工具栏扩展图标**：一键展开侧边栏。
    - **全局快捷键 `Alt+Shift+D`**：全屏看视频或刷信息流时直接呼出侧边栏并同步当前页（可在 `chrome://extensions/shortcuts` 自定义改键）。
    - **网页右键双菜单（零 Content Script 注入）**：
@@ -18,10 +23,10 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
      - 「用 DokiTool 极速下载（最高画质 / 全部图集）」：无需打开侧边栏，后台直接按画质偏好静默落盘，工具栏角标实时显示进度与完成状态。
    - **跟随标签页自动同步**：仅在本地命中 14 个受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）。
    - **批量链接队列模式**：粘贴整段多行分享文本，本地自动提取、过滤与去重受支持平台链接，按序解析并并发落盘到各自 `<安全标题>/` 子文件夹，单条失败不中断队列且支持一键重试。
-4. **Pixiv 式勾选与子文件夹无上限保存**
+5. **Pixiv 式勾选与子文件夹无上限保存**
    - 图集、实况照片（支持「视频 + 封面 / 仅视频 / 仅封面」三档过滤）与哔哩哔哩多 P 支持全选、反选与单项勾选。
    - 默认按 `<可选前缀>/<安全标题>/001.jpg` 逐个流式落盘（无内存体积上限），同时保留 `500 MiB` 以内的一键 ZIP 打包按钮；下载完成后可一键「打开文件夹」在系统文件管理器中定位文件。
-5. **浅色 / 深色 / 跟随系统主题切换与动态工具栏状态**
+6. **浅色 / 深色 / 跟随系统主题切换与动态工具栏状态**
    - 侧边栏支持 **浅色（Light）/ 深色（Dark）/ 跟随系统（System）** 三态主题切换，即时持久化保存且与系统深浅色联动。
    - 后台下载或极速下载进行时，扩展工具栏图标实时更新 **百分比进度角标（Badge）** 与 **动态悬停提示（Tooltip）**，无需展开侧边栏即可一眼掌握当前任务进度与完成状态。
 
@@ -87,4 +92,4 @@ npm run build:extension:zip
 
 - **零网页注入、零 `<all_urls>` 通配符**：`manifest.json` 不声明任何 `content_scripts`，不包含 `cookies`、`scripting`、`debugger`、`webRequestBlocking` 或未受限的 `declarativeNetRequest` 权限；`host_permissions` 仅列出 `https://snap.dokitool.com/*` 与 14 个平台显式媒体 CDN 域名。
 - **浏览隐私防火墙**：标签页 URL 先在扩展本地执行 14 平台域名与路径语法匹配；访问任何非支持网站、`chrome://`、`file://` 或内网页面时均静默忽略，**向后端发送 0 请求**。
-- **全链路无 Cookie 直连**：扩展发往后端 API 与各平台媒体 CDN 的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则剥离 `Cookie` 与扩展 `Origin` 头，绝不触碰浏览器已登录的站点账号状态，亦不影响用户正常网页浏览。
+- **全链路无 Cookie 直连与零服务端媒体中转**：扩展发往后端 API 与各平台媒体 CDN（含 B 站 DASH `.m4s` 音视频流）的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则（含针对 B 站防盗链的 Rule `1004`）剥离 `Cookie` 与扩展 `Origin` 头；全部媒体数据与 `Mediabunny` 无损合流均在用户本机浏览器内完成，服务端不中转媒体流量，亦不触碰浏览器已登录的站点账号状态或干扰正常网页浏览。
