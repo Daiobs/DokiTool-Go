@@ -106,6 +106,16 @@ export interface OffscreenZipEntrySpec {
   segments?: OffscreenSegmentSpec[];
 }
 
+export interface MediaRefreshContext {
+  parseUrl: string;
+  platform: string;
+  itemId: string;
+  variantId?: string;
+  attachmentId?: string;
+  resolveUrl?: string;
+  expiresAtMs?: number;
+}
+
 export interface OffscreenDownloadSpec {
   kind: OffscreenDownloadKind;
   apiOrigin: string;
@@ -118,6 +128,7 @@ export interface OffscreenDownloadSpec {
   youtubeMux?: OffscreenYouTubeMuxSpec;
   dashMux?: OffscreenDashMuxSpec;
   zipEntries?: OffscreenZipEntrySpec[];
+  refreshContext?: MediaRefreshContext;
 }
 
 export type ExtensionTaskStatus =
@@ -157,6 +168,9 @@ export interface ExtensionDownloadTask {
   total: number;
   speed: number;
   error?: string;
+  lastErrorCode?: string;
+  lastErrorHttpStatus?: number;
+  autoRefreshCount?: number;
   unwhitelistedHost?: string;
   fallbackUrl?: string;
   chromeDownloadId?: number;
@@ -170,6 +184,7 @@ export interface EnqueueDownloadItem {
   platform: string;
   workFingerprint?: string;
   fallbackUrl?: string;
+  refreshContext?: MediaRefreshContext;
   spec: OffscreenDownloadSpec;
 }
 
@@ -348,6 +363,7 @@ export type OffscreenToBackgroundMessage =
       taskId: string;
       error: string;
       code?: string;
+      httpStatus?: number;
       cancelled?: boolean;
       unwhitelistedHost?: string;
       fallbackUrl?: string;

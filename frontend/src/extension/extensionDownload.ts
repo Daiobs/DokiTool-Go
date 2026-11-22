@@ -32,25 +32,43 @@ import {
   type YouTubeHelperPlayerPayload,
   type YouTubeHelperPlayerResult,
 } from "../utils/youtubeHelperCore";
+import { executeDashMux } from "./dashMuxDownload";
 import {
-  runDashMuxToOpfs,
-  type DashMuxOpfsSink,
-  type DashMuxTrackFetchParams,
-  type DashMuxTrackFetchResult,
-  type DashMuxWritableLike,
-} from "./dashMuxEngine";
+  computeEarliestExpiresAtMs,
+  extractDashMuxSpec,
+  extractVariantEarliestExpiresAtMs,
+} from "./dashMuxSpec";
 import {
   MAX_FOLDER_CODE_POINTS,
   buildSafeDownloadPath,
   formatBatchItemIndex,
   sanitizeFilenameSegment,
 } from "./filenameSanitizer";
-import { isWhitelistedMediaUrl, validateApiBaseUrl } from "./hostWhitelist";
+import { validateApiBaseUrl } from "./hostWhitelist";
+import {
+  ExtensionDownloadError,
+  assertWhitelistedUrl,
+  buildEffectiveExtraOrigins,
+  ensureOpfsQuotaAvailable,
+  hasIsoBmffBoxHeader,
+  isAbortLikeError,
+  resolveBlobMimeType,
+  streamResponseBodyToWriter,
+  streamResumableRouteToOpfs,
+  throwIfAborted,
+  whitelistedFetch,
+  type OpfsDirectoryLike,
+  type OpfsSinkLike,
+  type OpfsStorageLike,
+  type OpfsWritableLike,
+  type WebLocksLike,
+} from "./opfsStreamTransfer";
 import {
   EXTENSION_OPFS_TEMP_PREFIX,
   type BatchSaveMode,
   type EnqueueDownloadItem,
   type HandOffBlobDownloadResult,
+  type MediaRefreshContext,
   type OffscreenDashMuxSpec,
   type OffscreenDownloadSpec,
   type OffscreenSegmentSpec,
@@ -64,6 +82,21 @@ import {
   type UrlObjectApiLike,
 } from "./youtubeExtensionBridge";
 
+export {
+  extractDashMuxSpec,
+  extractDashMuxSpec as extractFileMuxSpec,
+} from "./dashMuxSpec";
+export {
+  ExtensionDownloadError,
+  ensureOpfsQuotaAvailable,
+  hasIsoBmffBoxHeader,
+  resolveBlobMimeType,
+  streamResumableRouteToOpfs,
+  whitelistedFetch,
+  type OpfsStorageLike,
+  type WebLocksLike,
+} from "./opfsStreamTransfer";
+
 export const MAX_BATCH_ZIP_BYTES = 500 * 1024 * 1024;
 export const ARCHIVE_LIMIT_ERROR =
   "打包总大小超过 500 MB 上限，请分批或单文件下载";
@@ -72,39 +105,18 @@ export const DEFAULT_PROGRESS_THROTTLE_MS = 150;
 
 export type LivePhotoSaveMode = "both" | "video" | "motion" | "image";
 
-export class ExtensionDownloadError extends Error {
-  code?: string;
-  cancelled?: boolean;
-  unwhitelistedHost?: string;
-  fallbackUrl?: string;
-
-  constructor(
-    message: string,
-    extra?: {
-      code?: string;
-      cancelled?: boolean;
-      unwhitelistedHost?: string;
-      fallbackUrl?: string;
-    },
-  ) {
-    super(message);
-    this.name = extra?.cancelled ? "AbortError" : "ExtensionDownloadError";
-    this.code = extra?.code;
-    this.cancelled = extra?.cancelled;
-    this.unwhitelistedHost = extra?.unwhitelistedHost;
-    this.fallbackUrl = extra?.fallbackUrl;
-  }
-}
-
 export interface SelectedVariantPlan {
   variant: ReadyVariant;
   target: DownloadTarget;
   isAudioOnly: boolean;
+  attachmentId?: string;
   youtubeMux?: {
     videoUrl: string;
     audioUrl: string;
     videoSize?: number;
     audioSize?: number;
+    videoSource?: Source;
+    audioSource?: Source;
     outputContainer: "mp4" | "webm";
   };
   dashMux?: OffscreenDashMuxSpec;
@@ -152,87 +164,6 @@ function resolveVariantVideoCodec(variant: ReadyVariant): string {
     }
   }
   return "";
-}
-
-/**
- * Extracts a generic lossless DASH mux spec from a `delivery.kind === "mux"`
- * variant whose resources contain exactly 1 `video` (`kind: "file"`) and
- * 1 `audio` (`kind: "file"`) leaf stream with available routes.
- */
-export function extractFileMuxSpec(
-  variant: ReadyVariant,
-  context: TargetContext = {},
-): OffscreenDashMuxSpec | null {
-  if (variant.delivery.kind !== "mux") return null;
-  const outputContainer = (
-    variant.delivery.output?.container ||
-    variant.delivery.output?.extension ||
-    variant.metadata?.container ||
-    variant.metadata?.extension ||
-    "mp4"
-  )
-    .trim()
-    .toLowerCase();
-  if (outputContainer !== "mp4") {
-    return null;
-  }
-
-  const videoResources = variant.delivery.resources.filter(
-    (r) => r.role === "video",
-  );
-  const audioResources = variant.delivery.resources.filter(
-    (r) => r.role === "audio",
-  );
-  if (videoResources.length !== 1 || audioResources.length !== 1) {
-    return null;
-  }
-  const videoRes = videoResources[0];
-  const audioRes = audioResources[0];
-  if (
-    videoRes.delivery.kind !== "file" ||
-    audioRes.delivery.kind !== "file"
-  ) {
-    return null;
-  }
-
-  const availVideo = availableSources(videoRes.delivery.sources, context.now);
-  const availAudio = availableSources(audioRes.delivery.sources, context.now);
-  if (!availVideo.length || !availAudio.length) {
-    return null;
-  }
-
-  let videoRoutes: string[];
-  let audioRoutes: string[];
-  try {
-    videoRoutes = deliveryRoutes(availVideo, context);
-    audioRoutes = deliveryRoutes(availAudio, context);
-  } catch {
-    return null;
-  }
-  if (!videoRoutes.length || !audioRoutes.length) {
-    return null;
-  }
-
-  const videoSize =
-    typeof availVideo[0]?.size_bytes === "number" &&
-    Number.isSafeInteger(availVideo[0].size_bytes) &&
-    availVideo[0].size_bytes > 0
-      ? availVideo[0].size_bytes
-      : undefined;
-  const audioSize =
-    typeof availAudio[0]?.size_bytes === "number" &&
-    Number.isSafeInteger(availAudio[0].size_bytes) &&
-    availAudio[0].size_bytes > 0
-      ? availAudio[0].size_bytes
-      : undefined;
-
-  return {
-    videoRoutes,
-    audioRoutes,
-    ...(videoSize ? { videoSize } : {}),
-    ...(audioSize ? { audioSize } : {}),
-    outputContainer: "mp4",
-  };
 }
 
 function inferShortEdgeFromLabel(label?: string): number {
@@ -332,11 +263,12 @@ export function selectVariantByPreference(
   attachments: Attachment[] | undefined,
   qualityPreference: QualityPreference,
   apiOrigin: string,
+  now?: number,
 ): SelectedVariantPlan | null {
   if (!readyItem(item)) {
     return null;
   }
-  const context: TargetContext = { apiOrigin };
+  const context: TargetContext = now !== undefined ? { apiOrigin, now } : { apiOrigin };
   const readyVariants = item.variants.filter(readyVariant);
 
   // 1. Image / LivePhoto items always resolve as visual items even when qualityPreference === "audio"
@@ -423,7 +355,7 @@ export function selectVariantByPreference(
         (att?.role === "background_audio" || att?.resource?.role === "audio") &&
         att.resource?.delivery?.kind === "file"
       ) {
-        const avail = availableSources(att.resource.delivery.sources);
+        const avail = availableSources(att.resource.delivery.sources, context.now);
         if (!avail.length) return;
         const syntheticVariant: ReadyVariant = {
           id: att.id || `att-${att.resource.id || "audio"}`,
@@ -457,7 +389,12 @@ export function selectVariantByPreference(
         ).toLowerCase();
         const mime = (syntheticVariant.metadata?.mime_type || "").toLowerCase();
         audioPlans.push({
-          plan: { variant: syntheticVariant, target, isAudioOnly: true },
+          plan: {
+            variant: syntheticVariant,
+            target,
+            isAudioOnly: true,
+            ...(att.id ? { attachmentId: att.id } : {}),
+          },
           prefersM4a: ext === "m4a" || mime === "audio/mp4" || ext === "mp3",
           notDubbed: true,
           bitrate:
@@ -513,7 +450,7 @@ export function selectVariantByPreference(
     if (item.type !== "audio" && isStandaloneAudioVariant(variant)) {
       continue;
     }
-    const dashMux = extractFileMuxSpec(variant, context);
+    const dashMux = extractDashMuxSpec(variant, context);
     const target = getDownloadTarget(item, { variant_id: variant.id }, context);
     if (!("variant" in target) && !dashMux) {
       continue;
@@ -562,6 +499,8 @@ export function selectVariantByPreference(
           audioUrl: sourceUrl(pair.audioSource, context),
           videoSize: target.source.size_bytes,
           audioSize: pair.audioSource.size_bytes,
+          videoSource: target.source,
+          audioSource: pair.audioSource,
           outputContainer: pair.outputContainer,
         };
       }
@@ -777,23 +716,6 @@ function buildSegmentSpecsFromDelivery(
   });
 }
 
-function buildEffectiveExtraOrigins(
-  apiOrigin: string,
-  extraAllowedOrigins?: string[],
-): string[] {
-  const set = new Set<string>();
-  const validated = validateApiBaseUrl(apiOrigin);
-  if (validated.ok) {
-    set.add(validated.origin);
-  }
-  for (const extra of extraAllowedOrigins ?? []) {
-    if (typeof extra === "string" && extra.trim()) {
-      set.add(extra.trim());
-    }
-  }
-  return Array.from(set);
-}
-
 export interface BuildEnqueueItemsOptions {
   apiOrigin: string;
   qualityPreference?: QualityPreference;
@@ -804,6 +726,8 @@ export interface BuildEnqueueItemsOptions {
   livePhotoMode?: LivePhotoSaveMode;
   forceSubfolder?: boolean;
   extraAllowedOrigins?: string[];
+  sourceUrl?: string;
+  now?: number;
 }
 
 interface PreparedLeafItem {
@@ -820,6 +744,7 @@ interface PreparedLeafItem {
   segments?: OffscreenSegmentSpec[];
   youtubeMux?: OffscreenDownloadSpec["youtubeMux"];
   dashMux?: OffscreenDownloadSpec["dashMux"];
+  refreshContext?: MediaRefreshContext;
 }
 
 function prepareResourceLeaf(params: {
@@ -830,8 +755,9 @@ function prepareResourceLeaf(params: {
   index?: number;
   totalCount: number;
   fallbackUrl?: string;
+  baseRefreshContext?: Omit<MediaRefreshContext, "expiresAtMs">;
 }): PreparedLeafItem {
-  const { resource, context } = params;
+  const { resource, context, baseRefreshContext } = params;
   const delivery = resource.delivery;
   const ext =
     mediaExtension(resource.metadata, delivery) !== "bin"
@@ -842,6 +768,15 @@ function prepareResourceLeaf(params: {
           ? "m4a"
           : "mp4";
   const mimeType = resource.metadata?.mime_type;
+
+  const withExpiry = (sources: Source[]): MediaRefreshContext | undefined => {
+    if (!baseRefreshContext) return undefined;
+    const expiresAtMs = computeEarliestExpiresAtMs(sources);
+    return {
+      ...baseRefreshContext,
+      ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+    };
+  };
 
   if (delivery.kind === "file") {
     const avail = availableSources(delivery.sources, context.now);
@@ -860,6 +795,7 @@ function prepareResourceLeaf(params: {
       fallbackUrl: params.fallbackUrl || routes[0],
       specKind: "direct_file",
       routes,
+      refreshContext: withExpiry(avail),
     };
   }
 
@@ -867,7 +803,8 @@ function prepareResourceLeaf(params: {
     if (delivery.scope !== "single") {
       throw new Error("自适应 HLS 暂不支持直接合并");
     }
-    const routes = deliveryRoutes(delivery.sources, context);
+    const avail = availableSources(delivery.sources, context.now);
+    const routes = deliveryRoutes(avail, context);
     if (!routes.length) {
       throw new Error("HLS 资源没有可用来源");
     }
@@ -881,11 +818,16 @@ function prepareResourceLeaf(params: {
       fallbackUrl: params.fallbackUrl || routes[0],
       specKind: "hls",
       routes,
+      refreshContext: withExpiry(avail),
     };
   }
 
   if (delivery.kind === "segments") {
     const segments = buildSegmentSpecsFromDelivery(delivery, context);
+    const segSources: Source[] = [
+      ...(delivery.init?.sources ?? []),
+      ...delivery.pieces.flatMap((p) => p.sources),
+    ];
     return {
       title: params.title,
       entryStem: params.entryStem,
@@ -897,6 +839,7 @@ function prepareResourceLeaf(params: {
       specKind: "segments",
       routes: segments[0]?.routes ?? (segments[0]?.url ? [segments[0].url] : []),
       segments,
+      refreshContext: withExpiry(availableSources(segSources, context.now)),
     };
   }
 
@@ -913,7 +856,8 @@ export function buildEnqueueItemsForMedia(
 ): EnqueueDownloadItem[] {
   const validatedApi = validateApiBaseUrl(options.apiOrigin);
   const apiOrigin = validatedApi.ok ? validatedApi.origin : options.apiOrigin;
-  const context: TargetContext = { apiOrigin };
+  const context: TargetContext =
+    options.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
   const qualityPreference = options.qualityPreference ?? "best";
   const batchSaveMode = options.batchSaveMode ?? "subfolder";
   const livePhotoMode = options.livePhotoMode ?? "both";
@@ -978,7 +922,7 @@ export function buildEnqueueItemsForMedia(
           readyVariant(v) && v.id === explicitChoice.variant_id,
       );
       const explicitDashMux = explicitVariant
-        ? extractFileMuxSpec(explicitVariant, context)
+        ? extractDashMuxSpec(explicitVariant, context)
         : null;
 
       if (!("variant" in target)) {
@@ -1012,6 +956,8 @@ export function buildEnqueueItemsForMedia(
               audioUrl: sourceUrl(pair.audioSource, context),
               videoSize: target.source.size_bytes,
               audioSize: pair.audioSource.size_bytes,
+              videoSource: target.source,
+              audioSource: pair.audioSource,
               outputContainer: pair.outputContainer,
             };
           }
@@ -1029,6 +975,7 @@ export function buildEnqueueItemsForMedia(
         media.attachments,
         qualityPreference,
         apiOrigin,
+        options.now,
       );
     }
 
@@ -1056,6 +1003,33 @@ export function buildEnqueueItemsForMedia(
         : undefined;
     const itemDisplayTitle = item.title?.trim() || rawWorkTitle;
     const fallbackUrl = item.source_url || media.source_url;
+    const parseUrlForItem =
+      item.source_url?.trim() ||
+      media.source_url?.trim() ||
+      options.sourceUrl?.trim() ||
+      "";
+    const resolveUrlForItem = item.resolve_url?.trim() || undefined;
+    const baseRefreshContext: Omit<MediaRefreshContext, "expiresAtMs"> | undefined =
+      parseUrlForItem || resolveUrlForItem
+        ? {
+            parseUrl: parseUrlForItem,
+            platform: media.platform,
+            itemId: item.id,
+            ...(plan.attachmentId
+              ? { attachmentId: plan.attachmentId }
+              : { variantId: plan.variant.id }),
+            ...(resolveUrlForItem ? { resolveUrl: resolveUrlForItem } : {}),
+          }
+        : undefined;
+    const buildLeafRefreshContext = (
+      expiresAtMs?: number,
+    ): MediaRefreshContext | undefined =>
+      baseRefreshContext
+        ? {
+            ...baseRefreshContext,
+            ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+          }
+        : undefined;
 
     // Live Photo pair handling
     if (
@@ -1079,6 +1053,7 @@ export function buildEnqueueItemsForMedia(
               index: itemNumber,
               totalCount,
               fallbackUrl,
+              baseRefreshContext,
             }),
           );
         }
@@ -1092,6 +1067,7 @@ export function buildEnqueueItemsForMedia(
               index: itemNumber,
               totalCount,
               fallbackUrl,
+              baseRefreshContext,
             }),
           );
         }
@@ -1108,6 +1084,7 @@ export function buildEnqueueItemsForMedia(
             index: isMultiItemCollection ? itemNumber : undefined,
             totalCount,
             fallbackUrl,
+            baseRefreshContext,
           }),
         );
       } else if (livePhotoMode === "image" && imageRes) {
@@ -1120,6 +1097,7 @@ export function buildEnqueueItemsForMedia(
             index: isMultiItemCollection ? itemNumber : undefined,
             totalCount,
             fallbackUrl,
+            baseRefreshContext,
           }),
         );
       }
@@ -1131,6 +1109,10 @@ export function buildEnqueueItemsForMedia(
       const totalBytes =
         (plan.youtubeMux.videoSize || 0) + (plan.youtubeMux.audioSize || 0) ||
         undefined;
+      const ytExpiresAtMs = computeEarliestExpiresAtMs([
+        plan.youtubeMux.videoSource,
+        plan.youtubeMux.audioSource,
+      ]);
       leaves.push({
         title: itemDisplayTitle,
         entryStem: isMultiItemCollection ? distinctEpisodeTitle : rawWorkTitle,
@@ -1142,7 +1124,18 @@ export function buildEnqueueItemsForMedia(
         fallbackUrl: fallbackUrl || plan.youtubeMux.videoUrl,
         specKind: "youtube_mux",
         routes: [plan.youtubeMux.videoUrl],
-        youtubeMux: plan.youtubeMux,
+        youtubeMux: {
+          videoUrl: plan.youtubeMux.videoUrl,
+          audioUrl: plan.youtubeMux.audioUrl,
+          ...(plan.youtubeMux.videoSize
+            ? { videoSize: plan.youtubeMux.videoSize }
+            : {}),
+          ...(plan.youtubeMux.audioSize
+            ? { audioSize: plan.youtubeMux.audioSize }
+            : {}),
+          outputContainer: plan.youtubeMux.outputContainer,
+        },
+        refreshContext: buildLeafRefreshContext(ytExpiresAtMs),
       });
       continue;
     }
@@ -1152,6 +1145,10 @@ export function buildEnqueueItemsForMedia(
       const exactTotalBytes =
         (plan.dashMux.videoSize || 0) + (plan.dashMux.audioSize || 0) ||
         undefined;
+      const dashExpiresAtMs = extractVariantEarliestExpiresAtMs(
+        plan.variant,
+        context.now,
+      );
       leaves.push({
         title: itemDisplayTitle,
         entryStem: isMultiItemCollection ? distinctEpisodeTitle : rawWorkTitle,
@@ -1164,6 +1161,7 @@ export function buildEnqueueItemsForMedia(
         specKind: "dash_mux",
         routes: plan.dashMux.videoRoutes,
         dashMux: plan.dashMux,
+        refreshContext: buildLeafRefreshContext(dashExpiresAtMs),
       });
       continue;
     }
@@ -1177,6 +1175,10 @@ export function buildEnqueueItemsForMedia(
       item,
       media.platform,
       plan.isAudioOnly,
+    );
+    const variantExpiresAtMs = extractVariantEarliestExpiresAtMs(
+      plan.variant,
+      context.now,
     );
 
     if (plan.target.kind === "file") {
@@ -1203,6 +1205,7 @@ export function buildEnqueueItemsForMedia(
         fallbackUrl: fallbackUrl || routes[0],
         specKind: isYtDirect ? "youtube_direct" : "direct_file",
         routes,
+        refreshContext: buildLeafRefreshContext(variantExpiresAtMs),
       });
       continue;
     }
@@ -1225,6 +1228,7 @@ export function buildEnqueueItemsForMedia(
         fallbackUrl: fallbackUrl || routes[0],
         specKind: "hls",
         routes,
+        refreshContext: buildLeafRefreshContext(variantExpiresAtMs),
       });
       continue;
     }
@@ -1249,6 +1253,7 @@ export function buildEnqueueItemsForMedia(
         routes:
           segments[0]?.routes ?? (segments[0]?.url ? [segments[0].url] : []),
         segments,
+        refreshContext: buildLeafRefreshContext(variantExpiresAtMs),
       });
       continue;
     }
@@ -1351,6 +1356,7 @@ export function buildEnqueueItemsForMedia(
       platform: media.platform,
       ...(workFingerprint ? { workFingerprint } : {}),
       ...(leaf.fallbackUrl ? { fallbackUrl: leaf.fallbackUrl } : {}),
+      ...(leaf.refreshContext ? { refreshContext: leaf.refreshContext } : {}),
       spec: {
         kind: leaf.specKind,
         apiOrigin,
@@ -1362,6 +1368,7 @@ export function buildEnqueueItemsForMedia(
         ...(leaf.segments ? { segments: leaf.segments } : {}),
         ...(leaf.youtubeMux ? { youtubeMux: leaf.youtubeMux } : {}),
         ...(leaf.dashMux ? { dashMux: leaf.dashMux } : {}),
+        ...(leaf.refreshContext ? { refreshContext: leaf.refreshContext } : {}),
       },
     };
   });
@@ -1370,37 +1377,6 @@ export function buildEnqueueItemsForMedia(
 // ============================================================================
 // OPFS Cleanup & Streaming Download/Mux Executor
 // ============================================================================
-
-type OpfsWritableLike = DashMuxWritableLike;
-
-interface OpfsFileHandleLike {
-  getFile(): Promise<File | Blob>;
-  createWritable(): Promise<OpfsWritableLike>;
-}
-
-interface OpfsDirectoryLike {
-  getFileHandle(
-    name: string,
-    options?: { create?: boolean },
-  ): Promise<OpfsFileHandleLike>;
-  removeEntry(name: string): Promise<void>;
-  keys?(): AsyncIterable<string>;
-  entries?(): AsyncIterable<[string, unknown]>;
-  values?(): AsyncIterable<{ name?: string }>;
-}
-
-export interface OpfsStorageLike {
-  getDirectory(): Promise<OpfsDirectoryLike>;
-  estimate?(): Promise<{ quota?: number; usage?: number }>;
-}
-
-export interface WebLocksLike {
-  request<T>(
-    name: string,
-    options: { mode?: "exclusive" | "shared"; ifAvailable?: boolean },
-    callback: (lock: unknown) => Promise<T> | T,
-  ): Promise<T>;
-}
 
 async function acquireExclusiveWebLock(
   locks: WebLocksLike | LockManager | null | undefined,
@@ -1604,26 +1580,6 @@ function sanitizeZipEntryPath(rawEntryName: string, fallbackIdx: number): string
   });
 }
 
-function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) {
-    throw new ExtensionDownloadError("已取消", {
-      code: "USER_CANCELLED",
-      cancelled: true,
-    });
-  }
-}
-
-function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
-  if (signal?.aborted) return true;
-  if (!err || typeof err !== "object") return false;
-  const e = err as { name?: string; code?: string; cancelled?: boolean };
-  return (
-    e.cancelled === true ||
-    e.name === "AbortError" ||
-    e.code === "USER_CANCELLED"
-  );
-}
-
 export interface CreateOffscreenDownloadExecutorOptions {
   handoffBlobDownload: (
     message: Extract<
@@ -1781,60 +1737,16 @@ export function createOffscreenDownloadExecutor(
     rawUrl: string,
     spec: OffscreenDownloadSpec,
   ): void => {
-    const check = isWhitelistedMediaUrl(rawUrl, getAllowedOriginsForSpec(spec));
-    if (!check.allowed) {
-      throw new ExtensionDownloadError(
-        check.reason || `媒体域名 ${check.hostname || "未知"} 未收录于扩展白名单`,
-        {
-          code: "UNWHITELISTED_CDN",
-          unwhitelistedHost: check.hostname || undefined,
-          fallbackUrl: rawUrl,
-        },
-      );
-    }
+    assertWhitelistedUrl(rawUrl, spec);
   };
 
-  const whitelistedFetch = async (
+  const fetchWhitelisted = (
     rawUrl: string,
     spec: OffscreenDownloadSpec,
     init: RequestInit | undefined,
     signal: AbortSignal,
-  ): Promise<Response> => {
-    throwIfAborted(signal);
-    assertWhitelisted(rawUrl, spec);
-
-    const resp = await fetchFn(rawUrl, {
-      ...init,
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      signal,
-    });
-
-    const finalUrl =
-      typeof resp.url === "string" && resp.url.trim()
-        ? resp.url.trim()
-        : rawUrl;
-    if (finalUrl !== rawUrl) {
-      const redirectCheck = isWhitelistedMediaUrl(
-        finalUrl,
-        getAllowedOriginsForSpec(spec),
-      );
-      if (!redirectCheck.allowed) {
-        void resp.body?.cancel?.().catch(() => {});
-        throw new ExtensionDownloadError(
-          redirectCheck.reason ||
-            `重定向媒体域名 ${redirectCheck.hostname || "未知"} 未收录于扩展白名单`,
-          {
-            code: "UNWHITELISTED_CDN",
-            unwhitelistedHost: redirectCheck.hostname || undefined,
-            fallbackUrl: rawUrl,
-          },
-        );
-      }
-    }
-
-    return resp;
-  };
+  ): Promise<Response> =>
+    whitelistedFetch(fetchFn, rawUrl, spec, init, signal);
 
   const createProgressReporter = (
     taskId: string,
@@ -1897,7 +1809,7 @@ export function createOffscreenDownloadExecutor(
     taskId: string,
     mimeType?: string,
     tag?: string,
-  ): Promise<DashMuxOpfsSink> => {
+  ): Promise<OpfsSinkLike> => {
     if (opfsStorage && typeof opfsStorage.getDirectory === "function") {
       const cleanTag =
         typeof tag === "string" && tag.trim()
@@ -1994,58 +1906,10 @@ export function createOffscreenDownloadExecutor(
     };
   };
 
-  const EXT_TO_BLOB_MIME: Readonly<Record<string, string>> = {
-    mp4: "video/mp4",
-    m4v: "video/mp4",
-    mov: "video/quicktime",
-    webm: "video/webm",
-    mkv: "video/x-matroska",
-    ts: "video/mp2t",
-    m4a: "audio/x-m4a",
-    mp3: "audio/mpeg",
-    aac: "audio/aac",
-    opus: "audio/ogg",
-    ogg: "audio/ogg",
-    wav: "audio/wav",
-    flac: "audio/flac",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    webp: "image/webp",
-    gif: "image/gif",
-    avif: "image/avif",
-    zip: "application/zip",
-  };
-
-  const resolveBlobMimeType = (
-    filename: string,
-    explicitMime?: string,
-  ): string => {
-    const dotIdx = filename.lastIndexOf(".");
-    const ext =
-      dotIdx >= 0 ? filename.slice(dotIdx + 1).trim().toLowerCase() : "";
-    const cleanExplicit =
-      typeof explicitMime === "string" ? explicitMime.trim().toLowerCase() : "";
-    // Chromium's DownloadTargetDeterminer maps `audio/mp4` to `.mp4` on macOS
-    // and silently rewrites `.m4a` downloads to `.mp4`. Using `audio/x-m4a`
-    // preserves the `.m4a` extension cleanly across macOS/Linux/Windows.
-    if (ext === "m4a" && (!cleanExplicit || cleanExplicit === "audio/mp4")) {
-      return "audio/x-m4a";
-    }
-    if (
-      cleanExplicit &&
-      cleanExplicit !== "text/plain" &&
-      cleanExplicit !== "application/octet-stream"
-    ) {
-      return cleanExplicit;
-    }
-    return EXT_TO_BLOB_MIME[ext] || cleanExplicit || "application/octet-stream";
-  };
-
   const handoffSinkAndWaitRelease = async (params: {
     taskId: string;
     spec: OffscreenDownloadSpec;
-    sink: Awaited<ReturnType<typeof openOpfsSink>>;
+    sink: OpfsSinkLike;
     signal: AbortSignal;
     reportProgress: ReturnType<typeof createProgressReporter>;
   }): Promise<void> => {
@@ -2110,253 +1974,30 @@ export function createOffscreenDownloadExecutor(
     }
   };
 
-  const hasIsoBmffBoxHeader = (bytes: Uint8Array): boolean => {
-    if (bytes.byteLength < 8) return false;
-    // Reject obvious JSON/HTML/whitespace leading bytes before reading big-endian boxSize
-    const first = bytes[0];
-    if (
-      first === 0x7b || // '{'
-      first === 0x5b || // '['
-      first === 0x22 || // '"'
-      first === 0x3c || // '<'
-      first === 0x20 || // ' '
-      first === 0x09 || // '\t'
-      first === 0x0a || // '\n'
-      first === 0x0d // '\r'
-    ) {
-      return false;
-    }
-    const boxSize =
-      ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
-    if (boxSize !== 1 && boxSize < 8) return false;
-    const boxType = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
-    // Structural header boxes (ftyp/styp/sidx/free/skip/wide) never exceed 64 MiB
-    if (
-      boxType !== "mdat" &&
-      boxType !== "moov" &&
-      boxType !== "moof" &&
-      boxSize > 64 * 1024 * 1024
-    ) {
-      return false;
-    }
-    return (
-      boxType === "ftyp" ||
-      boxType === "styp" ||
-      boxType === "moov" ||
-      boxType === "moof" ||
-      boxType === "sidx" ||
-      boxType === "free" ||
-      boxType === "skip" ||
-      boxType === "wide" ||
-      boxType === "mdat"
-    );
-  };
-
-  const streamResponseBodyToWriter = async (params: {
-    response: Response;
-    write: (chunk: Uint8Array) => Promise<void>;
-    signal: AbortSignal;
-    onBytes?: (chunkBytes: number, totalLoadedForStream: number) => void;
-    maxBytes?: number;
-    maxBytesError?: string;
-    verifyFirstBytes?: (prefix: Uint8Array) => void;
-  }): Promise<number> => {
-    const {
-      response,
-      write,
-      signal,
-      onBytes,
-      maxBytes,
-      maxBytesError,
-      verifyFirstBytes,
-    } = params;
-    const rawContentLen = response.headers.get("Content-Length");
-    const hasContentEncoding = Boolean(
-      response.headers.get("Content-Encoding")?.trim(),
-    );
-    const declaredLen =
-      !hasContentEncoding && rawContentLen && /^\d+$/.test(rawContentLen.trim())
-        ? Number(rawContentLen.trim())
-        : 0;
-
-    if (maxBytes !== undefined && declaredLen > maxBytes) {
-      void response.body?.cancel?.().catch(() => {});
-      throw new ExtensionDownloadError(maxBytesError || ARCHIVE_LIMIT_ERROR);
-    }
-
-    if (!response.body) {
-      const buf = new Uint8Array(await response.arrayBuffer());
-      throwIfAborted(signal);
-      if (maxBytes !== undefined && buf.byteLength > maxBytes) {
-        throw new ExtensionDownloadError(maxBytesError || ARCHIVE_LIMIT_ERROR);
-      }
-      if (buf.byteLength === 0) {
-        throw new ExtensionDownloadError("媒体响应内容为空");
-      }
-      verifyFirstBytes?.(buf.subarray(0, Math.min(16, buf.byteLength)));
-      await write(buf);
-      onBytes?.(buf.byteLength, buf.byteLength);
-      return buf.byteLength;
-    }
-
-    const reader = response.body.getReader();
-    let streamLoaded = 0;
-    let finishedCleanly = false;
-    let verifiedFirstBytes = !verifyFirstBytes;
-    const sniffChunks: Uint8Array[] = [];
-    let sniffBytes = 0;
-    let rejectOnAbort: (() => void) | null = null;
-    const abortRace = new Promise<never>((_resolve, reject) => {
-      rejectOnAbort = () => {
-        void reader.cancel().catch(() => {});
-        reject(
-          new ExtensionDownloadError("已取消", {
-            code: "USER_CANCELLED",
-            cancelled: true,
-          }),
-        );
-      };
-      if (signal.aborted) {
-        rejectOnAbort();
-      } else {
-        signal.addEventListener("abort", rejectOnAbort, { once: true });
-      }
-    });
-    // Prevent unhandled rejection when stream finishes normally without abort
-    void abortRace.catch(() => {});
-
-    const flushSniffedChunks = async () => {
-      if (verifiedFirstBytes) return;
-      verifiedFirstBytes = true;
-      const sampleLen = Math.min(16, sniffBytes);
-      const sample = new Uint8Array(sampleLen);
-      let off = 0;
-      for (const part of sniffChunks) {
-        if (off >= sampleLen) break;
-        const take = Math.min(part.byteLength, sampleLen - off);
-        sample.set(part.subarray(0, take), off);
-        off += take;
-      }
-      verifyFirstBytes!(sample);
-      let writtenLoaded = 0;
-      for (const part of sniffChunks) {
-        await write(part);
-        writtenLoaded += part.byteLength;
-        onBytes?.(part.byteLength, writtenLoaded);
-      }
-      sniffChunks.length = 0;
-    };
-
-    try {
-      for (;;) {
-        throwIfAborted(signal);
-        const { done, value } = await Promise.race([reader.read(), abortRace]);
-        if (done) break;
-        if (!value || value.byteLength === 0) continue;
-        throwIfAborted(signal);
-        streamLoaded += value.byteLength;
-        if (maxBytes !== undefined && streamLoaded > maxBytes) {
-          throw new ExtensionDownloadError(maxBytesError || ARCHIVE_LIMIT_ERROR);
-        }
-        if (!verifiedFirstBytes) {
-          sniffChunks.push(value);
-          sniffBytes += value.byteLength;
-          if (sniffBytes >= 16) {
-            await flushSniffedChunks();
-          }
-        } else {
-          await write(value);
-          onBytes?.(value.byteLength, streamLoaded);
-        }
-      }
-      throwIfAborted(signal);
-      if (streamLoaded === 0) {
-        throw new ExtensionDownloadError("媒体流返回 0 字节");
-      }
-      if (!verifiedFirstBytes) {
-        await flushSniffedChunks();
-      }
-      if (declaredLen > 0 && streamLoaded !== declaredLen) {
-        throw new ExtensionDownloadError(
-          `媒体流提前中断（已收 ${streamLoaded} / 预期 ${declaredLen} 字节）`,
-        );
-      }
-      finishedCleanly = true;
-      return streamLoaded;
-    } finally {
-      if (rejectOnAbort) {
-        signal.removeEventListener("abort", rejectOnAbort);
-      }
-      if (!finishedCleanly) {
-        void reader.cancel().catch(() => {});
-      }
-      try {
-        reader.releaseLock();
-      } catch {
-        // Ignore
-      }
-    }
-  };
-
   const executeDirectFile = async (
     taskId: string,
     spec: OffscreenDownloadSpec,
     signal: AbortSignal,
   ): Promise<void> => {
-    const routes = spec.routes.map((r) => r.trim()).filter(Boolean);
-    if (routes.length === 0) {
-      throw new ExtensionDownloadError("缺少可用的下载线路");
-    }
-
     const reportProgress = createProgressReporter(taskId, "downloading");
-    let lastError: unknown;
-
-    for (let idx = 0; idx < routes.length; idx++) {
-      throwIfAborted(signal);
-      const route = routes[idx];
-      let sink: Awaited<ReturnType<typeof openOpfsSink>> | null = null;
-
-      try {
-        const resp = await whitelistedFetch(
-          route,
-          spec,
-          { method: "GET" },
-          signal,
-        );
-        if (resp.status !== 200) {
-          void resp.body?.cancel?.().catch(() => {});
-          throw new ExtensionDownloadError(
-            `媒体源返回 HTTP ${resp.status}`,
-          );
-        }
-        const contentType = resp.headers.get("Content-Type") || "";
-        if (/text\/html/i.test(contentType)) {
-          void resp.body?.cancel?.().catch(() => {});
-          throw new ExtensionDownloadError("媒体源返回了非媒体错误页");
-        }
-        const isJsonLabeled = /application\/json/i.test(contentType);
-
-        const rawLen = resp.headers.get("Content-Length");
-        const hasEncoding = Boolean(
-          resp.headers.get("Content-Encoding")?.trim(),
-        );
-        const total =
-          (!hasEncoding && rawLen && /^\d+$/.test(rawLen.trim())
-            ? Number(rawLen.trim())
-            : 0) ||
-          spec.sizeBytes ||
-          0;
-
-        sink = await openOpfsSink(
-          taskId,
-          spec.mimeType || (isJsonLabeled ? undefined : contentType),
-        );
+    const result = await streamResumableRouteToOpfs({
+      taskId,
+      routes: spec.routes,
+      spec,
+      fetchFn,
+      openOpfsSink,
+      signal,
+      estimatedSize: spec.sizeBytes,
+      sinkMimeType: spec.mimeType,
+      errorLabel: "媒体源",
+      onRouteStart({ routeIndex, routeCount, total, isFreshRetry }) {
         reportProgress(
           {
             status: "downloading",
-            statusText:
-              routes.length > 1 && idx > 0
-                ? `备用线路 ${idx + 1}/${routes.length} 下载中...`
+            statusText: isFreshRetry
+              ? "正在重新流式下载..."
+              : routeCount > 1 && routeIndex > 0
+                ? `备用线路 ${routeIndex + 1}/${routeCount} 下载中...`
                 : "正在流式下载...",
             loaded: 0,
             total,
@@ -2364,52 +2005,29 @@ export function createOffscreenDownloadExecutor(
           },
           true,
         );
-
-        await streamResponseBodyToWriter({
-          response: resp,
-          write: (chunk) => sink!.write(chunk),
-          signal,
-          ...(isJsonLabeled
-            ? {
-                verifyFirstBytes: (prefix: Uint8Array) => {
-                  if (!hasIsoBmffBoxHeader(prefix)) {
-                    throw new ExtensionDownloadError(
-                      "媒体源返回了非媒体错误页",
-                    );
-                  }
-                },
-              }
-            : {}),
-          onBytes: (_chunkLen, loaded) => {
-            reportProgress({
-              status: "downloading",
-              statusText: "正在流式下载...",
-              loaded,
-              total,
-            });
-          },
+      },
+      onProgress({ loaded, total, resumed }) {
+        reportProgress({
+          status: "downloading",
+          statusText: resumed ? "断点续传下载中..." : "正在流式下载...",
+          loaded,
+          total,
         });
+      },
+    });
 
-        await handoffSinkAndWaitRelease({
-          taskId,
-          spec,
-          sink,
-          signal,
-          reportProgress,
-        });
-        return;
-      } catch (err) {
-        await sink?.cleanup(err);
-        if (isAbortLikeError(err, signal)) {
-          throw err;
-        }
-        lastError = err;
-      }
+    try {
+      await handoffSinkAndWaitRelease({
+        taskId,
+        spec,
+        sink: result.sink,
+        signal,
+        reportProgress,
+      });
+    } catch (err) {
+      await result.sink.cleanup(err);
+      throw err;
     }
-
-    throw lastError instanceof Error
-      ? lastError
-      : new ExtensionDownloadError("所有下载线路均失败");
   };
 
   const resolveHlsVodSegments = async (
@@ -2417,7 +2035,7 @@ export function createOffscreenDownloadExecutor(
     spec: OffscreenDownloadSpec,
     signal: AbortSignal,
   ): Promise<OffscreenSegmentSpec[]> => {
-    const resp = await whitelistedFetch(
+    const resp = await fetchWhitelisted(
       manifestUrl,
       spec,
       { method: "GET" },
@@ -2537,7 +2155,7 @@ export function createOffscreenDownloadExecutor(
       const url = attempts[i];
       const bufferedChunks: Uint8Array[] = [];
       try {
-        const resp = await whitelistedFetch(
+        const resp = await fetchWhitelisted(
           url,
           spec,
           { method: "GET", headers },
@@ -2775,7 +2393,7 @@ export function createOffscreenDownloadExecutor(
         for (const route of routes) {
           throwIfAborted(signal);
           try {
-            const resp = await whitelistedFetch(
+            const resp = await fetchWhitelisted(
               route,
               spec,
               { method: "GET" },
@@ -2951,158 +2569,10 @@ export function createOffscreenDownloadExecutor(
     }
   };
 
-  const executeDashMux = async (
-    taskId: string,
-    spec: OffscreenDownloadSpec,
-    signal: AbortSignal,
-  ): Promise<void> => {
-    const dashMux = spec.dashMux;
-    if (
-      !dashMux ||
-      !Array.isArray(dashMux.videoRoutes) ||
-      dashMux.videoRoutes.length === 0 ||
-      !Array.isArray(dashMux.audioRoutes) ||
-      dashMux.audioRoutes.length === 0
-    ) {
-      throw new ExtensionDownloadError("缺少 DASH 音视频合流参数");
-    }
-
-    activeDynamicAllowedOriginsByTask.set(
-      taskId,
-      getAllowedOriginsForSpec(spec),
-    );
-    const reportProgress = createProgressReporter(taskId, "downloading");
-
-    const fetchTrackToOpfs = async (
-      trackParams: DashMuxTrackFetchParams,
-    ): Promise<DashMuxTrackFetchResult> => {
-      const { role, routes, estimatedSize, signal: trackSignal, onProgress } =
-        trackParams;
-      const trackLabel = role === "video" ? "视频轨" : "音频轨";
-      const trackTag = role === "video" ? "dash-v" : "dash-a";
-      const trackMime = role === "video" ? "video/mp4" : "audio/mp4";
-      let lastError: unknown;
-
-      for (let idx = 0; idx < routes.length; idx++) {
-        throwIfAborted(trackSignal);
-        const route = routes[idx];
-        let sink: DashMuxOpfsSink | null = null;
-        try {
-          const resp = await whitelistedFetch(
-            route,
-            spec,
-            { method: "GET" },
-            trackSignal,
-          );
-          if (resp.status !== 200) {
-            void resp.body?.cancel?.().catch(() => {});
-            throw new ExtensionDownloadError(
-              `${trackLabel}返回 HTTP ${resp.status}`,
-            );
-          }
-          const contentType = resp.headers.get("Content-Type") || "";
-          if (/text\/html/i.test(contentType)) {
-            void resp.body?.cancel?.().catch(() => {});
-            throw new ExtensionDownloadError(`${trackLabel}返回了非媒体错误页`);
-          }
-          const isJsonLabeled = /application\/json/i.test(contentType);
-
-          const rawLen = resp.headers.get("Content-Length");
-          const hasEncoding = Boolean(
-            resp.headers.get("Content-Encoding")?.trim(),
-          );
-          const total =
-            (!hasEncoding && rawLen && /^\d+$/.test(rawLen.trim())
-              ? Number(rawLen.trim())
-              : 0) ||
-            estimatedSize ||
-            0;
-
-          sink = await openOpfsSink(taskId, trackMime, trackTag);
-          onProgress({ loaded: 0, total });
-
-          const bytesRead = await streamResponseBodyToWriter({
-            response: resp,
-            write: (chunk) => sink!.write(chunk),
-            signal: trackSignal,
-            ...(isJsonLabeled
-              ? {
-                  verifyFirstBytes: (prefix: Uint8Array) => {
-                    if (!hasIsoBmffBoxHeader(prefix)) {
-                      throw new ExtensionDownloadError(
-                        `${trackLabel}返回了非媒体错误页`,
-                      );
-                    }
-                  },
-                }
-              : {}),
-            onBytes: (_chunkLen, loaded) => {
-              onProgress({ loaded, total });
-            },
-          });
-
-          const blob = await sink.closeAndGetBlob();
-          throwIfAborted(trackSignal);
-          return {
-            blob,
-            sink,
-            byteLength: bytesRead,
-          };
-        } catch (err) {
-          await sink?.cleanup(err);
-          if (isAbortLikeError(err, trackSignal)) {
-            throw err;
-          }
-          lastError = err;
-        }
-      }
-
-      throw lastError instanceof Error
-        ? lastError
-        : new ExtensionDownloadError(`${trackLabel}所有下载线路均失败`);
-    };
-
-    try {
-      const outputSink = await runDashMuxToOpfs({
-        taskId,
-        spec: dashMux,
-        fetchTrackToOpfs,
-        openOpfsSink,
-        signal,
-        mediabunnyMod: options.mediabunnyImpl,
-        onProgress(update) {
-          reportProgress(
-            {
-              status: update.status,
-              statusText: update.statusText,
-              loaded: update.loaded,
-              total: update.total,
-              percent: update.percent,
-              ...(update.status === "muxing" ? { speed: 0 } : {}),
-            },
-            Boolean(update.force),
-          );
-        },
-      });
-
-      try {
-        await handoffSinkAndWaitRelease({
-          taskId,
-          spec: { ...spec, mimeType: spec.mimeType || "video/mp4" },
-          sink: outputSink,
-          signal,
-          reportProgress,
-        });
-      } catch (err) {
-        await outputSink.cleanup(err);
-        throw err;
-      }
-    } finally {
-      activeDynamicAllowedOriginsByTask.delete(taskId);
-      notifyIfIdle();
-    }
-  };
-
+  // Module boundary: each independent download `kind` added in the future (e.g.
+  // `dash_mux` -> `./dashMuxDownload.ts`) MUST live in its own dedicated module
+  // file rather than appending new transport implementations into
+  // `extensionDownload.ts`. Keep `runSingleTask` as a lightweight dispatcher.
   const runSingleTask = async (entry: QueuedTaskEntry): Promise<void> => {
     const { taskId, spec, controller } = entry;
     const { signal } = controller;
@@ -3120,7 +2590,27 @@ export function createOffscreenDownloadExecutor(
           await executeYouTubeMux(taskId, spec, signal);
           break;
         case "dash_mux":
-          await executeDashMux(taskId, spec, signal);
+          await executeDashMux({
+            taskId,
+            spec,
+            signal,
+            fetchFn,
+            opfsStorage,
+            openOpfsSink,
+            reportProgress: createProgressReporter(taskId, "downloading"),
+            handoffSinkAndWaitRelease,
+            mediabunnyMod: options.mediabunnyImpl,
+            onEnterTask: () => {
+              activeDynamicAllowedOriginsByTask.set(
+                taskId,
+                getAllowedOriginsForSpec(spec),
+              );
+            },
+            onExitTask: () => {
+              activeDynamicAllowedOriginsByTask.delete(taskId);
+              notifyIfIdle();
+            },
+          });
           break;
         case "hls":
           await executeHls(taskId, spec, signal);
@@ -3142,6 +2632,11 @@ export function createOffscreenDownloadExecutor(
         (typeof (err as { code?: unknown })?.code === "string"
           ? ((err as { code: string }).code as string)
           : undefined);
+      const httpStatus =
+        extErr?.httpStatus ??
+        (typeof (err as { httpStatus?: unknown })?.httpStatus === "number"
+          ? (err as { httpStatus: number }).httpStatus
+          : undefined);
       options.onError?.({
         type: "OFFSCREEN_TASK_ERROR",
         taskId,
@@ -3151,6 +2646,7 @@ export function createOffscreenDownloadExecutor(
             ? err.message
             : "下载执行失败",
         ...(errCode ? { code: errCode } : {}),
+        ...(httpStatus !== undefined ? { httpStatus } : {}),
         ...(cancelled ? { cancelled: true } : {}),
         ...(extErr?.unwhitelistedHost
           ? { unwhitelistedHost: extErr.unwhitelistedHost }

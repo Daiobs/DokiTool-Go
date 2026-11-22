@@ -59,6 +59,11 @@ export interface RunDashMuxToOpfsParams {
     mimeType?: string,
     tag?: string,
   ) => Promise<DashMuxOpfsSink>;
+  beforeOpenOutputSink?: (info: {
+    videoBytes: number;
+    audioBytes: number;
+    totalInputBytes: number;
+  }) => Promise<void> | void;
   signal: AbortSignal;
   onProgress?: (update: DashMuxProgressUpdate) => void;
   mediabunnyMod?: Record<string, unknown> | null;
@@ -490,6 +495,15 @@ export async function runDashMuxToOpfs(
         "MUX_CODEC_UNSUPPORTED",
         `音视频编码不支持无损封装（video=${vCodec || "未知"}, audio=${aCodec || "未知"}）`,
       );
+    }
+
+    if (params.beforeOpenOutputSink) {
+      await params.beforeOpenOutputSink({
+        videoBytes: videoResult.byteLength,
+        audioBytes: audioResult.byteLength,
+        totalInputBytes,
+      });
+      assertNotAborted(signal);
     }
 
     outputSink = await openOpfsSink(taskId, "video/mp4");

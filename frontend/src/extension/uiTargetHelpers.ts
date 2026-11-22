@@ -29,6 +29,7 @@ import {
   sourceRoutes,
   sourceUrl,
   type DownloadTarget,
+  type TargetContext,
 } from "../utils/mediaContract";
 import { mediaExtension } from "../utils/mediaDelivery";
 import {
@@ -41,6 +42,11 @@ import {
   selectYouTubeMuxPair,
   type YouTubeMuxPairResult,
 } from "../utils/youtubeHelperCore";
+import {
+  computeEarliestExpiresAtMs,
+  extractDashMuxSpec,
+  extractVariantEarliestExpiresAtMs,
+} from "./dashMuxSpec";
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
@@ -57,6 +63,7 @@ import {
   type ExtensionRpcResponse,
   type ExtensionSettings,
   type ExtensionThemeMode,
+  type MediaRefreshContext,
   type OffscreenDashMuxSpec,
   type OffscreenDownloadSpec,
   type OffscreenSegmentSpec,
@@ -618,63 +625,6 @@ function uiVideoCodecPreferenceRank(rawCodec: unknown): number {
   return 0;
 }
 
-function extractUiDashMuxSpec(
-  variant: ReadyVariant,
-  ctx: { apiOrigin: string },
-): OffscreenDashMuxSpec | null {
-  if (variant.delivery.kind !== "mux") return null;
-  const container = (
-    variant.delivery.output?.container ||
-    variant.delivery.output?.extension ||
-    variant.metadata?.container ||
-    variant.metadata?.extension ||
-    "mp4"
-  )
-    .trim()
-    .toLowerCase();
-  if (container !== "mp4") return null;
-
-  const videoResources = variant.delivery.resources.filter(
-    (r) => r.role === "video",
-  );
-  const audioResources = variant.delivery.resources.filter(
-    (r) => r.role === "audio",
-  );
-  if (videoResources.length !== 1 || audioResources.length !== 1) return null;
-  const videoRes = videoResources[0];
-  const audioRes = audioResources[0];
-  if (
-    videoRes.delivery.kind !== "file" ||
-    audioRes.delivery.kind !== "file"
-  ) {
-    return null;
-  }
-
-  const availVideo = availableSources(videoRes.delivery.sources);
-  const availAudio = availableSources(audioRes.delivery.sources);
-  if (!availVideo.length || !availAudio.length) return null;
-
-  let videoRoutes: string[];
-  let audioRoutes: string[];
-  try {
-    videoRoutes = deliveryRoutes(availVideo, ctx);
-    audioRoutes = deliveryRoutes(availAudio, ctx);
-  } catch {
-    return null;
-  }
-  if (!videoRoutes.length || !audioRoutes.length) return null;
-
-  const videoSize = parsePositiveSafeBytes(availVideo[0]?.size_bytes);
-  const audioSize = parsePositiveSafeBytes(availAudio[0]?.size_bytes);
-  return {
-    videoRoutes,
-    audioRoutes,
-    ...(videoSize > 0 ? { videoSize } : {}),
-    ...(audioSize > 0 ? { audioSize } : {}),
-    outputContainer: "mp4",
-  };
-}
-
 function estimateDashMuxByteTotals(
   variant: ReadyVariant,
   dashMux: OffscreenDashMuxSpec,
@@ -970,7 +920,7 @@ export function isAttachmentApplicableToItem(
 function resolveItemScopedAudioAttachments(
   media: Pick<UnifiedMedia, "platform" | "attachments">,
   item: ReadyItem,
-  ctx: { apiOrigin: string },
+  ctx: TargetContext & { apiOrigin: string },
 ): Attachment[] {
   const scoped: Attachment[] = [];
   const seenPrimaryUrls = new Set<string>();
@@ -983,7 +933,7 @@ function resolveItemScopedAudioAttachments(
       att.resource?.delivery?.kind === "file"
     ) {
       scoped.push(att);
-      const avail = availableSources(att.resource.delivery.sources);
+      const avail = availableSources(att.resource.delivery.sources, ctx.now);
       const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
       if (primarySrc) {
         try {
@@ -1006,8 +956,8 @@ function resolveItemScopedAudioAttachments(
     if (!readyVariant(variant) || variant.delivery.kind !== "mux") continue;
     for (const res of variant.delivery.resources) {
       if (res.role !== "audio" || res.delivery.kind !== "file") continue;
-      const avail = availableSources(res.delivery.sources);
-      const primarySrc = avail[0] ?? res.delivery.sources[0];
+      const avail = availableSources(res.delivery.sources, ctx.now);
+      const primarySrc = avail[0];
       if (!primarySrc) continue;
       let url = "";
       try {
@@ -1051,10 +1001,12 @@ export function buildSidePanelQualityOptions(
   media: UnifiedMedia,
   item: MediaItem | null | undefined,
   rawApiOrigin: string,
+  options?: { now?: number },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
   const apiOrigin = resolveSafeApiOrigin(rawApiOrigin);
-  const ctx = { apiOrigin };
+  const ctx: TargetContext & { apiOrigin: string } =
+    options?.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
   const attachments = media.attachments ?? [];
   const isYouTube = media.platform === "youtube";
 
@@ -1070,13 +1022,13 @@ export function buildSidePanelQualityOptions(
     }
   }
 
-  const options: SidePanelQualityOption[] = [];
+  const qualityOptions: SidePanelQualityOption[] = [];
 
   for (const variant of item.variants) {
     if (!readyVariant(variant)) continue;
     const primarySource =
       variant.delivery.kind === "file"
-        ? availableSources(variant.delivery.sources)[0] ??
+        ? availableSources(variant.delivery.sources, ctx.now)[0] ??
           variant.delivery.sources[0] ??
           null
         : null;
@@ -1089,7 +1041,7 @@ export function buildSidePanelQualityOptions(
       },
       ctx,
     );
-    const dashMux = extractUiDashMuxSpec(variant, ctx);
+    const dashMux = extractDashMuxSpec(variant, ctx);
     const isDashMux = Boolean(dashMux);
     const downloadable =
       ["file", "hls", "segments", "pair"].includes(target.kind) || isDashMux;
@@ -1241,7 +1193,7 @@ export function buildSidePanelQualityOptions(
       meta.video_codec || videoLeafMeta?.video_codec || "",
     ).trim();
 
-    options.push({
+    qualityOptions.push({
       key: `variant:${variant.id}`,
       kind: "variant",
       variant,
@@ -1278,7 +1230,7 @@ export function buildSidePanelQualityOptions(
   }
 
   // Surface standalone audio attachments on video/audio items (e.g., Bilibili 30280 AAC M4A, Douyin/Kuaishou BGM, or YouTube audio track)
-  const hasVariantAudioOption = options.some(
+  const hasVariantAudioOption = qualityOptions.some(
     (opt) => opt.downloadable && opt.isAudioOnly,
   );
   if (item.type === "video" || item.type === "audio") {
@@ -1293,8 +1245,8 @@ export function buildSidePanelQualityOptions(
         att.resource?.delivery?.kind === "file"
       ) {
         // Avoid duplicating an identical YouTube audio source URL already listed in variants
-        const avail = availableSources(att.resource.delivery.sources);
-        const primarySrc = avail[0] ?? att.resource.delivery.sources[0];
+        const avail = availableSources(att.resource.delivery.sources, ctx.now);
+        const primarySrc = avail[0];
         if (!primarySrc) continue;
         let attUrl = "";
         let attRoutes: string[] = [];
@@ -1305,7 +1257,10 @@ export function buildSidePanelQualityOptions(
           continue;
         }
         if (!attUrl) continue;
-        if (hasVariantAudioOption && options.some((o) => o.directUrl === attUrl)) {
+        if (
+          hasVariantAudioOption &&
+          qualityOptions.some((o) => o.directUrl === attUrl)
+        ) {
           continue;
         }
 
@@ -1368,7 +1323,7 @@ export function buildSidePanelQualityOptions(
               ? formatApproxSizeLabel(attEstBytes)
               : formatMediaSize(0, "zh-CN");
 
-        options.push({
+        qualityOptions.push({
           key: `attachment:${att.id}`,
           kind: "attachment",
           variant: syntheticVariant,
@@ -1403,7 +1358,7 @@ export function buildSidePanelQualityOptions(
     }
   }
 
-  return options;
+  return qualityOptions;
 }
 
 function compareVideoQualityDesc(
@@ -1737,15 +1692,99 @@ function buildSegmentsSpecFromDelivery(
   });
 }
 
+function buildRefreshContextForOption(params: {
+  media: UnifiedMedia;
+  item: MediaItem;
+  option: SidePanelQualityOption;
+  now?: number;
+}): MediaRefreshContext | undefined {
+  const { media, item, option, now } = params;
+  const parseUrl = item.source_url?.trim() || media.source_url?.trim() || "";
+  const resolveUrl =
+    item.state !== "unavailable" && item.resolve_url?.trim()
+      ? item.resolve_url.trim()
+      : undefined;
+  if (!parseUrl && !resolveUrl) {
+    return undefined;
+  }
+
+  let expiresAtMs: number | undefined;
+  if (option.muxPair) {
+    expiresAtMs = computeEarliestExpiresAtMs([
+      option.muxPair.videoSource,
+      option.muxPair.audioSource,
+    ]);
+  } else if (
+    option.kind === "attachment" &&
+    option.attachment?.resource.delivery.kind === "file"
+  ) {
+    const avail = availableSources(option.attachment.resource.delivery.sources, now);
+    expiresAtMs = computeEarliestExpiresAtMs(
+      avail.length ? avail : option.attachment.resource.delivery.sources,
+    );
+  } else {
+    expiresAtMs = extractVariantEarliestExpiresAtMs(option.variant, now);
+  }
+
+  return {
+    parseUrl,
+    platform: media.platform,
+    itemId: item.id,
+    ...(option.kind === "attachment" && option.attachment?.id
+      ? { attachmentId: option.attachment.id }
+      : { variantId: option.variant.id }),
+    ...(resolveUrl ? { resolveUrl } : {}),
+    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+  };
+}
+
+function buildRefreshContextForResource(params: {
+  media: UnifiedMedia;
+  item: MediaItem;
+  variantId?: string;
+  resource: Resource;
+  now?: number;
+}): MediaRefreshContext | undefined {
+  const { media, item, variantId, resource, now } = params;
+  const parseUrl = item.source_url?.trim() || media.source_url?.trim() || "";
+  const resolveUrl =
+    item.state !== "unavailable" && item.resolve_url?.trim()
+      ? item.resolve_url.trim()
+      : undefined;
+  if (!parseUrl && !resolveUrl) {
+    return undefined;
+  }
+  const delivery = resource.delivery;
+  const sources =
+    delivery.kind === "segments"
+      ? [
+          ...(delivery.init?.sources ?? []),
+          ...delivery.pieces.flatMap((p) => p.sources),
+        ]
+      : delivery.sources;
+  const avail = availableSources(sources, now);
+  const expiresAtMs = computeEarliestExpiresAtMs(avail.length ? avail : sources);
+  return {
+    parseUrl,
+    platform: media.platform,
+    itemId: item.id,
+    ...(variantId ? { variantId } : {}),
+    ...(resolveUrl ? { resolveUrl } : {}),
+    ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+  };
+}
+
 export function buildSpecFromOption(params: {
   media: UnifiedMedia;
   option: SidePanelQualityOption;
   filename: string;
   apiOrigin: string;
+  refreshContext?: MediaRefreshContext;
 }): OffscreenDownloadSpec {
-  const { media, option, filename } = params;
+  const { media, option, filename, refreshContext } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
+  const refreshField = refreshContext ? { refreshContext } : {};
 
   if (option.muxPair) {
     const videoUrl = sourceUrl(option.muxPair.videoSource, { apiOrigin });
@@ -1761,6 +1800,7 @@ export function buildSpecFromOption(params: {
       mimeType: option.muxPair.outputMimeType,
       ...(totalSize > 0 ? { sizeBytes: totalSize } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
       youtubeMux: {
         videoUrl,
         audioUrl,
@@ -1787,6 +1827,7 @@ export function buildSpecFromOption(params: {
       mimeType: "video/mp4",
       ...(exactDashBytes > 0 ? { sizeBytes: exactDashBytes } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
       dashMux: option.dashMux,
     };
   }
@@ -1803,6 +1844,7 @@ export function buildSpecFromOption(params: {
       filename,
       ...(option.formatMime ? { mimeType: option.formatMime } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
     };
   }
 
@@ -1818,6 +1860,7 @@ export function buildSpecFromOption(params: {
       segments,
       ...(option.formatMime ? { mimeType: option.formatMime } : {}),
       ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+      ...refreshField,
     };
   }
 
@@ -1837,6 +1880,7 @@ export function buildSpecFromOption(params: {
     ...(option.formatMime ? { mimeType: option.formatMime } : {}),
     ...(option.sizeBytes > 0 ? { sizeBytes: option.sizeBytes } : {}),
     ...(extraAllowedOrigins ? { extraAllowedOrigins } : {}),
+    ...refreshField,
   };
 }
 
@@ -1861,11 +1905,18 @@ export function buildSingleDownloadEnqueueItem(params: {
     ext: option.resolvedExt,
   });
 
+  const refreshContext = buildRefreshContextForOption({
+    media,
+    item,
+    option,
+  });
+
   const spec = buildSpecFromOption({
     media,
     option,
     filename,
     apiOrigin,
+    refreshContext,
   });
 
   return {
@@ -1873,6 +1924,7 @@ export function buildSingleDownloadEnqueueItem(params: {
     platform: media.platform,
     ...(workFingerprint ? { workFingerprint } : {}),
     fallbackUrl: option.directUrl || media.source_url,
+    ...(refreshContext ? { refreshContext } : {}),
     spec,
   };
 }
@@ -2026,12 +2078,25 @@ export function buildChecklistSubfolderEnqueueItems(params: {
             stem: livePhotoFilter === "both" ? "live" : undefined,
             ext: probe.ext,
           });
+          const motionRefreshContext = buildRefreshContextForResource({
+            media,
+            item,
+            variantId: pairVariant.id,
+            resource: motionRes,
+          });
           out.push({
             title: `${subfolder} #${ordinalIndex} (实况视频)`,
             platform: media.platform,
             ...(workFingerprint ? { workFingerprint } : {}),
             fallbackUrl: probe.primaryUrl || media.source_url,
-            spec: { ...probe.spec, filename: motionFilename },
+            ...(motionRefreshContext ? { refreshContext: motionRefreshContext } : {}),
+            spec: {
+              ...probe.spec,
+              filename: motionFilename,
+              ...(motionRefreshContext
+                ? { refreshContext: motionRefreshContext }
+                : {}),
+            },
           });
         }
 
@@ -2053,12 +2118,25 @@ export function buildChecklistSubfolderEnqueueItems(params: {
             stem: livePhotoFilter === "both" ? "cover" : undefined,
             ext: probe.ext,
           });
+          const imageRefreshContext = buildRefreshContextForResource({
+            media,
+            item,
+            variantId: pairVariant.id,
+            resource: imageRes,
+          });
           out.push({
             title: `${subfolder} #${ordinalIndex} (实况封面)`,
             platform: media.platform,
             ...(workFingerprint ? { workFingerprint } : {}),
             fallbackUrl: probe.primaryUrl || media.source_url,
-            spec: { ...probe.spec, filename: imageFilename },
+            ...(imageRefreshContext ? { refreshContext: imageRefreshContext } : {}),
+            spec: {
+              ...probe.spec,
+              filename: imageFilename,
+              ...(imageRefreshContext
+                ? { refreshContext: imageRefreshContext }
+                : {}),
+            },
           });
         }
         continue;
@@ -2094,11 +2172,18 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       ext: chosen.resolvedExt,
     });
 
+    const refreshContext = buildRefreshContextForOption({
+      media,
+      item,
+      option: chosen,
+    });
+
     const spec = buildSpecFromOption({
       media,
       option: chosen,
       filename,
       apiOrigin,
+      refreshContext,
     });
 
     out.push({
@@ -2106,6 +2191,7 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       platform: media.platform,
       ...(workFingerprint ? { workFingerprint } : {}),
       fallbackUrl: chosen.directUrl || media.source_url,
+      ...(refreshContext ? { refreshContext } : {}),
       spec,
     });
   }
