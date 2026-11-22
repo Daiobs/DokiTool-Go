@@ -583,7 +583,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 2. **何时需要直接遍历 `item.variants[*]`**：
    - **`type == "live_photo"`（实况照片，如抖音实况、小红书 Live Photo）**：实况照片由静图与动态视频片段成对组成，其 `delivery.kind` 为 `"pair"`。因 `"pair"` 不是单一文件，按契约规定 **`item.default` 固定为 `null`**（`default_unavailable_reason: "processing_required"`）。此时应读取 `item.variants[0].delivery.resources[*]`，分别下载 `role == "image"` 与 `role == "motion"` 两个子资源。
    - **指定目标清晰度或编码**：例如只想要 `1080p` H.264（`video_codec: "avc"`）而非 `2160p` HEVC（`video_codec: "hevc"`），可在 `item.variants` 中筛选 `state != "deferred"` 且 `delivery.kind == "file"` 的候选。
-   - **更高画质分离轨道（`item.higher_quality_variants[*]`）**：当某平台（如哔哩哔哩高码率 DASH）存在比最高完整单文件 `file` 分辨率更高的音视频分离版本时，`item.default` 仍指向可直接单文件下载的最高完整 `file`，而 `item.higher_quality_variants` 会列出 `requires: ["mux"]` 的 `variant_id`。仅当 Agent 本地具备 `ffmpeg` 无损混流步骤时才选择 `delivery.kind == "mux"` 的版本。
+   - **更高画质分离轨道（`item.higher_quality_variants[*]`）**：当某平台（如哔哩哔哩 1080P（免登录）DASH）存在比最高完整单文件 `file` 分辨率更高的音视频分离版本时，`item.default` 仍指向可直接单文件下载的最高完整 `file`，而 `item.higher_quality_variants` 会列出 `requires: ["mux"]` 的 `variant_id`。仅当 Agent 本地具备 `ffmpeg` 无损混流步骤时才选择 `delivery.kind == "mux"` 的版本。
 
 ### 4.3 交付形态（`delivery.kind`）速查表
 
