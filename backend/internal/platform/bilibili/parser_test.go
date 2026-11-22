@@ -638,8 +638,12 @@ func TestWithDASHResilientDegradation(t *testing.T) {
 		fn   func() (fetch.Response, error)
 	}{
 		{"network-error", func() (fetch.Response, error) { return fetch.Response{}, errors.New("dial timeout") }},
-		{"non-zero-code", func() (fetch.Response, error) { return fetch.Response{StatusCode: 200, Body: []byte(`{"code":-412}`)}, nil }},
-		{"empty-dash", func() (fetch.Response, error) { return fetch.Response{StatusCode: 200, Body: []byte(`{"code":0,"data":{"dash":{"video":[],"audio":[]}}}`)}, nil }},
+		{"non-zero-code", func() (fetch.Response, error) {
+			return fetch.Response{StatusCode: 200, Body: []byte(`{"code":-412}`)}, nil
+		}},
+		{"empty-dash", func() (fetch.Response, error) {
+			return fetch.Response{StatusCode: 200, Body: []byte(`{"code":0,"data":{"dash":{"video":[],"audio":[]}}}`)}, nil
+		}},
 		{"pcdn-only-dash", func() (fetch.Response, error) {
 			return fetch.Response{StatusCode: 200, Body: []byte(`{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"https://x.edge.mountaintoys.cn/v.m4s"}],"audio":[{"id":30280,"baseUrl":"https://x.edge.mountaintoys.cn/a.m4s"}]}}}`)}, nil
 		}},
