@@ -841,3 +841,102 @@ func TestWithDASHShanghaiRouteMerge(t *testing.T) {
 		t.Fatalf("unexpected merged audio attachment sources: %v", attSrcs)
 	}
 }
+
+func TestWithDASHDURLWithoutDimensionsGetsSameQNDASHGeometry(t *testing.T) {
+	const (
+		now     int64 = 1800000000
+		durlURL       = "https://upos-sz-estgoss.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		v80AVC        = "https://upos-sz-mirrorhwo1.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		v80HEVC       = "https://upos-sz-mirrorhwo1.bilivideo.com/upgcxcode/101-80-hevc.m4s?deadline=1800007200"
+		v80AV1        = "https://upos-sz-mirrorhwo1.bilivideo.com/upgcxcode/101-80-av1.m4s?deadline=1800007200"
+		v64AVC        = "https://upos-sz-mirrorhwo1.bilivideo.com/upgcxcode/101-64-avc.m4s?deadline=1800007200"
+		v64HEVC       = "https://upos-sz-mirrorhwo1.bilivideo.com/upgcxcode/101-64-hevc.m4s?deadline=1800007200"
+		a30280        = "https://upos-sz-mirrorcoso1.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+	)
+
+	// Real Bilibili html5 playurl omits width/height on durl[0].
+	durlBody := `{"code":0,"data":{"quality":64,"format":"mp4720","durl":[{"order":1,"length":212000,"size":51973319,"url":"` + durlURL + `"}]}}`
+	dashBody := `{"code":0,"data":{"quality":80,"dash":{"video":[` +
+		`{"id":80,"codecid":7,"codecs":"avc1.640032","width":1920,"height":1080,"bandwidth":2600000,"baseUrl":"` + v80AVC + `"},` +
+		`{"id":80,"codecid":12,"codecs":"hev1.1.6.L150.90","width":1920,"height":1080,"bandwidth":1900000,"baseUrl":"` + v80HEVC + `"},` +
+		`{"id":80,"codecid":13,"codecs":"av01.0.08M.08","width":1920,"height":1080,"bandwidth":1500000,"baseUrl":"` + v80AV1 + `"},` +
+		`{"id":64,"codecid":7,"codecs":"avc1.640028","width":1280,"height":720,"bandwidth":1200000,"baseUrl":"` + v64AVC + `"},` +
+		`{"id":64,"codecid":12,"codecs":"hev1.1.6.L120.90","width":1280,"height":720,"bandwidth":900000,"baseUrl":"` + v64HEVC + `"}` +
+		`],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":203000,"baseUrl":"` + a30280 + `"}]}}}`
+
+	exec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+		case "bilibili-play-dash":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+
+	rawEnv, err := New(exec).WithDASH(true).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	pubEnv, err := PreparePublic(context.Background(), "bilibili", rawEnv, now)
+	if err != nil {
+		t.Fatalf("PreparePublic failed: %v", err)
+	}
+	view := unified.PublicView(pubEnv, false, now)
+	if err := unified.ValidateEnvelopeAt(view, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+
+	item := unified.Map(unified.Slice(unified.Map(view["data"])["items"])[0])
+	variants := unified.Slice(item["variants"])
+	durlVar := unified.Map(variants[0])
+	durlMeta := unified.Map(durlVar["metadata"])
+	if intValue(durlMeta["width"]) != 1280 || intValue(durlMeta["height"]) != 720 {
+		t.Fatalf("durl variant metadata = %v, want 1280x720 from same-qn DASH", durlMeta)
+	}
+	higher := unified.Slice(item["higher_quality_variants"])
+	if len(higher) != 3 {
+		t.Fatalf("higher_quality_variants len = %d (%v), want 3 (1080p avc/hevc/av1)", len(higher), higher)
+	}
+	for i, wantID := range []string{"dash-80-avc", "dash-80-hevc", "dash-80-av1"} {
+		entry := unified.Map(higher[i])
+		reqs := unified.Slice(entry["requires"])
+		if unified.Str(entry["variant_id"]) != wantID || len(reqs) != 1 || unified.Str(reqs[0]) != "mux" {
+			t.Fatalf("higher[%d] = %v, want {variant_id:%s, requires:[mux]}", i, entry, wantID)
+		}
+	}
+
+	// Conflicting same-qn DASH dimensions must refuse to guess width/height.
+	conflictDash := `{"code":0,"data":{"quality":80,"dash":{"video":[` +
+		`{"id":80,"codecid":7,"codecs":"avc1.640032","width":1920,"height":1080,"bandwidth":2600000,"baseUrl":"` + v80AVC + `"},` +
+		`{"id":64,"codecid":7,"codecs":"avc1.640028","width":1280,"height":720,"bandwidth":1200000,"baseUrl":"` + v64AVC + `"},` +
+		`{"id":64,"codecid":12,"codecs":"hev1.1.6.L120.90","width":1280,"height":718,"bandwidth":900000,"baseUrl":"` + v64HEVC + `"}` +
+		`],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":203000,"baseUrl":"` + a30280 + `"}]}}}`
+	conflictExec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+		case "bilibili-play-dash":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(conflictDash)}, nil
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+	conflictEnv, err := New(conflictExec).WithDASH(true).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("conflict Parse failed: %v", err)
+	}
+	if err := unified.ValidateEnvelopeAt(conflictEnv, now); err != nil {
+		t.Fatalf("conflict ValidateEnvelopeAt failed: %v", err)
+	}
+	conflictItem := unified.Map(unified.Slice(unified.Map(conflictEnv["data"])["items"])[0])
+	conflictDURL := unified.Map(unified.Slice(conflictItem["variants"])[0])
+	if unified.Map(conflictDURL["metadata"])["width"] != nil || conflictItem["higher_quality_variants"] != nil {
+		t.Fatalf("conflicting same-qn DASH should not assign geometry or higher_quality_variants: durl=%v higher=%v", conflictDURL["metadata"], conflictItem["higher_quality_variants"])
+	}
+}

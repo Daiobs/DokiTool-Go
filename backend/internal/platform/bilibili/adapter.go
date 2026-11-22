@@ -136,6 +136,12 @@ func variantsWithOptions(raw object, bvid string, page int64, cid any, now int64
 		markSingleDURL(candidate, bvid, page, stringValue(cid), play, part)
 		// PHP array union keeps the first fact: part before play, video before audio.
 		union(candidate, unified.VideoFacts(part), unified.VideoFacts(play), unified.AudioFacts(part), unified.AudioFacts(play))
+		if enableDASH && candidate["width"] == nil && candidate["height"] == nil {
+			if w, h, ok := dashQualityDimensions(play, jpQuality); ok {
+				candidate["width"] = w
+				candidate["height"] = h
+			}
+		}
 		result = unified.FileVariants(array{candidate}, now)
 		if shPlay != nil && jpQuality > 0 && shPlay.DURLQuality == jpQuality && len(shPlay.DURLPieces) == 1 && len(result) == 1 {
 			shURLs := filterShanghaiURLsAt(shPlay.DURLPieces[0].URLs, now)
@@ -314,6 +320,39 @@ func filterAndSortBilibiliDashURLs(primary any, backups array) array {
 		out = append(out, buckets[i]...)
 	}
 	return out
+}
+
+// dashQualityDimensions returns the unanimous upstream (width, height) reported
+// by Bilibili's DASH video tracks for the same quality tier (qn) on this cid.
+// Real Bilibili html5 durl responses omit width/height on durl[0]; pairing the
+// same-qn DASH geometry lets unified.SelectDefault compare durl against higher
+// DASH tiers and populate higher_quality_variants without guessing dimensions.
+func dashQualityDimensions(play object, qn int64) (int64, int64, bool) {
+	if qn <= 0 {
+		return 0, 0, false
+	}
+	var width, height int64
+	found := false
+	for _, value := range unified.Slice(child(play, "dash", "video")) {
+		rawVideo := unified.Map(value)
+		if rawVideo == nil || intValue(rawVideo["id"]) != qn {
+			continue
+		}
+		w, wOK := unified.Numeric(rawVideo["width"])
+		h, hOK := unified.Numeric(rawVideo["height"])
+		if !wOK || !hOK || w <= 0 || h <= 0 {
+			continue
+		}
+		wi, hi := intValue(rawVideo["width"]), intValue(rawVideo["height"])
+		if !found {
+			width, height, found = wi, hi, true
+			continue
+		}
+		if wi != width || hi != height {
+			return 0, 0, false
+		}
+	}
+	return width, height, found
 }
 
 func dashAudioIDRank(id int64) int {

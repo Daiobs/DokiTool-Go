@@ -1968,7 +1968,7 @@ export function createOffscreenDownloadExecutor(
     webm: "video/webm",
     mkv: "video/x-matroska",
     ts: "video/mp2t",
-    m4a: "audio/mp4",
+    m4a: "audio/x-m4a",
     mp3: "audio/mpeg",
     aac: "audio/aac",
     opus: "audio/ogg",
@@ -1988,8 +1988,17 @@ export function createOffscreenDownloadExecutor(
     filename: string,
     explicitMime?: string,
   ): string => {
+    const dotIdx = filename.lastIndexOf(".");
+    const ext =
+      dotIdx >= 0 ? filename.slice(dotIdx + 1).trim().toLowerCase() : "";
     const cleanExplicit =
       typeof explicitMime === "string" ? explicitMime.trim().toLowerCase() : "";
+    // Chromium's DownloadTargetDeterminer maps `audio/mp4` to `.mp4` on macOS
+    // and silently rewrites `.m4a` downloads to `.mp4`. Using `audio/x-m4a`
+    // preserves the `.m4a` extension cleanly across macOS/Linux/Windows.
+    if (ext === "m4a" && (!cleanExplicit || cleanExplicit === "audio/mp4")) {
+      return "audio/x-m4a";
+    }
     if (
       cleanExplicit &&
       cleanExplicit !== "text/plain" &&
@@ -1997,9 +2006,6 @@ export function createOffscreenDownloadExecutor(
     ) {
       return cleanExplicit;
     }
-    const dotIdx = filename.lastIndexOf(".");
-    const ext =
-      dotIdx >= 0 ? filename.slice(dotIdx + 1).trim().toLowerCase() : "";
     return EXT_TO_BLOB_MIME[ext] || cleanExplicit || "application/octet-stream";
   };
 
@@ -2071,6 +2077,25 @@ export function createOffscreenDownloadExecutor(
     }
   };
 
+  const hasIsoBmffBoxHeader = (bytes: Uint8Array): boolean => {
+    if (bytes.byteLength < 8) return false;
+    const boxSize =
+      ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
+    if (boxSize !== 1 && boxSize < 8) return false;
+    const boxType = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    return (
+      boxType === "ftyp" ||
+      boxType === "styp" ||
+      boxType === "moov" ||
+      boxType === "moof" ||
+      boxType === "sidx" ||
+      boxType === "free" ||
+      boxType === "skip" ||
+      boxType === "wide" ||
+      boxType === "mdat"
+    );
+  };
+
   const streamResponseBodyToWriter = async (params: {
     response: Response;
     write: (chunk: Uint8Array) => Promise<void>;
@@ -2078,9 +2103,17 @@ export function createOffscreenDownloadExecutor(
     onBytes?: (chunkBytes: number, totalLoadedForStream: number) => void;
     maxBytes?: number;
     maxBytesError?: string;
+    verifyFirstBytes?: (prefix: Uint8Array) => void;
   }): Promise<number> => {
-    const { response, write, signal, onBytes, maxBytes, maxBytesError } =
-      params;
+    const {
+      response,
+      write,
+      signal,
+      onBytes,
+      maxBytes,
+      maxBytesError,
+      verifyFirstBytes,
+    } = params;
     const rawContentLen = response.headers.get("Content-Length");
     const hasContentEncoding = Boolean(
       response.headers.get("Content-Encoding")?.trim(),
@@ -2104,6 +2137,7 @@ export function createOffscreenDownloadExecutor(
       if (buf.byteLength === 0) {
         throw new ExtensionDownloadError("媒体响应内容为空");
       }
+      verifyFirstBytes?.(buf.subarray(0, Math.min(16, buf.byteLength)));
       await write(buf);
       onBytes?.(buf.byteLength, buf.byteLength);
       return buf.byteLength;
@@ -2112,6 +2146,9 @@ export function createOffscreenDownloadExecutor(
     const reader = response.body.getReader();
     let streamLoaded = 0;
     let finishedCleanly = false;
+    let verifiedFirstBytes = !verifyFirstBytes;
+    const sniffChunks: Uint8Array[] = [];
+    let sniffBytes = 0;
     let rejectOnAbort: (() => void) | null = null;
     const abortRace = new Promise<never>((_resolve, reject) => {
       rejectOnAbort = () => {
@@ -2132,6 +2169,28 @@ export function createOffscreenDownloadExecutor(
     // Prevent unhandled rejection when stream finishes normally without abort
     void abortRace.catch(() => {});
 
+    const flushSniffedChunks = async () => {
+      if (verifiedFirstBytes) return;
+      verifiedFirstBytes = true;
+      const sampleLen = Math.min(16, sniffBytes);
+      const sample = new Uint8Array(sampleLen);
+      let off = 0;
+      for (const part of sniffChunks) {
+        if (off >= sampleLen) break;
+        const take = Math.min(part.byteLength, sampleLen - off);
+        sample.set(part.subarray(0, take), off);
+        off += take;
+      }
+      verifyFirstBytes!(sample);
+      let writtenLoaded = 0;
+      for (const part of sniffChunks) {
+        await write(part);
+        writtenLoaded += part.byteLength;
+        onBytes?.(part.byteLength, writtenLoaded);
+      }
+      sniffChunks.length = 0;
+    };
+
     try {
       for (;;) {
         throwIfAborted(signal);
@@ -2143,12 +2202,23 @@ export function createOffscreenDownloadExecutor(
         if (maxBytes !== undefined && streamLoaded > maxBytes) {
           throw new ExtensionDownloadError(maxBytesError || ARCHIVE_LIMIT_ERROR);
         }
-        await write(value);
-        onBytes?.(value.byteLength, streamLoaded);
+        if (!verifiedFirstBytes) {
+          sniffChunks.push(value);
+          sniffBytes += value.byteLength;
+          if (sniffBytes >= 16) {
+            await flushSniffedChunks();
+          }
+        } else {
+          await write(value);
+          onBytes?.(value.byteLength, streamLoaded);
+        }
       }
       throwIfAborted(signal);
       if (streamLoaded === 0) {
         throw new ExtensionDownloadError("媒体流返回 0 字节");
+      }
+      if (!verifiedFirstBytes) {
+        await flushSniffedChunks();
       }
       if (declaredLen > 0 && streamLoaded !== declaredLen) {
         throw new ExtensionDownloadError(
@@ -2204,10 +2274,11 @@ export function createOffscreenDownloadExecutor(
           );
         }
         const contentType = resp.headers.get("Content-Type") || "";
-        if (/text\/html|application\/json/i.test(contentType)) {
+        if (/text\/html/i.test(contentType)) {
           void resp.body?.cancel?.().catch(() => {});
           throw new ExtensionDownloadError("媒体源返回了非媒体错误页");
         }
+        const isJsonLabeled = /application\/json/i.test(contentType);
 
         const rawLen = resp.headers.get("Content-Length");
         const hasEncoding = Boolean(
@@ -2220,7 +2291,10 @@ export function createOffscreenDownloadExecutor(
           spec.sizeBytes ||
           0;
 
-        sink = await openOpfsSink(taskId, spec.mimeType || contentType);
+        sink = await openOpfsSink(
+          taskId,
+          spec.mimeType || (isJsonLabeled ? undefined : contentType),
+        );
         reportProgress(
           {
             status: "downloading",
@@ -2239,6 +2313,17 @@ export function createOffscreenDownloadExecutor(
           response: resp,
           write: (chunk) => sink!.write(chunk),
           signal,
+          ...(isJsonLabeled
+            ? {
+                verifyFirstBytes: (prefix: Uint8Array) => {
+                  if (!hasIsoBmffBoxHeader(prefix)) {
+                    throw new ExtensionDownloadError(
+                      "媒体源返回了非媒体错误页",
+                    );
+                  }
+                },
+              }
+            : {}),
           onBytes: (_chunkLen, loaded) => {
             reportProgress({
               status: "downloading",
@@ -2860,10 +2945,11 @@ export function createOffscreenDownloadExecutor(
             );
           }
           const contentType = resp.headers.get("Content-Type") || "";
-          if (/text\/html|application\/json/i.test(contentType)) {
+          if (/text\/html/i.test(contentType)) {
             void resp.body?.cancel?.().catch(() => {});
             throw new ExtensionDownloadError(`${trackLabel}返回了非媒体错误页`);
           }
+          const isJsonLabeled = /application\/json/i.test(contentType);
 
           const rawLen = resp.headers.get("Content-Length");
           const hasEncoding = Boolean(
@@ -2883,6 +2969,17 @@ export function createOffscreenDownloadExecutor(
             response: resp,
             write: (chunk) => sink!.write(chunk),
             signal: trackSignal,
+            ...(isJsonLabeled
+              ? {
+                  verifyFirstBytes: (prefix: Uint8Array) => {
+                    if (!hasIsoBmffBoxHeader(prefix)) {
+                      throw new ExtensionDownloadError(
+                        `${trackLabel}返回了非媒体错误页`,
+                      );
+                    }
+                  },
+                }
+              : {}),
             onBytes: (_chunkLen, loaded) => {
               onProgress({ loaded, total });
             },

@@ -6011,3 +6011,180 @@ test("executeDashMux & runDashMuxToOpfs: real mediabunny lossless MP4 mux (H.264
     }
   }
 });
+
+test("Bilibili CDN quirks: allows ISOBMFF binary mislabeled as application/json, still rejects genuine JSON errors, and hands off .m4a blobs as audio/x-m4a", async () => {
+  const { videoBytes, audioBytes } =
+    await createSyntheticDashTrackBuffers("avc");
+
+  // 1) dash_mux: primary route returns genuine JSON error (rejected -> fallback),
+  //    secondary route (like Huawei OBS upos-sz-mirrorhwo1.bilivideo.com) returns valid ISOBMFF
+  //    bytes mislabeled with Content-Type: application/json -> accepted & muxed losslessly!
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    const handoffs = [];
+    const fetchedUrls = [];
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      fetchedUrls.push(s);
+      if (s.includes("json-error.m4s")) {
+        return new Response(JSON.stringify({ code: -403, message: "denied" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (s.includes("huawei-obs-video.m4s")) {
+        return new Response(videoBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(videoBytes.byteLength),
+          },
+        });
+      }
+      if (s.includes("audio-ok.m4s")) {
+        return new Response(audioBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": String(audioBytes.byteLength),
+          },
+        });
+      }
+      throw new Error(`Unexpected URL: ${s}`);
+    };
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: mockFetch,
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      mediabunnyImpl: mediabunny,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        assert.ok(blob);
+        assert.equal(blob.type, "video/mp4");
+        handoffs.push({ msg, blobType: blob.type, byteLength: blob.size });
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 201 };
+      },
+    });
+
+    try {
+      executor.startTask("dash-json-ct-sniff", {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorhwo1.bilivideo.com/huawei-obs-video.m4s"],
+        filename: "bili-avc.mp4",
+        mimeType: "video/mp4",
+        dashMux: {
+          videoRoutes: [
+            "https://upos-sz-mirrorcos.bilivideo.com/json-error.m4s",
+            "https://upos-sz-mirrorhwo1.bilivideo.com/huawei-obs-video.m4s",
+          ],
+          audioRoutes: ["https://upos-sz-mirrorcoso1.bilivideo.com/audio-ok.m4s"],
+          outputContainer: "mp4",
+        },
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(handoffs.length, 1);
+      assert.ok(handoffs[0].byteLength > 0);
+      assert.ok(fetchedUrls.some((u) => u.includes("json-error.m4s")));
+      assert.ok(fetchedUrls.some((u) => u.includes("huawei-obs-video.m4s")));
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 2) direct_file standalone .m4a: accepts mislabeled application/json ISOBMFF audio,
+  //    still rejects genuine JSON error route, and wraps Blob as audio/x-m4a (not audio/mp4)
+  //    so Chromium preserves the `.m4a` extension on disk.
+  {
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    const handoffs = [];
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      if (s.includes("audio-json-error.m4s")) {
+        return new Response('{"code":-403,"message":"forbidden"}', {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (s.includes("audio-huawei-obs.m4s")) {
+        return new Response(audioBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": String(audioBytes.byteLength),
+          },
+        });
+      }
+      throw new Error(`Unexpected URL: ${s}`);
+    };
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: mockFetch,
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        assert.ok(blob);
+        handoffs.push({ filename: msg.filename, blobType: blob.type, size: blob.size });
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 202 };
+      },
+    });
+
+    try {
+      executor.startTask("direct-m4a-mime", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: [
+          "https://upos-sz-mirrorcos.bilivideo.com/audio-json-error.m4s",
+          "https://upos-sz-mirrorhwo1.bilivideo.com/audio-huawei-obs.m4s",
+        ],
+        filename: "track_原声音频 (M4A).m4a",
+        mimeType: "audio/mp4",
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(handoffs.length, 1);
+      assert.equal(handoffs[0].filename, "track_原声音频 (M4A).m4a");
+      assert.equal(handoffs[0].blobType, "audio/x-m4a");
+      assert.equal(handoffs[0].size, audioBytes.byteLength);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+});
