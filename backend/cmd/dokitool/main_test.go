@@ -1169,7 +1169,7 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 			}).WithClock(func() time.Time { return nowTime })
 
-			douyinParser, bilibiliParser := newShanghaiParsers(jpExec, probe.New(jpExec, douyin.AllowedMediaURL), shanghai)
+			douyinParser, bilibiliParser := newShanghaiParsers(jpExec, probe.New(jpExec, douyin.AllowedMediaURL), shanghai, false)
 			c, err := catalog.Load()
 			if err != nil {
 				t.Fatal(err)
@@ -1781,7 +1781,59 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-func TestNewShanghaiParsersEnablesBilibiliDASH(t *testing.T) {
+func TestBilibiliDASHSwitchValidationAndWiring(t *testing.T) {
+	validCases := []struct {
+		raw  string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"FALSE", false},
+		{"f", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{"t", true},
+	}
+	for _, tc := range validCases {
+		got, err := parseBilibiliDASH(func(k string) string {
+			if k == "DOKITOOL_BILIBILI_DASH" {
+				return tc.raw
+			}
+			return ""
+		})
+		if err != nil || got != tc.want {
+			t.Fatalf("parseBilibiliDASH(%q) = (%v, %v), want (%v, nil)", tc.raw, got, err, tc.want)
+		}
+	}
+
+	for _, invalid := range []string{"yes_please", "2", "on", "off", "auto", " true", "true "} {
+		if _, err := parseBilibiliDASH(func(k string) string {
+			if k == "DOKITOOL_BILIBILI_DASH" {
+				return invalid
+			}
+			return ""
+		}); err == nil || !strings.Contains(err.Error(), "DOKITOOL_BILIBILI_DASH must be a boolean") {
+			t.Fatalf("parseBilibiliDASH(%q) err = %v, want DOKITOOL_BILIBILI_DASH boolean error", invalid, err)
+		}
+
+		t.Setenv("DOKITOOL_BILIBILI_DASH", invalid)
+		t.Setenv("DOKITOOL_SHANGHAI_MODE", "")
+		occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+		occupied.Close()
+		if runErr == nil || !strings.Contains(runErr.Error(), "DOKITOOL_BILIBILI_DASH must be a boolean") {
+			t.Fatalf("want DOKITOOL_BILIBILI_DASH startup error before listener bind for %q, got %v", invalid, runErr)
+		}
+		if strings.Contains(runErr.Error(), invalid) {
+			t.Fatalf("startup error echoed raw invalid env value %q: %v", invalid, runErr)
+		}
+	}
+
 	const (
 		bvid    = "BV1234567890"
 		nowUnix = int64(1800000000)
@@ -1792,53 +1844,64 @@ func TestNewShanghaiParsersEnablesBilibiliDASH(t *testing.T) {
 	dashBody := fmt.Sprintf(`{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2200000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/101-80.m4s?deadline=%d"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":192000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/101-30280.m4s?deadline=%d"}]}}}`, dlUnix, dlUnix)
 
 	for _, withShanghai := range []bool{false, true} {
-		name := "standalone"
-		if withShanghai {
-			name = "shanghai-backed"
-		}
-		t.Run(name, func(t *testing.T) {
-			var dashCalls atomic.Int32
-			exec := fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
-				switch req.Policy.Purpose {
-				case "bilibili-view":
-					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(viewBody)}, nil
-				case "bilibili-play":
-					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
-				case "bilibili-play-dash":
-					dashCalls.Add(1)
-					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
-				default:
-					return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+		for _, dashEnabled := range []bool{false, true} {
+			name := fmt.Sprintf("shanghai=%t/dash=%t", withShanghai, dashEnabled)
+			t.Run(name, func(t *testing.T) {
+				var dashCalls atomic.Int32
+				exec := fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+					switch req.Policy.Purpose {
+					case "bilibili-view":
+						return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(viewBody)}, nil
+					case "bilibili-play":
+						return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+					case "bilibili-play-dash":
+						dashCalls.Add(1)
+						return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+					default:
+						return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+					}
+				})
+				var sh douyin.OriginalResolver
+				if withShanghai {
+					broker, err := shresolver.NewPullBroker(randomHexToken(t, 24))
+					if err != nil {
+						t.Fatal(err)
+					}
+					broker.WithBilibili(true)
+					sh = broker
+				}
+				_, biliParser := newShanghaiParsers(exec, probe.New(exec, douyin.AllowedMediaURL), sh, dashEnabled)
+				env, err := biliParser.Parse(context.Background(), "https://www.bilibili.com/video/"+bvid+"/", nowUnix)
+				if err != nil {
+					t.Fatalf("Parse failed: %v", err)
+				}
+				if err := unified.ValidateEnvelopeAt(env, nowUnix); err != nil {
+					t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+				}
+				data := unified.Map(env["data"])
+				variants := unified.Slice(unified.Map(unified.Slice(data["items"])[0])["variants"])
+				if dashEnabled {
+					if dashCalls.Load() != 1 {
+						t.Fatalf("dashCalls = %d, want 1", dashCalls.Load())
+					}
+					if len(unified.Slice(data["attachments"])) != 1 {
+						t.Fatalf("expected 1 audio attachment, got %v", data["attachments"])
+					}
+					if len(variants) != 2 || unified.Str(unified.Map(variants[1])["id"]) != "dash-80-avc" {
+						t.Fatalf("expected [durl, dash-80-avc], got %v", variants)
+					}
+				} else {
+					if dashCalls.Load() != 0 {
+						t.Fatalf("dashCalls = %d, want 0 when DOKITOOL_BILIBILI_DASH=false", dashCalls.Load())
+					}
+					if data["attachments"] != nil {
+						t.Fatalf("expected 0 attachments when disabled, got %v", data["attachments"])
+					}
+					if len(variants) != 1 {
+						t.Fatalf("expected single durl variant when disabled, got %v", variants)
+					}
 				}
 			})
-			var sh douyin.OriginalResolver
-			if withShanghai {
-				broker, err := shresolver.NewPullBroker(randomHexToken(t, 24))
-				if err != nil {
-					t.Fatal(err)
-				}
-				broker.WithBilibili(true)
-				sh = broker
-			}
-			_, biliParser := newShanghaiParsers(exec, probe.New(exec, douyin.AllowedMediaURL), sh)
-			env, err := biliParser.Parse(context.Background(), "https://www.bilibili.com/video/"+bvid+"/", nowUnix)
-			if err != nil {
-				t.Fatalf("Parse failed: %v", err)
-			}
-			if err := unified.ValidateEnvelopeAt(env, nowUnix); err != nil {
-				t.Fatalf("ValidateEnvelopeAt failed: %v", err)
-			}
-			if dashCalls.Load() != 1 {
-				t.Fatalf("dashCalls = %d, want 1", dashCalls.Load())
-			}
-			data := unified.Map(env["data"])
-			if len(unified.Slice(data["attachments"])) != 1 {
-				t.Fatalf("expected 1 audio attachment, got %v", data["attachments"])
-			}
-			variants := unified.Slice(unified.Map(unified.Slice(data["items"])[0])["variants"])
-			if len(variants) != 2 || unified.Str(unified.Map(variants[1])["id"]) != "dash-80-avc" {
-				t.Fatalf("expected [durl, dash-80-avc], got %v", variants)
-			}
-		})
+		}
 	}
 }

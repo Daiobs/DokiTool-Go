@@ -944,3 +944,228 @@ func TestWithDASHDURLWithoutDimensionsGetsSameQNDASHGeometry(t *testing.T) {
 		t.Fatalf("conflicting same-qn DASH should not assign geometry or higher_quality_variants: durl=%v higher=%v", conflictDURL["metadata"], conflictItem["higher_quality_variants"])
 	}
 }
+
+func TestWithDASHGraceTimeoutAfterDURLSuccessAndFallbackOnDURLFailure(t *testing.T) {
+	if (*Parser)(nil).WithDASHGraceTimeout(time.Second) != nil {
+		t.Fatal("(*Parser)(nil).WithDASHGraceTimeout must return nil")
+	}
+
+	const (
+		now     int64 = 1800000000
+		durlURL       = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		vidURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		audURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+	)
+	durlBody := `{"code":0,"data":{"quality":64,"durl":[{"url":"` + durlURL + `","width":1280,"height":720}]}}`
+	dashBody := `{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2200000,"baseUrl":"` + vidURL + `"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":192000,"baseUrl":"` + audURL + `"}]}}}`
+
+	t.Run("durl-fast-dash-hangs-grace-cancels-dash", func(t *testing.T) {
+		dashCanceled := make(chan error, 1)
+		exec := executorFunc(func(reqCtx context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.Policy.Purpose {
+			case "bilibili-view":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			case "bilibili-play":
+				time.Sleep(10 * time.Millisecond)
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+			case "bilibili-play-dash":
+				select {
+				case <-reqCtx.Done():
+					dashCanceled <- reqCtx.Err()
+					return fetch.Response{}, reqCtx.Err()
+				case <-time.After(10 * time.Second):
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+				}
+			default:
+				return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+			}
+		})
+
+		start := time.Now()
+		env, err := New(exec).WithDASH(true).WithDASHGraceTimeout(60*time.Millisecond).Parse(context.Background(), testURL, now)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Parse failed on DASH grace timeout: %v", err)
+		}
+		if elapsed >= 300*time.Millisecond {
+			t.Fatalf("Parse took %v, want < 300ms after 60ms grace timeout", elapsed)
+		}
+		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		data := unified.Map(env["data"])
+		if data["attachments"] != nil {
+			t.Fatalf("expected 0 attachments after DASH grace skip, got %v", data["attachments"])
+		}
+		item := unified.Map(unified.Slice(data["items"])[0])
+		if unified.Str(unified.Map(item["default"])["url"]) != durlURL || len(unified.Slice(item["variants"])) != 1 {
+			t.Fatalf("expected clean 720p durl fallback after DASH grace skip, got item=%v", item)
+		}
+		select {
+		case cancelErr := <-dashCanceled:
+			if !errors.Is(cancelErr, context.Canceled) {
+				t.Fatalf("dashCtx err = %v, want context.Canceled", cancelErr)
+			}
+		case <-time.After(200 * time.Millisecond):
+			t.Fatal("dashCtx was not canceled when grace timer expired")
+		}
+	})
+
+	t.Run("durl-fails-dash-succeeds-after-grace", func(t *testing.T) {
+		exec := executorFunc(func(reqCtx context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.Policy.Purpose {
+			case "bilibili-view":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			case "bilibili-play":
+				return fetch.Response{StatusCode: 502, URL: req.URL}, nil
+			case "bilibili-play-dash":
+				select {
+				case <-time.After(120 * time.Millisecond):
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+				case <-reqCtx.Done():
+					return fetch.Response{}, reqCtx.Err()
+				}
+			default:
+				return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+			}
+		})
+
+		env, err := New(exec).WithDASH(true).WithDASHGraceTimeout(40*time.Millisecond).Parse(context.Background(), testURL, now)
+		if err != nil {
+			t.Fatalf("Parse failed when durl failed and dash succeeded after grace: %v", err)
+		}
+		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		data := unified.Map(env["data"])
+		item := unified.Map(unified.Slice(data["items"])[0])
+		variants := unified.Slice(item["variants"])
+		if len(variants) != 1 || unified.Str(unified.Map(variants[0])["id"]) != "dash-80-avc" {
+			t.Fatalf("expected DASH fallback variant after durl 502, got %v", variants)
+		}
+		if len(unified.Slice(data["attachments"])) != 1 {
+			t.Fatalf("expected standalone audio attachment on DASH fallback, got %v", data["attachments"])
+		}
+	})
+
+	t.Run("durl-empty-url-dash-succeeds-after-grace", func(t *testing.T) {
+		exec := executorFunc(func(reqCtx context.Context, req fetch.Request) (fetch.Response, error) {
+			switch req.Policy.Purpose {
+			case "bilibili-view":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+			case "bilibili-play":
+				return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":""}]}}`)}, nil
+			case "bilibili-play-dash":
+				select {
+				case <-time.After(120 * time.Millisecond):
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+				case <-reqCtx.Done():
+					return fetch.Response{}, reqCtx.Err()
+				}
+			default:
+				return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+			}
+		})
+
+		env, err := New(exec).WithDASH(true).WithDASHGraceTimeout(40*time.Millisecond).Parse(context.Background(), testURL, now)
+		if err != nil {
+			t.Fatalf("Parse failed when durl had empty url and dash succeeded after grace: %v", err)
+		}
+		if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+			t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+		}
+		item := unified.Map(unified.Slice(unified.Map(env["data"])["items"])[0])
+		variants := unified.Slice(item["variants"])
+		if len(variants) != 1 || unified.Str(unified.Map(variants[0])["id"]) != "dash-80-avc" {
+			t.Fatalf("expected DASH fallback variant when durl url is empty, got %v", variants)
+		}
+	})
+}
+
+func TestDisabledDASHIgnoresUpgradedShanghaiDASHTracks(t *testing.T) {
+	const (
+		now     int64 = 1800000000
+		shDURL        = "https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		jpDURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		shVid80       = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
+		shAud         = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"
+	)
+
+	var dashCalls atomic.Int32
+	jpExec := executorFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		switch req.Policy.Purpose {
+		case "bilibili-view":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(testView)}, nil
+		case "bilibili-play":
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"` + jpDURL + `","width":1280,"height":720}]}}`)}, nil
+		case "bilibili-play-dash":
+			dashCalls.Add(1)
+			return fetch.Response{}, errors.New("unexpected DASH call when enableDASH=false")
+		default:
+			return fetch.Response{}, fmt.Errorf("unexpected purpose: %s", req.Policy.Purpose)
+		}
+	})
+	shRes := &staticPendingShanghaiResolver{
+		play: &ShanghaiPlay{
+			BVID:        "BV1234567890",
+			CID:         101,
+			DURLQuality: 64,
+			DURLPieces:  []ShanghaiDURLPiece{{URLs: []string{shDURL}}},
+			DashVideo:   []ShanghaiDashTrack{{ID: 80, CodecID: 7, Codecs: "avc1.640028", URLs: []string{shVid80}}},
+			DashAudio:   []ShanghaiDashTrack{{ID: 30280, Codecs: "mp4a.40.2", URLs: []string{shAud}}},
+		},
+	}
+
+	env, err := NewWithShanghai(jpExec, shRes).WithDASH(false).Parse(context.Background(), testURL, now)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if dashCalls.Load() != 0 {
+		t.Fatalf("dashCalls = %d, want 0 when DASH disabled", dashCalls.Load())
+	}
+	if !shRes.matched.Load() {
+		t.Fatal("expected Shanghai finish(true) on DURL match")
+	}
+	data := unified.Map(env["data"])
+	if data["attachments"] != nil {
+		t.Fatalf("expected 0 attachments when DASH disabled, got %v", data["attachments"])
+	}
+	item := unified.Map(unified.Slice(data["items"])[0])
+	variants := unified.Slice(item["variants"])
+	if len(variants) != 1 {
+		t.Fatalf("variants len = %d, want 1 (durl only, ignoring Shanghai DASH)", len(variants))
+	}
+	srcs := unified.Slice(unified.Map(unified.Map(variants[0])["delivery"])["sources"])
+	if len(srcs) != 2 || unified.Str(unified.Map(srcs[0])["url"]) != shDURL || unified.Str(unified.Map(srcs[1])["url"]) != jpDURL {
+		t.Fatalf("unexpected DURL sources: %v", srcs)
+	}
+	encoded, _ := unified.Encode(env)
+	if strings.Contains(string(encoded), shVid80) || strings.Contains(string(encoded), shAud) {
+		t.Fatalf("Shanghai DASH URLs leaked into payload when DASH disabled: %s", string(encoded))
+	}
+}
+
+func TestAdaptDASHModernAudioLessDegradation(t *testing.T) {
+	const now int64 = 1800000000
+	play := object{
+		"dash": object{
+			"video": array{
+				object{"id": int64(80), "codecid": int64(7), "codecs": "avc1.640028", "width": int64(1920), "height": int64(1080), "bandwidth": int64(2000000), "baseUrl": "https://upos-sz-mirrorcosov.bilivideo.com/v80.m4s?deadline=1800007200"},
+			},
+			"audio": array{},
+		},
+	}
+
+	if variants, matched, audio := adaptDASHModern(play, now, nil, true); len(variants) != 0 || matched || audio != nil {
+		t.Fatalf("hasDURL=true with no audio: got (%v, %v, %v), want (nil, false, nil)", variants, matched, audio)
+	}
+
+	variants, matched, audio := adaptDASHModern(play, now, nil, false)
+	if matched || audio != nil || len(variants) != 1 {
+		t.Fatalf("hasDURL=false with no audio: got (%v, %v, %v), want 1 deferred variant", variants, matched, audio)
+	}
+	v := unified.Map(variants[0])
+	if unified.Str(v["id"]) != "dash-80-avc" || unified.Str(v["state"]) != "deferred" || unified.Str(child(v, "reason", "code")) != "MISSING_AUDIO_TRACK" {
+		t.Fatalf("unexpected deferred variant: %v", v)
+	}
+}

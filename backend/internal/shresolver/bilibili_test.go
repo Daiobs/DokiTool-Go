@@ -734,3 +734,149 @@ func TestBilibiliDefaultDisabledOnPullBrokerAndClient(t *testing.T) {
 		}
 	})
 }
+
+func TestBilibiliDASHSwitchOnServerAndPullWorker(t *testing.T) {
+	if (*Server)(nil).WithBilibiliDASH(true) != nil || (*Server)(nil).BilibiliDASHEnabled() {
+		t.Fatal("nil *Server WithBilibiliDASH / BilibiliDASHEnabled must be nil-safe")
+	}
+	if (*PullWorker)(nil).WithBilibiliDASH(true) != nil || (*PullWorker)(nil).BilibiliDASHEnabled() {
+		t.Fatal("nil *PullWorker WithBilibiliDASH / BilibiliDASHEnabled must be nil-safe")
+	}
+
+	const origin = "https://japan.example.org"
+	exp := fmt.Sprintf("%010d", time.Now().Add(2*time.Hour).Unix())
+	durlOnlyBody := []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=` + exp + `&upsig=dom1"}]}}`)
+	dashOnlyBody := []byte(`{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","baseUrl":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=` + exp + `&upsig=dv1"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","base_url":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=` + exp + `&upsig=da1"}]}}}`)
+	noopProbe := resolverFunc(func(context.Context, string) ([]unified.Object, error) { return nil, errors.New("unused") })
+
+	for _, enableDASH := range []bool{false, true} {
+		modeName := "dash-default-off"
+		if enableDASH {
+			modeName = "dash-enabled"
+		}
+
+		t.Run("direct-server/"+modeName, func(t *testing.T) {
+			var playCalls, dashCalls atomic.Int32
+			shExec := resolveExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-play":
+					playCalls.Add(1)
+					return fetch.Response{StatusCode: http.StatusOK, Body: durlOnlyBody}, nil
+				case "bilibili-play-dash":
+					dashCalls.Add(1)
+					return fetch.Response{StatusCode: http.StatusOK, Body: dashOnlyBody}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			srvHandler, err := NewHandlerWithDetail(wireToken, shExec, noopProbe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if srvHandler.BilibiliDASHEnabled() {
+				t.Fatal("NewHandlerWithDetail must default BilibiliDASHEnabled to false")
+			}
+			if enableDASH {
+				srvHandler.WithBilibiliDASH(true)
+			}
+			if srvHandler.BilibiliDASHEnabled() != enableDASH {
+				t.Fatalf("BilibiliDASHEnabled() = %v, want %v", srvHandler.BilibiliDASHEnabled(), enableDASH)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, Path, strings.NewReader(`{"protocol":2,"task_type":"bilibili","bvid":"`+biliTestBVID+`","cid":101}`))
+			req.Header.Set("Authorization", "Bearer "+wireToken)
+			rec := httptest.NewRecorder()
+			srvHandler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			var got bilibili.ShanghaiPlay
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if playCalls.Load() != 1 {
+				t.Fatalf("playCalls = %d, want 1", playCalls.Load())
+			}
+			if enableDASH {
+				if dashCalls.Load() != 1 || len(got.DashVideo) != 1 || len(got.DashAudio) != 1 {
+					t.Fatalf("dash enabled: dashCalls=%d got=%+v", dashCalls.Load(), got)
+				}
+			} else {
+				if dashCalls.Load() != 0 || len(got.DashVideo) != 0 || len(got.DashAudio) != 0 {
+					t.Fatalf("dash disabled: dashCalls=%d got=%+v", dashCalls.Load(), got)
+				}
+			}
+		})
+
+		t.Run("pull-worker/"+modeName, func(t *testing.T) {
+			var playCalls, dashCalls atomic.Int32
+			shExec := resolveExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-play":
+					playCalls.Add(1)
+					return fetch.Response{StatusCode: http.StatusOK, Body: durlOnlyBody}, nil
+				case "bilibili-play-dash":
+					dashCalls.Add(1)
+					return fetch.Response{StatusCode: http.StatusOK, Body: dashOnlyBody}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			broker, err := NewPullBroker(wireToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			broker.WithBilibili(true)
+			broker.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+			}
+			srv := httptest.NewTLSServer(broker)
+			defer srv.Close()
+
+			worker, err := NewPullWorkerWithDetail(origin, wireToken, controlTransportForTLS(srv, origin), shExec, noopProbe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if worker.BilibiliDASHEnabled() {
+				t.Fatal("NewPullWorkerWithDetail must default BilibiliDASHEnabled to false")
+			}
+			if _, err := worker.WithWorkers(1); err != nil {
+				t.Fatal(err)
+			}
+			if enableDASH {
+				worker.WithBilibiliDASH(true)
+			}
+			if worker.BilibiliDASHEnabled() != enableDASH {
+				t.Fatalf("worker.BilibiliDASHEnabled() = %v, want %v", worker.BilibiliDASHEnabled(), enableDASH)
+			}
+
+			wCtx, wCancel := context.WithCancel(t.Context())
+			defer wCancel()
+			wDone := make(chan error, 1)
+			go func() { wDone <- worker.Run(wCtx) }()
+			waitForPullCount(t, broker, 1)
+
+			got, err := broker.ResolveBilibili(t.Context(), biliTestBVID, biliTestCID)
+			if err != nil {
+				t.Fatalf("ResolveBilibili failed: %v", err)
+			}
+			wCancel()
+			<-wDone
+
+			if playCalls.Load() != 1 {
+				t.Fatalf("playCalls = %d, want 1", playCalls.Load())
+			}
+			if enableDASH {
+				if dashCalls.Load() != 1 || len(got.DashVideo) != 1 || len(got.DashAudio) != 1 {
+					t.Fatalf("dash enabled: dashCalls=%d got=%+v", dashCalls.Load(), got)
+				}
+			} else {
+				if dashCalls.Load() != 0 || len(got.DashVideo) != 0 || len(got.DashAudio) != 0 {
+					t.Fatalf("dash disabled: dashCalls=%d got=%+v", dashCalls.Load(), got)
+				}
+			}
+		})
+	}
+}

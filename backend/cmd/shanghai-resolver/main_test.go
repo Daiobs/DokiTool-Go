@@ -385,3 +385,112 @@ func TestDirectModeGracefulShutdownTimeoutAndDrain(t *testing.T) {
 		t.Fatalf("serveDirect returned error after draining in-flight request: %v", err)
 	}
 }
+
+func TestBilibiliDASHSwitchValidationAndStartupWiring(t *testing.T) {
+	validCases := []struct {
+		raw  string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"FALSE", false},
+		{"f", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{"t", true},
+	}
+	for _, tc := range validCases {
+		got, err := parseBilibiliDASH(func(k string) string {
+			if k == "DOKITOOL_BILIBILI_DASH" {
+				return tc.raw
+			}
+			return ""
+		})
+		if err != nil || got != tc.want {
+			t.Fatalf("parseBilibiliDASH(%q) = (%v, %v), want (%v, nil)", tc.raw, got, err, tc.want)
+		}
+	}
+
+	for _, invalid := range []string{"yes_please", "2", "on", "off", "auto", " true", "true "} {
+		t.Setenv("DOKITOOL_BILIBILI_DASH", invalid)
+		t.Setenv("DOKITOOL_SHANGHAI_TOKEN", randomTestToken(t))
+		t.Setenv("DOKITOOL_SHANGHAI_PULL_TOKEN", randomTestToken(t))
+
+		// Direct mode: must fail BEFORE listener bind and never echo raw invalid value.
+		occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		directErr := runWithContext(context.Background(), []string{"-listen=" + occupied.Addr().String()}, io.Discard)
+		occupied.Close()
+		if directErr == nil || !strings.Contains(directErr.Error(), "DOKITOOL_BILIBILI_DASH must be a boolean") {
+			t.Fatalf("direct mode invalid %q: got err=%v, want DOKITOOL_BILIBILI_DASH boolean error", invalid, directErr)
+		}
+		if strings.Contains(directErr.Error(), invalid) {
+			t.Fatalf("direct mode error echoed raw invalid value %q: %v", invalid, directErr)
+		}
+
+		// Pull mode: must fail BEFORE starting pull loop and never echo raw invalid value.
+		pullErr := runWithContext(context.Background(), []string{"-pull-origin=https://japan.example.org"}, io.Discard)
+		if pullErr == nil || !strings.Contains(pullErr.Error(), "DOKITOOL_BILIBILI_DASH must be a boolean") {
+			t.Fatalf("pull mode invalid %q: got err=%v, want DOKITOOL_BILIBILI_DASH boolean error", invalid, pullErr)
+		}
+		if strings.Contains(pullErr.Error(), invalid) {
+			t.Fatalf("pull mode error echoed raw invalid value %q: %v", invalid, pullErr)
+		}
+	}
+
+	// Verify both pull mode and direct mode wire DOKITOOL_BILIBILI_DASH (default false, explicit true).
+	prevLogOut := log.Writer()
+	t.Cleanup(func() { log.SetOutput(prevLogOut) })
+
+	for _, tc := range []struct {
+		envVal string
+		want   string
+	}{
+		{"", "bilibili_dash=false"},
+		{"false", "bilibili_dash=false"},
+		{"true", "bilibili_dash=true"},
+	} {
+		t.Run("wiring/"+tc.envVal, func(t *testing.T) {
+			t.Setenv("DOKITOOL_BILIBILI_DASH", tc.envVal)
+			t.Setenv("DOKITOOL_SHANGHAI_PULL_TOKEN", randomTestToken(t))
+			t.Setenv("DOKITOOL_SHANGHAI_TOKEN", randomTestToken(t))
+
+			var pullLogs syncLogBuffer
+			log.SetOutput(&pullLogs)
+			pullCtx, cancelPull := context.WithCancel(context.Background())
+			cancelPull()
+			if err := runWithContext(pullCtx, []string{"-pull-origin=https://japan.example.org"}, io.Discard); err != nil {
+				t.Fatalf("pull mode failed: %v", err)
+			}
+			if !strings.Contains(pullLogs.String(), tc.want) {
+				t.Fatalf("pull log %q missing %q", pullLogs.String(), tc.want)
+			}
+
+			var directLogs syncLogBuffer
+			log.SetOutput(&directLogs)
+			directCtx, cancelDirect := context.WithCancel(context.Background())
+			directDone := make(chan error, 1)
+			go func() {
+				directDone <- runWithContext(directCtx, []string{"-listen=127.0.0.1:0"}, io.Discard)
+			}()
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if strings.Contains(directLogs.String(), "direct mode") {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			cancelDirect()
+			if err := <-directDone; err != nil {
+				t.Fatalf("direct mode failed: %v", err)
+			}
+			if !strings.Contains(directLogs.String(), tc.want) {
+				t.Fatalf("direct log %q missing %q", directLogs.String(), tc.want)
+			}
+		})
+	}
+}

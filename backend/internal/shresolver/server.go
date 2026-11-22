@@ -154,30 +154,48 @@ func (a bearerAuth) verifyHeader(values []string) bool {
 	return a.enabled && match
 }
 
-type server struct {
-	auth     bearerAuth
-	detail   fetch.Executor
-	bilibili fetch.Executor
-	probe    originalProbe
+// Server handles direct HTTPS Shanghai resolver requests (v1 and v2).
+// Parallel Bilibili DASH fetching defaults to disabled unless enabled via WithBilibiliDASH.
+type Server struct {
+	auth         bearerAuth
+	detail       fetch.Executor
+	bilibili     fetch.Executor
+	bilibiliDASH bool
+	probe        originalProbe
+}
+
+// WithBilibiliDASH enables or disables parallel Bilibili DASH playurl fetching on s.
+// Defaults to false so disabled deployments issue strictly the single html5 durl request.
+func (s *Server) WithBilibiliDASH(enabled bool) *Server {
+	if s == nil {
+		return nil
+	}
+	s.bilibiliDASH = enabled
+	return s
+}
+
+// BilibiliDASHEnabled reports whether s fetches Bilibili DASH playurl in parallel.
+func (s *Server) BilibiliDASHEnabled() bool {
+	return s != nil && s.bilibiliDASH
 }
 
 // NewHandler authorizes the legacy v1 video_id metadata-only endpoint; the
 // command binds to loopback behind a certificate-validating HTTPS ingress.
-func NewHandler(token string, p originalProbe) (http.Handler, error) {
+func NewHandler(token string, p originalProbe) (*Server, error) {
 	auth, err := newBearerAuth(token)
 	if err != nil || p == nil {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
-	return &server{auth: auth, probe: p}, nil
+	return &Server{auth: auth, probe: p}, nil
 }
 
 // NewHandlerWithDetail authorizes v1 (video_id) and v2 (Douyin aweme_id + Bilibili bvid/cid) requests.
-func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) (http.Handler, error) {
+func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) (*Server, error) {
 	auth, err := newBearerAuth(token)
 	if err != nil || detail == nil || p == nil {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
-	return &server{
+	return &Server{
 		auth:     auth,
 		detail:   detail,
 		bilibili: wrapBilibiliExecutor(detail),
@@ -186,12 +204,12 @@ func NewHandlerWithDetail(token string, detail fetch.Executor, p originalProbe) 
 }
 
 // NewHandlerWithExecutors authorizes v1/v2 requests with explicit Douyin detail and Bilibili executors.
-func NewHandlerWithExecutors(token string, detail, bilibiliExec fetch.Executor, p originalProbe) (http.Handler, error) {
+func NewHandlerWithExecutors(token string, detail, bilibiliExec fetch.Executor, p originalProbe) (*Server, error) {
 	auth, err := newBearerAuth(token)
 	if err != nil || p == nil || (detail == nil && bilibiliExec == nil) {
 		return nil, errors.New("missing or invalid Shanghai resolver configuration")
 	}
-	return &server{
+	return &Server{
 		auth:     auth,
 		detail:   detail,
 		bilibili: wrapBilibiliExecutor(bilibiliExec),
@@ -211,7 +229,7 @@ func ValidToken(token string) bool {
 	return true
 }
 
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if r.URL.EscapedPath() != Path || r.URL.RawQuery != "" {
 		http.NotFound(w, r)
@@ -276,7 +294,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			out, err := resolveBilibili(r.Context(), s.bilibili, req.BVID, req.CID)
+			out, err := resolveBilibili(r.Context(), s.bilibili, req.BVID, req.CID, s.bilibiliDASH)
 			if err != nil {
 				w.WriteHeader(http.StatusBadGateway)
 				return
@@ -291,7 +309,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func resolveBilibili(ctx context.Context, bilibiliExec fetch.Executor, bvid string, cid int64) (*bilibili.ShanghaiPlay, error) {
+func resolveBilibili(ctx context.Context, bilibiliExec fetch.Executor, bvid string, cid int64, enableDASH bool) (*bilibili.ShanghaiPlay, error) {
 	if bilibiliExec == nil {
 		return nil, errUnavailable
 	}
@@ -311,7 +329,9 @@ func resolveBilibili(ctx context.Context, bilibiliExec fetch.Executor, bvid stri
 	}
 	playCtx, cancel := context.WithTimeout(ctx, playBudget)
 	defer cancel()
-	return bilibili.FetchShanghaiPlay(playCtx, wrapBilibiliExecutor(bilibiliExec), bvid, cid)
+	return bilibili.FetchShanghaiPlayWithOptions(playCtx, wrapBilibiliExecutor(bilibiliExec), bvid, cid, bilibili.ShanghaiPlayOptions{
+		EnableDASH: enableDASH,
+	})
 }
 
 func resolveWork(ctx context.Context, detailExec fetch.Executor, p originalProbe, awemeID string) (WorkResponse, error) {

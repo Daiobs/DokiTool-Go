@@ -16,10 +16,15 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
+// defaultDASHGraceTimeout bounds how long Parse waits for the parallel DASH
+// playurl response once html5 durl has already returned a usable stream.
+const defaultDASHGraceTimeout = 2500 * time.Millisecond
+
 type Parser struct {
-	executor   fetch.Executor
-	shanghai   ShanghaiResolver
-	enableDASH bool
+	executor         fetch.Executor
+	shanghai         ShanghaiResolver
+	enableDASH       bool
+	dashGraceTimeout time.Duration
 }
 
 func New(executor fetch.Executor) *Parser { return &Parser{executor: executor} }
@@ -43,6 +48,24 @@ func (p *Parser) WithDASH(enabled bool) *Parser {
 	}
 	p.enableDASH = enabled
 	return p
+}
+
+// WithDASHGraceTimeout overrides the grace window for waiting on the parallel
+// DASH playurl response after html5 durl succeeds. Non-positive durations fall
+// back to defaultDASHGraceTimeout.
+func (p *Parser) WithDASHGraceTimeout(d time.Duration) *Parser {
+	if p == nil {
+		return nil
+	}
+	p.dashGraceTimeout = d
+	return p
+}
+
+func (p *Parser) effectiveDASHGraceTimeout() time.Duration {
+	if p != nil && p.dashGraceTimeout > 0 {
+		return p.dashGraceTimeout
+	}
+	return defaultDASHGraceTimeout
 }
 
 var partNumber = regexp.MustCompile(`^[1-9][0-9]{0,5}$`)
@@ -183,7 +206,11 @@ func (p *Parser) parseLegacyWithShanghai(parent context.Context, source string) 
 	}
 	playTimeout := remaining(ctx, 20*time.Second)
 	var dashCh chan object
+	var cancelDash context.CancelFunc
 	if p.enableDASH {
+		var dashCtx context.Context
+		dashCtx, cancelDash = context.WithCancel(ctx)
+		defer cancelDash()
 		dashCh = make(chan object, 1)
 		dashReq := dashPlayRequest(bvid, selected["cid"], playTimeout)
 		go func() {
@@ -196,19 +223,42 @@ func (p *Parser) parseLegacyWithShanghai(parent context.Context, source string) 
 					dashCh <- nil
 				}
 			}()
-			res := p.apiRequest(ctx, dashReq)
+			res := p.apiRequest(dashCtx, dashReq)
 			sent = true
 			dashCh <- res
 		}()
 	}
 	play := p.apiRequest(ctx, playRequest(bvid, selected["cid"], playTimeout))
+	if err := parent.Err(); err != nil {
+		shCall.abort()
+		return nil, nil, err
+	}
 	var dashPlay object
 	if dashCh != nil {
-		select {
-		case dashPlay = <-dashCh:
-		case <-parent.Done():
-			shCall.abort()
-			return nil, nil, parent.Err()
+		if hasUsableDURL(play) {
+			select {
+			case dashPlay = <-dashCh:
+			default:
+				graceTimer := time.NewTimer(p.effectiveDASHGraceTimeout())
+				defer graceTimer.Stop()
+				select {
+				case dashPlay = <-dashCh:
+				case <-graceTimer.C:
+					cancelDash()
+				case <-parent.Done():
+					cancelDash()
+					shCall.abort()
+					return nil, nil, parent.Err()
+				}
+			}
+		} else {
+			select {
+			case dashPlay = <-dashCh:
+			case <-parent.Done():
+				cancelDash()
+				shCall.abort()
+				return nil, nil, parent.Err()
+			}
 		}
 	}
 	if err := parent.Err(); err != nil {
@@ -337,6 +387,18 @@ func legacyError(code int64, message string) object {
 		contractCode = "UPSTREAM_INVALID_RESPONSE"
 	}
 	return unified.ContractError(contractCode, message, contractCode == "RATE_LIMITED" || contractCode == "UPSTREAM_TIMEOUT" || contractCode == "UPSTREAM_UNAVAILABLE")
+}
+
+func hasUsableDURL(play object) bool {
+	if play == nil || !strictInteger(play["code"], 0) {
+		return false
+	}
+	durl := unified.Slice(child(play, "data", "durl"))
+	if len(durl) == 0 {
+		return false
+	}
+	firstPart := unified.Map(durl[0])
+	return firstPart != nil && unified.MediaURL(firstPart["url"]) != ""
 }
 
 func mergeDASHPlay(play, dashPlay object) object {

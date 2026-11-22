@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -58,6 +59,10 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 	if *workers < shresolver.MinPullWorkers || *workers > shresolver.MaxPullWorkers {
 		return fmt.Errorf("workers must be between %d and %d", shresolver.MinPullWorkers, shresolver.MaxPullWorkers)
 	}
+	biliDASH, err := parseBilibiliDASH(os.Getenv)
+	if err != nil {
+		return err
+	}
 	p := probe.New(fetch.New(), douyin.AllowedMediaURL).WithTimeout(shresolver.ProbeTimeout)
 	var pull, serverOpt, workersOpt bool
 	flags.Visit(func(f *flag.Flag) {
@@ -84,9 +89,10 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 		if _, err = w.WithWorkers(*workers); err != nil {
 			return err
 		}
+		w.WithBilibiliDASH(biliDASH)
 		ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		log.Printf("shanghai-resolver: starting pull mode (version=%s, origin=%s, workers=%d)", version, *origin, *workers)
+		log.Printf("shanghai-resolver: starting pull mode (version=%s, origin=%s, workers=%d, bilibili_dash=%t)", version, *origin, *workers, biliDASH)
 		if err = w.Run(ctx); errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return nil
 		}
@@ -106,6 +112,7 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 	if err != nil {
 		return err
 	}
+	h.WithBilibiliDASH(biliDASH)
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -114,6 +121,18 @@ func runWithContext(parentCtx context.Context, args []string, stdout io.Writer) 
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return serveDirect(ctx, ln, h, *cert, *key)
+}
+
+func parseBilibiliDASH(getenv func(string) string) (bool, error) {
+	raw := getenv("DOKITOOL_BILIBILI_DASH")
+	if raw == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("DOKITOOL_BILIBILI_DASH must be a boolean")
+	}
+	return enabled, nil
 }
 
 var shutdownServer = (*http.Server).Shutdown
@@ -139,7 +158,11 @@ func serveDirect(ctx context.Context, ln net.Listener, h http.Handler, cert, key
 		}
 		done <- s.Serve(ln)
 	}()
-	log.Printf("shanghai-resolver: starting direct mode (version=%s, listen=%s, tls=%t)", version, ln.Addr().String(), cert != "")
+	biliDASH := false
+	if srv, ok := h.(*shresolver.Server); ok {
+		biliDASH = srv.BilibiliDASHEnabled()
+	}
+	log.Printf("shanghai-resolver: starting direct mode (version=%s, listen=%s, tls=%t, bilibili_dash=%t)", version, ln.Addr().String(), cert != "", biliDASH)
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {

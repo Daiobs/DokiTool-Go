@@ -35,13 +35,14 @@ var errPullAuth = errors.New("Shanghai pull credential rejected")
 // to MinPullWorkers..MaxPullWorkers). Only the pinned Japanese control endpoints
 // receive its bearer. Detail lookups and media probes use separate transports.
 type PullWorker struct {
-	origin   string
-	token    string
-	workers  int
-	control  fetch.Executor
-	detail   fetch.Executor
-	bilibili fetch.Executor
-	probe    originalProbe
+	origin       string
+	token        string
+	workers      int
+	control      fetch.Executor
+	detail       fetch.Executor
+	bilibili     fetch.Executor
+	bilibiliDASH bool
+	probe        originalProbe
 }
 
 func NewPullWorker(origin, token string, control fetch.Executor, p originalProbe) (*PullWorker, error) {
@@ -83,6 +84,21 @@ func (w *PullWorker) WithBilibili(exec fetch.Executor) *PullWorker {
 	}
 	w.bilibili = wrapBilibiliExecutor(exec)
 	return w
+}
+
+// WithBilibiliDASH enables or disables parallel Bilibili DASH playurl fetching on w.
+// Defaults to false so disabled deployments issue strictly the single html5 durl request.
+func (w *PullWorker) WithBilibiliDASH(enabled bool) *PullWorker {
+	if w == nil {
+		return nil
+	}
+	w.bilibiliDASH = enabled
+	return w
+}
+
+// BilibiliDASHEnabled reports whether w fetches Bilibili DASH playurl in parallel.
+func (w *PullWorker) BilibiliDASHEnabled() bool {
+	return w != nil && w.bilibiliDASH
 }
 
 // WithWorkers configures the number of concurrent pull lease loops within
@@ -214,7 +230,7 @@ func (w *PullWorker) runOnce(ctx context.Context) (bool, error) {
 			leaseBudget = min(remaining, BilibiliTimeout)
 			lease, cancel := context.WithTimeout(ctx, leaseBudget)
 			defer cancel()
-			out, playErr := resolveBilibili(lease, w.bilibili, job.BVID, job.CID)
+			out, playErr := resolveBilibili(lease, w.bilibili, job.BVID, job.CID, w.bilibiliDASH)
 			if err := lease.Err(); err != nil {
 				return true, err
 			}

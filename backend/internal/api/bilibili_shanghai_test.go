@@ -1069,9 +1069,10 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 	}
 
 	// At +35s (> 30s earliest-expiry TTL, even though < 60s default and < 180s max!): must expire and re-fetch!
+	// Default PullWorker keeps Bilibili DASH disabled (0 bilibili-play-dash calls).
 	h.advanceClock(15 * time.Second)
 	code, _ = h.doAPI(resolveURL, "198.51.100.10", "")
-	if code != http.StatusOK || jpPlayCalls.Load() != callsBeforeHit+1 || shPlayCalls.Load() != 3 || shDashCalls.Load() != 3 {
+	if code != http.StatusOK || jpPlayCalls.Load() != callsBeforeHit+1 || shPlayCalls.Load() != 3 || shDashCalls.Load() != 0 {
 		t.Fatalf("expected cache expiry at +35s (>30s earliest-expiry TTL), jpCalls=%d shPlayCalls=%d shDashCalls=%d", jpPlayCalls.Load(), shPlayCalls.Load(), shDashCalls.Load())
 	}
 
@@ -1198,5 +1199,217 @@ func TestBilibiliShanghaiDisabledDefaultWithUpgradedWorkerAndDouyinActive(t *tes
 	}
 	if snapFinal.Shanghai.ByPlatform.Bilibili.Hits != 0 || snapFinal.Shanghai.ByPlatform.Bilibili.Fallbacks != 0 {
 		t.Fatalf("Bilibili Shanghai counters must remain 0 after Douyin hit, got %+v", snapFinal.Shanghai.ByPlatform.Bilibili)
+	}
+}
+
+func TestBilibiliShanghaiDASHFlagConvergenceEndToEnd(t *testing.T) {
+	const (
+		bvid       = "BV1234567890"
+		cid  int64 = 4001
+	)
+	baseNow := time.Date(2026, 11, 15, 4, 0, 0, 0, time.UTC)
+	dl := baseNow.Unix() + 7200
+
+	shDURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/04/4001/4001-1-64.mp4?deadline=%d", dl)
+	jpDURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/04/4001/4001-1-64.mp4?deadline=%d", dl)
+	shVid80 := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/04/4001/4001-1-30080.m4s?deadline=%d", dl)
+	jpVid80 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/04/4001/4001-1-30080.m4s?deadline=%d", dl)
+	shAud := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/04/4001/4001-1-30280.m4s?deadline=%d", dl)
+	jpAud := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/04/4001/4001-1-30280.m4s?deadline=%d", dl)
+
+	cases := []struct {
+		name           string
+		japanDASH      bool
+		shanghaiDASH   bool
+		wantJPDASH     int64
+		wantSHDASH     int64
+		wantMuxVariant bool
+		wantSHInDASH   bool
+	}{
+		{"both-default-off", false, false, 0, 0, false, false},
+		{"shanghai-on-japan-off-ignores-dash", false, true, 0, 1, false, false},
+		{"both-enabled-merges-domestic-dash", true, true, 1, 1, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var jpDashCalls, shPlayCalls, shDashCalls atomic.Int64
+
+			jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-view":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: makeBilibiliViewJSON(bvid, cid)}, nil
+				case "bilibili-play":
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 64,
+							"format":  "mp4720",
+							"durl":    []map[string]any{{"url": jpDURL, "size": 2097152, "length": 60000}},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				case "bilibili-play-dash":
+					jpDashCalls.Add(1)
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 80,
+							"dash": map[string]any{
+								"video": []map[string]any{
+									{"id": 80, "codecid": 7, "codecs": "avc1.640028", "width": 1920, "height": 1080, "bandwidth": 2200000, "baseUrl": jpVid80},
+								},
+								"audio": []map[string]any{
+									{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "bandwidth": 192000, "baseUrl": jpAud},
+								},
+							},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected Japan purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			shExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-play":
+					shPlayCalls.Add(1)
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 64,
+							"durl":    []map[string]any{{"url": shDURL}},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				case "bilibili-play-dash":
+					shDashCalls.Add(1)
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 80,
+							"dash": map[string]any{
+								"video": []map[string]any{
+									{"id": 80, "codecid": 7, "codecs": "avc1.640028", "baseUrl": shVid80},
+								},
+								"audio": []map[string]any{
+									{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "baseUrl": shAud},
+								},
+							},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected Shanghai purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			h := newBilibiliShanghaiHarnessWithSwitch(t, baseNow, jpExec, nil, true)
+			if tc.japanDASH {
+				cat, err := catalog.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				adapters := map[string]Adapter{
+					"bilibili": bilibili.NewWithShanghai(jpExec, h.broker).WithDASH(true),
+				}
+				apiHandler, err := NewWithCacheConfig(cat, adapters, func() time.Time { return baseNow }, bilibili.PreparePublic, DefaultCacheConfig())
+				if err != nil {
+					t.Fatal(err)
+				}
+				apiHandler.Stats().SetShanghaiSource(h.broker)
+				admCfg := DefaultAdmissionConfig()
+				admCfg.Parse.ClientBurst = 100
+				admCfg.Parse.ClientRPS = 100
+				ownerAuth, err := NewOwnerAuth(h.ownerToken)
+				if err != nil {
+					t.Fatal(err)
+				}
+				router, err := WithAdmissionWithOwner(apiHandler, h.broker, "caddy", h.edgeKey, admCfg, ownerAuth)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.router = router
+			}
+
+			noopDouyin := fetchFunc(func(_ context.Context, _ fetch.Request) (fetch.Response, error) {
+				return fetch.Response{}, fmt.Errorf("unexpected douyin call")
+			})
+			worker, err := shresolver.NewPullWorkerWithDetail(
+				"https://japan.example",
+				h.pullToken,
+				handlerControlExecutor(h.router, h.edgeKey),
+				noopDouyin,
+				probe.New(noopDouyin, douyin.AllowedMediaURL),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, err = worker.WithWorkers(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker.WithBilibili(shExec).WithBilibiliDASH(tc.shanghaiDASH)
+			wCtx, wCancel := context.WithCancel(context.Background())
+			wDone := make(chan struct{})
+			go func() {
+				defer close(wDone)
+				_ = worker.Run(wCtx)
+			}()
+			t.Cleanup(func() {
+				wCancel()
+				<-wDone
+			})
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && h.broker.ShanghaiStatsSnapshot().WaitingWorkers == 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			code, payload := h.doAPI("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/"+bvid), "198.51.100.60", "")
+			if code != http.StatusOK {
+				t.Fatalf("status=%d payload=%v", code, payload)
+			}
+			if jpDashCalls.Load() != tc.wantJPDASH || shPlayCalls.Load() != 1 || shDashCalls.Load() != tc.wantSHDASH {
+				t.Fatalf("calls jpDash=%d shPlay=%d shDash=%d, want jpDash=%d shPlay=1 shDash=%d",
+					jpDashCalls.Load(), shPlayCalls.Load(), shDashCalls.Load(), tc.wantJPDASH, tc.wantSHDASH)
+			}
+
+			data := unified.Map(payload["data"])
+			item := unified.Map(unified.Slice(data["items"])[0])
+			variants := unified.Slice(item["variants"])
+			fileURLs := collectVariantSourceURLs(unified.Map(variants[0]))
+			if len(fileURLs) != 2 || fileURLs[0] != shDURL || fileURLs[1] != jpDURL {
+				t.Fatalf("durl sources = %v, want [%s, %s]", fileURLs, shDURL, jpDURL)
+			}
+
+			if !tc.wantMuxVariant {
+				if len(variants) != 1 || data["attachments"] != nil {
+					t.Fatalf("expected 0 DASH variants and 0 attachments when japanDASH=false, got variants=%d attachments=%v", len(variants), data["attachments"])
+				}
+				encoded, _ := unified.Encode(payload)
+				if strings.Contains(string(encoded), shVid80) || strings.Contains(string(encoded), shAud) {
+					t.Fatalf("Shanghai DASH URLs leaked into response when japanDASH=false: %s", string(encoded))
+				}
+			} else {
+				if len(variants) != 2 || unified.Str(unified.Map(variants[1])["id"]) != "dash-80-avc" {
+					t.Fatalf("expected [durl, dash-80-avc], got %v", variants)
+				}
+				muxRes := unified.Slice(unified.Map(unified.Map(variants[1])["delivery"])["resources"])
+				vidSrcs := unified.Slice(unified.Map(unified.Map(muxRes[0])["delivery"])["sources"])
+				audSrcs := unified.Slice(unified.Map(unified.Map(muxRes[1])["delivery"])["sources"])
+				if tc.wantSHInDASH {
+					if len(vidSrcs) != 2 || unified.Str(unified.Map(vidSrcs[0])["url"]) != shVid80 || unified.Str(unified.Map(vidSrcs[1])["url"]) != jpVid80 {
+						t.Fatalf("unexpected merged DASH video sources: %v", vidSrcs)
+					}
+					if len(audSrcs) != 2 || unified.Str(unified.Map(audSrcs[0])["url"]) != shAud || unified.Str(unified.Map(audSrcs[1])["url"]) != jpAud {
+						t.Fatalf("unexpected merged DASH audio sources: %v", audSrcs)
+					}
+				}
+				if len(unified.Slice(data["attachments"])) != 1 {
+					t.Fatalf("expected 1 audio attachment, got %v", data["attachments"])
+				}
+			}
+		})
 	}
 }

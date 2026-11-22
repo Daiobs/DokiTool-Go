@@ -29,6 +29,11 @@ const (
 	// playurl fetch, and cross-border control-plane RTT).
 	ShanghaiTotalBudget = 3000 * time.Millisecond
 
+	// defaultShanghaiDASHGraceTimeout bounds how long Shanghai waits for the parallel
+	// domestic DASH playurl response once domestic html5 durl has returned valid pieces.
+	// Fits cleanly inside ShanghaiPlayTimeout (2.5s).
+	defaultShanghaiDASHGraceTimeout = 1200 * time.Millisecond
+
 	MaxShanghaiDURLPieces = 64
 	MaxShanghaiDashTracks = 32
 	MaxShanghaiTrackURLs  = 8
@@ -504,114 +509,202 @@ func ValidateShanghaiMediaURL(raw string, requireDeadline bool) (int64, bool) {
 	return exp, ok
 }
 
-// FetchShanghaiPlay queries Bilibili's official non-VIP playurl endpoints
-// (html5 durl and DASH try_look=1) in parallel for (bvid, cid) without cookies,
-// validates every candidate URL against https://*.bilivideo.com (prioritizing
-// upos-*.bilivideo.com and discarding any non-conforming URL), and returns the
-// bounded domestic stream set. Partial failure is tolerated when at least one
-// validated domestic route is obtained.
+// ShanghaiPlayOptions configures optional behavior for FetchShanghaiPlayWithOptions.
+// Zero values preserve the default single-request html5 durl fetch (EnableDASH: false).
+type ShanghaiPlayOptions struct {
+	EnableDASH       bool
+	DASHGraceTimeout time.Duration
+}
+
+func (o ShanghaiPlayOptions) effectiveDASHGraceTimeout() time.Duration {
+	if o.DASHGraceTimeout > 0 {
+		return o.DASHGraceTimeout
+	}
+	return defaultShanghaiDASHGraceTimeout
+}
+
+type shanghaiPlayFetchResult struct {
+	data object
+	err  error
+}
+
+// FetchShanghaiPlay queries Bilibili's official non-VIP html5 playurl endpoint
+// for (bvid, cid) without cookies, validates every candidate URL against
+// https://*.bilivideo.com, and returns the bounded domestic stream set.
+// Parallel DASH fetching defaults to disabled; use FetchShanghaiPlayWithOptions
+// to opt in.
 func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string, cid int64) (*ShanghaiPlay, error) {
+	return FetchShanghaiPlayWithOptions(ctx, executor, bvid, cid, ShanghaiPlayOptions{})
+}
+
+// FetchShanghaiPlayWithOptions queries Bilibili's official non-VIP playurl
+// endpoints for (bvid, cid) without cookies, validates every candidate URL
+// against https://*.bilivideo.com (prioritizing upos-*.bilivideo.com for DASH
+// and discarding any non-conforming URL), and returns the bounded domestic
+// stream set. When opts.EnableDASH is false, strictly the single html5 durl
+// request is issued. When opts.EnableDASH is true, html5 durl and DASH
+// try_look=1 run in parallel with a bounded grace timeout once domestic durl
+// succeeds; partial failure is tolerated when at least one validated domestic
+// route is obtained.
+func FetchShanghaiPlayWithOptions(ctx context.Context, executor fetch.Executor, bvid string, cid int64, opts ShanghaiPlayOptions) (*ShanghaiPlay, error) {
 	if executor == nil || !ValidBVID(bvid) || !ValidCID(cid) {
 		return nil, errInvalidShanghaiInput
 	}
-	if err := ctx.Err(); err != nil {
+	timeout, err := shanghaiPlayBudget(ctx)
+	if err != nil {
 		return nil, err
+	}
+
+	durlRes, dashRes, durlQuality, durlPieces, err := fetchShanghaiPlayStreams(ctx, executor, bvid, cid, timeout, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	out := &ShanghaiPlay{
+		BVID:        bvid,
+		CID:         cid,
+		DURLQuality: durlQuality,
+		DURLPieces:  durlPieces,
+	}
+	out.DashVideo, out.DashAudio = extractShanghaiDashStreams(dashRes, durlRes)
+
+	if !out.HasAnyRoute() {
+		if durlRes.err != nil && (!opts.EnableDASH || dashRes.err != nil) {
+			return nil, durlRes.err
+		}
+		return nil, errShanghaiPlayFailed
+	}
+	return out, nil
+}
+
+func shanghaiPlayBudget(ctx context.Context) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	timeout := ShanghaiPlayTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		rem := time.Until(deadline)
 		if rem <= 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return 0, err
 			}
-			return nil, context.DeadlineExceeded
+			return 0, context.DeadlineExceeded
 		}
 		if rem < timeout {
 			timeout = rem
 		}
 	}
+	return timeout, nil
+}
 
-	type playFetchResult struct {
-		data object
-		err  error
-	}
-	dashCh := make(chan playFetchResult, 1)
-	dashReq := dashPlayRequest(bvid, cid, timeout)
-	go func() {
-		sent := false
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				log.Printf("bilibili: shanghai dash fetch goroutine panic recovered: panic_type=%T", recovered)
-			}
-			if !sent {
-				dashCh <- playFetchResult{err: errShanghaiPlayFailed}
-			}
+func fetchShanghaiPlayStreams(
+	ctx context.Context,
+	executor fetch.Executor,
+	bvid string,
+	cid int64,
+	timeout time.Duration,
+	opts ShanghaiPlayOptions,
+) (durlRes, dashRes shanghaiPlayFetchResult, durlQuality int64, durlPieces []ShanghaiDURLPiece, err error) {
+	var dashCh chan shanghaiPlayFetchResult
+	var cancelDash context.CancelFunc
+	if opts.EnableDASH {
+		var dashCtx context.Context
+		dashCtx, cancelDash = context.WithCancel(ctx)
+		defer cancelDash()
+		dashCh = make(chan shanghaiPlayFetchResult, 1)
+		dashReq := dashPlayRequest(bvid, cid, timeout)
+		go func() {
+			sent := false
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("bilibili: shanghai dash fetch goroutine panic recovered: panic_type=%T", recovered)
+				}
+				if !sent {
+					dashCh <- shanghaiPlayFetchResult{err: errShanghaiPlayFailed}
+				}
+			}()
+			data, dashErr := fetchShanghaiPlayData(dashCtx, executor, dashReq)
+			sent = true
+			dashCh <- shanghaiPlayFetchResult{data: data, err: dashErr}
 		}()
-		data, err := fetchShanghaiPlayData(ctx, executor, dashReq)
-		sent = true
-		dashCh <- playFetchResult{data: data, err: err}
-	}()
+	}
 
 	durlData, durlErr := fetchShanghaiPlayData(ctx, executor, playRequest(bvid, cid, timeout))
-	var dashRes playFetchResult
-	select {
-	case dashRes = <-dashCh:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return shanghaiPlayFetchResult{}, shanghaiPlayFetchResult{}, 0, nil, err
 	}
-
-	out := &ShanghaiPlay{
-		BVID: bvid,
-		CID:  cid,
-	}
-
+	durlRes = shanghaiPlayFetchResult{data: durlData, err: durlErr}
 	if durlErr == nil && len(durlData) > 0 {
-		rawDURL := unified.Slice(durlData["durl"])
-		qn := intValue(durlData["quality"])
-		if len(rawDURL) > 0 && len(rawDURL) <= MaxShanghaiDURLPieces && qn > 0 && strictInteger(durlData["quality"], qn) {
-			pieces := make([]ShanghaiDURLPiece, 0, len(rawDURL))
-			allPiecesValid := true
-			for _, entry := range rawDURL {
-				part := unified.Map(entry)
-				if part == nil {
-					allPiecesValid = false
-					break
+		durlQuality, durlPieces = extractShanghaiDURLPieces(durlData)
+	}
+
+	if dashCh != nil {
+		if len(durlPieces) > 0 {
+			select {
+			case dashRes = <-dashCh:
+			default:
+				graceTimer := time.NewTimer(opts.effectiveDASHGraceTimeout())
+				defer graceTimer.Stop()
+				select {
+				case dashRes = <-dashCh:
+				case <-graceTimer.C:
+					cancelDash()
+					dashRes = shanghaiPlayFetchResult{err: context.DeadlineExceeded}
+				case <-ctx.Done():
+					cancelDash()
+					return shanghaiPlayFetchResult{}, shanghaiPlayFetchResult{}, 0, nil, ctx.Err()
 				}
-				urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]), false)
-				if len(urls) == 0 {
-					allPiecesValid = false
-					break
-				}
-				pieces = append(pieces, ShanghaiDURLPiece{URLs: urls})
 			}
-			if allPiecesValid && len(pieces) == len(rawDURL) {
-				out.DURLQuality = qn
-				out.DURLPieces = pieces
+		} else {
+			select {
+			case dashRes = <-dashCh:
+			case <-ctx.Done():
+				cancelDash()
+				return shanghaiPlayFetchResult{}, shanghaiPlayFetchResult{}, 0, nil, ctx.Err()
 			}
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return shanghaiPlayFetchResult{}, shanghaiPlayFetchResult{}, 0, nil, err
+	}
+	return durlRes, dashRes, durlQuality, durlPieces, nil
+}
+
+func extractShanghaiDURLPieces(durlData object) (int64, []ShanghaiDURLPiece) {
+	rawDURL := unified.Slice(durlData["durl"])
+	qn := intValue(durlData["quality"])
+	if len(rawDURL) == 0 || len(rawDURL) > MaxShanghaiDURLPieces || qn <= 0 || !strictInteger(durlData["quality"], qn) {
+		return 0, nil
+	}
+	pieces := make([]ShanghaiDURLPiece, 0, len(rawDURL))
+	for _, entry := range rawDURL {
+		part := unified.Map(entry)
+		if part == nil {
+			return 0, nil
+		}
+		urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]), false)
+		if len(urls) == 0 {
+			return 0, nil
+		}
+		pieces = append(pieces, ShanghaiDURLPiece{URLs: urls})
+	}
+	return qn, pieces
+}
+
+func extractShanghaiDashStreams(dashRes, durlRes shanghaiPlayFetchResult) ([]ShanghaiDashTrack, []ShanghaiDashTrack) {
+	var video, audio []ShanghaiDashTrack
 	if dashRes.err == nil && len(dashRes.data) > 0 {
-		out.DashVideo = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "video")))
-		out.DashAudio = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "audio")))
+		video = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "video")))
+		audio = extractShanghaiDashTracks(unified.Slice(child(dashRes.data, "dash", "audio")))
 	}
-	if len(out.DashVideo) == 0 && durlErr == nil && len(durlData) > 0 {
-		out.DashVideo = extractShanghaiDashTracks(unified.Slice(child(durlData, "dash", "video")))
+	if len(video) == 0 && durlRes.err == nil && len(durlRes.data) > 0 {
+		video = extractShanghaiDashTracks(unified.Slice(child(durlRes.data, "dash", "video")))
 	}
-	if len(out.DashAudio) == 0 && durlErr == nil && len(durlData) > 0 {
-		out.DashAudio = extractShanghaiDashTracks(unified.Slice(child(durlData, "dash", "audio")))
+	if len(audio) == 0 && durlRes.err == nil && len(durlRes.data) > 0 {
+		audio = extractShanghaiDashTracks(unified.Slice(child(durlRes.data, "dash", "audio")))
 	}
-
-	if !out.HasAnyRoute() {
-		if durlErr != nil && dashRes.err != nil {
-			return nil, durlErr
-		}
-		return nil, errShanghaiPlayFailed
-	}
-	return out, nil
+	return video, audio
 }
 
 func fetchShanghaiPlayData(ctx context.Context, executor fetch.Executor, req fetch.Request) (object, error) {

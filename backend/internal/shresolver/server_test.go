@@ -187,7 +187,7 @@ func TestBearerAuthDigestComparisonAndFailClosed(t *testing.T) {
 		t.Fatalf("unexpected zero bearerAuth formatting: %q / %q", zeroAuth.String(), zeroAuth.GoString())
 	}
 
-	var zeroServer server
+	var zeroServer Server
 	zw := httptest.NewRecorder()
 	zr := httptest.NewRequest(http.MethodPost, Path, strings.NewReader(`{"video_id":"v0200fg10000d9umdsfog65tds1f8o0g"}`))
 	zr.Header.Set("Authorization", "Bearer ")
