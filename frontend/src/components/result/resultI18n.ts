@@ -73,6 +73,19 @@ const content: Record<string, Record<string, string>> = {
     noBackups: "暂无备用画质",
     selectQuality: "选择画质",
     selectQualityFirst: "请先选择画质",
+    biliDashTitle: "检测到更高画质 B 站 DASH（共 {count} 档）",
+    biliDashTitleOne: "检测到更高画质 B 站 DASH（共 1 档）",
+    biliDashUpTo: "最高 {res}",
+    biliDashHint:
+      "网页版继续保留直连 MP4 即时预览与下载；安装 DokiTool Chrome 扩展即可零 Cookie 本地无损合流下载高码率 DASH。",
+    biliDashCta: "安装 Chrome 扩展无损下载",
+    biliDashBadge: "高码率 · 需 Chrome 扩展",
+    biliDashSummaryAll: "高码率 DASH 档位 · 需 Chrome 扩展 ({count})",
+    biliDashSummaryMixed: "其他版本 · 含高码率 DASH ({count})",
+    biliDashMuxExplain:
+      "该高码率 DASH 档位需附带 B 站来源头并本地无损合流，安装 DokiTool Chrome 扩展即可一键保存",
+    biliDashOpenGuide: "打开扩展安装指引",
+    biliDashMuxCap: "DASH 无损合流",
   },
   en: {
     resultTitle: "Result",
@@ -149,6 +162,19 @@ const content: Record<string, Record<string, string>> = {
     noBackups: "No backup qualities",
     selectQuality: "Select Quality",
     selectQualityFirst: "Select Quality First",
+    biliDashTitle: "Higher-Bitrate Bilibili DASH Available ({count} tiers)",
+    biliDashTitleOne: "Higher-Bitrate Bilibili DASH Available (1 tier)",
+    biliDashUpTo: "Up to {res}",
+    biliDashHint:
+      "Direct MP4 preview and download stay ready here. Install the DokiTool Chrome Extension for cookie-free local lossless DASH muxing.",
+    biliDashCta: "Get Chrome Extension for Lossless DASH",
+    biliDashBadge: "High-Bitrate · Chrome Ext",
+    biliDashSummaryAll: "High-Bitrate DASH · Chrome Extension ({count})",
+    biliDashSummaryMixed: "Other versions · incl. DASH ({count})",
+    biliDashMuxExplain:
+      "This high-bitrate DASH tier requires Bilibili referer headers and local lossless muxing. Install the DokiTool Chrome Extension to save it in one click.",
+    biliDashOpenGuide: "Open Extension Guide",
+    biliDashMuxCap: "DASH Lossless Mux",
   },
 };
 

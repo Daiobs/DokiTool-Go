@@ -31,12 +31,15 @@ const props = defineProps({
   showAllQualityVariants: Boolean,
   unavailableQualityReason: String,
   higherQualityNotice: Boolean,
+  isBilibili: Boolean,
+  bilibiliDashSummary: { type: Object, default: null },
 });
 
 const emit = defineEmits([
   "update:active-tab",
   "toggle-show-all-qualities",
   "select-quality",
+  "open-extension",
   "copy-text",
   "download-music",
   "mark-image-broken",
@@ -423,10 +426,13 @@ onUnmounted(() => {
         :show-all-quality-variants="showAllQualityVariants"
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
+        :is-bilibili="isBilibili"
+        :bilibili-dash-summary="bilibiliDashSummary"
         :display-variant-label="displayVariantLabel"
         :format-option-size="formatOptionSize"
         @select-quality="emit('select-quality', $event)"
         @toggle-show-all="emit('toggle-show-all-qualities')"
+        @open-extension="emit('open-extension')"
       />
 
       <div v-if="activeTab === 'tags'" class="rs-tab-panel">

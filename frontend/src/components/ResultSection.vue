@@ -25,6 +25,8 @@ import {
   formatHeaderReadyTitle,
   buildPlayerQualityTagText,
   resolvePrimaryDownloadCtaLabel,
+  extractBilibiliDashMuxVariants,
+  summarizeBilibiliDashMuxVariants,
 } from "./result/resultPresentation";
 
 const props = defineProps({
@@ -67,6 +69,7 @@ const emit = defineEmits([
   "install-youtube-helper",
   "refresh-youtube-helper-page",
   "prompt-select-quality",
+  "open-extension",
 ]);
 
 const context = { apiOrigin: apiConfig.baseUrl };
@@ -81,6 +84,13 @@ const markImageBroken = (raw) => {
 
 const currentItem = computed(() => props.selection?.currentVideo.value || null);
 const target = computed(() => props.selection?.currentTarget.value || null);
+const isBilibili = computed(() => props.resultData?.platform === "bilibili");
+const bilibiliDashMuxVariants = computed(() =>
+  extractBilibiliDashMuxVariants(props.resultData?.platform, currentItem.value),
+);
+const bilibiliDashSummary = computed(() =>
+  summarizeBilibiliDashMuxVariants(bilibiliDashMuxVariants.value),
+);
 const youtubeHelper = computed(() =>
   props.resultData?.platform === "youtube"
     ? props.resultData?.extra?.youtube_helper || null
@@ -644,11 +654,13 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :active-collection="activeCollection"
           :resolving-ids="resolvingIds"
           :selection="selection"
+          :bilibili-dash-summary="bilibiliDashSummary"
           @playback-error="updatePlaybackStatus($event, true)"
           @playback-loaded="updatePlaybackStatus($event, false)"
           @mark-image-broken="markImageBroken"
           @open-quality-picker="openQualityPicker(false)"
           @open-yt-helper-modal="openYtHelperModal"
+          @open-extension="emit('open-extension')"
           @refresh-item="emit('refresh-item', $event)"
           @primary-download="handlePrimaryDownloadClick"
           @download-selected="emit('download-selected')"
@@ -718,10 +730,13 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         :show-all-quality-variants="showAllQualityVariants"
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
+        :is-bilibili="isBilibili"
+        :bilibili-dash-summary="bilibiliDashSummary"
         @toggle-show-all-qualities="
           showAllQualityVariants = !showAllQualityVariants
         "
         @select-quality="selectQuality"
+        @open-extension="emit('open-extension')"
         @copy-text="copyToClipboard"
         @download-music="emit('download-music', $event)"
         @mark-image-broken="markImageBroken"

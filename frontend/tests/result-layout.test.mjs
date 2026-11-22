@@ -484,3 +484,210 @@ test('quality selection badge shows 当前已选 / Selected across platforms and
     view.app.unmount();
   }
 });
+
+test('Bilibili DASH mux variants preserve durl default, surface Chrome extension guidance with specs, emit open-extension, and stay hidden on non-Bilibili platforms', async () => {
+  const durlUrl = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/durl-720p.mp4';
+  const biliAudioResource = {
+    id: 'audio',
+    role: 'audio',
+    metadata: { audio_codec: 'mp4a.40.2', audio_bitrate_bps: 203000, evidence: 'upstream' },
+    delivery: {
+      kind: 'file',
+      sources: [{ id: 'a-30280', url: 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/audio-30280.m4s' }],
+    },
+  };
+  const makeBiliMuxVariant = (id, codec, bitrate) => ({
+    id,
+    label: '1080p',
+    metadata: {
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      video_codec: codec,
+      video_bitrate_bps: bitrate,
+      audio_codec: 'mp4a.40.2',
+      audio_bitrate_bps: 203000,
+      has_audio: true,
+      container: 'mp4',
+      extension: 'mp4',
+      mime_type: 'video/mp4',
+      evidence: 'upstream',
+    },
+    delivery: {
+      kind: 'mux',
+      output: { container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+      resources: [
+        {
+          id: 'video',
+          role: 'video',
+          metadata: { width: 1920, height: 1080, fps: 30, video_codec: codec, video_bitrate_bps: bitrate, evidence: 'upstream' },
+          delivery: {
+            kind: 'file',
+            sources: [{ id: `v-${id}`, url: `https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/${id}.m4s` }],
+          },
+        },
+        structuredClone(biliAudioResource),
+      ],
+    },
+  });
+  const biliItem = {
+    id: 'BV1GJ411x7h7-p1',
+    type: 'video',
+    title: 'P1 高清测试',
+    duration_ms: 212000,
+    default: { variant_id: 'durl-720p', source_id: 's-durl', url: durlUrl },
+    variants: [
+      {
+        id: 'durl-720p',
+        label: '720p',
+        metadata: {
+          width: 1280,
+          height: 720,
+          video_codec: 'avc1.64001F',
+          audio_codec: 'mp4a.40.2',
+          has_audio: true,
+          container: 'mp4',
+          extension: 'mp4',
+          mime_type: 'video/mp4',
+          evidence: 'upstream',
+        },
+        delivery: { kind: 'file', sources: [{ id: 's-durl', url: durlUrl, size_bytes: 51900000 }] },
+      },
+      makeBiliMuxVariant('mux-1080p-avc', 'avc1.640032', 2630000),
+      makeBiliMuxVariant('mux-1080p-hevc', 'hev1.1.6.L120.90', 1850000),
+      makeBiliMuxVariant('mux-1080p-av1', 'av01.0.08M.08', 1520000),
+    ],
+    higher_quality_variants: [
+      { variant_id: 'mux-1080p-avc', requires: ['mux'] },
+      { variant_id: 'mux-1080p-hevc', requires: ['mux'] },
+      { variant_id: 'mux-1080p-av1', requires: ['mux'] },
+    ],
+  };
+  const biliData = {
+    platform: 'bilibili',
+    content_id: 'BV1GJ411x7h7',
+    title: 'B站高码率 DASH 测试作品',
+    source_url: 'https://www.bilibili.com/video/BV1GJ411x7h7',
+    items: [biliItem],
+    default_item_id: biliItem.id,
+    author: { name: 'UP主', id: '42' },
+  };
+
+  const view = await mount(biliData);
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  let openExtensionCalls = 0;
+  let downloadMainCalls = 0;
+  view.state.value = {
+    ...view.state.value,
+    onOpenExtension() { openExtensionCalls++; },
+    onDownloadMain() { downloadMainCalls++; },
+  };
+  await view.flush();
+
+  try {
+    // 1. durl remains active playable & downloadable default (zero regression)
+    assert.equal(view.state.value.selection.currentTarget.value.kind, 'file');
+    assert.equal(view.state.value.selection.currentTarget.value.url, durlUrl);
+    assert.equal(view.elements('rs-video')[0].props.src, durlUrl);
+    const primaryBtn = () => view.elements('rs-btn--primary')[0];
+    assert.equal(Boolean(primaryBtn().props.disabled), false);
+    assert.equal(textOf(primaryBtn()), '下载视频');
+    primaryBtn().props.onClick();
+    await view.flush();
+    assert.equal(downloadMainCalls, 1);
+
+    // 2. Bilibili DASH Chrome extension guidance card renders immediately with 1080p, H.264, HEVC, AV1, AAC
+    const callouts = view.elements('rs-bili-dash-callout');
+    assert.equal(callouts.length, 1);
+    const calloutText = textOf(callouts[0]);
+    for (const expected of ['3 档', '1080p', 'H.264', 'HEVC', 'AV1', 'AAC', '安装 Chrome 扩展无损下载']) {
+      assert.ok(calloutText.includes(expected), `expected callout to include ${expected}, got: ${calloutText}`);
+    }
+    const calloutCta = view.elements('rs-bili-dash-cta')[0];
+    assert.equal(calloutCta.props['data-bilibili-dash-extension-cta'], '');
+    calloutCta.props.onClick();
+    await view.flush();
+    assert.equal(openExtensionCalls, 1);
+    assert.equal(view.state.value.selection.currentTarget.value.url, durlUrl, 'extension CTA must never replace active durl default');
+
+    // 3. Quality tab shows guidance card, keeps durl active, and turns otherQualityOptions mux entries into friendly extension guidance
+    await view.tab('画质选项');
+    assert.equal(view.elements('rs-higher-quality-note').length, 0, 'Bilibili DASH card replaces generic unsupported notice');
+    const qualityCard = view.elements('rs-bili-dash-quality-card')[0];
+    assert.ok(qualityCard);
+    for (const expected of ['1080p', 'H.264', 'HEVC', 'AV1', 'AAC']) {
+      assert.ok(textOf(qualityCard).includes(expected));
+    }
+    view.elements('rs-bili-dash-quality-cta')[0].props.onClick();
+    await view.flush();
+    assert.equal(openExtensionCalls, 2);
+
+    assert.equal(view.elements('rs-backup-item').length, 1);
+    assert.ok(textOf(view.elements('rs-backup-item')[0]).includes('720p'));
+    const muxTriggers = view.elements('rs-bili-mux-trigger');
+    assert.equal(muxTriggers.length, 3);
+    assert.ok(textOf(muxTriggers[0]).includes('高码率 · 需 Chrome 扩展'));
+    assert.equal(view.elements('rs-bili-mux-guide').length, 1);
+    assert.ok(
+      textOf(view.elements('rs-bili-mux-guide')[0]).includes(
+        '该高码率 DASH 档位需附带 B 站来源头并本地无损合流，安装 DokiTool Chrome 扩展即可一键保存',
+      ),
+    );
+    assert.ok(!textOf(view.elements('rs-other-versions')[0]).includes('当前暂不支持'));
+
+    // Clicking a specific DASH mux tier opens inline guidance without altering active durl download target
+    muxTriggers[1].props.onClick();
+    await view.flush();
+    assert.equal(muxTriggers[1].props['aria-expanded'], true);
+    assert.equal(view.elements('rs-bili-mux-guide').length, 1);
+    assert.equal(view.state.value.selection.currentTarget.value.url, durlUrl);
+    assert.equal(Boolean(primaryBtn().props.disabled), false);
+    const guideBtn = view.elements('rs-bili-mux-guide-btn')[0];
+    assert.equal(textOf(guideBtn), '打开扩展安装指引');
+    guideBtn.props.onClick();
+    await view.flush();
+    assert.equal(openExtensionCalls, 3);
+
+    // 4. English locale renders English copy & specs cleanly
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    const enCalloutText = textOf(view.elements('rs-bili-dash-callout')[0]);
+    for (const expected of ['3 tiers', 'Up to 1080p', 'H.264 / HEVC / AV1', '+ AAC', 'Get Chrome Extension for Lossless DASH']) {
+      assert.ok(enCalloutText.includes(expected), `expected English callout to include ${expected}, got: ${enCalloutText}`);
+    }
+    assert.equal(textOf(view.elements('rs-bili-mux-guide-btn')[0]), 'Open Extension Guide');
+
+    // 5. Non-Bilibili platforms with mux variants must NOT show the Bilibili DASH banner or Bilibili mux guidance
+    const nonBiliData = { ...biliData, platform: 'douyin' };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonBiliData });
+    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: nonBiliData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(view.elements('rs-bili-dash-callout').length, 0);
+    await view.tab('画质选项');
+    assert.equal(view.elements('rs-bili-dash-quality-card').length, 0);
+    assert.equal(view.elements('rs-bili-mux-trigger').length, 0);
+    assert.equal(view.elements('rs-bili-mux-guide').length, 0);
+    assert.equal(view.elements('rs-higher-quality-note').length, 1);
+
+    // 6. Bilibili payload with only durl (no mux variants) does NOT show the Bilibili DASH banner
+    const durlOnlyBili = {
+      ...biliData,
+      items: [{ ...biliItem, variants: [biliItem.variants[0]], higher_quality_variants: undefined }],
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: durlOnlyBili });
+    view.state.value = { ...view.state.value, resultVersion: 3, resultData: durlOnlyBili };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(view.elements('rs-bili-dash-callout').length, 0);
+    await view.tab('画质选项');
+    assert.equal(view.elements('rs-bili-dash-quality-card').length, 0);
+
+    // 7. App.vue wires ResultSection @open-extension directly to lazy ExtensionDownloadModal state
+    const appSource = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8');
+    const resultTag = appSource.match(/<ResultSection[\s\S]*?\/>/)?.[0] || '';
+    assert.match(resultTag, /@open-extension="showExtensionModal\s*=\s*true"/);
+  } finally {
+    view.app.unmount();
+  }
+});
