@@ -569,6 +569,7 @@
     "frontend/src/extension/components/SidePanelHeader.vue",
     "frontend/src/extension/components/SidePanelResult.vue",
     "frontend/src/extension/components/SidePanelSettings.vue",
+    "frontend/src/extension/dashMuxEngine.ts",
     "frontend/src/extension/dnrRules.ts",
     "frontend/src/extension/extensionDownload.ts",
     "frontend/src/extension/filenameSanitizer.ts",

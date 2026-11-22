@@ -589,6 +589,7 @@
 !/frontend/src/extension/SidePanelApp.vue
 !/frontend/src/extension/background.ts
 !/frontend/src/extension/components/
+!/frontend/src/extension/dashMuxEngine.ts
 !/frontend/src/extension/dnrRules.ts
 !/frontend/src/extension/extensionDownload.ts
 !/frontend/src/extension/filenameSanitizer.ts
