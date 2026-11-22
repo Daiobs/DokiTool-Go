@@ -50,6 +50,7 @@ import {
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
+  isWhitelistedMediaUrl,
   validateApiBaseUrl,
   type ApiBaseUrlValidationResult,
 } from "./hostWhitelist";
@@ -504,6 +505,37 @@ export function buildExtraAllowedOrigins(apiOrigin: string): string[] | undefine
   return apiOrigin && apiOrigin !== PROD_API_ORIGIN ? [apiOrigin] : undefined;
 }
 
+/**
+ * Builds the extension's `TargetContext` with relay-direct opt-in strictly gated
+ * to built-in whitelisted HTTPS media CDN hosts (never trusting custom API origins
+ * or unwhitelisted hosts for `source.direct_url`).
+ */
+export function buildExtensionTargetContext(
+  apiOrigin?: string | null,
+  now?: number,
+): TargetContext {
+  const resolvedOrigin = resolveSafeApiOrigin(apiOrigin ?? undefined);
+  return {
+    apiOrigin: resolvedOrigin,
+    ...(now !== undefined ? { now } : {}),
+    preferRelayDirect: (directUrl: string) => {
+      try {
+        const parsed = new URL(directUrl);
+        if (parsed.protocol !== "https:") return false;
+        if (
+          parsed.origin === PROD_API_ORIGIN ||
+          parsed.origin === resolvedOrigin
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      return isWhitelistedMediaUrl(directUrl).allowed;
+    },
+  };
+}
+
 export function formatDurationMs(durationMs?: number): string {
   if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs <= 0) {
     return "";
@@ -815,7 +847,7 @@ export function findBestStandaloneAudioForYouTube(
   attachments: Attachment[],
   apiOrigin: string,
 ): { variantId: string; url: string; ext: "m4a" | "webm" } | null {
-  const ctx = { apiOrigin: resolveSafeApiOrigin(apiOrigin) };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const candidates: ReadyVariant[] = [];
   if (readyItem(item)) {
     for (const v of item.variants) {
@@ -920,7 +952,7 @@ export function isAttachmentApplicableToItem(
 function resolveItemScopedAudioAttachments(
   media: Pick<UnifiedMedia, "platform" | "attachments">,
   item: ReadyItem,
-  ctx: TargetContext & { apiOrigin: string },
+  ctx: TargetContext,
 ): Attachment[] {
   const scoped: Attachment[] = [];
   const seenPrimaryUrls = new Set<string>();
@@ -1004,9 +1036,7 @@ export function buildSidePanelQualityOptions(
   options?: { now?: number },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
-  const apiOrigin = resolveSafeApiOrigin(rawApiOrigin);
-  const ctx: TargetContext & { apiOrigin: string } =
-    options?.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
+  const ctx = buildExtensionTargetContext(rawApiOrigin, options?.now);
   const attachments = media.attachments ?? [];
   const isYouTube = media.platform === "youtube";
 
@@ -1669,7 +1699,7 @@ function buildSegmentsSpecFromDelivery(
   delivery: Extract<LeafDelivery, { kind: "segments" }>,
   apiOrigin: string,
 ): OffscreenSegmentSpec[] {
-  const ctx = { apiOrigin };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const chunks: Chunk[] = [
     ...(delivery.init ? [delivery.init] : []),
     ...delivery.pieces,
@@ -1790,12 +1820,13 @@ export function buildSpecFromOption(params: {
 }): OffscreenDownloadSpec {
   const { media, option, filename, refreshContext } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
   const refreshField = refreshContext ? { refreshContext } : {};
 
   if (option.muxPair) {
-    const videoUrl = sourceUrl(option.muxPair.videoSource, { apiOrigin });
-    const audioUrl = sourceUrl(option.muxPair.audioSource, { apiOrigin });
+    const videoUrl = sourceUrl(option.muxPair.videoSource, ctx);
+    const audioUrl = sourceUrl(option.muxPair.audioSource, ctx);
     const totalSize =
       parsePositiveSafeBytes(option.muxPair.videoSource.size_bytes) +
       parsePositiveSafeBytes(option.muxPair.audioSource.size_bytes);
@@ -1842,7 +1873,7 @@ export function buildSpecFromOption(params: {
   const delivery = option.variant.delivery;
 
   if (delivery.kind === "hls") {
-    const routes = deliveryRoutes(delivery.sources, { apiOrigin });
+    const routes = deliveryRoutes(delivery.sources, ctx);
     if (!routes.length) throw new Error("HLS 清单缺少可用来源");
     return {
       kind: "hls",
@@ -1944,7 +1975,7 @@ function buildLeafResourceSpec(params: {
 }): { spec: OffscreenDownloadSpec; ext: string; primaryUrl: string; sizeBytes?: number } {
   const { media, resource, filename } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
-  const ctx = { apiOrigin };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
   const delivery = resource.delivery;
 

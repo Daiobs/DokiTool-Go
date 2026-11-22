@@ -593,7 +593,7 @@ func runShanghaiWorkerLoop(
 		if upErr == nil && upResp != nil && upResp.StatusCode == http.StatusOK {
 			if job.TaskType == shresolver.TaskBilibili {
 				dl := time.Now().Unix() + 7200
-				shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/%d/%d-1-80.mp4?deadline=%d", job.CID, job.CID, dl)
+				shURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/%d/%d-1-80.mp4?deadline=%d", job.CID, job.CID, dl)
 				play := bilibili.ShanghaiPlay{
 					BVID:        job.BVID,
 					CID:         job.CID,

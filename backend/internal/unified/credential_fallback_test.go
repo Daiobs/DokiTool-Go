@@ -18,6 +18,30 @@ func TestCredentialFallbackSourceValidation(t *testing.T) {
 	}
 }
 
+func TestRelayDirectURLSourceValidation(t *testing.T) {
+	good := Object{
+		"url":        "/api/media/weibo?ticket=abc.def",
+		"access":     "relay",
+		"direct_url": "https://f.video.weibocdn.com/hd.mp4?token=1",
+	}
+	if err := ValidateSource(good, nil); err != nil {
+		t.Fatalf("valid relay direct_url rejected: %v", err)
+	}
+	for _, bad := range []Object{
+		{"url": "https://f.video.weibocdn.com/hd.mp4", "access": "direct", "direct_url": "https://f.video.weibocdn.com/hd.mp4"},
+		{"url": "https://f.video.weibocdn.com/hd.mp4", "direct_url": "https://f.video.weibocdn.com/hd.mp4"},
+		{"url": "/api/media/weibo?ticket=abc.def", "access": "relay", "direct_url": "http://f.video.weibocdn.com/hd.mp4"},
+		{"url": "/api/media/weibo?ticket=abc.def", "access": "relay", "direct_url": "https://f.video.weibocdn.com/hd.mp4#frag"},
+		{"url": "/api/media/weibo?ticket=abc.def", "access": "relay", "direct_url": "https://user:pass@f.video.weibocdn.com/hd.mp4"},
+		{"url": "/api/media/weibo?ticket=abc.def", "access": "relay", "direct_url": "/api/media/weibo?ticket=other"},
+		{"url": "/api/media/weibo?ticket=abc.def", "access": "relay", "direct_url": ""},
+	} {
+		if err := ValidateSource(bad, nil); err == nil {
+			t.Errorf("accepted invalid direct_url source: %#v", bad)
+		}
+	}
+}
+
 func TestSourceIdentityRenewalAcrossPlatforms(t *testing.T) {
 	const now int64 = 1762300800
 	yt1 := "https://rr2---sn-ogueln67.googlevideo.com/videoplayback?expire=1700000000&ei=AAA&ip=1.2.3.4&id=o-123&itag=18&source=youtube&clen=28523658&sig=SIG_OLD"

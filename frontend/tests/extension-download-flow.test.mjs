@@ -1,5 +1,6 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7065,6 +7066,7 @@ test("[M2 Part A] Mid-stream Range resume (206 + strict Content-Range) on direct
         routes: ["https://upos-sz-mirrorcos.bilivideo.com/direct-resumable.mp4"],
         filename: "direct-resumed.mp4",
         mimeType: "video/mp4",
+        sizeBytes: fullBytes.byteLength,
       });
       await executor.waitForIdle();
       assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
@@ -7304,6 +7306,7 @@ test("[M2 Part A] Mid-stream Range resume (206 + strict Content-Range) on direct
         routes: [`https://upos-sz-mirrorcos.bilivideo.com/${mode}.mp4`],
         filename: `${mode}.mp4`,
         mimeType: "video/mp4",
+        sizeBytes: fullBytes.byteLength,
       });
       await executor.waitForIdle();
       assert.equal(errors.length, 0, `${mode}: unexpected errors ${JSON.stringify(errors)}`);
@@ -7367,6 +7370,7 @@ test("[M2 Part A] Mid-stream Range resume (206 + strict Content-Range) on direct
         routes: ["https://upos-sz-mirrorcos.bilivideo.com/cancel-midstream.mp4"],
         filename: "cancelled-midstream.mp4",
         mimeType: "video/mp4",
+        sizeBytes: 4096,
       });
       await chunkEmitted;
       await new Promise((r) => setTimeout(r, 10));
@@ -8262,6 +8266,1526 @@ test("[M2 Part B] Expired signed URL auto re-parse refresh: pre-start expires_at
       assert.equal(fetchedUrls.includes(freshMotionUrl), false, "must NEVER download motion video into .jpg cover");
       assert.equal(fetchedUrls.includes(staleCoverUrl), false, "pre-start expiry must skip stale URL");
       assert.deepEqual(savedBlobs.get("DokiTool/001_cover.jpg"), jpegBytes);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      offscreenCtrl?.dispose();
+      bg.dispose();
+    }
+  }
+});
+
+// ============================================================================
+// [PR-A Item 4] Multi-Range Chunked Concurrent OPFS Transfer Tests
+// ============================================================================
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function makeDeterministicPayload(byteLength, seed = 17) {
+  const out = new Uint8Array(byteLength);
+  for (let i = 0; i < byteLength; i++) {
+    out[i] = ((i * 131 + (i >> 8) * 17 + seed) & 0xff);
+  }
+  return out;
+}
+
+function parseTestRangeHeader(raw) {
+  if (typeof raw !== "string") return null;
+  const m = /^bytes=(\d+)-(\d*)$/i.exec(raw.trim());
+  if (!m) return null;
+  const start = Number(m[1]);
+  const end = m[2] === "" ? null : Number(m[2]);
+  return { start, end };
+}
+
+function padMp4WithFreeBox(baseBytes, minTotalBytes) {
+  if (baseBytes.byteLength >= minTotalBytes) return baseBytes;
+  const padSize = Math.max(8, minTotalBytes - baseBytes.byteLength);
+  const out = new Uint8Array(baseBytes.byteLength + padSize);
+  out.set(baseBytes, 0);
+  const view = new DataView(out.buffer, baseBytes.byteLength, 8);
+  view.setUint32(0, padSize, false);
+  out[baseBytes.byteLength + 4] = 0x66; // 'f'
+  out[baseBytes.byteLength + 5] = 0x72; // 'r'
+  out[baseBytes.byteLength + 6] = 0x65; // 'e'
+  out[baseBytes.byteLength + 7] = 0x65; // 'e'
+  return out;
+}
+
+function makeTestOpfsSink(opfs) {
+  let seq = 0;
+  return async (taskId, _mimeType, tag) => {
+    const dir = await opfs.storage.getDirectory();
+    const name = `${protocol.EXTENSION_OPFS_TEMP_PREFIX}${tag ? `${tag}-` : ""}${taskId}-${++seq}.tmp`;
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    let closed = false;
+    let cleaned = false;
+    let queue = Promise.resolve();
+    const enqueue = (fn) => {
+      const task = queue.then(() => {
+        if (closed || cleaned) throw new Error("closed");
+        return fn();
+      });
+      queue = task.catch(() => {});
+      return task;
+    };
+    return {
+      tempName: name,
+      rawWritable: writable,
+      write(chunk) {
+        return enqueue(() => writable.write(chunk));
+      },
+      writeAt(position, chunk) {
+        return enqueue(() => writable.write({ type: "write", position, data: chunk }));
+      },
+      async closeAndGetBlob() {
+        await queue;
+        if (!closed) {
+          closed = true;
+          await writable.close();
+        }
+        return handle.getFile();
+      },
+      async cleanup() {
+        cleaned = true;
+        await queue.catch(() => {});
+        if (!closed) {
+          closed = true;
+          await writable.abort?.().catch(() => {});
+        }
+        await dir.removeEntry(name).catch(() => {});
+      },
+    };
+  };
+}
+
+test("[PR-A Item 4a] Multi-Range concurrent OPFS transfer: out-of-order chunk assembly, maxConcurrency clamping <= 4, realistic 20 MiB direct_file & in-memory fallback writeAt", async () => {
+  // 1) Unit matrix: unknown size, out-of-order chunk arrival, maxConcurrency=99 clamped to 4, monotonic progress, exact SHA-256
+  {
+    const payload = makeDeterministicPayload(16_384, 41); // 8 x 2 KiB chunks
+    const expectedSha = sha256Hex(payload);
+    const opfs = createMockOpfs();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const progressEvents = [];
+    const chunkRanges = [];
+
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "range-unit-ooo",
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/ooo.mp4"],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/ooo.mp4"],
+        filename: "ooo.mp4",
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 99, // must clamp to 4
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      onProgress(evt) {
+        progressEvents.push(evt);
+      },
+      fetchFn: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          assert.ok(parsed, "must send Range header");
+          const start = parsed.start;
+          const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+          chunkRanges.push([start, end]);
+          // Reverse delay for chunks 1..7 so later chunks arrive BEFORE earlier chunks
+          const chunkIdx = Math.floor(start / 2048);
+          const delayMs = chunkIdx === 0 ? 1 : Math.max(2, (8 - chunkIdx) * 8);
+          await new Promise((r) => setTimeout(r, delayMs));
+          const slice = payload.subarray(start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+    });
+
+    const blob = await result.sink.closeAndGetBlob();
+    const outBytes = new Uint8Array(await blob.arrayBuffer());
+    await result.sink.cleanup();
+
+    assert.equal(result.parallelUsed, true);
+    assert.equal(result.chunkCount, 8);
+    assert.equal(maxInFlight, 4, "maxConcurrency=99 must clamp strictly to 4");
+    assert.equal(sha256Hex(outBytes), expectedSha, "out-of-order parallel assembly SHA-256 mismatch");
+    assert.equal(opfs.files.size, 0);
+    // Verify monotonic progress ending at full byteLength
+    for (let i = 1; i < progressEvents.length; i++) {
+      assert.ok(
+        progressEvents[i].loaded >= progressEvents[i - 1].loaded,
+        `progress must be monotonic: ${progressEvents[i - 1].loaded} -> ${progressEvents[i].loaded}`,
+      );
+    }
+    assert.equal(progressEvents[progressEvents.length - 1].loaded, payload.byteLength);
+    assert.equal(progressEvents[progressEvents.length - 1].total, payload.byteLength);
+  }
+
+  // 2) Full executeDirectFile with realistic 20 MiB buffer (default 4 MiB chunks, 8 MiB threshold, unknown sizeBytes)
+  {
+    const payload = makeDeterministicPayload(20 * 1024 * 1024, 93);
+    const expectedSha = sha256Hex(payload);
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let handedBytes = null;
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          assert.ok(parsed, "20 MiB unknown-size direct_file must probe with Range");
+          const start = parsed.start;
+          const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+          // Hold parallel chunks briefly so all 4 workers overlap deterministically
+          await new Promise((r) => setTimeout(r, start === 0 ? 1 : 25));
+          const slice = payload.subarray(start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handedBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 401 };
+      },
+    });
+    try {
+      executor.startTask("direct-20mib-parallel", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://f.video.weibocdn.com/o0/large-20mib.mp4"],
+        filename: "large-20mib.mp4",
+        mimeType: "video/mp4",
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(maxInFlight, 4, "20 MiB direct_file must hit 4 concurrent Range workers");
+      assert.ok(handedBytes);
+      assert.equal(handedBytes.byteLength, payload.byteLength);
+      assert.equal(sha256Hex(handedBytes), expectedSha);
+      assert.equal(opfs.files.size, 0, "0 OPFS residue after 20 MiB parallel download");
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 3) Full executeDirectFile with in-memory fallback sink (opfsStorage: null) + out-of-order 12 MiB parallel writeAt
+  {
+    const payload = makeDeterministicPayload(12 * 1024 * 1024, 55);
+    const expectedSha = sha256Hex(payload);
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let handedBytes = null;
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          assert.ok(parsed);
+          const start = parsed.start;
+          const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+          // Chunk 2 arrives before Chunk 1!
+          await new Promise((r) => setTimeout(r, start === 0 ? 1 : start === 4 * 1024 * 1024 ? 30 : 5));
+          const slice = payload.subarray(start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+      opfsStorage: null,
+      webLocks: null,
+      urlApi,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handedBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({ taskId: msg.taskId, blobUrl: msg.blobUrl });
+        }, 0);
+        return { chromeDownloadId: 402 };
+      },
+    });
+    try {
+      executor.startTask("direct-12mib-mem-fallback", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://f.video.weibocdn.com/o0/mem-12mib.mp4"],
+        filename: "mem-12mib.mp4",
+        mimeType: "video/mp4",
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(maxInFlight, 2);
+      assert.equal(sha256Hex(handedBytes), expectedSha);
+    } finally {
+      executor.dispose();
+    }
+  }
+});
+
+test("[PR-A Item 4b & 4c] Probe fallbacks (200 OK zero-waste, 416, gzip 206, malformed 206), small 206 (< threshold), known-small skip, and sink-without-writeAt", async () => {
+  const baseSpec = {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://upos-sz-mirrorcos.bilivideo.com/probe-test.mp4"],
+    filename: "probe-test.mp4",
+  };
+
+  // 1) Server ignores Range and returns 200 OK -> zero-waste 1x stream (1 fetch total!)
+  {
+    const payload = makeDeterministicPayload(12_000, 11);
+    const opfs = createMockOpfs();
+    let calls = 0;
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "probe-200",
+      routes: baseSpec.routes,
+      spec: baseSpec,
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      fetchFn: async (_url, init) => {
+        calls += 1;
+        assert.equal(init?.headers?.Range, "bytes=0-2047");
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(payload.byteLength),
+          },
+        });
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(calls, 1, "200 OK probe must stream in 1 request with zero wasted bytes");
+    assert.equal(result.parallelUsed, false);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 2) 416, non-identity Content-Encoding (gzip), and malformed Content-Range (*) on probe -> clean plain GET 1x fallback
+  for (const mode of ["416", "gzip-206", "star-total-206"]) {
+    const payload = makeDeterministicPayload(10_000, 23);
+    const opfs = createMockOpfs();
+    const seenRanges = [];
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: `probe-fallback-${mode}`,
+      routes: baseSpec.routes,
+      spec: baseSpec,
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      fetchFn: async (_url, init) => {
+        const range = init?.headers?.Range ?? null;
+        seenRanges.push(range);
+        if (seenRanges.length === 1) {
+          assert.equal(range, "bytes=0-2047");
+          if (mode === "416") {
+            return new Response("Range Not Satisfiable", { status: 416 });
+          }
+          if (mode === "gzip-206") {
+            return new Response(payload.subarray(0, 2048), {
+              status: 206,
+              headers: {
+                "Content-Type": "video/mp4",
+                "Content-Encoding": "gzip",
+                "Content-Range": `bytes 0-2047/${payload.byteLength}`,
+              },
+            });
+          }
+          return new Response(payload.subarray(0, 2048), {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": "bytes 0-2047/*",
+            },
+          });
+        }
+        assert.equal(range, null, `${mode}: fallback plain GET must not send Range`);
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(payload.byteLength),
+          },
+        });
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.deepEqual(seenRanges, ["bytes=0-2047", null], `${mode}: expected probe then plain GET`);
+    assert.equal(result.parallelUsed, false);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 3) 206 probe with total < chunkSize -> finishes in 1 single request
+  {
+    const payload = makeDeterministicPayload(1500, 31);
+    const opfs = createMockOpfs();
+    let calls = 0;
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "probe-small-single",
+      routes: baseSpec.routes,
+      spec: baseSpec,
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 4096,
+      minParallelRangeBytes: 8192,
+      fetchFn: async (_url, init) => {
+        calls += 1;
+        assert.equal(init?.headers?.Range, "bytes=0-4095");
+        return new Response(payload, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Range": `bytes 0-${payload.byteLength - 1}/${payload.byteLength}`,
+            "Content-Length": String(payload.byteLength),
+          },
+        });
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(calls, 1);
+    assert.equal(result.parallelUsed, false);
+    assert.equal(result.chunkCount, 1);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 4) 206 probe with chunkSize < total < minParallelRangeBytes -> sequential 1x continuation, zero wasted bytes
+  {
+    const payload = makeDeterministicPayload(6144, 37);
+    const opfs = createMockOpfs();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const ranges = [];
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "probe-below-threshold",
+      routes: baseSpec.routes,
+      spec: baseSpec,
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 4096,
+      minParallelRangeBytes: 8192,
+      fetchFn: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          ranges.push(init?.headers?.Range);
+          const start = parsed.start;
+          const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+          await new Promise((r) => setTimeout(r, 5));
+          const slice = payload.subarray(start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(maxInFlight, 1, "total < minParallelRangeBytes must NOT fan out");
+    assert.equal(result.parallelUsed, false);
+    assert.deepEqual(ranges, ["bytes=0-4095", "bytes=4096-6143"]);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 5) Sink without writeAt gracefully stays sequential (maxInFlight === 1)
+  {
+    const payload = makeDeterministicPayload(12_288, 43);
+    const chunks = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "no-write-at",
+      routes: baseSpec.routes,
+      spec: baseSpec,
+      openOpfsSink: async () => ({
+        async write(chunk) {
+          chunks.push(chunk.slice());
+        },
+        async closeAndGetBlob() {
+          return new Blob(chunks);
+        },
+        async cleanup() {
+          chunks.length = 0;
+        },
+      }),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      fetchFn: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          const start = parsed.start;
+          const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+          await new Promise((r) => setTimeout(r, 5));
+          const slice = payload.subarray(start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(maxInFlight, 1);
+    assert.equal(result.parallelUsed, false);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+  }
+});
+
+test("[PR-A Item 4d] Mid-chunk drop + independent offset retry + backup route failover + Content-Range total mismatch rejection + application/json ISOBMFF sniff safety", async () => {
+  // 1) Mid-chunk drop -> retries from updated cursor -> backup #2 returns mismatched total (rejected permanently!) -> route #3 completes cleanly
+  {
+    const payload = makeDeterministicPayload(16_384, 71);
+    const expectedSha = sha256Hex(payload);
+    const opfs = createMockOpfs();
+    const r1 = "https://upos-sz-mirrorcos.bilivideo.com/r1.mp4";
+    const r2BadTotal = "https://upos-sz-mirrorali.bilivideo.com/r2-bad-total.mp4";
+    const r3GoodBackup = "https://upos-sz-mirrorhw.bilivideo.com/r3-good.mp4";
+    let droppedChunk2Once = false;
+    let badTotalHits = 0;
+    const chunk2Attempts = [];
+
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "chunk-retry-failover",
+      routes: [r1, r2BadTotal, r3GoodBackup],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: [r1, r2BadTotal, r3GoodBackup],
+        filename: "failover.mp4",
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      maxChunkRetries: 3,
+      fetchFn: async (url, init) => {
+        const s = String(url);
+        const parsed = parseTestRangeHeader(init?.headers?.Range);
+        const start = parsed.start;
+        const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+
+        // Chunk 2 spans [4096 .. 6143]
+        if (start >= 4096 && end === 6143) {
+          chunk2Attempts.push({ url: s, range: init?.headers?.Range });
+        }
+
+        if (s === r2BadTotal) {
+          badTotalHits += 1;
+          const corruptSlice = new Uint8Array(end - start + 1).fill(0xee);
+          return new Response(corruptSlice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              // Deliberate total mismatch -> MUST be rejected!
+              "Content-Range": `bytes ${start}-${end}/${payload.byteLength + 777}`,
+              "Content-Length": String(corruptSlice.byteLength),
+            },
+          });
+        }
+
+        if (s === r1 && start === 4096 && !droppedChunk2Once) {
+          droppedChunk2Once = true;
+          // Emit first 1024 bytes then drop mid-stream!
+          let emitted = false;
+          const stream = new ReadableStream({
+            pull(controller) {
+              if (!emitted) {
+                emitted = true;
+                controller.enqueue(payload.subarray(4096, 5120));
+                return;
+              }
+              controller.error(new TypeError("simulated chunk-2 mid-stream drop"));
+            },
+          });
+          return new Response(stream, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes 4096-6143/${payload.byteLength}`,
+              "Content-Length": "2048",
+            },
+          });
+        }
+
+        const slice = payload.subarray(start, end + 1);
+        return new Response(slice, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+            "Content-Length": String(slice.byteLength),
+          },
+        });
+      },
+    });
+
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(sha256Hex(out), expectedSha, "exact SHA-256 must match without any corruption from bad-total route");
+    assert.equal(badTotalHits, 1, "mismatched-total backup route must be rejected on first hit and not reused");
+    assert.deepEqual(
+      chunk2Attempts,
+      [
+        { url: r1, range: "bytes=4096-6143" },
+        { url: r2BadTotal, range: "bytes=5120-6143" },
+        { url: r3GoodBackup, range: "bytes=5120-6143" },
+      ],
+      "Chunk 2 must resume from updated cursor 5120, reject r2 bad total, and complete via r3",
+    );
+    assert.ok(result.resumedCount >= 2);
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 2) application/json ISOBMFF sniff safety on 206 probe:
+  //    2a) Fake JSON error body MUST fail on Chunk 0 BEFORE spawning ANY sibling workers!
+  {
+    const opfs = createMockOpfs();
+    let fetchCount = 0;
+    const jsonErr = new TextEncoder().encode('{"code":-403,"message":"fake error body padded to exceed 16 bytes"}');
+    await assert.rejects(
+      () =>
+        opfsStreamTransferMod.streamResumableRouteToOpfs({
+          taskId: "json-sniff-reject",
+          routes: ["https://upos-sz-mirrorhwo1.bilivideo.com/bad-json.m4s"],
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://upos-sz-mirrorhwo1.bilivideo.com/bad-json.m4s"],
+            filename: "bad.m4s",
+          },
+          openOpfsSink: makeTestOpfsSink(opfs),
+          signal: new AbortController().signal,
+          maxConcurrency: 4,
+          rangeChunkSizeBytes: 2048,
+          minParallelRangeBytes: 4096,
+          fetchFn: async () => {
+            fetchCount += 1;
+            return new Response(jsonErr, {
+              status: 206,
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Range": `bytes 0-${jsonErr.byteLength - 1}/16384`,
+                "Content-Length": String(jsonErr.byteLength),
+              },
+            });
+          },
+        }),
+      /非媒体错误页/,
+    );
+    assert.equal(fetchCount, 1, "must abort on Chunk 0 sniff failure with 0 sibling worker requests");
+    assert.equal(opfs.files.size, 0);
+  }
+
+  //    2b) Genuine ISO BMFF header labeled application/json (Huawei OBS quirk) succeeds in parallel!
+  {
+    const payload = makeDeterministicPayload(12_288, 88);
+    // Write a genuine `ftyp` box header at bytes 0..7
+    payload[0] = 0x00;
+    payload[1] = 0x00;
+    payload[2] = 0x00;
+    payload[3] = 0x18;
+    payload[4] = 0x66; // f
+    payload[5] = 0x74; // t
+    payload[6] = 0x79; // y
+    payload[7] = 0x70; // p
+    const opfs = createMockOpfs();
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "json-sniff-pass",
+      routes: ["https://upos-sz-mirrorhwo1.bilivideo.com/obs-good.m4s"],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorhwo1.bilivideo.com/obs-good.m4s"],
+        filename: "good.m4s",
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      fetchFn: async (_url, init) => {
+        const parsed = parseTestRangeHeader(init?.headers?.Range);
+        const start = parsed.start;
+        const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+        const slice = payload.subarray(start, end + 1);
+        return new Response(slice, {
+          status: 206,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+            "Content-Length": String(slice.byteLength),
+          },
+        });
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(result.parallelUsed, true);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+});
+
+test("[PR-A Item 4e & 4f] All-routes 403/410 expiry (probe & mid-transfer chunk), direct->/api/ failover without parallel fanout, and mid-parallel user cancel with 0 OPFS residue", async () => {
+  // 1) All routes return 403/410 on initial probe -> MEDIA_URL_EXPIRED, 0 OPFS residue
+  {
+    const opfs = createMockOpfs();
+    let err = null;
+    try {
+      await opfsStreamTransferMod.streamResumableRouteToOpfs({
+        taskId: "probe-all-403",
+        routes: [
+          "https://upos-sz-mirrorcos.bilivideo.com/exp1.mp4",
+          "https://upos-sz-mirrorali.bilivideo.com/exp2.mp4",
+        ],
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: [
+            "https://upos-sz-mirrorcos.bilivideo.com/exp1.mp4",
+            "https://upos-sz-mirrorali.bilivideo.com/exp2.mp4",
+          ],
+          filename: "exp.mp4",
+        },
+        openOpfsSink: makeTestOpfsSink(opfs),
+        signal: new AbortController().signal,
+        maxConcurrency: 4,
+        rangeChunkSizeBytes: 2048,
+        minParallelRangeBytes: 4096,
+        fetchFn: async (url) => {
+          const status = String(url).includes("exp1") ? 403 : 410;
+          return new Response("Expired", { status });
+        },
+      });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err);
+    assert.equal(err.code, "MEDIA_URL_EXPIRED");
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 2) Mid-transfer all-routes 403/410 -> immediately aborts sibling worker, 0 OPFS residue, throws MEDIA_URL_EXPIRED
+  {
+    const payload = makeDeterministicPayload(16_384, 99);
+    const opfs = createMockOpfs();
+    const r1 = "https://upos-sz-mirrorcos.bilivideo.com/mid-exp1.mp4";
+    const r2 = "https://upos-sz-mirrorali.bilivideo.com/mid-exp2.mp4";
+    let siblingAborted = false;
+    let err = null;
+    try {
+      await opfsStreamTransferMod.streamResumableRouteToOpfs({
+        taskId: "mid-chunk-all-403",
+        routes: [r1, r2],
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: [r1, r2],
+          filename: "mid-exp.mp4",
+        },
+        openOpfsSink: makeTestOpfsSink(opfs),
+        signal: new AbortController().signal,
+        maxConcurrency: 4,
+        rangeChunkSizeBytes: 2048,
+        minParallelRangeBytes: 4096,
+        fetchFn: async (url, init) => {
+          const s = String(url);
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          if (parsed.start === 0 && s === r1) {
+            return new Response(payload.subarray(0, 2048), {
+              status: 206,
+              headers: {
+                "Content-Type": "video/mp4",
+                "Content-Range": `bytes 0-2047/${payload.byteLength}`,
+                "Content-Length": "2048",
+              },
+            });
+          }
+          if (parsed.start === 4096) {
+            // Sibling chunk hangs until aborted by poolAbort!
+            return new Promise((_resolve, reject) => {
+              const onAbort = () => {
+                siblingAborted = true;
+                reject(new DOMException("Aborted", "AbortError"));
+              };
+              if (init?.signal?.aborted) onAbort();
+              else init?.signal?.addEventListener("abort", onAbort, { once: true });
+            });
+          }
+          // Chunk 1 hits 403 on r1 and 410 on r2 -> ALL routes expired!
+          await new Promise((r) => setTimeout(r, 10));
+          return new Response("Expired", { status: s === r1 ? 403 : 410 });
+        },
+      });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err);
+    assert.equal(err.code, "MEDIA_URL_EXPIRED");
+    assert.equal(siblingAborted, true, "sibling in-flight worker MUST be aborted immediately");
+    assert.equal(opfs.files.size, 0, "0 OPFS residue after mid-transfer expiry");
+  }
+
+  // 3) Direct CDN returns 403 mid-transfer while backup is /api/ relay -> NEVER fans out to /api/, fails over to /api/ at 1x!
+  {
+    const payload = makeDeterministicPayload(12_288, 61);
+    const opfs = createMockOpfs();
+    const directUrl = "https://f.video.weibocdn.com/o0/mid-403.mp4";
+    const relayUrl = "https://snap.dokitool.com/api/media/weibo?ticket=midfallback";
+    let relayInFlight = 0;
+    let relayMaxInFlight = 0;
+    const relayRanges = [];
+
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "direct-to-relay-failover",
+      routes: [directUrl, relayUrl],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: [directUrl, relayUrl],
+        filename: "weibo-mid-failover.mp4",
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 2048,
+      minParallelRangeBytes: 4096,
+      apiOrigin: "https://snap.dokitool.com",
+      fetchFn: async (url, init) => {
+        const s = String(url);
+        if (s === directUrl) {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          if (parsed?.start === 0) {
+            return new Response(payload.subarray(0, 2048), {
+              status: 206,
+              headers: {
+                "Content-Type": "video/mp4",
+                "Content-Range": `bytes 0-2047/${payload.byteLength}`,
+                "Content-Length": "2048",
+              },
+            });
+          }
+          return new Response("Forbidden", { status: 403 });
+        }
+        if (s === relayUrl) {
+          relayInFlight += 1;
+          relayMaxInFlight = Math.max(relayMaxInFlight, relayInFlight);
+          relayRanges.push(init?.headers?.Range ?? null);
+          try {
+            await new Promise((r) => setTimeout(r, 10));
+            return new Response(payload, {
+              status: 200,
+              headers: {
+                "Content-Type": "video/mp4",
+                "Content-Length": String(payload.byteLength),
+              },
+            });
+          } finally {
+            relayInFlight -= 1;
+          }
+        }
+        throw new Error(`Unexpected URL: ${s}`);
+      },
+    });
+    const out = new Uint8Array(await (await result.sink.closeAndGetBlob()).arrayBuffer());
+    await result.sink.cleanup();
+    assert.equal(relayMaxInFlight, 1, "/api/ relay fallback must NEVER run in parallel");
+    assert.deepEqual(relayRanges, [null], "/api/ relay fallback must use plain 1x GET");
+    assert.equal(result.route, relayUrl);
+    assert.equal(sha256Hex(out), sha256Hex(payload));
+    assert.equal(opfs.files.size, 0);
+  }
+
+  // 4) User cancel mid-parallel via executor.cancelTask -> aborts ALL parallel workers immediately, 0 OPFS residue
+  {
+    const payload = makeDeterministicPayload(20 * 1024 * 1024, 19);
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let parallelStarted = 0;
+    let parallelAborted = 0;
+    let allFourStartedResolve;
+    const allFourStarted = new Promise((r) => {
+      allFourStartedResolve = r;
+    });
+
+    const executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (_url, init) => {
+        const parsed = parseTestRangeHeader(init?.headers?.Range);
+        if (parsed?.start === 0) {
+          const end = Math.min(payload.byteLength - 1, parsed.end);
+          const slice = payload.subarray(0, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Range": `bytes 0-${end}/${payload.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        }
+        parallelStarted += 1;
+        if (parallelStarted === 4) {
+          allFourStartedResolve();
+        }
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => {
+            parallelAborted += 1;
+            reject(new DOMException("Aborted", "AbortError"));
+          };
+          if (init?.signal?.aborted) onAbort();
+          else init?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload() {
+        throw new Error("cancelled parallel task must not handoff");
+      },
+    });
+    try {
+      executor.startTask("cancel-mid-parallel", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://f.video.weibocdn.com/o0/cancel-20mib.mp4"],
+        filename: "cancel-20mib.mp4",
+        mimeType: "video/mp4",
+      });
+      await allFourStarted;
+      executor.cancelTask("cancel-mid-parallel");
+      await executor.waitForIdle();
+      assert.equal(parallelAborted, 4, "all 4 in-flight parallel workers MUST be aborted");
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].code, "USER_CANCELLED");
+      assert.equal(errors[0].cancelled, true);
+      assert.equal(opfs.files.size, 0, "0 OPFS residue after mid-parallel cancel");
+      assert.equal(executor.getActiveOpfsTempNames().size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+});
+
+test("[PR-A Item 4g & 4h] dash_mux concurrent video (<=3) + audio (<=1) with total <=4 and valid mediabunny MP4, plus same-origin /api/ relay strictly capped at 1x even >= 8 MiB", async () => {
+  // 1) dash_mux: 16 MiB video (Chunk 0 + 3 parallel chunks -> max 3) + 9 MiB audio (strictly capped at 1) -> combined <= 4, valid MP4!
+  {
+    const { videoBytes: rawVideo, audioBytes: rawAudio } =
+      await createSyntheticDashTrackBuffers("avc");
+    const videoBytes = padMp4WithFreeBox(rawVideo, 16 * 1024 * 1024);
+    const audioBytes = padMp4WithFreeBox(rawAudio, 9 * 1024 * 1024);
+    const opfs = createMockOpfs({ quota: 200 * 1024 * 1024 });
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let muxedMp4Bytes = null;
+
+    let videoInFlight = 0;
+    let videoMaxInFlight = 0;
+    let audioInFlight = 0;
+    let audioMaxInFlight = 0;
+    let totalInFlight = 0;
+    let totalMaxInFlight = 0;
+    const audioRangeHeaders = [];
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (url, init) => {
+        const s = String(url);
+        const isVideo = s.includes("dash-par-v.m4s");
+        const isAudio = s.includes("dash-par-a.m4s");
+        assert.ok(isVideo || isAudio, `Unexpected URL: ${s}`);
+        totalInFlight += 1;
+        totalMaxInFlight = Math.max(totalMaxInFlight, totalInFlight);
+        if (isVideo) {
+          videoInFlight += 1;
+          videoMaxInFlight = Math.max(videoMaxInFlight, videoInFlight);
+        } else {
+          audioInFlight += 1;
+          audioMaxInFlight = Math.max(audioMaxInFlight, audioInFlight);
+          if (init?.headers?.Range) audioRangeHeaders.push(init.headers.Range);
+        }
+
+        try {
+          const buf = isVideo ? videoBytes : audioBytes;
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          if (parsed) {
+            const start = parsed.start;
+            const end = Math.min(buf.byteLength - 1, parsed.end ?? buf.byteLength - 1);
+            // Stagger so video's 3 parallel workers + audio's 1 worker overlap cleanly
+            await new Promise((r) => setTimeout(r, start === 0 ? 1 : 35));
+            const slice = buf.subarray(start, end + 1);
+            return new Response(slice, {
+              status: 206,
+              headers: {
+                "Content-Type": isVideo ? "video/mp4" : "audio/mp4",
+                "Content-Range": `bytes ${start}-${end}/${buf.byteLength}`,
+                "Content-Length": String(slice.byteLength),
+              },
+            });
+          }
+          // Audio (maxConcurrency=1) receives plain GET without Range!
+          await new Promise((r) => setTimeout(r, 45));
+          return new Response(buf, {
+            status: 200,
+            headers: {
+              "Content-Type": isVideo ? "video/mp4" : "audio/mp4",
+              "Content-Length": String(buf.byteLength),
+            },
+          });
+        } finally {
+          totalInFlight -= 1;
+          if (isVideo) videoInFlight -= 1;
+          else audioInFlight -= 1;
+        }
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      progressThrottleMs: 0,
+      mediabunnyImpl: mediabunny,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        muxedMp4Bytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 405 };
+      },
+    });
+
+    try {
+      executor.startTask("dash-parallel-mux", {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/dash-par-v.m4s"],
+        filename: "dash-parallel.mp4",
+        mimeType: "video/mp4",
+        dashMux: {
+          videoRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/dash-par-v.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/dash-par-a.m4s"],
+          videoSize: videoBytes.byteLength,
+          audioSize: audioBytes.byteLength,
+          outputContainer: "mp4",
+        },
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(videoMaxInFlight, 3, "DASH video track must use up to 3 concurrent Range workers");
+      assert.equal(audioMaxInFlight, 1, "DASH audio track must stay strictly at 1 connection even >= 8 MiB");
+      assert.equal(audioRangeHeaders.length, 0, "DASH audio track (maxConcurrency=1) must not send initial Range probe");
+      assert.ok(
+        totalMaxInFlight <= 4,
+        `combined DASH in-flight connections must be <= 4 (got ${totalMaxInFlight})`,
+      );
+      assert.ok(muxedMp4Bytes && muxedMp4Bytes.byteLength > 0);
+
+      const parsed = new mediabunny.Input({
+        source: new mediabunny.BufferSource(muxedMp4Bytes),
+        formats: mediabunny.ALL_FORMATS,
+      });
+      try {
+        const vTrack = await parsed.getPrimaryVideoTrack();
+        const aTrack = await parsed.getPrimaryAudioTrack();
+        assert.ok(vTrack, "parallel-fetched DASH MP4 must contain valid video track");
+        assert.ok(aTrack, "parallel-fetched DASH MP4 must contain valid audio track");
+      } finally {
+        parsed.dispose?.();
+      }
+      assert.equal(opfs.files.size, 0, "0 OPFS residue after parallel dash_mux");
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 2) Same-origin /api/ relay route strictly capped at 1 connection even when size >= 8 MiB (12 MiB)
+  {
+    const payload = makeDeterministicPayload(12 * 1024 * 1024, 107);
+    const expectedSha = sha256Hex(payload);
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const errors = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let rangeHeaderCount = 0;
+    let handedBytes = null;
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        if (init?.headers?.Range) rangeHeaderCount += 1;
+        try {
+          await new Promise((r) => setTimeout(r, 10));
+          return new Response(payload, {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Length": String(payload.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handedBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 406 };
+      },
+    });
+    try {
+      executor.startTask("relay-12mib-cap-1x", {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://snap.dokitool.com/api/media/weibo?ticket=large12mib"],
+        filename: "weibo-relay-12mib.mp4",
+        mimeType: "video/mp4",
+        sizeBytes: payload.byteLength,
+      });
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.equal(maxInFlight, 1, "same-origin /api/ relay MUST be strictly capped at 1 connection");
+      assert.equal(rangeHeaderCount, 0, "same-origin /api/ relay MUST NOT probe Range for parallel fanout");
+      assert.equal(sha256Hex(handedBytes), expectedSha);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+});
+
+test("[PR-A Item 2] Extension Weibo anonymous relay direct_url: direct-first, 403/network fallback to /api/media/weibo, unwhitelisted direct_url ignored, and refreshSpecFromContext preserves [direct_url, relay_url]", async () => {
+  const apiOrigin = "https://snap.dokitool.com";
+  const directUrl = "https://f.video.weibocdn.com/o0/weibo-anon-direct.mp4?Expires=9999999999";
+  const relayPath = "/api/media/weibo?ticket=anon-ticket-1";
+  const relayFullUrl = `${apiOrigin}${relayPath}`;
+  const unwhitelistedDirectUrl = "https://evil.example.com/not-whitelisted.mp4";
+  const payload = makeDeterministicPayload(16_384, 123);
+  const expectedSha = sha256Hex(payload);
+
+  const makeWeiboRelayMedia = (sourceDirectUrl, ticketPath = relayPath) => ({
+    platform: "weibo",
+    content_id: "5123456789012345",
+    title: "微博匿名直连测试视频",
+    source_url: "https://weibo.com/123456/P12345678",
+    default_item_id: "wb-item-1",
+    items: [
+      {
+        id: "wb-item-1",
+        type: "video",
+        state: "ready",
+        title: "微博匿名直连测试视频",
+        source_url: "https://weibo.com/123456/P12345678",
+        default: {
+          variant_id: "wb-hd",
+          source_id: "wb-relay-src",
+          url: ticketPath,
+          access: "relay",
+        },
+        variants: [
+          {
+            id: "wb-hd",
+            state: "ready",
+            label: "1080P",
+            metadata: {
+              width: 1920,
+              height: 1080,
+              has_audio: true,
+              extension: "mp4",
+              mime_type: "video/mp4",
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "wb-relay-src",
+                  url: ticketPath,
+                  access: "relay",
+                  ...(sourceDirectUrl ? { direct_url: sourceDirectUrl } : {}),
+                  size_bytes: payload.byteLength,
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  // 1) buildEnqueueItemsForMedia puts whitelisted direct_url first, relay_url second;
+  //    executor connects directly to weibocdn.com first with 0 calls to /api/media/weibo
+  {
+    const items = extensionDownloadMod.buildEnqueueItemsForMedia(
+      makeWeiboRelayMedia(directUrl),
+      { apiOrigin },
+    );
+    assert.equal(items.length, 1);
+    assert.deepEqual(items[0].spec.routes, [directUrl, relayFullUrl]);
+
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const fetchedUrls = [];
+    const errors = [];
+    let handedBytes = null;
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (url) => {
+        const s = String(url);
+        fetchedUrls.push(s);
+        if (s === directUrl) {
+          return new Response(payload, {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Length": String(payload.byteLength),
+            },
+          });
+        }
+        throw new Error(`Relay must not be fetched when direct succeeds: ${s}`);
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handedBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 501 };
+      },
+    });
+    try {
+      executor.startTask("weibo-direct-ok", items[0].spec);
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+      assert.deepEqual(fetchedUrls, [directUrl]);
+      assert.equal(sha256Hex(handedBytes), expectedSha);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 2) Fallback from direct_url to /api/media/weibo on BOTH HTTP 403 and network drop
+  for (const failureMode of ["http-403", "network-drop"]) {
+    const items = extensionDownloadMod.buildEnqueueItemsForMedia(
+      makeWeiboRelayMedia(directUrl),
+      { apiOrigin },
+    );
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const fetchedUrls = [];
+    const errors = [];
+    let handedBytes = null;
+
+    let executor;
+    executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+      fetchImpl: async (url) => {
+        const s = String(url);
+        fetchedUrls.push(s);
+        if (s === directUrl) {
+          if (failureMode === "http-403") {
+            return new Response("Forbidden", { status: 403 });
+          }
+          throw new TypeError("simulated network error to weibocdn");
+        }
+        if (s === relayFullUrl) {
+          return new Response(payload, {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Length": String(payload.byteLength),
+            },
+          });
+        }
+        throw new Error(`Unexpected URL: ${s}`);
+      },
+      opfsStorage: opfs.storage,
+      webLocks: opfs.locks,
+      urlApi,
+      onError(msg) {
+        errors.push(msg);
+      },
+      async handoffBlobDownload(msg) {
+        const blob = urlApi.activeBlobs.get(msg.blobUrl);
+        handedBytes = new Uint8Array(await blob.arrayBuffer());
+        setTimeout(() => {
+          executor.releaseBlob({
+            taskId: msg.taskId,
+            blobUrl: msg.blobUrl,
+            opfsTempName: msg.opfsTempName,
+          });
+        }, 0);
+        return { chromeDownloadId: 502 };
+      },
+    });
+    try {
+      executor.startTask(`weibo-fallback-${failureMode}`, items[0].spec);
+      await executor.waitForIdle();
+      assert.equal(errors.length, 0, `${failureMode}: unexpected errors ${JSON.stringify(errors)}`);
+      assert.deepEqual(
+        fetchedUrls,
+        [directUrl, relayFullUrl],
+        `${failureMode}: must try direct_url first then fall back to relay_url`,
+      );
+      assert.equal(sha256Hex(handedBytes), expectedSha);
+      assert.equal(opfs.files.size, 0);
+    } finally {
+      executor.dispose();
+    }
+  }
+
+  // 3) Unwhitelisted direct_url is strictly ignored -> routes contain ONLY [relay_url]
+  {
+    const items = extensionDownloadMod.buildEnqueueItemsForMedia(
+      makeWeiboRelayMedia(unwhitelistedDirectUrl),
+      { apiOrigin },
+    );
+    assert.equal(items.length, 1);
+    assert.deepEqual(
+      items[0].spec.routes,
+      [relayFullUrl],
+      "unwhitelisted direct_url must be ignored, keeping only relay_url",
+    );
+  }
+
+  // 4) refreshSpecFromContext on expired/retried Weibo task preserves [fresh_direct_url, fresh_relay_url]
+  {
+    const staleDirectUrl = "https://f.video.weibocdn.com/o0/stale.mp4";
+    const staleRelayUrl = `${apiOrigin}/api/media/weibo?ticket=stale-ticket`;
+    const freshDirectUrl = "https://f.video.weibocdn.com/o0/fresh-after-refresh.mp4";
+    const freshRelayPath = "/api/media/weibo?ticket=fresh-ticket";
+    const freshRelayUrl = `${apiOrigin}${freshRelayPath}`;
+
+    const opfs = createMockOpfs();
+    const urlApi = createTrackedUrlApi();
+    const fetchedUrls = [];
+    const savedBlobs = new Map();
+    let parseCalls = 0;
+
+    const refreshedEnvelope = {
+      schema_version: "1.0",
+      code: "OK",
+      data: makeWeiboRelayMedia(freshDirectUrl, freshRelayPath),
+    };
+
+    const mockFetch = async (url) => {
+      const s = String(url);
+      fetchedUrls.push(s);
+      if (s.includes("/api/parse")) {
+        parseCalls += 1;
+        return new Response(JSON.stringify(refreshedEnvelope), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (s === freshDirectUrl) {
+        // Return 403 on fresh direct to prove BOTH fresh direct was tried FIRST
+        // AND fresh relay_url remained preserved behind it as fallback!
+        return new Response("Forbidden", { status: 403 });
+      }
+      if (s === freshRelayUrl) {
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(payload.byteLength),
+          },
+        });
+      }
+      throw new Error(`Unexpected URL during Weibo refresh test: ${s}`);
+    };
+
+    let offscreenCtrl = null;
+    const env = createMockMv3Environment({
+      autoCompleteDownloads: true,
+      async spawnOffscreenHook() {
+        if (!offscreenCtrl) {
+          offscreenCtrl = offscreenMod.createOffscreenController({
+            chrome: env.chrome,
+            fetchImpl: mockFetch,
+            opfsStorage: opfs.storage,
+            webLocks: opfs.locks,
+            urlApi,
+          });
+        }
+      },
+    });
+    const origDownload = env.chrome.downloads.download;
+    env.chrome.downloads.download = async (opts) => {
+      const blob = urlApi.activeBlobs.get(opts.url);
+      if (blob) {
+        savedBlobs.set(opts.filename, new Uint8Array(await blob.arrayBuffer()));
+      }
+      return origDownload(opts);
+    };
+
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: storage.createExtensionStorage(),
+      fetchImpl: mockFetch,
+    });
+    await bg.init();
+    try {
+      const rpc = await env.chrome.runtime.sendMessage({
+        type: "ENQUEUE_DOWNLOADS",
+        items: [
+          {
+            title: "微博匿名直连测试视频",
+            platform: "weibo",
+            spec: {
+              kind: "direct_file",
+              apiOrigin,
+              routes: [staleDirectUrl, staleRelayUrl],
+              filename: "DokiTool/weibo-refreshed.mp4",
+              mimeType: "video/mp4",
+              sizeBytes: payload.byteLength,
+              refreshContext: {
+                parseUrl: "https://weibo.com/123456/P12345678",
+                platform: "weibo",
+                itemId: "wb-item-1",
+                variantId: "wb-hd",
+                expiresAtMs: Date.now() - 60_000,
+              },
+            },
+          },
+        ],
+      });
+      assert.equal(rpc.ok, true);
+      await bg.waitForIdle();
+      await offscreenCtrl?.executor.waitForIdle();
+
+      assert.equal(parseCalls, 1, "expired Weibo task must re-parse once before start");
+      assert.equal(fetchedUrls.includes(staleDirectUrl), false, "must skip stale direct URL");
+      assert.equal(fetchedUrls.includes(staleRelayUrl), false, "must skip stale relay URL");
+      const directIdx = fetchedUrls.indexOf(freshDirectUrl);
+      const relayIdx = fetchedUrls.indexOf(freshRelayUrl);
+      assert.ok(directIdx >= 0, `refreshed spec must try fresh direct_url first; urls=${JSON.stringify(fetchedUrls)}`);
+      assert.ok(relayIdx > directIdx, `refreshed spec must preserve fresh relay_url after direct_url; urls=${JSON.stringify(fetchedUrls)}`);
+      assert.equal(sha256Hex(savedBlobs.get("DokiTool/weibo-refreshed.mp4")), expectedSha);
       assert.equal(opfs.files.size, 0);
     } finally {
       offscreenCtrl?.dispose();

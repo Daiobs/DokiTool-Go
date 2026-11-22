@@ -1004,11 +1004,22 @@ func TestQueryParameterTokensNeverAuthenticateAsOwner(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("query param %s status=%d body=%s", qk, w.Code, w.Body.String())
 		}
-		if strings.Contains(w.Body.String(), weiboCDNURL) {
-			t.Fatalf("query param ?%s= bypassed Weibo relay and returned raw CDN URL", qk)
+		payload, err := unified.Decode(w.Body.Bytes())
+		if err != nil {
+			t.Fatalf("query param %s invalid JSON: %v", qk, err)
 		}
-		if !strings.Contains(w.Body.String(), "/api/media/weibo?ticket=") {
-			t.Fatalf("query param ?%s= did not receive anonymous relay ticket", qk)
+		item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
+		def := unified.Map(item["default"])
+		if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
+			t.Fatalf("query param ?%s= bypassed Weibo relay default=%v", qk, def)
+		}
+		for _, v := range unified.Slice(item["variants"]) {
+			for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
+				src := unified.Map(sv)
+				if src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") {
+					t.Fatalf("query param ?%s= bypassed Weibo relay source=%v", qk, src)
+				}
+			}
 		}
 	}
 
@@ -1128,6 +1139,14 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 				errs <- fmt.Errorf("owner #%d default=%v, want direct %s", idx, def, weiboCDNURL)
 				return
 			}
+			for _, v := range unified.Slice(item["variants"]) {
+				for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
+					if unified.Map(sv)["direct_url"] != nil {
+						errs <- fmt.Errorf("owner #%d source unexpectedly carried direct_url: %v", idx, sv)
+						return
+					}
+				}
+			}
 		}(i)
 
 		// Anonymous caller (distinct visitor IPs)
@@ -1148,11 +1167,6 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 				errs <- fmt.Errorf("anonymous #%d status=%d body=%s", idx, w.Code, w.Body.String())
 				return
 			}
-			rawBody := w.Body.String()
-			if strings.Contains(rawBody, weiboCDNURL) {
-				errs <- fmt.Errorf("anonymous #%d leaked raw CDN URL: %s", idx, rawBody)
-				return
-			}
 			payload, err := unified.Decode(w.Body.Bytes())
 			if err != nil {
 				errs <- err
@@ -1167,6 +1181,15 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 			if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
 				errs <- fmt.Errorf("anonymous #%d default=%v, want signed relay", idx, def)
 				return
+			}
+			for _, v := range unified.Slice(item["variants"]) {
+				for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
+					src := unified.Map(sv)
+					if src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") || src["direct_url"] != weiboCDNURL {
+						errs <- fmt.Errorf("anonymous #%d unexpected relay source=%v", idx, src)
+						return
+					}
+				}
 			}
 			ticket := strings.TrimPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=")
 			decoded, ok := weibomedia.Verify(ticket, mediaKey, weiboFrozenNow)

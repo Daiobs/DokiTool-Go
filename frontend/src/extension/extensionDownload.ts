@@ -46,6 +46,7 @@ import {
 } from "./filenameSanitizer";
 import { validateApiBaseUrl } from "./hostWhitelist";
 import {
+  DEFAULT_DIRECT_FILE_MAX_CONCURRENCY,
   ExtensionDownloadError,
   assertWhitelistedUrl,
   buildEffectiveExtraOrigins,
@@ -77,6 +78,7 @@ import {
   type QualityPreference,
 } from "./protocol";
 import { buildWorkFingerprint } from "./storage";
+import { buildExtensionTargetContext } from "./uiTargetHelpers";
 import {
   createYouTubeExtensionBridge,
   type UrlObjectApiLike,
@@ -268,7 +270,7 @@ export function selectVariantByPreference(
   if (!readyItem(item)) {
     return null;
   }
-  const context: TargetContext = now !== undefined ? { apiOrigin, now } : { apiOrigin };
+  const context: TargetContext = buildExtensionTargetContext(apiOrigin, now);
   const readyVariants = item.variants.filter(readyVariant);
 
   // 1. Image / LivePhoto items always resolve as visual items even when qualityPreference === "audio"
@@ -863,8 +865,10 @@ export function buildEnqueueItemsForMedia(
 ): EnqueueDownloadItem[] {
   const validatedApi = validateApiBaseUrl(options.apiOrigin);
   const apiOrigin = validatedApi.ok ? validatedApi.origin : options.apiOrigin;
-  const context: TargetContext =
-    options.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
+  const context: TargetContext = buildExtensionTargetContext(
+    apiOrigin,
+    options.now,
+  );
   const qualityPreference = options.qualityPreference ?? "best";
   const batchSaveMode = options.batchSaveMode ?? "subfolder";
   const livePhotoMode = options.livePhotoMode ?? "both";
@@ -1829,6 +1833,9 @@ export function createOffscreenDownloadExecutor(
       let writable: OpfsWritableLike | null = null;
       let closed = false;
       let cleaned = false;
+      let writeQueue: Promise<void> = Promise.resolve();
+      let writeQueueError: unknown = null;
+      let cleanupPromise: Promise<void> | null = null;
 
       try {
         const dir = (await opfsStorage.getDirectory()) as unknown as OpfsDirectoryLike;
@@ -1836,35 +1843,78 @@ export function createOffscreenDownloadExecutor(
         const handle = await dir.getFileHandle(tempName, { create: true });
         writable = await handle.createWritable();
 
-        const cleanup = async (reason?: unknown) => {
-          if (cleaned) return;
-          cleaned = true;
-          if (!closed && writable) {
-            try {
-              await writable.abort?.(reason);
-            } catch {
-              // Ignore
+        const enqueueWrite = (op: () => Promise<void>): Promise<void> => {
+          const task = writeQueue.then(async () => {
+            if (closed || cleaned) {
+              throw new ExtensionDownloadError("临时文件写入流已关闭");
             }
-          }
-          try {
-            await root?.removeEntry(tempName);
-          } catch {
-            // Ignore NotFound
-          }
-          activeOpfsNames.delete(tempName);
-          releaseLock();
+            await op();
+          });
+          // Keep writeQueue chain settled so close/cleanup can safely drain it
+          // without causing unhandled rejections.
+          writeQueue = task.catch((err) => {
+            if (writeQueueError === null) {
+              writeQueueError = err;
+            }
+          });
+          return task;
+        };
+
+        const cleanup = (reason?: unknown): Promise<void> => {
+          if (cleanupPromise) return cleanupPromise;
+          cleaned = true;
+          cleanupPromise = (async () => {
+            try {
+              await writeQueue;
+            } catch {
+              // Ignore write queue errors during teardown
+            }
+            if (!closed && writable) {
+              closed = true;
+              try {
+                await writable.abort?.(reason);
+              } catch {
+                // Ignore
+              }
+            }
+            try {
+              await root?.removeEntry(tempName);
+            } catch {
+              // Ignore NotFound
+            }
+            activeOpfsNames.delete(tempName);
+            releaseLock();
+          })();
+          return cleanupPromise;
         };
 
         return {
           tempName,
           rawWritable: writable,
-          async write(chunk: Uint8Array) {
-            await writable!.write(chunk);
+          write(chunk: Uint8Array) {
+            return enqueueWrite(() => writable!.write(chunk));
+          },
+          writeAt(position: number, chunk: Uint8Array) {
+            if (!Number.isSafeInteger(position) || position < 0) {
+              return Promise.reject(
+                new ExtensionDownloadError(`无效的 OPFS 写入偏移：${position}`),
+              );
+            }
+            return enqueueWrite(() =>
+              writable!.write({ type: "write", position, data: chunk }),
+            );
           },
           markWritableClosed() {
             closed = true;
           },
           async closeAndGetBlob(): Promise<Blob | File> {
+            await writeQueue;
+            if (cleaned) {
+              throw new ExtensionDownloadError("临时文件已被清理");
+            }
+            if (writeQueueError !== null) {
+              throw writeQueueError;
+            }
             if (!closed) {
               closed = true;
               await writable!.close();
@@ -1891,24 +1941,105 @@ export function createOffscreenDownloadExecutor(
     }
 
     // Fallback when OPFS is absent in a stripped test environment
-    const chunks: Uint8Array[] = [];
+    const segments: Array<{ position: number; data: Uint8Array }> = [];
+    let seqCursor = 0;
+    let maxEnd = 0;
+    let memWriteQueue: Promise<void> = Promise.resolve();
+    let memWriteError: unknown = null;
+    let memClosed = false;
+    let memCleaned = false;
+
+    const enqueueMemWrite = (op: () => void): Promise<void> => {
+      const task = memWriteQueue.then(() => {
+        if (memClosed || memCleaned) {
+          throw new ExtensionDownloadError("临时文件写入流已关闭");
+        }
+        op();
+      });
+      memWriteQueue = task.catch((err) => {
+        if (memWriteError === null) {
+          memWriteError = err;
+        }
+      });
+      return task;
+    };
+
     return {
       tempName: undefined as string | undefined,
-      async write(chunk: Uint8Array) {
-        chunks.push(chunk.slice());
+      write(chunk: Uint8Array) {
+        const copy = chunk.slice();
+        return enqueueMemWrite(() => {
+          segments.push({ position: seqCursor, data: copy });
+          seqCursor += copy.byteLength;
+          if (seqCursor > maxEnd) maxEnd = seqCursor;
+        });
+      },
+      writeAt(position: number, chunk: Uint8Array) {
+        if (!Number.isSafeInteger(position) || position < 0) {
+          return Promise.reject(
+            new ExtensionDownloadError(`无效的写入偏移：${position}`),
+          );
+        }
+        const copy = chunk.slice();
+        return enqueueMemWrite(() => {
+          segments.push({ position, data: copy });
+          const end = position + copy.byteLength;
+          if (end > maxEnd) maxEnd = end;
+        });
       },
       async closeAndGetBlob(): Promise<Blob> {
-        const blob = new Blob(chunks as BlobPart[], {
-          type: mimeType || "application/octet-stream",
-        });
-        chunks.length = 0;
+        await memWriteQueue;
+        if (memCleaned) {
+          throw new ExtensionDownloadError("临时文件已被清理");
+        }
+        if (memWriteError !== null) {
+          throw memWriteError;
+        }
+        memClosed = true;
+        if (maxEnd === 0) {
+          segments.length = 0;
+          throw new ExtensionDownloadError("下载产物为空");
+        }
+        let strictlySequential = true;
+        let expectedPos = 0;
+        for (const seg of segments) {
+          if (seg.position !== expectedPos) {
+            strictlySequential = false;
+            break;
+          }
+          expectedPos += seg.data.byteLength;
+        }
+        let blob: Blob;
+        if (strictlySequential && expectedPos === maxEnd) {
+          blob = new Blob(
+            segments.map((s) => s.data) as BlobPart[],
+            { type: mimeType || "application/octet-stream" },
+          );
+        } else {
+          const assembled = new Uint8Array(maxEnd);
+          for (const seg of segments) {
+            assembled.set(seg.data, seg.position);
+          }
+          blob = new Blob([assembled], {
+            type: mimeType || "application/octet-stream",
+          });
+        }
+        segments.length = 0;
         if (blob.size === 0) {
           throw new ExtensionDownloadError("下载产物为空");
         }
         return blob;
       },
       async cleanup() {
-        chunks.length = 0;
+        memCleaned = true;
+        try {
+          await memWriteQueue;
+        } catch {
+          // Ignore
+        }
+        segments.length = 0;
+        seqCursor = 0;
+        maxEnd = 0;
       },
     };
   };
@@ -1997,6 +2128,8 @@ export function createOffscreenDownloadExecutor(
       estimatedSize: spec.sizeBytes,
       sinkMimeType: spec.mimeType,
       errorLabel: "媒体源",
+      maxConcurrency: DEFAULT_DIRECT_FILE_MAX_CONCURRENCY,
+      apiOrigin: spec.apiOrigin,
       onRouteStart({ routeIndex, routeCount, total, isFreshRetry }) {
         reportProgress(
           {

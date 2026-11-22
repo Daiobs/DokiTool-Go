@@ -385,10 +385,10 @@ func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid st
 		var kept []string
 		seen := map[string]bool{}
 		for _, raw := range urls {
-			if seen[raw] || !bilibili.AllowedBrowserFetchURL(raw) {
+			if seen[raw] {
 				continue
 			}
-			exp, ok := bilibili.MediaURLDeadline(raw)
+			exp, ok := bilibili.ValidateShanghaiMediaURL(raw, true)
 			if !ok || exp <= now {
 				continue
 			}

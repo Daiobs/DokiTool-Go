@@ -78,7 +78,7 @@ export function redactServerBoundYouTubeMedia(
         const redactedUrl = isGooglevideoUrl(source.url)
           ? nextPlaceholder(source.id || variant.id)
           : source.url;
-        const { fallback_urls: _drop, ...rest } = source;
+        const { fallback_urls: _drop, direct_url: _dropDirect, ...rest } = source;
         return {
           ...rest,
           url: redactedUrl,
@@ -129,7 +129,7 @@ export function redactServerBoundYouTubeMedia(
       const redactedUrl = isGooglevideoUrl(source.url)
         ? nextPlaceholder(source.id || att.id)
         : source.url;
-      const { fallback_urls: _drop, ...rest } = source;
+      const { fallback_urls: _drop, direct_url: _dropDirect, ...rest } = source;
       return {
         ...rest,
         url: redactedUrl,

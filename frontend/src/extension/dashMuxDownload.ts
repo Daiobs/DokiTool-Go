@@ -5,6 +5,8 @@ import {
   type DashMuxTrackFetchResult,
 } from "./dashMuxEngine";
 import {
+  DEFAULT_DASH_AUDIO_MAX_CONCURRENCY,
+  DEFAULT_DASH_VIDEO_MAX_CONCURRENCY,
   ExtensionDownloadError,
   ensureOpfsQuotaAvailable,
   streamResumableRouteToOpfs,
@@ -78,6 +80,10 @@ export async function fetchDashTrackToOpfs(
   const trackLabel = role === "video" ? "视频轨" : "音频轨";
   const trackTag = role === "video" ? "dash-v" : "dash-a";
   const trackMime = role === "video" ? "video/mp4" : "audio/mp4";
+  const maxConcurrency =
+    role === "video"
+      ? DEFAULT_DASH_VIDEO_MAX_CONCURRENCY
+      : DEFAULT_DASH_AUDIO_MAX_CONCURRENCY;
 
   const transferred = await streamResumableRouteToOpfs({
     taskId,
@@ -90,6 +96,8 @@ export async function fetchDashTrackToOpfs(
     sinkMimeType: trackMime,
     sinkTag: trackTag,
     errorLabel: trackLabel,
+    maxConcurrency,
+    apiOrigin: spec.apiOrigin,
     onProgress({ loaded, total }) {
       onProgress({ loaded, total });
     },

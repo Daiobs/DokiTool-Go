@@ -15,6 +15,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	weibomedia "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
@@ -91,6 +92,60 @@ func weiboSignedSameJSON(t *testing.T, got, want any) {
 	}
 }
 
+func verifyAndStripWeiboDirectURLs(t *testing.T, payload unified.Object, key string, now int64) unified.Object {
+	t.Helper()
+	cloned := unified.Clone(payload)
+	if unified.Str(cloned["code"]) != "OK" {
+		return cloned
+	}
+	data := unified.Map(cloned["data"])
+	if data == nil {
+		return cloned
+	}
+	checkDelivery := func(delivery unified.Object) {
+		if delivery == nil {
+			return
+		}
+		for _, group := range unified.DeliverySources(delivery) {
+			for _, rawSrc := range group {
+				src := unified.Map(rawSrc)
+				if src == nil {
+					continue
+				}
+				rawURL := unified.Str(src["url"])
+				if src["access"] == "relay" && strings.HasPrefix(rawURL, "/api/media/weibo?ticket=") {
+					ticket := strings.TrimPrefix(rawURL, "/api/media/weibo?ticket=")
+					decoded, valid := weibomedia.Verify(ticket, key, now)
+					if !valid {
+						t.Fatalf("relay ticket failed verification: %s", rawURL)
+					}
+					if src["direct_url"] != decoded["u"] {
+						t.Fatalf("relay source direct_url = %v, want verified ticket target %v", src["direct_url"], decoded["u"])
+					}
+					delete(src, "direct_url")
+				} else if _, hasDirect := src["direct_url"]; hasDirect {
+					t.Fatalf("non-relay source unexpectedly carried direct_url: %v", src)
+				}
+			}
+		}
+	}
+	for _, rawItem := range unified.Slice(data["items"]) {
+		item := unified.Map(rawItem)
+		if def := unified.Map(item["default"]); def != nil {
+			if _, hasDirect := def["direct_url"]; hasDirect {
+				t.Fatalf("item.default unexpectedly carried direct_url: %v", def)
+			}
+		}
+		for _, rawVariant := range unified.Slice(item["variants"]) {
+			checkDelivery(unified.Map(unified.Map(rawVariant)["delivery"]))
+		}
+	}
+	for _, rawAttachment := range unified.Slice(data["attachments"]) {
+		checkDelivery(unified.Map(unified.Map(unified.Map(rawAttachment)["resource"])["delivery"]))
+	}
+	return cloned
+}
+
 func TestWeiboHTTPSignedPHPOracle(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "platform", "weibo", "testdata", "php-signed-baseline.json"))
 	if err != nil {
@@ -152,7 +207,8 @@ func TestWeiboHTTPSignedPHPOracle(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				weiboSignedSameJSON(t, unified.Object{"status": recorder.Code, "payload": payload},
+				stripped := verifyAndStripWeiboDirectURLs(t, payload, unified.Str(input["key"]), now)
+				weiboSignedSameJSON(t, unified.Object{"status": recorder.Code, "payload": stripped},
 					unified.Object{"status": expected[view+"_status"], "payload": expected[view]})
 				if err := unified.ValidateEnvelopeAt(payload, now); err != nil {
 					t.Fatal(err)

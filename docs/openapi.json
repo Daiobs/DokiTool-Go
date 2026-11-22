@@ -1647,6 +1647,13 @@
             },
             "description": "Bounded alternate credential URLs for the same logical source and HTTPS origin; primary remains authoritative."
           },
+          "direct_url": {
+            "format": "uri",
+            "pattern": "^https://[^\\s/?#]+/[^\\s#]*$",
+            "title": "Direct Url",
+            "type": "string",
+            "description": "Optional verified direct HTTPS upstream media URL alongside access=\"relay\", for privileged/extension clients that can supply required Referer headers while keeping browser relay defaults unchanged."
+          },
           "access": {
             "default": "direct",
             "enum": [

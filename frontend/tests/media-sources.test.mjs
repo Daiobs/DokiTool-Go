@@ -1,14 +1,22 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { build as esbuildBuild, stop as esbuildStop } from 'esbuild';
 import { transformWithEsbuild } from 'vite';
 import { createRenderer, h, markRaw, nextTick, reactive, ref } from 'vue';
 import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
 import { loadSfc } from './helpers/loadSfc.mjs';
 
 const require = createRequire(import.meta.url);
-let labels, contract, useVideoSelection, ResultSection;
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FRONTEND_DIR = resolve(__dirname, '..');
+let tmpExtBundleDir = '';
+let labels, contract, useVideoSelection, ResultSection, uiTargetHelpers, parseHelpers, SidePanelResult;
 const originals = { window: globalThis.window, document: globalThis.document };
 before(async () => {
   const modules = {};
@@ -33,10 +41,46 @@ before(async () => {
       },
     },
   );
+  tmpExtBundleDir = mkdtempSync(join(tmpdir(), 'dokitool-media-sources-'));
+  const extOutfile = join(tmpExtBundleDir, 'ext-helpers.mjs');
+  await esbuildBuild({
+    stdin: {
+      contents: `
+        export * as uiTargetHelpers from "./src/extension/uiTargetHelpers.ts";
+        export * as parseHelpers from "./src/utils/parseHelpers.ts";
+        export * as mediaContract from "./src/utils/mediaContract.ts";
+      `,
+      resolveDir: FRONTEND_DIR,
+      loader: 'ts',
+    },
+    bundle: true,
+    outfile: extOutfile,
+    platform: 'browser',
+    format: 'esm',
+    define: { 'import.meta.env': '{}' },
+  });
+  const extSuite = await import(pathToFileURL(extOutfile).href);
+  uiTargetHelpers = extSuite.uiTargetHelpers;
+  parseHelpers = extSuite.parseHelpers;
+  SidePanelResult = await loadSfc(
+    new URL('../src/extension/components/SidePanelResult.vue', import.meta.url),
+    {
+      modules: {
+        '../../utils/mediaContract': extSuite.mediaContract,
+        '../uiTargetHelpers': uiTargetHelpers,
+      },
+    },
+  );
   globalThis.window = { addEventListener() {}, removeEventListener() {} };
   globalThis.document = { body: { style: {} } };
 });
-after(() => Object.assign(globalThis, originals));
+after(() => {
+  esbuildStop();
+  if (tmpExtBundleDir) {
+    rmSync(tmpExtBundleDir, { recursive: true, force: true });
+  }
+  Object.assign(globalThis, originals);
+});
 
 const url = route => `https://media.example.test/${route}.mp4`;
 const variant = (id, routes = [id], metadata = {}) => ({ id,
@@ -517,5 +561,478 @@ test('formatCodecLabel maps technical codec strings to human-readable labels whi
     );
   } finally {
     view.app.unmount();
+  }
+});
+
+const WEIBO_DIRECT = 'https://f.video.weibocdn.com/o0/direct-hd.mp4?Expires=1999999999&ssig=abc%2B123';
+const WEIBO_RELAY_PATH = '/api/media/weibo?ticket=signed%2Bticket%2F1';
+const WEIBO_API_ORIGIN = 'https://snap.dokitool.com';
+const WEIBO_RELAY_FULL = WEIBO_API_ORIGIN + WEIBO_RELAY_PATH;
+
+function makeWeiboRelayEnvelope(sourceOverrides = {}, extraVariants = []) {
+  const primarySource = {
+    id: 'wb-src-hd',
+    url: WEIBO_RELAY_PATH,
+    access: 'relay',
+    direct_url: WEIBO_DIRECT,
+    size_bytes: 12_345_678,
+    ...sourceOverrides,
+  };
+  const primaryVariant = {
+    id: 'wb-hd',
+    label: 'mp4_1080p_mp4',
+    metadata: {
+      width: 1920,
+      height: 1080,
+      container: 'mp4',
+      extension: 'mp4',
+      mime_type: 'video/mp4',
+      has_audio: true,
+      evidence: 'upstream',
+    },
+    delivery: {
+      kind: 'file',
+      sources: [primarySource],
+    },
+  };
+  const wbItem = {
+    id: 'wb-video-1',
+    type: 'video',
+    title: '微博实测视频',
+    variants: [primaryVariant, ...extraVariants],
+    default: {
+      variant_id: primaryVariant.id,
+      source_id: primarySource.id,
+      url: primarySource.url,
+      ...(primarySource.access ? { access: primarySource.access } : {}),
+    },
+  };
+  return {
+    schema_version: '1.0',
+    code: 'OK',
+    data: {
+      platform: 'weibo',
+      content_id: '500123456',
+      source_url: 'https://weibo.com/12345/AbCdEf',
+      title: '微博实测视频',
+      generated_at: '2026-11-22T00:00:00Z',
+      items: [wbItem],
+    },
+  };
+}
+
+test('Web SPA default TargetContext completely ignores source.direct_url and stays on /api/media/weibo', async () => {
+  const envelope = makeWeiboRelayEnvelope();
+  const validated = contract.validateMediaEnvelope(envelope, { apiOrigin: WEIBO_API_ORIGIN });
+  const wbItem = validated.items[0];
+  const wbSource = wbItem.variants[0].delivery.sources[0];
+
+  assert.equal(contract.sourceUrl(wbSource, { apiOrigin: WEIBO_API_ORIGIN }), WEIBO_RELAY_FULL);
+  assert.deepEqual(contract.sourceRoutes(wbSource, { apiOrigin: WEIBO_API_ORIGIN }), [WEIBO_RELAY_FULL]);
+  assert.deepEqual(contract.deliveryRoutes([wbSource], { apiOrigin: WEIBO_API_ORIGIN }), [WEIBO_RELAY_FULL]);
+  assert.equal(contract.getDefaultFileUrl(wbItem, { apiOrigin: WEIBO_API_ORIGIN }), WEIBO_RELAY_FULL);
+
+  const defTarget = contract.getDefaultDownloadTarget(wbItem, { apiOrigin: WEIBO_API_ORIGIN });
+  assert.equal(defTarget.kind, 'file');
+  assert.equal(defTarget.url, WEIBO_RELAY_FULL);
+  assert.deepEqual(defTarget.routes, [WEIBO_RELAY_FULL]);
+
+  const selTarget = contract.getDownloadTarget(
+    wbItem,
+    { variant_id: 'wb-hd', source_id: 'wb-src-hd' },
+    { apiOrigin: WEIBO_API_ORIGIN },
+  );
+  assert.equal(selTarget.kind, 'file');
+  assert.equal(selTarget.url, WEIBO_RELAY_FULL);
+  assert.deepEqual(selTarget.routes, [WEIBO_RELAY_FULL]);
+
+  // Verify Web SPA ResultSection renders ONLY the relay URL and never weibocdn.com
+  const view = await mount(validated);
+  try {
+    assert.ok(view.player().src.endsWith(WEIBO_RELAY_PATH), 'Web SPA <video> must use relay URL');
+    assert.ok(!view.player().src.includes('weibocdn.com'), 'Web SPA must never target direct_url');
+    assert.deepEqual(view.selection.currentTarget.value.routes.every(r => !r.includes('weibocdn.com')), true);
+  } finally {
+    view.app.unmount();
+  }
+});
+
+test('validateMediaEnvelope accepts valid relay direct_url and rejects non-relay or malformed direct_url', () => {
+  const validEnvelope = makeWeiboRelayEnvelope();
+  assert.deepEqual(
+    contract.validateMediaEnvelope(validEnvelope, { apiOrigin: WEIBO_API_ORIGIN }),
+    validEnvelope.data,
+  );
+  // validateMediaEnvelope MUST force preferRelayDirect: false so canonical item.default.url validation succeeds
+  assert.deepEqual(
+    contract.validateMediaEnvelope(validEnvelope, {
+      apiOrigin: WEIBO_API_ORIGIN,
+      preferRelayDirect: true,
+    }),
+    validEnvelope.data,
+  );
+  assert.deepEqual(
+    contract.validateMediaEnvelope(
+      validEnvelope,
+      uiTargetHelpers.buildExtensionTargetContext(WEIBO_API_ORIGIN),
+    ),
+    validEnvelope.data,
+  );
+
+  // Reject direct_url on non-relay sources (access: "direct" or omitted)
+  for (const nonRelay of [
+    { access: 'direct', url: 'https://media.example.test/v.mp4' },
+    { access: undefined, url: 'https://media.example.test/v.mp4' },
+  ]) {
+    const bad = makeWeiboRelayEnvelope(nonRelay);
+    assert.throws(
+      () => contract.validateMediaEnvelope(bad, { apiOrigin: WEIBO_API_ORIGIN }),
+      /媒体合同无效/,
+      `non-relay source (${String(nonRelay.access)}) with direct_url must fail`,
+    );
+  }
+
+  // Reject non-HTTPS, missing path, userinfo, fragment, whitespace, control chars, backslash, non-string
+  const invalidDirectUrls = [
+    '',
+    '   ',
+    null,
+    123,
+    'http://f.video.weibocdn.com/o0/v.mp4',
+    'HTTPS://f.video.weibocdn.com/o0/v.mp4',
+    'https://f.video.weibocdn.com',
+    'https://f.video.weibocdn.com?a=1',
+    'https://f.video.weibocdn.com/o0/v.mp4#frag',
+    'https://user:pass@f.video.weibocdn.com/o0/v.mp4',
+    'https://@f.video.weibocdn.com/o0/v.mp4',
+    'https://f.video.weibocdn.com:/o0/v.mp4',
+    'https://f.video.weibocdn.com/o0/a b.mp4',
+    'https://f.video.weibocdn.com/o0/a\nb.mp4',
+    'https://f.video.weibocdn.com/o0/a\\b.mp4',
+    '/api/media/weibo?ticket=nested',
+  ];
+  for (const badDirect of invalidDirectUrls) {
+    const bad = makeWeiboRelayEnvelope({ direct_url: badDirect });
+    assert.throws(
+      () => contract.validateMediaEnvelope(bad, { apiOrigin: WEIBO_API_ORIGIN }),
+      /媒体合同无效/,
+      `invalid direct_url (${JSON.stringify(badDirect)}) must fail`,
+    );
+  }
+});
+
+test('preferRelayDirect boolean and predicate place accepted direct_url FIRST and keep signed relay as fallback', () => {
+  const envelope = makeWeiboRelayEnvelope();
+  const wbItem = envelope.data.items[0];
+  const wbSource = wbItem.variants[0].delivery.sources[0];
+
+  // preferRelayDirect: true
+  const ctxTrue = { apiOrigin: WEIBO_API_ORIGIN, preferRelayDirect: true };
+  assert.equal(contract.sourceUrl(wbSource, ctxTrue), WEIBO_DIRECT);
+  assert.deepEqual(contract.sourceRoutes(wbSource, ctxTrue), [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  assert.deepEqual(contract.deliveryRoutes([wbSource], ctxTrue), [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+
+  const targetTrue = contract.getDefaultDownloadTarget(wbItem, ctxTrue);
+  assert.equal(targetTrue.kind, 'file');
+  assert.equal(targetTrue.url, WEIBO_DIRECT);
+  assert.deepEqual(targetTrue.routes, [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+
+  // preferRelayDirect predicate returning true
+  const seenUrls = [];
+  const ctxPredAllow = {
+    apiOrigin: WEIBO_API_ORIGIN,
+    preferRelayDirect: (u) => {
+      seenUrls.push(u);
+      return u.startsWith('https://f.video.weibocdn.com/');
+    },
+  };
+  assert.equal(contract.sourceUrl(wbSource, ctxPredAllow), WEIBO_DIRECT);
+  assert.deepEqual(contract.sourceRoutes(wbSource, ctxPredAllow), [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  assert.deepEqual(contract.deliveryRoutes([wbSource], ctxPredAllow), [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  const selAllow = contract.getDownloadTarget(wbItem, { variant_id: 'wb-hd', source_id: 'wb-src-hd' }, ctxPredAllow);
+  assert.equal(selAllow.kind, 'file');
+  assert.equal(selAllow.url, WEIBO_DIRECT);
+  assert.deepEqual(selAllow.routes, [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  assert.ok(seenUrls.every(u => u === WEIBO_DIRECT));
+
+  // preferRelayDirect predicate returning false omits direct_url
+  const ctxPredDeny = {
+    apiOrigin: WEIBO_API_ORIGIN,
+    preferRelayDirect: () => false,
+  };
+  assert.equal(contract.sourceUrl(wbSource, ctxPredDeny), WEIBO_RELAY_FULL);
+  assert.deepEqual(contract.sourceRoutes(wbSource, ctxPredDeny), [WEIBO_RELAY_FULL]);
+  assert.deepEqual(contract.deliveryRoutes([wbSource], ctxPredDeny), [WEIBO_RELAY_FULL]);
+  const selDeny = contract.getDefaultDownloadTarget(wbItem, ctxPredDeny);
+  assert.equal(selDeny.kind, 'file');
+  assert.equal(selDeny.url, WEIBO_RELAY_FULL);
+  assert.deepEqual(selDeny.routes, [WEIBO_RELAY_FULL]);
+
+  // Throwing predicate fails closed to relay-only
+  const ctxPredThrow = {
+    apiOrigin: WEIBO_API_ORIGIN,
+    preferRelayDirect: () => {
+      throw new Error('predicate boom');
+    },
+  };
+  assert.deepEqual(contract.sourceRoutes(wbSource, ctxPredThrow), [WEIBO_RELAY_FULL]);
+});
+
+test('buildExtensionTargetContext accepts built-in whitelisted media hosts and rejects unwhitelisted/API hosts', () => {
+  const customApi = 'https://custom-api.example.com';
+  const extCtx = uiTargetHelpers.buildExtensionTargetContext(`${customApi}/`, 1_700_000_000_000);
+  assert.equal(extCtx.apiOrigin, customApi);
+  assert.equal(extCtx.now, 1_700_000_000_000);
+  assert.equal(typeof extCtx.preferRelayDirect, 'function');
+
+  // Default origin when omitted/null/invalid
+  assert.equal(uiTargetHelpers.buildExtensionTargetContext().apiOrigin, 'https://snap.dokitool.com');
+  assert.equal(uiTargetHelpers.buildExtensionTargetContext(null).apiOrigin, 'https://snap.dokitool.com');
+  assert.equal(uiTargetHelpers.buildExtensionTargetContext('not-a-url').apiOrigin, 'https://snap.dokitool.com');
+
+  // Built-in whitelisted Weibo CDN hosts accepted
+  assert.equal(extCtx.preferRelayDirect(WEIBO_DIRECT), true);
+  assert.equal(extCtx.preferRelayDirect('https://wx1.sinaimg.cn/large/abc.jpg'), true);
+
+  // Unwhitelisted, custom API origin, PROD API origin, non-HTTPS, non-standard port rejected
+  assert.equal(extCtx.preferRelayDirect('https://evil.example.com/video.mp4'), false);
+  assert.equal(extCtx.preferRelayDirect(`${customApi}/hijack.mp4`), false);
+  assert.equal(extCtx.preferRelayDirect('https://snap.dokitool.com/api/media/weibo?ticket=1'), false);
+  assert.equal(extCtx.preferRelayDirect('http://f.video.weibocdn.com/o0/v.mp4'), false);
+  assert.equal(extCtx.preferRelayDirect('https://f.video.weibocdn.com:8443/o0/v.mp4'), false);
+
+  // End-to-end with buildSidePanelQualityOptions & buildSingleDownloadEnqueueItem
+  const goodEnv = makeWeiboRelayEnvelope();
+  const goodOpts = uiTargetHelpers.buildSidePanelQualityOptions(goodEnv.data, goodEnv.data.items[0], customApi);
+  assert.equal(goodOpts.length, 1);
+  assert.equal(goodOpts[0].directUrl, WEIBO_DIRECT);
+  assert.deepEqual(goodOpts[0].routes, [WEIBO_DIRECT, customApi + WEIBO_RELAY_PATH]);
+
+  const goodEnq = uiTargetHelpers.buildSingleDownloadEnqueueItem({
+    media: goodEnv.data,
+    item: goodEnv.data.items[0],
+    option: goodOpts[0],
+    settings: {
+      apiBaseUrl: customApi,
+      bearerToken: '',
+      qualityPreference: 'best',
+      batchSaveMode: 'subfolder',
+      subfolderPrefix: '',
+      themeMode: 'system',
+    },
+  });
+  assert.deepEqual(goodEnq.spec.routes, [WEIBO_DIRECT, customApi + WEIBO_RELAY_PATH]);
+
+  // Unwhitelisted direct_url is omitted by buildSidePanelQualityOptions -> falls back cleanly to relay only
+  const evilEnv = makeWeiboRelayEnvelope({ direct_url: 'https://evil.example.com/v.mp4' });
+  const evilOpts = uiTargetHelpers.buildSidePanelQualityOptions(evilEnv.data, evilEnv.data.items[0], customApi);
+  assert.equal(evilOpts.length, 1);
+  assert.equal(evilOpts[0].directUrl, customApi + WEIBO_RELAY_PATH);
+  assert.deepEqual(evilOpts[0].routes, [customApi + WEIBO_RELAY_PATH]);
+});
+
+test('redactServerBoundYouTubeMedia strips direct_url alongside fallback_urls', () => {
+  const media = {
+    platform: 'youtube',
+    content_id: 'dQw4w9WgXcQ',
+    items: [
+      {
+        id: 'yt-1',
+        type: 'video',
+        variants: [
+          {
+            id: 'v1',
+            delivery: {
+              kind: 'file',
+              sources: [
+                {
+                  id: 's1',
+                  url: 'https://rr1---sn.googlevideo.com/videoplayback?id=1',
+                  fallback_urls: ['https://rr1---sn.googlevideo.com/videoplayback?id=2'],
+                  direct_url: 'https://rr1---sn.googlevideo.com/direct.mp4',
+                },
+              ],
+            },
+          },
+        ],
+        default: {
+          variant_id: 'v1',
+          source_id: 's1',
+          url: 'https://rr1---sn.googlevideo.com/videoplayback?id=1',
+        },
+      },
+    ],
+    attachments: [
+      {
+        id: 'att-1',
+        role: 'background_audio',
+        resource: {
+          id: 'res-a1',
+          role: 'audio',
+          delivery: {
+            kind: 'file',
+            sources: [
+              {
+                id: 'as1',
+                url: 'https://rr2---sn.googlevideo.com/audioplayback?id=1',
+                fallback_urls: ['https://rr2---sn.googlevideo.com/audioplayback?id=2'],
+                direct_url: 'https://rr2---sn.googlevideo.com/direct.m4a',
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+
+  const redacted = parseHelpers.redactServerBoundYouTubeMedia(
+    media,
+    { status: 'missing' },
+    'dQw4w9WgXcQ',
+  );
+  const vSrc = redacted.items[0].variants[0].delivery.sources[0];
+  const aSrc = redacted.attachments[0].resource.delivery.sources[0];
+  assert.equal('fallback_urls' in vSrc, false);
+  assert.equal('direct_url' in vSrc, false);
+  assert.equal('fallback_urls' in aSrc, false);
+  assert.equal('direct_url' in aSrc, false);
+});
+
+test('SidePanelResult video preview prefers Weibo direct_url and falls back to relay on @error', async () => {
+  const sdDirect = 'https://f.video.weibocdn.com/o0/direct-sd.mp4?Expires=1999999999&ssig=sd';
+  const sdRelayPath = '/api/media/weibo?ticket=signed%2Bsd';
+  const sdVariant = {
+    id: 'wb-sd',
+    label: 'mp4_sd_url',
+    metadata: {
+      width: 854,
+      height: 480,
+      container: 'mp4',
+      extension: 'mp4',
+      mime_type: 'video/mp4',
+      has_audio: true,
+      evidence: 'upstream',
+    },
+    delivery: {
+      kind: 'file',
+      sources: [
+        {
+          id: 'wb-src-sd',
+          url: sdRelayPath,
+          access: 'relay',
+          direct_url: sdDirect,
+        },
+      ],
+    },
+  };
+  const envelope = makeWeiboRelayEnvelope({}, [sdVariant]);
+
+  const element = (type, text = '') =>
+    markRaw({
+      type,
+      text,
+      props: {},
+      children: [],
+      parent: null,
+      style: {},
+      dataset: {},
+      removeAttribute() {},
+      getAttribute(name) {
+        return this.props[name] ?? null;
+      },
+    });
+  const detach = (node) => {
+    if (node.parent) node.parent.children = node.parent.children.filter((n) => n !== node);
+    node.parent = null;
+  };
+  const renderer = createRenderer({
+    querySelector: () => null,
+    createElement: element,
+    createText: (text) => element('#text', text),
+    createComment: (text) => element('#comment', text),
+    setText(node, text) {
+      node.text = text;
+    },
+    setElementText(node, text) {
+      node.text = text;
+      node.children = [];
+    },
+    parentNode: (node) => node.parent,
+    nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+    insert(node, parent, anchor) {
+      detach(node);
+      node.parent = parent;
+      const idx = parent.children.indexOf(anchor);
+      parent.children.splice(idx < 0 ? parent.children.length : idx, 0, node);
+    },
+    remove: detach,
+    patchProp(node, key, _, value) {
+      node.props[key] = value;
+      if (key === 'src') node.src = value;
+    },
+  });
+
+  const findAll = (node, match) => [
+    ...(match(node) ? [node] : []),
+    ...node.children.flatMap((child) => findAll(child, match)),
+  ];
+
+  const state = reactive({
+    media: envelope.data,
+    workFingerprint: 'weibo:500123456',
+    isSaved: false,
+    settings: {
+      apiBaseUrl: WEIBO_API_ORIGIN,
+      bearerToken: '',
+      qualityPreference: 'best',
+      batchSaveMode: 'subfolder',
+      subfolderPrefix: '',
+      themeMode: 'system',
+    },
+    resolvingItemIds: new Set(),
+  });
+  const root = element('root');
+  const app = renderer.createApp({
+    render: () => h(SidePanelResult, { ...state }),
+  });
+  app.mount(root);
+  await nextTick();
+
+  try {
+    const getVideo = () => findAll(root, (n) => n.type === 'video')[0];
+    const variantButtons = () =>
+      findAll(root, (n) => n.type === 'button' && String(n.props.class || '').includes('sp-variant-card'));
+
+    // Starts on Weibo direct_url
+    const firstVideo = getVideo();
+    assert.ok(firstVideo, 'SidePanelResult should render <video>');
+    assert.equal(firstVideo.src, WEIBO_DIRECT);
+
+    // Trigger @error on direct_url -> cycles previewVideoRouteIndex to relay URL
+    firstVideo.props.onError({ currentTarget: firstVideo });
+    await nextTick();
+    const fallbackVideo = getVideo();
+    assert.ok(fallbackVideo, 'SidePanelResult should fall back to relay <video>');
+    assert.equal(fallbackVideo.src, WEIBO_RELAY_FULL);
+
+    // Late stale @error from firstVideo must NOT skip past relay URL
+    fallbackVideo.props.onError({ currentTarget: firstVideo });
+    await nextTick();
+    assert.equal(getVideo().src, WEIBO_RELAY_FULL);
+
+    // Switching variant resets previewVideoRouteIndex to 0 -> tries sdDirect first
+    const cards = variantButtons();
+    assert.equal(cards.length, 2);
+    cards[1].props.onClick();
+    await nextTick();
+    assert.equal(getVideo().src, sdDirect);
+
+    // Failing sdDirect falls back cleanly to sdRelayPath
+    const sdVideo = getVideo();
+    sdVideo.props.onError({ currentTarget: sdVideo });
+    await nextTick();
+    assert.equal(getVideo().src, WEIBO_API_ORIGIN + sdRelayPath);
+  } finally {
+    app.unmount();
   }
 });
