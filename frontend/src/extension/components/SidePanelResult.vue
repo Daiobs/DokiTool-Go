@@ -672,9 +672,19 @@ async function prepareResolvedChecklistEntries(): Promise<
           current: i + 1,
           total: deferredList.length,
         };
-        const resolved = await requestLazyResolvePromise(deferredList[i].item);
+        const deferredItem = deferredList[i].item;
+        const resolved = await requestLazyResolvePromise(deferredItem);
         if (resolved && readyItem(resolved)) {
-          resolvedById.set(resolved.id, resolved);
+          const originalResolveUrl =
+            deferredItem.state !== "unavailable"
+              ? deferredItem.resolve_url
+              : undefined;
+          resolvedById.set(
+            resolved.id,
+            !resolved.resolve_url && originalResolveUrl
+              ? { ...resolved, resolve_url: originalResolveUrl }
+              : resolved,
+          );
         }
       }
     } finally {
