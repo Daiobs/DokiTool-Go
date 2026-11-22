@@ -1426,7 +1426,9 @@ export function createBackgroundController(
       statusText:
         enrichedSpec.kind === "youtube_mux"
           ? "正在准备 4K 无损合流..."
-          : "正在准备下载...",
+          : enrichedSpec.kind === "dash_mux"
+            ? "正在准备音视频无损合流..."
+            : "正在准备下载...",
       updatedAt: nowFn(),
       retryPayload: { kind: "spec", spec: enrichedSpec },
     };

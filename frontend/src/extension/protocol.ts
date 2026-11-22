@@ -70,6 +70,7 @@ export type OffscreenDownloadKind =
   | "direct_file"
   | "youtube_direct"
   | "youtube_mux"
+  | "dash_mux"
   | "hls"
   | "segments"
   | "batch_zip";
@@ -87,6 +88,14 @@ export interface OffscreenYouTubeMuxSpec {
   videoSize?: number;
   audioSize?: number;
   outputContainer: "mp4" | "webm";
+}
+
+export interface OffscreenDashMuxSpec {
+  videoRoutes: string[];
+  audioRoutes: string[];
+  videoSize?: number;
+  audioSize?: number;
+  outputContainer: "mp4";
 }
 
 export interface OffscreenZipEntrySpec {
@@ -107,6 +116,7 @@ export interface OffscreenDownloadSpec {
   extraAllowedOrigins?: string[];
   segments?: OffscreenSegmentSpec[];
   youtubeMux?: OffscreenYouTubeMuxSpec;
+  dashMux?: OffscreenDashMuxSpec;
   zipEntries?: OffscreenZipEntrySpec[];
 }
 

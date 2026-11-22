@@ -33,6 +33,13 @@ import {
   type YouTubeHelperPlayerResult,
 } from "../utils/youtubeHelperCore";
 import {
+  runDashMuxToOpfs,
+  type DashMuxOpfsSink,
+  type DashMuxTrackFetchParams,
+  type DashMuxTrackFetchResult,
+  type DashMuxWritableLike,
+} from "./dashMuxEngine";
+import {
   MAX_FOLDER_CODE_POINTS,
   buildSafeDownloadPath,
   formatBatchItemIndex,
@@ -44,6 +51,7 @@ import {
   type BatchSaveMode,
   type EnqueueDownloadItem,
   type HandOffBlobDownloadResult,
+  type OffscreenDashMuxSpec,
   type OffscreenDownloadSpec,
   type OffscreenSegmentSpec,
   type OffscreenToBackgroundMessage,
@@ -90,7 +98,7 @@ export class ExtensionDownloadError extends Error {
 
 export interface SelectedVariantPlan {
   variant: ReadyVariant;
-  target: Extract<DownloadTarget, { variant: ReadyVariant }>;
+  target: DownloadTarget;
   isAudioOnly: boolean;
   youtubeMux?: {
     videoUrl: string;
@@ -98,6 +106,132 @@ export interface SelectedVariantPlan {
     videoSize?: number;
     audioSize?: number;
     outputContainer: "mp4" | "webm";
+  };
+  dashMux?: OffscreenDashMuxSpec;
+}
+
+export function videoCodecPreferenceRank(rawCodec: unknown): number {
+  if (typeof rawCodec !== "string") return 0;
+  const lower = rawCodec.trim().toLowerCase();
+  if (!lower) return 0;
+  if (
+    lower === "h264" ||
+    lower === "h.264" ||
+    lower === "avc" ||
+    lower === "avc1" ||
+    lower.startsWith("avc1.") ||
+    lower === "avc3" ||
+    lower.startsWith("avc3.")
+  ) {
+    return 3;
+  }
+  if (
+    lower === "hevc" ||
+    lower === "h265" ||
+    lower === "h.265" ||
+    lower === "hev1" ||
+    lower.startsWith("hev1.") ||
+    lower === "hvc1" ||
+    lower.startsWith("hvc1.")
+  ) {
+    return 2;
+  }
+  if (lower === "av1" || lower === "av01" || lower.startsWith("av01.")) {
+    return 1;
+  }
+  return 0;
+}
+
+function resolveVariantVideoCodec(variant: ReadyVariant): string {
+  const top = variant.metadata?.video_codec;
+  if (typeof top === "string" && top.trim()) return top.trim();
+  if (variant.delivery.kind === "mux") {
+    const vRes = variant.delivery.resources.find((r) => r.role === "video");
+    if (vRes?.metadata?.video_codec?.trim()) {
+      return vRes.metadata.video_codec.trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * Extracts a generic lossless DASH mux spec from a `delivery.kind === "mux"`
+ * variant whose resources contain exactly 1 `video` (`kind: "file"`) and
+ * 1 `audio` (`kind: "file"`) leaf stream with available routes.
+ */
+export function extractFileMuxSpec(
+  variant: ReadyVariant,
+  context: TargetContext = {},
+): OffscreenDashMuxSpec | null {
+  if (variant.delivery.kind !== "mux") return null;
+  const outputContainer = (
+    variant.delivery.output?.container ||
+    variant.delivery.output?.extension ||
+    variant.metadata?.container ||
+    variant.metadata?.extension ||
+    "mp4"
+  )
+    .trim()
+    .toLowerCase();
+  if (outputContainer !== "mp4") {
+    return null;
+  }
+
+  const videoResources = variant.delivery.resources.filter(
+    (r) => r.role === "video",
+  );
+  const audioResources = variant.delivery.resources.filter(
+    (r) => r.role === "audio",
+  );
+  if (videoResources.length !== 1 || audioResources.length !== 1) {
+    return null;
+  }
+  const videoRes = videoResources[0];
+  const audioRes = audioResources[0];
+  if (
+    videoRes.delivery.kind !== "file" ||
+    audioRes.delivery.kind !== "file"
+  ) {
+    return null;
+  }
+
+  const availVideo = availableSources(videoRes.delivery.sources, context.now);
+  const availAudio = availableSources(audioRes.delivery.sources, context.now);
+  if (!availVideo.length || !availAudio.length) {
+    return null;
+  }
+
+  let videoRoutes: string[];
+  let audioRoutes: string[];
+  try {
+    videoRoutes = deliveryRoutes(availVideo, context);
+    audioRoutes = deliveryRoutes(availAudio, context);
+  } catch {
+    return null;
+  }
+  if (!videoRoutes.length || !audioRoutes.length) {
+    return null;
+  }
+
+  const videoSize =
+    typeof availVideo[0]?.size_bytes === "number" &&
+    Number.isSafeInteger(availVideo[0].size_bytes) &&
+    availVideo[0].size_bytes > 0
+      ? availVideo[0].size_bytes
+      : undefined;
+  const audioSize =
+    typeof availAudio[0]?.size_bytes === "number" &&
+    Number.isSafeInteger(availAudio[0].size_bytes) &&
+    availAudio[0].size_bytes > 0
+      ? availAudio[0].size_bytes
+      : undefined;
+
+  return {
+    videoRoutes,
+    audioRoutes,
+    ...(videoSize ? { videoSize } : {}),
+    ...(audioSize ? { audioSize } : {}),
+    outputContainer: "mp4",
   };
 }
 
@@ -146,6 +280,7 @@ interface ScoredCandidate {
   shortEdge: number;
   pixelArea: number;
   fps: number;
+  codecRank: number;
   bitrate: number;
   hasPlayableAudio: boolean;
   isOriginalProvenance: boolean;
@@ -172,11 +307,14 @@ function compareScoredCandidatesDesc(
   if (a.isOriginalProvenance !== b.isOriginalProvenance) {
     return a.isOriginalProvenance ? -1 : 1;
   }
-  if (a.isDirectFile !== b.isDirectFile) {
-    return a.isDirectFile ? -1 : 1;
+  if (a.codecRank !== b.codecRank) {
+    return b.codecRank - a.codecRank;
   }
   if (a.bitrate !== b.bitrate) {
     return b.bitrate - a.bitrate;
+  }
+  if (a.isDirectFile !== b.isDirectFile) {
+    return a.isDirectFile ? -1 : 1;
   }
   if (a.isDefault !== b.isDefault) {
     return a.isDefault ? -1 : 1;
@@ -281,8 +419,8 @@ export function selectVariantByPreference(
 
     for (const att of attachments ?? []) {
       if (
-        att?.resource?.role === "audio" &&
-        att.resource.delivery?.kind === "file"
+        (att?.role === "background_audio" || att?.resource?.role === "audio") &&
+        att.resource?.delivery?.kind === "file"
       ) {
         const avail = availableSources(att.resource.delivery.sources);
         if (!avail.length) continue;
@@ -342,26 +480,43 @@ export function selectVariantByPreference(
     if (item.type !== "audio" && isStandaloneAudioVariant(variant)) {
       continue;
     }
+    const dashMux = extractFileMuxSpec(variant, context);
     const target = getDownloadTarget(item, { variant_id: variant.id }, context);
-    if (!("variant" in target)) {
+    if (!("variant" in target) && !dashMux) {
       continue;
     }
 
+    const videoLeafMeta =
+      variant.delivery.kind === "mux"
+        ? variant.delivery.resources.find((r) => r.role === "video")?.metadata
+        : undefined;
     const meta = variant.metadata;
-    const w = meta?.width && meta.width > 0 ? meta.width : 0;
-    const h = meta?.height && meta.height > 0 ? meta.height : 0;
+    const rawW = meta?.width || videoLeafMeta?.width || 0;
+    const rawH = meta?.height || videoLeafMeta?.height || 0;
+    const w = rawW > 0 ? rawW : 0;
+    const h = rawH > 0 ? rawH : 0;
     const shortEdge =
       w > 0 && h > 0
         ? Math.min(w, h)
         : h || w || inferShortEdgeFromLabel(variant.label);
     const pixelArea = w > 0 && h > 0 ? w * h : shortEdge * shortEdge;
-    const fps = meta?.fps && meta.fps > 0 ? meta.fps : 0;
-    const bitrate = meta?.bitrate_bps || meta?.video_bitrate_bps || 0;
+    const rawFps = meta?.fps || videoLeafMeta?.fps || 0;
+    const fps = rawFps > 0 ? rawFps : 0;
+    const bitrate =
+      meta?.bitrate_bps ||
+      meta?.video_bitrate_bps ||
+      videoLeafMeta?.video_bitrate_bps ||
+      videoLeafMeta?.bitrate_bps ||
+      0;
+    const codecRank = videoCodecPreferenceRank(
+      resolveVariantVideoCodec(variant),
+    );
 
-    let hasPlayableAudio = meta?.has_audio !== false;
+    let hasPlayableAudio = dashMux ? true : meta?.has_audio !== false;
     let youtubeMux: SelectedVariantPlan["youtubeMux"];
 
     if (
+      !dashMux &&
       meta?.has_audio === false &&
       target.kind === "file" &&
       isValidGooglevideoPlaybackUrl(target.url)
@@ -385,10 +540,12 @@ export function selectVariantByPreference(
         target,
         isAudioOnly: item.type === "audio",
         ...(youtubeMux ? { youtubeMux } : {}),
+        ...(dashMux ? { dashMux } : {}),
       },
       shortEdge,
       pixelArea,
       fps,
+      codecRank,
       bitrate,
       hasPlayableAudio,
       isOriginalProvenance: variant.provenance === "original_endpoint",
@@ -629,6 +786,7 @@ interface PreparedLeafItem {
   routes: string[];
   segments?: OffscreenSegmentSpec[];
   youtubeMux?: OffscreenDownloadSpec["youtubeMux"];
+  dashMux?: OffscreenDownloadSpec["dashMux"];
 }
 
 function prepareResourceLeaf(params: {
@@ -782,38 +940,56 @@ export function buildEnqueueItemsForMedia(
 
     if (explicitChoice) {
       const target = getDownloadTarget(item, explicitChoice, context);
+      const explicitVariant = item.variants.find(
+        (v): v is ReadyVariant =>
+          readyVariant(v) && v.id === explicitChoice.variant_id,
+      );
+      const explicitDashMux = explicitVariant
+        ? extractFileMuxSpec(explicitVariant, context)
+        : null;
+
       if (!("variant" in target)) {
-        throw new Error(target.message);
-      }
-      const isAudioOnly =
-        item.type === "audio" || isStandaloneAudioVariant(target.variant);
-      let youtubeMux: SelectedVariantPlan["youtubeMux"];
-      if (
-        target.variant.metadata?.has_audio === false &&
-        target.kind === "file" &&
-        isValidGooglevideoPlaybackUrl(target.url)
-      ) {
-        const pair = selectYouTubeMuxPair(
-          target.variant,
-          item.variants,
-          media.attachments,
-        );
-        if (pair.ok) {
-          youtubeMux = {
-            videoUrl: target.url,
-            audioUrl: sourceUrl(pair.audioSource, context),
-            videoSize: target.source.size_bytes,
-            audioSize: pair.audioSource.size_bytes,
-            outputContainer: pair.outputContainer,
+        if (explicitVariant && explicitDashMux) {
+          plan = {
+            variant: explicitVariant,
+            target,
+            isAudioOnly: false,
+            dashMux: explicitDashMux,
           };
+        } else {
+          throw new Error(target.message);
         }
+      } else {
+        const isAudioOnly =
+          item.type === "audio" || isStandaloneAudioVariant(target.variant);
+        let youtubeMux: SelectedVariantPlan["youtubeMux"];
+        if (
+          target.variant.metadata?.has_audio === false &&
+          target.kind === "file" &&
+          isValidGooglevideoPlaybackUrl(target.url)
+        ) {
+          const pair = selectYouTubeMuxPair(
+            target.variant,
+            item.variants,
+            media.attachments,
+          );
+          if (pair.ok) {
+            youtubeMux = {
+              videoUrl: target.url,
+              audioUrl: sourceUrl(pair.audioSource, context),
+              videoSize: target.source.size_bytes,
+              audioSize: pair.audioSource.size_bytes,
+              outputContainer: pair.outputContainer,
+            };
+          }
+        }
+        plan = {
+          variant: target.variant,
+          target,
+          isAudioOnly,
+          ...(youtubeMux ? { youtubeMux } : {}),
+        };
       }
-      plan = {
-        variant: target.variant,
-        target,
-        isAudioOnly,
-        ...(youtubeMux ? { youtubeMux } : {}),
-      };
     } else {
       plan = selectVariantByPreference(
         item,
@@ -936,6 +1112,31 @@ export function buildEnqueueItemsForMedia(
         youtubeMux: plan.youtubeMux,
       });
       continue;
+    }
+
+    // Generic lossless DASH video+audio mux (e.g. Bilibili 1080p/4K AVC/HEVC/AV1 + AAC)
+    if (plan.dashMux) {
+      const exactTotalBytes =
+        (plan.dashMux.videoSize || 0) + (plan.dashMux.audioSize || 0) ||
+        undefined;
+      leaves.push({
+        title: itemDisplayTitle,
+        entryStem: isMultiItemCollection ? distinctEpisodeTitle : rawWorkTitle,
+        index: isMultiItemCollection ? itemNumber : undefined,
+        totalCount,
+        ext: plan.dashMux.outputContainer,
+        mimeType: "video/mp4",
+        sizeBytes: exactTotalBytes,
+        fallbackUrl: fallbackUrl || media.source_url,
+        specKind: "dash_mux",
+        routes: plan.dashMux.videoRoutes,
+        dashMux: plan.dashMux,
+      });
+      continue;
+    }
+
+    if (!("variant" in plan.target)) {
+      throw new Error("当前暂不支持该媒体交付类型");
     }
 
     const { ext, mimeType } = resolveExtensionForTarget(
@@ -1127,6 +1328,7 @@ export function buildEnqueueItemsForMedia(
         ...(extraAllowedOrigins.length ? { extraAllowedOrigins } : {}),
         ...(leaf.segments ? { segments: leaf.segments } : {}),
         ...(leaf.youtubeMux ? { youtubeMux: leaf.youtubeMux } : {}),
+        ...(leaf.dashMux ? { dashMux: leaf.dashMux } : {}),
       },
     };
   });
@@ -1136,11 +1338,7 @@ export function buildEnqueueItemsForMedia(
 // OPFS Cleanup & Streaming Download/Mux Executor
 // ============================================================================
 
-interface OpfsWritableLike {
-  write(chunk: Uint8Array): Promise<void>;
-  close(): Promise<void>;
-  abort?(reason?: unknown): Promise<void>;
-}
+type OpfsWritableLike = DashMuxWritableLike;
 
 interface OpfsFileHandleLike {
   getFile(): Promise<File | Blob>;
@@ -1622,6 +1820,7 @@ export function createOffscreenDownloadExecutor(
         loaded: number;
         total: number;
         percent?: number;
+        speed?: number;
       },
       force = false,
     ) => {
@@ -1651,14 +1850,27 @@ export function createOffscreenDownloadExecutor(
         percent: Math.max(0, Math.min(99, computedPercent)),
         loaded: update.loaded,
         total: update.total,
-        speed: update.status === "saving" ? 0 : Math.max(0, currentSpeed),
+        speed:
+          update.speed !== undefined
+            ? Math.max(0, update.speed)
+            : update.status === "saving"
+              ? 0
+              : Math.max(0, currentSpeed),
       });
     };
   };
 
-  const openOpfsSink = async (taskId: string, mimeType?: string) => {
+  const openOpfsSink = async (
+    taskId: string,
+    mimeType?: string,
+    tag?: string,
+  ): Promise<DashMuxOpfsSink> => {
     if (opfsStorage && typeof opfsStorage.getDirectory === "function") {
-      const tempName = `${EXTENSION_OPFS_TEMP_PREFIX}${sanitizeOpfsTaskSlug(taskId)}-${nowFn()}-${++tempSeq}.tmp`;
+      const cleanTag =
+        typeof tag === "string" && tag.trim()
+          ? `${sanitizeOpfsTaskSlug(tag)}-`
+          : "";
+      const tempName = `${EXTENSION_OPFS_TEMP_PREFIX}${cleanTag}${sanitizeOpfsTaskSlug(taskId)}-${nowFn()}-${++tempSeq}.tmp`;
       activeOpfsNames.add(tempName);
       const releaseLock = await acquireExclusiveWebLock(webLocks, tempName);
       let root: OpfsDirectoryLike | null = null;
@@ -1693,12 +1905,18 @@ export function createOffscreenDownloadExecutor(
 
         return {
           tempName,
+          rawWritable: writable,
           async write(chunk: Uint8Array) {
             await writable!.write(chunk);
           },
-          async closeAndGetBlob(): Promise<Blob | File> {
+          markWritableClosed() {
             closed = true;
-            await writable!.close();
+          },
+          async closeAndGetBlob(): Promise<Blob | File> {
+            if (!closed) {
+              closed = true;
+              await writable!.close();
+            }
             const rawFile = await handle.getFile();
             if (!rawFile || rawFile.size === 0) {
               await cleanup();
@@ -2592,6 +2810,146 @@ export function createOffscreenDownloadExecutor(
     }
   };
 
+  const executeDashMux = async (
+    taskId: string,
+    spec: OffscreenDownloadSpec,
+    signal: AbortSignal,
+  ): Promise<void> => {
+    const dashMux = spec.dashMux;
+    if (
+      !dashMux ||
+      !Array.isArray(dashMux.videoRoutes) ||
+      dashMux.videoRoutes.length === 0 ||
+      !Array.isArray(dashMux.audioRoutes) ||
+      dashMux.audioRoutes.length === 0
+    ) {
+      throw new ExtensionDownloadError("缺少 DASH 音视频合流参数");
+    }
+
+    activeDynamicAllowedOriginsByTask.set(
+      taskId,
+      getAllowedOriginsForSpec(spec),
+    );
+    const reportProgress = createProgressReporter(taskId, "downloading");
+
+    const fetchTrackToOpfs = async (
+      trackParams: DashMuxTrackFetchParams,
+    ): Promise<DashMuxTrackFetchResult> => {
+      const { role, routes, estimatedSize, signal: trackSignal, onProgress } =
+        trackParams;
+      const trackLabel = role === "video" ? "视频轨" : "音频轨";
+      const trackTag = role === "video" ? "dash-v" : "dash-a";
+      const trackMime = role === "video" ? "video/mp4" : "audio/mp4";
+      let lastError: unknown;
+
+      for (let idx = 0; idx < routes.length; idx++) {
+        throwIfAborted(trackSignal);
+        const route = routes[idx];
+        let sink: DashMuxOpfsSink | null = null;
+        try {
+          const resp = await whitelistedFetch(
+            route,
+            spec,
+            { method: "GET" },
+            trackSignal,
+          );
+          if (resp.status !== 200) {
+            void resp.body?.cancel?.().catch(() => {});
+            throw new ExtensionDownloadError(
+              `${trackLabel}返回 HTTP ${resp.status}`,
+            );
+          }
+          const contentType = resp.headers.get("Content-Type") || "";
+          if (/text\/html|application\/json/i.test(contentType)) {
+            void resp.body?.cancel?.().catch(() => {});
+            throw new ExtensionDownloadError(`${trackLabel}返回了非媒体错误页`);
+          }
+
+          const rawLen = resp.headers.get("Content-Length");
+          const hasEncoding = Boolean(
+            resp.headers.get("Content-Encoding")?.trim(),
+          );
+          const total =
+            (!hasEncoding && rawLen && /^\d+$/.test(rawLen.trim())
+              ? Number(rawLen.trim())
+              : 0) ||
+            estimatedSize ||
+            0;
+
+          sink = await openOpfsSink(taskId, trackMime, trackTag);
+          onProgress({ loaded: 0, total });
+
+          const bytesRead = await streamResponseBodyToWriter({
+            response: resp,
+            write: (chunk) => sink!.write(chunk),
+            signal: trackSignal,
+            onBytes: (_chunkLen, loaded) => {
+              onProgress({ loaded, total });
+            },
+          });
+
+          const blob = await sink.closeAndGetBlob();
+          throwIfAborted(trackSignal);
+          return {
+            blob,
+            sink,
+            byteLength: bytesRead,
+          };
+        } catch (err) {
+          await sink?.cleanup(err);
+          if (isAbortLikeError(err, trackSignal)) {
+            throw err;
+          }
+          lastError = err;
+        }
+      }
+
+      throw lastError instanceof Error
+        ? lastError
+        : new ExtensionDownloadError(`${trackLabel}所有下载线路均失败`);
+    };
+
+    try {
+      const outputSink = await runDashMuxToOpfs({
+        taskId,
+        spec: dashMux,
+        fetchTrackToOpfs,
+        openOpfsSink,
+        signal,
+        mediabunnyMod: options.mediabunnyImpl,
+        onProgress(update) {
+          reportProgress(
+            {
+              status: update.status,
+              statusText: update.statusText,
+              loaded: update.loaded,
+              total: update.total,
+              percent: update.percent,
+              ...(update.status === "muxing" ? { speed: 0 } : {}),
+            },
+            Boolean(update.force),
+          );
+        },
+      });
+
+      try {
+        await handoffSinkAndWaitRelease({
+          taskId,
+          spec: { ...spec, mimeType: spec.mimeType || "video/mp4" },
+          sink: outputSink,
+          signal,
+          reportProgress,
+        });
+      } catch (err) {
+        await outputSink.cleanup(err);
+        throw err;
+      }
+    } finally {
+      activeDynamicAllowedOriginsByTask.delete(taskId);
+      notifyIfIdle();
+    }
+  };
+
   const runSingleTask = async (entry: QueuedTaskEntry): Promise<void> => {
     const { taskId, spec, controller } = entry;
     const { signal } = controller;
@@ -2607,6 +2965,9 @@ export function createOffscreenDownloadExecutor(
           break;
         case "youtube_mux":
           await executeYouTubeMux(taskId, spec, signal);
+          break;
+        case "dash_mux":
+          await executeDashMux(taskId, spec, signal);
           break;
         case "hls":
           await executeHls(taskId, spec, signal);
