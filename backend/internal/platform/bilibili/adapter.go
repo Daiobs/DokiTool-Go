@@ -50,12 +50,7 @@ func adaptWithOptions(raw object, sourceURL string, now int64, shPlay *ShanghaiP
 					matchedShanghai = true
 				}
 				if enableDASH && bestAudio != nil {
-					bestAudioAttachment = object{
-						"id":       "bilibili-audio-" + bvid + "-p" + strconv.FormatInt(current, 10),
-						"role":     "background_audio",
-						"title":    "原声音频 (M4A)",
-						"resource": unified.Clone(bestAudio),
-					}
+					bestAudioAttachment = buildBilibiliAudioAttachment(bvid, current, bestAudio)
 				}
 			}
 		} else {
@@ -198,6 +193,11 @@ func variantsWithOptions(raw object, bvid string, page int64, cid any, now int64
 		digest   string
 		matched  bool
 	}
+	var shAudioTracks, shVideoTracks []ShanghaiDashTrack
+	if shPlay != nil {
+		shAudioTracks = shPlay.DashAudio
+		shVideoTracks = shPlay.DashVideo
+	}
 	audioOptions := make([]dashAudioOption, 0)
 	for _, value := range unified.Slice(child(play, "dash", "audio")) {
 		rawAudio := unified.Map(value)
@@ -206,23 +206,7 @@ func variantsWithOptions(raw object, bvid string, page int64, cid any, now int64
 			continue
 		}
 		audioDigest := digest(unified.PHPIdentityJSON(unified.ResourceIdentity(resource), false))
-		audioMatched := false
-		if shPlay != nil {
-			var shURLs []string
-			for _, shTrack := range shPlay.DashAudio {
-				if dashTrackMatch(shTrack, rawAudio) {
-					shURLs = append(shURLs, shTrack.URLs...)
-				}
-			}
-			shURLs = filterShanghaiURLsAt(shURLs, now)
-			if len(shURLs) > 0 {
-				delivery := unified.Map(resource["delivery"])
-				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
-					delivery["sources"] = merged
-					audioMatched = true
-				}
-			}
-		}
+		audioMatched := prependMatchingShanghaiDashSources(shAudioTracks, rawAudio, resource, now)
 		audioOptions = append(audioOptions, dashAudioOption{resource: resource, digest: audioDigest, matched: audioMatched})
 	}
 	for _, value := range unified.Slice(child(play, "dash", "video")) {
@@ -236,23 +220,7 @@ func variantsWithOptions(raw object, bvid string, page int64, cid any, now int64
 			result = append(result, object{"id": variantID, "state": "deferred", "reason": object{"code": "MISSING_AUDIO_TRACK", "message": "未取得可确认的完整音视频组合，暂不可下载"}})
 			continue
 		}
-		videoMatched := false
-		if shPlay != nil {
-			var shURLs []string
-			for _, shTrack := range shPlay.DashVideo {
-				if dashTrackMatch(shTrack, rawVideo) {
-					shURLs = append(shURLs, shTrack.URLs...)
-				}
-			}
-			shURLs = filterShanghaiURLsAt(shURLs, now)
-			if len(shURLs) > 0 {
-				delivery := unified.Map(video["delivery"])
-				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
-					delivery["sources"] = merged
-					videoMatched = true
-				}
-			}
-		}
+		videoMatched := prependMatchingShanghaiDashSources(shVideoTracks, rawVideo, video, now)
 		for _, audio := range audioOptions {
 			id := variantID + "-" + audio.digest
 			variant := object{"id": id, "delivery": object{"kind": "mux", "resources": array{unified.Clone(video), unified.Clone(audio.resource)}, "output": output()}}
@@ -399,16 +367,68 @@ func dashVariantCodecKey(codecs string, codecID int64) string {
 	return "unknown"
 }
 
+type dashAudioCandidate struct {
+	raw       object
+	resource  object
+	isMP4A    bool
+	idRank    int
+	bandwidth int64
+}
+
+type dashVideoKey struct {
+	qn       int64
+	codecKey string
+}
+
+type dashVideoCandidate struct {
+	raw       object
+	resource  object
+	qn        int64
+	codecKey  string
+	codecRank int
+	pixels    int64
+	bandwidth int64
+}
+
+type dashStreamCandidates struct {
+	videos []dashVideoCandidate
+	audios []dashAudioCandidate
+}
+
 func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool) (array, bool, object) {
-	type dashAudioCandidate struct {
-		raw       object
-		resource  object
-		isMP4A    bool
-		idRank    int
-		bandwidth int64
+	// Step 1: Extract and whitelist-filter raw DASH stream candidates.
+	candidates := extractFilteredDashCandidates(play, now)
+
+	// Step 2: Select optimal audio track, deduplicate/order video tiers, and merge Shanghai sources.
+	bestAudio := selectBestDashAudio(candidates.audios)
+	videos := selectOrderedDashVideos(candidates.videos)
+	if len(videos) == 0 {
+		return nil, false, nil
 	}
-	var bestAudio *dashAudioCandidate
-	for _, value := range unified.Slice(child(play, "dash", "audio")) {
+	matchedAny := false
+	if bestAudio != nil && shPlay != nil {
+		if prependMatchingShanghaiDashSources(shPlay.DashAudio, bestAudio.raw, bestAudio.resource, now) {
+			matchedAny = true
+		}
+		for i := range videos {
+			if prependMatchingShanghaiDashSources(shPlay.DashVideo, videos[i].raw, videos[i].resource, now) {
+				matchedAny = true
+			}
+		}
+	}
+
+	// Step 3: Build mux variants (or audio-less deferred fallbacks) and expose best audio.
+	variants := buildDashMuxVariants(videos, bestAudio, hasDURL)
+	if bestAudio == nil {
+		return variants, false, nil
+	}
+	return variants, matchedAny, bestAudio.resource
+}
+
+func extractFilteredDashCandidates(play object, now int64) dashStreamCandidates {
+	rawAudios := unified.Slice(child(play, "dash", "audio"))
+	audios := make([]dashAudioCandidate, 0, len(rawAudios))
+	for _, value := range rawAudios {
 		rawAudio := unified.Map(value)
 		if rawAudio == nil {
 			continue
@@ -418,55 +438,18 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 			continue
 		}
 		fam := dashCodecFamily(unified.Str(rawAudio["codecs"]), intValue(rawAudio["codecid"]))
-		cand := dashAudioCandidate{
+		audios = append(audios, dashAudioCandidate{
 			raw:       rawAudio,
 			resource:  resource,
 			isMP4A:    fam == "mp4a",
 			idRank:    dashAudioIDRank(intValue(rawAudio["id"])),
 			bandwidth: intValue(rawAudio["bandwidth"]),
-		}
-		if bestAudio == nil ||
-			(cand.isMP4A != bestAudio.isMP4A && cand.isMP4A) ||
-			(cand.isMP4A == bestAudio.isMP4A && (cand.idRank > bestAudio.idRank || (cand.idRank == bestAudio.idRank && cand.bandwidth > bestAudio.bandwidth))) {
-			picked := cand
-			bestAudio = &picked
-		}
+		})
 	}
 
-	audioMatched := false
-	if bestAudio != nil && shPlay != nil {
-		var shURLs []string
-		for _, shTrack := range shPlay.DashAudio {
-			if dashTrackMatch(shTrack, bestAudio.raw) {
-				shURLs = append(shURLs, shTrack.URLs...)
-			}
-		}
-		shURLs = filterShanghaiURLsAt(shURLs, now)
-		if len(shURLs) > 0 {
-			delivery := unified.Map(bestAudio.resource["delivery"])
-			if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
-				delivery["sources"] = merged
-				audioMatched = true
-			}
-		}
-	}
-
-	type dashVideoKey struct {
-		qn       int64
-		codecKey string
-	}
-	type dashVideoCandidate struct {
-		raw       object
-		resource  object
-		qn        int64
-		codecKey  string
-		codecRank int
-		pixels    int64
-		bandwidth int64
-	}
-	byKey := make(map[dashVideoKey]int)
-	videos := make([]dashVideoCandidate, 0)
-	for _, value := range unified.Slice(child(play, "dash", "video")) {
+	rawVideos := unified.Slice(child(play, "dash", "video"))
+	videos := make([]dashVideoCandidate, 0, len(rawVideos))
+	for _, value := range rawVideos {
 		rawVideo := unified.Map(value)
 		if rawVideo == nil {
 			continue
@@ -486,7 +469,7 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 		if w > 0 && h > 0 {
 			pixels = w * h
 		}
-		cand := dashVideoCandidate{
+		videos = append(videos, dashVideoCandidate{
 			raw:       rawVideo,
 			resource:  resource,
 			qn:        qn,
@@ -494,8 +477,34 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 			codecRank: dashVideoCodecRank(codecKey),
 			pixels:    pixels,
 			bandwidth: intValue(rawVideo["bandwidth"]),
+		})
+	}
+
+	return dashStreamCandidates{videos: videos, audios: audios}
+}
+
+func selectBestDashAudio(candidates []dashAudioCandidate) *dashAudioCandidate {
+	var best *dashAudioCandidate
+	for i := range candidates {
+		cand := candidates[i]
+		if best == nil ||
+			(cand.isMP4A != best.isMP4A && cand.isMP4A) ||
+			(cand.isMP4A == best.isMP4A && (cand.idRank > best.idRank || (cand.idRank == best.idRank && cand.bandwidth > best.bandwidth))) {
+			picked := cand
+			best = &picked
 		}
-		key := dashVideoKey{qn: qn, codecKey: codecKey}
+	}
+	return best
+}
+
+func selectOrderedDashVideos(candidates []dashVideoCandidate) []dashVideoCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	byKey := make(map[dashVideoKey]int, len(candidates))
+	videos := make([]dashVideoCandidate, 0, len(candidates))
+	for _, cand := range candidates {
+		key := dashVideoKey{qn: cand.qn, codecKey: cand.codecKey}
 		if idx, exists := byKey[key]; exists {
 			if cand.bandwidth > videos[idx].bandwidth {
 				videos[idx] = cand
@@ -505,11 +514,6 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 		byKey[key] = len(videos)
 		videos = append(videos, cand)
 	}
-
-	if len(videos) == 0 {
-		return nil, false, nil
-	}
-
 	sort.SliceStable(videos, func(i, j int) bool {
 		a, b := videos[i], videos[j]
 		if a.qn != b.qn {
@@ -526,40 +530,50 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 		}
 		return a.codecKey < b.codecKey
 	})
+	return videos
+}
 
+func prependMatchingShanghaiDashSources(shTracks []ShanghaiDashTrack, rawTrack, resource object, now int64) bool {
+	if len(shTracks) == 0 || rawTrack == nil || resource == nil {
+		return false
+	}
+	var shURLs []string
+	for _, shTrack := range shTracks {
+		if dashTrackMatch(shTrack, rawTrack) {
+			shURLs = append(shURLs, shTrack.URLs...)
+		}
+	}
+	shURLs = filterShanghaiURLsAt(shURLs, now)
+	if len(shURLs) == 0 {
+		return false
+	}
+	delivery := unified.Map(resource["delivery"])
+	if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
+		delivery["sources"] = merged
+		return true
+	}
+	return false
+}
+
+func buildDashMuxVariants(videos []dashVideoCandidate, bestAudio *dashAudioCandidate, hasDURL bool) array {
+	if len(videos) == 0 {
+		return nil
+	}
 	if bestAudio == nil {
 		if hasDURL {
-			return nil, false, nil
+			return nil
 		}
 		out := make(array, 0, len(videos))
 		for _, v := range videos {
 			id := "dash-" + strconv.FormatInt(v.qn, 10) + "-" + v.codecKey
 			out = append(out, object{"id": id, "state": "deferred", "reason": object{"code": "MISSING_AUDIO_TRACK", "message": "未取得可确认的完整音视频组合，暂不可下载"}})
 		}
-		return out, false, nil
+		return out
 	}
 
 	out := make(array, 0, len(videos))
-	matchedAny := false
 	audioMeta := unified.Map(bestAudio.resource["metadata"])
 	for _, v := range videos {
-		videoMatched := false
-		if shPlay != nil {
-			var shURLs []string
-			for _, shTrack := range shPlay.DashVideo {
-				if dashTrackMatch(shTrack, v.raw) {
-					shURLs = append(shURLs, shTrack.URLs...)
-				}
-			}
-			shURLs = filterShanghaiURLsAt(shURLs, now)
-			if len(shURLs) > 0 {
-				delivery := unified.Map(v.resource["delivery"])
-				if merged, ok := prependShanghaiSources(shURLs, unified.Slice(delivery["sources"]), now); ok {
-					delivery["sources"] = merged
-					videoMatched = true
-				}
-			}
-		}
 		id := "dash-" + strconv.FormatInt(v.qn, 10) + "-" + v.codecKey
 		variant := object{
 			"id": id,
@@ -580,11 +594,20 @@ func adaptDASHModern(play object, now int64, shPlay *ShanghaiPlay, hasDURL bool)
 			variant["label"] = label
 		}
 		out = append(out, variant)
-		if videoMatched || audioMatched {
-			matchedAny = true
-		}
 	}
-	return out, matchedAny, bestAudio.resource
+	return out
+}
+
+func buildBilibiliAudioAttachment(bvid string, page int64, audioResource object) object {
+	if audioResource == nil {
+		return nil
+	}
+	return object{
+		"id":       "bilibili-audio-" + bvid + "-p" + strconv.FormatInt(page, 10),
+		"role":     "background_audio",
+		"title":    "原声音频 (M4A)",
+		"resource": unified.Clone(audioResource),
+	}
 }
 
 func dashTrack(raw object, role string, now int64) object {
