@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,106 @@ PLATFORM_ORACLES = {
     **{name: (ROOT / "backend/internal/platform" / name / "testdata/php-baseline.json", f"verify-{name}.py")
        for name in ("kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu")},
 }
+_WEIBO_SIGNED_VERIFIER = None
+
+
+def _weibo_signed_verifier():
+    global _WEIBO_SIGNED_VERIFIER
+    if _WEIBO_SIGNED_VERIFIER is None:
+        spec = importlib.util.spec_from_file_location(
+            "dokitool_verify_weibo_signed",
+            ROOT / "scripts/go-migration/verify-weibo-signed.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WEIBO_SIGNED_VERIFIER = module
+    return _WEIBO_SIGNED_VERIFIER
+
+
+def _assert_no_direct_url_key(value, context):
+    if isinstance(value, dict):
+        if "direct_url" in value:
+            raise ValueError(f"Unexpected direct_url in {context}")
+        for child in value.values():
+            _assert_no_direct_url_key(child, context)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_direct_url_key(child, context)
+
+
+def verify_and_strip_weibo_direct_urls(envelope, case, view):
+    """Verify signed Weibo relay sources' direct_url against HMAC tickets and strip for baseline parity.
+
+    Never mutates `envelope`. Returns `(stripped_copy, verified_direct_url_count)`.
+    """
+    case_id = case.get("id", "<unknown>")
+    clone = copy.deepcopy(envelope)
+    if not isinstance(clone, dict) or clone.get("code") != "OK" or not isinstance(clone.get("data"), dict):
+        _assert_no_direct_url_key(clone, f"non-OK weibo payload {case_id}/{view}")
+        return clone, 0
+
+    given = case["input"]
+    key = given["key"]
+    now = given["now"]
+    legacy_data = (case.get("expected") or {}).get("legacy_response", {}).get("data") or {}
+    raw_urls = {
+        entry["url"]
+        for entry in legacy_data.get("video_backup", [])
+        if isinstance(entry, dict) and isinstance(entry.get("url"), str)
+    }
+    verifier = _weibo_signed_verifier()
+    verified_count = 0
+
+    def check_source(source):
+        nonlocal verified_count
+        if not isinstance(source, dict):
+            return
+        url = source.get("url")
+        if source.get("access") == "relay" and isinstance(url, str) and url.startswith("/api/media/weibo?ticket="):
+            verified_raw = verifier.checked_ticket(source, raw_urls, key, now)
+            if "direct_url" not in source or source["direct_url"] != verified_raw:
+                raise ValueError(
+                    f"Weibo relay source direct_url mismatch in {case_id}/{view}: "
+                    f"got {source.get('direct_url')!r}, want {verified_raw!r}"
+                )
+            del source["direct_url"]
+            verified_count += 1
+        elif "direct_url" in source:
+            raise ValueError(f"Non-relay Weibo source unexpectedly carried direct_url in {case_id}/{view}")
+
+    def check_delivery(delivery):
+        if not isinstance(delivery, dict):
+            return
+        for source in delivery.get("sources") or ():
+            check_source(source)
+        init_chunk = delivery.get("init")
+        if isinstance(init_chunk, dict):
+            for source in init_chunk.get("sources") or ():
+                check_source(source)
+        for piece in delivery.get("pieces") or ():
+            if isinstance(piece, dict):
+                for source in piece.get("sources") or ():
+                    check_source(source)
+        for resource in delivery.get("resources") or ():
+            if isinstance(resource, dict):
+                check_delivery(resource.get("delivery"))
+
+    data = clone["data"]
+    for item in data.get("items") or ():
+        if not isinstance(item, dict):
+            continue
+        selected = item.get("default")
+        if isinstance(selected, dict) and "direct_url" in selected:
+            raise ValueError(f"Weibo item.default must not carry direct_url in {case_id}/{view}")
+        for variant in item.get("variants") or ():
+            if isinstance(variant, dict):
+                check_delivery(variant.get("delivery"))
+    for attachment in data.get("attachments") or ():
+        if isinstance(attachment, dict):
+            resource = attachment.get("resource")
+            if isinstance(resource, dict):
+                check_delivery(resource.get("delivery"))
+    return clone, verified_count
 
 
 def run(command, *, cwd=ROOT, env=None):
@@ -71,11 +173,21 @@ def verify_platform_exports(path, frozen_path, name):
     frozen, actual = case_index(read_json(frozen_path)), case_index(read_json(path))
     if frozen.keys() != actual.keys():
         raise ValueError(f"Actual Go {name} export inventory mismatch")
+    verified_direct_urls = 0
     for case_id, case in frozen.items():
         for view in ("normal", "debug"):
-            if view not in actual[case_id] or not same_json(case["expected"][view], actual[case_id][view]):
+            if view not in actual[case_id]:
                 raise ValueError(f"Undeclared {name} public response difference: {case_id}/{view}")
-    return {"passed": True, "cases": len(frozen), "public_envelopes": 2 * len(frozen), "declared_differences": 0}
+            observed = actual[case_id][view]
+            if name == "weibo":
+                observed, count = verify_and_strip_weibo_direct_urls(observed, case, view)
+                verified_direct_urls += count
+            if not same_json(case["expected"][view], observed):
+                raise ValueError(f"Undeclared {name} public response difference: {case_id}/{view}")
+    result = {"passed": True, "cases": len(frozen), "public_envelopes": 2 * len(frozen), "declared_differences": 0}
+    if name == "weibo":
+        result["verified_direct_urls"] = verified_direct_urls
+    return result
 
 
 def main():

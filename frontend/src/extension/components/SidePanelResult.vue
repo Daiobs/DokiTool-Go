@@ -62,6 +62,7 @@ const emit = defineEmits<{
 
 const apiOrigin = computed(() => resolveSafeApiOrigin(props.settings.apiBaseUrl));
 const targetContext = computed(() => buildExtensionTargetContext(apiOrigin.value));
+const copyTargetContext = computed(() => ({ apiOrigin: apiOrigin.value }));
 
 const layoutKind = computed(() => classifyMediaLayout(props.media));
 
@@ -448,13 +449,17 @@ const directCopyCandidateUrl = computed<string>(() => {
   if (isDashMuxSelected.value) {
     return "";
   }
-  if (activeSelectedOption.value?.directUrl) {
-    return activeSelectedOption.value.directUrl;
+  const opt = activeSelectedOption.value;
+  if (opt?.copyUrl) {
+    return opt.copyUrl;
+  }
+  if (opt?.directUrl) {
+    return opt.directUrl;
   }
   if (activeItem.value?.type === "live_photo") {
     return (
-      resolveLiveResourceUrl(activeItem.value, "motion") ||
-      resolveLiveResourceUrl(activeItem.value, "image")
+      resolveLiveResourceUrl(activeItem.value, "motion", copyTargetContext.value) ||
+      resolveLiveResourceUrl(activeItem.value, "image", copyTargetContext.value)
     );
   }
   return props.media.source_url || "";
@@ -533,6 +538,7 @@ function handleSinglePrimaryDownload() {
 function resolveLiveResourceRoutes(
   item: MediaItem,
   role: "image" | "motion",
+  ctx = targetContext.value,
 ): string[] {
   if (!readyItem(item)) return [];
   const pairVar = item.variants.find(
@@ -542,10 +548,10 @@ function resolveLiveResourceRoutes(
   const res = pairVar.delivery.resources.find((r) =>
     role === "motion" ? r.role === "motion" || r.role === "video" : r.role === "image",
   );
-  const src = res ? resourceSource(res, targetContext.value) : undefined;
+  const src = res ? resourceSource(res, ctx) : undefined;
   if (!src) return [];
   try {
-    return sourceRoutes(src, targetContext.value);
+    return sourceRoutes(src, ctx);
   } catch {
     return [];
   }
@@ -554,8 +560,9 @@ function resolveLiveResourceRoutes(
 function resolveLiveResourceUrl(
   item: MediaItem,
   role: "image" | "motion",
+  ctx = targetContext.value,
 ): string {
-  const routes = resolveLiveResourceRoutes(item, role);
+  const routes = resolveLiveResourceRoutes(item, role, ctx);
   if (routes.length > 0) return routes[0];
   return "";
 }

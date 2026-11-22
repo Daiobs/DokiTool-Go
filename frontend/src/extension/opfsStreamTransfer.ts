@@ -205,6 +205,7 @@ export async function whitelistedFetch(
 
   const resp = await fetchFn(rawUrl, {
     ...init,
+    cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
     signal,

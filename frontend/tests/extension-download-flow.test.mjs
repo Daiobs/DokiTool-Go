@@ -9793,3 +9793,146 @@ test("[PR-A Item 2] Extension Weibo anonymous relay direct_url: direct-first, 40
     }
   }
 });
+
+test("[PR-A R2 B2] whitelistedFetch, direct_file (parallel + sequential), and dash_mux enforce cache: 'no-store' on all media fetches", async () => {
+  // 1) Direct whitelistedFetch overrides caller-provided cache mode (e.g. force-cache -> no-store)
+  {
+    const seenInits = [];
+    const resp = await opfsStreamTransferMod.whitelistedFetch(
+      async (_url, init) => {
+        seenInits.push(init);
+        return new Response(new Uint8Array([1, 2, 3, 4]), {
+          status: 200,
+          headers: { "Content-Type": "video/mp4", "Content-Length": "4" },
+        });
+      },
+      "https://upos-sz-mirrorcos.bilivideo.com/cache-test.mp4",
+      {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/cache-test.mp4"],
+        filename: "cache-test.mp4",
+      },
+      { cache: "force-cache", headers: { Range: "bytes=0-3" } },
+      new AbortController().signal,
+    );
+    assert.equal(resp.status, 200);
+    assert.equal(seenInits.length, 1);
+    assert.equal(seenInits[0]?.cache, "no-store", "whitelistedFetch must enforce cache: no-store");
+    assert.equal(seenInits[0]?.credentials, "omit");
+    assert.equal(seenInits[0]?.referrerPolicy, "no-referrer");
+  }
+
+  // 2) Parallel direct_file Range fetches ALL pass cache: "no-store"
+  {
+    const payload = makeDeterministicPayload(16_384, 51);
+    const opfs = createMockOpfs();
+    const seenCaches = [];
+    const result = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: "b2-direct-parallel",
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/b2-parallel.mp4"],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/b2-parallel.mp4"],
+        filename: "b2-parallel.mp4",
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 4096,
+      minParallelRangeBytes: 8192,
+      fetchFn: async (_url, init) => {
+        seenCaches.push(init?.cache);
+        const parsed = parseTestRangeHeader(init?.headers?.Range);
+        const start = parsed ? parsed.start : 0;
+        const end = parsed && parsed.end !== null ? Math.min(payload.byteLength - 1, parsed.end) : payload.byteLength - 1;
+        const slice = payload.subarray(start, end + 1);
+        return new Response(slice, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+            "Content-Length": String(slice.byteLength),
+          },
+        });
+      },
+    });
+    await result.sink.cleanup();
+    assert.equal(result.parallelUsed, true);
+    assert.ok(seenCaches.length >= 4, `expected >= 4 Range fetches, got ${seenCaches.length}`);
+    assert.ok(
+      seenCaches.every((c) => c === "no-store"),
+      `all parallel direct_file fetches must pass cache: no-store, got ${JSON.stringify(seenCaches)}`,
+    );
+  }
+
+  // 3) dash_mux video + audio fetches ALL pass cache: "no-store"
+  {
+    const muxFixture = await createSyntheticDashTrackBuffers("avc");
+    const opfs = createMockOpfs();
+    const seenVideoCaches = [];
+    const seenAudioCaches = [];
+    let handoffSize = 0;
+    const videoUrl = "https://upos-sz-mirrorcos.bilivideo.com/b2-dash-video.m4s";
+    const audioUrl = "https://upos-sz-mirrorcos.bilivideo.com/b2-dash-audio.m4s";
+    await dashMuxDownloadMod.executeDashMux({
+      taskId: "b2-dash-cache",
+      spec: {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        filename: "b2-dash.mp4",
+        mimeType: "video/mp4",
+        dashMux: {
+          videoRoutes: [videoUrl],
+          audioRoutes: [audioUrl],
+          videoSize: muxFixture.videoBytes.byteLength,
+          audioSize: muxFixture.audioBytes.byteLength,
+          outputContainer: "mp4",
+        },
+      },
+      fetchFn: async (url, init) => {
+        const s = String(url);
+        const buf = s === videoUrl ? muxFixture.videoBytes : muxFixture.audioBytes;
+        if (s === videoUrl) seenVideoCaches.push(init?.cache);
+        else seenAudioCaches.push(init?.cache);
+        const parsed = parseTestRangeHeader(init?.headers?.Range);
+        if (parsed) {
+          const end = parsed.end !== null ? Math.min(buf.byteLength - 1, parsed.end) : buf.byteLength - 1;
+          const slice = buf.subarray(parsed.start, end + 1);
+          return new Response(slice, {
+            status: 206,
+            headers: {
+              "Content-Type": s === videoUrl ? "video/mp4" : "audio/mp4",
+              "Content-Range": `bytes ${parsed.start}-${end}/${buf.byteLength}`,
+              "Content-Length": String(slice.byteLength),
+            },
+          });
+        }
+        return new Response(buf, {
+          status: 200,
+          headers: {
+            "Content-Type": s === videoUrl ? "video/mp4" : "audio/mp4",
+            "Content-Length": String(buf.byteLength),
+          },
+        });
+      },
+      opfsStorage: opfs.storage,
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      reportProgress: () => {},
+      handoffSinkAndWaitRelease: async ({ sink }) => {
+        const blob = await sink.closeAndGetBlob();
+        handoffSize = blob.size;
+        await sink.cleanup();
+      },
+    });
+    assert.ok(handoffSize > 0, "expected muxed output blob");
+    assert.ok(seenVideoCaches.length >= 1 && seenAudioCaches.length >= 1);
+    assert.ok(
+      [...seenVideoCaches, ...seenAudioCaches].every((c) => c === "no-store"),
+      `all dash_mux fetches must pass cache: no-store, got video=${JSON.stringify(seenVideoCaches)} audio=${JSON.stringify(seenAudioCaches)}`,
+    );
+    assert.equal(opfs.files.size, 0);
+  }
+});

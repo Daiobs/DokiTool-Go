@@ -717,6 +717,7 @@
     "scripts/test-unified-schema.py",
     "scripts/tests/test_bump_runtime_pins.py",
     "scripts/tests/test_upstream_updates.py",
+    "scripts/tests/test_weibo_direct_url_oracle.py",
     "scripts/third-party-notices.py",
     "scripts/validate-unified-schema.py"
   ]

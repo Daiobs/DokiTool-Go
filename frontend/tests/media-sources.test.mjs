@@ -1036,3 +1036,164 @@ test('SidePanelResult video preview prefers Weibo direct_url and falls back to r
     app.unmount();
   }
 });
+
+test('PR-A R2 M1: SidePanel copy direct link preserves signed relay URL for anonymous Weibo while keeping extension preview/download on direct_url', async () => {
+  const { buildSidePanelQualityOptions, buildSingleDownloadEnqueueItem } = uiTargetHelpers;
+  const { createRenderer, h, markRaw, nextTick, reactive } = await import('vue');
+
+  // 1) Anonymous relay Weibo: preview/download stay direct_url first, copyUrl & fallbackUrl use signed relay URL
+  const anonEnvelope = makeWeiboRelayEnvelope();
+  const anonItem = anonEnvelope.data.items[0];
+  const anonOptions = buildSidePanelQualityOptions(anonEnvelope.data, anonItem, WEIBO_API_ORIGIN);
+  assert.equal(anonOptions.length, 1);
+  assert.equal(anonOptions[0].directUrl, WEIBO_DIRECT, 'extension internal directUrl stays on direct_url');
+  assert.deepEqual(anonOptions[0].routes, [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  assert.equal(anonOptions[0].copyUrl, WEIBO_RELAY_FULL, 'external copyUrl must stay on signed relay URL');
+
+  const enqueueItem = buildSingleDownloadEnqueueItem({
+    media: anonEnvelope.data,
+    item: anonItem,
+    option: anonOptions[0],
+    settings: {
+      apiBaseUrl: WEIBO_API_ORIGIN,
+      bearerToken: '',
+      qualityPreference: 'best',
+      batchSaveMode: 'subfolder',
+      subfolderPrefix: '',
+      themeMode: 'system',
+    },
+  });
+  assert.equal(enqueueItem.spec.kind, 'direct_file');
+  assert.deepEqual(enqueueItem.spec.routes, [WEIBO_DIRECT, WEIBO_RELAY_FULL]);
+  assert.equal(enqueueItem.fallbackUrl, WEIBO_RELAY_FULL, 'external fallbackUrl must use signed relay URL');
+
+  // 2) Owner direct Weibo (access === "direct", no direct_url): copyUrl === directUrl
+  const ownerEnvelope = structuredClone(anonEnvelope);
+  ownerEnvelope.data.items[0].default = {
+    variant_id: 'wb-1080p',
+    source_id: 'wb-src-1080p',
+    url: WEIBO_DIRECT,
+    access: 'direct',
+  };
+  ownerEnvelope.data.items[0].variants[0].delivery.sources = [
+    {
+      id: 'wb-src-1080p',
+      url: WEIBO_DIRECT,
+      access: 'direct',
+    },
+  ];
+  const ownerOptions = buildSidePanelQualityOptions(
+    ownerEnvelope.data,
+    ownerEnvelope.data.items[0],
+    WEIBO_API_ORIGIN,
+  );
+  assert.equal(ownerOptions[0].directUrl, WEIBO_DIRECT);
+  assert.equal(ownerOptions[0].copyUrl, WEIBO_DIRECT, 'owner direct source keeps direct CDN copyUrl');
+
+  // 3) SidePanelResult.vue copy button actually copies signed relay URL (NOT Referer-locked weibocdn.com)
+  const copiedTexts = [];
+  const origNavDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      clipboard: {
+        async writeText(text) {
+          copiedTexts.push(text);
+        },
+      },
+    },
+  });
+
+  const element = (type, text = '') =>
+    markRaw({
+      type,
+      text,
+      props: {},
+      children: [],
+      parent: null,
+      style: {},
+      dataset: {},
+      removeAttribute() {},
+      getAttribute(name) {
+        return this.props[name] ?? null;
+      },
+    });
+  const detach = (node) => {
+    if (node.parent) node.parent.children = node.parent.children.filter((n) => n !== node);
+    node.parent = null;
+  };
+  const renderer = createRenderer({
+    querySelector: () => null,
+    createElement: element,
+    createText: (text) => element('#text', text),
+    createComment: (text) => element('#comment', text),
+    setText(node, text) {
+      node.text = text;
+    },
+    setElementText(node, text) {
+      node.text = text;
+      node.children = [];
+    },
+    parentNode: (node) => node.parent,
+    nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+    insert(node, parent, anchor) {
+      detach(node);
+      node.parent = parent;
+      const idx = parent.children.indexOf(anchor);
+      parent.children.splice(idx < 0 ? parent.children.length : idx, 0, node);
+    },
+    remove: detach,
+    patchProp(node, key, _, value) {
+      node.props[key] = value;
+      if (key === 'src') node.src = value;
+    },
+  });
+  const findAll = (node, match) => [
+    ...(match(node) ? [node] : []),
+    ...node.children.flatMap((child) => findAll(child, match)),
+  ];
+  const textOf = (node) => (node.text || '') + node.children.map(textOf).join('');
+
+  const state = reactive({
+    media: anonEnvelope.data,
+    workFingerprint: 'weibo:500123456',
+    isSaved: false,
+    settings: {
+      apiBaseUrl: WEIBO_API_ORIGIN,
+      bearerToken: '',
+      qualityPreference: 'best',
+      batchSaveMode: 'subfolder',
+      subfolderPrefix: '',
+      themeMode: 'system',
+    },
+    resolvingItemIds: new Set(),
+  });
+  const root = element('root');
+  const app = renderer.createApp({
+    render: () => h(SidePanelResult, { ...state }),
+  });
+  app.mount(root);
+  await nextTick();
+
+  try {
+    // Video preview stays on Weibo direct_url
+    const videoEl = findAll(root, (n) => n.type === 'video')[0];
+    assert.equal(videoEl?.src, WEIBO_DIRECT);
+
+    // Clicking "复制直链" copies signed relay URL
+    const copyBtn = findAll(
+      root,
+      (n) => n.type === 'button' && textOf(n).includes('复制直链'),
+    )[0];
+    assert.ok(copyBtn, 'expected 复制直链 button in SidePanelResult');
+    await copyBtn.props.onClick();
+    assert.deepEqual(copiedTexts, [WEIBO_RELAY_FULL]);
+  } finally {
+    app.unmount();
+    if (origNavDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', origNavDescriptor);
+    } else {
+      delete globalThis.navigator;
+    }
+  }
+});

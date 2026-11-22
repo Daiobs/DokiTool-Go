@@ -622,6 +622,13 @@ export interface SidePanelQualityOption {
   resolvedExt: string;
   formatMime?: string;
   directUrl: string;
+  /**
+   * External/clipboard-safe URL for user-initiated "copy direct link" or
+   * browser-tab fallback: preserves signed relay URLs for `access === "relay"`
+   * sources (which would 403 outside extension DNR), while matching `directUrl`
+   * for direct/owner sources.
+   */
+  copyUrl: string;
   routes: string[];
 }
 
@@ -1036,7 +1043,12 @@ export function buildSidePanelQualityOptions(
   options?: { now?: number },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
-  const ctx = buildExtensionTargetContext(rawApiOrigin, options?.now);
+  const resolvedApiOrigin = resolveSafeApiOrigin(rawApiOrigin);
+  const ctx = buildExtensionTargetContext(resolvedApiOrigin, options?.now);
+  const copyCtx: TargetContext =
+    options?.now !== undefined
+      ? { apiOrigin: resolvedApiOrigin, now: options.now }
+      : { apiOrigin: resolvedApiOrigin };
   const attachments = media.attachments ?? [];
   const isYouTube = media.platform === "youtube";
 
@@ -1091,13 +1103,19 @@ export function buildSidePanelQualityOptions(
       (item.type === "video" && meta.has_audio !== false);
 
     let directUrl = "";
+    let copyUrl = "";
     let routes: string[] = [];
     if (isDashMux && dashMux) {
       // Do NOT expose a broken video-only .m4s URL as directUrl
       directUrl = "";
+      copyUrl = "";
       routes = dashMux.videoRoutes;
     } else if (target.kind === "file") {
       directUrl = target.url;
+      copyUrl =
+        target.source.access === "relay"
+          ? sourceUrl(target.source, copyCtx)
+          : directUrl;
       const tbCandidate =
         item.type === "video" &&
         (media.platform === "pipigx" || media.platform === "zuiyou") &&
@@ -1117,10 +1135,14 @@ export function buildSidePanelQualityOptions(
     ) {
       routes = deliveryRoutes(variant.delivery.sources, ctx);
       directUrl = routes[0] ?? "";
+      copyUrl = deliveryRoutes(variant.delivery.sources, copyCtx)[0] ?? directUrl;
     } else if (variant.delivery.kind === "segments") {
       const firstPiece = variant.delivery.init ?? variant.delivery.pieces[0];
       routes = firstPiece ? deliveryRoutes(firstPiece.sources, ctx) : [];
       directUrl = routes[0] ?? "";
+      copyUrl =
+        (firstPiece ? deliveryRoutes(firstPiece.sources, copyCtx)[0] : "") ||
+        directUrl;
     } else if (variant.delivery.kind === "pair") {
       const motionRes = variant.delivery.resources.find(
         (r) => r.role === "motion" || r.role === "video",
@@ -1130,8 +1152,13 @@ export function buildSidePanelQualityOptions(
         try {
           routes = sourceRoutes(motionSrc, ctx);
           directUrl = routes[0] ?? "";
+          copyUrl =
+            motionSrc.access === "relay"
+              ? sourceUrl(motionSrc, copyCtx)
+              : directUrl;
         } catch {
           directUrl = "";
+          copyUrl = "";
         }
       }
     }
@@ -1255,6 +1282,7 @@ export function buildSidePanelQualityOptions(
       resolvedExt,
       formatMime,
       directUrl,
+      copyUrl,
       routes,
     });
   }
@@ -1382,6 +1410,10 @@ export function buildSidePanelQualityOptions(
           resolvedExt,
           formatMime,
           directUrl: attUrl,
+          copyUrl:
+            primarySrc.access === "relay"
+              ? sourceUrl(primarySrc, copyCtx)
+              : attUrl,
           routes: attRoutes,
         });
       }
@@ -1961,7 +1993,7 @@ export function buildSingleDownloadEnqueueItem(params: {
     title: stem,
     platform: media.platform,
     ...(workFingerprint ? { workFingerprint } : {}),
-    fallbackUrl: option.directUrl || media.source_url,
+    fallbackUrl: option.copyUrl || option.directUrl || media.source_url,
     ...(refreshContext ? { refreshContext } : {}),
     spec,
   };
@@ -2228,7 +2260,7 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       title: episodeStem ? `${subfolder} - ${episodeStem}` : `${subfolder} #${ordinalIndex}`,
       platform: media.platform,
       ...(workFingerprint ? { workFingerprint } : {}),
-      fallbackUrl: chosen.directUrl || media.source_url,
+      fallbackUrl: chosen.copyUrl || chosen.directUrl || media.source_url,
       ...(refreshContext ? { refreshContext } : {}),
       spec,
     });
