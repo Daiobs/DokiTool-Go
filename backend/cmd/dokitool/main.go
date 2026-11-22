@@ -250,7 +250,7 @@ func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai do
 			}
 		}
 	}
-	return douyinParser, bilibiliParser
+	return douyinParser, bilibiliParser.WithDASH(true)
 }
 
 // An existing #27 endpoint remains opt-in for direct mode. Pull never invokes that endpoint.
@@ -375,26 +375,6 @@ func startAPIKeySignalReloader(
 			<-doneCh
 		})
 	}
-}
-
-func loadOwnerAuth(getenv func(string) string) (api.OwnerAuth, error) {
-	auth, err := api.LoadOwnerAuth(getenv)
-	if err != nil || !auth.Enabled() {
-		return auth, err
-	}
-	ownerToken := getenv("DOKITOOL_OWNER_TOKEN")
-	for _, key := range []string{
-		"SNAP_INGRESS_KEY",
-		"SNAP_MEDIA_SIGNING_KEY",
-		"DOKITOOL_SHANGHAI_TOKEN",
-		"DOKITOOL_SHANGHAI_PULL_TOKEN",
-	} {
-		other := getenv(key)
-		if other != "" && subtle.ConstantTimeCompare([]byte(ownerToken), []byte(other)) == 1 {
-			return api.OwnerAuth{}, errors.New("DOKITOOL_OWNER_TOKEN requires a dedicated credential")
-		}
-	}
-	return auth, nil
 }
 
 func newXHSExecutor(mode string) (fetch.Executor, error) {

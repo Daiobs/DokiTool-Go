@@ -914,11 +914,12 @@ func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
 	if sp, ok := shanghai.(shresolver.StatsProvider); ok {
 		h.Stats().SetShanghaiSource(sp)
 	}
-	ownerAuth, err := loadOwnerAuth(getenv)
+	adm := api.DefaultAdmissionConfig()
+	keyRegistry, err := api.LoadAPIKeyRegistry(getenv, adm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, err := api.WithAdmissionWithOwner(h, control, "direct", "", api.DefaultAdmissionConfig(), ownerAuth)
+	entry, err := api.WithAdmissionWithRegistry(h, control, "direct", "", adm, keyRegistry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1181,14 +1182,14 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 				t.Fatal(err)
 			}
 			h.Stats().SetShanghaiSource(broker)
-			ownerAuth, err := loadOwnerAuth(getenv)
-			if err != nil {
-				t.Fatal(err)
-			}
 			adm := api.DefaultAdmissionConfig()
 			adm.Parse.ClientBurst = 50
 			adm.Parse.ClientRPS = 50
-			entry, err := api.WithAdmissionWithOwner(h, control, "direct", "", adm, ownerAuth)
+			keyRegistry, err := api.LoadAPIKeyRegistry(getenv, adm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, err := api.WithAdmissionWithRegistry(h, control, "direct", "", adm, keyRegistry)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1779,3 +1780,65 @@ func TestServeAPIKeysFileStartupValidationAndSIGHUPHotReload(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestNewShanghaiParsersEnablesBilibiliDASH(t *testing.T) {
+	const (
+		bvid    = "BV1234567890"
+		nowUnix = int64(1800000000)
+		dlUnix  = int64(1800007200)
+	)
+	viewBody := `{"code":0,"data":{"title":"DASH Wiring","pages":[{"page":1,"cid":101,"part":"P1","duration":60}]}}`
+	durlBody := fmt.Sprintf(`{"code":0,"data":{"quality":64,"durl":[{"url":"https://upos-sz-mirrorcosov.bilivideo.com/101-64.mp4?deadline=%d","width":1280,"height":720}]}}`, dlUnix)
+	dashBody := fmt.Sprintf(`{"code":0,"data":{"quality":80,"dash":{"video":[{"id":80,"codecid":7,"codecs":"avc1.640028","width":1920,"height":1080,"bandwidth":2200000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/101-80.m4s?deadline=%d"}],"audio":[{"id":30280,"codecid":0,"codecs":"mp4a.40.2","bandwidth":192000,"baseUrl":"https://upos-sz-mirrorcosov.bilivideo.com/101-30280.m4s?deadline=%d"}]}}}`, dlUnix, dlUnix)
+
+	for _, withShanghai := range []bool{false, true} {
+		name := "standalone"
+		if withShanghai {
+			name = "shanghai-backed"
+		}
+		t.Run(name, func(t *testing.T) {
+			var dashCalls atomic.Int32
+			exec := fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-view":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(viewBody)}, nil
+				case "bilibili-play":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(durlBody)}, nil
+				case "bilibili-play-dash":
+					dashCalls.Add(1)
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: []byte(dashBody)}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected purpose %q", req.Policy.Purpose)
+				}
+			})
+			var sh douyin.OriginalResolver
+			if withShanghai {
+				broker, err := shresolver.NewPullBroker(randomHexToken(t, 24))
+				if err != nil {
+					t.Fatal(err)
+				}
+				broker.WithBilibili(true)
+				sh = broker
+			}
+			_, biliParser := newShanghaiParsers(exec, probe.New(exec, douyin.AllowedMediaURL), sh)
+			env, err := biliParser.Parse(context.Background(), "https://www.bilibili.com/video/"+bvid+"/", nowUnix)
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			if err := unified.ValidateEnvelopeAt(env, nowUnix); err != nil {
+				t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+			}
+			if dashCalls.Load() != 1 {
+				t.Fatalf("dashCalls = %d, want 1", dashCalls.Load())
+			}
+			data := unified.Map(env["data"])
+			if len(unified.Slice(data["attachments"])) != 1 {
+				t.Fatalf("expected 1 audio attachment, got %v", data["attachments"])
+			}
+			variants := unified.Slice(unified.Map(unified.Slice(data["items"])[0])["variants"])
+			if len(variants) != 2 || unified.Str(unified.Map(variants[1])["id"]) != "dash-80-avc" {
+				t.Fatalf("expected [durl, dash-80-avc], got %v", variants)
+			}
+		})
+	}
+}
