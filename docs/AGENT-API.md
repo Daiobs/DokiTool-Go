@@ -258,7 +258,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.4 `GET /api/stats` — 查询进程内只读运行统计快照
 
-提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `owner` 三池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`yt-dlp` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态及端到端解析耗时直方图。仅统计聚合计数器与密钥标识，不含任何 URL、IP、明文令牌或摘要内容。
+提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `owner` 三池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`yt-dlp` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
 
 - **认证**：**严格要求 `owner` 角色 Bearer 凭据**（`DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥）。缺失、错误、已停用（`enabled: false`）、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或未配置任何启用密钥时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）；携带合法 `agent` 或 `friend` 角色密钥访问时同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥 `unauthorized` 计数，不扣减匿名单 IP 配额）。**通过 `owner` 鉴权的 `/api/stats` 请求不占用并发槽位，也不计入 `requests` 解析统计**。
 - **HTTP 方法与查询参数**：
@@ -544,15 +544,74 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
           "wait_ms_total": 0,
           "wait_ms_max": 0
         }
+      ],
+      "runtime": {
+        "version": "1.0.0",
+        "shanghai_mode": "pull",
+        "shanghai_bilibili": true,
+        "bilibili_dash": false,
+        "youtube_helper": true,
+        "xhs_transport": "chrome131",
+        "ytdlp_enabled": true,
+        "ytdlp_generic_enabled": false,
+        "tbvideo_pipigx": false,
+        "tbvideo_zuiyou": false,
+        "stats_persistence_enabled": true
+      },
+      "daily": [
+        {
+          "date": "2026-11-15",
+          "total": 128,
+          "ok": 128,
+          "failed": 0,
+          "cache_hits": 24,
+          "shanghai_hits": 70,
+          "latency_ms": {
+            "p50_ms": 250,
+            "p95_ms": 1000,
+            "max_ms": 2140
+          },
+          "by_platform": {
+            "douyin": {
+              "total": 100,
+              "ok": 100,
+              "failed": 0,
+              "by_code": {
+                "OK": 100
+              },
+              "p95_ms": 500
+            },
+            "x": {
+              "total": 28,
+              "ok": 28,
+              "failed": 0,
+              "by_code": {
+                "OK": 28
+              },
+              "p95_ms": 1000
+            }
+          }
+        }
+      ],
+      "hourly": [
+        {
+          "hour_start": "2026-11-15T09:00:00+08:00",
+          "total": 128,
+          "ok": 128,
+          "failed": 0,
+          "cache_hits": 24
+        }
       ]
     }
   }
   ```
 - **核心统计字段说明**：
-  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 为 14 个内置平台 ID 加 `"unknown"`（共 15 个闭合枚举）；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
+  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 遵循受控规范化模式 `^[a-z0-9][a-z0-9_:-]{0,31}$`（最长 32 字节），覆盖 14 个核心平台 ID、`"unknown"`、上限 64 个动态长尾提取器标识及溢出桶 `"ytdlp_other"`；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
   - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（`admission.owner` 汇总 `owner` 角色池快照，保持向后兼容）。
   - `api_keys[*]`：按配置顺序返回每把已注册 API 密钥（最多 `64` 项，未配置时为空数组 `[]`；已停用密钥仍以 `enabled: false` 保留在列表中，绝不返回令牌或 SHA-256 摘要）的实时并发与累计指标，包含固定 22 个字段：`id`、`role`（`"owner"` / `"agent"` / `"friend"`）、`enabled`、`active`、`slow_active`、`queued`、`concurrency_limit`、`slow_concurrency_limit`、`queue_limit`、`requests_total`、`ok`、`errors`、`cache_hits`（零槽位缓存快路径命中次数）、`rate_limited`、`unauthorized`（角色或平台白名单拦截次数）、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`。`SIGHUP` 热重载时，相同 `id` 的密钥自动延续累计计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
+  - `runtime`：只读脱敏返回 11 项运行开关（`version`、`shanghai_mode`、`shanghai_bilibili`、`bilibili_dash`、`youtube_helper`、`xhs_transport`、`ytdlp_enabled`、`ytdlp_generic_enabled`、`tbvideo_pipigx`、`tbvideo_zuiyou`、`stats_persistence_enabled`），绝不泄露任何宿主机路径、IP、URL 或凭据。
+  - `daily` 与 `hourly`：分别按 `Asia/Shanghai`（UTC+8）自然日与整点升序返回滚动统计桶（线上响应固定包含近 30 天日桶与近 24 小时时桶，上方示例为便于阅读仅展示单日/单小时条目）；`daily[*]` 含 `date`（`YYYY-MM-DD`）、`total`、`ok`、`failed`、`cache_hits`、`shanghai_hits`、`latency_ms`（`p50_ms` / `p95_ms` / `max_ms`）及非空平台字典 `by_platform`（各平台含 `total`、`ok`、`failed`、`by_code`、`p95_ms`），`hourly[*]` 含 `hour_start`（RFC 3339 `+08:00`）、`total`、`ok`、`failed`、`cache_hits`。配置 `DOKITOOL_STATS_SNAPSHOT_PATH` 后，日桶与时桶会按原子落盘策略跨重启保留（见 [CONFIGURATION.md](CONFIGURATION.md)）。
   - 直方图（`HistogramSnapshot`）：`buckets` 键集合固定为 `<=10`、`<=50`、`<=100`、`<=250`、`<=500`、`<=1000`、`<=2500`、`<=5000`、`<=10000`、`<=30000`、`+Inf`（单位毫秒，采用 Prometheus 风格的**累积上界桶**，单调不减且 `buckets["+Inf"] == count`）。
 
 ---

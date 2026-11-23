@@ -217,7 +217,7 @@
       "get": {
         "operationId": "getStats",
         "summary": "Read in-process aggregate runtime telemetry snapshot (owner role required)",
-        "description": "Returns bounded-cardinality aggregate request, cache, admission queue, per-key API key pool (`api_keys`), yt-dlp slot, Shanghai resolver, and parse latency metrics. Strictly requires an `owner`-role Bearer credential (`DOKITOOL_OWNER_TOKEN` or an `owner`-role key in `DOKITOOL_API_KEYS_FILE`); valid `agent` or `friend` keys receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`) without charging the anonymous IP bucket, while missing, disabled, or invalid tokens return HTTP 401 and charge the anonymous per-IP burst bucket. Authenticated `owner` calls do not consume a concurrency slot or increment parse request counters, and any unrecognized query parameter or trailing bare `?` returns HTTP 400 (`INVALID_INPUT`).",
+        "description": "Returns bounded-cardinality aggregate request, cache, admission queue, per-key API key pool (`api_keys`), yt-dlp slot, Shanghai resolver, parse latency, read-only runtime configuration switches (`runtime`), and rolling Asia/Shanghai (UTC+8) 30-day (`daily`) and 24-hour (`hourly`) bucket metrics. Strictly requires an `owner`-role Bearer credential (`DOKITOOL_OWNER_TOKEN` or an `owner`-role key in `DOKITOOL_API_KEYS_FILE`); valid `agent` or `friend` keys receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`) without charging the anonymous IP bucket, while missing, disabled, or invalid tokens return HTTP 401 and charge the anonymous per-IP burst bucket. Authenticated `owner` calls do not consume a concurrency slot or increment parse request counters, and any unrecognized query parameter or trailing bare `?` returns HTTP 400 (`INVALID_INPUT`).",
         "security": [
           {
             "BearerAuth": []
@@ -2203,23 +2203,9 @@
       },
       "StatsPlatform": {
         "type": "string",
-        "enum": [
-          "douyin",
-          "bilibili",
-          "weibo",
-          "toutiao",
-          "kuaishou",
-          "pipixia",
-          "pipigx",
-          "zuiyou",
-          "xiaohongshu",
-          "x",
-          "youtube",
-          "instagram",
-          "facebook",
-          "tumblr",
-          "unknown"
-        ]
+        "pattern": "^[a-z0-9][a-z0-9_:-]{0,31}$",
+        "maxLength": 32,
+        "description": "Core 14 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), or 'ytdlp_other'."
       },
       "StatsOutcomeCode": {
         "type": "string",
@@ -3014,6 +3000,239 @@
           }
         }
       },
+      "RuntimeConfigSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "shanghai_mode",
+          "shanghai_bilibili",
+          "bilibili_dash",
+          "youtube_helper",
+          "xhs_transport",
+          "ytdlp_enabled",
+          "ytdlp_generic_enabled",
+          "tbvideo_pipigx",
+          "tbvideo_zuiyou",
+          "stats_persistence_enabled"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "Compiled dokitool version identifier (defaults to 'unknown' when unset)."
+          },
+          "shanghai_mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "direct",
+              "pull"
+            ],
+            "description": "Active Shanghai resolver mode."
+          },
+          "shanghai_bilibili": {
+            "type": "boolean",
+            "description": "Whether Shanghai domestic Bilibili parallel resolution is enabled."
+          },
+          "bilibili_dash": {
+            "type": "boolean",
+            "description": "Whether Bilibili login-free DASH resolution is enabled."
+          },
+          "youtube_helper": {
+            "type": "boolean",
+            "description": "Whether YouTube browser helper endpoints are enabled."
+          },
+          "xhs_transport": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "chrome131"
+            ],
+            "description": "HTTPS transport profile used for Xiaohongshu page fetches."
+          },
+          "ytdlp_enabled": {
+            "type": "boolean",
+            "description": "Whether the external yt-dlp extractor engine is enabled."
+          },
+          "ytdlp_generic_enabled": {
+            "type": "boolean",
+            "description": "Whether generic long-tail yt-dlp sites are enabled."
+          },
+          "tbvideo_pipigx": {
+            "type": "boolean",
+            "description": "Whether Pipigx watermark-free rewrite candidate metadata is enabled."
+          },
+          "tbvideo_zuiyou": {
+            "type": "boolean",
+            "description": "Whether Zuiyou watermark-free rewrite candidate metadata is enabled."
+          },
+          "stats_persistence_enabled": {
+            "type": "boolean",
+            "description": "Whether atomic stats snapshot persistence (DOKITOOL_STATS_SNAPSHOT_PATH) is enabled; never exposes the file path."
+          }
+        }
+      },
+      "DailyLatencySummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "p50_ms",
+          "p95_ms",
+          "max_ms"
+        ],
+        "properties": {
+          "p50_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Estimated 50th percentile parse latency in milliseconds for this day (0 when no samples)."
+          },
+          "p95_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Estimated 95th percentile parse latency in milliseconds for this day (0 when no samples)."
+          },
+          "max_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum observed parse latency in milliseconds for this day."
+          }
+        }
+      },
+      "DailyPlatformStats": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "total",
+          "ok",
+          "failed",
+          "by_code",
+          "p95_ms"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total parse/resolve requests for this platform on this day."
+          },
+          "ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Successful (code='OK') parse/resolve requests for this platform on this day."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Failed (non-'OK') parse/resolve requests for this platform on this day."
+          },
+          "by_code": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Non-zero outcome counts keyed by StatsOutcomeCode for this platform on this day."
+          },
+          "p95_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Estimated 95th percentile parse latency in milliseconds for this platform on this day."
+          }
+        }
+      },
+      "DailyStatsBucket": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "date",
+          "total",
+          "ok",
+          "failed",
+          "cache_hits",
+          "shanghai_hits",
+          "latency_ms",
+          "by_platform"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "Asia/Shanghai (UTC+8) calendar date in YYYY-MM-DD format."
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total parse/resolve requests recorded on this Asia/Shanghai calendar date."
+          },
+          "ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Successful (code='OK') parse/resolve requests on this date."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Failed (non-'OK') parse/resolve requests on this date."
+          },
+          "cache_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Parse/resolve response cache hits recorded on this date."
+          },
+          "shanghai_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Successful Shanghai domestic resolutions recorded on this date."
+          },
+          "latency_ms": {
+            "$ref": "#/components/schemas/DailyLatencySummary"
+          },
+          "by_platform": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DailyPlatformStats"
+            },
+            "description": "Per-platform aggregate counts and latency summary for platforms with total > 0 on this date."
+          }
+        }
+      },
+      "HourlyStatsBucket": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hour_start",
+          "total",
+          "ok",
+          "failed",
+          "cache_hits"
+        ],
+        "properties": {
+          "hour_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Hour bucket start timestamp in RFC 3339 format with Asia/Shanghai (+08:00) offset."
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total parse/resolve requests recorded in this Asia/Shanghai hour bucket."
+          },
+          "ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Successful (code='OK') parse/resolve requests in this hour bucket."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Failed (non-'OK') parse/resolve requests in this hour bucket."
+          },
+          "cache_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Parse/resolve response cache hits recorded in this hour bucket."
+          }
+        }
+      },
       "StatsSnapshot": {
         "type": "object",
         "additionalProperties": false,
@@ -3027,7 +3246,10 @@
           "ytdlp",
           "shanghai",
           "parse_latency_ms",
-          "api_keys"
+          "api_keys",
+          "runtime",
+          "daily",
+          "hourly"
         ],
         "properties": {
           "started_at": {
@@ -3067,6 +3289,27 @@
             "description": "Per-key configuration and runtime telemetry for configured Bearer API keys (empty array when none configured; never exposes tokens or digests).",
             "items": {
               "$ref": "#/components/schemas/APIKeyStatsSnapshot"
+            }
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/RuntimeConfigSnapshot"
+          },
+          "daily": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 30,
+            "description": "Rolling Asia/Shanghai (UTC+8) daily aggregate buckets in ascending date order (up to 30 days).",
+            "items": {
+              "$ref": "#/components/schemas/DailyStatsBucket"
+            }
+          },
+          "hourly": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 24,
+            "description": "Rolling Asia/Shanghai (UTC+8) hourly aggregate buckets in ascending hour_start order (up to 24 hours).",
+            "items": {
+              "$ref": "#/components/schemas/HourlyStatsBucket"
             }
           }
         }

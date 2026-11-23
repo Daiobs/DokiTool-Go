@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1259,5 +1260,666 @@ func TestStatsSnapshotAPIKeysNonNilWhenNilOrUnconfigured(t *testing.T) {
 	}
 	if !strings.Contains(string(rawEmpty), `"api_keys":[]`) {
 		t.Fatalf("unattached Stats.Snapshot() did not serialize api_keys as []: %s", string(rawEmpty))
+	}
+	if len(nilSnap.Daily) != DailyStatsWindowDays || len(nilSnap.Hourly) != HourlyStatsWindowHours {
+		t.Fatalf("nil Stats.Snapshot() daily=%d hourly=%d, want 30/24", len(nilSnap.Daily), len(nilSnap.Hourly))
+	}
+	if len(emptySnap.Daily) != DailyStatsWindowDays || len(emptySnap.Hourly) != HourlyStatsWindowHours {
+		t.Fatalf("empty Stats.Snapshot() daily=%d hourly=%d, want 30/24", len(emptySnap.Daily), len(emptySnap.Hourly))
+	}
+	if nilSnap.Runtime.Version != "unknown" || nilSnap.Runtime.ShanghaiMode != "off" || nilSnap.Runtime.XHSTransport != "standard" {
+		t.Fatalf("unexpected nil Stats default runtime config: %+v", nilSnap.Runtime)
+	}
+}
+
+type mockShanghaiStatsProvider struct {
+	mode string
+	hits atomic.Uint64
+}
+
+func (m *mockShanghaiStatsProvider) ShanghaiStatsSnapshot() shresolver.StatsSnapshot {
+	h := m.hits.Load()
+	return shresolver.StatsSnapshot{
+		Enabled: m.mode == "direct" || m.mode == "pull",
+		Mode:    m.mode,
+		Total: shresolver.ChannelStatsSnapshot{
+			Hits: h,
+		},
+	}
+}
+
+func TestStatsShanghaiDailyHourlyRolloverAndMidnightBoundary(t *testing.T) {
+	// Start at 2026-11-22 23:59:30+08:00 (= 2026-11-22 15:59:30Z).
+	var clockMu sync.Mutex
+	curTime := time.Date(2026, 11, 22, 15, 59, 30, 0, time.UTC)
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return curTime
+	}
+	setClock := func(next time.Time) {
+		clockMu.Lock()
+		curTime = next
+		clockMu.Unlock()
+	}
+
+	st := NewStats(clock)
+	st.RecordParse("douyin", "OK", ChannelAnonymous, 45*time.Millisecond)
+	st.recordCacheHit(ChannelAnonymous)
+
+	// Cross Asia/Shanghai midnight (+1 min -> 2026-11-23 00:00:30+08:00, still 2026-11-22 16:00:30Z in UTC!).
+	setClock(time.Date(2026, 11, 22, 16, 0, 30, 0, time.UTC))
+	st.RecordParse("bilibili", "OK", ChannelOwner, 120*time.Millisecond)
+	st.RecordParse("bilibili", "UPSTREAM_TIMEOUT", ChannelAnonymous, 6500*time.Millisecond)
+
+	snap1 := st.Snapshot()
+	if len(snap1.Daily) != 30 {
+		t.Fatalf("daily len = %d, want 30", len(snap1.Daily))
+	}
+	if len(snap1.Hourly) != 24 {
+		t.Fatalf("hourly len = %d, want 24", len(snap1.Hourly))
+	}
+	for i := 1; i < len(snap1.Daily); i++ {
+		if snap1.Daily[i-1].Date >= snap1.Daily[i].Date {
+			t.Fatalf("daily buckets not strictly ascending at %d: %s >= %s", i, snap1.Daily[i-1].Date, snap1.Daily[i].Date)
+		}
+		if snap1.Daily[i].ByPlatform == nil {
+			t.Fatalf("daily[%d].ByPlatform is nil", i)
+		}
+	}
+	for i := 1; i < len(snap1.Hourly); i++ {
+		if snap1.Hourly[i-1].HourStart >= snap1.Hourly[i].HourStart {
+			t.Fatalf("hourly buckets not strictly ascending at %d: %s >= %s", i, snap1.Hourly[i-1].HourStart, snap1.Hourly[i].HourStart)
+		}
+	}
+	if snap1.Daily[28].Date != "2026-11-22" || snap1.Daily[28].Total != 1 || snap1.Daily[28].OK != 1 || snap1.Daily[28].CacheHits != 1 {
+		t.Fatalf("unexpected yesterday (2026-11-22) daily bucket: %+v", snap1.Daily[28])
+	}
+	if snap1.Daily[29].Date != "2026-11-23" || snap1.Daily[29].Total != 2 || snap1.Daily[29].OK != 1 || snap1.Daily[29].Failed != 1 {
+		t.Fatalf("unexpected today (2026-11-23) daily bucket: %+v", snap1.Daily[29])
+	}
+	if snap1.Hourly[22].HourStart != "2026-11-22T23:00:00+08:00" || snap1.Hourly[22].Total != 1 || snap1.Hourly[22].CacheHits != 1 {
+		t.Fatalf("unexpected 23:00+08:00 hourly bucket: %+v", snap1.Hourly[22])
+	}
+	if snap1.Hourly[23].HourStart != "2026-11-23T00:00:00+08:00" || snap1.Hourly[23].Total != 2 || snap1.Hourly[23].OK != 1 || snap1.Hourly[23].Failed != 1 {
+		t.Fatalf("unexpected 00:00+08:00 hourly bucket: %+v", snap1.Hourly[23])
+	}
+
+	// Cross UTC midnight (2026-11-22 23:59:30Z = 2026-11-23 07:59:30+08:00 -> 2026-11-23 00:00:30Z = 2026-11-23 08:00:30+08:00).
+	// Both MUST stay inside Shanghai day 2026-11-23 while advancing the hourly bucket from 07:00 to 08:00!
+	setClock(time.Date(2026, 11, 22, 23, 59, 30, 0, time.UTC))
+	st.RecordParse("x", "OK", ChannelOwner, 80*time.Millisecond)
+	setClock(time.Date(2026, 11, 23, 0, 0, 30, 0, time.UTC))
+	st.RecordParse("x", "OK", ChannelOwner, 90*time.Millisecond)
+	st.recordCacheHit(ChannelOwner)
+
+	snap2 := st.Snapshot()
+	if snap2.Daily[29].Date != "2026-11-23" || snap2.Daily[29].Total != 4 || snap2.Daily[29].OK != 3 || snap2.Daily[29].Failed != 1 || snap2.Daily[29].CacheHits != 1 {
+		t.Fatalf("crossing UTC midnight must remain in Shanghai day 2026-11-23: %+v", snap2.Daily[29])
+	}
+	if snap2.Hourly[22].HourStart != "2026-11-23T07:00:00+08:00" || snap2.Hourly[22].Total != 1 {
+		t.Fatalf("unexpected 07:00+08:00 hourly bucket: %+v", snap2.Hourly[22])
+	}
+	if snap2.Hourly[23].HourStart != "2026-11-23T08:00:00+08:00" || snap2.Hourly[23].Total != 1 || snap2.Hourly[23].CacheHits != 1 {
+		t.Fatalf("unexpected 08:00+08:00 hourly bucket: %+v", snap2.Hourly[23])
+	}
+
+	// Roll forward 32 days: old buckets from 2026-11-22 and 2026-11-23 must be completely evicted
+	// and reused ring slots must start cleanly at zero!
+	setClock(time.Date(2026, 12, 25, 2, 0, 0, 0, time.UTC)) // 2026-12-25 10:00+08:00
+	st.RecordParse("weibo", "OK", ChannelAnonymous, 30*time.Millisecond)
+	snap3 := st.Snapshot()
+	if snap3.Daily[0].Date != "2026-11-26" || snap3.Daily[29].Date != "2026-12-25" {
+		t.Fatalf("unexpected 30d window bounds after rollover: [%s .. %s]", snap3.Daily[0].Date, snap3.Daily[29].Date)
+	}
+	var sumDaily uint64
+	for _, b := range snap3.Daily {
+		sumDaily += b.Total
+	}
+	if sumDaily != 1 || snap3.Daily[29].Total != 1 {
+		t.Fatalf("stale daily counts leaked across 30d ring rollover: sum=%d today=%+v", sumDaily, snap3.Daily[29])
+	}
+	var sumHourly uint64
+	for _, h := range snap3.Hourly {
+		sumHourly += h.Total
+	}
+	if sumHourly != 1 || snap3.Hourly[23].HourStart != "2026-12-25T10:00:00+08:00" || snap3.Hourly[23].Total != 1 {
+		t.Fatalf("stale hourly counts leaked across 24h ring rollover: sum=%d cur=%+v", sumHourly, snap3.Hourly[23])
+	}
+}
+
+func TestStatsDailyLatencyPercentilesAndPerPlatformBreakdown(t *testing.T) {
+	now := time.Date(2026, 11, 22, 4, 0, 0, 0, time.UTC) // 2026-11-22 12:00+08:00
+	st := NewStats(func() time.Time { return now })
+
+	// Empty day must report all zeros.
+	empty := st.Snapshot().Daily[29]
+	if empty.LatencyMS.P50MS != 0 || empty.LatencyMS.P95MS != 0 || empty.LatencyMS.MaxMS != 0 {
+		t.Fatalf("empty day latency must be 0/0/0, got %+v", empty.LatencyMS)
+	}
+
+	// Single tiny sample (5ms): upper bound of <=10ms bin MUST clamp to max_ms (5ms)!
+	st.RecordParse("weibo", "OK", ChannelAnonymous, 5*time.Millisecond)
+	single := st.Snapshot().Daily[29]
+	if single.LatencyMS.P50MS != 5 || single.LatencyMS.P95MS != 5 || single.LatencyMS.MaxMS != 5 {
+		t.Fatalf("single 5ms sample must clamp to 5/5/5, got %+v", single.LatencyMS)
+	}
+	if ps := single.ByPlatform["weibo"]; ps.P95MS != 5 || ps.Total != 1 || ps.OK != 1 || ps.Failed != 0 || ps.ByCode["OK"] != 1 || len(ps.ByCode) != 1 {
+		t.Fatalf("unexpected weibo single-sample platform stats: %+v", ps)
+	}
+
+	// Multi-sample distribution on douyin including +Inf (>30s) tail and multiple error codes.
+	st2 := NewStats(func() time.Time { return now })
+	for i := 0; i < 90; i++ {
+		st2.RecordParse("douyin", "OK", ChannelAnonymous, 40*time.Millisecond) // <=50ms bin
+	}
+	for i := 0; i < 4; i++ {
+		st2.RecordParse("douyin", "UPSTREAM_BLOCKED", ChannelAnonymous, 400*time.Millisecond) // <=500ms bin
+	}
+	for i := 0; i < 6; i++ {
+		st2.RecordParse("douyin", "UPSTREAM_TIMEOUT", ChannelOwner, 42000*time.Millisecond) // +Inf bin (6% tail -> P95 lands in +Inf!)
+	}
+	st2.RecordParse("bilibili", "NO_MEDIA", ChannelAnonymous, 180*time.Millisecond) // <=250ms clamped to 180ms
+
+	day := st2.Snapshot().Daily[29]
+	if day.Total != 101 || day.OK != 90 || day.Failed != 11 {
+		t.Fatalf("unexpected day totals: %+v", day)
+	}
+	if !(day.LatencyMS.P50MS <= day.LatencyMS.P95MS && day.LatencyMS.P95MS <= day.LatencyMS.MaxMS) {
+		t.Fatalf("broken latency invariant 0 <= p50 <= p95 <= max: %+v", day.LatencyMS)
+	}
+	if day.LatencyMS.P50MS != 50 || day.LatencyMS.P95MS != 42000 || day.LatencyMS.MaxMS != 42000 {
+		t.Fatalf("unexpected day latency summary: %+v", day.LatencyMS)
+	}
+
+	dy := day.ByPlatform["douyin"]
+	if dy.Total != 100 || dy.OK != 90 || dy.Failed != 10 || dy.P95MS != 42000 {
+		t.Fatalf("unexpected douyin daily stats: %+v", dy)
+	}
+	if len(dy.ByCode) != 3 || dy.ByCode["OK"] != 90 || dy.ByCode["UPSTREAM_BLOCKED"] != 4 || dy.ByCode["UPSTREAM_TIMEOUT"] != 6 {
+		t.Fatalf("unexpected douyin by_code: %+v", dy.ByCode)
+	}
+
+	bili := day.ByPlatform["bilibili"]
+	if bili.Total != 1 || bili.OK != 0 || bili.Failed != 1 || bili.P95MS != 180 || len(bili.ByCode) != 1 || bili.ByCode["NO_MEDIA"] != 1 {
+		t.Fatalf("unexpected bilibili daily stats: %+v", bili)
+	}
+}
+
+func TestStatsShanghaiHitsDeltaSyncAndModeInference(t *testing.T) {
+	cur := time.Date(2026, 11, 22, 4, 0, 0, 0, time.UTC) // 2026-11-22 12:00+08:00
+	st := NewStats(func() time.Time { return cur })
+
+	mock1 := &mockShanghaiStatsProvider{mode: "pull"}
+	st.SetShanghaiSource(mock1)
+
+	// Runtime ShanghaiMode should infer "pull" when unset/"off" while shSrc != nil.
+	if got := st.Snapshot().Runtime.ShanghaiMode; got != "pull" {
+		t.Fatalf("expected inferred runtime.shanghai_mode=pull, got %q", got)
+	}
+
+	mock1.hits.Add(3)
+	st.RecordParse("douyin", "OK", ChannelAnonymous, 50*time.Millisecond)
+	snap1 := st.Snapshot()
+	if snap1.Daily[29].ShanghaiHits != 3 {
+		t.Fatalf("day 1 shanghai_hits = %d, want 3", snap1.Daily[29].ShanghaiHits)
+	}
+	// Repeated Snapshot() without new hits MUST NOT duplicate-count.
+	snap1Repeat := st.Snapshot()
+	if snap1Repeat.Daily[29].ShanghaiHits != 3 {
+		t.Fatalf("repeated Snapshot duplicated shanghai_hits: got %d, want 3", snap1Repeat.Daily[29].ShanghaiHits)
+	}
+
+	// Additional 2 hits on day 1 synced via Snapshot().
+	mock1.hits.Add(2)
+	if got := st.Snapshot().Daily[29].ShanghaiHits; got != 5 {
+		t.Fatalf("day 1 shanghai_hits after +2 = %d, want 5", got)
+	}
+
+	// Advance to day 2 (+24h), add 4 more hits, flush via SaveSnapshot -> only delta +4 lands in day 2!
+	cur = cur.Add(24 * time.Hour)
+	mock1.hits.Add(4)
+	snapPath := filepath.Join(t.TempDir(), "stats.json")
+	if err := st.SaveSnapshot(snapPath); err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+	snap2 := st.Snapshot()
+	if snap2.Daily[28].ShanghaiHits != 5 || snap2.Daily[29].ShanghaiHits != 4 {
+		t.Fatalf("unexpected shanghai_hits across day rollover: day1=%d day2=%d, want 5/4", snap2.Daily[28].ShanghaiHits, snap2.Daily[29].ShanghaiHits)
+	}
+
+	// Replacing Shanghai source resets lastSyncedShanghaiHits = 0 so direct mode hits start syncing fresh.
+	mock2 := &mockShanghaiStatsProvider{mode: "direct"}
+	st.SetShanghaiSource(mock2)
+	mock2.hits.Add(2)
+	snap3 := st.Snapshot()
+	if snap3.Runtime.ShanghaiMode != "direct" {
+		t.Fatalf("expected inferred runtime.shanghai_mode=direct after swap, got %q", snap3.Runtime.ShanghaiMode)
+	}
+	if snap3.Daily[29].ShanghaiHits != 6 {
+		t.Fatalf("day 2 shanghai_hits after source swap +2 = %d, want 6", snap3.Daily[29].ShanghaiHits)
+	}
+}
+
+func TestStatsBoundedDynamicPlatformsAndClosedVocabularyPreserved(t *testing.T) {
+	// Verify KnownPlatforms & NormalizePlatform remain strictly unchanged (15 closed elements).
+	if len(KnownPlatforms()) != 15 {
+		t.Fatalf("KnownPlatforms() len = %d, want 15", len(KnownPlatforms()))
+	}
+	if NormalizePlatform("vimeo") != PlatformUnknown || NormalizePlatform(PlatformYTDLPOther) != PlatformUnknown {
+		t.Fatal("NormalizePlatform must remain strictly closed-set (14 core + unknown)")
+	}
+
+	// Validate IsValidDynamicPlatformKey edge cases.
+	for _, valid := range []string{"a", "0", "vimeo", "yt:vimeo-hd_1", "tiktok", PlatformYTDLPOther, strings.Repeat("a", 32)} {
+		if !IsValidDynamicPlatformKey(valid) {
+			t.Fatalf("IsValidDynamicPlatformKey(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{"", "all", "unknown", "_lead", "-lead", ":lead", "Upper", "bad/slash", "bad.dot", "has space", "抖音", strings.Repeat("a", 33)} {
+		if IsValidDynamicPlatformKey(invalid) {
+			t.Fatalf("IsValidDynamicPlatformKey(%q) = true, want false", invalid)
+		}
+	}
+
+	now := time.Date(2026, 11, 22, 6, 0, 0, 0, time.UTC)
+	st := NewStats(func() time.Time { return now })
+
+	// Record 1 core platform via RecordDynamicParse.
+	st.RecordDynamicParse("douyin", "OK", ChannelOwner, 25*time.Millisecond)
+	// Record invalid keys -> must all route to "unknown".
+	for _, bad := range []string{"", "all", "unknown", "UPPER_BAD", "evil/path", strings.Repeat("z", 40)} {
+		st.RecordDynamicParse(bad, "UNSUPPORTED_PLATFORM", ChannelAnonymous, 10*time.Millisecond)
+	}
+	// Record 64 distinct valid dynamic platforms in reverse order to verify deterministic sorting!
+	for i := MaxDynamicPlatforms; i >= 1; i-- {
+		key := fmt.Sprintf("dyn_%02d", i)
+		st.RecordDynamicParse(key, "OK", ChannelAnonymous, 35*time.Millisecond)
+	}
+	// Record 10 additional distinct keys beyond 64 -> must ALL spill into ytdlp_other!
+	for i := MaxDynamicPlatforms + 1; i <= MaxDynamicPlatforms+10; i++ {
+		key := fmt.Sprintf("dyn_%02d", i)
+		st.RecordDynamicParse(key, "UPSTREAM_TIMEOUT", ChannelOwner, 100*time.Millisecond)
+	}
+	// Direct ytdlp_other key also merges into ytdlp_other without displacing the 64 keys.
+	st.RecordDynamicParse(PlatformYTDLPOther, "OK", ChannelAnonymous, 20*time.Millisecond)
+
+	snap := st.Snapshot()
+	wantTotal := uint64(1 + 6 + MaxDynamicPlatforms + 10 + 1)
+	if snap.Requests.Total != wantTotal || snap.ParseLatencyMS.Total.Count != wantTotal {
+		t.Fatalf("total=%d latencyCount=%d, want %d", snap.Requests.Total, snap.ParseLatencyMS.Total.Count, wantTotal)
+	}
+	if snap.Requests.ByChannel.Anonymous+snap.Requests.ByChannel.Owner != wantTotal {
+		t.Fatalf("by_channel sum mismatch: %+v", snap.Requests.ByChannel)
+	}
+
+	// Verify ordering in by_platform_code_channel: core platforms first ("douyin", "unknown"),
+	// then sorted dyn_01..dyn_64, then ytdlp_other.
+	cells := snap.Requests.ByPlatformCodeChannel
+	if len(cells) != 2+MaxDynamicPlatforms+2 {
+		t.Fatalf("unexpected cells len=%d, want %d", len(cells), 2+MaxDynamicPlatforms+2)
+	}
+	if cells[0].Platform != "douyin" || cells[1].Platform != PlatformUnknown || cells[1].Count != 6 {
+		t.Fatalf("unexpected core prefix cells: %+v %+v", cells[0], cells[1])
+	}
+	for i := 1; i <= MaxDynamicPlatforms; i++ {
+		wantPlat := fmt.Sprintf("dyn_%02d", i)
+		if cells[1+i].Platform != wantPlat || cells[1+i].Count != 1 {
+			t.Fatalf("dynamic cell[%d] = %+v, want platform %q count 1", 1+i, cells[1+i], wantPlat)
+		}
+	}
+	if lookupCellCount(cells, PlatformYTDLPOther, "UPSTREAM_TIMEOUT", ChannelOwner) != 10 {
+		t.Fatalf("expected 10 spilled timeouts under ytdlp_other, cells tail=%+v", cells[len(cells)-2:])
+	}
+	if lookupCellCount(cells, PlatformYTDLPOther, "OK", ChannelAnonymous) != 1 {
+		t.Fatalf("expected 1 explicit OK under ytdlp_other, cells tail=%+v", cells[len(cells)-2:])
+	}
+
+	// Verify daily[29].ByPlatform matches exact bounded set (no dyn_65..dyn_74, no invalid keys).
+	dayPlats := snap.Daily[29].ByPlatform
+	if len(dayPlats) != 2+MaxDynamicPlatforms+1 {
+		t.Fatalf("daily by_platform count = %d, want %d", len(dayPlats), 2+MaxDynamicPlatforms+1)
+	}
+	if _, leaked := dayPlats["dyn_65"]; leaked {
+		t.Fatal("65th dynamic platform leaked into daily.by_platform instead of spilling to ytdlp_other")
+	}
+	if other := dayPlats[PlatformYTDLPOther]; other.Total != 11 || other.OK != 1 || other.Failed != 10 {
+		t.Fatalf("unexpected daily ytdlp_other stats: %+v", other)
+	}
+
+	// SummaryReporter.FormatLine() must still only emit closed-vocabulary platform tokens.
+	line := st.FormatSummaryLine()
+	if strings.Contains(line, "dyn_01") || strings.Contains(line, "UPPER_BAD") || strings.Contains(line, "evil/path") {
+		t.Fatalf("SummaryReporter.FormatLine() leaked non-closed platform key: %q", line)
+	}
+}
+
+func TestStatsRuntimeConfigNormalizationAndNoSecretLeak(t *testing.T) {
+	st := NewStats(func() time.Time { return time.Date(2026, 11, 22, 4, 0, 0, 0, time.UTC) })
+	st.SetRuntimeConfig(RuntimeConfigSnapshot{
+		Version:                 "  v2.3.4\r\n",
+		ShanghaiMode:            "bogus-mode",
+		ShanghaiBilibili:        true,
+		BilibiliDASH:            true,
+		YouTubeHelper:           true,
+		XHSTransport:            "evil-transport",
+		YTDLPEnabled:            true,
+		YTDLPGenericEnabled:     false,
+		TBVideoPipigx:           true,
+		TBVideoZuiyou:           false,
+		StatsPersistenceEnabled: true,
+	})
+	snap := st.Snapshot()
+	if snap.Runtime.Version != "v2.3.4" ||
+		snap.Runtime.ShanghaiMode != "off" ||
+		!snap.Runtime.ShanghaiBilibili ||
+		!snap.Runtime.BilibiliDASH ||
+		!snap.Runtime.YouTubeHelper ||
+		snap.Runtime.XHSTransport != "standard" ||
+		!snap.Runtime.YTDLPEnabled ||
+		snap.Runtime.YTDLPGenericEnabled ||
+		!snap.Runtime.TBVideoPipigx ||
+		snap.Runtime.TBVideoZuiyou ||
+		!snap.Runtime.StatsPersistenceEnabled {
+		t.Fatalf("unexpected normalized runtime config: %+v", snap.Runtime)
+	}
+
+	raw, err := json.Marshal(snap.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 11 {
+		t.Fatalf("expected exactly 11 fields in runtime JSON, got %d: %s", len(m), string(raw))
+	}
+	for _, forbidden := range []string{"url", "endpoint", "token", "secret", "path", "file"} {
+		for k := range m {
+			if strings.Contains(strings.ToLower(k), forbidden) {
+				t.Fatalf("runtime JSON field %q looks like secret/path/endpoint", k)
+			}
+		}
+	}
+}
+
+func TestStatsPersistenceAtomicSaveLoadPruningAndFailSoft(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "stats-snapshot.json")
+
+	// Cold start on missing file and empty path -> nil error, zero warning logs.
+	var coldLogs []string
+	coldLogf := func(format string, args ...any) {
+		coldLogs = append(coldLogs, fmt.Sprintf(format, args...))
+	}
+	cur := time.Date(2026, 11, 10, 4, 0, 0, 0, time.UTC) // 2026-11-10 12:00+08:00
+	st1 := NewStats(func() time.Time { return cur })
+	if err := st1.LoadSnapshot("", coldLogf); err != nil {
+		t.Fatalf("empty path LoadSnapshot failed: %v", err)
+	}
+	if err := st1.LoadSnapshot(snapPath, coldLogf); err != nil {
+		t.Fatalf("missing file cold-start LoadSnapshot failed: %v", err)
+	}
+	if len(coldLogs) != 0 {
+		t.Fatalf("cold start should not emit warnings, got %v", coldLogs)
+	}
+
+	mockSH := &mockShanghaiStatsProvider{mode: "pull"}
+	st1.SetShanghaiSource(mockSH)
+
+	// Day 1 (2026-11-10): will be expired after advancing +31 days!
+	st1.RecordParse("douyin", "OK", ChannelAnonymous, 40*time.Millisecond)
+	st1.recordCacheHit(ChannelAnonymous)
+	mockSH.hits.Add(2)
+	st1.RecordDynamicParse("vimeo", "UPSTREAM_TIMEOUT", ChannelOwner, 1200*time.Millisecond)
+
+	// Day 2 (2026-11-22 12:00+08:00): recent day + recent hours!
+	cur = time.Date(2026, 11, 22, 4, 0, 0, 0, time.UTC)
+	st1.RecordParse("bilibili", "OK", ChannelOwner, 85*time.Millisecond)
+	st1.RecordParse("bilibili", "UPSTREAM_BLOCKED", ChannelAnonymous, 320*time.Millisecond)
+	st1.recordCacheHit(ChannelOwner)
+	mockSH.hits.Add(3)
+	st1.RecordDynamicParse("tiktok", "OK", ChannelAnonymous, 210*time.Millisecond)
+
+	cur = cur.Add(2 * time.Hour) // 14:00+08:00
+	st1.RecordParse("x", "OK", ChannelOwner, 500*time.Millisecond)
+
+	if err := st1.SaveSnapshot(snapPath); err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+
+	// Verify 0600 permissions (on Unix) and zero leftover .tmp files in directory.
+	info, err := os.Stat(snapPath)
+	if err != nil {
+		t.Fatalf("stat snapshot failed: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("snapshot file mode = %o, want 0600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "stats-snapshot.json" {
+		t.Fatalf("unexpected directory entries (leftover tmp files?): %v", entries)
+	}
+
+	// Reload into fresh Stats at the exact same timestamp -> 30d daily & 24h hourly match identically!
+	wantSnap := st1.Snapshot()
+	st2 := NewStats(func() time.Time { return cur })
+	if err := st2.LoadSnapshot(snapPath, nil); err != nil {
+		t.Fatalf("LoadSnapshot into fresh Stats failed: %v", err)
+	}
+	gotSnap := st2.Snapshot()
+	wantDailyJSON, _ := json.Marshal(wantSnap.Daily)
+	gotDailyJSON, _ := json.Marshal(gotSnap.Daily)
+	if string(wantDailyJSON) != string(gotDailyJSON) {
+		t.Fatalf("reloaded daily mismatch:\nwant=%s\ngot =%s", string(wantDailyJSON), string(gotDailyJSON))
+	}
+	wantHourlyJSON, _ := json.Marshal(wantSnap.Hourly)
+	gotHourlyJSON, _ := json.Marshal(gotSnap.Hourly)
+	if string(wantHourlyJSON) != string(gotHourlyJSON) {
+		t.Fatalf("reloaded hourly mismatch:\nwant=%s\ngot =%s", string(wantHourlyJSON), string(gotHourlyJSON))
+	}
+
+	// Reload at +20 days later (2026-12-12 14:00+08:00):
+	// 2026-11-10 is > 30 days old (pruned!), 2026-11-22 is 20 days old (kept!), hourly buckets are > 24h old (pruned!).
+	later := cur.Add(20 * 24 * time.Hour)
+	st3 := NewStats(func() time.Time { return later })
+	if err := st3.LoadSnapshot(snapPath, nil); err != nil {
+		t.Fatalf("LoadSnapshot at +20d failed: %v", err)
+	}
+	snap3 := st3.Snapshot()
+	var totalDaily3, totalHourly3 uint64
+	var foundNov22 bool
+	for _, b := range snap3.Daily {
+		totalDaily3 += b.Total
+		if b.Date == "2026-11-22" {
+			foundNov22 = true
+			if b.Total != 4 || b.OK != 3 || b.Failed != 1 || b.CacheHits != 1 || b.ShanghaiHits != 3 {
+				t.Fatalf("unexpected preserved 2026-11-22 bucket after pruning: %+v", b)
+			}
+		}
+	}
+	for _, h := range snap3.Hourly {
+		totalHourly3 += h.Total
+	}
+	if !foundNov22 || totalDaily3 != 4 || totalHourly3 != 0 {
+		t.Fatalf("unexpected pruned reload counts: foundNov22=%v totalDaily=%d totalHourly=%d", foundNov22, totalDaily3, totalHourly3)
+	}
+
+	// Hand-crafted snapshot with >64 dynamic platforms, invalid platform key, and unknown outcome code -> clamped & normalized!
+	var oversizedDyn []string
+	platMap := make(map[string]persistedDailyPlatform)
+	for i := 1; i <= 70; i++ {
+		k := fmt.Sprintf("ext_%02d", i)
+		oversizedDyn = append(oversizedDyn, k)
+		platMap[k] = persistedDailyPlatform{
+			Total: 1, OK: 1,
+			ByCode: map[string]uint64{"OK": 1},
+		}
+	}
+	platMap["BAD/KEY"] = persistedDailyPlatform{
+		Total: 2, Failed: 2,
+		ByCode: map[string]uint64{"BOGUS_ERR": 2},
+	}
+	crafted := persistedStatsSnapshot{
+		SchemaVersion:    1,
+		Timezone:         "Asia/Shanghai",
+		SavedAt:          cur.In(shanghaiZone).Format(time.RFC3339),
+		DynamicPlatforms: oversizedDyn,
+		Daily: []persistedDailyBucket{{
+			Date:       "2026-11-22",
+			Total:      72,
+			OK:         70,
+			Failed:     2,
+			ByPlatform: platMap,
+		}},
+	}
+	craftedBytes, _ := json.Marshal(crafted)
+	craftedPath := filepath.Join(dir, "crafted.json")
+	if err := os.WriteFile(craftedPath, craftedBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stCrafted := NewStats(func() time.Time { return cur })
+	if err := stCrafted.LoadSnapshot(craftedPath, nil); err != nil {
+		t.Fatalf("crafted snapshot load failed: %v", err)
+	}
+	craftedDay := stCrafted.Snapshot().Daily[29]
+	if craftedDay.ByPlatform[PlatformYTDLPOther].Total != 6 {
+		t.Fatalf("expected 6 overflow dynamic keys (65..70) spilled to ytdlp_other, got %+v", craftedDay.ByPlatform[PlatformYTDLPOther])
+	}
+	if unk := craftedDay.ByPlatform[PlatformUnknown]; unk.Total != 2 || unk.ByCode["INTERNAL_ERROR"] != 2 {
+		t.Fatalf("expected invalid key + unknown code normalized to unknown/INTERNAL_ERROR, got %+v", unk)
+	}
+
+	// Fail-soft corrupt / bad-version / bad-date / bad-hour / oversized / directory cases!
+	badCases := []struct {
+		name string
+		data []byte
+		path string
+	}{
+		{"corrupt-json", []byte("{not-json"), filepath.Join(dir, "bad1.json")},
+		{"wrong-schema-version", []byte(`{"schema_version":2,"timezone":"Asia/Shanghai"}`), filepath.Join(dir, "bad2.json")},
+		{"missing-schema-version", []byte(`{"timezone":"Asia/Shanghai"}`), filepath.Join(dir, "bad3.json")},
+		{"wrong-timezone", []byte(`{"schema_version":1,"timezone":"UTC"}`), filepath.Join(dir, "bad4.json")},
+		{"invalid-daily-date", []byte(`{"schema_version":1,"timezone":"Asia/Shanghai","daily":[{"date":"2026-13-45","total":1}]}`), filepath.Join(dir, "bad5.json")},
+		{"non-hour-aligned-hourly", []byte(`{"schema_version":1,"timezone":"Asia/Shanghai","hourly":[{"hour_start":"2026-11-22T14:30:00+08:00","total":1}]}`), filepath.Join(dir, "bad6.json")},
+		{"oversized-file", bytes.Repeat([]byte("{"), MaxStatsSnapshotBytes+16), filepath.Join(dir, "bad7.json")},
+		{"directory-instead-of-file", nil, dir},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.data != nil {
+				if err := os.WriteFile(tc.path, tc.data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var warnBuf bytes.Buffer
+			stBad := NewStats(func() time.Time { return cur })
+			err := stBad.LoadSnapshot(tc.path, func(format string, args ...any) {
+				fmt.Fprintf(&warnBuf, format, args...)
+			})
+			if err == nil {
+				t.Fatalf("%s: expected LoadSnapshot error, got nil", tc.name)
+			}
+			if warnBuf.Len() == 0 {
+				t.Fatalf("%s: expected warning log on fail-soft error", tc.name)
+			}
+			if strings.Contains(warnBuf.String(), dir) || strings.Contains(err.Error(), dir) {
+				t.Fatalf("%s: leaked local filesystem path in warning/error: warn=%q err=%v", tc.name, warnBuf.String(), err)
+			}
+			// State must remain cleanly empty.
+			if got := stBad.Snapshot().Daily[29].Total; got != 0 {
+				t.Fatalf("%s: expected clean empty stats after failed load, got today total=%d", tc.name, got)
+			}
+		})
+	}
+
+	// StartPeriodicSnapshot writes periodically and exits cleanly on stop().
+	periodicPath := filepath.Join(dir, "periodic.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopPeriodic := st1.StartPeriodicSnapshot(ctx, periodicPath, 15*time.Millisecond, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(periodicPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stopPeriodic()
+	stopPeriodic() // idempotent
+	if _, err := os.Stat(periodicPath); err != nil {
+		t.Fatalf("periodic snapshot file was not created: %v", err)
+	}
+}
+
+func TestStatsConcurrentRecordSnapshotSaveRace(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "race-snapshot.json")
+
+	st := NewStats(time.Now)
+	mockSH := &mockShanghaiStatsProvider{mode: "pull"}
+	st.SetShanghaiSource(mockSH)
+	st.SetRuntimeConfig(RuntimeConfigSnapshot{
+		Version:                 "race-test",
+		ShanghaiMode:            "pull",
+		StatsPersistenceEnabled: true,
+	})
+
+	const workers = 8
+	const iters = 60
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				switch (id + i) % 5 {
+				case 0:
+					st.RecordParse("douyin", "OK", ChannelAnonymous, time.Duration(i+1)*time.Millisecond)
+				case 1:
+					st.RecordDynamicParse(fmt.Sprintf("dyn_%02d", (id*13+i)%80), "OK", ChannelOwner, time.Duration(i+5)*time.Millisecond)
+				case 2:
+					st.recordCacheHit(ChannelAnonymous)
+					mockSH.hits.Add(1)
+				case 3:
+					snap := st.Snapshot()
+					if len(snap.Daily) != DailyStatsWindowDays || len(snap.Hourly) != HourlyStatsWindowHours {
+						t.Errorf("invalid daily/hourly length under concurrency: %d/%d", len(snap.Daily), len(snap.Hourly))
+					}
+				case 4:
+					if err := st.SaveSnapshot(snapPath); err != nil {
+						t.Errorf("concurrent SaveSnapshot failed: %v", err)
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Final save and invariant check.
+	if err := st.SaveSnapshot(snapPath); err != nil {
+		t.Fatalf("final SaveSnapshot failed: %v", err)
+	}
+	finalSnap := st.Snapshot()
+	var sumCells uint64
+	for _, cell := range finalSnap.Requests.ByPlatformCodeChannel {
+		sumCells += cell.Count
+	}
+	if sumCells != finalSnap.Requests.Total || finalSnap.ParseLatencyMS.Total.Count != finalSnap.Requests.Total {
+		t.Fatalf("post-race invariant mismatch: sumCells=%d total=%d latencyCount=%d", sumCells, finalSnap.Requests.Total, finalSnap.ParseLatencyMS.Total.Count)
+	}
+	// Verify zero leftover .tmp files in directory.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("found leftover temp file after concurrent saves: %s", e.Name())
+		}
 	}
 }

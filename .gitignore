@@ -260,6 +260,7 @@
 !/frontend/tests/download-worker.test.mjs
 !/frontend/tests/extension-download-flow.test.mjs
 !/frontend/tests/extension-filename.test.mjs
+!/frontend/tests/extension-monitor.test.mjs
 !/frontend/tests/extension-security.test.mjs
 !/frontend/tests/fixtures/
 !/frontend/tests/helpers/
@@ -384,6 +385,7 @@
 !/backend/internal/api/pipixia_http_test.go
 !/backend/internal/api/platform_traits.go
 !/backend/internal/api/stats.go
+!/backend/internal/api/stats_persistence.go
 !/backend/internal/api/stats_test.go
 !/backend/internal/api/tbvideo_outcome.go
 !/backend/internal/api/tbvideo_outcome_test.go
@@ -587,6 +589,7 @@
 !/frontend/src/downloads/streaming.ts
 !/frontend/src/downloads/types.ts
 /frontend/src/extension/*
+!/frontend/src/extension/MonitorApp.vue
 !/frontend/src/extension/SidePanelApp.vue
 !/frontend/src/extension/background.ts
 !/frontend/src/extension/components/
@@ -597,6 +600,9 @@
 !/frontend/src/extension/extensionDownload.ts
 !/frontend/src/extension/filenameSanitizer.ts
 !/frontend/src/extension/hostWhitelist.ts
+!/frontend/src/extension/monitor.css
+!/frontend/src/extension/monitor.html
+!/frontend/src/extension/monitor.ts
 !/frontend/src/extension/offscreen.html
 !/frontend/src/extension/offscreen.ts
 !/frontend/src/extension/opfsStreamTransfer.ts
@@ -604,6 +610,7 @@
 !/frontend/src/extension/sidepanel.css
 !/frontend/src/extension/sidepanel.html
 !/frontend/src/extension/sidepanel.ts
+!/frontend/src/extension/statsTypes.ts
 !/frontend/src/extension/storage.ts
 !/frontend/src/extension/uiTargetHelpers.ts
 !/frontend/src/extension/urlMatcher.ts

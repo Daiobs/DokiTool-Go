@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -841,6 +841,7 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
       "manifest.json",
       "background.js",
       "sidepanel.html",
+      "monitor.html",
       "offscreen.html",
       "icons/icon-16.png",
       "icons/icon-32.png",
@@ -851,6 +852,36 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
         existsSync(join(prodOut, rel)),
         true,
         `expected artifact ${rel}`,
+      );
+    }
+
+    // Verify mediabunny library is strictly isolated to offscreen (0 occurrences in background, sidepanel, monitor)
+    const assetEntries = await readdir(join(prodOut, "assets"));
+    const sidepanelBundles = assetEntries.filter((f) =>
+      /^sidepanel-.*\.js$/.test(f),
+    );
+    const monitorBundles = assetEntries.filter((f) =>
+      /^monitor-.*\.js$/.test(f),
+    );
+    assert.ok(sidepanelBundles.length > 0, "expected assets/sidepanel-*.js");
+    assert.ok(monitorBundles.length > 0, "expected assets/monitor-*.js");
+    for (const rel of [
+      "background.js",
+      ...sidepanelBundles.map((f) => `assets/${f}`),
+      ...monitorBundles.map((f) => `assets/${f}`),
+    ]) {
+      const code = await readFile(join(prodOut, rel), "utf8");
+      assert.equal(
+        /\bMp4OutputFormat\b/.test(code),
+        false,
+        `${rel} must not contain Mp4OutputFormat`,
+      );
+      assert.equal(
+        /MediabunnyVideoHandler|mediabunny loaded|Mediabunny Codec Registry/.test(
+          code,
+        ),
+        false,
+        `${rel} must not bundle Mediabunny library`,
       );
     }
 
@@ -920,6 +951,20 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
       /External script URL/,
     );
     await writeFile(sidepanelHtmlPath, origSidepanelHtml, "utf8");
+
+    // Tampering monitor bundle with Mp4OutputFormat MUST fail verifyExtensionDist mediabunny isolation gate
+    const firstMonitorBundlePath = join(prodOut, "assets", monitorBundles[0]);
+    const origMonitorJs = await readFile(firstMonitorBundlePath, "utf8");
+    await writeFile(
+      firstMonitorBundlePath,
+      `${origMonitorJs}\n/* Mp4OutputFormat */\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /Mediabunny isolation violation/,
+    );
+    await writeFile(firstMonitorBundlePath, origMonitorJs, "utf8");
   } finally {
     await rm(prodOut, { recursive: true, force: true });
     await rm(devOut, { recursive: true, force: true });
@@ -984,6 +1029,7 @@ test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-fo
     assert.ok(parsedZip.files["manifest.json"], "manifest.json must sit directly at ZIP root");
     assert.ok(parsedZip.files["background.js"], "background.js must sit directly at ZIP root");
     assert.ok(parsedZip.files["sidepanel.html"], "sidepanel.html must sit directly at ZIP root");
+    assert.ok(parsedZip.files["monitor.html"], "monitor.html must sit directly at ZIP root");
     assert.ok(parsedZip.files["offscreen.html"], "offscreen.html must sit directly at ZIP root");
     assert.ok(parsedZip.files["icons/icon-128.png"], "icons/icon-128.png must sit at root icons/");
 

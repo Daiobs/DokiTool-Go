@@ -72,12 +72,14 @@ import {
   type OffscreenDownloadSpec,
   type OffscreenResponseMap,
   type OffscreenToBackgroundMessage,
+  type OwnerStatsResult,
   type PendingPanelIntent,
   type QualityPreference,
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
   type TabSyncState,
 } from "./protocol";
+import { isValidStatsSnapshot } from "./statsTypes";
 import {
   buildApiAuthHeaders,
   buildWorkFingerprint,
@@ -1190,6 +1192,85 @@ export function createBackgroundController(
       };
       lastConnectionCheck = netFail;
       return netFail;
+    }
+  };
+
+  const fetchOwnerStats = async (): Promise<
+    ExtensionRpcResponse<OwnerStatsResult>
+  > => {
+    const saved = await storage.getSettings();
+    const token = saved.bearerToken.trim();
+    if (!token) {
+      return errRpc("未配置凭据", { status: 401, code: "NO_TOKEN" });
+    }
+
+    const validated = validateApiBaseUrl(saved.apiBaseUrl);
+    if (!validated.ok) {
+      return errRpc(validated.error || "后端地址格式无效", {
+        status: 400,
+        code: "STATS_FAILED",
+      });
+    }
+
+    if (!validated.isLoopback && chromeApi.declarativeNetRequest) {
+      await syncDynamicDnrRules([validated.origin]).catch(() => []);
+    }
+
+    const endpoint = `${validated.origin}/api/stats?schema_version=1.0`;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("获取监控统计超时，请稍后重试")),
+      15_000,
+    );
+    (timeout as { unref?: () => void })?.unref?.();
+
+    try {
+      const headers = buildApiAuthHeaders(
+        { bearerToken: token },
+        { Accept: "application/json" },
+      );
+      const resp = await fetchFn(endpoint, {
+        method: "GET",
+        headers,
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const payload = await resp.json().catch(() => null);
+
+      if (
+        resp.status === 200 &&
+        payload &&
+        typeof payload === "object" &&
+        (payload as { code?: unknown }).code === "OK" &&
+        isValidStatsSnapshot((payload as { data?: unknown }).data)
+      ) {
+        return okRpc({
+          stats: (payload as { data: OwnerStatsResult["stats"] }).data,
+          apiOrigin: validated.origin,
+          fetchedAt: nowFn(),
+        });
+      }
+
+      if (resp.status === 200) {
+        return errRpc("监控接口返回数据格式无效", {
+          status: 502,
+          code: "STATS_FAILED",
+        });
+      }
+
+      const extracted = extractApiErrorMessage(payload, resp.status);
+      return errRpc(extracted.message, {
+        status: resp.status,
+        code: resp.status === 401 ? "UNAUTHORIZED" : "STATS_FAILED",
+      });
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message ? err.message : "无法获取监控统计";
+      return errRpc(msg, { status: 0, code: "STATS_FAILED" });
+    } finally {
+      clearTimeout(timeout);
     }
   };
 
@@ -2921,6 +3002,10 @@ export function createBackgroundController(
           bearerToken: req.bearerToken,
         });
         return okRpc(result);
+      }
+
+      case "FETCH_OWNER_STATS": {
+        return fetchOwnerStats();
       }
 
       case "PARSE_URL": {

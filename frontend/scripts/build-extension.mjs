@@ -453,6 +453,7 @@ export async function verifyExtensionDist(
     "manifest.json",
     "background.js",
     "sidepanel.html",
+    "monitor.html",
     "offscreen.html",
     ...ICON_SIZES.map((s) => `icons/icon-${s}.png`),
   ];
@@ -505,6 +506,62 @@ export async function verifyExtensionDist(
     if (ext === ".js" || ext === ".mjs") {
       if (externalScriptTagRe.test(content) || externalStylesheetTagRe.test(content)) {
         throw new Error(`External script/stylesheet tag loader detected in ${relPath}`);
+      }
+    }
+  }
+
+  // Static mediabunny isolation gate: Mp4OutputFormat and Mediabunny library
+  // markers MUST NEVER appear in background.js, assets/sidepanel-*.js, or
+  // assets/monitor-*.js (and Mediabunny library markers must never appear in
+  // any non-offscreen JS bundle; strictly confined to assets/offscreen-*.js).
+  const relPosixFiles = allFiles.map((abs) =>
+    path.relative(outDir, abs).split(path.sep).join("/"),
+  );
+  const sidepanelEntries = relPosixFiles.filter((rel) =>
+    /^assets\/sidepanel-[^/]+\.js$/i.test(rel),
+  );
+  const monitorEntries = relPosixFiles.filter((rel) =>
+    /^assets\/monitor-[^/]+\.js$/i.test(rel),
+  );
+  if (sidepanelEntries.length === 0) {
+    throw new Error("Missing built assets/sidepanel-*.js bundle");
+  }
+  if (monitorEntries.length === 0) {
+    throw new Error("Missing built assets/monitor-*.js bundle");
+  }
+
+  const strictEntryTargets = new Set([
+    "background.js",
+    ...sidepanelEntries,
+    ...monitorEntries,
+  ]);
+  const nonOffscreenJsFiles = relPosixFiles.filter(
+    (rel) =>
+      rel.endsWith(".js") && !/^assets\/offscreen-[^/]+\.js$/i.test(rel),
+  );
+
+  const mediabunnyLibraryMarkers = [
+    { name: "MediabunnyVideoHandler", re: /\bMediabunnyVideoHandler\b/ },
+    { name: "MediabunnySoundHandler", re: /\bMediabunnySoundHandler\b/ },
+    { name: "mediabunny loaded", re: /mediabunny loaded/i },
+    { name: "Mediabunny Codec Registry", re: /Mediabunny Codec Registry/ },
+    { name: "Mediabunny v", re: /Mediabunny v(?:\d|\$\{)/ },
+  ];
+  const strictEntryMarkers = [
+    { name: "Mp4OutputFormat", re: /\bMp4OutputFormat\b/ },
+    ...mediabunnyLibraryMarkers,
+  ];
+
+  for (const relTarget of nonOffscreenJsFiles) {
+    const jsText = await fsp.readFile(path.join(outDir, relTarget), "utf8");
+    const markers = strictEntryTargets.has(relTarget)
+      ? strictEntryMarkers
+      : mediabunnyLibraryMarkers;
+    for (const marker of markers) {
+      if (marker.re.test(jsText)) {
+        throw new Error(
+          `Mediabunny isolation violation: forbidden marker ${marker.name} found in ${relTarget} (must remain strictly inside offscreen)`,
+        );
       }
     }
   }
@@ -603,6 +660,7 @@ export async function verifyExtensionZip(zipPath, expectedOutDir) {
     "manifest.json",
     "background.js",
     "sidepanel.html",
+    "monitor.html",
     "offscreen.html",
     ...ICON_SIZES.map((s) => `icons/icon-${s}.png`),
   ];
@@ -679,7 +737,7 @@ export async function buildExtension({
   await fsp.rm(resolvedOutDir, { recursive: true, force: true });
   await fsp.mkdir(resolvedOutDir, { recursive: true });
 
-  // 1. Build SidePanel + Offscreen HTML & local assets via Vite
+  // 1. Build SidePanel + Monitor + Offscreen HTML & local assets via Vite
   await viteBuild({
     configFile: false,
     root: extensionSrcDir,
@@ -709,6 +767,7 @@ export async function buildExtension({
       rollupOptions: {
         input: {
           sidepanel: path.join(extensionSrcDir, "sidepanel.html"),
+          monitor: path.join(extensionSrcDir, "monitor.html"),
           offscreen: path.join(extensionSrcDir, "offscreen.html"),
         },
       },

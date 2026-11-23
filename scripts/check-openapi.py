@@ -112,6 +112,33 @@ EXPECTED_API_KEY_STATS_REQUIRED = [
     "wait_ms_total",
     "wait_ms_max",
 ]
+EXPECTED_STATS_PLATFORM_PATTERN = "^[a-z0-9][a-z0-9_:-]{0,31}$"
+EXPECTED_RUNTIME_CONFIG_REQUIRED = [
+    "version",
+    "shanghai_mode",
+    "shanghai_bilibili",
+    "bilibili_dash",
+    "youtube_helper",
+    "xhs_transport",
+    "ytdlp_enabled",
+    "ytdlp_generic_enabled",
+    "tbvideo_pipigx",
+    "tbvideo_zuiyou",
+    "stats_persistence_enabled",
+]
+EXPECTED_DAILY_LATENCY_REQUIRED = ["p50_ms", "p95_ms", "max_ms"]
+EXPECTED_DAILY_PLATFORM_REQUIRED = ["total", "ok", "failed", "by_code", "p95_ms"]
+EXPECTED_DAILY_BUCKET_REQUIRED = [
+    "date",
+    "total",
+    "ok",
+    "failed",
+    "cache_hits",
+    "shanghai_hits",
+    "latency_ms",
+    "by_platform",
+]
+EXPECTED_HOURLY_BUCKET_REQUIRED = ["hour_start", "total", "ok", "failed", "cache_hits"]
 EMPTY_STRING_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
@@ -346,11 +373,20 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         all_cfg_caps <= set(comp_schemas["PlatformCapability"]["enum"]),
         "PlatformCapability enum is missing capability values from backend/config/platforms.json",
     )
+    stats_platform = comp_schemas.get("StatsPlatform") or {}
     require(
-        set(comp_schemas["StatsPlatform"]["enum"]) == {*platform_ids, "unknown"}
-        and len(comp_schemas["StatsPlatform"]["enum"]) == 15,
-        "StatsPlatform enum must match the 14 registered platforms + 'unknown'",
+        stats_platform.get("type") == "string"
+        and "enum" not in stats_platform
+        and stats_platform.get("pattern") == EXPECTED_STATS_PLATFORM_PATTERN
+        and stats_platform.get("maxLength") == 32,
+        "StatsPlatform must be a bounded pattern string (^[a-z0-9][a-z0-9_:-]{0,31}$, maxLength=32)",
     )
+    stats_platform_re = re.compile(EXPECTED_STATS_PLATFORM_PATTERN)
+    for pid in [*platform_ids, "unknown", "ytdlp_other"]:
+        require(
+            bool(stats_platform_re.fullmatch(pid)),
+            f"StatsPlatform pattern must accept platform id {pid!r}",
+        )
     wire_error_codes = set(comp_schemas["APIError"]["properties"]["code"]["enum"])
     require(
         set(comp_schemas["StatsOutcomeCode"]["enum"]) == (wire_error_codes | {"OK", "UNAUTHORIZED"})
@@ -398,10 +434,111 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
             and api_key_props[int_field].get("minimum") == 0,
             f"APIKeyStatsSnapshot.{int_field} must be integer with minimum=0",
         )
+    runtime_snap = comp_schemas.get("RuntimeConfigSnapshot") or {}
+    runtime_props = runtime_snap.get("properties") or {}
+    require(
+        runtime_snap.get("additionalProperties") is False
+        and runtime_snap.get("required") == EXPECTED_RUNTIME_CONFIG_REQUIRED
+        and list(runtime_props.keys()) == EXPECTED_RUNTIME_CONFIG_REQUIRED,
+        "RuntimeConfigSnapshot must require the exact 11 fields with additionalProperties=false",
+    )
+    require(
+        runtime_props["version"].get("type") == "string"
+        and runtime_props["shanghai_mode"].get("enum") == ["off", "direct", "pull"]
+        and runtime_props["xhs_transport"].get("enum") == ["standard", "chrome131"],
+        "RuntimeConfigSnapshot version/shanghai_mode/xhs_transport schema mismatch",
+    )
+    for bool_field in EXPECTED_RUNTIME_CONFIG_REQUIRED:
+        if bool_field not in {"version", "shanghai_mode", "xhs_transport"}:
+            require(
+                runtime_props[bool_field].get("type") == "boolean",
+                f"RuntimeConfigSnapshot.{bool_field} must be boolean",
+            )
+
+    daily_lat = comp_schemas.get("DailyLatencySummary") or {}
+    daily_lat_props = daily_lat.get("properties") or {}
+    require(
+        daily_lat.get("additionalProperties") is False
+        and daily_lat.get("required") == EXPECTED_DAILY_LATENCY_REQUIRED
+        and list(daily_lat_props.keys()) == EXPECTED_DAILY_LATENCY_REQUIRED,
+        "DailyLatencySummary must require p50_ms, p95_ms, max_ms with additionalProperties=false",
+    )
+    for int_field in EXPECTED_DAILY_LATENCY_REQUIRED:
+        require(
+            daily_lat_props[int_field].get("type") == "integer"
+            and daily_lat_props[int_field].get("minimum") == 0,
+            f"DailyLatencySummary.{int_field} must be integer with minimum=0",
+        )
+
+    daily_plat = comp_schemas.get("DailyPlatformStats") or {}
+    daily_plat_props = daily_plat.get("properties") or {}
+    require(
+        daily_plat.get("additionalProperties") is False
+        and daily_plat.get("required") == EXPECTED_DAILY_PLATFORM_REQUIRED
+        and list(daily_plat_props.keys()) == EXPECTED_DAILY_PLATFORM_REQUIRED,
+        "DailyPlatformStats must require total, ok, failed, by_code, p95_ms with additionalProperties=false",
+    )
+    for int_field in ("total", "ok", "failed", "p95_ms"):
+        require(
+            daily_plat_props[int_field].get("type") == "integer"
+            and daily_plat_props[int_field].get("minimum") == 0,
+            f"DailyPlatformStats.{int_field} must be integer with minimum=0",
+        )
+    require(
+        daily_plat_props["by_code"].get("type") == "object"
+        and daily_plat_props["by_code"].get("additionalProperties") == {"type": "integer", "minimum": 0},
+        "DailyPlatformStats.by_code must map strings to non-negative integers",
+    )
+
+    daily_bucket = comp_schemas.get("DailyStatsBucket") or {}
+    daily_bucket_props = daily_bucket.get("properties") or {}
+    require(
+        daily_bucket.get("additionalProperties") is False
+        and daily_bucket.get("required") == EXPECTED_DAILY_BUCKET_REQUIRED
+        and list(daily_bucket_props.keys()) == EXPECTED_DAILY_BUCKET_REQUIRED,
+        "DailyStatsBucket must require the exact 8 fields with additionalProperties=false",
+    )
+    require(
+        daily_bucket_props["date"].get("type") == "string"
+        and daily_bucket_props["date"].get("pattern") == r"^\d{4}-\d{2}-\d{2}$"
+        and daily_bucket_props["latency_ms"].get("$ref") == "#/components/schemas/DailyLatencySummary"
+        and daily_bucket_props["by_platform"].get("type") == "object"
+        and daily_bucket_props["by_platform"].get("additionalProperties")
+        == {"$ref": "#/components/schemas/DailyPlatformStats"},
+        "DailyStatsBucket date/latency_ms/by_platform schema mismatch",
+    )
+    for int_field in ("total", "ok", "failed", "cache_hits", "shanghai_hits"):
+        require(
+            daily_bucket_props[int_field].get("type") == "integer"
+            and daily_bucket_props[int_field].get("minimum") == 0,
+            f"DailyStatsBucket.{int_field} must be integer with minimum=0",
+        )
+
+    hourly_bucket = comp_schemas.get("HourlyStatsBucket") or {}
+    hourly_bucket_props = hourly_bucket.get("properties") or {}
+    require(
+        hourly_bucket.get("additionalProperties") is False
+        and hourly_bucket.get("required") == EXPECTED_HOURLY_BUCKET_REQUIRED
+        and list(hourly_bucket_props.keys()) == EXPECTED_HOURLY_BUCKET_REQUIRED,
+        "HourlyStatsBucket must require the exact 5 fields with additionalProperties=false",
+    )
+    require(
+        hourly_bucket_props["hour_start"].get("type") == "string"
+        and hourly_bucket_props["hour_start"].get("format") == "date-time",
+        "HourlyStatsBucket.hour_start must be a date-time string",
+    )
+    for int_field in ("total", "ok", "failed", "cache_hits"):
+        require(
+            hourly_bucket_props[int_field].get("type") == "integer"
+            and hourly_bucket_props[int_field].get("minimum") == 0,
+            f"HourlyStatsBucket.{int_field} must be integer with minimum=0",
+        )
+
     require(
         comp_schemas["StatsSnapshot"]["required"] == [
             "started_at", "generated_at", "uptime_seconds",
             "requests", "cache", "admission", "ytdlp", "shanghai", "parse_latency_ms", "api_keys",
+            "runtime", "daily", "hourly",
         ],
         "StatsSnapshot required fields mismatch",
     )
@@ -411,6 +548,27 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         and api_keys_prop.get("maxItems") == 64
         and (api_keys_prop.get("items") or {}).get("$ref") == "#/components/schemas/APIKeyStatsSnapshot",
         "StatsSnapshot.api_keys must be maxItems=64 array of APIKeyStatsSnapshot",
+    )
+    runtime_prop = comp_schemas["StatsSnapshot"]["properties"].get("runtime") or {}
+    require(
+        runtime_prop.get("$ref") == "#/components/schemas/RuntimeConfigSnapshot",
+        "StatsSnapshot.runtime must reference RuntimeConfigSnapshot",
+    )
+    daily_prop = comp_schemas["StatsSnapshot"]["properties"].get("daily") or {}
+    require(
+        daily_prop.get("type") == "array"
+        and daily_prop.get("minItems") == 0
+        and daily_prop.get("maxItems") == 30
+        and (daily_prop.get("items") or {}).get("$ref") == "#/components/schemas/DailyStatsBucket",
+        "StatsSnapshot.daily must be minItems=0, maxItems=30 array of DailyStatsBucket",
+    )
+    hourly_prop = comp_schemas["StatsSnapshot"]["properties"].get("hourly") or {}
+    require(
+        hourly_prop.get("type") == "array"
+        and hourly_prop.get("minItems") == 0
+        and hourly_prop.get("maxItems") == 24
+        and (hourly_prop.get("items") or {}).get("$ref") == "#/components/schemas/HourlyStatsBucket",
+        "StatsSnapshot.hourly must be minItems=0, maxItems=24 array of HourlyStatsBucket",
     )
     return ref_count
 
@@ -526,15 +684,61 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "wait_ms_total": 0,
         "wait_ms_max": 0,
     }
+    sample_runtime = {
+        "version": "1.0.0",
+        "shanghai_mode": "pull",
+        "shanghai_bilibili": True,
+        "bilibili_dash": False,
+        "youtube_helper": True,
+        "xhs_transport": "chrome131",
+        "ytdlp_enabled": True,
+        "ytdlp_generic_enabled": False,
+        "tbvideo_pipigx": False,
+        "tbvideo_zuiyou": False,
+        "stats_persistence_enabled": True,
+    }
+    sample_daily_bucket = {
+        "date": "2026-11-15",
+        "total": 2,
+        "ok": 2,
+        "failed": 0,
+        "cache_hits": 1,
+        "shanghai_hits": 1,
+        "latency_ms": {"p50_ms": 100, "p95_ms": 250, "max_ms": 250},
+        "by_platform": {
+            "douyin": {
+                "total": 1,
+                "ok": 1,
+                "failed": 0,
+                "by_code": {"OK": 1},
+                "p95_ms": 100,
+            },
+            "ytdlp_other": {
+                "total": 1,
+                "ok": 1,
+                "failed": 0,
+                "by_code": {"OK": 1},
+                "p95_ms": 250,
+            },
+        },
+    }
+    sample_hourly_bucket = {
+        "hour_start": "2026-11-15T08:00:00+08:00",
+        "total": 2,
+        "ok": 2,
+        "failed": 0,
+        "cache_hits": 1,
+    }
     base_stats_data = {
         "started_at": "2026-11-15T00:00:00Z",
         "generated_at": "2026-11-15T00:05:00Z",
         "uptime_seconds": 300,
         "requests": {
-            "total": 1,
-            "by_channel": {"anonymous": 0, "owner": 1},
+            "total": 2,
+            "by_channel": {"anonymous": 0, "owner": 2},
             "by_platform_code_channel": [
                 {"platform": "douyin", "code": "OK", "channel": "owner", "count": 1},
+                {"platform": "vimeo:embed", "code": "OK", "channel": "owner", "count": 1},
             ],
         },
         "cache": {
@@ -559,22 +763,26 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
             "by_channel": {"anonymous": zero_hist, "owner": zero_hist},
         },
         "api_keys": [sample_api_key],
+        "runtime": sample_runtime,
+        "daily": [sample_daily_bucket],
+        "hourly": [sample_hourly_bucket],
     }
     require(not list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
         "data": base_stats_data,
-    })), "Valid /api/stats payload with api_keys rejected")
+    })), "Valid /api/stats payload with api_keys/runtime/daily/hourly rejected")
     require(not list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
-        "data": {**base_stats_data, "api_keys": []},
-    })), "Valid /api/stats payload with empty api_keys=[] rejected")
-    require(bool(list(stats_val.iter_errors({
-        "schema_version": "1.0",
-        "code": "OK",
-        "data": {k: v for k, v in base_stats_data.items() if k != "api_keys"},
-    }))), "Missing api_keys field in /api/stats must be rejected")
+        "data": {**base_stats_data, "api_keys": [], "daily": [], "hourly": []},
+    })), "Valid /api/stats payload with empty api_keys/daily/hourly rejected")
+    for req_field in ("api_keys", "runtime", "daily", "hourly"):
+        require(bool(list(stats_val.iter_errors({
+            "schema_version": "1.0",
+            "code": "OK",
+            "data": {k: v for k, v in base_stats_data.items() if k != req_field},
+        }))), f"Missing {req_field} field in /api/stats must be rejected")
     require(bool(list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
@@ -595,8 +803,79 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "code": "OK",
         "data": {**base_stats_data, "api_keys": [{**sample_api_key, "id": "Bad_ID"}]},
     }))), "Invalid id pattern in APIKeyStatsSnapshot must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "runtime": {**sample_runtime, "snapshot_path": "example-snapshot.json"}},
+    }))), "Unknown property in RuntimeConfigSnapshot must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "runtime": {**sample_runtime, "xhs_transport": "curl"}},
+    }))), "Invalid xhs_transport in RuntimeConfigSnapshot must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "requests": {
+                **base_stats_data["requests"],
+                "by_platform_code_channel": [
+                    {"platform": "Bad Platform", "code": "OK", "channel": "owner", "count": 1},
+                ],
+            },
+        },
+    }))), "Invalid StatsPlatform pattern must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "daily": [{**sample_daily_bucket, "date": "2026/11/15"}]},
+    }))), "Invalid date format in DailyStatsBucket must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "daily": [{**sample_daily_bucket, "latency_ms": {"p50_ms": -1, "p95_ms": 0, "max_ms": 0}}],
+        },
+    }))), "Negative latency_ms in DailyLatencySummary must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "daily": [{
+                **sample_daily_bucket,
+                "by_platform": {
+                    "douyin": {
+                        "total": 1,
+                        "ok": 1,
+                        "failed": 0,
+                        "by_code": {"OK": 1},
+                        "p95_ms": 100,
+                        "extra": True,
+                    },
+                },
+            }],
+        },
+    }))), "Unknown property in DailyPlatformStats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "daily": [sample_daily_bucket] * 31},
+    }))), "daily array exceeding maxItems=30 must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "hourly": [sample_hourly_bucket] * 25},
+    }))), "hourly array exceeding maxItems=24 must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "hourly": [{**sample_hourly_bucket, "extra": 1}]},
+    }))), "Unknown property in HourlyStatsBucket must be rejected")
 
-    return {"enabled": True, "validated_fixtures": len(fixture_files) + 11 + validate_doc_json_blocks(
+    return {"enabled": True, "validated_fixtures": len(fixture_files) + 23 + validate_doc_json_blocks(
         success_val, failure_val, catalog_val, stats_val, unauth_val, ratelimit_val
     )}
 

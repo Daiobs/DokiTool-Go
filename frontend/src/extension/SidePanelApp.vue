@@ -16,9 +16,15 @@ import {
   type ExtensionSettings,
   type ExtensionStateSnapshot,
   type MatchedPlatformUrl,
+  type OwnerStatsResult,
   type PendingPanelIntent,
   type TabSyncState,
 } from "./protocol";
+import {
+  computeTodayVsYesterday,
+  formatPercent,
+  type TodayVsYesterdaySummary,
+} from "./statsTypes";
 import {
   DEFAULT_EXTENSION_SETTINGS,
   buildWorkFingerprint,
@@ -30,6 +36,7 @@ import {
   getNextExtensionTheme,
   mergeEnqueuedTasks,
   mergeMediaAttachmentsById,
+  openMonitorDashboardTab,
   readCachedExtensionTheme,
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
@@ -90,9 +97,57 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const consumedIntentIds = new Set<string>();
 let bridgeHandle: { dispose: () => void } | null = null;
 
+// Read-only owner telemetry capsule state (silently populated ONLY on 200 OK)
+const OWNER_STATS_THROTTLE_MS = 15_000;
+const ownerStats = ref<OwnerStatsResult | null>(null);
+let ownerStatsGeneration = 0;
+let lastOwnerStatsCredentialKey = "";
+let lastOwnerStatsFetchAt = 0;
+
 // ============================================================================
 // Computed Derived State
 // ============================================================================
+
+const showOwnerStatsPill = computed<boolean>(() =>
+  Boolean(settings.value.bearerToken.trim() && ownerStats.value),
+);
+
+const ownerTodaySummary = computed<TodayVsYesterdaySummary | null>(() =>
+  ownerStats.value ? computeTodayVsYesterday(ownerStats.value.stats) : null,
+);
+
+const ownerTodayRateText = computed<string>(() => {
+  const s = ownerTodaySummary.value;
+  if (!s || s.total <= 0) return "—";
+  return formatPercent(s.ok, s.total, 1);
+});
+
+const ownerTodayRateTone = computed<"ok" | "warn" | "danger" | "idle">(() => {
+  const s = ownerTodaySummary.value;
+  if (!s || s.successRate === null) return "idle";
+  if (s.successRate >= 95) return "ok";
+  if (s.successRate >= 80) return "warn";
+  return "danger";
+});
+
+const ownerShanghaiWorkers = computed<number>(() => {
+  const workers = ownerStats.value?.stats.shanghai?.waiting_workers;
+  return typeof workers === "number" && Number.isFinite(workers) && workers > 0
+    ? Math.floor(workers)
+    : 0;
+});
+
+const ownerShanghaiOnline = computed<boolean>(
+  () => ownerShanghaiWorkers.value > 0,
+);
+
+const ownerShanghaiTitle = computed<string>(() => {
+  const sh = ownerStats.value?.stats.shanghai;
+  if (!sh || sh.mode === "off") {
+    return "上海出口节点未启用";
+  }
+  return `上海出口 (${sh.mode}) · 在线 Worker ${ownerShanghaiWorkers.value} · 待处理 ${sh.queued_tasks}`;
+});
 
 const isCurrentWorkSaved = computed<boolean>(() =>
   Boolean(
@@ -124,7 +179,7 @@ const showOneClickCurrentTabBtn = computed<boolean>(() => {
 });
 
 // ============================================================================
-// Notification Helper
+// Notification & Owner Telemetry Helpers
 // ============================================================================
 
 function showToast(
@@ -136,6 +191,62 @@ function showToast(
   toastTimer = setTimeout(() => {
     toast.value = null;
   }, 2600);
+}
+
+async function refreshOwnerStatsSilently(options?: {
+  force?: boolean;
+  targetSettings?: ExtensionSettings;
+}) {
+  const target = options?.targetSettings ?? settings.value;
+  const token = target.bearerToken.trim();
+  const apiBaseUrl = target.apiBaseUrl.trim();
+  if (!token) {
+    ownerStatsGeneration += 1;
+    lastOwnerStatsCredentialKey = "";
+    lastOwnerStatsFetchAt = 0;
+    ownerStats.value = null;
+    return;
+  }
+
+  const credKey = `${apiBaseUrl}|${token}`;
+  const now = Date.now();
+  const credentialsChanged = credKey !== lastOwnerStatsCredentialKey;
+  if (
+    !options?.force &&
+    !credentialsChanged &&
+    now - lastOwnerStatsFetchAt < OWNER_STATS_THROTTLE_MS
+  ) {
+    return;
+  }
+
+  if (credentialsChanged) {
+    ownerStats.value = null;
+  }
+  lastOwnerStatsCredentialKey = credKey;
+  lastOwnerStatsFetchAt = now;
+  const myGen = ++ownerStatsGeneration;
+
+  try {
+    const rpc = await sendSidePanelRequest({ type: "FETCH_OWNER_STATS" });
+    if (myGen !== ownerStatsGeneration) return;
+    if (!settings.value.bearerToken.trim()) {
+      ownerStats.value = null;
+      return;
+    }
+    if (rpc.ok) {
+      ownerStats.value = rpc.data;
+    } else {
+      ownerStats.value = null;
+    }
+  } catch {
+    if (myGen === ownerStatsGeneration) {
+      ownerStats.value = null;
+    }
+  }
+}
+
+function handleOpenMonitorDashboard() {
+  void openMonitorDashboardTab();
 }
 
 // ============================================================================
@@ -204,6 +315,9 @@ async function runParseUrl(
       activeWorkFingerprint.value,
       ...savedWorkFingerprints.value,
     ];
+  }
+  if (settings.value.bearerToken.trim()) {
+    void refreshOwnerStatsSilently();
   }
 }
 
@@ -334,12 +448,25 @@ async function handlePendingIntent(intent: PendingPanelIntent | null) {
 }
 
 function applySnapshot(snapshot: ExtensionStateSnapshot) {
+  const prevToken = settings.value.bearerToken.trim();
+  const prevUrl = settings.value.apiBaseUrl.trim();
   settings.value = { ...snapshot.settings };
   applyExtensionTheme(snapshot.settings.theme);
   tasks.value = [...snapshot.tasks];
   savedWorkFingerprints.value = [...snapshot.savedWorkFingerprints];
   if (snapshot.connection !== undefined) {
     connection.value = snapshot.connection ?? null;
+  }
+  const nextToken = snapshot.settings.bearerToken.trim();
+  const nextUrl = snapshot.settings.apiBaseUrl.trim();
+  if (!nextToken) {
+    void refreshOwnerStatsSilently({ targetSettings: snapshot.settings });
+  } else if (
+    nextToken !== prevToken ||
+    nextUrl !== prevUrl ||
+    ownerStats.value === null
+  ) {
+    void refreshOwnerStatsSilently({ targetSettings: snapshot.settings });
   }
   if (snapshot.pendingIntent) {
     tabSync.value = snapshot.tabSync;
@@ -413,8 +540,20 @@ async function handleCycleThemeHeader() {
 }
 
 function handleSettingsSaved(nextSettings: ExtensionSettings) {
+  const prevToken = settings.value.bearerToken.trim();
+  const prevUrl = settings.value.apiBaseUrl.trim();
   settings.value = { ...nextSettings };
   applyExtensionTheme(nextSettings.theme);
+  const nextToken = nextSettings.bearerToken.trim();
+  const nextUrl = nextSettings.apiBaseUrl.trim();
+  if (!nextToken) {
+    void refreshOwnerStatsSilently({ targetSettings: nextSettings });
+  } else if (nextToken !== prevToken || nextUrl !== prevUrl) {
+    void refreshOwnerStatsSilently({
+      force: true,
+      targetSettings: nextSettings,
+    });
+  }
   if (settings.value.autoFollowTab) {
     evaluateTabSync(tabSync.value);
   } else {
@@ -629,6 +768,61 @@ onUnmounted(() => {
       @cycle-theme="handleCycleThemeHeader"
       @open-settings="settingsOpen = true"
     />
+
+    <!-- Read-Only Owner Status Capsule (STRICTLY shown only when owner /api/stats returns 200 OK) -->
+    <div
+      v-if="showOwnerStatsPill && ownerTodaySummary"
+      class="sp-owner-pill"
+      data-testid="owner-stats-pill"
+    >
+      <div class="sp-owner-pill__metrics">
+        <span
+          class="sp-owner-pill__item"
+          :title="`今日成功 ${ownerTodaySummary.ok} / 失败 ${ownerTodaySummary.failed}`"
+        >
+          <span
+            class="sp-owner-pill__dot"
+            :class="`sp-owner-pill__dot--${ownerTodayRateTone}`"
+          />
+          <span class="sp-owner-pill__value">
+            今日 {{ ownerTodaySummary.total }} 次
+          </span>
+          <span class="sp-owner-pill__sep">·</span>
+          <span
+            class="sp-owner-pill__rate"
+            :class="`sp-owner-pill__rate--${ownerTodayRateTone}`"
+          >
+            {{ ownerTodayRateText }}
+          </span>
+        </span>
+
+        <span
+          class="sp-owner-pill__item sp-owner-pill__shanghai"
+          :title="ownerShanghaiTitle"
+        >
+          <span
+            class="sp-owner-pill__dot"
+            :class="
+              ownerShanghaiOnline
+                ? 'sp-owner-pill__dot--ok'
+                : 'sp-owner-pill__dot--idle'
+            "
+          />
+          <span>上海 {{ ownerShanghaiWorkers }} 节点</span>
+        </span>
+      </div>
+
+      <button
+        type="button"
+        class="sp-owner-pill__btn"
+        data-testid="open-monitor-dashboard-btn"
+        title="在新标签页打开宽屏解析监控大盘"
+        @click="handleOpenMonitorDashboard"
+      >
+        <span>解析监控大盘</span>
+        <span aria-hidden="true">↗</span>
+      </button>
+    </div>
 
     <main class="sp-main">
       <!-- SINGLE LINK MODE -->
@@ -855,6 +1049,126 @@ onUnmounted(() => {
   flex-direction: column;
   overflow: hidden;
   position: relative;
+}
+
+/* Compact Owner Telemetry Capsule */
+.sp-owner-pill {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 10px;
+  background: var(--sp-bg-surface);
+  border-bottom: 1px solid var(--sp-border);
+  font-size: 11px;
+  color: var(--sp-text-secondary);
+  min-width: 0;
+}
+
+.sp-owner-pill__metrics {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.sp-owner-pill__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.sp-owner-pill__shanghai {
+  color: var(--sp-text-muted);
+}
+
+.sp-owner-pill__dot {
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sp-owner-pill__dot--ok {
+  background: var(--sp-success);
+  box-shadow: 0 0 6px var(--sp-success-glow);
+}
+
+.sp-owner-pill__dot--warn {
+  background: var(--sp-warning);
+}
+
+.sp-owner-pill__dot--danger {
+  background: var(--sp-danger);
+  box-shadow: 0 0 6px var(--sp-danger-glow);
+}
+
+.sp-owner-pill__dot--idle {
+  background: var(--sp-dot-idle);
+}
+
+.sp-owner-pill__value {
+  font-weight: 600;
+  color: var(--sp-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-owner-pill__sep {
+  color: var(--sp-text-muted);
+}
+
+.sp-owner-pill__rate {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-owner-pill__rate--ok {
+  color: var(--sp-success-text);
+}
+
+.sp-owner-pill__rate--warn {
+  color: var(--sp-warning-text);
+}
+
+.sp-owner-pill__rate--danger {
+  color: var(--sp-danger-text);
+}
+
+.sp-owner-pill__rate--idle {
+  color: var(--sp-text-muted);
+}
+
+.sp-owner-pill__btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 8px;
+  border-radius: var(--sp-radius-pill);
+  border: 1px solid var(--sp-accent-border);
+  background: var(--sp-accent-soft);
+  color: var(--sp-accent-text-strong);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.sp-owner-pill__btn:hover {
+  background: var(--sp-accent-soft-strong);
+  border-color: var(--sp-border-accent);
+}
+
+.sp-owner-pill__btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sp-focus-ring);
 }
 
 .sp-main {

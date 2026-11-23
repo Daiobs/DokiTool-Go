@@ -60,9 +60,9 @@
 | `DOKITOOL_OWNER_TOKEN` | 个人 `owner` 通道及只读统计接口（`/api/stats`）的私有 Bearer 鉴权令牌（非空时生成隐式 `id: "owner"`、`role: "owner"` 密钥，可与 `DOKITOOL_API_KEYS_FILE` 并存；须为独立凭据且不得与其他密钥或摘要冲突） | 是 |
 | `DOKITOOL_API_KEYS_FILE` | 指定多密钥 SHA-256 鉴权注册表 JSON 配置文件路径（支持 `owner` / `agent` / `friend` 角色、按密钥独立并发池与速率限流、平台白名单及 `SIGHUP` 原子热重载；文件内仅存 SHA-256 摘要，建议宿主机权限设为 `0600`） | 是（含鉴权摘要与策略） |
 
-### 2. 抖音上海通道、解析缓存与平台启用开关
+### 2. 抖音上海通道、解析缓存、统计快照与平台启用开关
 
-源码定义：`backend/cmd/dokitool/main.go`、`backend/cmd/shanghai-resolver/main.go`、`backend/internal/api/cache.go`、`backend/internal/platform/ytgeneric/sites.go`
+源码定义：`backend/cmd/dokitool/main.go`、`backend/cmd/shanghai-resolver/main.go`、`backend/internal/api/cache.go`、`backend/internal/api/stats_persistence.go`、`backend/internal/platform/ytgeneric/sites.go`
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
@@ -71,6 +71,7 @@
 | `DOKITOOL_SHANGHAI_BILIBILI` | 控制主后端在启用上海解析通道时是否开启哔哩哔哩国内线路并行解析与合并 | 否 |
 | `DOKITOOL_BILIBILI_DASH` | 控制 `dokitool` 主后端与 `shanghai-resolver` 上海节点是否开启哔哩哔哩免登录 DASH（1080P 视频轨与独立 M4A 音频轨）并行解析与合并；默认关闭（`false`），关闭时两端均严格仅发送原有单次 `durl` 请求，传入非布尔值时进程在监听前即报错退出 | 否 |
 | `DOKITOOL_PARSE_CACHE` | 控制主后端是否启用 `/api/parse` 与 `/api/resolve` 进程内短时结果缓存及同键并发请求合并 | 否 |
+| `DOKITOOL_STATS_SNAPSHOT_PATH` | 指定 `/api/stats` 统计快照的本地持久化文件路径（默认为空，纯内存运行不执行磁盘读写）；配置路径后，启动时加载未过期的近 30 天（`Asia/Shanghai` UTC+8）日桶与近 24 小时时桶，文件不存在则冷启动，若文件损坏或快照版本不匹配则打印告警并以安全空状态启动、不阻塞主服务；运行期每 5 分钟及收到 `SIGINT`/`SIGTERM` 停机时通过同目录临时文件 + `Sync` + 原子重命名以 `0600` 权限落盘；仅存聚合统计元数据，绝不写入 URL、IP 或令牌 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
