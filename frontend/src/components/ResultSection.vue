@@ -5,7 +5,11 @@ import ResultVideoStageCard from "./result/ResultVideoStageCard.vue";
 import ResultGalleryCard from "./result/ResultGalleryCard.vue";
 import ResultLivePhotoCard from "./result/ResultLivePhotoCard.vue";
 import ResultDetailsSidebar from "./result/ResultDetailsSidebar.vue";
-import ResultYouTubeHelperModal from "./result/ResultYouTubeHelperModal.vue";
+import CapabilityUpgradeNotice from "./result/CapabilityUpgradeNotice.vue";
+import {
+  LATEST_EXTENSION_VERSION,
+  isExtensionVersionOutdated,
+} from "../core/capabilityHub";
 import {
   readyItem,
   readyVariant,
@@ -136,6 +140,14 @@ const extensionBridgeState = ref({
 });
 const isExtensionConnected = computed(() =>
   Boolean(extensionBridgeState.value.connected),
+);
+const isExtensionOutdated = computed(
+  () =>
+    isExtensionConnected.value &&
+    isExtensionVersionOutdated(
+      extensionBridgeState.value.version,
+      LATEST_EXTENSION_VERSION,
+    ),
 );
 const canExtensionDashMux = computed(
   () =>
@@ -403,14 +415,30 @@ const sourceHint = computed(() =>
       : "sourceHint",
   ),
 );
+const youtubeHelperDisplayVersion = computed(() =>
+  youtubeHelper.value?.provider === "extension"
+    ? youtubeHelper.value?.extensionVersion ||
+      youtubeHelper.value?.version ||
+      extensionBridgeState.value.version ||
+      null
+    : youtubeHelper.value?.version,
+);
 const headerStatusText = computed(() =>
   isYouTubeHelperReady.value
-    ? formatHeaderReadyStatus(youtubeHelper.value?.version, props.locale)
+    ? formatHeaderReadyStatus(
+        youtubeHelperDisplayVersion.value,
+        props.locale,
+        youtubeHelper.value?.provider,
+      )
     : sourceHint.value,
 );
 const headerStatusTitle = computed(() =>
   isYouTubeHelperReady.value
-    ? formatHeaderReadyTitle(youtubeHelper.value?.version, props.locale)
+    ? formatHeaderReadyTitle(
+        youtubeHelperDisplayVersion.value,
+        props.locale,
+        youtubeHelper.value?.provider,
+      )
     : undefined,
 );
 const playerQualityTagText = computed(() =>
@@ -574,16 +602,13 @@ const copyToClipboard = async (text) => {
 
 const syncBodyScrollLock = () => {
   if (typeof document === "undefined" || !document.body) return;
-  document.body.style.overflow =
-    imageModalOpen.value || ytHelperModalOpen.value ? "hidden" : "";
+  document.body.style.overflow = imageModalOpen.value ? "hidden" : "";
 };
 const closeYtHelperModal = () => {
   ytHelperModalDismissed.value = true;
-  syncBodyScrollLock();
 };
 const openYtHelperModal = () => {
   ytHelperModalDismissed.value = false;
-  syncBodyScrollLock();
 };
 const onImageModalOpenChange = (open) => {
   imageModalOpen.value = open;
@@ -602,10 +627,8 @@ watch(
   () => youtubeHelper.value?.status,
   () => {
     ytHelperModalDismissed.value = false;
-    syncBodyScrollLock();
   },
 );
-watch(ytHelperModalOpen, syncBodyScrollLock);
 
 const extConnectedTitleText = computed(() => {
   const ver = extensionBridgeState.value.version
@@ -613,6 +636,18 @@ const extConnectedTitleText = computed(() => {
     : "";
   return `${t(props.locale, "extConnectedTitle")}${ver}`;
 });
+const extUpdateBadgeText = computed(() =>
+  t(props.locale, "extUpdateBadge").replace(
+    "{version}",
+    LATEST_EXTENSION_VERSION,
+  ),
+);
+const extUpdateBadgeTitle = computed(() =>
+  t(props.locale, "extUpdateBadgeTitle").replace(
+    "{version}",
+    LATEST_EXTENSION_VERSION,
+  ),
+);
 const extInstallHintText = computed(() => {
   const maxRes = bilibiliDashSummary.value?.maxResolution;
   if (maxRes) {
@@ -783,6 +818,17 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
             /><span class="rs-header-hint-text">{{
               t(locale, "extConnected")
             }}</span></span
+          ><button
+            v-if="isExtensionOutdated"
+            type="button"
+            data-testid="extension-update-badge"
+            class="rs-ext-update-pill"
+            :title="extUpdateBadgeTitle"
+            @click="emit('open-extension')"
+            ><AppIcon class="fas fa-bolt rs-ext-update-pill-icon" /><span
+              class="rs-ext-update-pill-text"
+              >{{ extUpdateBadgeText }}</span
+            ></button
           ><span
             v-if="isYouTubeHelperReady || !isExtensionConnected"
             class="rs-header-hint"
@@ -891,7 +937,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :locale="locale"
           :selection="selection"
           :result-version="resultVersion"
-          :suspend-keys="ytHelperModalOpen"
+          :suspend-keys="false"
           :safe-image-url="safeImageUrl"
           @download-images="emit('download-images')"
           @download-image="emit('download-image', $event)"
@@ -985,14 +1031,16 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
       ></Teleport
     >
 
-    <ResultYouTubeHelperModal
+    <CapabilityUpgradeNotice
       :open="ytHelperModalOpen"
       :is-client-mounted="isClientMounted"
+      mode="client_session"
       :youtube-helper="youtubeHelper"
       :youtube-helper-script-url="youtubeHelperScriptUrl"
       :needs-manual-helper-refresh="needsManualHelperRefresh"
       :locale="locale"
       @close="closeYtHelperModal"
+      @open-extension="emit('open-extension')"
       @install-youtube-helper="emit('install-youtube-helper')"
       @refresh-youtube-helper-page="emit('refresh-youtube-helper-page')"
     />
@@ -1119,6 +1167,10 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+}
+.rs-header-right {
+  flex-wrap: wrap;
+  gap: 0.5rem 0.625rem;
 }
 .rs-header-left {
   flex-wrap: wrap;
@@ -1310,6 +1362,44 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
 .rs-header-hint--ready .rs-header-hint-text {
   color: var(--c-fg-2);
   font-weight: 600;
+}
+.rs-ext-update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.1);
+  color: #b45309;
+  font-family: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--t-fast);
+}
+.rs-ext-update-pill:hover {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.52);
+  transform: translateY(-1px);
+}
+.rs-ext-update-pill:focus-visible {
+  outline: 2px solid var(--c-warn);
+  outline-offset: 2px;
+}
+.rs-ext-update-pill-icon {
+  font-size: 0.625rem;
+}
+:global(.dark) .rs-ext-update-pill {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(251, 191, 36, 0.36);
+  color: #fcd34d;
+}
+:global(.dark) .rs-ext-update-pill:hover {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: rgba(251, 191, 36, 0.55);
 }
 
 .rs-playback-error {

@@ -29,6 +29,8 @@ let storage;
 let protocol;
 let backgroundMod;
 let extensionBridge;
+let extensionDownloadMod;
+let youtubeExtensionBridgeMod;
 let youtubeHelperSource = "";
 
 async function bundleTsModule(relPath) {
@@ -48,6 +50,7 @@ async function bundleTsModule(relPath) {
 
 before(async () => {
   globalThis.__DOKITOOL_EXT_TEST__ = true;
+  let offscreenBundle;
   [
     hostWhitelist,
     dnrRules,
@@ -56,6 +59,7 @@ before(async () => {
     protocol,
     backgroundMod,
     extensionBridge,
+    offscreenBundle,
     youtubeHelperSource,
   ] = await Promise.all([
     bundleTsModule("../src/extension/hostWhitelist.ts"),
@@ -65,11 +69,32 @@ before(async () => {
     bundleTsModule("../src/extension/protocol.ts"),
     bundleTsModule("../src/extension/background.ts"),
     bundleTsModule("../src/services/extensionBridge.ts"),
+    (async () => {
+      const bundled = await build({
+        stdin: {
+          contents: `
+            export * as extensionDownloadMod from "./src/extension/extensionDownload.ts";
+            export * as youtubeExtensionBridgeMod from "./src/extension/youtubeExtensionBridge.ts";
+          `,
+          resolveDir: fileURLToPath(new URL("..", import.meta.url)),
+          loader: "ts",
+        },
+        bundle: true,
+        write: false,
+        platform: "node",
+        format: "esm",
+      });
+      return import(
+        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
+      );
+    })(),
     readFile(
       new URL("../src/utils/youtubeHelperCore.js", import.meta.url),
       "utf8",
     ),
   ]);
+  extensionDownloadMod = offscreenBundle.extensionDownloadMod;
+  youtubeExtensionBridgeMod = offscreenBundle.youtubeExtensionBridgeMod;
 });
 
 beforeEach(() => {
@@ -2084,7 +2109,12 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
       data: {
         version: "1.2.3",
         extensionId: DOKITOOL_EXTENSION_ID,
-        capabilities: ["dash_mux", "direct_download"],
+        capabilities: [
+          "dash_mux",
+          "direct_download",
+          "youtube_parse",
+          "youtube_mux",
+        ],
       },
     });
     assert.equal(
@@ -2330,4 +2360,839 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
   }
+});
+
+test("PR-2 Web External Bridge: WEB_EXT_PARSE_YOUTUBE (valid/invalid videoId, zero-secret anonymous fetch, LOGIN_REQUIRED), youtube_mux/youtube_direct strict *.googlevideo.com whitelist, and WEB_EXT_CANCEL_TASK isolation", async () => {
+  const prodManifest = {
+    version: "4.2.0",
+    externally_connectable: { matches: PROD_EXTERNALLY_CONNECTABLE_MATCHES },
+  };
+  const devManifest = {
+    version: "4.2.0",
+    externally_connectable: { matches: DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES },
+  };
+
+  let activeManifest = prodManifest;
+  let nextPlayerStatus = "OK";
+  const observedFetches = [];
+  const offscreenMessages = [];
+  const cancelledDownloadIds = [];
+  let dnrSyncCount = 0;
+
+  const mockFetch = async (url, init = {}) => {
+    const reqUrl = String(url);
+    const headers = Object.fromEntries(
+      Object.entries(init.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)]),
+    );
+    observedFetches.push({
+      url: reqUrl,
+      method: init.method || "GET",
+      credentials: init.credentials,
+      headers,
+      body: init.body,
+    });
+
+    if (reqUrl.includes("/api/youtube/context")) {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: {
+            player_id: "player-anon-1",
+            signature_timestamp: 20100,
+            client: {
+              clientName: "TVHTML5",
+              clientVersion: "7.20260101.00.00",
+              hl: "en",
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (reqUrl.includes("/api/youtube/finalize")) {
+      const parsedBody = JSON.parse(String(init.body || "{}"));
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: {
+            platform: "youtube",
+            content_id: parsedBody.video_id,
+            source_url: `https://www.youtube.com/watch?v=${parsedBody.video_id}`,
+            title: parsedBody.title || "Web Bridge 4K Demo",
+            items: [
+              {
+                id: "item-1",
+                type: "video",
+                state: "ready",
+                variants: [
+                  {
+                    id: "v-2160",
+                    state: "ready",
+                    label: "2160p60",
+                    metadata: { width: 3840, height: 2160, has_audio: false, container: "mp4" },
+                    delivery: {
+                      kind: "file",
+                      sources: [
+                        {
+                          id: "src-v",
+                          url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=313",
+                          access: "direct",
+                        },
+                      ],
+                    },
+                  },
+                ],
+                default: {
+                  variant_id: "v-2160",
+                  url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=313",
+                  access: "direct",
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    return new Response(JSON.stringify({ code: "NOT_FOUND" }), { status: 404 });
+  };
+
+  const extStore = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  await extStore.updateSettings({
+    bearerToken: "doki_owner_secret_MUST_NEVER_BE_SENT_ON_WEB_BRIDGE",
+    apiBaseUrl: "https://custom-owner-backend.example.com",
+    subfolderPrefix: "DokiClips",
+  });
+
+  const externalListeners = [];
+  const mockChrome = {
+    runtime: {
+      id: DOKITOOL_EXTENSION_ID,
+      getManifest: () => activeManifest,
+      onMessage: { addListener() {}, removeListener() {} },
+      onMessageExternal: {
+        addListener(fn) { externalListeners.push(fn); },
+        removeListener(fn) {
+          const i = externalListeners.indexOf(fn);
+          if (i >= 0) externalListeners.splice(i, 1);
+        },
+      },
+      onConnect: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onStartup: { addListener() {} },
+      sendMessage: async (msg) => {
+        offscreenMessages.push(msg);
+        if (msg?.type === "OFFSCREEN_YOUTUBE_PLAYER") {
+          return {
+            ok: true,
+            data: {
+              player: {
+                playabilityStatus: { status: nextPlayerStatus },
+                videoDetails: {
+                  title: "Zero Secret 4K60 Video",
+                  author: "TestChannel",
+                  lengthSeconds: 180,
+                },
+                streamingData: { formats: [], adaptiveFormats: [] },
+              },
+            },
+          };
+        }
+        return { ok: true, data: { accepted: true, cancelled: true } };
+      },
+      getContexts: async () => [{ contextType: "OFFSCREEN_DOCUMENT" }],
+    },
+    declarativeNetRequest: {
+      updateDynamicRules: async () => { dnrSyncCount += 1; },
+      getDynamicRules: async () => [],
+    },
+    downloads: {
+      download: async () => 101,
+      cancel: async (id) => { cancelledDownloadIds.push(id); },
+      onChanged: { addListener() {}, removeListener() {} },
+      onDeterminingFilename: { addListener() {}, removeListener() {} },
+    },
+    offscreen: {
+      createDocument: async () => {},
+      closeDocument: async () => {},
+    },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+      setTitle: async () => {},
+    },
+  };
+
+  const bg = backgroundMod.createBackgroundController({
+    chrome: mockChrome,
+    storage: extStore,
+    fetchImpl: mockFetch,
+  });
+
+  const sendExternal = (
+    msg,
+    sender = { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+  ) =>
+    new Promise((resolveResp) => {
+      externalListeners[0](msg, sender, (resp) => resolveResp(resp));
+    });
+
+  try {
+    // 1) Invalid YouTube videoId rejected before any network or offscreen call
+    for (const badVideoId of ["", "short", "waytoolongvideoid123", "bad/char!11", 12345678901]) {
+      const resp = await sendExternal({
+        type: "WEB_EXT_PARSE_YOUTUBE",
+        videoId: badVideoId,
+      });
+      assert.equal(resp.ok, false);
+      assert.equal(resp.code, "INVALID_PAYLOAD");
+    }
+    assert.equal(observedFetches.length, 0);
+    assert.equal(offscreenMessages.length, 0);
+
+    // 2) Valid videoId runs DNR sync + anonymous /api/youtube/context & /api/youtube/finalize on PROD_API_ORIGIN
+    const parseResp = await sendExternal({
+      type: "WEB_EXT_PARSE_YOUTUBE",
+      videoId: "dQw4w9WgXcQ",
+      locale: "zh-CN",
+    });
+    assert.equal(parseResp.ok, true);
+    assert.ok(dnrSyncCount >= 1, "must sync dynamic DNR rules before YouTube player request");
+    assert.equal(observedFetches.length, 2);
+    assert.ok(
+      observedFetches[0].url.startsWith("https://snap.dokitool.com/api/youtube/context"),
+      "prod web bridge must ignore custom owner apiBaseUrl and use PROD_API_ORIGIN",
+    );
+    assert.ok(
+      observedFetches[1].url.startsWith("https://snap.dokitool.com/api/youtube/finalize"),
+    );
+    for (const req of observedFetches) {
+      assert.equal(req.credentials, "omit");
+      assert.equal(
+        req.headers.authorization,
+        undefined,
+        "WEB_EXT_PARSE_YOUTUBE must NEVER send owner's bearerToken",
+      );
+      assert.equal(
+        JSON.stringify(req).includes("doki_owner_secret_MUST_NEVER_BE_SENT_ON_WEB_BRIDGE"),
+        false,
+      );
+    }
+    assert.equal(parseResp.data.media.content_id, "dQw4w9WgXcQ");
+    assert.equal(parseResp.data.media.extra?.youtube_helper?.status, "ready");
+    assert.equal(parseResp.data.media.extra?.youtube_helper?.provider, "extension");
+    assert.equal(parseResp.data.media.extra?.youtube_helper?.version, "4.2.0");
+    assert.equal(parseResp.data.media.extra?.youtube_helper?.extensionVersion, "4.2.0");
+    assert.equal(
+      JSON.stringify(parseResp).includes("doki_owner_secret_MUST_NEVER_BE_SENT_ON_WEB_BRIDGE"),
+      false,
+    );
+
+    // 3) LOGIN_REQUIRED returns structured code and skips /api/youtube/finalize
+    observedFetches.length = 0;
+    nextPlayerStatus = "LOGIN_REQUIRED";
+    const loginReqResp = await sendExternal({
+      type: "WEB_EXT_PARSE_YOUTUBE",
+      videoId: "I9JvDaciaFk",
+    });
+    assert.equal(loginReqResp.ok, false);
+    assert.equal(loginReqResp.code, "LOGIN_REQUIRED");
+    assert.equal(observedFetches.length, 1, "must not call /api/youtube/finalize after LOGIN_REQUIRED");
+    nextPlayerStatus = "OK";
+
+    // 4) Strict *.googlevideo.com whitelist on youtube_mux & youtube_direct (rejects bilivideo, apex, http, evil, loopback on prod)
+    for (const badUrl of [
+      "https://upos-sz-mirrorcos.bilivideo.com/video.m4s",
+      "https://googlevideo.com/videoplayback",
+      "http://rr1---sn-test.googlevideo.com/videoplayback",
+      "https://rr1---sn-test.googlevideo.com.evil.test/videoplayback",
+      "https://evil.example.com/video.mp4",
+      "http://127.0.0.1:5173/mock.mp4",
+    ]) {
+      const badMux = await sendExternal({
+        type: "WEB_EXT_ENQUEUE_MEDIA",
+        payload: {
+          kind: "youtube_mux",
+          platform: "youtube",
+          title: "Bad YT Mux",
+          filename: "video.mp4",
+          youtubeMux: {
+            videoUrl: badUrl,
+            audioUrl: "https://rr2---sn-test.googlevideo.com/audio",
+            outputContainer: "mp4",
+          },
+        },
+      });
+      assert.equal(badMux.ok, false, `youtube_mux must reject videoUrl=${badUrl}`);
+      assert.equal(badMux.code, "UNWHITELISTED_CDN");
+
+      const badMuxAudio = await sendExternal({
+        type: "WEB_EXT_ENQUEUE_MEDIA",
+        payload: {
+          kind: "youtube_mux",
+          platform: "youtube",
+          title: "Bad YT Mux Audio",
+          filename: "video.mp4",
+          youtubeMux: {
+            videoUrl: "https://rr1---sn-test.googlevideo.com/video",
+            audioUrl: badUrl,
+            outputContainer: "mp4",
+          },
+        },
+      });
+      assert.equal(badMuxAudio.ok, false, `youtube_mux must reject audioUrl=${badUrl}`);
+      assert.equal(badMuxAudio.code, "UNWHITELISTED_CDN");
+
+      const badDirect = await sendExternal({
+        type: "WEB_EXT_ENQUEUE_MEDIA",
+        payload: {
+          kind: "youtube_direct",
+          platform: "youtube",
+          title: "Bad YT Direct",
+          filename: "video.mp4",
+          url: badUrl,
+        },
+      });
+      assert.equal(badDirect.ok, false, `youtube_direct must reject url=${badUrl}`);
+      assert.equal(badDirect.code, "UNWHITELISTED_CDN");
+    }
+
+    // Invalid youtube_mux container rejected with INVALID_PAYLOAD
+    const badContainer = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "youtube_mux",
+        platform: "youtube",
+        filename: "clip.mkv",
+        youtubeMux: {
+          videoUrl: "https://rr1---sn-test.googlevideo.com/video",
+          audioUrl: "https://rr2---sn-test.googlevideo.com/audio",
+          outputContainer: "mkv",
+        },
+      },
+    });
+    assert.equal(badContainer.ok, false);
+    assert.equal(badContainer.code, "INVALID_PAYLOAD");
+
+    // 5) Valid youtube_mux (webm) & youtube_direct (m4a / forced safe ext) succeed and sanitize filenames
+    const ytMuxResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "youtube_mux",
+        platform: "youtube",
+        title: "4K60 WebM Test",
+        filename: "../../CON.mp4",
+        youtubeMux: {
+          videoUrl: "https://rr1---sn-test.googlevideo.com/video?itag=315",
+          audioUrl: "https://rr2---sn-test.googlevideo.com/audio?itag=251",
+          videoSize: 50_000_000,
+          audioSize: 4_000_000,
+          outputContainer: "webm",
+        },
+      },
+    });
+    assert.equal(ytMuxResp.ok, true);
+    const ytMuxStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: ytMuxResp.data.taskId,
+    });
+    assert.equal(ytMuxStatus.ok, true);
+    assert.equal(ytMuxStatus.data.filename, "DokiClips/_CON.webm");
+
+    const ytDirectM4a = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "youtube_direct",
+        platform: "youtube",
+        title: "YT Audio",
+        filename: "原声.m4a",
+        url: "https://rr3---sn-test.googlevideo.com/audio?itag=140",
+        mimeType: "audio/mp4",
+      },
+    });
+    assert.equal(ytDirectM4a.ok, true);
+    const ytDirectM4aStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: ytDirectM4a.data.taskId,
+    });
+    assert.equal(ytDirectM4aStatus.data.filename, "DokiClips/原声.m4a");
+
+    const ytDirectBadExt = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "youtube_direct",
+        platform: "youtube",
+        title: "YT Ext Guard",
+        filename: "image.jpg",
+        url: "https://rr3---sn-test.googlevideo.com/video?itag=18",
+      },
+    });
+    assert.equal(ytDirectBadExt.ok, true);
+    const ytDirectBadExtStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: ytDirectBadExt.data.taskId,
+    });
+    assert.equal(
+      ytDirectBadExtStatus.data.filename.endsWith(".mp4"),
+      true,
+      "youtube_direct must only permit .mp4/.m4a/.webm",
+    );
+
+    // 6) Dev loopback sender allows ONLY exact sender origin over http: while still rejecting mismatched port or bilivideo
+    activeManifest = devManifest;
+    const loopbackSender = {
+      origin: "http://127.0.0.1:5173",
+      url: "http://127.0.0.1:5173/",
+    };
+    const devLoopbackOk = await sendExternal(
+      {
+        type: "WEB_EXT_ENQUEUE_MEDIA",
+        payload: {
+          kind: "youtube_direct",
+          platform: "youtube",
+          filename: "loopback.webm",
+          url: "http://127.0.0.1:5173/mock-yt.webm",
+        },
+      },
+      loopbackSender,
+    );
+    assert.equal(devLoopbackOk.ok, true);
+    const devWrongPort = await sendExternal(
+      {
+        type: "WEB_EXT_ENQUEUE_MEDIA",
+        payload: {
+          kind: "youtube_direct",
+          platform: "youtube",
+          filename: "loopback.mp4",
+          url: "http://127.0.0.1:9999/mock-yt.mp4",
+        },
+      },
+      loopbackSender,
+    );
+    assert.equal(devWrongPort.ok, false);
+    assert.equal(devWrongPort.code, "UNWHITELISTED_CDN");
+    activeManifest = prodManifest;
+
+    // 7) WEB_EXT_CANCEL_TASK cancels web-bridge tasks and rejects internal SidePanel tasks with TASK_NOT_FOUND
+    const cancelWebResp = await sendExternal({
+      type: "WEB_EXT_CANCEL_TASK",
+      taskId: ytMuxResp.data.taskId,
+    });
+    assert.deepEqual(cancelWebResp, {
+      ok: true,
+      data: { taskId: ytMuxResp.data.taskId, cancelled: true },
+    });
+    const afterCancelStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: ytMuxResp.data.taskId,
+    });
+    assert.equal(afterCancelStatus.ok, true);
+    assert.equal(afterCancelStatus.data.status, "cancelled");
+    assert.equal(afterCancelStatus.data.phase, "cancelled");
+    assert.ok(
+      offscreenMessages.some(
+        (m) => m?.type === "OFFSCREEN_CANCEL_TASK" && m.taskId === ytMuxResp.data.taskId,
+      ),
+    );
+
+    const internalResp = await new Promise((resolveInternal) => {
+      bg.handleRuntimeMessage(
+        {
+          type: "ENQUEUE_DOWNLOADS",
+          items: [
+            {
+              title: "Internal Only Task",
+              platform: "bilibili",
+              spec: {
+                kind: "direct_file",
+                apiOrigin: "https://snap.dokitool.com",
+                routes: ["https://upos-sz-mirrorcos.bilivideo.com/internal-only.mp4"],
+                filename: "internal-only.mp4",
+              },
+            },
+          ],
+        },
+        { id: DOKITOOL_EXTENSION_ID },
+        (r) => resolveInternal(r),
+      );
+    });
+    assert.equal(internalResp.ok, true);
+    const internalTaskId = internalResp.data.tasks[0].taskId;
+    const crossCancel = await sendExternal({
+      type: "WEB_EXT_CANCEL_TASK",
+      taskId: internalTaskId,
+    });
+    assert.equal(crossCancel.ok, false);
+    assert.equal(crossCancel.code, "TASK_NOT_FOUND");
+    const snap = await bg.getSnapshot();
+    const internalTask = snap.tasks.find((t) => t.taskId === internalTaskId);
+    assert.ok(internalTask);
+    assert.notEqual(
+      internalTask.status,
+      "cancelled",
+      "rejected WEB_EXT_CANCEL_TASK must never mutate internal SidePanel task",
+    );
+  } finally {
+    bg.dispose();
+  }
+});
+
+test("PR-2 Authoritative onDeterminingFilename gatekeeper resists Chromium UUID overwrite, ignores unrelated/other-extension downloads, and cleans up across lifecycle", async () => {
+  const extStore = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  const determiningListeners = [];
+  const changedListeners = [];
+  let nextDlId = 500;
+  let fireSyncDuringDownload = true;
+  let failNextDownload = false;
+  const syncSuggestions = [];
+
+  const mockChrome = {
+    runtime: {
+      id: DOKITOOL_EXTENSION_ID,
+      getManifest: () => ({ version: "4.2.0" }),
+      onMessage: { addListener() {}, removeListener() {} },
+      onMessageExternal: { addListener() {}, removeListener() {} },
+      onConnect: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onStartup: { addListener() {} },
+      sendMessage: async () => ({ ok: true, data: { released: true } }),
+      getContexts: async () => [{ contextType: "OFFSCREEN_DOCUMENT" }],
+    },
+    declarativeNetRequest: {
+      updateDynamicRules: async () => {},
+      getDynamicRules: async () => [],
+    },
+    downloads: {
+      download: async (opts) => {
+        if (failNextDownload) {
+          failNextDownload = false;
+          throw new Error("Simulated downloads.download failure");
+        }
+        const dlId = ++nextDlId;
+        if (fireSyncDuringDownload) {
+          // Simulate Chromium firing onDeterminingFilename synchronously BEFORE download() resolves with a UUID filename
+          const ret = determiningListeners[0](
+            {
+              id: dlId,
+              url: opts.url,
+              finalUrl: opts.url,
+              filename: "f47ac10b-58cc-4372-a567-0e02b2c3d479.txt",
+              byExtensionId: DOKITOOL_EXTENSION_ID,
+            },
+            (suggestion) => syncSuggestions.push(suggestion),
+          );
+          assert.equal(ret, undefined, "onDeterminingFilename must call suggest synchronously and not return true");
+        }
+        return dlId;
+      },
+      cancel: async () => {},
+      onChanged: {
+        addListener(fn) { changedListeners.push(fn); },
+        removeListener(fn) {
+          const idx = changedListeners.indexOf(fn);
+          if (idx >= 0) changedListeners.splice(idx, 1);
+        },
+      },
+      onDeterminingFilename: {
+        addListener(fn) { determiningListeners.push(fn); },
+        removeListener(fn) {
+          const idx = determiningListeners.indexOf(fn);
+          if (idx >= 0) determiningListeners.splice(idx, 1);
+        },
+      },
+    },
+    offscreen: {
+      createDocument: async () => {},
+      closeDocument: async () => {},
+    },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+      setTitle: async () => {},
+    },
+  };
+
+  const bg = backgroundMod.createBackgroundController({
+    chrome: mockChrome,
+    storage: extStore,
+  });
+
+  const sendInternal = (msg) =>
+    new Promise((resolveResp) => {
+      bg.handleRuntimeMessage(msg, { id: DOKITOOL_EXTENSION_ID }, (resp) =>
+        resolveResp(resp),
+      );
+    });
+
+  try {
+    assert.equal(determiningListeners.length, 1, "must register onDeterminingFilename listener");
+
+    // 1) Blob handoff: synchronous onDeterminingFilename with UUID filename overridden with authoritative relative path
+    const blobUrl1 = `blob:chrome-extension://${DOKITOOL_EXTENSION_ID}/11111111-2222-3333-4444-555555555555`;
+    const handoff1 = await sendInternal({
+      type: "HANDOFF_BLOB_DOWNLOAD",
+      taskId: "task-blob-1",
+      blobUrl: blobUrl1,
+      filename: "DokiClips/我的4K演示视频.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 12345,
+    });
+    assert.equal(handoff1.ok, true);
+    const dlId1 = handoff1.data.chromeDownloadId;
+    assert.deepEqual(syncSuggestions, [
+      { filename: "DokiClips/我的4K演示视频.mp4", conflictAction: "uniquify" },
+    ]);
+
+    // 2) Unrelated normal browser download & other-extension download MUST be ignored (suggest not called)
+    const unrelatedSuggestions = [];
+    determiningListeners[0](
+      {
+        id: 9999,
+        url: "https://example.org/report.pdf",
+        finalUrl: "https://example.org/report.pdf",
+        filename: "report.pdf",
+      },
+      (s) => unrelatedSuggestions.push(s),
+    );
+    determiningListeners[0](
+      {
+        id: 9998,
+        url: blobUrl1,
+        finalUrl: blobUrl1,
+        filename: "other.mp4",
+        byExtensionId: "differentextensionid000000000000",
+      },
+      (s) => unrelatedSuggestions.push(s),
+    );
+    assert.equal(unrelatedSuggestions.length, 0);
+
+    // 3) Terminal onChanged cleans up both authoritative maps
+    changedListeners[0]({
+      id: dlId1,
+      state: { previous: "in_progress", current: "complete" },
+    });
+    await bg.waitForIdle();
+    const afterCompleteSuggestions = [];
+    determiningListeners[0](
+      {
+        id: dlId1,
+        url: blobUrl1,
+        filename: "uuid-after-complete.txt",
+        byExtensionId: DOKITOOL_EXTENSION_ID,
+      },
+      (s) => afterCompleteSuggestions.push(s),
+    );
+    assert.equal(afterCompleteSuggestions.length, 0, "maps must be cleaned after terminal onChanged");
+
+    // 4) Failed downloads.download cleans up authoritativeFilenamesByUrl immediately
+    failNextDownload = true;
+    const blobUrlFail = `blob:chrome-extension://${DOKITOOL_EXTENSION_ID}/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`;
+    const failedHandoff = await sendInternal({
+      type: "HANDOFF_BLOB_DOWNLOAD",
+      taskId: "task-blob-fail",
+      blobUrl: blobUrlFail,
+      filename: "DokiClips/fail.mp4",
+    });
+    assert.equal(failedHandoff.ok, false);
+    const afterErrorSuggestions = [];
+    determiningListeners[0](
+      {
+        id: 7777,
+        url: blobUrlFail,
+        filename: "uuid.txt",
+        byExtensionId: DOKITOOL_EXTENSION_ID,
+      },
+      (s) => afterErrorSuggestions.push(s),
+    );
+    assert.equal(afterErrorSuggestions.length, 0, "maps must be cleaned on downloads.download error");
+
+    // 5) Native fallback download + asynchronous onDeterminingFilename (by downloadId) + cancel cleanup
+    fireSyncDuringDownload = false;
+    const nativeEnqueue = await sendInternal({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "Long-tail Native MP4",
+          platform: "generic",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://cdn.vimeo.example/video/1080p.mp4"],
+            filename: "DokiClips/Vimeo 演示.mp4",
+          },
+        },
+      ],
+    });
+    assert.equal(nativeEnqueue.ok, true);
+    const nativeTaskId = nativeEnqueue.data.taskIds[0];
+    // Allow dispatch microtasks to register native download
+    await new Promise((r) => setTimeout(r, 20));
+    const snapBeforeCancel = await bg.getSnapshot();
+    const nativeTask = snapBeforeCancel.tasks.find((t) => t.taskId === nativeTaskId);
+    assert.ok(nativeTask && typeof nativeTask.chromeDownloadId === "number");
+    const nativeDlId = nativeTask.chromeDownloadId;
+
+    const asyncNativeSuggestions = [];
+    determiningListeners[0](
+      {
+        id: nativeDlId,
+        url: "https://redirected-edge.vimeo.example/random-uuid",
+        finalUrl: "https://cdn.vimeo.example/video/1080p.mp4",
+        filename: "random-uuid.bin",
+        byExtensionId: DOKITOOL_EXTENSION_ID,
+      },
+      (s) => asyncNativeSuggestions.push(s),
+    );
+    assert.deepEqual(asyncNativeSuggestions, [
+      { filename: "DokiClips/Vimeo 演示.mp4", conflictAction: "uniquify" },
+    ]);
+
+    // Cancelling the task must clean up both authoritative maps
+    const cancelRes = await sendInternal({ type: "CANCEL_TASK", taskId: nativeTaskId });
+    assert.equal(cancelRes.ok, true);
+    const afterCancelSuggestions = [];
+    determiningListeners[0](
+      {
+        id: nativeDlId,
+        url: "https://cdn.vimeo.example/video/1080p.mp4",
+        filename: "late.bin",
+        byExtensionId: DOKITOOL_EXTENSION_ID,
+      },
+      (s) => afterCancelSuggestions.push(s),
+    );
+    assert.equal(afterCancelSuggestions.length, 0, "maps must be cleaned on cancel");
+  } finally {
+    bg.dispose();
+  }
+
+  assert.equal(
+    determiningListeners.length,
+    0,
+    "dispose() must remove onDeterminingFilename listener",
+  );
+  assert.equal(
+    changedListeners.length,
+    0,
+    "dispose() must remove onChanged listener",
+  );
+});
+
+test("PR-2 Blob URL File wrapper: extensionDownload.ts and youtubeExtensionBridge.ts wrap OPFS blobs in File with leaf filename and authoritative MIME", async () => {
+  assert.equal(typeof File, "function", "Node 20+ test runtime must expose global File");
+
+  // 1) extensionDownload.ts (direct_file -> OPFS -> handoffSinkAndWaitRelease)
+  const extBlobsCreated = [];
+  const extUrlApi = {
+    createObjectURL(blob) {
+      extBlobsCreated.push(blob);
+      return `blob:ext-test/${extBlobsCreated.length}`;
+    },
+    revokeObjectURL() {},
+  };
+  const payloadBytes = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
+  const executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+    fetchImpl: async () =>
+      new Response(payloadBytes, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(payloadBytes.byteLength),
+        },
+      }),
+    urlApi: extUrlApi,
+    opfsStorage: null,
+    handoffBlobDownload: async (msg) => {
+      queueMicrotask(() =>
+        executor.releaseBlob({
+          taskId: msg.taskId,
+          blobUrl: msg.blobUrl,
+          opfsTempName: msg.opfsTempName,
+        }),
+      );
+      return { chromeDownloadId: 1 };
+    },
+    onProgress() {},
+    onError(err) {
+      throw new Error(`unexpected task error: ${err.error}`);
+    },
+  });
+
+  executor.startTask("t-file-ext", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://upos-sz-mirrorcos.bilivideo.com/sample.mp4"],
+    filename: "DokiClips/子目录/测试视频.mp4",
+    mimeType: "video/mp4",
+  });
+  await executor.waitForIdle();
+  executor.dispose();
+
+  assert.equal(extBlobsCreated.length, 1);
+  assert.ok(extBlobsCreated[0] instanceof File, "extensionDownload must wrap Blob in File");
+  assert.equal(extBlobsCreated[0].name, "测试视频.mp4");
+  assert.equal(extBlobsCreated[0].type, "video/mp4");
+
+  // 2) youtubeExtensionBridge.ts (downloadDirect -> handoffAndAwaitAuthoritativeRelease)
+  const ytBlobsCreated = [];
+  const ytUrlApi = {
+    createObjectURL(blob) {
+      ytBlobsCreated.push(blob);
+      return `blob:yt-test/${ytBlobsCreated.length}`;
+    },
+    revokeObjectURL() {},
+  };
+  const ytBytes = new Uint8Array(1024).fill(0x1a);
+  const ytBridge = youtubeExtensionBridgeMod.createYouTubeExtensionBridge({
+    fetchImpl: async (_url, init) => {
+      const rangeHeader = init?.headers?.Range || init?.headers?.range;
+      if (rangeHeader) {
+        return new Response(ytBytes, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/webm",
+            "Content-Length": String(ytBytes.byteLength),
+            "Content-Range": `bytes 0-${ytBytes.byteLength - 1}/${ytBytes.byteLength}`,
+          },
+        });
+      }
+      return new Response(ytBytes, {
+        status: 200,
+        headers: {
+          "Content-Type": "video/webm",
+          "Content-Length": String(ytBytes.byteLength),
+        },
+      });
+    },
+    urlApi: ytUrlApi,
+    opfsStorage: null,
+    handoffBlobDownload: async (msg) => {
+      queueMicrotask(() =>
+        ytBridge.releaseBlob({ taskId: msg.taskId, blobUrl: msg.blobUrl }),
+      );
+      return { chromeDownloadId: 2 };
+    },
+  });
+
+  await ytBridge.downloadDirect({
+    taskId: "t-file-yt",
+    url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=248",
+    filename: "DokiClips/YouTube 4K/Demo Clip.webm",
+    sizeBytes: ytBytes.byteLength,
+  });
+  ytBridge.dispose();
+
+  assert.equal(ytBlobsCreated.length, 1);
+  assert.ok(ytBlobsCreated[0] instanceof File, "youtubeExtensionBridge must wrap Blob in File");
+  assert.equal(ytBlobsCreated[0].name, "Demo Clip.webm");
+  assert.equal(ytBlobsCreated[0].type, "video/webm");
 });

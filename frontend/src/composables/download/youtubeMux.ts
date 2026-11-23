@@ -1,4 +1,5 @@
 import { confirmedFormatMime, extensionsFor } from "../../downloads/file";
+import type { WebExtEnqueuePayload } from "../../extension/protocol";
 import type {
   Attachment,
   DownloadTask,
@@ -142,6 +143,16 @@ export function createYouTubeDownloadController(deps: {
     controller?: AbortController,
     startedAt?: number,
   ) => Promise<void>;
+  runExtensionBridgeDownload?: (params: {
+    snapshot?: ItemSnapshot;
+    retryId?: number;
+    controller?: AbortController;
+    filename: string;
+    payload: WebExtEnqueuePayload;
+    savePathLabel: string;
+    startStatusText: string;
+    selectionKey: string;
+  }) => Promise<boolean>;
 }) {
   const {
     videoStore,
@@ -486,6 +497,47 @@ export function createYouTubeDownloadController(deps: {
       pair.outputExtension,
       syncTarget.variant,
     );
+    const estTotal =
+      (syncTarget.source.size_bytes || 0) + (pair.audioSource.size_bytes || 0);
+
+    if (ytHelper.provider === "extension" && deps.runExtensionBridgeDownload) {
+      return deps.runExtensionBridgeDownload({
+        snapshot,
+        retryId,
+        filename: mergedFilename,
+        payload: {
+          kind: "youtube_mux",
+          platform: snapshot.platform || "media",
+          title: snapshot.title || snapshot.item.title || mergedFilename,
+          filename: mergedFilename,
+          youtubeMux: {
+            videoUrl: syncTarget.url,
+            audioUrl: sourceUrl(pair.audioSource, apiContext),
+            ...(syncTarget.source.size_bytes
+              ? { videoSize: syncTarget.source.size_bytes }
+              : {}),
+            ...(pair.audioSource.size_bytes
+              ? { audioSize: pair.audioSource.size_bytes }
+              : {}),
+            outputContainer: pair.outputContainer,
+          },
+          ...(estTotal > 0 ? { sizeBytes: estTotal } : {}),
+          mimeType:
+            pair.outputContainer === "webm" ? "video/webm" : "video/mp4",
+        },
+        savePathLabel: "保存路径：Chrome 扩展后台无损合流",
+        startStatusText: "扩展已接管，正在无损合流...",
+        selectionKey:
+          selectedKey ||
+          JSON.stringify([
+            snapshot.version,
+            snapshot.item.id,
+            syncTarget.variant.id,
+            "ext-yt-mux",
+          ]),
+      });
+    }
+
     const id =
       retryId ??
       videoStore.addDownload({
@@ -498,8 +550,6 @@ export function createYouTubeDownloadController(deps: {
     const startedAt = Date.now();
     let lastBytes = 0;
     let lastSampleAt = startedAt;
-    const estTotal =
-      (syncTarget.source.size_bytes || 0) + (pair.audioSource.size_bytes || 0);
     const deliveryId = nextMuxDeliveryId();
     deliveryTasks.set(deliveryId, id);
     videoStore.updateDownload(id, {

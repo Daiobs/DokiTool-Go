@@ -3,8 +3,10 @@ import {
   errRpc,
   type ExtensionRpcResponse,
   type WebBridgeCapability,
+  type WebExtCancelTaskData,
   type WebExtEnqueueMediaData,
   type WebExtEnqueuePayload,
+  type WebExtParseYouTubeData,
   type WebExtPingData,
   type WebExtTaskStatusData,
   type WebToExtensionRequest,
@@ -15,6 +17,14 @@ export { DOKITOOL_EXTENSION_ID };
 
 export const EXTENSION_BRIDGE_PING_TIMEOUT_MS = 800 as const;
 export const EXTENSION_BRIDGE_RPC_TIMEOUT_MS = 5000 as const;
+export const EXTENSION_BRIDGE_YOUTUBE_PARSE_TIMEOUT_MS = 30000 as const;
+
+const KNOWN_WEB_BRIDGE_CAPABILITIES = new Set<string>([
+  "dash_mux",
+  "direct_download",
+  "youtube_parse",
+  "youtube_mux",
+]);
 
 export interface ExtensionBridgeState {
   connected: boolean;
@@ -167,9 +177,8 @@ export async function pingInstalledExtension(options?: {
 
   const data = resp.data as WebExtPingData | undefined;
   const capabilities = Array.isArray(data?.capabilities)
-    ? data.capabilities.filter(
-        (cap): cap is WebBridgeCapability =>
-          cap === "dash_mux" || cap === "direct_download",
+    ? data.capabilities.filter((cap): cap is WebBridgeCapability =>
+        KNOWN_WEB_BRIDGE_CAPABILITIES.has(cap),
       )
     : [];
 
@@ -182,6 +191,27 @@ export async function pingInstalledExtension(options?: {
         : options?.extensionId || DOKITOOL_EXTENSION_ID,
     capabilities,
   };
+}
+
+export async function parseYouTubeViaExtension(
+  videoId: string,
+  options?: {
+    locale?: "zh-CN" | "en";
+    timeoutMs?: number;
+    extensionId?: string;
+  },
+): Promise<ExtensionRpcResponse<WebExtParseYouTubeData>> {
+  return sendExternalExtensionMessage(
+    {
+      type: "WEB_EXT_PARSE_YOUTUBE",
+      videoId,
+      ...(options?.locale ? { locale: options.locale } : {}),
+    },
+    {
+      timeoutMs: options?.timeoutMs ?? EXTENSION_BRIDGE_YOUTUBE_PARSE_TIMEOUT_MS,
+      extensionId: options?.extensionId,
+    },
+  );
 }
 
 export async function enqueueMediaViaExtension(
@@ -210,6 +240,22 @@ export async function getExtensionTaskStatus(
   return sendExternalExtensionMessage(
     {
       type: "WEB_EXT_GET_TASK_STATUS",
+      taskId,
+    },
+    options,
+  );
+}
+
+export async function cancelExtensionTask(
+  taskId: string,
+  options?: {
+    timeoutMs?: number;
+    extensionId?: string;
+  },
+): Promise<ExtensionRpcResponse<WebExtCancelTaskData>> {
+  return sendExternalExtensionMessage(
+    {
+      type: "WEB_EXT_CANCEL_TASK",
       taskId,
     },
     options,

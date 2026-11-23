@@ -218,8 +218,19 @@ export function formatYouTubeMuxOptionSize(
 export function formatHeaderReadyStatus(
   version: string | null | undefined,
   locale?: string,
+  provider?: "extension" | "userscript",
 ): string {
   const ver = version ? `v${version}` : "";
+  if (provider === "extension") {
+    if (locale === "en") {
+      return ver
+        ? `Extension ${ver} Ready · No Userscript`
+        : "Extension Ready · No Userscript";
+    }
+    return ver
+      ? `扩展 ${ver} 已就绪 · 免油猴无损合流`
+      : "扩展已就绪 · 免油猴无损合流";
+  }
   if (locale === "en") {
     return ver
       ? `Helper ${ver} Ready · Auto Audio Mux`
@@ -231,8 +242,14 @@ export function formatHeaderReadyStatus(
 export function formatHeaderReadyTitle(
   version: string | null | undefined,
   locale?: string,
+  provider?: "extension" | "userscript",
 ): string {
   const ver = version ? ` (v${version})` : "";
+  if (provider === "extension") {
+    return locale === "en"
+      ? `DokiTool Extension${ver} is ready: zero-cookie local parsing & background lossless audio/video muxing without Tampermonkey.`
+      : `DokiTool 扩展${ver}已就绪：免油猴零 Cookie 本地解析，高画质下载自动后台无损合流原声至浏览器默认下载目录。`;
+  }
   return locale === "en"
     ? `YouTube Helper${ver} is ready: high-quality downloads automatically mux original audio losslessly in the browser; 360p includes audio for inline preview and direct download.`
     : `YouTube 助手${ver}已就绪：高画质下载自动分块并发无损合成原声至浏览器默认下载目录；360p 音画合一支持在线预览与浏览器直下。`;

@@ -397,7 +397,11 @@ export type OffscreenChannelMessage =
 // Web SPA <-> Installed Extension External Bridge Contracts (Zero-Secret)
 // ============================================================================
 
-export type WebBridgeCapability = "dash_mux" | "direct_download";
+export type WebBridgeCapability =
+  | "dash_mux"
+  | "direct_download"
+  | "youtube_parse"
+  | "youtube_mux";
 
 export interface WebExtDashMuxPayload {
   videoRoutes: string[];
@@ -405,6 +409,14 @@ export interface WebExtDashMuxPayload {
   videoSize?: number;
   audioSize?: number;
   outputContainer?: "mp4";
+}
+
+export interface WebExtYouTubeMuxPayload {
+  videoUrl: string;
+  audioUrl: string;
+  videoSize?: number;
+  audioSize?: number;
+  outputContainer: "mp4" | "webm";
 }
 
 export type WebExtEnqueuePayload =
@@ -425,16 +437,43 @@ export type WebExtEnqueuePayload =
       routes: string[];
       sizeBytes?: number;
       mimeType?: string;
+    }
+  | {
+      kind: "youtube_mux";
+      platform: string;
+      title?: string;
+      filename: string;
+      youtubeMux: WebExtYouTubeMuxPayload;
+      sizeBytes?: number;
+      mimeType?: string;
+    }
+  | {
+      kind: "youtube_direct";
+      platform: string;
+      title?: string;
+      filename: string;
+      url: string;
+      sizeBytes?: number;
+      mimeType?: string;
     };
 
 export type WebToExtensionRequest =
   | { type: "WEB_EXT_PING" }
+  | {
+      type: "WEB_EXT_PARSE_YOUTUBE";
+      videoId: string;
+      locale?: "zh-CN" | "en";
+    }
   | {
       type: "WEB_EXT_ENQUEUE_MEDIA";
       payload: WebExtEnqueuePayload;
     }
   | {
       type: "WEB_EXT_GET_TASK_STATUS";
+      taskId: string;
+    }
+  | {
+      type: "WEB_EXT_CANCEL_TASK";
       taskId: string;
     };
 
@@ -444,9 +483,18 @@ export interface WebExtPingData {
   capabilities: WebBridgeCapability[];
 }
 
+export interface WebExtParseYouTubeData {
+  media: UnifiedMedia;
+}
+
 export interface WebExtEnqueueMediaData {
   taskId: string;
   status: ExtensionTaskStatus;
+}
+
+export interface WebExtCancelTaskData {
+  taskId: string;
+  cancelled: boolean;
 }
 
 export type WebExtTaskPhase =
@@ -472,8 +520,10 @@ export interface WebExtTaskStatusData {
 
 export interface WebToExtensionResponseMap {
   WEB_EXT_PING: WebExtPingData;
+  WEB_EXT_PARSE_YOUTUBE: WebExtParseYouTubeData;
   WEB_EXT_ENQUEUE_MEDIA: WebExtEnqueueMediaData;
   WEB_EXT_GET_TASK_STATUS: WebExtTaskStatusData;
+  WEB_EXT_CANCEL_TASK: WebExtCancelTaskData;
 }
 
 export type AnyExtensionRuntimeMessage =
@@ -482,8 +532,10 @@ export type AnyExtensionRuntimeMessage =
 
 const WEB_TO_EXTENSION_REQUEST_TYPES = new Set<WebToExtensionRequest["type"]>([
   "WEB_EXT_PING",
+  "WEB_EXT_PARSE_YOUTUBE",
   "WEB_EXT_ENQUEUE_MEDIA",
   "WEB_EXT_GET_TASK_STATUS",
+  "WEB_EXT_CANCEL_TASK",
 ]);
 
 const SIDEPANEL_REQUEST_TYPES = new Set<SidePanelToBackgroundRequest["type"]>([

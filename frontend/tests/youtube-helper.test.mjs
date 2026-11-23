@@ -4025,7 +4025,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     }
   });
 
-  test("centered YouTube helper modal & sessionStorage install-return state machine: handshake on return, single auto-reload guard, URL restore + auto-re-parse, and manual refresh button when still missing", async () => {
+  test("non-blocking corner CapabilityUpgradeNotice & sessionStorage install-return state machine: handshake on return, single auto-reload guard, URL restore + auto-re-parse, and manual refresh button when still missing", async () => {
     const env = setupEnvironment();
     const storageMap = new Map();
     const mockSessionStorage = {
@@ -4053,7 +4053,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
         },
       });
 
-    // 1. Parse without helper -> renders centered modal (role="dialog", aria-modal="true", data-yt-helper-modal)
+    // 1. Parse without helper -> renders non-blocking corner CapabilityUpgradeNotice (role="region", data-capability-upgrade-notice, NO aria-modal="true")
     globalThis.fetch = async (url) => {
       const u = new URL(url, "https://snap.dokitool.com");
       if (u.pathname === "/api/parse") {
@@ -4128,9 +4128,20 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
             }),
         }),
       );
-      assert.ok(modalHtml.includes("data-yt-helper-modal"));
-      assert.ok(modalHtml.includes('role="dialog"'));
-      assert.ok(modalHtml.includes('aria-modal="true"'));
+      assert.ok(modalHtml.includes("data-capability-upgrade-notice"));
+      assert.ok(modalHtml.includes('data-notice-mode="client_session"'));
+      assert.ok(modalHtml.includes('role="region"'));
+      assert.ok(!modalHtml.includes("data-yt-helper-modal"));
+      assert.ok(!modalHtml.includes('aria-modal="true"'));
+      assert.ok(modalHtml.includes("data-upgrade-open-extension"));
+      assert.ok(
+        modalHtml.includes(
+          "安装 DokiTool 扩展（免油猴解锁 YouTube 4K60 &amp; B 站 1080P）",
+        ),
+      );
+      assert.ok(modalHtml.includes("data-legacy-userscript-fallback"));
+      assert.ok(modalHtml.includes("data-yt-helper-install-link"));
+      assert.ok(modalHtml.includes("/helper/dokitool-youtube.user.js"));
       assert.ok(!modalHtml.includes("data-yt-helper-manual-refresh"));
 
       // 2. Click install button -> records waiting state + URL in sessionStorage
@@ -4180,6 +4191,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
             }),
         }),
       );
+      assert.ok(fallbackModalHtml.includes("data-capability-upgrade-notice"));
       assert.ok(fallbackModalHtml.includes("data-yt-helper-manual-refresh"));
       assert.ok(fallbackModalHtml.includes("刷新页面"));
 
