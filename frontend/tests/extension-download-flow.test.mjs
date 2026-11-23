@@ -11404,10 +11404,14 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
   }
 
   try {
-    // 1) Anonymous mode -> zero /api/stats fetch, pill hidden, zero alerts/toasts
+    // 1) Anonymous mode -> zero /api/stats fetch, pill hidden, header shows 匿名模式, zero alerts/toasts
     const anon = await mountScenario({ token: "" });
     try {
       assert.equal(anon.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        anon.view.textOf(anon.findByTestId("header-auth-pill")[0]).trim(),
+        "匿名模式",
+      );
       assert.equal(
         anon.fetchUrls.some((u) => u.includes("/api/stats")),
         false,
@@ -11425,10 +11429,14 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
       anon.cleanup();
     }
 
-    // 2) Friend 401 -> pill hidden silently with zero alert/toast
+    // 2) Friend 401 -> pill hidden silently, header stays Bearer 已就绪, zero alert/toast
     const friend = await mountScenario({ token: "friend-tok-123" });
     try {
       assert.equal(friend.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        friend.view.textOf(friend.findByTestId("header-auth-pill")[0]).trim(),
+        "Bearer 已就绪",
+      );
       assert.equal(
         friend.fetchUrls.some((u) => u.includes("/api/stats")),
         true,
@@ -11445,9 +11453,15 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
       friend.cleanup();
     }
 
-    // 3) Owner 200 (default production origin) -> renders pill and opens https://snap.dokitool.com/monitor
+    // 3) Owner 200 (default production origin) -> header upgrades to Owner 已就绪,
+    //    capsule prioritizes effectiveSuccessRate, shows dual hover metrics + click-to-refresh,
+    //    and opens https://snap.dokitool.com/monitor
     const prodOwner = await mountScenario({ token: "owner-prod-secret-xyz" });
     try {
+      assert.equal(
+        prodOwner.view.textOf(prodOwner.findByTestId("header-auth-pill")[0]).trim(),
+        "Owner 已就绪",
+      );
       const pills = prodOwner.findByTestId("owner-stats-pill");
       assert.equal(pills.length, 1);
       const pillText = prodOwner.view.textOf(pills[0]);
@@ -11461,6 +11475,26 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
         "SidePanel DOM must never expose raw bearerToken",
       );
 
+      // Hover title includes both 有效成功率 and 原始成功率 + 点击刷新
+      const refreshBtn = prodOwner.findByTestId("owner-stats-refresh-btn")[0];
+      assert.ok(refreshBtn);
+      assert.match(refreshBtn.props.title, /有效成功率 95\.0%/);
+      assert.match(refreshBtn.props.title, /原始成功率 95\.0%/);
+      assert.match(refreshBtn.props.title, /点击刷新/);
+
+      // Clicking metrics area triggers a manual /api/stats refresh (does not open monitor tab)
+      const statsFetchesBefore = prodOwner.fetchUrls.filter((u) =>
+        u.includes("/api/stats"),
+      ).length;
+      await prodOwner.view.fire(refreshBtn, "onClick");
+      await new Promise((r) => setTimeout(r, 30));
+      await prodOwner.view.flush();
+      const statsFetchesAfter = prodOwner.fetchUrls.filter((u) =>
+        u.includes("/api/stats"),
+      ).length;
+      assert.equal(statsFetchesAfter, statsFetchesBefore + 1);
+      assert.equal(prodOwner.tabCreateCalls.length, 0);
+
       const openBtn = prodOwner.findByTestId("open-monitor-dashboard-btn")[0];
       await prodOwner.view.fire(openBtn, "onClick");
       assert.deepEqual(prodOwner.tabCreateCalls, [
@@ -11472,6 +11506,43 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
       assert.equal(openedUrl.includes("#"), false);
     } finally {
       prodOwner.cleanup();
+    }
+
+    // 3b) Effective vs raw rate divergence: 108/120 raw (90.0%) vs 108/112 effective (96.4%) -> capsule displays 96.4%
+    const originalByPlatform = sampleStats.daily[1].by_platform;
+    const originalOk = sampleStats.daily[1].ok;
+    const originalFailed = sampleStats.daily[1].failed;
+    sampleStats.daily[1].ok = 108;
+    sampleStats.daily[1].failed = 12;
+    sampleStats.daily[1].by_platform = {
+      bilibili: {
+        total: 112,
+        ok: 108,
+        failed: 4,
+        by_code: { OK: 108, UPSTREAM_BLOCKED: 4 },
+        p95_ms: 820,
+      },
+      unknown: {
+        total: 8,
+        ok: 0,
+        failed: 8,
+        by_code: { INVALID_INPUT: 5, RATE_LIMITED: 3 },
+        p95_ms: 10,
+      },
+    };
+    const effOwner = await mountScenario({ token: "owner-eff-secret-xyz" });
+    try {
+      const rateEl = effOwner.findByTestId("owner-stats-rate")[0];
+      assert.equal(effOwner.view.textOf(rateEl).trim(), "96.4%");
+      const refreshBtn = effOwner.findByTestId("owner-stats-refresh-btn")[0];
+      assert.match(refreshBtn.props.title, /有效成功率 96\.4%/);
+      assert.match(refreshBtn.props.title, /原始成功率 90\.0%/);
+      assert.match(refreshBtn.props.title, /点击刷新/);
+    } finally {
+      effOwner.cleanup();
+      sampleStats.daily[1].by_platform = originalByPlatform;
+      sampleStats.daily[1].ok = originalOk;
+      sampleStats.daily[1].failed = originalFailed;
     }
 
     // 4) Owner 200 (custom loopback apiBaseUrl) -> opens http://127.0.0.1:18080/monitor with zero token in URL

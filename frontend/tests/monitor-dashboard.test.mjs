@@ -896,7 +896,7 @@ test("statsTypes: validation guard supports both new (generic_slow/ytdlp_generic
 
   const unknownToday = todayRows.find((r) => r.platform === "unknown");
   assert.ok(unknownToday);
-  assert.equal(unknownToday.label, "未识别 / 无效输入");
+  assert.equal(unknownToday.label, "无效输入 / 未路由");
   assert.equal(unknownToday.excludedCount, 3);
   assert.equal(unknownToday.effectiveTotal, 0);
   assert.equal(unknownToday.effectiveSuccessRate, null);
@@ -916,8 +916,63 @@ test("statsTypes: validation guard supports both new (generic_slow/ytdlp_generic
   assert.equal(statsTypes.formatStatsPlatformLabel("instagram"), "Instagram");
   assert.equal(statsTypes.formatStatsPlatformLabel("facebook"), "Facebook");
   assert.equal(statsTypes.formatStatsPlatformLabel("tumblr"), "Tumblr");
+  // Tier-2 friendly names, special error buckets & Title-Case fallback
   assert.equal(statsTypes.formatStatsPlatformLabel("ytdlp_other"), "其他站点 (yt-dlp)");
-  assert.equal(statsTypes.formatStatsPlatformLabel("vimeo"), "vimeo");
+  assert.equal(statsTypes.formatStatsPlatformLabel("ytdlp_unmatched"), "未匹配站点 (Tier-2)");
+  assert.equal(statsTypes.formatStatsPlatformLabel("unknown"), "无效输入 / 未路由");
+  assert.equal(statsTypes.formatStatsPlatformLabel("vimeo"), "Vimeo");
+  assert.equal(statsTypes.formatStatsPlatformLabel("tiktok"), "TikTok");
+  assert.equal(statsTypes.formatStatsPlatformLabel("tedtalk"), "TED");
+  assert.equal(statsTypes.formatStatsPlatformLabel("ted_talk"), "TED");
+  assert.equal(statsTypes.formatStatsPlatformLabel("archiveorg"), "Internet Archive");
+  assert.equal(statsTypes.formatStatsPlatformLabel("archive_org"), "Internet Archive");
+  assert.equal(statsTypes.formatStatsPlatformLabel("dailymotion"), "Dailymotion");
+  assert.equal(statsTypes.formatStatsPlatformLabel("soundcloud"), "SoundCloud");
+  assert.equal(statsTypes.formatStatsPlatformLabel("twitch"), "Twitch");
+  assert.equal(statsTypes.formatStatsPlatformLabel("reddit"), "Reddit");
+  assert.equal(statsTypes.formatStatsPlatformLabel("pinterest"), "Pinterest");
+  assert.equal(statsTypes.formatStatsPlatformLabel("vk"), "VK");
+  assert.equal(statsTypes.formatStatsPlatformLabel("nicovideo"), "Niconico");
+  assert.equal(statsTypes.formatStatsPlatformLabel("rutube"), "RuTube");
+  assert.equal(statsTypes.formatStatsPlatformLabel("okru"), "OK.ru");
+  assert.equal(statsTypes.formatStatsPlatformLabel("kick"), "Kick");
+  assert.equal(statsTypes.formatStatsPlatformLabel("bandcamp"), "Bandcamp");
+  assert.equal(statsTypes.formatStatsPlatformLabel("my_custom_site"), "My Custom Site");
+  assert.equal(statsTypes.formatStatsPlatformLabel("nebula"), "Nebula");
+  assert.equal(statsTypes.formatStatsPlatformLabel("site_17live"), "17live");
+
+  // Version badge formatting (40-char SHA -> 7-char, short non-SHA preserved)
+  const fullSha = "0a3e4d4123456789abcdef0123456789abcdef01";
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge(fullSha), {
+    display: "0a3e4d4",
+    full: fullSha,
+    isShortened: true,
+  });
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge("abcdef012345"), {
+    display: "abcdef0",
+    full: "abcdef012345",
+    isShortened: true,
+  });
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge(`${fullSha}-dirty`), {
+    display: "0a3e4d4-dirty",
+    full: `${fullSha}-dirty`,
+    isShortened: true,
+  });
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge("dev"), {
+    display: "dev",
+    full: "dev",
+    isShortened: false,
+  });
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge("v4.1.0-prc"), {
+    display: "v4.1.0-prc",
+    full: "v4.1.0-prc",
+    isShortened: false,
+  });
+  assert.deepEqual(statsTypes.formatMonitorVersionBadge(""), {
+    display: "unknown",
+    full: "unknown",
+    isShortened: false,
+  });
 
   // since_start window effective rate excludes UNAUTHORIZED & INVALID_INPUT
   const sinceStartRows = statsTypes.aggregatePlatformHealth(rich, "since_start");
@@ -956,6 +1011,17 @@ test("monitorStorage: dual-tier storage semantics, theme sync, URL strip, token 
   assert.equal(monitorStorage.getNextMonitorTheme("system"), "light");
   assert.equal(monitorStorage.getNextMonitorTheme("light"), "dark");
   assert.equal(monitorStorage.getNextMonitorTheme("dark"), "system");
+
+  // Auto-refresh preference persistence (defaults false, safe round-trip)
+  assert.equal(monitorStorage.readMonitorAutoRefresh(), false);
+  monitorStorage.writeMonitorAutoRefresh(true);
+  assert.equal(
+    globalThis.localStorage.getItem(monitorStorage.MONITOR_AUTO_REFRESH_STORAGE_KEY),
+    "1",
+  );
+  assert.equal(monitorStorage.readMonitorAutoRefresh(), true);
+  monitorStorage.writeMonitorAutoRefresh(false);
+  assert.equal(monitorStorage.readMonitorAutoRefresh(), false);
 
   monitorStorage.writeMonitorTheme("dark");
   assert.equal(monitorStorage.readMonitorTheme(), "dark");
@@ -1546,5 +1612,135 @@ test("MonitorApp.vue: auto-unlocks from pre-stored localStorage token and strips
     );
   } finally {
     mounted.unmount();
+  }
+});
+
+test("MonitorApp.vue: 40-char SHA version copy, process-memory copy, Shanghai by_platform, pool semantics, home link, and persisted auto-refresh", async () => {
+  const fullSha = "0a3e4d4123456789abcdef0123456789abcdef01";
+  const sampleStats = createRichStatsSnapshot();
+  sampleStats.runtime.version = fullSha;
+  // Simulate post-restart state where persisted today shanghai_hits (24) > in-memory hits (5)
+  sampleStats.shanghai.total.hits = 5;
+  sampleStats.shanghai.total.fallbacks = 2;
+  sampleStats.shanghai.by_platform.douyin.hits = 4;
+  sampleStats.shanghai.by_platform.douyin.fallbacks = 1;
+  sampleStats.shanghai.by_platform.bilibili.hits = 1;
+  sampleStats.shanghai.by_platform.bilibili.fallbacks = 1;
+
+  // Pre-seed auto-refresh preference BEFORE mounting locked -> must make 0 fetches while locked!
+  monitorStorage.writeMonitorAutoRefresh(true);
+
+  const copiedTexts = [];
+  const prevNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      clipboard: {
+        async writeText(txt) {
+          copiedTexts.push(txt);
+        },
+      },
+    },
+  });
+
+  const fetchCalls = [];
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, init });
+    return new Response(
+      JSON.stringify({ schema_version: "1.0", code: "OK", data: sampleStats }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  const mounted = mountSfcTree(MonitorApp);
+  try {
+    await mounted.flush();
+
+    // 1) Locked state: 0 fetches even with persisted auto-refresh=true, and top-bar origin is <a href="/">
+    assert.equal(fetchCalls.length, 0);
+    const homeLink = mounted.findByTestId("monitor-home-link")[0];
+    assert.ok(homeLink);
+    assert.equal(homeLink.type, "a");
+    assert.equal(homeLink.props.href, "/");
+    assert.match(mounted.textOf(homeLink), /https:\/\/snap\.dokitool\.com/);
+
+    // 2) Unlock -> persisted auto-refresh preference restores to ON automatically
+    await mounted.setInputValue(
+      mounted.findByTestId("monitor-token-input")[0],
+      VALID_OWNER_TOKEN,
+    );
+    await mounted.fire(
+      mounted.findByTestId("monitor-unlock-form")[0],
+      "onSubmit",
+      { preventDefault() {} },
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    await mounted.flush();
+
+    const autoBtn = mounted.findByTestId("monitor-auto-refresh-toggle")[0];
+    assert.match(mounted.textOf(autoBtn), /30s 自动刷新：开/);
+
+    // Toggling off persists "0" to localStorage
+    await mounted.fire(autoBtn, "onClick");
+    assert.match(mounted.textOf(autoBtn), /30s 自动刷新：关/);
+    assert.equal(monitorStorage.readMonitorAutoRefresh(), false);
+
+    // 3) KPI Card #5 version badge & Runtime Matrix Cell #1: crisp 7-char SHA + full hover title + click-to-copy + "已复制" feedback
+    const kpiVerBtn = mounted.findByTestId("kpi-version-badge")[0];
+    const matrixVerBtn = mounted.findByTestId("runtime-version-pill")[0];
+    assert.ok(kpiVerBtn);
+    assert.ok(matrixVerBtn);
+    assert.equal(mounted.textOf(kpiVerBtn).trim(), "0a3e4d4");
+    assert.equal(mounted.textOf(matrixVerBtn).trim(), "0a3e4d4");
+    assert.equal(kpiVerBtn.props.title, `点击复制完整版本: ${fullSha}`);
+    assert.equal(matrixVerBtn.props.title, `点击复制完整版本: ${fullSha}`);
+
+    await mounted.fire(kpiVerBtn, "onClick");
+    assert.equal(copiedTexts[0], fullSha);
+    assert.equal(mounted.textOf(mounted.findByTestId("kpi-version-badge")[0]).trim(), "已复制");
+
+    await mounted.fire(matrixVerBtn, "onClick");
+    assert.equal(copiedTexts[1], fullSha);
+    assert.equal(mounted.textOf(mounted.findByTestId("runtime-version-pill")[0]).trim(), "已复制");
+
+    // 4) Process-memory "本次启动" clarity on KPI Cards #3 & #4 + Shanghai per-platform breakdown
+    const cacheCardText = mounted.textOf(mounted.findByTestId("kpi-cache")[0]);
+    assert.match(cacheCardText, /本次启动命中 140 \/ 未命中 60/);
+
+    const shanghaiCardText = mounted.textOf(mounted.findByTestId("kpi-shanghai")[0]);
+    assert.match(shanghaiCardText, /今日上海命中 24/);
+    assert.match(shanghaiCardText, /本次启动命中 5 \/ 回退 2/);
+    const shPlatText = mounted.textOf(mounted.findByTestId("kpi-shanghai-platforms")[0]);
+    assert.match(shPlatText, /抖音\s*命中 4 \/ 回退 1/);
+    assert.match(shPlatText, /B 站\s*命中 1 \/ 回退 1/);
+
+    // 5) Concurrency pools copy: admission pools labeled "排队放行", yt-dlp pools labeled "共享总网关槽位"
+    const poolNodes = mounted.findAll((n) => Boolean(n.props?.["data-pool-id"]));
+    for (const id of ["fast", "slow", "generic_slow", "owner"]) {
+      const node = poolNodes.find((n) => n.props["data-pool-id"] === id);
+      assert.ok(node);
+      assert.match(mounted.textOf(node), /排队放行/);
+    }
+    for (const id of ["ytdlp", "ytdlp_generic"]) {
+      const node = poolNodes.find((n) => n.props["data-pool-id"] === id);
+      assert.ok(node);
+      assert.match(mounted.textOf(node), /共享总网关槽位/);
+    }
+
+    // 6) Zero inline style attributes anywhere on rendered tree
+    const nodesWithInlineStyle = mounted.findAll(
+      (n) => n.props && ("style" in n.props || Object.keys(n.style || {}).length > 0),
+    );
+    assert.equal(nodesWithInlineStyle.length, 0);
+  } finally {
+    mounted.unmount();
+    if (prevNavigator === undefined) {
+      delete globalThis.navigator;
+    } else {
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: prevNavigator,
+      });
+    }
   }
 });

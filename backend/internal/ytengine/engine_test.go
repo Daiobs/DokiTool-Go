@@ -2742,3 +2742,82 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 		})
 	}
 }
+
+func TestExtractExtractorFromStderrAndErrorAttribution(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   string
+	}{
+		{"vimeo-404", "ERROR: [vimeo] 123456: HTTP Error 404: Not Found", "vimeo"},
+		{"tiktok-mixed-case", "ERROR: [TikTok] 7300000000000000001: Unable to extract webpage video data", "TikTok"},
+		{"tiktok-sub-extractor", "ERROR: [tiktok:user] @demo: Unable to download webpage", "tiktok:user"},
+		{"archive-dot", "ERROR: [archive.org] item123: Unable to download", "archive.org"},
+		{"warning-fallback", "WARNING: [SoundCloud] Retrying (1/3)...\nERROR: Unable to download webpage: timed out", "SoundCloud"},
+		{"error-beats-warning", "WARNING: [vimeo] Retrying...\nERROR: [dailymotion] x8abc: Video is private", "dailymotion"},
+		{"generic-tag-extracted", "ERROR: [generic] https://example.com/a: Unsupported URL", "generic"},
+		{"unsupported-url-no-bracket", "ERROR: Unsupported URL: https://example.org/blog/post", ""},
+		{"python-errno-ignored", "ERROR: [Errno 111] Connection refused", ""},
+		{"python-ssl-ignored", "ERROR: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed", ""},
+		{"non-extractor-download-tag", "ERROR: [download] Got error: HTTP Error 403", ""},
+		{"non-extractor-skipped-for-later-error", "ERROR: [download] retrying\nERROR: [vimeo] 999: Private video", "vimeo"},
+		{"hostile-path-traversal", "ERROR: [../etc/passwd] boom", ""},
+		{"overlong-tag", "ERROR: [" + strings.Repeat("a", 65) + "] boom", ""},
+		{"empty-stderr", "   \r\n  ", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExtractExtractorFromStderr(tc.stderr); got != tc.want {
+				t.Fatalf("ExtractExtractorFromStderr(%q) = %q, want %q", tc.stderr, got, tc.want)
+			}
+		})
+	}
+
+	// Subprocess integration: verify Extract attaches Extractor on classified *Error.
+	script := `
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  *vimeo-403*)
+    echo "ERROR: [Vimeo] 123: HTTP Error 403: Forbidden" >&2
+    exit 1
+    ;;
+  *soundcloud-warn*)
+    echo "WARNING: [SoundCloud] Retrying request..." >&2
+    echo "ERROR: Unable to download webpage: timed out" >&2
+    exit 1
+    ;;
+  *unsupported*)
+    echo "ERROR: Unsupported URL: $last" >&2
+    exit 1
+    ;;
+esac
+`
+	binPath, hashes := writeFakeYTDLP(t, script)
+	eng, err := New(Config{
+		BinaryPath:    binPath,
+		AllowedHashes: hashes,
+		Timeout:       5 * time.Second,
+	})
+	if err != nil || !eng.Enabled() {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	_, err = eng.Extract(context.Background(), "https://vimeo.com/vimeo-403")
+	var eErr *Error
+	if !errors.As(err, &eErr) || eErr.Code != CodeUpstreamBlocked || eErr.Extractor != "Vimeo" {
+		t.Fatalf("vimeo-403 err = %#v, want UPSTREAM_BLOCKED Extractor=Vimeo", eErr)
+	}
+
+	_, err = eng.Extract(context.Background(), "https://soundcloud.com/soundcloud-warn")
+	eErr = nil
+	if !errors.As(err, &eErr) || eErr.Code != CodeUpstreamTimeout || eErr.Extractor != "SoundCloud" {
+		t.Fatalf("soundcloud-warn err = %#v, want UPSTREAM_TIMEOUT Extractor=SoundCloud", eErr)
+	}
+
+	_, err = eng.Extract(context.Background(), "https://example.org/unsupported")
+	eErr = nil
+	if !errors.As(err, &eErr) || !eErr.UnsupportedURL || eErr.Extractor != "" {
+		t.Fatalf("unsupported err = %#v, want UnsupportedURL=true Extractor=''", eErr)
+	}
+}

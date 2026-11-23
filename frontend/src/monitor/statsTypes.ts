@@ -436,11 +436,134 @@ const CORE_PLATFORM_LABEL_MAP = new Map<string, string>([
   ["tumblr", "Tumblr"],
 ]);
 
+const TIER2_PLATFORM_LABEL_MAP = new Map<string, string>([
+  ["ted", "TED"],
+  ["tedtalk", "TED"],
+  ["ted_talk", "TED"],
+  ["tedembed", "TED"],
+  ["archiveorg", "Internet Archive"],
+  ["archive_org", "Internet Archive"],
+  ["tiktok", "TikTok"],
+  ["tiktokuser", "TikTok"],
+  ["tiktok_user", "TikTok"],
+  ["vimeo", "Vimeo"],
+  ["vimeo_album", "Vimeo"],
+  ["vimeo_ondemand", "Vimeo"],
+  ["vimeo_review", "Vimeo"],
+  ["dailymotion", "Dailymotion"],
+  ["dailymotion_playlist", "Dailymotion"],
+  ["soundcloud", "SoundCloud"],
+  ["soundcloud_set", "SoundCloud"],
+  ["soundcloud_user", "SoundCloud"],
+  ["twitch", "Twitch"],
+  ["twitchvod", "Twitch"],
+  ["twitch_vod", "Twitch"],
+  ["twitchclips", "Twitch"],
+  ["twitch_clips", "Twitch"],
+  ["twitch_stream", "Twitch"],
+  ["reddit", "Reddit"],
+  ["redditr", "Reddit"],
+  ["pinterest", "Pinterest"],
+  ["pinterest_collection", "Pinterest"],
+  ["vk", "VK"],
+  ["vk_wall", "VK"],
+  ["vkplay", "VK"],
+  ["vkvideo", "VK"],
+  ["nicovideo", "Niconico"],
+  ["niconico", "Niconico"],
+  ["niconico_playlist", "Niconico"],
+  ["rutube", "RuTube"],
+  ["okru", "OK.ru"],
+  ["ok_ru", "OK.ru"],
+  ["odnoklassniki", "OK.ru"],
+  ["kick", "Kick"],
+  ["kick_vod", "Kick"],
+  ["kick_clips", "Kick"],
+  ["bandcamp", "Bandcamp"],
+  ["bandcamp_album", "Bandcamp"],
+  ["bandcamp_track", "Bandcamp"],
+  ["streamable", "Streamable"],
+  ["mixcloud", "Mixcloud"],
+  ["rumble", "Rumble"],
+  ["odysee", "Odysee"],
+  ["lbry", "Odysee"],
+  ["peertube", "PeerTube"],
+  ["loom", "Loom"],
+  ["linkedin", "LinkedIn"],
+  ["bluesky", "Bluesky"],
+  ["bsky", "Bluesky"],
+  ["threads", "Threads"],
+  ["snapchat", "Snapchat"],
+  ["ximalaya", "喜马拉雅"],
+  ["acfun", "AcFun"],
+  ["9gag", "9GAG"],
+  ["site_9gag", "9GAG"],
+  ["bbc", "BBC"],
+  ["bbccouk", "BBC"],
+  ["cnn", "CNN"],
+  ["espn", "ESPN"],
+  ["imdb", "IMDb"],
+  ["imgur", "Imgur"],
+  ["flickr", "Flickr"],
+  ["coub", "Coub"],
+  ["vidyard", "Vidyard"],
+  ["wistia", "Wistia"],
+  ["crunchyroll", "Crunchyroll"],
+  ["fc2", "FC2"],
+  ["patreon", "Patreon"],
+  ["substack", "Substack"],
+  ["spotify", "Spotify"],
+]);
+
+function formatTitleCasePlatformFallback(key: string): string {
+  const normalized = /^site_\d/.test(key) ? key.slice(5) : key;
+  const words = normalized
+    .split(/[_:-]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (words.length === 0) return key;
+  return words
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 export function formatStatsPlatformLabel(platform: string): string {
   const key = typeof platform === "string" ? platform.trim().toLowerCase() : "";
-  if (!key || key === "unknown") return "未识别 / 无效输入";
+  if (!key || key === "unknown") return "无效输入 / 未路由";
+  if (key === "ytdlp_unmatched") return "未匹配站点 (Tier-2)";
   if (key === "ytdlp_other") return "其他站点 (yt-dlp)";
-  return CORE_PLATFORM_LABEL_MAP.get(key) || key;
+  const core = CORE_PLATFORM_LABEL_MAP.get(key);
+  if (core) return core;
+  const tier2 = TIER2_PLATFORM_LABEL_MAP.get(key);
+  if (tier2) return tier2;
+  return formatTitleCasePlatformFallback(key);
+}
+
+const LONG_HEX_SHA_RE = /^([0-9a-f]{12,64})(-dirty)?$/i;
+
+export interface MonitorVersionBadge {
+  display: string;
+  full: string;
+  isShortened: boolean;
+}
+
+export function formatMonitorVersionBadge(
+  rawVersion: string | null | undefined,
+): MonitorVersionBadge {
+  const full = typeof rawVersion === "string" ? rawVersion.trim() : "";
+  if (!full) {
+    return { display: "unknown", full: "unknown", isShortened: false };
+  }
+  const shaMatch = LONG_HEX_SHA_RE.exec(full);
+  if (shaMatch) {
+    const suffix = shaMatch[2] ? shaMatch[2].toLowerCase() : "";
+    return {
+      display: `${shaMatch[1].slice(0, 7)}${suffix}`,
+      full,
+      isShortened: true,
+    };
+  }
+  return { display: full, full, isShortened: false };
 }
 
 export type PlatformHealthRange =

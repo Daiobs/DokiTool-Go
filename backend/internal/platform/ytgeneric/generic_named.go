@@ -19,6 +19,11 @@ import (
 // Tier-2 yt-dlp generic named extractors.
 const DefaultGenericConcurrency = 2
 
+// PlatformUnmatched is the dedicated bounded telemetry bucket for Tier-2 generic
+// parse failures where no named yt-dlp extractor matched (decoupled from pre-routing
+// invalid inputs recorded under "unknown").
+const PlatformUnmatched = "ytdlp_unmatched"
+
 // GenericExtractorArgs returns the hardened --use-extractors selector list for
 // Tier-2 generic named extraction: allow all named yt-dlp extractors ("default")
 // while explicitly disabling the catch-all generic HTML scraper ("-generic") and
@@ -237,27 +242,30 @@ var blockedCoreExtractorFamilies = []string{
 }
 
 var blockedNormalizedPlatforms = map[string]bool{
-	"generic":     true,
-	"all":         true,
-	"unknown":     true,
-	"douyin":      true,
-	"iesdouyin":   true,
-	"bilibili":    true,
-	"bili":        true,
-	"weibo":       true,
-	"toutiao":     true,
-	"kuaishou":    true,
-	"pipixia":     true,
-	"pipigx":      true,
-	"zuiyou":      true,
-	"xiaohongshu": true,
-	"rednote":     true,
-	"twitter":     true,
-	"x":           true,
-	"youtube":     true,
-	"instagram":   true,
-	"facebook":    true,
-	"tumblr":      true,
+	"generic":         true,
+	"all":             true,
+	"unknown":         true,
+	"ytdlp_generic":   true,
+	"ytdlp_other":     true,
+	"ytdlp_unmatched": true,
+	"douyin":          true,
+	"iesdouyin":       true,
+	"bilibili":        true,
+	"bili":            true,
+	"weibo":           true,
+	"toutiao":         true,
+	"kuaishou":        true,
+	"pipixia":         true,
+	"pipigx":          true,
+	"zuiyou":          true,
+	"xiaohongshu":     true,
+	"rednote":         true,
+	"twitter":         true,
+	"x":               true,
+	"youtube":         true,
+	"instagram":       true,
+	"facebook":        true,
+	"tumblr":          true,
 }
 
 func isBlockedExtractorIdentity(raw string) bool {
@@ -378,18 +386,69 @@ func (p *GenericParser) verifyPublicHost(ctx context.Context, host string) (bool
 	return true, nil
 }
 
+// ExtractExtractorFromStderr extracts the yt-dlp extractor identifier from
+// stderr lines formatted as "ERROR: [<extractor>] ..." or "WARNING: [<extractor>] ...".
+func ExtractExtractorFromStderr(stderr string) string {
+	return ytengine.ExtractExtractorFromStderr(stderr)
+}
+
+// AttributeGenericFailurePlatform resolves the bounded telemetry platform bucket for
+// a Tier-2 extraction error:
+//   - If a named yt-dlp extractor is identifiable (via structured ytengine.Error.Extractor
+//     or stderr "ERROR: [<extractor>]" / "WARNING: [<extractor>]") and passes
+//     NormalizeExtractorPlatform, returns that normalized platform ID (e.g. "vimeo", "tiktok").
+//   - Otherwise (Unsupported URL, [generic], core-14 extractor, empty/unrecognized stderr,
+//     or DNS/SSRF/outbound-host rejections), returns PlatformUnmatched ("ytdlp_unmatched").
+func AttributeGenericFailurePlatform(err error) string {
+	if err == nil {
+		return PlatformUnmatched
+	}
+	var engineErr *ytengine.Error
+	if errors.As(err, &engineErr) && engineErr != nil {
+		if raw := strings.TrimSpace(engineErr.Extractor); raw != "" {
+			if norm := NormalizeExtractorPlatform(raw, ""); norm != "" {
+				return norm
+			}
+			return PlatformUnmatched
+		}
+		if engineErr.Cause != nil {
+			if raw := ytengine.ExtractExtractorFromStderr(engineErr.Cause.Error()); raw != "" {
+				if norm := NormalizeExtractorPlatform(raw, ""); norm != "" {
+					return norm
+				}
+				return PlatformUnmatched
+			}
+		}
+		return PlatformUnmatched
+	}
+	if raw := ytengine.ExtractExtractorFromStderr(err.Error()); raw != "" {
+		if norm := NormalizeExtractorPlatform(raw, ""); norm != "" {
+			return norm
+		}
+	}
+	return PlatformUnmatched
+}
+
 // Parse validates the input URL, enforces public-IP DNS resolution, extracts
 // metadata via named yt-dlp extractors, and adapts the result to unified-v1.
 func (p *GenericParser) Parse(ctx context.Context, source string, now int64) (unified.Object, error) {
+	payload, _, err := p.ParseWithPlatform(ctx, source, now)
+	return payload, err
+}
+
+// ParseWithPlatform performs Tier-2 generic parsing and returns both the unified-v1
+// payload and the attributed bounded platform identifier for telemetry (a normalized
+// named platform ID on success or extractor-matched failure, or PlatformUnmatched).
+func (p *GenericParser) ParseWithPlatform(ctx context.Context, source string, now int64) (unified.Object, string, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, PlatformUnmatched, err
 	}
 	cleanURL, ok := NormalizeGenericInputURL(source)
 	if !ok {
-		return unified.ContractError("INVALID_INPUT", "请输入有效的公网分享链接", false), nil
+		return unified.ContractError("INVALID_INPUT", "请输入有效的公网分享链接", false), PlatformUnmatched, nil
 	}
 	if p == nil || p.engine == nil || !p.engine.Enabled() {
-		return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), nil
+		return unified.ContractError("SERVICE_NOT_CONFIGURED", "当前平台解析服务暂不可用", false), PlatformUnmatched, nil
 	}
 
 	parsedURL, err := url.Parse(cleanURL)
@@ -403,41 +462,42 @@ func (p *GenericParser) Parse(ctx context.Context, source string, now int64) (un
 	if !inputOK {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if errors.Is(ctxErr, context.Canceled) {
-				return nil, ctxErr
+				return nil, PlatformUnmatched, ctxErr
 			}
-			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), PlatformUnmatched, nil
 		}
 		if errors.Is(lookupErr, context.DeadlineExceeded) {
-			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), PlatformUnmatched, nil
 		}
-		return unified.ContractError("UPSTREAM_BLOCKED", "目标地址解析到受限网络，已拒绝访问", false), nil
+		return unified.ContractError("UPSTREAM_BLOCKED", "目标地址解析到受限网络，已拒绝访问", false), PlatformUnmatched, nil
 	}
 
 	info, err := p.engine.Extract(ctx, cleanURL)
 	if err != nil {
+		attributed := AttributeGenericFailurePlatform(err)
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(ctxErr, context.Canceled) {
-			return nil, ctxErr
+			return nil, attributed, ctxErr
 		}
 		var engineErr *ytengine.Error
 		if errors.As(err, &engineErr) {
 			if engineErr.UnsupportedURL {
-				return unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false), nil
+				return unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false), attributed, nil
 			}
 			resp := unified.ContractError(string(engineErr.Code), engineErr.Message, engineErr.Retryable)
 			if engineErr.Retryable && engineErr.RetryAfter > 0 {
 				unified.Map(resp["error"])["retry_after_seconds"] = engineErr.RetryAfter
 			}
-			return resp, nil
+			return resp, attributed, nil
 		}
-		return unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), nil
+		return unified.ContractError("UPSTREAM_UNAVAILABLE", "当前平台解析服务暂不可用，请稍后重试", true), attributed, nil
 	}
 	if info == nil {
-		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "解析器返回数据为空", false), nil
+		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "解析器返回数据为空", false), PlatformUnmatched, nil
 	}
 
 	platformID := NormalizeExtractorPlatform(info.ExtractorKey, info.Extractor)
 	if platformID == "" {
-		return unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false), nil
+		return unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false), PlatformUnmatched, nil
 	}
 
 	contentID := strings.TrimSpace(info.DisplayID)
@@ -464,16 +524,16 @@ func (p *GenericParser) Parse(ctx context.Context, source string, now int64) (un
 	ytengine.PopulateMissingMP4Sizes(ctx, info, p.sizeProber, opts)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		if errors.Is(ctxErr, context.Canceled) {
-			return nil, ctxErr
+			return nil, platformID, ctxErr
 		}
-		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), platformID, nil
 	}
 	adapted := ytengine.AdaptInfo(info, opts, now)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		if errors.Is(ctxErr, context.Canceled) {
-			return nil, ctxErr
+			return nil, platformID, ctxErr
 		}
-		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), nil
+		return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), platformID, nil
 	}
-	return adapted, nil
+	return adapted, platformID, nil
 }

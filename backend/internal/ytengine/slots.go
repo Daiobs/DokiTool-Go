@@ -183,14 +183,18 @@ func (e *Engine) runSubprocess(callCtx context.Context, rawURL, effectiveProxy, 
 
 	runErr := cmd.Run()
 	stderrText := stderr.String()
+	stderrExtractor := ExtractExtractorFromStderr(stderrText)
 	if callCtx.Err() != nil {
-		return nil, stderrText, classifyContextErr(callCtx.Err())
+		ctxErr := classifyContextErr(callCtx.Err())
+		ctxErr.Extractor = stderrExtractor
+		return nil, stderrText, ctxErr
 	}
 	if stdout.overflow {
 		return nil, stderrText, &Error{
 			Code:      CodeUpstreamInvalidResponse,
 			Message:   "上游返回的元数据超出大小限制",
 			Retryable: false,
+			Extractor: stderrExtractor,
 		}
 	}
 	if runErr != nil {
@@ -203,6 +207,7 @@ func (e *Engine) runSubprocess(callCtx context.Context, rawURL, effectiveProxy, 
 			Code:      CodeUpstreamInvalidResponse,
 			Message:   "上游未返回有效的元数据",
 			Retryable: false,
+			Extractor: stderrExtractor,
 		}
 	}
 	var info Info
@@ -211,14 +216,23 @@ func (e *Engine) runSubprocess(callCtx context.Context, rawURL, effectiveProxy, 
 			Code:      CodeUpstreamInvalidResponse,
 			Message:   "上游返回的元数据格式异常",
 			Retryable: false,
+			Extractor: stderrExtractor,
 			Cause:     err,
 		}
 	}
 	if info.ID == "" && len(info.Formats) == 0 && len(info.Entries) == 0 {
+		emptyExtractor := strings.TrimSpace(info.ExtractorKey)
+		if emptyExtractor == "" {
+			emptyExtractor = strings.TrimSpace(info.Extractor)
+		}
+		if emptyExtractor == "" {
+			emptyExtractor = stderrExtractor
+		}
 		return nil, stderrText, &Error{
 			Code:      CodeContentUnavailable,
 			Message:   "未找到可用的作品内容",
 			Retryable: false,
+			Extractor: emptyExtractor,
 		}
 	}
 	return &info, stderrText, nil
@@ -277,8 +291,80 @@ func classifyContextErr(err error) *Error {
 	}
 }
 
+const maxRawExtractorTagLen = 64
+
+func isNonExtractorStderrTag(tag string) bool {
+	lower := strings.ToLower(tag)
+	switch lower {
+	case "download", "info", "debug", "warning", "error", "metadata",
+		"ffmpeg", "merger", "extractaudio", "fixup", "subtitles",
+		"cookies", "errno", "ssl", "http", "https", "url", "ejs", "js", "po_token":
+		return true
+	}
+	return strings.HasPrefix(lower, "errno:") || strings.HasPrefix(lower, "ssl:")
+}
+
+func parsePrefixedExtractorTag(line, prefix string) string {
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		return ""
+	}
+	rest := strings.TrimLeft(line[len(prefix):], " \t")
+	if !strings.HasPrefix(rest, "[") {
+		return ""
+	}
+	end := strings.IndexByte(rest[1:], ']')
+	if end <= 0 || end > maxRawExtractorTagLen {
+		return ""
+	}
+	tag := rest[1 : 1+end]
+	if isNonExtractorStderrTag(tag) {
+		return ""
+	}
+	for i := 0; i < len(tag); i++ {
+		c := tag[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum {
+				return ""
+			}
+			continue
+		}
+		if !isAlphaNum && c != '.' && c != '_' && c != ':' && c != '+' && c != '-' {
+			return ""
+		}
+	}
+	return tag
+}
+
+// ExtractExtractorFromStderr extracts the yt-dlp extractor name from stderr lines
+// formatted as "ERROR: [<extractor>] ..." or "WARNING: [<extractor>] ...".
+// ERROR lines take precedence over WARNING lines. Non-extractor bracket tags
+// (such as Python "[Errno ...]", "[SSL: ...]", or log tags like "[download]") are ignored.
+func ExtractExtractorFromStderr(stderr string) string {
+	if strings.TrimSpace(stderr) == "" {
+		return ""
+	}
+	var warningFallback string
+	for _, rawLine := range strings.Split(stderr, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if tag := parsePrefixedExtractorTag(line, "ERROR:"); tag != "" {
+			return tag
+		}
+		if warningFallback == "" {
+			if tag := parsePrefixedExtractorTag(line, "WARNING:"); tag != "" {
+				warningFallback = tag
+			}
+		}
+	}
+	return warningFallback
+}
+
 func classifyStderr(stderrText string, runErr error) *Error {
 	lower := strings.ToLower(stderrText)
+	extractor := ExtractExtractorFromStderr(stderrText)
 	switch {
 	case strings.Contains(lower, "upstream blocked by outbound security policy") ||
 		strings.Contains(lower, "tunnel connection failed: 403"):
@@ -286,6 +372,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeUpstreamBlocked,
 			Message:   "目标地址或重定向跳点超出安全出站边界，已拒绝访问",
 			Retryable: false,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	case strings.Contains(lower, "unsupported url") ||
@@ -295,6 +382,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Message:        "未找到可用的媒体，或该内容已不可访问",
 			Retryable:      false,
 			UnsupportedURL: true,
+			Extractor:      extractor,
 			Cause:          runErr,
 		}
 	case strings.Contains(lower, "429") ||
@@ -304,6 +392,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeRateLimited,
 			Message:   "上游访问频率受限，请稍后重试",
 			Retryable: true,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	case strings.Contains(lower, "timed out") ||
@@ -312,6 +401,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeUpstreamTimeout,
 			Message:   "上游连接超时，请稍后重试",
 			Retryable: true,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	case strings.Contains(lower, "protected tweet") ||
@@ -331,6 +421,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeUpstreamBlocked,
 			Message:   "该内容受访问限制（如私密账号或年龄限制），无法无凭据解析",
 			Retryable: false,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	case strings.Contains(lower, "no video could be found") ||
@@ -344,6 +435,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeContentUnavailable,
 			Message:   "未找到可用的媒体，或该内容已不可访问",
 			Retryable: false,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	default:
@@ -351,6 +443,7 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Code:      CodeUpstreamUnavailable,
 			Message:   "当前平台解析服务暂不可用，请稍后重试",
 			Retryable: true,
+			Extractor: extractor,
 			Cause:     runErr,
 		}
 	}

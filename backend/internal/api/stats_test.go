@@ -2083,3 +2083,63 @@ echo '{"id":"12345","extractor_key":"Vimeo","extractor":"vimeo","title":"Demo","
 		t.Fatalf("unexpected post-release generic stats: adm=%+v ytdlp_generic=%+v", endSnap.Admission.GenericSlow, endSnap.YTDLPGeneric)
 	}
 }
+
+func TestStatsYTDLPUnmatchedReservedCardinalityAndPersistence(t *testing.T) {
+	cur := time.Date(2026, 11, 22, 6, 0, 0, 0, time.UTC)
+	st := NewStats(func() time.Time { return cur })
+
+	// Fill all 64 dynamic platform slots first.
+	for i := 1; i <= MaxDynamicPlatforms; i++ {
+		st.RecordDynamicParse(fmt.Sprintf("dyn_%02d", i), "OK", ChannelAnonymous, 20*time.Millisecond)
+	}
+	// Overflow 3 extra dynamic keys -> must spill to ytdlp_other.
+	for i := MaxDynamicPlatforms + 1; i <= MaxDynamicPlatforms+3; i++ {
+		st.RecordDynamicParse(fmt.Sprintf("dyn_%02d", i), "UPSTREAM_TIMEOUT", ChannelOwner, 50*time.Millisecond)
+	}
+	// Record ytdlp_unmatched AFTER all 64 slots are saturated -> must stay in dedicated ytdlp_unmatched (never spill to ytdlp_other!).
+	st.RecordDynamicParse(PlatformYTDLPUnmatched, "UNSUPPORTED_PLATFORM", ChannelAnonymous, 15*time.Millisecond)
+	st.RecordDynamicParse(PlatformYTDLPUnmatched, "UPSTREAM_BLOCKED", ChannelOwner, 30*time.Millisecond)
+	// Hostile / raw stderr strings must still fall back to unknown (never corrupt dynamic or unmatched buckets).
+	st.RecordDynamicParse("ERROR: [bad/raw]", "UPSTREAM_UNAVAILABLE", ChannelAnonymous, 10*time.Millisecond)
+
+	snap := st.Snapshot()
+	wantTotal := uint64(MaxDynamicPlatforms + 3 + 2 + 1)
+	if snap.Requests.Total != wantTotal {
+		t.Fatalf("total = %d, want %d", snap.Requests.Total, wantTotal)
+	}
+	cells := snap.Requests.ByPlatformCodeChannel
+	if got := lookupCellCount(cells, PlatformYTDLPUnmatched, "UNSUPPORTED_PLATFORM", ChannelAnonymous); got != 1 {
+		t.Fatalf("ytdlp_unmatched UNSUPPORTED_PLATFORM = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, PlatformYTDLPUnmatched, "UPSTREAM_BLOCKED", ChannelOwner); got != 1 {
+		t.Fatalf("ytdlp_unmatched UPSTREAM_BLOCKED = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, PlatformYTDLPOther, "UPSTREAM_TIMEOUT", ChannelOwner); got != 3 {
+		t.Fatalf("ytdlp_other UPSTREAM_TIMEOUT = %d, want 3", got)
+	}
+	if got := lookupCellCount(cells, PlatformUnknown, "UPSTREAM_UNAVAILABLE", ChannelAnonymous); got != 1 {
+		t.Fatalf("unknown UPSTREAM_UNAVAILABLE (rejected raw key) = %d, want 1", got)
+	}
+
+	dayPlats := snap.Daily[29].ByPlatform
+	if unmatched := dayPlats[PlatformYTDLPUnmatched]; unmatched.Total != 2 || unmatched.ByCode["UNSUPPORTED_PLATFORM"] != 1 || unmatched.ByCode["UPSTREAM_BLOCKED"] != 1 {
+		t.Fatalf("daily ytdlp_unmatched mismatch: %+v", unmatched)
+	}
+
+	// Persist & reload cleanly while 64 dynamic platforms are active.
+	snapPath := filepath.Join(t.TempDir(), "stats-unmatched.json")
+	if err := st.SaveSnapshot(snapPath); err != nil {
+		t.Fatalf("SaveSnapshot failed: %v", err)
+	}
+	st2 := NewStats(func() time.Time { return cur })
+	if err := st2.LoadSnapshot(snapPath, nil); err != nil {
+		t.Fatalf("LoadSnapshot failed: %v", err)
+	}
+	reloadedDay := st2.Snapshot().Daily[29].ByPlatform
+	if unmatched := reloadedDay[PlatformYTDLPUnmatched]; unmatched.Total != 2 || unmatched.ByCode["UNSUPPORTED_PLATFORM"] != 1 || unmatched.ByCode["UPSTREAM_BLOCKED"] != 1 {
+		t.Fatalf("reloaded daily ytdlp_unmatched mismatch: %+v", unmatched)
+	}
+	if other := reloadedDay[PlatformYTDLPOther]; other.Total != 3 {
+		t.Fatalf("reloaded daily ytdlp_other total = %d, want 3", other.Total)
+	}
+}

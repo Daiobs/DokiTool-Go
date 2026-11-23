@@ -31,6 +31,7 @@ type Error struct {
 	RetryAfter     int
 	LocalBusy      bool
 	UnsupportedURL bool
+	Extractor      string
 	Cause          error
 }
 

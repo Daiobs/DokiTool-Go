@@ -962,10 +962,103 @@ esac
 		t.Fatalf("expected --use-extractors %s in captured args, got:\n%s", wantSelector, string(rawArgs))
 	}
 
-	// 2. Subprocess stderr "ERROR: Unsupported URL:" maps cleanly to UNSUPPORTED_PLATFORM.
-	unsupPayload, err := parser.Parse(context.Background(), "https://vimeo.com/unsupported/page", now)
+	// 2. Subprocess stderr "ERROR: Unsupported URL:" maps cleanly to UNSUPPORTED_PLATFORM and ytdlp_unmatched.
+	unsupPayload, unsupPlat, err := parser.ParseWithPlatform(context.Background(), "https://vimeo.com/unsupported/page", now)
 	if err != nil {
-		t.Fatalf("Parse(unsupported) failed: %v", err)
+		t.Fatalf("ParseWithPlatform(unsupported) failed: %v", err)
 	}
 	assertGenericEnvelopeValid(t, unsupPayload, now, "UNSUPPORTED_PLATFORM")
+	if unsupPlat != PlatformUnmatched {
+		t.Fatalf("unsupported attributed platform = %q, want %q", unsupPlat, PlatformUnmatched)
+	}
+}
+
+func TestAttributeGenericFailurePlatformAndParseWithPlatform(t *testing.T) {
+	const now int64 = 1762300800
+
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil-error", nil, PlatformUnmatched},
+		{"vimeo-structured", &ytengine.Error{Code: ytengine.CodeUpstreamBlocked, Extractor: "Vimeo"}, "vimeo"},
+		{"tiktok-structured", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "TikTok"}, "tiktok"},
+		{"dailymotion-structured", &ytengine.Error{Code: ytengine.CodeUpstreamTimeout, Extractor: "dailymotion"}, "dailymotion"},
+		{"soundcloud-structured", &ytengine.Error{Code: ytengine.CodeRateLimited, Extractor: "SoundCloud"}, "soundcloud"},
+		{"sub-extractor-normalized", &ytengine.Error{Code: ytengine.CodeUpstreamUnavailable, Extractor: "vimeo:album"}, "vimeo_album"},
+		{"generic-rejected", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "generic"}, PlatformUnmatched},
+		{"core-youtube-rejected", &ytengine.Error{Code: ytengine.CodeUpstreamBlocked, Extractor: "youtube"}, PlatformUnmatched},
+		{"core-twitter-rejected", &ytengine.Error{Code: ytengine.CodeUpstreamBlocked, Extractor: "Twitter"}, PlatformUnmatched},
+		{"reserved-ytdlp-other-rejected", &ytengine.Error{Code: ytengine.CodeUpstreamUnavailable, Extractor: "ytdlp_other"}, PlatformUnmatched},
+		{"reserved-ytdlp-unmatched-rejected", &ytengine.Error{Code: ytengine.CodeUpstreamUnavailable, Extractor: "ytdlp_unmatched"}, PlatformUnmatched},
+		{"unsupported-no-extractor", &ytengine.Error{Code: ytengine.CodeContentUnavailable, UnsupportedURL: true}, PlatformUnmatched},
+		{"cause-stderr-error-bracket", &ytengine.Error{Code: ytengine.CodeUpstreamUnavailable, Cause: errors.New("ERROR: [Reddit] abc123: boom")}, "reddit"},
+		{"plain-stderr-warning", errors.New("WARNING: [Twitch] Retrying...\nERROR: timed out"), "twitch"},
+		{"plain-stderr-errno", errors.New("ERROR: [Errno 111] Connection refused"), PlatformUnmatched},
+		{"plain-stderr-hostile", errors.New("ERROR: [bad/path] fail"), PlatformUnmatched},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AttributeGenericFailurePlatform(tc.err); got != tc.want {
+				t.Fatalf("AttributeGenericFailurePlatform(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	pubResolver := stubResolver{ips: map[string][]netip.Addr{
+		"vimeo.com":   {netip.MustParseAddr("93.184.216.34")},
+		"example.org": {netip.MustParseAddr("93.184.216.34")},
+		"private.org": {netip.MustParseAddr("127.0.0.1")},
+	}}
+
+	// 1. Named extractor failure attributes to normalized platform ("vimeo").
+	vimeoBlocked := NewGenericNamed(&stubExtractor{
+		enabled: true,
+		extract: func(context.Context, string) (*ytengine.Info, error) {
+			return nil, &ytengine.Error{
+				Code:      ytengine.CodeUpstreamBlocked,
+				Message:   "私密视频",
+				Extractor: "Vimeo",
+			}
+		},
+	}, nil, pubResolver)
+	payload, plat, err := vimeoBlocked.ParseWithPlatform(context.Background(), "https://vimeo.com/12345", now)
+	if err != nil {
+		t.Fatalf("ParseWithPlatform(vimeo blocked) err: %v", err)
+	}
+	assertGenericEnvelopeValid(t, payload, now, "UPSTREAM_BLOCKED")
+	if plat != "vimeo" {
+		t.Fatalf("vimeo blocked attributed platform = %q, want vimeo", plat)
+	}
+
+	// 2. NO_MEDIA after valid Vimeo Info still attributes to "vimeo".
+	vimeoNoMedia := NewGenericNamed(&stubExtractor{
+		enabled: true,
+		extract: func(context.Context, string) (*ytengine.Info, error) {
+			return &ytengine.Info{
+				ID:           "999",
+				ExtractorKey: "Vimeo",
+				Formats:      nil,
+			}, nil
+		},
+	}, nil, pubResolver)
+	payload, plat, err = vimeoNoMedia.ParseWithPlatform(context.Background(), "https://vimeo.com/999", now)
+	if err != nil {
+		t.Fatalf("ParseWithPlatform(vimeo no media) err: %v", err)
+	}
+	assertGenericEnvelopeValid(t, payload, now, "NO_MEDIA")
+	if plat != "vimeo" {
+		t.Fatalf("vimeo NO_MEDIA attributed platform = %q, want vimeo", plat)
+	}
+
+	// 3. DNS private-IP SSRF rejection inside Tier-2 attributes to ytdlp_unmatched.
+	payload, plat, err = vimeoBlocked.ParseWithPlatform(context.Background(), "https://private.org/v/1", now)
+	if err != nil {
+		t.Fatalf("ParseWithPlatform(ssrf) err: %v", err)
+	}
+	assertGenericEnvelopeValid(t, payload, now, "UPSTREAM_BLOCKED")
+	if plat != PlatformUnmatched {
+		t.Fatalf("SSRF attributed platform = %q, want %q", plat, PlatformUnmatched)
+	}
 }
