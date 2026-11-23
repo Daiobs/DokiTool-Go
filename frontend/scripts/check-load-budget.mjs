@@ -45,6 +45,19 @@ assert.ok(
     !keys.has(extensionModalKey),
   'youtubeHelperCore, useMediaDownload, DownloadCard, and ExtensionDownloadModal must not be in the initial static import graph',
 );
+assert.ok(
+  manifest['monitor.html'],
+  'Expected monitor.html multi-page entry in Vite manifest',
+);
+const isMonitorArtifact = value =>
+  typeof value === 'string' &&
+  (value === 'monitor.html' ||
+    value.startsWith('src/monitor/') ||
+    value.includes('assets/monitor-'));
+assert.ok(
+  ![...keys].some(isMonitorArtifact) && ![...files].some(isMonitorArtifact),
+  'Monitor dashboard chunks and assets must not enter index.html initial static import graph',
+);
 const assetNames = await readdir(new URL('assets/', dist));
 assert.ok(!assetNames.some(name => /\.(woff2?|ttf|otf)$/i.test(name)), 'UI must not regain external font dependencies');
 

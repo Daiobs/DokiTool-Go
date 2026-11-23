@@ -50,6 +50,7 @@ import {
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
+  isSafeNativeBrowserDownloadUrl,
   isWhitelistedMediaUrl,
   validateApiBaseUrl,
   type ApiBaseUrlValidationResult,
@@ -73,7 +74,10 @@ import {
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
 } from "./protocol";
-import { normalizeExtensionThemeMode } from "./storage";
+import {
+  DEFAULT_EXTENSION_SETTINGS,
+  normalizeExtensionThemeMode,
+} from "./storage";
 import { PLATFORM_DOMAIN_SPECS } from "./urlMatcher";
 
 export const MAX_EXTENSION_ZIP_BYTES = 500 * 1024 * 1024;
@@ -481,45 +485,87 @@ export function openSafeHttpTab(rawUrl: string): boolean {
 }
 
 /**
- * Opens the built-in Owner Parse Monitor Dashboard (`monitor.html`) in a browser tab.
- * Reuses an already-open tab for the same extension page URL when `chrome.tabs.query`
- * and `chrome.tabs.update` are available; otherwise opens a new tab via `chrome.tabs.create`.
- * Safe no-op (`false`) outside a Chrome extension runtime.
+ * Opens the Web Owner Parse Monitor Dashboard (`${apiOrigin}/monitor`) in a browser tab.
+ * Validates `apiBaseUrl` (defaulting to `DEFAULT_EXTENSION_SETTINGS.apiBaseUrl`), NEVER
+ * appends query params, `#hash`, or any Bearer token, and reuses an already-open
+ * `/monitor` or `/monitor.html` tab for the same origin when `chrome.tabs.query` and
+ * `chrome.tabs.update` are available; otherwise opens a new tab via `chrome.tabs.create`.
+ * Safe no-op (`false`) on invalid URLs or outside a Chrome extension runtime.
  */
-export async function openMonitorDashboardTab(): Promise<boolean> {
-  const { runtime, tabs, windows } = getChromeNamespace();
-  if (!runtime?.getURL) {
+export async function openMonitorDashboardTab(
+  apiBaseUrl?: string,
+): Promise<boolean> {
+  const validated = validateApiBaseUrl(
+    apiBaseUrl || DEFAULT_EXTENSION_SETTINGS.apiBaseUrl,
+  );
+  if (!validated.ok) {
     return false;
   }
-  let monitorUrl = "";
-  try {
-    monitorUrl = runtime.getURL("monitor.html");
-  } catch {
-    return false;
-  }
-  if (!monitorUrl) return false;
+
+  const monitorUrl = `${validated.origin}/monitor`;
+  const monitorHtmlUrl = `${validated.origin}/monitor.html`;
+  const { tabs, windows } = getChromeNamespace();
+
+  const findMatchingTab = (
+    candidates: unknown,
+    requireExplicitUrl: boolean,
+  ): ChromeTabRecordLike | undefined => {
+    if (!Array.isArray(candidates)) return undefined;
+    return candidates.find((tab) => {
+      if (typeof tab?.id !== "number" || !Number.isInteger(tab.id)) {
+        return false;
+      }
+      if (typeof tab.url !== "string" || !tab.url) {
+        return !requireExplicitUrl;
+      }
+      return (
+        tab.url === monitorUrl ||
+        tab.url === `${monitorUrl}/` ||
+        tab.url === monitorHtmlUrl
+      );
+    });
+  };
+
+  const activateTab = async (existing: ChromeTabRecordLike): Promise<boolean> => {
+    if (typeof existing.id !== "number" || !tabs?.update) return false;
+    await tabs.update(existing.id, { active: true });
+    if (typeof existing.windowId === "number" && windows?.update) {
+      try {
+        await windows.update(existing.windowId, { focused: true });
+      } catch {
+        // Best-effort window focus
+      }
+    }
+    return true;
+  };
 
   if (tabs?.query && tabs?.update) {
     try {
-      const existingTabs = await tabs.query({ url: monitorUrl });
-      const existing = Array.isArray(existingTabs)
-        ? existingTabs.find(
-            (tab) => typeof tab?.id === "number" && Number.isInteger(tab.id),
-          )
-        : undefined;
-      if (existing && typeof existing.id === "number") {
-        await tabs.update(existing.id, { active: true });
-        if (typeof existing.windowId === "number" && windows?.update) {
-          try {
-            await windows.update(existing.windowId, { focused: true });
-          } catch {
-            // Best-effort window focus
-          }
-        }
-        return true;
+      const existingTabs = await tabs.query({
+        url: [monitorUrl, monitorHtmlUrl],
+      });
+      const existing = findMatchingTab(existingTabs, false);
+      if (existing) {
+        return await activateTab(existing);
       }
     } catch {
-      // Fall through to tabs.create
+      // Chrome MV3 match patterns forbid explicit ports (e.g. http://127.0.0.1:18080).
+      // Retry with portless host patterns and strictly filter by exact tab.url.
+      try {
+        const parsedOrigin = new URL(validated.origin);
+        if (parsedOrigin.port !== "") {
+          const portlessOrigin = `${parsedOrigin.protocol}//${parsedOrigin.hostname}`;
+          const fallbackTabs = await tabs.query({
+            url: [`${portlessOrigin}/monitor`, `${portlessOrigin}/monitor.html`],
+          });
+          const existing = findMatchingTab(fallbackTabs, true);
+          if (existing) {
+            return await activateTab(existing);
+          }
+        }
+      } catch {
+        // Fall through to tabs.create
+      }
     }
   }
 
@@ -571,10 +617,39 @@ const PLATFORM_LABEL_MAP = new Map<string, string>(
   PLATFORM_DOMAIN_SPECS.map((spec) => [spec.id, spec.label]),
 );
 
+const LONG_TAIL_PLATFORM_LABELS: Readonly<Record<string, string>> = {
+  tiktok: "TikTok",
+  vimeo: "Vimeo",
+  reddit: "Reddit",
+  twitch: "Twitch",
+  twitchvod: "Twitch",
+  twitchclips: "Twitch",
+  soundcloud: "SoundCloud",
+  niconico: "Niconico",
+  pinterest: "Pinterest",
+  dailymotion: "Dailymotion",
+  vk: "VK",
+  streamable: "Streamable",
+  bandcamp: "Bandcamp",
+  generic: "通用站点",
+  unknown: "未知平台",
+};
+
 export function formatPlatformDisplayName(platform?: string): string {
-  if (!platform) return "未知平台";
-  const key = platform.trim().toLowerCase();
-  return PLATFORM_LABEL_MAP.get(key) || platform;
+  if (!platform || !platform.trim()) return "未知平台";
+  const trimmed = platform.trim();
+  const key = trimmed.toLowerCase();
+  const mapped = PLATFORM_LABEL_MAP.get(key) ?? LONG_TAIL_PLATFORM_LABELS[key];
+  if (mapped) return mapped;
+  if (trimmed.includes(".")) return key;
+  if (/^[a-z0-9_-]+$/.test(trimmed)) {
+    return trimmed
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
+  return trimmed;
 }
 
 export function resolveSafeApiOrigin(rawApiBaseUrl?: string): string {
@@ -677,6 +752,11 @@ export interface SidePanelAudioBadge {
   tone: "mux" | "audio" | "track" | "silent";
 }
 
+export type QualityDeliveryMode = "opfs" | "native_direct" | "external_only";
+
+export const EXTERNAL_ONLY_STREAM_REASON =
+  "该长尾流媒体域名不在扩展权限白名单内，支持复制直链或打开原帖" as const;
+
 export interface SidePanelQualityOption {
   key: string;
   kind: "variant" | "attachment";
@@ -685,6 +765,8 @@ export interface SidePanelQualityOption {
   source: Source | null;
   downloadTarget: DownloadTarget;
   downloadable: boolean;
+  deliveryMode: QualityDeliveryMode;
+  externalOnlyReason?: string;
   titleLabel: string;
   specs: string[];
   audioBadge: SidePanelAudioBadge | null;
@@ -826,7 +908,26 @@ function inferVideoExtFromUrl(
     if (pathExtMatch) {
       const ext = pathExtMatch[1].toLowerCase();
       if (ext === "mp4" || ext === "m4v") return "mp4";
-      if (["webm", "mov", "mkv", "m4a", "mp3", "jpg", "jpeg", "png", "webp", "gif", "avif"].includes(ext)) {
+      if (
+        [
+          "webm",
+          "mov",
+          "mkv",
+          "m4a",
+          "mp3",
+          "aac",
+          "ogg",
+          "opus",
+          "wav",
+          "flac",
+          "jpg",
+          "jpeg",
+          "png",
+          "webp",
+          "gif",
+          "avif",
+        ].includes(ext)
+      ) {
         return ext === "jpeg" ? "jpg" : ext;
       }
     }
@@ -910,7 +1011,10 @@ function isStandaloneAudioMetadata(
       ext === "m4a" ||
       ext === "mp3" ||
       ext === "aac" ||
-      ext === "opus")
+      ext === "opus" ||
+      ext === "ogg" ||
+      ext === "wav" ||
+      ext === "flac")
   );
 }
 
@@ -1117,14 +1221,53 @@ function resolveItemScopedAudioAttachments(
   return scoped;
 }
 
+function hasWhitelistedRoute(
+  routes: readonly string[],
+  extraOrigins?: string[],
+): boolean {
+  return routes.some((r) => isWhitelistedMediaUrl(r, extraOrigins).allowed);
+}
+
+function classifyDirectFileDeliveryMode(
+  routes: readonly string[],
+  extraOrigins?: string[],
+): {
+  deliveryMode: QualityDeliveryMode;
+  downloadable: boolean;
+  externalOnlyReason?: string;
+} {
+  if (hasWhitelistedRoute(routes, extraOrigins)) {
+    return { deliveryMode: "opfs", downloadable: true };
+  }
+  if (
+    routes.some((r) => isSafeNativeBrowserDownloadUrl(r, extraOrigins).safe)
+  ) {
+    return { deliveryMode: "native_direct", downloadable: true };
+  }
+  return {
+    deliveryMode: "external_only",
+    downloadable: false,
+    externalOnlyReason: "该媒体直链不符合扩展安全下载规则，请打开原帖查看",
+  };
+}
+
 export function buildSidePanelQualityOptions(
   media: UnifiedMedia,
   item: MediaItem | null | undefined,
   rawApiOrigin: string,
-  options?: { now?: number },
+  options?: { now?: number; extraAllowedOrigins?: string[] },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
   const resolvedApiOrigin = resolveSafeApiOrigin(rawApiOrigin);
+  const defaultExtraOrigins = buildExtraAllowedOrigins(resolvedApiOrigin) ?? [];
+  const mergedExtraOrigins = Array.from(
+    new Set([
+      ...defaultExtraOrigins,
+      ...(options?.extraAllowedOrigins ?? []),
+    ]),
+  );
+  const extraOrigins =
+    mergedExtraOrigins.length > 0 ? mergedExtraOrigins : undefined;
   const ctx = buildExtensionTargetContext(resolvedApiOrigin, options?.now);
   const copyCtx: TargetContext =
     options?.now !== undefined
@@ -1166,7 +1309,7 @@ export function buildSidePanelQualityOptions(
     );
     const dashMux = extractDashMuxSpec(variant, ctx);
     const isDashMux = Boolean(dashMux);
-    const downloadable =
+    const structurallyDownloadable =
       ["file", "hls", "segments", "pair"].includes(target.kind) || isDashMux;
     const resolvedSource = target.kind === "file" ? target.source : primarySource;
     const muxPair = muxPairsByVariantId.get(variant.id) ?? null;
@@ -1211,8 +1354,8 @@ export function buildSidePanelQualityOptions(
         ]),
       );
     } else if (
-      variant.delivery.kind === "hls" &&
-      variant.delivery.scope === "single"
+      variant.delivery.kind === "hls" ||
+      variant.delivery.kind === "dash"
     ) {
       routes = deliveryRoutes(variant.delivery.sources, ctx);
       directUrl = routes[0] ?? "";
@@ -1241,6 +1384,126 @@ export function buildSidePanelQualityOptions(
           directUrl = "";
           copyUrl = "";
         }
+      }
+    }
+
+    let deliveryMode: QualityDeliveryMode = "external_only";
+    let downloadable = false;
+    let externalOnlyReason: string | undefined;
+
+    if (!structurallyDownloadable) {
+      deliveryMode = "external_only";
+      downloadable = false;
+      if (
+        (variant.delivery.kind === "hls" ||
+          variant.delivery.kind === "dash" ||
+          variant.delivery.kind === "mux") &&
+        routes.length > 0 &&
+        !hasWhitelistedRoute(routes, extraOrigins)
+      ) {
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
+      } else if (target.kind === "unsupported" && target.message) {
+        externalOnlyReason = target.message;
+      }
+    } else if (isDashMux && dashMux) {
+      const videoOk = hasWhitelistedRoute(dashMux.videoRoutes, extraOrigins);
+      const audioOk = hasWhitelistedRoute(dashMux.audioRoutes, extraOrigins);
+      if (videoOk && audioOk) {
+        deliveryMode = "opfs";
+        downloadable = true;
+      } else {
+        deliveryMode = "external_only";
+        downloadable = false;
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
+      }
+    } else if (muxPair) {
+      let videoOk = false;
+      let audioOk = false;
+      try {
+        videoOk = isWhitelistedMediaUrl(
+          sourceUrl(muxPair.videoSource, ctx),
+          extraOrigins,
+        ).allowed;
+        audioOk = isWhitelistedMediaUrl(
+          sourceUrl(muxPair.audioSource, ctx),
+          extraOrigins,
+        ).allowed;
+      } catch {
+        videoOk = false;
+        audioOk = false;
+      }
+      if (videoOk && audioOk) {
+        deliveryMode = "opfs";
+        downloadable = true;
+      } else {
+        deliveryMode = "external_only";
+        downloadable = false;
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
+      }
+    } else if (target.kind === "file") {
+      const classified = classifyDirectFileDeliveryMode(routes, extraOrigins);
+      deliveryMode = classified.deliveryMode;
+      downloadable = classified.downloadable;
+      externalOnlyReason = classified.externalOnlyReason;
+    } else if (target.kind === "hls") {
+      if (hasWhitelistedRoute(routes, extraOrigins)) {
+        deliveryMode = "opfs";
+        downloadable = true;
+      } else {
+        deliveryMode = "external_only";
+        downloadable = false;
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
+      }
+    } else if (target.kind === "segments" && variant.delivery.kind === "segments") {
+      const chunks: Chunk[] = [
+        ...(variant.delivery.init ? [variant.delivery.init] : []),
+        ...variant.delivery.pieces,
+      ];
+      const allChunksWhitelisted =
+        chunks.length > 0 &&
+        chunks.every((chunk) =>
+          hasWhitelistedRoute(deliveryRoutes(chunk.sources, ctx), extraOrigins),
+        );
+      if (allChunksWhitelisted) {
+        deliveryMode = "opfs";
+        downloadable = true;
+      } else {
+        deliveryMode = "external_only";
+        downloadable = false;
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
+      }
+    } else if (target.kind === "pair" && variant.delivery.kind === "pair") {
+      const allResourcesWhitelisted =
+        variant.delivery.resources.length > 0 &&
+        variant.delivery.resources.every((res) => {
+          const del = res.delivery;
+          if (del.kind === "segments") {
+            const chunks: Chunk[] = [
+              ...(del.init ? [del.init] : []),
+              ...del.pieces,
+            ];
+            return (
+              chunks.length > 0 &&
+              chunks.every((chunk) =>
+                hasWhitelistedRoute(
+                  deliveryRoutes(chunk.sources, ctx),
+                  extraOrigins,
+                ),
+              )
+            );
+          }
+          return hasWhitelistedRoute(
+            deliveryRoutes(del.sources, ctx),
+            extraOrigins,
+          );
+        });
+      if (allResourcesWhitelisted) {
+        deliveryMode = "opfs";
+        downloadable = true;
+      } else {
+        deliveryMode = "external_only";
+        downloadable = false;
+        externalOnlyReason = EXTERNAL_ONLY_STREAM_REASON;
       }
     }
 
@@ -1338,6 +1601,8 @@ export function buildSidePanelQualityOptions(
       source: resolvedSource,
       downloadTarget: target,
       downloadable,
+      deliveryMode,
+      ...(externalOnlyReason ? { externalOnlyReason } : {}),
       titleLabel,
       specs: variantSpecifications(variant),
       audioBadge,
@@ -1462,6 +1727,11 @@ export function buildSidePanelQualityOptions(
               ? formatApproxSizeLabel(attEstBytes)
               : formatMediaSize(0, "zh-CN");
 
+        const attClassified = classifyDirectFileDeliveryMode(
+          attRoutes,
+          extraOrigins,
+        );
+
         qualityOptions.push({
           key: `attachment:${att.id}`,
           kind: "attachment",
@@ -1469,7 +1739,11 @@ export function buildSidePanelQualityOptions(
           attachment: att,
           source: primarySrc,
           downloadTarget: attTarget,
-          downloadable: true,
+          downloadable: attClassified.downloadable,
+          deliveryMode: attClassified.deliveryMode,
+          ...(attClassified.externalOnlyReason
+            ? { externalOnlyReason: attClassified.externalOnlyReason }
+            : {}),
           titleLabel: syntheticVariant.label || "原声音频",
           specs: variantSpecifications(syntheticVariant),
           audioBadge: {
@@ -1554,7 +1828,9 @@ export function selectPreferredQualityOption(
   media?: UnifiedMedia | null,
   apiOrigin?: string,
 ): SidePanelQualityOption | null {
-  const downloadable = options.filter((opt) => opt.downloadable);
+  const downloadable = options.filter(
+    (opt) => opt.downloadable && opt.deliveryMode !== "external_only",
+  );
   if (!downloadable.length) return options[0] ?? null;
 
   const defaultVariantId =
@@ -1635,7 +1911,9 @@ export function buildPrimarySingleCtaLabel(params: {
 }): string {
   const { item, option } = params;
   if (!item || !option || !option.downloadable) {
-    return "暂无可用下载源";
+    return option?.deliveryMode === "external_only"
+      ? "非白名单流（请复制直链或打开原帖）"
+      : "暂无可用下载源";
   }
   const extUpper = (option.resolvedExt || "mp4").toUpperCase();
 
@@ -2384,6 +2662,9 @@ export function buildChecklistZipEnqueueItem(params: {
     return { ok: false, reason: "没有可打包的已就绪条目" };
   }
 
+  const apiOrigin = resolveSafeApiOrigin(settings.apiBaseUrl);
+  const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
+
   let knownBytes = 0;
   const zipEntries: OffscreenZipEntrySpec[] = [];
 
@@ -2406,6 +2687,29 @@ export function buildChecklistZipEnqueueItem(params: {
       return {
         ok: false,
         reason: "HLS 流媒体分片条目请使用「按标题存子文件夹」流式落盘",
+      };
+    }
+    if (!hasWhitelistedRoute(sub.spec.routes, extraAllowedOrigins)) {
+      return {
+        ok: false,
+        reason:
+          "该长尾站点媒体域名不在扩展打包白名单内，请使用「按标题存子文件夹」直接通过浏览器原生保存",
+      };
+    }
+    if (
+      sub.spec.segments?.some((seg) => {
+        const segRoutes = seg.routes?.length
+          ? seg.routes
+          : seg.url
+            ? [seg.url]
+            : [];
+        return !hasWhitelistedRoute(segRoutes, extraAllowedOrigins);
+      })
+    ) {
+      return {
+        ok: false,
+        reason:
+          "该长尾站点媒体域名不在扩展打包白名单内，请使用「按标题存子文件夹」直接通过浏览器原生保存",
       };
     }
     const size = parsePositiveSafeBytes(sub.spec.sizeBytes);
@@ -2431,8 +2735,6 @@ export function buildChecklistZipEnqueueItem(params: {
     });
   }
 
-  const apiOrigin = resolveSafeApiOrigin(settings.apiBaseUrl);
-  const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
   const workTitle = resolveWorkBaseTitle(media);
   const zipFilename = buildSafeDownloadPath({
     prefix: settings.subfolderPrefix,

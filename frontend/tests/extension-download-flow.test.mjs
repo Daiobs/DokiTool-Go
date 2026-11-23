@@ -9936,3 +9936,1528 @@ test("[PR-A R2 B2] whitelistedFetch, direct_file (parallel + sequential), and da
     assert.equal(opfs.files.size, 0);
   }
 });
+
+// ============================================================================
+// PR-C: Zero-<all_urls> Long-Tail Platform Support Tests
+// ============================================================================
+
+test("[PR-C 1] Privacy firewall unchanged on browsing/Alt+Shift+D/RESOLVE_LAZY_ITEM while active PARSE_URL, ENQUEUE_BATCH_URLS, QUICK_DOWNLOAD, and RETRY_TASK support long-tail platforms with platform=all", async () => {
+  const apiRequests = [];
+  let failVimeoFirstAttempt = false;
+
+  const mockFetch = async (url) => {
+    apiRequests.push(String(url));
+    if (String(url).startsWith("https://snap.dokitool.com/api/parse")) {
+      const parsed = new URL(String(url));
+      assert.equal(
+        parsed.searchParams.get("platform"),
+        "all",
+        "must always send platform=all (never platform=generic)",
+      );
+      const target = parsed.searchParams.get("url") || "";
+      if (target.includes("vimeo.com/123456")) {
+        if (failVimeoFirstAttempt) {
+          failVimeoFirstAttempt = false;
+          return new Response(
+            JSON.stringify({
+              schema_version: "1.0",
+              code: "UPSTREAM_INVALID_RESPONSE",
+              error: { code: "UPSTREAM_INVALID_RESPONSE", message: "临时错误" },
+            }),
+            { status: 502, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "OK",
+            data: {
+              platform: "vimeo",
+              content_id: "123456",
+              source_url: "https://vimeo.com/123456",
+              title: "Vimeo Alpine Film",
+              items: [
+                {
+                  id: "v-123456",
+                  type: "video",
+                  variants: [
+                    {
+                      id: "hls-1080p",
+                      label: "1080p HLS",
+                      metadata: {
+                        width: 1920,
+                        height: 1080,
+                        extension: "mp4",
+                        has_audio: true,
+                      },
+                      delivery: {
+                        kind: "hls",
+                        scope: "single",
+                        sources: [
+                          { url: "https://skyfire.vimeocdn.com/hls/1080p.m3u8" },
+                        ],
+                      },
+                    },
+                    {
+                      id: "mp4-720p",
+                      label: "720p MP4",
+                      metadata: {
+                        width: 1280,
+                        height: 720,
+                        extension: "mp4",
+                        has_audio: true,
+                      },
+                      delivery: {
+                        kind: "file",
+                        sources: [
+                          {
+                            url: "https://skyfire.vimeocdn.com/prog/720p.mp4",
+                            size_bytes: 12_345_678,
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                  default: {
+                    variant_id: "mp4-720p",
+                    url: "https://skyfire.vimeocdn.com/prog/720p.mp4",
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (target.includes("soundcloud.com/artist/track-1")) {
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "OK",
+            data: {
+              platform: "soundcloud",
+              content_id: "track-1",
+              source_url: "https://soundcloud.com/artist/track-1",
+              title: "Midnight Synth",
+              items: [
+                {
+                  id: "sc-1",
+                  type: "audio",
+                  variants: [
+                    {
+                      id: "mp3-128",
+                      label: "MP3 128kbps",
+                      metadata: {
+                        extension: "mp3",
+                        mime_type: "audio/mpeg",
+                        has_audio: true,
+                        audio_bitrate_bps: 128000,
+                      },
+                      delivery: {
+                        kind: "file",
+                        sources: [
+                          {
+                            url: "https://cf-media.sndcdn.com/midnight-synth.mp3",
+                            size_bytes: 4_200_000,
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                  default: {
+                    variant_id: "mp3-128",
+                    url: "https://cf-media.sndcdn.com/midnight-synth.mp3",
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+    throw new Error(`Unexpected fetch URL in PR-C 1: ${url}`);
+  };
+
+  const env = createMockMv3Environment({ autoCompleteDownloads: true });
+  const extStorage = storage.createExtensionStorage();
+  await extStorage.updateSettings({
+    bearerToken: "owner-token-123",
+    autoFollowTab: true,
+    subfolderPrefix: "LongTail",
+  });
+
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    fetchImpl: mockFetch,
+    tabSyncDebounceMs: 15,
+    badgeSuccessDurationMs: 40,
+  });
+  await bg.init();
+
+  // 1) Privacy firewall: browsing Vimeo, TikTok, or online banking triggers ZERO network calls & redacts rawUrl!
+  for (const browsedUrl of [
+    "https://vimeo.com/123456",
+    "https://www.tiktok.com/@creator/video/7123456789",
+    "https://online-banking.example.com/secret?token=abc",
+  ]) {
+    env.emitTabUpdated(
+      1,
+      { status: "complete", url: browsedUrl },
+      { id: 1, windowId: 10, active: true, url: browsedUrl },
+    );
+    env.emitTabActivated(1, 10);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(apiRequests.length, 0, `0 network requests when browsing ${browsedUrl}`);
+    const snap = await bg.getSnapshot();
+    assert.equal(snap.tabSync?.matched, null, `tabSync.matched must stay null for ${browsedUrl}`);
+    assert.equal(snap.tabSync?.rawUrl, "", `tabSync.rawUrl must be redacted for ${browsedUrl}`);
+  }
+
+  // Alt+Shift+D on Vimeo opens SidePanel synchronously but emits NO inspect intent & 0 network calls
+  env.emitCommand(protocol.COMMAND_OPEN_SIDEPANEL, {
+    id: 1,
+    windowId: 10,
+    url: "https://vimeo.com/123456",
+  });
+  await bg.waitForIdle();
+  assert.equal(apiRequests.length, 0, "Alt+Shift+D on long-tail tab makes 0 network calls");
+  assert.equal(await extStorage.consumePendingIntent(), null);
+
+  // RESOLVE_LAZY_ITEM still strictly requires core-14 platform inner URL
+  const lazyReject = await env.chrome.runtime.sendMessage({
+    type: "RESOLVE_LAZY_ITEM",
+    platform: "vimeo",
+    resolveUrl: "/api/resolve?item_id=p2&url=https%3A%2F%2Fvimeo.com%2F123456",
+  });
+  assert.equal(lazyReject.ok, false);
+  assert.equal(apiRequests.length, 0, "RESOLVE_LAZY_ITEM must reject non-core-14 locally");
+
+  // 2) Active PARSE_URL accepts Vimeo, sends platform=all, and enriches matched.platform / matched.platformLabel
+  const parseResp = await env.chrome.runtime.sendMessage({
+    type: "PARSE_URL",
+    url: "https://vimeo.com/123456",
+  });
+  assert.equal(parseResp.ok, true, `expected PARSE_URL ok: ${parseResp.error || ""}`);
+  assert.equal(parseResp.data.matched.platform, "vimeo");
+  assert.equal(parseResp.data.matched.platformLabel, "Vimeo");
+  assert.equal(parseResp.data.media.title, "Vimeo Alpine Film");
+  assert.equal(apiRequests.length, 1);
+
+  // PARSE_URL still rejects local/private/internal/bare URLs locally with 0 network calls
+  for (const blocked of [
+    "chrome://extensions",
+    "file:///etc/passwd",
+    "http://192.168.1.1/video.mp4",
+    "http://localhost/video/1",
+    "https://snap.dokitool.com/api/parse",
+    "https://vimeo.com/",
+  ]) {
+    const reqCountBefore = apiRequests.length;
+    const rej = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: blocked,
+    });
+    assert.equal(rej.ok, false);
+    assert.equal(apiRequests.length, reqCountBefore, `0 network calls for blocked ${blocked}`);
+  }
+
+  // 3) Active CONTEXT_MENU_QUICK_DOWNLOAD_ID:
+  //    a) rejects unsafe/internal URLs locally with 0 network calls
+  for (const badQuick of [
+    "chrome://extensions",
+    "file:///etc/passwd",
+    "http://127.0.0.1/secret",
+    "http://localhost/admin",
+    "https://snap.dokitool.com/api/parse",
+  ]) {
+    const reqCountBefore = apiRequests.length;
+    env.emitContextMenuClick(
+      { menuItemId: protocol.CONTEXT_MENU_QUICK_DOWNLOAD_ID, linkUrl: badQuick },
+      { id: 1, windowId: 10 },
+    );
+    await bg.waitForIdle();
+    assert.equal(apiRequests.length, reqCountBefore, `quick-download must not fetch ${badQuick}`);
+  }
+  await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+
+  //    b) accepts https://vimeo.com/123456 -> selects downloadable 720p progressive MP4 over 1080p external_only HLS
+  //       and dispatches straight to chrome.downloads.download with 0 Offscreen document creations!
+  env.downloadCalls.length = 0;
+  env.emitContextMenuClick(
+    {
+      menuItemId: protocol.CONTEXT_MENU_QUICK_DOWNLOAD_ID,
+      linkUrl: "https://vimeo.com/123456",
+    },
+    { id: 1, windowId: 10 },
+  );
+  await bg.waitForIdle();
+  assert.equal(env.getOffscreenCreateCount(), 0, "native direct download must NEVER spawn offscreen.html");
+  assert.equal(env.downloadCalls.length, 1);
+  assert.equal(env.downloadCalls[0].url, "https://skyfire.vimeocdn.com/prog/720p.mp4");
+  assert.equal(env.downloadCalls[0].filename, "LongTail/Vimeo Alpine Film.mp4");
+
+  await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+
+  // 4) Active ENQUEUE_BATCH_URLS + RETRY_TASK (url kind) with mixed long-tail URLs & blocked noise
+  env.downloadCalls.length = 0;
+  failVimeoFirstAttempt = true;
+  const batchResp = await env.chrome.runtime.sendMessage({
+    type: "ENQUEUE_BATCH_URLS",
+    urls: [
+      "https://vimeo.com/123456",
+      "https://soundcloud.com/artist/track-1",
+      "chrome://settings",
+      "http://localhost/ignored",
+      "https://snap.dokitool.com/api/parse",
+    ],
+  });
+  assert.equal(batchResp.ok, true);
+  assert.equal(batchResp.data.taskIds.length, 2, "only valid long-tail URLs enqueued");
+  await bg.waitForIdle();
+
+  let snap = await bg.getSnapshot();
+  const failedVimeo = snap.tasks.find((t) => t.status === "failed");
+  const doneSoundCloud = snap.tasks.find((t) => t.status === "completed");
+  assert.ok(failedVimeo && failedVimeo.retryPayload?.kind === "url");
+  assert.ok(doneSoundCloud && doneSoundCloud.platform === "soundcloud");
+  assert.ok(
+    env.downloadCalls.some(
+      (d) =>
+        d.url === "https://cf-media.sndcdn.com/midnight-synth.mp3" &&
+        d.filename === "LongTail/Midnight Synth/Midnight Synth.mp3",
+    ),
+  );
+
+  // Retry failed long-tail URL task -> succeeds natively with 0 offscreen creates!
+  const retryResp = await env.chrome.runtime.sendMessage({
+    type: "RETRY_TASK",
+    taskId: failedVimeo.taskId,
+  });
+  assert.equal(retryResp.ok, true);
+  await bg.waitForIdle();
+  snap = await bg.getSnapshot();
+  assert.equal(snap.tasks.every((t) => t.status === "completed"), true);
+  assert.equal(env.getOffscreenCreateCount(), 0, "still 0 offscreen creates for long-tail native downloads");
+
+  bg.dispose();
+});
+
+test("[PR-C 2] Zero-<all_urls> native chrome.downloads.download lifecycle (complete, interrupted, OPEN_DOWNLOAD_FOLDER, savedWork, zero Offscreen) and background UNWHITELISTED_CDN guard for non-whitelisted streams + ZIP fallback", async () => {
+  const fetchCalls = [];
+  const offscreenMessages = [];
+  const mockFetch = async (url) => {
+    fetchCalls.push(String(url));
+    throw new Error(`fetch must NEVER be invoked for native direct / blocked stream: ${url}`);
+  };
+
+  const env = createMockMv3Environment({ autoCompleteDownloads: false });
+  env.chrome.runtime.onMessage.addListener((msg) => {
+    if (protocol.isBackgroundToOffscreenRequest(msg)) {
+      offscreenMessages.push(msg);
+    }
+    return false;
+  });
+
+  const extStorage = storage.createExtensionStorage();
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    fetchImpl: mockFetch,
+    badgeSuccessDurationMs: 50,
+  });
+  await bg.init();
+
+  // 1) Non-whitelisted direct_file -> straight to chrome.downloads.download with 0 Offscreen invocations!
+  const enq1 = await env.chrome.runtime.sendMessage({
+    type: "ENQUEUE_DOWNLOADS",
+    items: [
+      {
+        title: "TikTok Clip",
+        platform: "tiktok",
+        workFingerprint: "tiktok:7123456789",
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: ["https://v16-webapp.tiktokcdn.com/video/tos/clip.mp4"],
+          filename: "DokiTool/TikTok Clip.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: 8_500_000,
+        },
+      },
+    ],
+  });
+  assert.equal(enq1.ok, true);
+  const taskId1 = enq1.data.taskIds[0];
+
+  for (let i = 0; i < 40 && env.downloadCalls.length === 0; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(env.getOffscreenCreateCount(), 0, "must NOT launch offscreen.html");
+  assert.equal(fetchCalls.length, 0, "must NOT call fetch");
+  assert.equal(env.downloadCalls.length, 1);
+  assert.equal(env.downloadCalls[0].url, "https://v16-webapp.tiktokcdn.com/video/tos/clip.mp4");
+  assert.equal(env.downloadCalls[0].filename, "DokiTool/TikTok Clip.mp4");
+
+  let snap = await bg.getSnapshot();
+  assert.equal(snap.tasks[0].status, "downloading");
+  assert.equal(snap.tasks[0].statusText, "浏览器原生下载中...");
+  assert.equal(snap.tasks[0].chromeDownloadId, env.downloadCalls[0].id);
+
+  // Emit onChanged complete -> completed, percent 100, savedWork recorded, badge ✓, NO RELEASE_BLOB sent!
+  env.emitDownloadChanged({
+    id: env.downloadCalls[0].id,
+    state: { previous: "in_progress", current: "complete" },
+  });
+  await bg.waitForIdle();
+
+  snap = await bg.getSnapshot();
+  assert.equal(snap.tasks[0].status, "completed");
+  assert.equal(snap.tasks[0].percent, 100);
+  assert.equal(snap.tasks[0].chromeDownloadId, env.downloadCalls[0].id);
+  assert.ok(snap.savedWorkFingerprints.includes("tiktok:7123456789"));
+  assert.equal(
+    offscreenMessages.some((m) => m.type === "RELEASE_BLOB"),
+    false,
+    "native download without blobUrl must NOT send RELEASE_BLOB to offscreen",
+  );
+  const badgeTexts = env.badgeHistory
+    .filter((b) => b.kind === "text")
+    .map((b) => b.text);
+  assert.ok(badgeTexts.includes("✓"), "badge must show ✓ on native download complete");
+
+  // OPEN_DOWNLOAD_FOLDER calls chrome.downloads.show(downloadId)
+  const showResp = await env.chrome.runtime.sendMessage({
+    type: "OPEN_DOWNLOAD_FOLDER",
+    taskId: taskId1,
+  });
+  assert.equal(showResp.ok, true);
+  assert.equal(showResp.data.opened, true);
+  assert.deepEqual(env.shownDownloads, [env.downloadCalls[0].id]);
+
+  // 2) Interrupted native download -> marks failed cleanly
+  await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+  env.downloadCalls.length = 0;
+  await env.chrome.runtime.sendMessage({
+    type: "ENQUEUE_DOWNLOADS",
+    items: [
+      {
+        title: "Reddit Video",
+        platform: "reddit",
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: ["https://v.redd.it/abc/DASH_720.mp4"],
+          filename: "Reddit Video.mp4",
+        },
+      },
+    ],
+  });
+  for (let i = 0; i < 40 && env.downloadCalls.length === 0; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  env.emitDownloadChanged({
+    id: env.downloadCalls[0].id,
+    state: { current: "interrupted" },
+    error: { current: "NETWORK_FAILED" },
+  });
+  await bg.waitForIdle();
+  snap = await bg.getSnapshot();
+  assert.equal(snap.tasks[0].status, "failed");
+  assert.match(snap.tasks[0].error || "", /NETWORK_FAILED/);
+
+  // 3) Unsafe direct_file (private IP) AND non-whitelisted hls / dash_mux / segments -> fail cleanly in Background with UNWHITELISTED_CDN, 0 Offscreen, 0 chrome.downloads!
+  await env.chrome.runtime.sendMessage({ type: "CLEAR_FINISHED_TASKS" });
+  env.downloadCalls.length = 0;
+  const blockedSpecs = [
+    {
+      title: "Private IP Direct",
+      platform: "generic",
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["http://192.168.1.50/private.mp4"],
+        filename: "private.mp4",
+      },
+      expectedHost: "192.168.1.50",
+    },
+    {
+      title: "Vimeo HLS Stream",
+      platform: "vimeo",
+      fallbackUrl: "https://vimeo.com/123456",
+      spec: {
+        kind: "hls",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://skyfire.vimeocdn.com/hls/master.m3u8"],
+        filename: "vimeo.mp4",
+      },
+      expectedHost: "skyfire.vimeocdn.com",
+    },
+    {
+      title: "Reddit DASH Mux",
+      platform: "reddit",
+      fallbackUrl: "https://www.reddit.com/r/videos/comments/abc/demo",
+      spec: {
+        kind: "dash_mux",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://v.redd.it/abc/DASH_1080.mp4"],
+        filename: "reddit-mux.mp4",
+        dashMux: {
+          videoRoutes: ["https://v.redd.it/abc/DASH_1080.mp4"],
+          audioRoutes: ["https://v.redd.it/abc/DASH_AUDIO_128.mp4"],
+          outputContainer: "mp4",
+        },
+      },
+      expectedHost: "v.redd.it",
+    },
+    {
+      title: "LongTail Segments",
+      platform: "dailymotion",
+      spec: {
+        kind: "segments",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://proxy-01.dmcdn.net/seg-0.m4s"],
+        filename: "dm.mp4",
+        segments: [{ url: "https://proxy-01.dmcdn.net/seg-0.m4s" }],
+      },
+      expectedHost: "proxy-01.dmcdn.net",
+    },
+  ];
+
+  await env.chrome.runtime.sendMessage({
+    type: "ENQUEUE_DOWNLOADS",
+    items: blockedSpecs.map(({ expectedHost: _h, ...item }) => item),
+  });
+  await bg.waitForIdle();
+
+  assert.equal(env.getOffscreenCreateCount(), 0, "0 offscreen launches for blocked specs");
+  assert.equal(env.downloadCalls.length, 0, "0 chrome.downloads calls for blocked specs");
+  assert.equal(fetchCalls.length, 0, "0 fetches for blocked specs");
+
+  snap = await bg.getSnapshot();
+  assert.equal(snap.tasks.length, blockedSpecs.length);
+  for (const expected of blockedSpecs) {
+    const task = snap.tasks.find((t) => t.title === expected.title);
+    assert.ok(task, `missing task ${expected.title}`);
+    assert.equal(task.status, "failed");
+    assert.equal(task.lastErrorCode, "UNWHITELISTED_CDN");
+    assert.equal(task.unwhitelistedHost, expected.expectedHost);
+    assert.ok(task.fallbackUrl, `expected fallbackUrl on ${expected.title}`);
+  }
+
+  // 4) buildEnqueueItemsForMedia: batchSaveMode="zip" on non-whitelisted Reddit gallery falls back to individual direct_file subfolder items!
+  const redditGallery = {
+    platform: "reddit",
+    content_id: "gal-1",
+    source_url: "https://www.reddit.com/gallery/gal-1",
+    title: "Alpine Photos",
+    items: [
+      {
+        id: "img1",
+        type: "image",
+        index: 1,
+        variants: [
+          {
+            id: "orig",
+            metadata: { extension: "jpg" },
+            delivery: {
+              kind: "file",
+              sources: [{ url: "https://i.redd.it/photo1.jpg" }],
+            },
+          },
+        ],
+        default: { variant_id: "orig", url: "https://i.redd.it/photo1.jpg" },
+      },
+      {
+        id: "img2",
+        type: "image",
+        index: 2,
+        variants: [
+          {
+            id: "orig",
+            metadata: { extension: "jpg" },
+            delivery: {
+              kind: "file",
+              sources: [{ url: "https://i.redd.it/photo2.jpg" }],
+            },
+          },
+        ],
+        default: { variant_id: "orig", url: "https://i.redd.it/photo2.jpg" },
+      },
+    ],
+  };
+  const galleryItems = extensionDownloadMod.buildEnqueueItemsForMedia(
+    redditGallery,
+    {
+      apiOrigin: "https://snap.dokitool.com",
+      batchSaveMode: "zip",
+      subfolderPrefix: "Collect",
+    },
+  );
+  assert.equal(
+    galleryItems.length,
+    2,
+    "non-whitelisted gallery with batchSaveMode=zip must fall back to individual direct_file items",
+  );
+  assert.equal(galleryItems[0].spec.kind, "direct_file");
+  assert.equal(galleryItems[1].spec.kind, "direct_file");
+  assert.equal(galleryItems[0].spec.filename, "Collect/Alpine Photos/001.jpg");
+  assert.equal(galleryItems[1].spec.filename, "Collect/Alpine Photos/002.jpg");
+
+  bg.dispose();
+});
+
+test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classification, progressive-over-HLS auto-selection, SidePanelResult external-only & audio UI, SidePanelBatchQueue mixed pills, and SidePanelApp manual long-tail parse", async () => {
+  // 1) formatPlatformDisplayName friendly names + Title Case fallback
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("tiktok"), "TikTok");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("vimeo"), "Vimeo");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("reddit"), "Reddit");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("twitch"), "Twitch");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("twitchvod"), "Twitch");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("twitchclips"), "Twitch");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("soundcloud"), "SoundCloud");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("niconico"), "Niconico");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("pinterest"), "Pinterest");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("dailymotion"), "Dailymotion");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("vk"), "VK");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("streamable"), "Streamable");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("bandcamp"), "Bandcamp");
+  assert.equal(uiTargetHelpersMod.formatPlatformDisplayName("bbc_iplayer"), "Bbc Iplayer");
+
+  // 2) buildSidePanelQualityOptions + selectPreferredQualityOption + selectVariantByPreference
+  const vimeoMedia = {
+    platform: "vimeo",
+    content_id: "987654",
+    source_url: "https://vimeo.com/987654",
+    title: "Mountain Time-Lapse",
+    items: [
+      {
+        id: "v1",
+        type: "video",
+        variants: [
+          {
+            id: "hls-1080",
+            label: "1080p HLS",
+            metadata: { width: 1920, height: 1080, extension: "mp4", has_audio: true },
+            delivery: {
+              kind: "hls",
+              scope: "single",
+              sources: [{ url: "https://skyfire.vimeocdn.com/hls/1080.m3u8" }],
+            },
+          },
+          {
+            id: "dash-4k",
+            label: "4K DASH",
+            metadata: { width: 3840, height: 2160, extension: "mp4", has_audio: true },
+            delivery: {
+              kind: "mux",
+              output: { container: "mp4", extension: "mp4", mime_type: "video/mp4" },
+              resources: [
+                {
+                  id: "vid",
+                  role: "video",
+                  metadata: { width: 3840, height: 2160, video_codec: "avc1.640033" },
+                  delivery: {
+                    kind: "file",
+                    sources: [{ url: "https://skyfire.vimeocdn.com/dash/video.m4s" }],
+                  },
+                },
+                {
+                  id: "aud",
+                  role: "audio",
+                  metadata: { audio_codec: "mp4a.40.2" },
+                  delivery: {
+                    kind: "file",
+                    sources: [{ url: "https://skyfire.vimeocdn.com/dash/audio.m4s" }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            id: "mp4-720",
+            label: "720p MP4",
+            metadata: { width: 1280, height: 720, extension: "mp4", has_audio: true },
+            delivery: {
+              kind: "file",
+              sources: [
+                { url: "https://skyfire.vimeocdn.com/prog/720p.mp4", size_bytes: 20_000_000 },
+              ],
+            },
+          },
+        ],
+        default: {
+          variant_id: "mp4-720",
+          url: "https://skyfire.vimeocdn.com/prog/720p.mp4",
+        },
+      },
+    ],
+  };
+
+  const options = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    vimeoMedia,
+    vimeoMedia.items[0],
+    "https://snap.dokitool.com",
+  );
+  const hlsOpt = options.find((o) => o.variant.id === "hls-1080");
+  const dashOpt = options.find((o) => o.variant.id === "dash-4k");
+  const mp4Opt = options.find((o) => o.variant.id === "mp4-720");
+
+  assert.equal(hlsOpt.deliveryMode, "external_only");
+  assert.equal(hlsOpt.downloadable, false);
+  assert.ok(hlsOpt.externalOnlyReason);
+
+  assert.equal(dashOpt.deliveryMode, "external_only");
+  assert.equal(dashOpt.downloadable, false);
+  assert.ok(dashOpt.externalOnlyReason);
+
+  assert.equal(mp4Opt.deliveryMode, "native_direct");
+  assert.equal(mp4Opt.downloadable, true);
+
+  // Also verify adaptive HLS (emitted by ytengine.AdaptInfo with EnableHLS: true) preserves copyUrl + external_only reason
+  const adaptiveHlsMedia = {
+    ...vimeoMedia,
+    items: [
+      {
+        ...vimeoMedia.items[0],
+        variants: [
+          {
+            id: "hls-adaptive-1080",
+            label: "1080p HLS 需合流",
+            metadata: { width: 1920, height: 1080, has_audio: true },
+            delivery: {
+              kind: "hls",
+              scope: "adaptive",
+              sources: [{ url: "https://skyfire.vimeocdn.com/adaptive/master.m3u8" }],
+              output: { container: "mp4", extension: "mp4", mime_type: "video/mp4" },
+            },
+          },
+          vimeoMedia.items[0].variants[2],
+        ],
+      },
+    ],
+  };
+  const adaptiveOpts = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    adaptiveHlsMedia,
+    adaptiveHlsMedia.items[0],
+    "https://snap.dokitool.com",
+  );
+  const adaptiveHlsOpt = adaptiveOpts.find((o) => o.variant.id === "hls-adaptive-1080");
+  assert.equal(adaptiveHlsOpt?.deliveryMode, "external_only");
+  assert.equal(adaptiveHlsOpt?.downloadable, false);
+  assert.equal(adaptiveHlsOpt?.copyUrl, "https://skyfire.vimeocdn.com/adaptive/master.m3u8");
+  assert.match(adaptiveHlsOpt?.externalOnlyReason || "", /白名单/);
+
+  // Both UI and background preference selectors pick downloadable native_direct 720p MP4 over higher-res external_only HLS/DASH!
+  for (const pref of ["best", "1080p"]) {
+    const uiPicked = uiTargetHelpersMod.selectPreferredQualityOption(
+      options,
+      vimeoMedia.items[0],
+      pref,
+      vimeoMedia,
+      "https://snap.dokitool.com",
+    );
+    assert.equal(uiPicked?.variant.id, "mp4-720", `UI selector (${pref}) must prefer native_direct over external_only`);
+
+    const bgPicked = extensionDownloadMod.selectVariantByPreference(
+      vimeoMedia.items[0],
+      vimeoMedia.attachments,
+      pref,
+      "https://snap.dokitool.com",
+    );
+    assert.equal(bgPicked?.variant.id, "mp4-720", `BG selector (${pref}) must prefer native_direct over external_only`);
+  }
+
+  // 3) Mounted SidePanelResult.vue: renders 浏览器直下, 需外链 · 非白名单流, external-only-fallback buttons, AND SoundCloud audio item
+  const SidePanelResult = await loadSidePanelSfc(
+    "../src/extension/components/SidePanelResult.vue",
+  );
+  const settings = { ...storage.DEFAULT_EXTENSION_SETTINGS };
+  const vimeoView = mountSfcTree(SidePanelResult, {
+    media: vimeoMedia,
+    workFingerprint: "vimeo:987654",
+    isSaved: false,
+    settings,
+    resolvingItemIds: new Set(),
+  });
+  try {
+    await vimeoView.flush();
+    const nativeBadges = vimeoView.findAll(
+      (n) => n.props?.["data-testid"] === "native-direct-badge",
+    );
+    const extBadges = vimeoView.findAll(
+      (n) => n.props?.["data-testid"] === "external-only-badge",
+    );
+    const extFallbacks = vimeoView.findAll(
+      (n) => n.props?.["data-testid"] === "external-only-fallback",
+    );
+    assert.ok(nativeBadges.length >= 1, "renders 浏览器直下 badge on native_direct options");
+    assert.ok(vimeoView.textOf(nativeBadges[0]).includes("浏览器直下"));
+    assert.equal(extBadges.length, 2);
+    assert.ok(vimeoView.textOf(extBadges[0]).includes("需外链 · 非白名单流"));
+    assert.equal(extFallbacks.length, 2);
+    // HLS fallback includes BOTH 复制直链 and 打开原帖 buttons
+    const collectButtons = (root) => {
+      const out = [];
+      const walk = (node) => {
+        if (!node || typeof node !== "object") return;
+        if (node.type === "button") out.push(node);
+        for (const ch of node.children || []) walk(ch);
+      };
+      walk(root);
+      return out;
+    };
+    const hlsFallbackBtnLabels = collectButtons(extFallbacks[0]).map((b) =>
+      vimeoView.textOf(b).trim(),
+    );
+    assert.deepEqual(hlsFallbackBtnLabels, ["复制直链", "打开原帖"]);
+    // DASH mux fallback has no direct copyUrl, so it renders only 打开原帖 button
+    const dashFallbackBtnLabels = collectButtons(extFallbacks[1]).map((b) =>
+      vimeoView.textOf(b).trim(),
+    );
+    assert.deepEqual(dashFallbackBtnLabels, ["打开原帖"]);
+  } finally {
+    vimeoView.unmount();
+  }
+
+  // SoundCloud item.type === "audio" preview & download
+  const soundCloudMedia = {
+    platform: "soundcloud",
+    content_id: "sc-track-9",
+    source_url: "https://soundcloud.com/artist/midnight",
+    title: "Midnight Groove",
+    cover: { url: "https://i1.sndcdn.com/artworks-1-large.jpg" },
+    items: [
+      {
+        id: "sc-a1",
+        type: "audio",
+        variants: [
+          {
+            id: "mp3",
+            label: "MP3 128kbps",
+            metadata: {
+              extension: "mp3",
+              mime_type: "audio/mpeg",
+              has_audio: true,
+              audio_bitrate_bps: 128000,
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                { url: "https://cf-media.sndcdn.com/midnight.mp3", size_bytes: 3_500_000 },
+              ],
+            },
+          },
+        ],
+        default: { variant_id: "mp3", url: "https://cf-media.sndcdn.com/midnight.mp3" },
+      },
+    ],
+  };
+  const audioEnqueues = [];
+  const scView = mountSfcTree(
+    SidePanelResult,
+    {
+      media: soundCloudMedia,
+      workFingerprint: "soundcloud:sc-track-9",
+      isSaved: false,
+      settings,
+      resolvingItemIds: new Set(),
+    },
+    { onEnqueueDownloads: (payload) => audioEnqueues.push(payload) },
+  );
+  try {
+    await scView.flush();
+    const audioStage = scView.findAll(
+      (n) => n.props?.["data-testid"] === "audio-preview-stage",
+    );
+    assert.equal(audioStage.length, 1, "SoundCloud audio item renders dedicated audio preview stage");
+    const audioEls = scView.findAll((n) => n.type === "audio");
+    assert.equal(audioEls.length, 1);
+    assert.equal(audioEls[0].props.src, "https://cf-media.sndcdn.com/midnight.mp3");
+    const mainBtn = scView.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__main"),
+    )[0];
+    assert.ok(scView.textOf(mainBtn).includes("下载音频 (MP3)"));
+    await scView.fire(mainBtn, "onClick");
+    assert.equal(audioEnqueues.length, 1);
+    assert.equal(audioEnqueues[0].items[0].spec.kind, "direct_file");
+    assert.ok(audioEnqueues[0].items[0].spec.filename.endsWith(".mp3"));
+  } finally {
+    scView.unmount();
+  }
+
+  // 4) SidePanelBatchQueue.vue extracts mixed core-14 + long-tail URLs with distinct pills
+  const SidePanelBatchQueue = await loadSidePanelSfc(
+    "../src/extension/components/SidePanelBatchQueue.vue",
+  );
+  const batchView = mountSfcTree(SidePanelBatchQueue, {
+    modelValue: [
+      "https://www.bilibili.com/video/BV1uv411q7Mv",
+      "https://vimeo.com/987654",
+      "https://www.tiktok.com/@creator/video/7123456789",
+      "chrome://extensions",
+      "http://localhost/admin",
+    ].join("\n"),
+    settings,
+    tasks: [],
+    activeBatchGroupId: "",
+    submitting: false,
+  });
+  try {
+    await batchView.flush();
+    const text = batchView.textOf();
+    assert.ok(text.includes("识别有效链接 3 条"));
+    assert.ok(text.includes("B站 ×1"));
+    assert.ok(text.includes("vimeo.com ×1"));
+    assert.ok(text.includes("tiktok.com ×1"));
+    assert.ok(text.includes("已忽略 2 行无关内容"));
+  } finally {
+    batchView.unmount();
+  }
+
+  // 5) SidePanelApp.vue: manual submit parses Vimeo long-tail URL while passive tab browsing makes 0 calls
+  const SidePanelApp = await loadSidePanelSfc("../src/extension/SidePanelApp.vue");
+  const prevChrome = globalThis.chrome;
+  const appApiUrls = [];
+  const env = createMockMv3Environment({ autoCompleteDownloads: true });
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: storage.createExtensionStorage(),
+    fetchImpl: async (url) => {
+      appApiUrls.push(String(url));
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: vimeoMedia,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    },
+    tabSyncDebounceMs: 10,
+  });
+  await bg.init();
+  globalThis.chrome = env.chrome;
+  let appView = null;
+  try {
+    appView = mountSfcTree(SidePanelApp);
+    await new Promise((r) => setTimeout(r, 30));
+    await appView.flush();
+
+    // Passive tab update on Vimeo -> 0 API calls
+    env.emitTabUpdated(
+      1,
+      { status: "complete", url: "https://vimeo.com/987654" },
+      { id: 1, windowId: 10, active: true, url: "https://vimeo.com/987654" },
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(appApiUrls.length, 0, "SidePanelApp must make 0 calls on long-tail tab navigation");
+
+    // Manual paste & submit on Vimeo -> sends PARSE_URL with platform=all and renders Vimeo result!
+    const inputEl = appView.findAll((n) => n.type === "input")[0];
+    inputEl.value = "https://vimeo.com/987654";
+    inputEl.dispatchEvent({ type: "input", target: inputEl });
+    await appView.flush();
+    const formEl = appView.findAll((n) => n.type === "form")[0];
+    await appView.fire(formEl, "onSubmit", { preventDefault() {} });
+    await new Promise((r) => setTimeout(r, 30));
+    await appView.flush();
+
+    assert.equal(appApiUrls.length, 1);
+    assert.ok(appApiUrls[0].includes("platform=all"));
+    assert.ok(appView.textOf().includes("Mountain Time-Lapse"));
+    assert.ok(appView.textOf().includes("Vimeo"));
+  } finally {
+    appView?.unmount();
+    globalThis.chrome = prevChrome;
+    bg.dispose();
+  }
+});
+
+function createOwnerStatsFixture() {
+  const emptyBuckets = {
+    "<=10": 10,
+    "<=50": 40,
+    "<=100": 80,
+    "<=250": 120,
+    "<=500": 160,
+    "<=1000": 190,
+    "<=2500": 210,
+    "<=5000": 218,
+    "<=10000": 220,
+    "<=30000": 220,
+    "+Inf": 220,
+  };
+  const emptyHist = {
+    count: 220,
+    sum_ms: 48_000,
+    max_ms: 4200,
+    buckets: emptyBuckets,
+  };
+  const emptySlot = {
+    acquired_count: 20,
+    wait_count: 1,
+    canceled_count: 0,
+    wait_ms_total: 120,
+    wait_ms_max: 60,
+    wait_ms: emptyHist,
+  };
+  const emptyShanghai = {
+    hits: 24,
+    fallbacks: 2,
+    canceled: 0,
+    queue_waits: 1,
+    queue_granted: 1,
+    queue_timeouts: 0,
+    queue_wait_ms_total: 40,
+    queue_wait_ms_max: 40,
+  };
+  return {
+    started_at: "2026-11-20T08:00:00Z",
+    generated_at: "2026-11-22T15:30:00Z",
+    uptime_seconds: 199_800,
+    requests: {
+      total: 220,
+      by_channel: { anonymous: 80, owner: 140 },
+      by_platform_code_channel: [
+        { platform: "douyin", code: "OK", channel: "owner", count: 140 },
+      ],
+    },
+    cache: {
+      enabled: true,
+      entries: 64,
+      bytes: 2_621_440,
+      max_entries: 1000,
+      max_bytes: 67_108_864,
+      total: { hits: 90, misses: 30, singleflight_shared: 5, uncacheable: 2 },
+      by_channel: {
+        anonymous: { hits: 30, misses: 15, singleflight_shared: 2, uncacheable: 1 },
+        owner: { hits: 60, misses: 15, singleflight_shared: 3, uncacheable: 1 },
+      },
+    },
+    admission: {
+      fast: {
+        active: 1,
+        queued: 0,
+        concurrency_limit: 8,
+        queue_limit: 32,
+        waited: 0,
+        granted: 100,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+      slow: {
+        active: 0,
+        queued: 0,
+        concurrency_limit: 4,
+        queue_limit: 16,
+        waited: 0,
+        granted: 20,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+      owner: {
+        active: 1,
+        queued: 0,
+        concurrency_limit: 6,
+        queue_limit: 24,
+        waited: 0,
+        granted: 80,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+    },
+    api_keys: [],
+    ytdlp: {
+      enabled: true,
+      concurrency_limit: 3,
+      active: 1,
+      waiting: 0,
+      total: emptySlot,
+      by_channel: { anonymous: emptySlot, owner: emptySlot },
+    },
+    shanghai: {
+      enabled: true,
+      mode: "pull",
+      waiting_workers: 2,
+      queued_tasks: 0,
+      pending_tasks: 0,
+      total: emptyShanghai,
+      by_channel: { anonymous: emptyShanghai, owner: emptyShanghai },
+      by_platform: { douyin: emptyShanghai, bilibili: emptyShanghai },
+    },
+    parse_latency_ms: {
+      total: emptyHist,
+      by_channel: { anonymous: emptyHist, owner: emptyHist },
+    },
+    runtime: {
+      version: "v4.1.0-r2",
+      shanghai_mode: "pull",
+      shanghai_bilibili: true,
+      bilibili_dash: true,
+      youtube_helper: true,
+      xhs_transport: "chrome131",
+      ytdlp_enabled: true,
+      ytdlp_generic_enabled: true,
+      tbvideo_pipigx: true,
+      tbvideo_zuiyou: true,
+      stats_persistence_enabled: true,
+    },
+    daily: [
+      {
+        date: "2026-11-21",
+        total: 100,
+        ok: 90,
+        failed: 10,
+        cache_hits: 20,
+        shanghai_hits: 10,
+        latency_ms: { p50_ms: 150, p95_ms: 800, max_ms: 2000 },
+        by_platform: {},
+      },
+      {
+        date: "2026-11-22",
+        total: 120,
+        ok: 114,
+        failed: 6,
+        cache_hits: 38,
+        shanghai_hits: 24,
+        latency_ms: { p50_ms: 140, p95_ms: 820, max_ms: 3100 },
+        by_platform: {},
+      },
+    ],
+    hourly: [
+      {
+        hour_start: "2026-11-22T15:00:00+08:00",
+        total: 20,
+        ok: 19,
+        failed: 1,
+        cache_hits: 8,
+      },
+    ],
+  };
+}
+
+test("[PR-C Round 2] uiTargetHelpers.openMonitorDashboardTab: opens Web ${apiOrigin}/monitor, supports loopback, reuses /monitor or /monitor.html tabs, rejects invalid apiBaseUrl, and never appends query/hash/token", async () => {
+  const prevChrome = globalThis.chrome;
+  try {
+    // 1) Outside Chrome extension runtime -> false
+    delete globalThis.chrome;
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), false);
+
+    // 2) Invalid apiBaseUrl inputs -> false with zero chrome.tabs calls
+    const invalidCalls = [];
+    globalThis.chrome = {
+      tabs: {
+        query: async (q) => {
+          invalidCalls.push(["query", q]);
+          return [];
+        },
+        update: async (id, props) => {
+          invalidCalls.push(["update", id, props]);
+        },
+        create: async (props) => {
+          invalidCalls.push(["create", props]);
+        },
+      },
+    };
+    for (const badBase of [
+      "   ",
+      "http://evil.com",
+      "https://192.168.1.1",
+      "https://snap.dokitool.com/subpath",
+      "https://snap.dokitool.com?token=secret",
+      "https://snap.dokitool.com#token=secret",
+      "javascript:alert(1)",
+      "https://portal.intranet",
+    ]) {
+      assert.equal(
+        await uiTargetHelpersMod.openMonitorDashboardTab(badBase),
+        false,
+        `expected invalid apiBaseUrl to return false: ${badBase}`,
+      );
+    }
+    assert.equal(invalidCalls.length, 0, "invalid apiBaseUrl must issue zero tabs API calls");
+
+    // 3) Default apiBaseUrl (undefined & "") opens https://snap.dokitool.com/monitor when absent
+    const calls = { query: [], update: [], windowUpdate: [], create: [] };
+    let existingTabs = [];
+    globalThis.chrome = {
+      tabs: {
+        query: async (q) => {
+          calls.query.push(q);
+          return existingTabs;
+        },
+        update: async (id, props) => {
+          calls.update.push({ id, props });
+        },
+        create: async (props) => {
+          calls.create.push(props);
+        },
+      },
+      windows: {
+        update: async (wid, props) => {
+          calls.windowUpdate.push({ wid, props });
+        },
+      },
+    };
+
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), true);
+    assert.deepEqual(calls.query[0], {
+      url: [
+        "https://snap.dokitool.com/monitor",
+        "https://snap.dokitool.com/monitor.html",
+      ],
+    });
+    assert.deepEqual(calls.create, [
+      { url: "https://snap.dokitool.com/monitor", active: true },
+    ]);
+    assert.equal(calls.create[0].url.includes("?"), false);
+    assert.equal(calls.create[0].url.includes("#"), false);
+
+    // Empty string also defaults to https://snap.dokitool.com/monitor
+    calls.create.length = 0;
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(""), true);
+    assert.deepEqual(calls.create, [
+      { url: "https://snap.dokitool.com/monitor", active: true },
+    ]);
+
+    // 4) Reuses existing /monitor tab without calling tabs.create
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    existingTabs = [
+      { id: 42, windowId: 7, url: "https://snap.dokitool.com/monitor" },
+    ];
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("https://snap.dokitool.com/"),
+      true,
+    );
+    assert.deepEqual(calls.update, [{ id: 42, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 7, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+
+    // 5) Reuses existing /monitor.html tab without calling tabs.create
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    existingTabs = [
+      { id: 55, windowId: 9, url: "https://snap.dokitool.com/monitor.html" },
+    ];
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), true);
+    assert.deepEqual(calls.update, [{ id: 55, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 9, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+
+    // 6) Loopback http://127.0.0.1:18080/ -> opens http://127.0.0.1:18080/monitor when absent
+    calls.create.length = 0;
+    calls.update.length = 0;
+    existingTabs = [];
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("http://127.0.0.1:18080/"),
+      true,
+    );
+    assert.deepEqual(calls.create, [
+      { url: "http://127.0.0.1:18080/monitor", active: true },
+    ]);
+    assert.equal(calls.create[0].url.includes("?"), false);
+    assert.equal(calls.create[0].url.includes("#"), false);
+
+    // 7) Real Chrome portless match-pattern fallback when tabs.query throws on explicit port
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    globalThis.chrome.tabs.query = async ({ url }) => {
+      const patterns = Array.isArray(url) ? url : [url];
+      if (patterns.some((p) => /:\d+\//.test(p))) {
+        throw new Error("Invalid url pattern");
+      }
+      return [
+        { id: 88, windowId: 1, url: "http://127.0.0.1:9999/monitor" },
+        { id: 89, windowId: 2, url: "http://127.0.0.1:18080/monitor.html" },
+      ];
+    };
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("http://127.0.0.1:18080"),
+      true,
+    );
+    assert.deepEqual(calls.update, [{ id: 89, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 2, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: silent on anonymous/401, renders on 200 owner, and opens Web ${apiBaseUrl}/monitor with zero token in URL", async () => {
+  assert.equal(
+    protocol.isSidePanelRequest({ type: "FETCH_OWNER_STATS" }),
+    true,
+  );
+
+  // Part A: Background FETCH_OWNER_STATS RPC
+  const sampleStats = createOwnerStatsFixture();
+  const rpcFetchCalls = [];
+  const rpcStore = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  const rpcEnv = createMockMv3Environment();
+  const rpcBg = backgroundMod.createBackgroundController({
+    chrome: rpcEnv.chrome,
+    storage: rpcStore,
+    now: () => 1_760_000_000_000,
+    fetchImpl: async (url, init) => {
+      rpcFetchCalls.push({ url: String(url), init });
+      const auth = init?.headers?.Authorization || "";
+      if (auth === "Bearer owner-secret-key") {
+        return new Response(
+          JSON.stringify({ schema_version: "1.0", code: "OK", data: sampleStats }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (auth === "Bearer bad-schema-key") {
+        return new Response(
+          JSON.stringify({ schema_version: "1.0", code: "OK", data: { broken: true } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "INVALID_INPUT",
+          error: { code: "UNAUTHORIZED", message: "owner token required" },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+  await rpcBg.init();
+
+  const sendBgRpc = (msg) =>
+    new Promise((resolvePromise) => {
+      rpcBg.handleRuntimeMessage(msg, {}, resolvePromise);
+    });
+
+  try {
+    // 1) Empty token -> 0 network calls, NO_TOKEN 401
+    const noTokenRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(noTokenRes.ok, false);
+    assert.equal(noTokenRes.status, 401);
+    assert.equal(noTokenRes.code, "NO_TOKEN");
+    assert.equal(rpcFetchCalls.length, 0);
+
+    // 2) Friend token -> 401 UNAUTHORIZED with cookie-free / no-store options
+    await rpcStore.updateSettings({ bearerToken: "friend-secret-key" });
+    const friendRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(friendRes.ok, false);
+    assert.equal(friendRes.status, 401);
+    assert.equal(friendRes.code, "UNAUTHORIZED");
+    assert.equal(rpcFetchCalls.length, 1);
+    assert.equal(
+      rpcFetchCalls[0].url,
+      "https://snap.dokitool.com/api/stats?schema_version=1.0",
+    );
+    assert.equal(rpcFetchCalls[0].init.credentials, "omit");
+    assert.equal(rpcFetchCalls[0].init.referrerPolicy, "no-referrer");
+    assert.equal(rpcFetchCalls[0].init.cache, "no-store");
+    assert.equal(
+      rpcFetchCalls[0].init.headers.Authorization,
+      "Bearer friend-secret-key",
+    );
+
+    // 3) Owner token -> 200 OK with validated StatsSnapshot
+    await rpcStore.updateSettings({ bearerToken: "owner-secret-key" });
+    const ownerRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(ownerRes.ok, true);
+    assert.equal(ownerRes.data.apiOrigin, "https://snap.dokitool.com");
+    assert.equal(ownerRes.data.fetchedAt, 1_760_000_000_000);
+    assert.equal(ownerRes.data.stats.runtime.version, "v4.1.0-r2");
+
+    // 4) Malformed 200 payload rejected cleanly
+    await rpcStore.updateSettings({ bearerToken: "bad-schema-key" });
+    const badRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(badRes.ok, false);
+    assert.equal(badRes.code, "STATS_FAILED");
+  } finally {
+    rpcBg.dispose();
+  }
+
+  // Part B: Mounted SidePanelApp.vue owner stats capsule behavior
+  const SidePanelApp = await loadSidePanelSfc("../src/extension/SidePanelApp.vue");
+  const prevChrome = globalThis.chrome;
+
+  async function mountScenario({ token = "", apiBaseUrl } = {}) {
+    const fetchUrls = [];
+    const tabCreateCalls = [];
+    const store = storage.createExtensionStorage({
+      local: storage.createMemoryStorageArea(),
+      session: storage.createMemoryStorageArea(),
+    });
+    const patch = {};
+    if (token) patch.bearerToken = token;
+    if (apiBaseUrl) patch.apiBaseUrl = apiBaseUrl;
+    if (Object.keys(patch).length > 0) {
+      await store.updateSettings(patch);
+    }
+
+    const env = createMockMv3Environment();
+    env.chrome.tabs.create = async (props) => {
+      tabCreateCalls.push(props);
+      return { id: 201 };
+    };
+    env.chrome.tabs.update = async () => ({});
+
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: store,
+      fetchImpl: async (url, init) => {
+        fetchUrls.push(String(url));
+        if (
+          String(url).includes("/api/stats") &&
+          init?.headers?.Authorization === `Bearer ${token}` &&
+          token.startsWith("owner-")
+        ) {
+          return new Response(
+            JSON.stringify({ schema_version: "1.0", code: "OK", data: sampleStats }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "INVALID_INPUT",
+            error: { code: "UNAUTHORIZED", message: "forbidden" },
+          }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    await bg.init();
+    globalThis.chrome = env.chrome;
+
+    const view = mountSfcTree(SidePanelApp);
+    await new Promise((r) => setTimeout(r, 40));
+    await view.flush();
+
+    return {
+      view,
+      fetchUrls,
+      tabCreateCalls,
+      findByTestId: (id) =>
+        view.findAll((n) => n.props?.["data-testid"] === id),
+      cleanup() {
+        view.unmount();
+        bg.dispose();
+      },
+    };
+  }
+
+  try {
+    // 1) Anonymous mode -> zero /api/stats fetch, pill hidden, zero alerts/toasts
+    const anon = await mountScenario({ token: "" });
+    try {
+      assert.equal(anon.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        anon.fetchUrls.some((u) => u.includes("/api/stats")),
+        false,
+        "anonymous SidePanel must never request /api/stats",
+      );
+      assert.equal(
+        anon.view.findAll((n) => n.props?.role === "alert").length,
+        0,
+      );
+      assert.equal(
+        anon.view.findAll((n) => n.props?.role === "status").length,
+        0,
+      );
+    } finally {
+      anon.cleanup();
+    }
+
+    // 2) Friend 401 -> pill hidden silently with zero alert/toast
+    const friend = await mountScenario({ token: "friend-tok-123" });
+    try {
+      assert.equal(friend.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        friend.fetchUrls.some((u) => u.includes("/api/stats")),
+        true,
+      );
+      assert.equal(
+        friend.view.findAll((n) => n.props?.role === "alert").length,
+        0,
+      );
+      assert.equal(
+        friend.view.findAll((n) => n.props?.role === "status").length,
+        0,
+      );
+    } finally {
+      friend.cleanup();
+    }
+
+    // 3) Owner 200 (default production origin) -> renders pill and opens https://snap.dokitool.com/monitor
+    const prodOwner = await mountScenario({ token: "owner-prod-secret-xyz" });
+    try {
+      const pills = prodOwner.findByTestId("owner-stats-pill");
+      assert.equal(pills.length, 1);
+      const pillText = prodOwner.view.textOf(pills[0]);
+      assert.match(pillText, /今日 120 次/);
+      assert.match(pillText, /95\.0%/);
+      assert.match(pillText, /上海 2 节点/);
+      assert.match(pillText, /解析监控大盘/);
+      assert.equal(
+        prodOwner.view.textOf().includes("owner-prod-secret-xyz"),
+        false,
+        "SidePanel DOM must never expose raw bearerToken",
+      );
+
+      const openBtn = prodOwner.findByTestId("open-monitor-dashboard-btn")[0];
+      await prodOwner.view.fire(openBtn, "onClick");
+      assert.deepEqual(prodOwner.tabCreateCalls, [
+        { url: "https://snap.dokitool.com/monitor", active: true },
+      ]);
+      const openedUrl = prodOwner.tabCreateCalls[0].url;
+      assert.equal(openedUrl.includes("owner-prod-secret-xyz"), false);
+      assert.equal(openedUrl.includes("?"), false);
+      assert.equal(openedUrl.includes("#"), false);
+    } finally {
+      prodOwner.cleanup();
+    }
+
+    // 4) Owner 200 (custom loopback apiBaseUrl) -> opens http://127.0.0.1:18080/monitor with zero token in URL
+    const loopbackOwner = await mountScenario({
+      token: "owner-loopback-secret-999",
+      apiBaseUrl: "http://127.0.0.1:18080/",
+    });
+    try {
+      assert.equal(loopbackOwner.findByTestId("owner-stats-pill").length, 1);
+      const openBtn = loopbackOwner.findByTestId("open-monitor-dashboard-btn")[0];
+      await loopbackOwner.view.fire(openBtn, "onClick");
+      assert.deepEqual(loopbackOwner.tabCreateCalls, [
+        { url: "http://127.0.0.1:18080/monitor", active: true },
+      ]);
+      const openedUrl = loopbackOwner.tabCreateCalls[0].url;
+      assert.equal(openedUrl.includes("owner-loopback-secret-999"), false);
+      assert.equal(openedUrl.includes("?"), false);
+      assert.equal(openedUrl.includes("#"), false);
+    } finally {
+      loopbackOwner.cleanup();
+    }
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

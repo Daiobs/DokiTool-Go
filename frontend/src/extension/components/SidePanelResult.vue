@@ -140,6 +140,8 @@ const batchPreparingProgress = ref<{ current: number; total: number } | null>(
 );
 const copiedDirectLink = ref(false);
 let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+const copiedOptionKey = ref("");
+let copyOptionResetTimer: ReturnType<typeof setTimeout> | null = null;
 
 function isItemCheckable(item: MediaItem): boolean {
   return item.state !== "unavailable";
@@ -480,6 +482,24 @@ async function handleCopyDirectLink() {
     if (copyResetTimer) clearTimeout(copyResetTimer);
     copyResetTimer = setTimeout(() => {
       copiedDirectLink.value = false;
+    }, 1800);
+    emit("notify", { message: "直链已复制到剪贴板", tone: "success" });
+  } else {
+    emit("notify", { message: "复制失败，请手动复制", tone: "error" });
+  }
+}
+
+async function handleCopyExternalOptionUrl(opt: SidePanelQualityOption) {
+  const url = opt.copyUrl || opt.directUrl;
+  if (!url) return;
+  const ok = await copyTextToClipboard(url);
+  if (ok) {
+    copiedOptionKey.value = opt.key;
+    if (copyOptionResetTimer) clearTimeout(copyOptionResetTimer);
+    copyOptionResetTimer = setTimeout(() => {
+      if (copiedOptionKey.value === opt.key) {
+        copiedOptionKey.value = "";
+      }
     }, 1800);
     emit("notify", { message: "直链已复制到剪贴板", tone: "success" });
   } else {
@@ -882,9 +902,44 @@ async function handleBatchZipSave() {
       <div
         v-if="layoutKind !== 'album' || albumItems.length === 1"
         class="sp-stage"
+        :class="{ 'sp-stage--audio': activeItem?.type === 'audio' }"
       >
+        <div
+          v-if="activeItem?.type === 'audio'"
+          class="sp-stage__audio"
+          data-testid="audio-preview-stage"
+        >
+          <img
+            v-if="previewCoverUrl"
+            :src="previewCoverUrl"
+            alt="音频封面预览"
+            referrerpolicy="no-referrer"
+            class="sp-stage__audio-cover"
+            @error="markUrlBroken(previewCoverUrl)"
+          />
+          <div v-else class="sp-stage__audio-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 18V5l12-2v13" />
+              <circle cx="6" cy="18" r="3" />
+              <circle cx="18" cy="16" r="3" />
+            </svg>
+          </div>
+          <audio
+            v-if="previewVideoUrl"
+            :key="previewVideoUrl"
+            :src="previewVideoUrl"
+            controls
+            preload="metadata"
+            referrerpolicy="no-referrer"
+            class="sp-stage__audio-player"
+            @error="handlePreviewVideoError($event)"
+          />
+          <span v-else class="sp-stage__audio-hint">
+            音频流已就绪，可直接后台下载或复制直链
+          </span>
+        </div>
         <video
-          v-if="previewVideoUrl"
+          v-else-if="previewVideoUrl"
           :key="previewVideoUrl"
           :src="previewVideoUrl"
           :poster="previewCoverUrl || undefined"
@@ -1581,46 +1636,97 @@ async function handleBatchZipSave() {
       </div>
 
       <div class="sp-variant-list">
-        <button
+        <div
           v-for="opt in activeQualityOptions"
           :key="opt.key"
-          type="button"
-          class="sp-variant-card"
-          :class="{
-            'sp-variant-card--active': activeSelectedOption?.key === opt.key,
-            'sp-variant-card--disabled': !opt.downloadable,
-          }"
-          :disabled="!opt.downloadable"
-          @click="chooseQualityOption(opt)"
+          class="sp-variant-entry"
         >
-          <div class="sp-variant-card__top">
-            <div class="sp-variant-card__title-group">
-              <span class="sp-variant-card__radio" />
-              <span class="sp-variant-card__label">{{ opt.titleLabel }}</span>
+          <button
+            type="button"
+            class="sp-variant-card"
+            :class="{
+              'sp-variant-card--active': activeSelectedOption?.key === opt.key,
+              'sp-variant-card--disabled': !opt.downloadable,
+            }"
+            :disabled="!opt.downloadable"
+            @click="chooseQualityOption(opt)"
+          >
+            <div class="sp-variant-card__top">
+              <div class="sp-variant-card__title-group">
+                <span class="sp-variant-card__radio" />
+                <span class="sp-variant-card__label">{{ opt.titleLabel }}</span>
+                <span
+                  v-if="opt.audioBadge"
+                  class="sp-variant-badge"
+                  :class="`sp-variant-badge--${opt.audioBadge.tone}`"
+                >
+                  {{ opt.audioBadge.text }}
+                </span>
+                <span
+                  v-if="opt.deliveryMode === 'native_direct'"
+                  class="sp-variant-badge sp-variant-badge--native"
+                  data-testid="native-direct-badge"
+                  title="非白名单域名直链将由 Chrome 原生下载引擎直接保存"
+                >
+                  浏览器直下
+                </span>
+                <span
+                  v-else-if="opt.deliveryMode === 'external_only'"
+                  class="sp-variant-badge sp-variant-badge--external"
+                  data-testid="external-only-badge"
+                  :title="opt.externalOnlyReason || '非白名单流媒体，支持复制直链或打开原帖'"
+                >
+                  需外链 · 非白名单流
+                </span>
+              </div>
+              <span class="sp-variant-card__size">{{ opt.sizeLabel }}</span>
+            </div>
+
+            <div v-if="opt.specs.length > 0" class="sp-variant-card__specs">
               <span
-                v-if="opt.audioBadge"
-                class="sp-variant-badge"
-                :class="`sp-variant-badge--${opt.audioBadge.tone}`"
+                v-for="spec in opt.specs"
+                :key="spec"
+                class="sp-variant-spec-chip"
               >
-                {{ opt.audioBadge.text }}
+                {{ spec }}
+              </span>
+              <span class="sp-variant-spec-chip sp-variant-spec-chip--ext">
+                {{ opt.resolvedExt.toUpperCase() }}
               </span>
             </div>
-            <span class="sp-variant-card__size">{{ opt.sizeLabel }}</span>
-          </div>
+          </button>
 
-          <div v-if="opt.specs.length > 0" class="sp-variant-card__specs">
-            <span
-              v-for="spec in opt.specs"
-              :key="spec"
-              class="sp-variant-spec-chip"
-            >
-              {{ spec }}
+          <div
+            v-if="opt.deliveryMode === 'external_only'"
+            class="sp-external-fallback"
+            data-testid="external-only-fallback"
+          >
+            <span class="sp-external-fallback__reason">
+              {{
+                opt.externalOnlyReason ||
+                "该长尾流媒体域名不在扩展权限白名单内，支持复制直链或打开原帖"
+              }}
             </span>
-            <span class="sp-variant-spec-chip sp-variant-spec-chip--ext">
-              {{ opt.resolvedExt.toUpperCase() }}
-            </span>
+            <div class="sp-external-fallback__actions">
+              <button
+                v-if="opt.copyUrl"
+                type="button"
+                class="sp-btn sp-btn--ghost sp-btn--xs"
+                @click="handleCopyExternalOptionUrl(opt)"
+              >
+                {{ copiedOptionKey === opt.key ? "已复制" : "复制直链" }}
+              </button>
+              <button
+                v-if="media.source_url"
+                type="button"
+                class="sp-btn sp-btn--secondary sp-btn--xs"
+                @click="openSafeHttpTab(media.source_url)"
+              >
+                打开原帖
+              </button>
+            </div>
           </div>
-        </button>
+        </div>
       </div>
     </div>
 
@@ -1732,6 +1838,53 @@ async function handleBatchZipSave() {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+}
+
+.sp-stage--audio {
+  aspect-ratio: auto;
+  min-height: 112px;
+  max-height: none;
+  padding: 34px 12px 12px;
+}
+
+.sp-stage__audio {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.sp-stage__audio-cover {
+  width: 68px;
+  height: 68px;
+  border-radius: var(--sp-radius-md);
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.sp-stage__audio-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--sp-pink-soft);
+  border: 1px solid var(--sp-pink-border);
+  color: var(--sp-pink-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sp-stage__audio-player {
+  width: 100%;
+  max-width: 100%;
+  height: 36px;
+}
+
+.sp-stage__audio-hint {
+  font-size: 11px;
+  color: var(--sp-stage-placeholder-text);
+  text-align: center;
 }
 
 .sp-stage__video,
@@ -2425,9 +2578,55 @@ async function handleBatchZipSave() {
   color: var(--sp-pink-text);
 }
 
+.sp-variant-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
 .sp-variant-badge--silent {
   background: var(--sp-warning-soft);
   color: var(--sp-warning-text);
+}
+
+.sp-variant-badge--native {
+  background: var(--sp-muted-pill-bg);
+  color: var(--sp-text-secondary);
+  border: 1px solid var(--sp-border);
+}
+
+.sp-variant-badge--external {
+  background: var(--sp-warning-soft);
+  color: var(--sp-warning-text);
+  border: 1px solid var(--sp-warning-border);
+}
+
+.sp-external-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 9px;
+  border-radius: var(--sp-radius-sm);
+  background: var(--sp-warning-soft);
+  border: 1px solid var(--sp-warning-border);
+}
+
+.sp-external-fallback__reason {
+  flex: 1;
+  min-width: 120px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--sp-warning-text);
+}
+
+.sp-external-fallback__actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
 }
 
 .sp-variant-card__specs {

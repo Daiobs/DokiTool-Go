@@ -74,10 +74,11 @@
 | `DOKITOOL_STATS_SNAPSHOT_PATH` | 指定 `/api/stats` 统计快照的本地持久化文件路径（默认为空，纯内存运行不执行磁盘读写）；配置路径后，启动时加载未过期的近 30 天（`Asia/Shanghai` UTC+8）日桶与近 24 小时时桶，文件不存在则冷启动，若文件损坏或快照版本不匹配则打印告警并以安全空状态启动、不阻塞主服务；运行期每 5 分钟及收到 `SIGINT`/`SIGTERM` 停机时通过同目录临时文件 + `Sync` + 原子重命名以 `0600` 权限落盘；仅存聚合统计元数据，绝不写入 URL、IP 或令牌 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
-| `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
-| `DOKITOOL_YTDLP_YOUTUBE_ENABLED` | 控制是否注册并启用 YouTube 解析路由适配器（启用时在启动阶段强校验提取器可用性） | 否 |
-| `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
+| `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
+| `DOKITOOL_YTDLP_YOUTUBE_ENABLED` | 控制是否注册并启用 YouTube 服务端解析路由适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
+| `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
 | `DOKITOOL_YTDLP_SITES` | 按逗号分隔指定启用的长尾海外平台标识集合（含未知标识或空项时拒绝启动；已退役标识静默忽略） | 否 |
+| `DOKITOOL_YTDLP_GENERIC_ENABLED` | 控制是否开启两级路由的第二级通用具名提取器兜底（仅响应 `GET /api/parse` 且 `platform=all` 或省略的非目录公网链接，严格禁用 `generic` 盲抓提取器；默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false` 与 `ytdlp_generic_enabled: false`） | 否 |
 | `DOKITOOL_YOUTUBE_HELPER` | 控制是否启用 YouTube 浏览器助手上下文与签名结算接口（启用时在启动阶段校验运行时与脚本文件摘要） | 否 |
 
 > **`DOKITOOL_BILIBILI_DASH` 灰度启用与回滚说明**：
@@ -92,7 +93,8 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_YTDLP_BINARY` | 指定受官方发布摘要锁定校验的外部提取器可执行文件路径 | 否 |
-| `DOKITOOL_YTDLP_CONCURRENCY` | 指定所有依赖外部提取器的平台共享的最大并发子进程数 | 否 |
+| `DOKITOOL_YTDLP_CONCURRENCY` | 指定核心海外提取器平台共享的最大并发子进程数 | 否 |
+| `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` | 指定第二级通用具名提取器兜底独立隔离的最大并发子进程数（整数 `1..24`，默认 `2`；与核心慢解析池及核心 `yt-dlp` 槽位严格隔离，非法或越界值在启动阶段即拒绝运行） | 否 |
 | `DOKITOOL_YTDLP_TIMEOUT` | 指定单次外部提取器子进程调用的超时时长 | 否 |
 | `DOKITOOL_YTDLP_GATE_PORTS` | 按逗号分隔指定本地回环任务网关监听端口池（端口数量须与提取器并发上限一致） | 否 |
 | `DOKITOOL_YTDLP_PROXY` | 外部提取器代理配置项（启用出站目标白名单策略时禁止设置；若携带代理凭据则属敏感信息） | 是 |
@@ -134,6 +136,14 @@
 | `DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY` | 慢解析池全局允许同时在途的最大请求数（未显式设置时跟随 `DOKITOOL_YTDLP_CONCURRENCY`） | 否 |
 | `DOKITOOL_PARSE_SLOW_QUEUE_WAIT` | 慢解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
 | `DOKITOOL_PARSE_SLOW_QUEUE_SIZE` | 慢解析池 FIFO 等待队列的最大容量上限 | 否 |
+| `DOKITOOL_PARSE_GENERIC_CLIENT_BURST` | 独立通用长尾慢解析池（覆盖未命中缓存的第二级通用具名提取器 `/api/parse` 请求，与快解析池及核心慢解析池完全隔离）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_GENERIC_CLIENT_RPS` | 独立通用长尾慢解析池单客户端每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_GENERIC_CLIENT_CONCURRENCY` | 独立通用长尾慢解析池单客户端允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_GENERIC_GLOBAL_BURST` | 独立通用长尾慢解析池全局令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_GENERIC_GLOBAL_RPS` | 独立通用长尾慢解析池全局每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_GENERIC_GLOBAL_CONCURRENCY` | 独立通用长尾慢解析池全局允许同时在途的最大请求数（未显式设置时跟随 `DOKITOOL_YTDLP_GENERIC_CONCURRENCY`） | 否 |
+| `DOKITOOL_PARSE_GENERIC_QUEUE_WAIT` | 独立通用长尾慢解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
+| `DOKITOOL_PARSE_GENERIC_QUEUE_SIZE` | 独立通用长尾慢解析池 FIFO 等待队列的最大容量上限 | 否 |
 | `DOKITOOL_OWNER_CONCURRENCY` | 隐式 `DOKITOOL_OWNER_TOKEN` 通道及未显式指定 `concurrency` 的 `owner` 角色密钥允许同时在途的最大并发请求数 | 否 |
 | `DOKITOOL_OWNER_QUEUE_WAIT` | 隐式 `DOKITOOL_OWNER_TOKEN` 通道及未显式指定 `queue_wait` 的 `owner` 角色密钥在并发满载时允许进入 FIFO 队列等待的最长时长 | 否 |
 | `DOKITOOL_OWNER_QUEUE_SIZE` | 隐式 `DOKITOOL_OWNER_TOKEN` 通道及未显式指定 `queue_size` 的 `owner` 角色密钥 FIFO 等待队列的最大容量上限 | 否 |
@@ -228,8 +238,8 @@
     - `"agent"` / `"friend"`：允许访问允许平台范围内的 `/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口；访问 `GET /api/stats` 会被直接拒绝并返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥自身的 `unauthorized` 计数，不扣减匿名单 IP 桶）。
     - 所有通过鉴权的角色（`owner`、`agent`、`friend`）在解析公开微博视频时均走直链分支（不签发 `/api/media/weibo` 服务端中转票据）。
   - `enabled`（可选布尔值，省略时默认 `true`）：设为 `false` 时立即停用该密钥的鉴权能力（携带已停用密钥的请求按无效凭据返回 HTTP `401` 并扣减匿名单 IP 突发桶），但该密钥条目仍以 `enabled: false` 展示在 `/api/stats` 的 `data.api_keys` 中。
-  - `slow_concurrency`（可选整数）：慢解析子并发上限（覆盖依赖外部提取器的海外慢解析平台以及未命中缓存的 YouTube 助手接口），必须满足 `0 <= slow_concurrency <= concurrency`（`0` 表示不单独设子上限，共享 `concurrency`）。队列唤醒采用非队头阻塞（non-HOL-blocking）机制：当慢解析子并发满载而总并发仍有空余时，排在后面的国内纯 Go 快解析请求可直接越过等待中的慢解析请求立即获槽执行。
-  - `platforms`（可选字符串数组）：按密钥限制允许访问的平台白名单。省略或空数组表示允许全部已启用平台；非空时每个元素须属于 14 个内置平台 ID（`douyin`、`bilibili`、`weibo`、`toutiao`、`kuaishou`、`pipixia`、`pipigx`、`zuiyou`、`xiaohongshu`、`x`、`youtube`、`instagram`、`facebook`、`tumblr`），禁止重复或未知平台名。请求未授权平台时（无论缓存命中与否）一律返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
+  - `slow_concurrency`（可选整数）：慢解析子并发上限（覆盖依赖外部提取器的海外慢解析平台、第二级通用具名提取器兜底以及未命中缓存的 YouTube 助手接口），必须满足 `0 <= slow_concurrency <= concurrency`（`0` 表示不单独设子上限，共享 `concurrency`）。队列唤醒采用非队头阻塞（non-HOL-blocking）机制：当慢解析子并发满载而总并发仍有空余时，排在后面的国内纯 Go 快解析请求可直接越过等待中的慢解析请求立即获槽执行。
+  - `platforms`（可选字符串数组）：按密钥限制允许访问的平台白名单。省略或空数组表示允许全部已启用平台（含已开启的第二级通用具名提取器兜底）；非空时每个元素须属于 14 个内置平台 ID（`douyin`、`bilibili`、`weibo`、`toutiao`、`kuaishou`、`pipixia`、`pipigx`、`zuiyou`、`xiaohongshu`、`x`、`youtube`、`instagram`、`facebook`、`tumblr`）或内部通用兜底作用域标识 `"ytdlp_generic"`，禁止重复或未知平台名。未包含 `"ytdlp_generic"` 的非空白名单密钥会拒绝第二级通用兜底请求；请求未授权平台或作用域时（无论缓存命中与否）一律返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。`"ytdlp_generic"` 仅用于内部路由与鉴权范围，绝不会出现在 `/api/platforms` 或响应的 `data.platform` 中。
 
 ### 3. 角色默认值与参数合法范围
 

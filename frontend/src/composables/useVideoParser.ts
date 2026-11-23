@@ -320,15 +320,20 @@ export function useVideoParser(options: {
 
   async function parseVideo() {
     if (active) return;
-    const url = (
+    const extracted = (
       inputUrl.value
         .match(
           /https?:\/\/[^\s<>"'\p{Script=Han}\u2014\u2018-\u201D\u2026\u203B\u3000-\u303F\uFE10-\uFE1F\uFE30-\uFE6F\uFF00-\uFFEF]+/iu,
         )?.[0]
         .replace(/[.,;!?]+$/, "") || inputUrl.value
     ).trim();
+    const hashIdx = extracted.indexOf("#");
+    const url = (hashIdx >= 0 ? extracted.slice(0, hashIdx) : extracted)
+      .replace(/[.,;!?]+$/, "")
+      .trim();
     try {
-      if (!["http:", "https:"].includes(new URL(url).protocol))
+      const parsed = new URL(url);
+      if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname)
         throw new Error();
     } catch {
       invalidate();

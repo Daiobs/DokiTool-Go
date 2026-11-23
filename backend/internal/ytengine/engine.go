@@ -84,6 +84,7 @@ type Engine struct {
 	resolver            Resolver
 	dialAddr            func(netip.Addr, string) string
 	sem                 chan struct{}
+	subSem              chan struct{}
 	timeout             time.Duration
 	socketTimeoutSec    int
 	maxStdoutBytes      int64
@@ -91,6 +92,7 @@ type Engine struct {
 	envPath             string
 	gatePorts           *gatePortPool
 	slotStats           *slotStats
+	subSlotStats        *slotStats
 	extractors          []string
 }
 
@@ -454,6 +456,43 @@ func normalizeExtractors(raw []string) []string {
 		return nil
 	}
 	return out
+}
+
+// WithGenericConcurrency returns a shallow copy of the Engine configured for
+// isolated Tier-2 generic concurrency (limit clamped to 1..MaxConcurrency,
+// defaulting to DefaultConcurrency when <= 0).
+//
+// When gatePorts is nil (dynamic loopback ports), the copy gets an independent
+// semaphore and fresh slotStats so generic traffic never contends with Tier-1.
+// When gatePorts is non-nil (fixed DOKITOOL_YTDLP_GATE_PORTS), the copy retains
+// the shared semaphore and port pool so total listeners never exceed configured
+// fixed ports, and attaches a dedicated subSem with fresh subSlotStats capped
+// at min(limit, cap(e.sem)).
+func (e *Engine) WithGenericConcurrency(limit int) *Engine {
+	if e == nil {
+		return NewDisabled("yt-dlp engine is nil")
+	}
+	if limit <= 0 {
+		limit = DefaultConcurrency
+	}
+	if limit > MaxConcurrency {
+		limit = MaxConcurrency
+	}
+	cp := *e
+	if e.gatePorts == nil {
+		cp.sem = make(chan struct{}, limit)
+		cp.subSem = nil
+		cp.slotStats = newSlotStats()
+		cp.subSlotStats = nil
+		return &cp
+	}
+	subLimit := limit
+	if e.sem != nil && cap(e.sem) > 0 && subLimit > cap(e.sem) {
+		subLimit = cap(e.sem)
+	}
+	cp.subSem = make(chan struct{}, subLimit)
+	cp.subSlotStats = newSlotStats()
+	return &cp
 }
 
 // WithExtractors returns a shallow copy of the Engine pinned to the given yt-dlp

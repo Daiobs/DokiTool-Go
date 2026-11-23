@@ -534,13 +534,32 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
             f"HourlyStatsBucket.{int_field} must be integer with minimum=0",
         )
 
+    adm_snap = comp_schemas.get("AdmissionStatsSnapshot") or {}
+    adm_props = adm_snap.get("properties") or {}
+    require(
+        adm_snap.get("additionalProperties") is False
+        and adm_snap.get("required") == ["fast", "slow", "generic_slow", "owner"]
+        and list(adm_props.keys()) == ["fast", "slow", "generic_slow", "owner"],
+        "AdmissionStatsSnapshot must require fast, slow, generic_slow, owner with additionalProperties=false",
+    )
+    for pool_key in ("fast", "slow", "generic_slow", "owner"):
+        require(
+            adm_props[pool_key].get("$ref") == "#/components/schemas/AdmissionPoolSnapshot",
+            f"AdmissionStatsSnapshot.{pool_key} must reference AdmissionPoolSnapshot",
+        )
+
     require(
         comp_schemas["StatsSnapshot"]["required"] == [
             "started_at", "generated_at", "uptime_seconds",
-            "requests", "cache", "admission", "ytdlp", "shanghai", "parse_latency_ms", "api_keys",
+            "requests", "cache", "admission", "ytdlp", "ytdlp_generic", "shanghai", "parse_latency_ms", "api_keys",
             "runtime", "daily", "hourly",
         ],
         "StatsSnapshot required fields mismatch",
+    )
+    ytdlp_generic_prop = comp_schemas["StatsSnapshot"]["properties"].get("ytdlp_generic") or {}
+    require(
+        ytdlp_generic_prop.get("$ref") == "#/components/schemas/YTDLPStatsSnapshot",
+        "StatsSnapshot.ytdlp_generic must reference YTDLPStatsSnapshot",
     )
     api_keys_prop = comp_schemas["StatsSnapshot"]["properties"].get("api_keys") or {}
     require(
@@ -746,9 +765,14 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
             "total": zero_cache_ch,
             "by_channel": {"anonymous": zero_cache_ch, "owner": zero_cache_ch},
         },
-        "admission": {"fast": zero_pool, "slow": zero_pool, "owner": zero_pool},
+        "admission": {"fast": zero_pool, "slow": zero_pool, "generic_slow": zero_pool, "owner": zero_pool},
         "ytdlp": {
             "enabled": True, "active": 0, "waiting": 0, "concurrency_limit": 2,
+            "total": zero_slot,
+            "by_channel": {"anonymous": zero_slot, "owner": zero_slot},
+        },
+        "ytdlp_generic": {
+            "enabled": False, "active": 0, "waiting": 0, "concurrency_limit": 0,
             "total": zero_slot,
             "by_channel": {"anonymous": zero_slot, "owner": zero_slot},
         },
@@ -777,12 +801,28 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "code": "OK",
         "data": {**base_stats_data, "api_keys": [], "daily": [], "hourly": []},
     })), "Valid /api/stats payload with empty api_keys/daily/hourly rejected")
-    for req_field in ("api_keys", "runtime", "daily", "hourly"):
+    for req_field in ("ytdlp_generic", "api_keys", "runtime", "daily", "hourly"):
         require(bool(list(stats_val.iter_errors({
             "schema_version": "1.0",
             "code": "OK",
             "data": {k: v for k, v in base_stats_data.items() if k != req_field},
         }))), f"Missing {req_field} field in /api/stats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "admission": {k: v for k, v in base_stats_data["admission"].items() if k != "generic_slow"},
+        },
+    }))), "Missing admission.generic_slow in /api/stats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "ytdlp_generic": {**base_stats_data["ytdlp_generic"], "extra": 1},
+        },
+    }))), "Unknown property in ytdlp_generic must be rejected")
     require(bool(list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
@@ -875,7 +915,7 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "data": {**base_stats_data, "hourly": [{**sample_hourly_bucket, "extra": 1}]},
     }))), "Unknown property in HourlyStatsBucket must be rejected")
 
-    return {"enabled": True, "validated_fixtures": len(fixture_files) + 23 + validate_doc_json_blocks(
+    return {"enabled": True, "validated_fixtures": len(fixture_files) + 26 + validate_doc_json_blocks(
         success_val, failure_val, catalog_val, stats_val, unauth_val, ratelimit_val
     )}
 
@@ -982,6 +1022,51 @@ def check_caddy_whitelist() -> int:
         "ops/examples/snap.caddy catch-all 'handle /api/*' must return 404 unified-v1 JSON with no-store header",
     )
 
+    monitor_matcher = re.search(r"(?m)^\s*@monitor\s+path\s+(.+?)\s*$", caddy)
+    require(monitor_matcher is not None, "ops/examples/snap.caddy must declare '@monitor path /monitor /monitor.html'")
+    require(
+        monitor_matcher.group(1).split() == ["/monitor", "/monitor.html"],
+        f"ops/examples/snap.caddy @monitor paths mismatch: got {monitor_matcher.group(1).split()}",
+    )
+    idx_share = caddy.find("handle /social/dokitool-share-v1.png {")
+    idx_monitor = caddy.find("handle @monitor {")
+    idx_spa_handle = caddy.find("\n    handle {", idx_monitor)
+    require(
+        0 < idx_source < idx_share < idx_monitor < idx_spa_handle < idx_spa,
+        "ops/examples/snap.caddy must place handle @monitor after /social/dokitool-share-v1.png and before SPA fallback",
+    )
+    monitor_block = caddy[idx_monitor:idx_spa_handle]
+    require(
+        'header Content-Type "text/html; charset=utf-8"' in monitor_block
+        and 'header Cache-Control "no-store"' in monitor_block
+        and 'header X-Robots-Tag "noindex, nofollow, noarchive"' in monitor_block
+        and "rewrite * /monitor.html" in monitor_block
+        and "file_server" in monitor_block,
+        "ops/examples/snap.caddy handle @monitor must set HTML Content-Type, no-store, noindex/nofollow/noarchive, rewrite * /monitor.html, and file_server",
+    )
+    csp_match = re.search(r'header\s+Content-Security-Policy\s+"([^"]+)"', monitor_block)
+    require(csp_match is not None, "ops/examples/snap.caddy handle @monitor must declare Content-Security-Policy header")
+    csp_val = csp_match.group(1)
+    csp_directives = [part.strip() for part in csp_val.split(";") if part.strip()]
+    for required_dir in (
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "img-src 'self' data:",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+    ):
+        require(
+            required_dir in csp_directives,
+            f"ops/examples/snap.caddy handle @monitor CSP missing directive: {required_dir}",
+        )
+    require(
+        "unsafe-inline" not in csp_val and "unsafe-eval" not in csp_val,
+        "ops/examples/snap.caddy handle @monitor CSP must forbid unsafe-inline and unsafe-eval",
+    )
+
     require(DEPLOYMENT_DOC_PATH.is_file(), f"Missing deployment doc: {DEPLOYMENT_DOC_PATH}")
     deploy_text = DEPLOYMENT_DOC_PATH.read_text(encoding="utf-8")
     require(
@@ -1009,6 +1094,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
     optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
     valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms)
     require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
+    valid_key_platforms = valid_platforms | {"ytdlp_generic"}
 
     allowed_fields = {
         "id", "role", "enabled", "token_sha256",
@@ -1108,7 +1194,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
             require(len(plats) == len(set(plats)), f"keys[{idx}].platforms must not contain duplicates")
             for plat in plats:
                 require(
-                    isinstance(plat, str) and plat in valid_platforms,
+                    isinstance(plat, str) and plat in valid_key_platforms,
                     f"keys[{idx}].platforms contains invalid platform {plat!r}",
                 )
 

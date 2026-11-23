@@ -6,7 +6,7 @@ import type {
   ExtensionSettings,
   MatchedPlatformUrl,
 } from "../protocol";
-import { extractSupportedUrlsFromText } from "../urlMatcher";
+import { extractActiveParseUrlsFromText } from "../urlMatcher";
 
 const props = defineProps<{
   modelValue: string;
@@ -69,7 +69,7 @@ function removeExtractedItem(dedupeKey: string) {
 }
 
 const rawExtraction = computed(() =>
-  extractSupportedUrlsFromText(props.modelValue),
+  extractActiveParseUrlsFromText(props.modelValue),
 );
 
 const effectiveItems = computed<MatchedPlatformUrl[]>(() =>
@@ -81,11 +81,14 @@ const effectiveItems = computed<MatchedPlatformUrl[]>(() =>
 const platformCounts = computed(() => {
   const counts = new Map<string, { label: string; count: number }>();
   for (const item of effectiveItems.value) {
-    const prev = counts.get(item.platform);
+    const bucketKey = item.isGeneric
+      ? `generic:${item.platformLabel}`
+      : item.platform;
+    const prev = counts.get(bucketKey);
     if (prev) {
       prev.count += 1;
     } else {
-      counts.set(item.platform, { label: item.platformLabel, count: 1 });
+      counts.set(bucketKey, { label: item.platformLabel, count: 1 });
     }
   }
   return Array.from(counts.values());
@@ -189,7 +192,7 @@ function handleRetryFailed() {
         :value="modelValue"
         rows="5"
         class="sp-textarea sp-batch-textarea"
-        placeholder="粘贴整段分享口令或多行链接（支持抖音/小红书/B站/微博/YouTube/X/快手等 14 平台混贴，本地自动去重并忽略无关文字）..."
+        placeholder="粘贴整段分享口令或多行链接（支持 14 核心平台及 TikTok/Vimeo/Reddit/SoundCloud 等长尾站点混贴，本地自动去重并忽略无关文字与内网地址）..."
         @input="onTextInput"
       />
 
@@ -208,7 +211,7 @@ function handleRetryFailed() {
           <span
             v-if="rawExtraction.ignoredLineCount > 0"
             class="sp-badge sp-badge--muted"
-            title="非支持平台域名或纯文字说明已在本地过滤，绝不外发"
+            title="纯文字说明、浏览器内部地址或本机/内网链接已在本地过滤，绝不外发"
           >
             已忽略 {{ rawExtraction.ignoredLineCount }} 行无关内容
           </span>

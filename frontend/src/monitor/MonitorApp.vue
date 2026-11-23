@@ -1,7 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { validateApiBaseUrl } from "./hostWhitelist";
-import type { ExtensionSettings, ExtensionThemeMode } from "./protocol";
+import {
+  applyMonitorTheme,
+  clearStoredOwnerToken,
+  fetchSameOriginOwnerStats,
+  getNextMonitorTheme,
+  readMonitorTheme,
+  readStoredOwnerToken,
+  saveOwnerToken,
+  stripUrlQueryAndHash,
+  validateOwnerBearerToken,
+  writeMonitorTheme,
+  type MonitorThemeMode,
+  type OwnerTokenSource,
+} from "./monitorStorage";
 import {
   aggregatePlatformHealth,
   buildDailyChartPoints,
@@ -10,27 +22,15 @@ import {
   formatBytesCompact,
   formatPercent,
   formatUptimeDuration,
-  isValidStatsSnapshot,
   resolveYtdlpQueuedCount,
+  type AdmissionPoolSnapshot,
   type DailyChartPoint,
   type HourlyChartPoint,
   type PlatformHealthRange,
   type PlatformHealthRow,
   type StatsSnapshot,
+  type YTDLPStatsSnapshot,
 } from "./statsTypes";
-import {
-  DEFAULT_EXTENSION_SETTINGS,
-  STORAGE_KEYS,
-  buildApiAuthHeaders,
-  createExtensionStorage,
-  normalizeExtensionThemeMode,
-} from "./storage";
-import {
-  applyExtensionTheme,
-  getNextExtensionTheme,
-  readCachedExtensionTheme,
-  sendSidePanelRequest,
-} from "./uiTargetHelpers";
 
 // ============================================================================
 // Constants & Types
@@ -38,18 +38,13 @@ import {
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 
-type MonitorErrorState = {
-  kind: "no_token" | "unauthorized" | "error";
-  message: string;
-  status?: number;
-};
-
 type PlatformSortKey =
   | "platform"
   | "total"
   | "ok"
   | "failed"
   | "successRate"
+  | "effectiveSuccessRate"
   | "p95Ms";
 
 interface RuntimeSwitchRow {
@@ -82,22 +77,51 @@ const HEALTH_RANGE_OPTIONS: ReadonlyArray<{
   { key: "since_start", label: "启动以来" },
 ];
 
+const ZERO_ADMISSION_POOL: AdmissionPoolSnapshot = {
+  active: 0,
+  queued: 0,
+  concurrency_limit: 0,
+  queue_limit: 0,
+  waited: 0,
+  granted: 0,
+  timeout: 0,
+  full: 0,
+  canceled: 0,
+  wait_ms_total: 0,
+  wait_ms_max: 0,
+};
+
+const ZERO_YTDLP_POOL: Pick<
+  YTDLPStatsSnapshot,
+  "active" | "concurrency_limit" | "waiting" | "queued"
+> & {
+  total?: { acquired_count?: number; wait_count?: number; wait_ms_max?: number };
+} = {
+  active: 0,
+  concurrency_limit: 0,
+  waiting: 0,
+  total: { acquired_count: 0, wait_count: 0, wait_ms_max: 0 },
+};
+
 // ============================================================================
-// Core State
+// Core Auth, Theme & Snapshot State
 // ============================================================================
 
-const storage = createExtensionStorage();
-const settings = ref<ExtensionSettings>({
-  ...DEFAULT_EXTENSION_SETTINGS,
-  theme: readCachedExtensionTheme(),
-});
-
+const currentTheme = ref<MonitorThemeMode>(readMonitorTheme());
 const stats = ref<StatsSnapshot | null>(null);
-const apiOrigin = ref<string>(DEFAULT_EXTENSION_SETTINGS.apiBaseUrl);
 const lastFetchedAt = ref<number | null>(null);
-const loading = ref<boolean>(true);
+const initialLoading = ref<boolean>(false);
 const refreshing = ref<boolean>(false);
-const errorState = ref<MonitorErrorState | null>(null);
+const staleError = ref<string>("");
+
+// Owner unlock form state (never persisted until 200 OK)
+let activeToken = "";
+const tokenSource = ref<OwnerTokenSource>(null);
+const tokenInput = ref<string>("");
+const showToken = ref<boolean>(false);
+const rememberDevice = ref<boolean>(false);
+const submitting = ref<boolean>(false);
+const authError = ref<string>("");
 
 // Auto-refresh (optional 30s toggle, pauses on hidden tab & refreshes on return)
 const autoRefreshEnabled = ref<boolean>(false);
@@ -119,15 +143,26 @@ const sortDir = ref<"asc" | "desc">("desc");
 // Derived Metrics & View Models
 // ============================================================================
 
-const currentTheme = computed<ExtensionThemeMode>(() =>
-  normalizeExtensionThemeMode(settings.value.theme),
-);
+const currentOrigin = computed<string>(() => {
+  if (
+    typeof window !== "undefined" &&
+    window.location?.origin &&
+    window.location.origin !== "null"
+  ) {
+    return window.location.origin;
+  }
+  return "同源站点";
+});
 
 const themeButtonLabel = computed<string>(() => {
   if (currentTheme.value === "light") return "浅色";
   if (currentTheme.value === "dark") return "深色";
   return "跟随系统";
 });
+
+const credentialSourceLabel = computed<string>(() =>
+  tokenSource.value === "local" ? "本机已记住" : "会话级凭据",
+);
 
 const formattedFetchedTime = computed<string>(() => {
   if (!lastFetchedAt.value) return "尚未同步";
@@ -141,6 +176,12 @@ const formattedFetchedTime = computed<string>(() => {
 const todaySummary = computed(() =>
   stats.value ? computeTodayVsYesterday(stats.value) : null,
 );
+
+const effectiveSuccessRateText = computed<string>(() => {
+  const s = todaySummary.value;
+  if (!s || s.effectiveSuccessRate === null) return "—";
+  return `${s.effectiveSuccessRate.toFixed(1)}%`;
+});
 
 const todayDeltaTotalText = computed<string>(() => {
   const s = todaySummary.value;
@@ -182,7 +223,8 @@ const shanghaiHitRateText = computed<string>(() => {
 });
 
 const shanghaiModeLabel = computed<string>(() => {
-  const mode = stats.value?.shanghai?.mode || stats.value?.runtime?.shanghai_mode || "off";
+  const mode =
+    stats.value?.shanghai?.mode || stats.value?.runtime?.shanghai_mode || "off";
   if (mode === "pull") return "Pull 拉取模式";
   if (mode === "direct") return "Direct 直连模式";
   return "未启用 (off)";
@@ -278,51 +320,77 @@ const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
   const makeAdmissionRow = (
     id: string,
     label: string,
-    pool: StatsSnapshot["admission"]["fast"],
+    pool?: AdmissionPoolSnapshot,
   ): PoolWatermarkRow => {
-    const limit = Math.max(0, pool.concurrency_limit || 0);
-    const active = Math.max(0, pool.active || 0);
-    const ratioPct = limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
+    const safePool = pool ?? ZERO_ADMISSION_POOL;
+    const limit = Math.max(0, safePool.concurrency_limit || 0);
+    const active = Math.max(0, safePool.active || 0);
+    const ratioPct =
+      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
     return {
       id,
       label,
       active,
       limit,
-      queued: Math.max(0, pool.queued || 0),
-      queueLimit: Math.max(0, pool.queue_limit || 0),
+      queued: Math.max(0, safePool.queued || 0),
+      queueLimit: Math.max(0, safePool.queue_limit || 0),
       ratioPct,
       tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `等待 ${pool.waited} · 放行 ${pool.granted} · 超时 ${pool.timeout} · 满载 ${pool.full}`,
+      footSummary: `等待 ${safePool.waited ?? 0} · 放行 ${safePool.granted ?? 0} · 超时 ${safePool.timeout ?? 0} · 满载 ${safePool.full ?? 0}`,
     };
   };
 
-  const ytLimit = Math.max(0, s.ytdlp.concurrency_limit || 0);
-  const ytActive = Math.max(0, s.ytdlp.active || 0);
-  const ytQueued = resolveYtdlpQueuedCount(s.ytdlp);
-  const ytRatio =
-    ytLimit > 0 ? Math.min(100, Math.round((ytActive / ytLimit) * 100)) : 0;
+  const makeYtdlpRow = (
+    id: string,
+    label: string,
+    slot?: YTDLPStatsSnapshot,
+  ): PoolWatermarkRow => {
+    const safeSlot = slot ?? ZERO_YTDLP_POOL;
+    const limit = Math.max(0, safeSlot.concurrency_limit || 0);
+    const active = Math.max(0, safeSlot.active || 0);
+    const queued = resolveYtdlpQueuedCount(slot ?? (ZERO_YTDLP_POOL as YTDLPStatsSnapshot));
+    const ratioPct =
+      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
+    return {
+      id,
+      label,
+      active,
+      limit,
+      queued,
+      queueLimit: null,
+      ratioPct,
+      tone: buildPoolWatermarkTone(ratioPct),
+      footSummary: `累计获取 ${safeSlot.total?.acquired_count ?? 0} · 等待 ${safeSlot.total?.wait_count ?? 0} · 最大等待 ${safeSlot.total?.wait_ms_max ?? 0} ms`,
+    };
+  };
 
   return [
     makeAdmissionRow("fast", "快速池 (fast)", s.admission.fast),
     makeAdmissionRow("slow", "慢速池 (slow)", s.admission.slow),
+    makeAdmissionRow(
+      "generic_slow",
+      "通用长尾慢池 (generic_slow)",
+      s.admission.generic_slow,
+    ),
     makeAdmissionRow("owner", "Owner 专属池 (owner)", s.admission.owner),
-    {
-      id: "ytdlp",
-      label: "yt-dlp 并发槽位",
-      active: ytActive,
-      limit: ytLimit,
-      queued: ytQueued,
-      queueLimit: null,
-      ratioPct: ytRatio,
-      tone: buildPoolWatermarkTone(ytRatio),
-      footSummary: `累计获取 ${s.ytdlp.total?.acquired_count ?? 0} · 等待 ${s.ytdlp.total?.wait_count ?? 0} · 最大等待 ${s.ytdlp.total?.wait_ms_max ?? 0} ms`,
-    },
+    makeYtdlpRow("ytdlp", "yt-dlp 并发槽位", s.ytdlp),
+    makeYtdlpRow(
+      "ytdlp_generic",
+      "yt-dlp 通用长尾槽位 (ytdlp_generic)",
+      s.ytdlp_generic,
+    ),
   ];
 });
 
 // Charts
 const dailyChart = computed(() =>
   buildDailyChartPoints(stats.value?.daily ?? [], dailyChartDays.value),
+);
+
+const dailyRatePoints = computed(() =>
+  dailyChart.value.points.filter(
+    (pt): pt is DailyChartPoint & { rateY: number } => pt.rateY !== null,
+  ),
 );
 
 const activeDailyPoint = computed<DailyChartPoint | null>(() => {
@@ -355,7 +423,7 @@ const activeHourlyPoint = computed<HourlyChartPoint | null>(() => {
   return pts[pts.length - 1];
 });
 
-// Platform health table with sorting
+// Platform health table with sorting (includes effectiveSuccessRate)
 const platformHealthRows = computed<PlatformHealthRow[]>(() => {
   if (!stats.value) return [];
   const base = aggregatePlatformHealth(stats.value, healthRange.value);
@@ -368,192 +436,29 @@ const platformHealthRows = computed<PlatformHealthRow[]>(() => {
     if (key === "successRate") {
       const av = a.successRate ?? -1;
       const bv = b.successRate ?? -1;
-      return (av - bv) * dir || (b.total - a.total);
+      return (av - bv) * dir || b.total - a.total;
+    }
+    if (key === "effectiveSuccessRate") {
+      const av = a.effectiveSuccessRate ?? -1;
+      const bv = b.effectiveSuccessRate ?? -1;
+      return (av - bv) * dir || b.effectiveTotal - a.effectiveTotal;
     }
     if (key === "p95Ms") {
       const av = a.p95Ms ?? -1;
       const bv = b.p95Ms ?? -1;
-      return (av - bv) * dir || (b.total - a.total);
+      return (av - bv) * dir || b.total - a.total;
     }
-    return ((a[key] as number) - (b[key] as number)) * dir || a.platform.localeCompare(b.platform);
+    return (
+      ((a[key] as number) - (b[key] as number)) * dir ||
+      a.platform.localeCompare(b.platform)
+    );
   });
 });
 
 const apiKeyRows = computed(() => stats.value?.api_keys ?? []);
 
 // ============================================================================
-// Data Loading (SW RPC with Direct Fetch Fallback)
-// ============================================================================
-
-async function fetchStatsDirectFallback(): Promise<
-  | { ok: true; stats: StatsSnapshot; apiOrigin: string; fetchedAt: number }
-  | { ok: false; error: MonitorErrorState }
-> {
-  const currentSettings = await storage.getSettings();
-  settings.value = { ...currentSettings };
-  apiOrigin.value = currentSettings.apiBaseUrl;
-
-  const token = currentSettings.bearerToken.trim();
-  if (!token) {
-    return {
-      ok: false,
-      error: {
-        kind: "no_token",
-        message: "尚未配置管理员（owner）Bearer Token",
-        status: 401,
-      },
-    };
-  }
-
-  const validated = validateApiBaseUrl(currentSettings.apiBaseUrl);
-  if (!validated.ok) {
-    return {
-      ok: false,
-      error: {
-        kind: "error",
-        message: validated.error || "后端地址配置无效",
-        status: 400,
-      },
-    };
-  }
-
-  try {
-    const resp = await fetch(`${validated.origin}/api/stats?schema_version=1.0`, {
-      method: "GET",
-      headers: buildApiAuthHeaders(
-        { bearerToken: token },
-        { Accept: "application/json" },
-      ),
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      cache: "no-store",
-    });
-    const payload = await resp.json().catch(() => null);
-    if (
-      resp.status === 200 &&
-      payload &&
-      typeof payload === "object" &&
-      (payload as { code?: unknown }).code === "OK" &&
-      isValidStatsSnapshot((payload as { data?: unknown }).data)
-    ) {
-      return {
-        ok: true,
-        stats: (payload as { data: StatsSnapshot }).data,
-        apiOrigin: validated.origin,
-        fetchedAt: Date.now(),
-      };
-    }
-    if (resp.status === 401) {
-      return {
-        ok: false,
-        error: {
-          kind: "unauthorized",
-          message: "当前 Bearer 凭据无权访问监控接口（需要 owner 角色）",
-          status: 401,
-        },
-      };
-    }
-    return {
-      ok: false,
-      error: {
-        kind: "error",
-        message: `监控接口请求失败（HTTP ${resp.status}）`,
-        status: resp.status,
-      },
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      error: {
-        kind: "error",
-        message:
-          err instanceof Error && err.message
-            ? err.message
-            : "无法连接后端监控接口",
-        status: 0,
-      },
-    };
-  }
-}
-
-async function fetchStats(options?: { silent?: boolean }) {
-  const myGen = ++fetchGeneration;
-  if (options?.silent && stats.value) {
-    refreshing.value = true;
-  } else if (!stats.value) {
-    loading.value = true;
-  } else {
-    refreshing.value = true;
-  }
-
-  try {
-    const rpc = await sendSidePanelRequest({ type: "FETCH_OWNER_STATS" });
-    if (myGen !== fetchGeneration) return;
-
-    if (rpc.ok) {
-      stats.value = rpc.data.stats;
-      apiOrigin.value = rpc.data.apiOrigin;
-      lastFetchedAt.value = rpc.data.fetchedAt;
-      errorState.value = null;
-      return;
-    }
-
-    if (
-      rpc.code === "NO_RUNTIME" ||
-      rpc.code === "IPC_ERROR" ||
-      rpc.code === "EMPTY_RESPONSE"
-    ) {
-      const direct = await fetchStatsDirectFallback();
-      if (myGen !== fetchGeneration) return;
-      if (direct.ok) {
-        stats.value = direct.stats;
-        apiOrigin.value = direct.apiOrigin;
-        lastFetchedAt.value = direct.fetchedAt;
-        errorState.value = null;
-      } else {
-        if (direct.error.kind !== "error") {
-          stats.value = null;
-        }
-        errorState.value = direct.error;
-      }
-      return;
-    }
-
-    if (rpc.code === "NO_TOKEN") {
-      stats.value = null;
-      errorState.value = {
-        kind: "no_token",
-        message: "尚未配置管理员（owner）Bearer Token",
-        status: 401,
-      };
-      return;
-    }
-
-    if (rpc.status === 401 || rpc.code === "UNAUTHORIZED") {
-      stats.value = null;
-      errorState.value = {
-        kind: "unauthorized",
-        message: "当前 Bearer 凭据无权访问监控接口（仅 owner 角色可查看）",
-        status: 401,
-      };
-      return;
-    }
-
-    errorState.value = {
-      kind: "error",
-      message: rpc.error || "获取监控数据失败，请稍后重试",
-      status: rpc.status,
-    };
-  } finally {
-    if (myGen === fetchGeneration) {
-      loading.value = false;
-      refreshing.value = false;
-    }
-  }
-}
-
-// ============================================================================
-// Auto-Refresh & Visibility Pause/Resume
+// Auth Unlock, Lock & Refresh State Machine
 // ============================================================================
 
 function clearAutoRefreshTimer() {
@@ -563,9 +468,117 @@ function clearAutoRefreshTimer() {
   }
 }
 
+function lockDashboard(reasonError = "") {
+  fetchGeneration += 1;
+  clearAutoRefreshTimer();
+  clearStoredOwnerToken();
+  autoRefreshEnabled.value = false;
+  pausedByVisibility.value = false;
+  activeToken = "";
+  tokenSource.value = null;
+  tokenInput.value = "";
+  showToken.value = false;
+  rememberDevice.value = false;
+  stats.value = null;
+  lastFetchedAt.value = null;
+  staleError.value = "";
+  authError.value = reasonError;
+  initialLoading.value = false;
+  refreshing.value = false;
+  submitting.value = false;
+}
+
+function handleLockClick() {
+  lockDashboard("");
+}
+
+async function handleUnlock() {
+  if (submitting.value) return;
+  const validated = validateOwnerBearerToken(tokenInput.value);
+  if (!validated.ok) {
+    authError.value = validated.error;
+    return;
+  }
+
+  const myGen = ++fetchGeneration;
+  submitting.value = true;
+  authError.value = "";
+
+  try {
+    const res = await fetchSameOriginOwnerStats(validated.token);
+    if (myGen !== fetchGeneration) return;
+
+    if (res.ok) {
+      const savedSource = saveOwnerToken(validated.token, rememberDevice.value);
+      activeToken = validated.token;
+      tokenSource.value = savedSource;
+      stats.value = res.stats;
+      lastFetchedAt.value = res.fetchedAt;
+      staleError.value = "";
+      authError.value = "";
+      tokenInput.value = "";
+      showToken.value = false;
+      return;
+    }
+
+    if (res.kind === "unauthorized") {
+      clearStoredOwnerToken();
+      activeToken = "";
+      tokenSource.value = null;
+      stats.value = null;
+      lastFetchedAt.value = null;
+      authError.value = res.message;
+      return;
+    }
+
+    stats.value = null;
+    authError.value = res.message;
+  } finally {
+    if (myGen === fetchGeneration) {
+      submitting.value = false;
+    }
+  }
+}
+
+async function refreshStats() {
+  if (!activeToken) {
+    lockDashboard("");
+    return;
+  }
+  const myGen = ++fetchGeneration;
+  refreshing.value = true;
+
+  try {
+    const res = await fetchSameOriginOwnerStats(activeToken);
+    if (myGen !== fetchGeneration) return;
+
+    if (res.ok) {
+      stats.value = res.stats;
+      lastFetchedAt.value = res.fetchedAt;
+      staleError.value = "";
+      return;
+    }
+
+    if (res.kind === "unauthorized") {
+      lockDashboard(res.message);
+      return;
+    }
+
+    staleError.value = res.message;
+  } finally {
+    if (myGen === fetchGeneration) {
+      refreshing.value = false;
+    }
+  }
+}
+
+// ============================================================================
+// Auto-Refresh & Visibility Pause/Resume
+// ============================================================================
+
 function syncAutoRefreshTimer() {
   clearAutoRefreshTimer();
-  if (!autoRefreshEnabled.value) {
+  if (!autoRefreshEnabled.value || !stats.value || !activeToken) {
     pausedByVisibility.value = false;
     return;
   }
@@ -577,6 +590,10 @@ function syncAutoRefreshTimer() {
   }
   pausedByVisibility.value = false;
   autoRefreshTimer = setInterval(() => {
+    if (!stats.value || !activeToken) {
+      clearAutoRefreshTimer();
+      return;
+    }
     if (
       typeof document !== "undefined" &&
       document.visibilityState === "hidden"
@@ -585,52 +602,38 @@ function syncAutoRefreshTimer() {
       clearAutoRefreshTimer();
       return;
     }
-    void fetchStats({ silent: true });
+    void refreshStats();
   }, AUTO_REFRESH_INTERVAL_MS);
   (autoRefreshTimer as { unref?: () => void })?.unref?.();
 }
 
 function handleToggleAutoRefresh() {
+  if (!stats.value) return;
   autoRefreshEnabled.value = !autoRefreshEnabled.value;
   syncAutoRefreshTimer();
 }
 
 function handleVisibilityChange() {
-  if (!autoRefreshEnabled.value) return;
+  if (!autoRefreshEnabled.value || !stats.value || !activeToken) return;
   if (typeof document !== "undefined" && document.visibilityState === "hidden") {
     pausedByVisibility.value = true;
     clearAutoRefreshTimer();
   } else {
     pausedByVisibility.value = false;
-    void fetchStats({ silent: true });
+    void refreshStats();
     syncAutoRefreshTimer();
   }
 }
 
 // ============================================================================
-// Theme, Sort, and Chrome Storage Sync
+// Theme, Chart & Table Helpers
 // ============================================================================
 
-async function handleCycleTheme() {
-  const nextTheme = getNextExtensionTheme(settings.value.theme);
-  settings.value = { ...settings.value, theme: nextTheme };
-  applyExtensionTheme(nextTheme);
-  const rpc = await sendSidePanelRequest({
-    type: "UPDATE_SETTINGS",
-    patch: { theme: nextTheme },
-  });
-  if (rpc.ok) {
-    settings.value = { ...rpc.data.settings };
-    applyExtensionTheme(rpc.data.settings.theme);
-  } else {
-    try {
-      const updated = await storage.updateSettings({ theme: nextTheme });
-      settings.value = { ...updated };
-      applyExtensionTheme(updated.theme);
-    } catch {
-      // Keep local theme applied
-    }
-  }
+function handleCycleTheme() {
+  const next = getNextMonitorTheme(currentTheme.value);
+  currentTheme.value = next;
+  writeMonitorTheme(next);
+  applyMonitorTheme(next);
 }
 
 function handleDailyRangeChange(days: 7 | 30) {
@@ -659,6 +662,11 @@ function rateToneClass(rate: number | null): string {
   return "danger";
 }
 
+function formatRateValue(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate)) return "—";
+  return `${Math.max(0, Math.min(100, rate)).toFixed(1)}%`;
+}
+
 function roleBadgeClass(role: string): string {
   const r = (role || "").trim().toLowerCase();
   if (r === "owner") return "mon-role-badge--owner";
@@ -667,77 +675,65 @@ function roleBadgeClass(role: string): string {
   return "mon-role-badge--other";
 }
 
-type ChromeStorageChangeListener = (
-  changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,
-  areaName: string,
-) => void;
-
-let storageChangeListener: ChromeStorageChangeListener | null = null;
-
-function getChromeStorageOnChanged():
-  | {
-      addListener(cb: ChromeStorageChangeListener): void;
-      removeListener(cb: ChromeStorageChangeListener): void;
-    }
-  | undefined {
-  const g = globalThis as unknown as {
-    chrome?: {
-      storage?: {
-        onChanged?: {
-          addListener(cb: ChromeStorageChangeListener): void;
-          removeListener(cb: ChromeStorageChangeListener): void;
-        };
-      };
-    };
-  };
-  return g.chrome?.storage?.onChanged;
-}
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 onMounted(async () => {
-  try {
-    const initial = await storage.getSettings();
-    settings.value = { ...initial };
-    apiOrigin.value = initial.apiBaseUrl;
-    applyExtensionTheme(initial.theme);
-  } catch {
-    // Keep defaults
-  }
-
-  storageChangeListener = (_changes, areaName) => {
-    if (areaName !== "local") return;
-    if (!(_changes && STORAGE_KEYS.SETTINGS in _changes)) return;
-    const prevToken = settings.value.bearerToken.trim();
-    const prevUrl = settings.value.apiBaseUrl.trim();
-    void storage
-      .getSettings()
-      .then((next) => {
-        settings.value = { ...next };
-        apiOrigin.value = next.apiBaseUrl;
-        applyExtensionTheme(next.theme);
-        if (
-          next.bearerToken.trim() !== prevToken ||
-          next.apiBaseUrl.trim() !== prevUrl
-        ) {
-          void fetchStats();
-        }
-      })
-      .catch(() => {});
-  };
-  getChromeStorageOnChanged()?.addListener(storageChangeListener);
+  stripUrlQueryAndHash();
+  currentTheme.value = readMonitorTheme();
+  applyMonitorTheme(currentTheme.value);
 
   if (typeof document !== "undefined") {
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }
 
-  await fetchStats();
+  const stored = readStoredOwnerToken();
+  if (!stored.token || !stored.source) {
+    return;
+  }
+
+  const validated = validateOwnerBearerToken(stored.token);
+  if (!validated.ok) {
+    clearStoredOwnerToken();
+    authError.value = validated.error;
+    return;
+  }
+
+  const myGen = ++fetchGeneration;
+  initialLoading.value = true;
+  try {
+    const res = await fetchSameOriginOwnerStats(validated.token);
+    if (myGen !== fetchGeneration) return;
+
+    if (res.ok) {
+      activeToken = validated.token;
+      tokenSource.value = stored.source;
+      stats.value = res.stats;
+      lastFetchedAt.value = res.fetchedAt;
+      staleError.value = "";
+      authError.value = "";
+      return;
+    }
+
+    if (res.kind === "unauthorized") {
+      clearStoredOwnerToken();
+      stats.value = null;
+      authError.value = res.message;
+      return;
+    }
+
+    stats.value = null;
+    authError.value = res.message;
+  } finally {
+    if (myGen === fetchGeneration) {
+      initialLoading.value = false;
+    }
+  }
 });
 
 onUnmounted(() => {
   clearAutoRefreshTimer();
-  if (storageChangeListener) {
-    getChromeStorageOnChanged()?.removeListener(storageChangeListener);
-    storageChangeListener = null;
-  }
   if (typeof document !== "undefined") {
     document.removeEventListener("visibilitychange", handleVisibilityChange);
   }
@@ -746,7 +742,7 @@ onUnmounted(() => {
 
 <template>
   <div class="mon-page" data-testid="monitor-dashboard-root">
-    <!-- Sticky Widescreen Topbar -->
+    <!-- Sticky Topbar -->
     <header class="mon-topbar">
       <div class="mon-topbar__inner">
         <div class="mon-brand">
@@ -767,49 +763,79 @@ onUnmounted(() => {
           <div class="mon-brand__titles">
             <div class="mon-brand__title-row">
               <h1 class="mon-brand__title">DokiTool 解析监控大盘</h1>
-              <span class="sp-badge sp-badge--accent">Owner 只读遥测</span>
+              <span
+                v-if="stats"
+                class="sp-badge sp-badge--accent"
+                data-testid="monitor-owner-badge"
+              >
+                Owner 只读遥测
+              </span>
+              <span
+                v-else
+                class="sp-badge sp-badge--muted"
+                data-testid="monitor-locked-badge"
+              >
+                未解锁 · 需 Owner 鉴权
+              </span>
+              <span
+                v-if="stats && tokenSource"
+                class="sp-badge"
+                :class="
+                  tokenSource === 'local'
+                    ? 'sp-badge--warn'
+                    : 'sp-badge--saved'
+                "
+                data-testid="monitor-credential-source"
+              >
+                {{ credentialSourceLabel }}
+              </span>
             </div>
             <div class="mon-brand__meta">
-              <span class="mon-brand__origin">{{ apiOrigin }}</span>
-              <span>最后刷新：{{ formattedFetchedTime }}</span>
+              <span class="mon-brand__origin">{{ currentOrigin }}</span>
+              <span v-if="stats">最后刷新：{{ formattedFetchedTime }}</span>
               <span>统计时区：Asia/Shanghai (UTC+8)</span>
             </div>
           </div>
         </div>
 
         <div class="mon-controls">
-          <button
-            type="button"
-            class="mon-auto-btn"
-            :class="{
-              'mon-auto-btn--on': autoRefreshEnabled && !pausedByVisibility,
-              'mon-auto-btn--paused': autoRefreshEnabled && pausedByVisibility,
-            }"
-            :aria-pressed="autoRefreshEnabled"
-            data-testid="monitor-auto-refresh-toggle"
-            @click="handleToggleAutoRefresh"
-          >
-            <span
-              class="mon-status-dot"
+          <template v-if="stats">
+            <button
+              type="button"
+              class="mon-auto-btn"
               :class="{
-                'mon-status-dot--ok': autoRefreshEnabled && !pausedByVisibility,
-                'mon-status-dot--warn': autoRefreshEnabled && pausedByVisibility,
+                'mon-auto-btn--on': autoRefreshEnabled && !pausedByVisibility,
+                'mon-auto-btn--paused':
+                  autoRefreshEnabled && pausedByVisibility,
               }"
-            />
-            <span v-if="!autoRefreshEnabled">30s 自动刷新：关</span>
-            <span v-else-if="pausedByVisibility">30s 自动刷新：已暂停</span>
-            <span v-else>30s 自动刷新：开</span>
-          </button>
+              :aria-pressed="autoRefreshEnabled"
+              data-testid="monitor-auto-refresh-toggle"
+              @click="handleToggleAutoRefresh"
+            >
+              <span
+                class="mon-status-dot"
+                :class="{
+                  'mon-status-dot--ok':
+                    autoRefreshEnabled && !pausedByVisibility,
+                  'mon-status-dot--warn':
+                    autoRefreshEnabled && pausedByVisibility,
+                }"
+              />
+              <span v-if="!autoRefreshEnabled">30s 自动刷新：关</span>
+              <span v-else-if="pausedByVisibility">30s 自动刷新：已暂停</span>
+              <span v-else>30s 自动刷新：开</span>
+            </button>
 
-          <button
-            type="button"
-            class="sp-btn sp-btn--secondary sp-btn--sm"
-            :disabled="loading || refreshing"
-            data-testid="monitor-refresh-btn"
-            @click="fetchStats()"
-          >
-            <span>{{ refreshing || loading ? "刷新中..." : "立即刷新" }}</span>
-          </button>
+            <button
+              type="button"
+              class="sp-btn sp-btn--secondary sp-btn--sm"
+              :disabled="refreshing"
+              data-testid="monitor-refresh-btn"
+              @click="refreshStats()"
+            >
+              <span>{{ refreshing ? "刷新中..." : "立即刷新" }}</span>
+            </button>
+          </template>
 
           <button
             type="button"
@@ -872,138 +898,183 @@ onUnmounted(() => {
             </svg>
             <span>{{ themeButtonLabel }}</span>
           </button>
+
+          <button
+            v-if="stats"
+            type="button"
+            class="sp-btn sp-btn--danger-ghost sp-btn--sm"
+            data-testid="monitor-lock-btn"
+            @click="handleLockClick"
+          >
+            锁定 / 清除凭据
+          </button>
         </div>
       </div>
     </header>
 
     <main class="mon-main">
-      <!-- Initial Loading -->
-      <div v-if="loading && !stats" class="mon-loading">
+      <!-- Auto-unlock Loading (Only when pre-stored token is being verified) -->
+      <div
+        v-if="initialLoading && !stats"
+        class="mon-loading"
+        data-testid="monitor-initial-loading"
+      >
         <div class="mon-loading__spinner sp-spin" />
-        <span>正在拉取实时解析监控快照...</span>
+        <span>正在校验本地凭据并拉取实时监控快照...</span>
       </div>
 
-      <!-- Missing Token / 401 Unauthorized Guidance Card (Never leaks token!) -->
+      <!-- In-Page Owner Unlock Card (Shown whenever locked / 401) -->
       <section
-        v-else-if="
-          !stats &&
-          errorState &&
-          (errorState.kind === 'no_token' ||
-            errorState.kind === 'unauthorized')
-        "
-        class="mon-guard-card"
-        data-testid="monitor-auth-guard"
+        v-else-if="!stats"
+        class="mon-unlock-card"
+        data-testid="monitor-unlock-card"
       >
-        <span class="mon-guard-card__badge">
-          {{
-            errorState.kind === "no_token"
-              ? "未配置凭据"
-              : "HTTP 401 · 权限不足"
-          }}
-        </span>
-        <h2 class="mon-guard-card__title">
-          {{
-            errorState.kind === "no_token"
-              ? "请先配置管理员（owner）Bearer Token"
-              : "当前凭据无权访问管理员监控大盘"
-          }}
-        </h2>
-        <p class="mon-guard-card__desc">
-          {{ errorState.message }}。<code>/api/stats</code>
-          仅对 <strong>owner</strong> 角色开放，匿名访问与
-          <code>friend</code> / <code>agent</code> 凭据均被后端拒绝。
-        </p>
-        <ol class="mon-guard-card__steps">
-          <li>点击浏览器工具栏中的 DokiTool 扩展图标打开侧边栏。</li>
-          <li>点击右上角「设置」按钮，检查后端服务地址并填入具有 owner 权限的 Bearer Token。</li>
-          <li>保存设置后本页面会自动感知更新，或点击下方按钮立即重新拉取。</li>
-        </ol>
-        <div class="mon-guard-card__actions">
-          <button
-            type="button"
-            class="sp-btn sp-btn--primary sp-btn--sm"
-            @click="fetchStats()"
-          >
-            重新检测权限
-          </button>
+        <div class="mon-unlock-card__head">
+          <span class="mon-unlock-card__badge">Owner 鉴权解锁</span>
+          <h2 class="mon-unlock-card__title">验证管理员凭据以进入监控大盘</h2>
+          <p class="mon-unlock-card__desc">
+            本页面通过同源接口 <code class="mon-mono">/api/stats</code>
+            拉取只读运行遥测，仅对 <strong>owner</strong> 角色开放；请求严格不携带
+            Cookie，且凭据不会写入 URL 或 Cookie。
+          </p>
         </div>
-      </section>
 
-      <!-- Generic Load Error without Data -->
-      <section
-        v-else-if="!stats && errorState"
-        class="mon-guard-card"
-        data-testid="monitor-error-card"
-      >
-        <span class="mon-guard-card__badge">连接异常</span>
-        <h2 class="mon-guard-card__title">暂时无法加载监控数据</h2>
-        <p class="mon-guard-card__desc">{{ errorState.message }}</p>
-        <div class="mon-guard-card__actions">
-          <button
-            type="button"
-            class="sp-btn sp-btn--primary sp-btn--sm"
-            @click="fetchStats()"
+        <form
+          class="mon-unlock-form"
+          data-testid="monitor-unlock-form"
+          @submit.prevent="handleUnlock"
+        >
+          <div class="mon-field">
+            <label class="mon-field__label" for="monitor-owner-token">
+              Owner Bearer Token
+            </label>
+            <div class="mon-input-row">
+              <input
+                id="monitor-owner-token"
+                v-model="tokenInput"
+                :type="showToken ? 'text' : 'password'"
+                class="sp-input"
+                autocomplete="current-password"
+                spellcheck="false"
+                autocapitalize="off"
+                placeholder="输入管理员（owner）Bearer Token（32～512 位可见 ASCII）"
+                :disabled="submitting"
+                data-testid="monitor-token-input"
+              />
+              <button
+                type="button"
+                class="sp-btn sp-btn--secondary mon-token-toggle"
+                :aria-pressed="showToken"
+                data-testid="monitor-token-visibility-btn"
+                @click="showToken = !showToken"
+              >
+                {{ showToken ? "隐藏" : "显示" }}
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-if="authError"
+            class="mon-auth-alert"
+            role="alert"
+            data-testid="monitor-auth-error"
           >
-            重试拉取
+            {{ authError }}
+          </div>
+
+          <div class="mon-checkbox-box">
+            <label class="mon-checkbox-row">
+              <input
+                v-model="rememberDevice"
+                type="checkbox"
+                :disabled="submitting"
+                data-testid="monitor-remember-checkbox"
+              />
+              <span>在此受信任设备记住凭据</span>
+            </label>
+            <p class="mon-checkbox-hint">
+              勾选后存入本机浏览器 localStorage，公共或他人设备请勿勾选
+            </p>
+          </div>
+
+          <button
+            type="submit"
+            class="sp-btn sp-btn--primary mon-unlock-submit"
+            :disabled="submitting"
+            data-testid="monitor-unlock-submit"
+          >
+            {{ submitting ? "正在验证凭据..." : "验证并进入监控大盘" }}
           </button>
-        </div>
+
+          <p class="mon-unlock-footnote">
+            默认仅保存在当前标签页会话（sessionStorage），关闭标签页后自动清除；解锁后可随时点击右上角「锁定 /
+            清除凭据」一键销毁。
+          </p>
+        </form>
       </section>
 
       <!-- Main 5-Section Widescreen Dashboard -->
       <template v-else-if="stats && todaySummary">
         <!-- Non-blocking stale refresh warning -->
         <div
-          v-if="errorState"
+          v-if="staleError"
           class="mon-inline-banner"
           role="status"
           data-testid="monitor-stale-banner"
         >
-          <span>最近一次刷新失败：{{ errorState.message }}（当前展示上次快照）</span>
+          <span>最近一次刷新失败：{{ staleError }}（当前展示上次快照）</span>
           <button
             type="button"
             class="sp-btn sp-btn--ghost sp-btn--xs"
-            @click="fetchStats()"
+            @click="refreshStats()"
           >
             重试
           </button>
         </div>
 
         <!-- ================================================================ -->
-        <!-- Section 1: 核心指标卡 (4-Column KPI Grid)                         -->
+        <!-- Section 1: 核心指标卡 (5-Column KPI Grid with Dual Success Rate)   -->
         <!-- ================================================================ -->
         <section
           class="mon-kpi-grid"
           aria-label="核心指标卡"
           data-testid="section-kpi-cards"
         >
-          <!-- KPI 1: Today Parses & Success Rate + Yesterday Delta -->
-          <article class="mon-kpi mon-kpi--info">
+          <!-- KPI 1: Today Total Parses -->
+          <article class="mon-kpi mon-kpi--info" data-testid="kpi-today-total">
             <div class="mon-kpi__label">
-              <span>今日解析总量 &amp; 成功率</span>
+              <span>今日解析总量</span>
               <span class="mon-mono">{{ todaySummary.date || "今日" }}</span>
             </div>
             <div class="mon-kpi__main">
               <span class="mon-kpi__value">{{ todaySummary.total }}</span>
               <span
-                class="sp-badge"
-                :class="
-                  todaySummary.successRate === null
-                    ? 'sp-badge--muted'
-                    : todaySummary.successRate >= 95
-                      ? 'sp-badge--saved'
-                      : 'sp-badge--warn'
-                "
-              >
-                成功率
-                {{ formatPercent(todaySummary.ok, todaySummary.total, 1) }}
-              </span>
-            </div>
-            <div class="mon-kpi__deltas">
-              <span
                 class="mon-delta-pill"
                 :class="`mon-delta-pill--${todayDeltaTotalTone}`"
               >
                 {{ todayDeltaTotalText }}
+              </span>
+            </div>
+            <div class="mon-kpi__meta">
+              <span>成功 {{ todaySummary.ok }} / 失败 {{ todaySummary.failed }}</span>
+            </div>
+            <div class="mon-kpi__meta">
+              <span>P50 {{ todaySummary.p50Ms }}ms · P95 {{ todaySummary.p95Ms }}ms</span>
+            </div>
+          </article>
+
+          <!-- KPI 2: Today Dual Success Rate (Full vs Effective) -->
+          <article
+            class="mon-kpi mon-kpi--success"
+            data-testid="kpi-success-rate"
+          >
+            <div class="mon-kpi__label">
+              <span>今日成功率</span>
+              <span class="sp-badge sp-badge--muted">全量口径</span>
+            </div>
+            <div class="mon-kpi__main">
+              <span class="mon-kpi__value">
+                {{ formatPercent(todaySummary.ok, todaySummary.total, 1) }}
               </span>
               <span
                 class="mon-delta-pill"
@@ -1012,13 +1083,19 @@ onUnmounted(() => {
                 {{ todayDeltaRateText }}
               </span>
             </div>
+            <div
+              class="mon-kpi__effective"
+              data-testid="kpi-effective-success-rate"
+            >
+              有效解析成功率 <strong>{{ effectiveSuccessRateText }}</strong>（已剔除限流/无效输入
+              {{ todaySummary.excludedCount }} 次）
+            </div>
             <div class="mon-kpi__meta">
-              <span>成功 {{ todaySummary.ok }} / 失败 {{ todaySummary.failed }}</span>
-              <span>P50 {{ todaySummary.p50Ms }}ms · P95 {{ todaySummary.p95Ms }}ms</span>
+              <span>全量分母 {{ todaySummary.total }} · 有效分母 {{ todaySummary.effectiveTotal }}</span>
             </div>
           </article>
 
-          <!-- KPI 2: Cache Hit Rate & Memory Occupancy -->
+          <!-- KPI 3: Cache Hit Rate & Memory Occupancy -->
           <article class="mon-kpi mon-kpi--success">
             <div class="mon-kpi__label">
               <span>缓存命中率 &amp; 内存占用</span>
@@ -1048,7 +1125,7 @@ onUnmounted(() => {
             </div>
           </article>
 
-          <!-- KPI 3: Shanghai Exit Nodes & Hit Rate -->
+          <!-- KPI 4: Shanghai Exit Nodes & Hit Rate -->
           <article class="mon-kpi mon-kpi--warn">
             <div class="mon-kpi__label">
               <span>上海出口节点 &amp; 命中率</span>
@@ -1057,13 +1134,12 @@ onUnmounted(() => {
             <div class="mon-kpi__main">
               <span class="mon-kpi__value">
                 <span
-                  class="mon-status-dot"
+                  class="mon-status-dot mon-status-dot--inline"
                   :class="
                     stats.shanghai.waiting_workers > 0
                       ? 'mon-status-dot--ok'
                       : ''
                   "
-                  style="display: inline-block; margin-right: 6px; vertical-align: middle"
                 />
                 {{ stats.shanghai.waiting_workers }} 节点
               </span>
@@ -1081,7 +1157,7 @@ onUnmounted(() => {
             </div>
           </article>
 
-          <!-- KPI 4: Version & Uptime -->
+          <!-- KPI 5: Version & Uptime -->
           <article class="mon-kpi">
             <div class="mon-kpi__label">
               <span>服务版本 &amp; 在线时长</span>
@@ -1151,16 +1227,19 @@ onUnmounted(() => {
             </div>
           </article>
 
-          <!-- Concurrency Pools Watermark -->
+          <!-- Concurrency Pools Watermark (6 Pools incl. generic_slow & ytdlp_generic) -->
           <article class="mon-card">
             <div class="mon-card__header">
               <div class="mon-card__title-group">
                 <h2 class="mon-card__title">并发池实时水位</h2>
                 <span class="mon-card__subtitle">
-                  admission (fast / slow / owner) 与共享 yt-dlp 信号量活跃与排队状态
+                  admission (fast / slow / generic_slow / owner) 与 yt-dlp /
+                  ytdlp_generic 信号量活跃与排队状态
                 </span>
               </div>
-              <span class="sp-badge sp-badge--muted">4 组资源池</span>
+              <span class="sp-badge sp-badge--muted">
+                {{ concurrencyPools.length }} 组资源池
+              </span>
             </div>
 
             <div class="mon-pools-list" data-testid="concurrency-pools">
@@ -1182,17 +1261,34 @@ onUnmounted(() => {
                     </template>
                   </span>
                 </div>
-                <div class="mon-pool-bar" aria-hidden="true">
-                  <div
-                    class="mon-pool-bar__fill"
+                <svg
+                  class="mon-pool-bar-svg"
+                  viewBox="0 0 100 8"
+                  preserveAspectRatio="none"
+                  aria-hidden="true"
+                >
+                  <rect
+                    class="mon-bar-track"
+                    x="0"
+                    y="0"
+                    width="100"
+                    height="8"
+                    rx="4"
+                  />
+                  <rect
+                    class="mon-bar-fill"
                     :class="
                       pool.tone === 'normal'
                         ? ''
-                        : `mon-pool-bar__fill--${pool.tone}`
+                        : `mon-bar-fill--${pool.tone}`
                     "
-                    :style="{ width: `${pool.ratioPct}%` }"
+                    x="0"
+                    y="0"
+                    :width="pool.ratioPct"
+                    height="8"
+                    rx="4"
                   />
-                </div>
+                </svg>
                 <div class="mon-pool-row__foot">
                   <span>{{ pool.footSummary }}</span>
                   <span>负载 {{ pool.ratioPct }}%</span>
@@ -1377,10 +1473,9 @@ onUnmounted(() => {
                   data-testid="daily-rate-path"
                 />
 
-                <!-- Success Rate Dots -->
+                <!-- Success Rate Dots (filtered computed array for strict CSP) -->
                 <circle
-                  v-for="pt in dailyChart.points"
-                  v-show="pt.rateY !== null"
+                  v-for="pt in dailyRatePoints"
                   :key="`rate-${pt.date}`"
                   class="mon-svg__rate-dot"
                   :class="{
@@ -1388,7 +1483,7 @@ onUnmounted(() => {
                       activeDailyPoint?.date === pt.date,
                   }"
                   :cx="pt.centerX"
-                  :cy="pt.rateY ?? dailyChart.plotBottom"
+                  :cy="pt.rateY"
                   :r="activeDailyPoint?.date === pt.date ? 4 : 2.6"
                 />
               </svg>
@@ -1548,14 +1643,14 @@ onUnmounted(() => {
         </section>
 
         <!-- ================================================================ -->
-        <!-- Section 4: 平台每日解析健康度总览表 (5 Time Windows + Sorting)     -->
+        <!-- Section 4: 平台每日解析健康度总览表 (5 Windows + Dual Rate + Sticky) -->
         <!-- ================================================================ -->
         <section class="mon-card" data-testid="section-platform-health">
           <div class="mon-card__header">
             <div class="mon-card__title-group">
               <h2 class="mon-card__title">平台解析健康度总览</h2>
               <span class="mon-card__subtitle">
-                覆盖 14 个核心平台及长尾扩展平台，支持按时间窗口切换与字段排序
+                覆盖 14 个核心平台及长尾扩展平台，区分全量成功率与剔除限流/无效输入后的有效成功率
               </span>
             </div>
 
@@ -1577,7 +1672,7 @@ onUnmounted(() => {
           </div>
 
           <div class="mon-table-wrap">
-            <table class="mon-table">
+            <table class="mon-table mon-table--platform-health">
               <thead>
                 <tr>
                   <th>
@@ -1637,6 +1732,21 @@ onUnmounted(() => {
                       <span>{{ sortIndicator("successRate") }}</span>
                     </button>
                   </th>
+                  <th>
+                    <button
+                      type="button"
+                      class="mon-sort-btn"
+                      :class="{
+                        'mon-sort-btn--active':
+                          sortKey === 'effectiveSuccessRate',
+                      }"
+                      data-testid="sort-effective-success-rate"
+                      @click="handleToggleSort('effectiveSuccessRate')"
+                    >
+                      <span>有效成功率</span>
+                      <span>{{ sortIndicator("effectiveSuccessRate") }}</span>
+                    </button>
+                  </th>
                   <th>主要错误码分布</th>
                   <th class="is-right">
                     <button
@@ -1653,7 +1763,7 @@ onUnmounted(() => {
               </thead>
               <tbody>
                 <tr v-if="platformHealthRows.length === 0">
-                  <td colspan="7" class="mon-empty-cell">
+                  <td colspan="8" class="mon-empty-cell">
                     所选时间窗口内暂无平台解析记录
                   </td>
                 </tr>
@@ -1679,17 +1789,80 @@ onUnmounted(() => {
                   </td>
                   <td>
                     <div class="mon-rate-cell">
-                      <div class="mon-rate-bar" aria-hidden="true">
-                        <div
-                          class="mon-rate-bar__fill"
-                          :class="`mon-rate-bar__fill--${rateToneClass(row.successRate)}`"
-                          :style="{
-                            width: `${row.successRate !== null ? Math.round(row.successRate) : 0}%`,
-                          }"
+                      <svg
+                        class="mon-rate-bar-svg"
+                        viewBox="0 0 100 8"
+                        preserveAspectRatio="none"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          class="mon-bar-track"
+                          x="0"
+                          y="0"
+                          width="100"
+                          height="8"
+                          rx="4"
                         />
-                      </div>
+                        <rect
+                          class="mon-bar-fill"
+                          :class="`mon-bar-fill--${rateToneClass(row.successRate)}`"
+                          x="0"
+                          y="0"
+                          :width="
+                            row.successRate !== null
+                              ? Math.round(row.successRate)
+                              : 0
+                          "
+                          height="8"
+                          rx="4"
+                        />
+                      </svg>
                       <span class="mon-mono">
                         {{ formatPercent(row.ok, row.total, 1) }}
+                      </span>
+                    </div>
+                  </td>
+                  <td>
+                    <div class="mon-effective-cell">
+                      <svg
+                        class="mon-rate-bar-svg"
+                        viewBox="0 0 100 8"
+                        preserveAspectRatio="none"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          class="mon-bar-track"
+                          x="0"
+                          y="0"
+                          width="100"
+                          height="8"
+                          rx="4"
+                        />
+                        <rect
+                          class="mon-bar-fill"
+                          :class="`mon-bar-fill--${rateToneClass(row.effectiveSuccessRate)}`"
+                          x="0"
+                          y="0"
+                          :width="
+                            row.effectiveSuccessRate !== null
+                              ? Math.round(row.effectiveSuccessRate)
+                              : 0
+                          "
+                          height="8"
+                          rx="4"
+                        />
+                      </svg>
+                      <span
+                        class="mon-mono"
+                        data-testid="platform-effective-rate"
+                      >
+                        {{ formatRateValue(row.effectiveSuccessRate) }}
+                      </span>
+                      <span
+                        v-if="row.excludedCount > 0"
+                        class="mon-effective-sub"
+                      >
+                        (-{{ row.excludedCount }})
                       </span>
                     </div>
                   </td>

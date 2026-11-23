@@ -1,6 +1,7 @@
 package ytengine
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -875,5 +876,348 @@ func TestGoldenBuildEntryVariantsAdaptiveHLSPairing(t *testing.T) {
 
 		env := AdaptInfo(entry, opts, now)
 		assertGoldenVariantEnvelopeValid(t, env, now, "OK")
+	})
+}
+
+func TestAdaptInfoAllowAudioOnlyAndProgressiveWebM(t *testing.T) {
+	const now int64 = 1762300800
+
+	t.Run("audio-only-disabled-by-default-returns-NO_MEDIA", func(t *testing.T) {
+		info := &Info{
+			ID:           "sc-track-1",
+			Title:        "Ambient Synth",
+			Uploader:     "Artist",
+			ExtractorKey: "Soundcloud",
+			Formats: []Format{
+				{
+					FormatID: "http_mp3_128",
+					URL:      "https://cf-media.sndcdn.com/track/ambient.mp3",
+					Ext:      "mp3",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp3",
+					ABR:      goldenFloat64Ptr(128),
+				},
+			},
+		}
+		env := AdaptInfo(info, AdaptOptions{
+			PlatformID: "soundcloud",
+			ContentID:  "sc-track-1",
+			SourceURL:  "https://soundcloud.com/artist/ambient-synth",
+		}, now)
+		assertGoldenVariantEnvelopeValid(t, env, now, "NO_MEDIA")
+	})
+
+	t.Run("audio-only-enabled-emits-audio-item-all-mime-types-and-dedups", func(t *testing.T) {
+		info := &Info{
+			ID:           "bc-track-42",
+			Title:        "Lossless Session",
+			Uploader:     "BandcampArtist",
+			Duration:     goldenFloat64Ptr(215.4),
+			Thumbnail:    "https://f4.bcbits.com/img/a12345_10.jpg",
+			ExtractorKey: "Bandcamp",
+			Formats: []Format{
+				{
+					FormatID: "mp3-320",
+					URL:      "https://t4.bcbits.com/stream/track_320.mp3",
+					Ext:      "mp3",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp3",
+					ABR:      goldenFloat64Ptr(320),
+					Filesize: goldenInt64Ptr(8600000),
+				},
+				{
+					FormatID: "mp3-128-a",
+					URL:      "https://t4.bcbits.com/stream/track_128_a.mp3",
+					Ext:      "mp3",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp3",
+					ABR:      goldenFloat64Ptr(128),
+				},
+				// Duplicate container+bitrate (mp3:128) -> must be deduplicated
+				{
+					FormatID: "mp3-128-b",
+					URL:      "https://t4.bcbits.com/stream/track_128_b.mp3",
+					Ext:      "mp3",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp3",
+					ABR:      goldenFloat64Ptr(128),
+				},
+				{
+					FormatID: "m4a-256",
+					URL:      "https://t4.bcbits.com/stream/track_256.m4a",
+					Ext:      "m4a",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp4a.40.2",
+					ABR:      goldenFloat64Ptr(256),
+				},
+				// Same container (mp4) + bitrate (256) as m4a-256 -> must be deduplicated
+				{
+					FormatID: "mp4-audio-256",
+					URL:      "https://t4.bcbits.com/stream/track_256.mp4",
+					Ext:      "mp4",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp4a.40.2",
+					ABR:      goldenFloat64Ptr(256),
+				},
+				{
+					FormatID: "webm-160",
+					URL:      "https://t4.bcbits.com/stream/track_160.webm",
+					Ext:      "webm",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "opus",
+					ABR:      goldenFloat64Ptr(160),
+				},
+				{
+					FormatID: "ogg-192",
+					URL:      "https://t4.bcbits.com/stream/track_192.ogg",
+					Ext:      "ogg",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "vorbis",
+					ABR:      goldenFloat64Ptr(192),
+				},
+				{
+					FormatID: "opus-128",
+					URL:      "https://t4.bcbits.com/stream/track_128.opus",
+					Ext:      "opus",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "opus",
+					ABR:      goldenFloat64Ptr(128),
+				},
+				{
+					FormatID: "flac-1000",
+					URL:      "https://t4.bcbits.com/stream/track.flac",
+					Ext:      "flac",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "flac",
+					ABR:      goldenFloat64Ptr(1000),
+				},
+				{
+					FormatID: "wav-1411",
+					URL:      "https://t4.bcbits.com/stream/track.wav",
+					Ext:      "wav",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "pcm_s16le",
+					ABR:      goldenFloat64Ptr(1411),
+				},
+				// Unsupported extension -> skipped
+				{
+					FormatID: "bad-ext",
+					URL:      "https://t4.bcbits.com/stream/track.mhtml",
+					Ext:      "mhtml",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "unknown_codec",
+				},
+				// HLS audio-only -> ignored as file
+				{
+					FormatID: "hls-mp3",
+					URL:      "https://t4.bcbits.com/stream/playlist.m3u8",
+					Ext:      "mp3",
+					Protocol: "m3u8_native",
+					VCodec:   "none",
+					ACodec:   "mp3",
+				},
+			},
+		}
+		opts := AdaptOptions{
+			PlatformID:     "bandcamp",
+			ContentID:      "bc-track-42",
+			SourceURL:      "https://artist.bandcamp.com/track/lossless-session",
+			AllowAudioOnly: true,
+			EnableDASHMux:  true,
+			EnableHLS:      true,
+		}
+		env := AdaptInfo(info, opts, now)
+		assertGoldenVariantEnvelopeValid(t, env, now, "OK")
+
+		data := unified.Map(env["data"])
+		if _, hasAtt := data["attachments"]; hasAtt {
+			t.Fatalf("audio-only item must not emit redundant attachments: %+v", data["attachments"])
+		}
+		items := unified.Slice(data["items"])
+		if len(items) != 1 {
+			t.Fatalf("expected 1 audio item, got %d", len(items))
+		}
+		item := unified.Map(items[0])
+		if unified.Str(item["type"]) != "audio" {
+			t.Fatalf("item type = %q, want audio", item["type"])
+		}
+		if !strings.HasPrefix(unified.Str(item["id"]), "audio-") {
+			t.Fatalf("audio item id = %q, want audio- prefix", item["id"])
+		}
+		if item["default"] == nil {
+			t.Fatalf("expected audio item to select a non-nil default file variant")
+		}
+
+		variants := unified.Slice(item["variants"])
+		// 8 unique container+bitrate variants: m4a(256), webm(160), opus(128), wav(1411), flac(1000), mp3(320), ogg(192), mp3(128)
+		if len(variants) != 8 {
+			t.Fatalf("expected 8 deduplicated audio variants, got %d: %+v", len(variants), variants)
+		}
+		seenMimes := make(map[string]int)
+		for _, rawV := range variants {
+			v := unified.Map(rawV)
+			if unified.Str(unified.Map(v["delivery"])["kind"]) != "file" {
+				t.Fatalf("expected kind=file for audio variant, got %+v", v["delivery"])
+			}
+			mime := unified.Str(unified.Map(v["metadata"])["mime_type"])
+			seenMimes[mime]++
+		}
+		wantMimes := map[string]int{
+			"audio/mpeg": 2, // 320k + 128k
+			"audio/mp4":  1, // m4a 256k (mp4 256k deduped)
+			"audio/webm": 1,
+			"audio/ogg":  2, // ogg 192k + opus 128k
+			"audio/flac": 1,
+			"audio/wav":  1,
+		}
+		for mime, wantCount := range wantMimes {
+			if seenMimes[mime] != wantCount {
+				t.Fatalf("mime %q count = %d, want %d (all=%+v)", mime, seenMimes[mime], wantCount, seenMimes)
+			}
+		}
+	})
+
+	t.Run("audio-only-does-not-override-when-video-exists", func(t *testing.T) {
+		info := &Info{
+			ID:    "vid-and-audio",
+			Title: "Video With Audio",
+			Formats: []Format{
+				{
+					FormatID: "mp4-720",
+					URL:      "https://cdn.example.com/video720.mp4",
+					Ext:      "mp4",
+					Protocol: "https",
+					Width:    goldenInt64Ptr(1280),
+					Height:   goldenInt64Ptr(720),
+					VCodec:   "avc1.4d401f",
+					ACodec:   "mp4a.40.2",
+				},
+				{
+					FormatID: "mp3-128",
+					URL:      "https://cdn.example.com/audio.mp3",
+					Ext:      "mp3",
+					Protocol: "https",
+					VCodec:   "none",
+					ACodec:   "mp3",
+					ABR:      goldenFloat64Ptr(128),
+				},
+			},
+		}
+		env := AdaptInfo(info, AdaptOptions{
+			PlatformID:     "vimeo",
+			ContentID:      "vid-and-audio",
+			SourceURL:      "https://vimeo.com/111111",
+			AllowAudioOnly: true,
+		}, now)
+		assertGoldenVariantEnvelopeValid(t, env, now, "OK")
+		item := unified.Map(unified.Slice(unified.Map(env["data"])["items"])[0])
+		if unified.Str(item["type"]) != "video" || !strings.HasPrefix(unified.Str(item["id"]), "video-") {
+			t.Fatalf("expected video item when video variants exist, got type=%v id=%v", item["type"], item["id"])
+		}
+	})
+
+	t.Run("progressive-webm-opt-in-and-size-probing", func(t *testing.T) {
+		makeInfo := func() *Info {
+			return &Info{
+				ID:    "webm-1",
+				Title: "Progressive WebM Clip",
+				Formats: []Format{
+					{
+						FormatID: "webm-720",
+						URL:      "https://cdn.example.com/clip720.webm",
+						Ext:      "webm",
+						Protocol: "https",
+						Width:    goldenInt64Ptr(1280),
+						Height:   goldenInt64Ptr(720),
+						VCodec:   "vp9",
+						ACodec:   "opus",
+						ABR:      goldenFloat64Ptr(128),
+					},
+					// Invalid as progressive WebM: m3u8 path / missing codec / none codec
+					{
+						FormatID: "webm-m3u8",
+						URL:      "https://cdn.example.com/clip.m3u8",
+						Ext:      "webm",
+						Protocol: "https",
+						VCodec:   "vp9",
+						ACodec:   "opus",
+					},
+					{
+						FormatID: "webm-silent",
+						URL:      "https://cdn.example.com/silent.webm",
+						Ext:      "webm",
+						Protocol: "https",
+						VCodec:   "vp9",
+						ACodec:   "none",
+					},
+				},
+			}
+		}
+
+		// Default AllowProgressiveWebM=false -> progressive WebM ignored (NO_MEDIA) and not size-probed.
+		offOpts := AdaptOptions{
+			PlatformID: "streamable",
+			ContentID:  "webm-1",
+			SourceURL:  "https://streamable.com/abc123",
+		}
+		offInfo := makeInfo()
+		probedOff := false
+		PopulateMissingMP4Sizes(context.Background(), offInfo, func(_ context.Context, _ string) (int64, bool) {
+			probedOff = true
+			return 555555, true
+		}, offOpts)
+		if probedOff {
+			t.Fatal("PopulateMissingMP4Sizes must not probe progressive WebM when AllowProgressiveWebM is false")
+		}
+		envOff := AdaptInfo(offInfo, offOpts, now)
+		assertGoldenVariantEnvelopeValid(t, envOff, now, "NO_MEDIA")
+
+		// Opt-in AllowProgressiveWebM=true -> probed and emitted as video/webm file variant.
+		onOpts := AdaptOptions{
+			PlatformID:           "streamable",
+			ContentID:            "webm-1",
+			SourceURL:            "https://streamable.com/abc123",
+			AllowProgressiveWebM: true,
+		}
+		onInfo := makeInfo()
+		var probedURLs []string
+		PopulateMissingMP4Sizes(context.Background(), onInfo, func(_ context.Context, rawURL string) (int64, bool) {
+			probedURLs = append(probedURLs, rawURL)
+			return 4444444, true
+		}, onOpts)
+		if len(probedURLs) != 1 || probedURLs[0] != "https://cdn.example.com/clip720.webm" {
+			t.Fatalf("expected only progressive WebM to be size-probed, got %v", probedURLs)
+		}
+		envOn := AdaptInfo(onInfo, onOpts, now)
+		assertGoldenVariantEnvelopeValid(t, envOn, now, "OK")
+		item := unified.Map(unified.Slice(unified.Map(envOn["data"])["items"])[0])
+		variants := unified.Slice(item["variants"])
+		if len(variants) != 1 {
+			t.Fatalf("expected 1 progressive WebM variant, got %d: %+v", len(variants), variants)
+		}
+		v := unified.Map(variants[0])
+		meta := unified.Map(v["metadata"])
+		if unified.Str(meta["container"]) != "webm" ||
+			unified.Str(meta["extension"]) != "webm" ||
+			unified.Str(meta["mime_type"]) != "video/webm" ||
+			meta["has_audio"] != true {
+			t.Fatalf("unexpected progressive WebM metadata: %+v", meta)
+		}
+		src := unified.Map(unified.Slice(unified.Map(v["delivery"])["sources"])[0])
+		if src["size_bytes"] != int64(4444444) {
+			t.Fatalf("expected probed size_bytes=4444444, got %+v", src)
+		}
 	})
 }

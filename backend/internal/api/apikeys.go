@@ -76,20 +76,21 @@ const (
 var apiKeyIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 var allowedKeyPlatforms = map[string]struct{}{
-	"douyin":      {},
-	"bilibili":    {},
-	"weibo":       {},
-	"toutiao":     {},
-	"kuaishou":    {},
-	"pipixia":     {},
-	"pipigx":      {},
-	"zuiyou":      {},
-	"xiaohongshu": {},
-	"x":           {},
-	"youtube":     {},
-	"instagram":   {},
-	"facebook":    {},
-	"tumblr":      {},
+	"douyin":        {},
+	"bilibili":      {},
+	"weibo":         {},
+	"toutiao":       {},
+	"kuaishou":      {},
+	"pipixia":       {},
+	"pipigx":        {},
+	"zuiyou":        {},
+	"xiaohongshu":   {},
+	"x":             {},
+	"youtube":       {},
+	"instagram":     {},
+	"facebook":      {},
+	"tumblr":        {},
+	PlatformGeneric: {},
 }
 
 var dedicatedSystemEnvKeys = [4]string{

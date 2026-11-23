@@ -201,6 +201,7 @@ func WithAdmissionWithRegistry(next, pullControl http.Handler, mode, edgeKey str
 		public:      newConfiguredPool(config.Parse, config.MaxClients),
 		resolve:     newConfiguredPool(config.Resolve, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
+		genericSlow: newConfiguredPool(config.GenericSlowParse, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
 		relay:       newConfiguredPool(config.Relay, config.MaxClients),
@@ -223,14 +224,14 @@ func ReloadAPIKeys(handler http.Handler, next *APIKeyRegistry) bool {
 }
 
 type admission struct {
-	next, pullControl                              http.Handler
-	edgeKey                                        string
-	now                                            func() time.Time
-	stats                                          *Stats
-	public, resolve, slow, catalog, relay, reports *pool
-	owner                                          *keyPool
-	reloadMu                                       sync.Mutex
-	keys                                           atomic.Pointer[APIKeyRegistry]
+	next, pullControl                                           http.Handler
+	edgeKey                                                     string
+	now                                                         func() time.Time
+	stats                                                       *Stats
+	public, resolve, slow, genericSlow, catalog, relay, reports *pool
+	owner                                                       *keyPool
+	reloadMu                                                    sync.Mutex
+	keys                                                        atomic.Pointer[APIKeyRegistry]
 }
 
 func (a *admission) reloadAPIKeys(next *APIKeyRegistry) {
@@ -301,7 +302,8 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !client.IsValid() {
 		if kind == parser {
-			a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "SERVICE_NOT_CONFIGURED", ChannelAnonymous, time.Since(wallStart))
+			p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+			a.stats.RecordParse(admissionStatsPlatform(p, isGeneric), "SERVICE_NOT_CONFIGURED", ChannelAnonymous, time.Since(wallStart))
 		}
 		rejectAdmission(w, r, kind, http.StatusServiceUnavailable, 30)
 		return
@@ -347,13 +349,15 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			retry := a.public.chargeClient(client, a.now())
 			if retry > 0 {
 				if kind == parser {
-					a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
+					p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+					a.stats.RecordParse(admissionStatsPlatform(p, isGeneric), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
 				}
 				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 				return
 			}
 			if kind == parser {
-				a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), OutcomeUnauthorized, ChannelAnonymous, time.Since(wallStart))
+				p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+				a.stats.RecordParse(admissionStatsPlatform(p, isGeneric), OutcomeUnauthorized, ChannelAnonymous, time.Since(wallStart))
 			}
 			rejectUnauthorized(w, r, kind)
 			return
@@ -374,7 +378,8 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if retry > 0 {
 		if kind == parser {
-			a.stats.RecordParse(a.parsePlatform(r.URL.RawQuery), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
+			p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+			a.stats.RecordParse(admissionStatsPlatform(p, isGeneric), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
 		}
 		rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 		return
@@ -409,17 +414,19 @@ func (a *admission) serveAuthenticated(
 		return
 	}
 	var parsedPlatform string
+	var isGeneric bool
 	if kind == parser {
-		parsedPlatform = a.parsePlatform(r.URL.RawQuery)
+		parsedPlatform, isGeneric = a.classifyParseRoute(path, r.URL.RawQuery)
 		if parsedPlatform != "" && !key.AllowsPlatform(parsedPlatform) {
+			statsPlat := admissionStatsPlatform(parsedPlatform, isGeneric)
 			if retry := key.pool.chargeFastRead(a.now()); retry > 0 {
 				key.recordRateLimited()
-				a.stats.RecordParse(parsedPlatform, "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
+				a.stats.RecordParse(statsPlat, "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
 				rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 				return
 			}
 			key.recordUnauthorized()
-			a.stats.RecordParse(parsedPlatform, OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
+			a.stats.RecordParse(statsPlat, OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
 			rejectUnauthorizedWithMessage(w, r, kind, "当前凭据无权访问该平台")
 			return
 		}
@@ -440,7 +447,7 @@ func (a *admission) serveAuthenticated(
 	if kind == parser && r.Method == http.MethodGet && a.hasFreshCachedParse(path, r.URL.RawQuery) {
 		if retry := key.pool.chargeFastRead(a.now()); retry > 0 {
 			key.recordRateLimited()
-			a.stats.RecordParse(parsedPlatform, "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
+			a.stats.RecordParse(admissionStatsPlatform(parsedPlatform, isGeneric), "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
 			rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 			return
 		}
@@ -451,7 +458,7 @@ func (a *admission) serveAuthenticated(
 	}
 
 	// 4. Uncached parse / helper / legacy path via isolated per-key execution pool.
-	isSlow := kind == youtubeHelper || (kind == parser && traitsForPlatform(parsedPlatform).slowEngine)
+	isSlow := kind == youtubeHelper || (kind == parser && (isGeneric || traitsForPlatform(parsedPlatform).slowEngine))
 	if key.pool.queueWait > 0 {
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(key.pool.queueWait + serverWriteWindow))
 	}
@@ -462,7 +469,7 @@ func (a *admission) serveAuthenticated(
 	if retry > 0 {
 		key.recordRateLimited()
 		if kind == parser {
-			a.stats.RecordParse(parsedPlatform, "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
+			a.stats.RecordParse(admissionStatsPlatform(parsedPlatform, isGeneric), "RATE_LIMITED", ChannelOwner, time.Since(wallStart))
 		}
 		rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
 		return
@@ -504,7 +511,11 @@ func (a *admission) selectPool(r *http.Request, kind route, path string) *pool {
 		if a.hasFreshCachedParse(path, r.URL.RawQuery) {
 			return a.catalog
 		}
-		if traitsForPlatform(a.parsePlatform(r.URL.RawQuery)).slowEngine {
+		p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+		if isGeneric {
+			return a.genericSlow
+		}
+		if traitsForPlatform(p).slowEngine {
 			return a.slow
 		}
 		if path == "/api/resolve" {
@@ -531,6 +542,22 @@ func (a *admission) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Requ
 func (a *admission) hasCachedYouTubeContext() bool {
 	checker, ok := a.next.(interface{ HasCachedYouTubeContext() bool })
 	return ok && checker.HasCachedYouTubeContext()
+}
+
+func (a *admission) classifyParseRoute(path, rawQuery string) (string, bool) {
+	if classifier, ok := a.next.(interface {
+		ClassifyParseRoute(string, string) (string, bool)
+	}); ok {
+		return classifier.ClassifyParseRoute(path, rawQuery)
+	}
+	return a.parsePlatform(rawQuery), false
+}
+
+func admissionStatsPlatform(platform string, isGeneric bool) string {
+	if isGeneric || platform == PlatformGeneric {
+		return PlatformUnknown
+	}
+	return platform
 }
 
 func (a *admission) parsePlatform(rawQuery string) string {
@@ -921,9 +948,10 @@ func (a *admission) statsSnapshot() AdmissionStatsSnapshot {
 		return AdmissionStatsSnapshot{}
 	}
 	return AdmissionStatsSnapshot{
-		Fast:  a.public.statsSnapshot(),
-		Slow:  a.slow.statsSnapshot(),
-		Owner: a.keys.Load().ownerStatsSnapshot(a.owner),
+		Fast:        a.public.statsSnapshot(),
+		Slow:        a.slow.statsSnapshot(),
+		GenericSlow: a.genericSlow.statsSnapshot(),
+		Owner:       a.keys.Load().ownerStatsSnapshot(a.owner),
 	}
 }
 

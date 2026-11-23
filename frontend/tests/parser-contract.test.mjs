@@ -6,7 +6,7 @@ import {reactive, ref} from 'vue';
 
 // Real composables, synthetic network responses; no live platform requests.
 describe('unified frontend request contract', () => {
-let vite, parser, config, contract, selection, parseHelpers, ytHelperCore;
+let vite, parser, config, contract, selection, parseHelpers, ytHelperCore, platforms, iconPaths;
 const originalFetch=globalThis.fetch, originalWindow=globalThis.window;
 const media='https://media.example.test/video.mp4';
 const file=(id='one',url=media)=>({id,type:'video',variants:[{id:'main',delivery:{kind:'file',sources:[{url}]}}],default:{variant_id:'main',url}});
@@ -19,6 +19,8 @@ before(async()=>{
   selection=await vite.ssrLoadModule('/src/composables/useVideoSelection.ts');
   parseHelpers=await vite.ssrLoadModule('/src/utils/parseHelpers.ts');
   ytHelperCore=await vite.ssrLoadModule('/src/utils/youtubeHelperCore.js');
+  platforms=await vite.ssrLoadModule('/src/utils/platforms.ts');
+  iconPaths=await vite.ssrLoadModule('/src/utils/iconPaths.ts');
   await vite.ssrLoadModule('/src/services/tbvideo.ts');
   await vite.ssrLoadModule('/src/services/secureApiClient.ts');
   (await vite.ssrLoadModule('/src/services/operationLogger.js')).operationLogger.enableConsole=false;
@@ -466,6 +468,113 @@ test('YouTube mobile & desktop helper detection: mobile UA + helper succeeds ide
     if(origNavDesc) Object.defineProperty(globalThis,'navigator',origNavDesc);
     else delete globalThis.navigator;
   }
+});
+
+test('PR-C: all mode submits arbitrary public http(s) URLs, strips URL fragments, and accepts dynamic platform values including audio items',async()=>{
+  for(const [rawInput, wantUrl, dynamicPlatform] of [
+    ['Check out https://vimeo.com/123456#t=10s!', 'https://vimeo.com/123456', 'vimeo'],
+    ['分享视频 https://www.tiktok.com/@user/video/123#share_tag 复制此消息', 'https://www.tiktok.com/@user/video/123', 'tiktok'],
+    ['https://www.reddit.com/r/videos/comments/abc/demo/?utm_source=share#top', 'https://www.reddit.com/r/videos/comments/abc/demo/?utm_source=share', 'reddit'],
+    ['Listen: https://soundcloud.com/artist/track#comment', 'https://soundcloud.com/artist/track', 'soundcloud'],
+    ['http://streamable.com/abc123', 'http://streamable.com/abc123', 'streamable'],
+  ]) {
+    const {instance,store}=harness(rawInput);let requested;
+    const isAudio=dynamicPlatform==='soundcloud';
+    const item=isAudio
+      ? {
+          id:'audio-sc-1',
+          type:'audio',
+          variants:[{
+            id:'mp3-320',
+            label:'MP3 320kbps',
+            metadata:{has_audio:true,audio_codec:'mp3',container:'mp3',extension:'mp3',mime_type:'audio/mpeg',evidence:'upstream'},
+            delivery:{kind:'file',sources:[{url:'https://cdn.soundcloud.test/track.mp3'}]},
+          }],
+          default:{variant_id:'mp3-320',url:'https://cdn.soundcloud.test/track.mp3'},
+        }
+      : file();
+    globalThis.fetch=async url=>{requested=new URL(url,'https://snap.example.test');return Response.json(good({platform:dynamicPlatform,source_url:wantUrl,items:[item]}));};
+    assert.equal(instance.currentPlatform.value,'all');
+    await instance.parseVideo();
+    assert.equal(requested.pathname,'/api/parse');
+    assert.equal(requested.searchParams.get('schema_version'),'1.0');
+    assert.equal(requested.searchParams.get('platform'),'all');
+    assert.equal(requested.searchParams.get('url'),wantUrl);
+    assert.equal(instance.inputUrl.value,wantUrl);
+    assert.equal(store.resultData?.platform,dynamicPlatform);
+    assert.equal(store.resultData?.items[0].type,isAudio?'audio':'video');
+    assert.equal(instance.parseError.value,'');
+  }
+
+  let fetchCalls=0;
+  globalThis.fetch=async()=>{fetchCalls++;return Response.json(good());};
+  for(const invalid of ['#only-fragment','javascript:alert(1)','ftp://example.com/video.mp4']) {
+    const {instance,store}=harness(invalid);
+    await instance.parseVideo();
+    assert.equal(fetchCalls,0);
+    assert.equal(store.resultData,null);
+    assert.equal(instance.parseError.value,'请输入有效分享链接');
+  }
+});
+
+test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and formats arbitrary long-tail platforms with verified SVGs',()=>{
+  const core14=[
+    ['douyin','抖音','Douyin','fa-music'],
+    ['kuaishou','快手','Kuaishou','fa-bolt'],
+    ['bilibili','B站','Bilibili','fa-play-circle'],
+    ['xiaohongshu','小红书','Xiaohongshu','fa-bookmark'],
+    ['toutiao','今日头条','Toutiao','fa-newspaper'],
+    ['weibo','微博','Weibo','fa-comment'],
+    ['pipixia','皮皮虾','Pipixia','fa-face-laugh'],
+    ['pipigx','皮皮搞笑','Pipigx','fa-face-smile'],
+    ['zuiyou','最右','Zuiyou','fa-comments'],
+    ['x','X','X','fa-x-twitter'],
+    ['youtube','YouTube','YouTube','fa-youtube'],
+    ['instagram','Instagram','Instagram','fa-instagram'],
+    ['facebook','Facebook','Facebook','fa-facebook'],
+    ['tumblr','Tumblr','Tumblr','fa-tumblr'],
+  ];
+  for(const [id,zhLabel,enLabel,expectedIcon] of core14) {
+    const zh=platforms.resolvePlatformPresentation(id,'zh-CN');
+    const en=platforms.resolvePlatformPresentation(id,'en');
+    assert.deepEqual(zh,{id,label:zhLabel,icon:expectedIcon,isBuiltin:true});
+    assert.deepEqual(en,{id,label:enLabel,icon:expectedIcon,isBuiltin:true});
+    assert.ok(iconPaths.iconForClass(zh.icon),`built-in icon ${zh.icon} must exist in iconPaths.ts`);
+  }
+
+  const longTail=[
+    ['tiktok','TikTok','fa-film'],
+    ['vimeo','Vimeo','fa-film'],
+    ['reddit','Reddit','fa-film'],
+    ['twitch','Twitch','fa-film'],
+    ['twitchvod','Twitch','fa-film'],
+    ['twitchclips','Twitch','fa-film'],
+    ['soundcloud','SoundCloud','fa-headphones'],
+    ['bandcamp','Bandcamp','fa-headphones'],
+    ['niconico','Niconico','fa-film'],
+    ['pinterest','Pinterest','fa-film'],
+    ['dailymotion','Dailymotion','fa-film'],
+    ['vk','VK','fa-film'],
+    ['streamable','Streamable','fa-film'],
+    ['custom_site','Custom Site','fa-film'],
+    ['site_9gag','9GAG','fa-film'],
+    ['site_7plus','7plus','fa-film'],
+  ];
+  for(const [id,expectedLabel,expectedIcon] of longTail) {
+    const resolved=platforms.resolvePlatformPresentation(id,'zh-CN');
+    assert.deepEqual(resolved,{id,label:expectedLabel,icon:expectedIcon,isBuiltin:false});
+    assert.ok(iconPaths.iconForClass(resolved.icon),`generic icon ${resolved.icon} for ${id} must exist in iconPaths.ts`);
+  }
+
+  const customAudio=platforms.resolvePlatformPresentation('custom_radio','en','audio');
+  assert.deepEqual(customAudio,{id:'custom_radio',label:'Custom Radio',icon:'fa-headphones',isBuiltin:false});
+  assert.ok(iconPaths.iconForClass(customAudio.icon));
+
+  // Case/whitespace normalization & prototype-key safety
+  assert.deepEqual(platforms.resolvePlatformPresentation('  Vimeo  ','en'),{id:'vimeo',label:'Vimeo',icon:'fa-film',isBuiltin:false});
+  assert.deepEqual(platforms.resolvePlatformPresentation('constructor','en'),{id:'constructor',label:'Constructor',icon:'fa-film',isBuiltin:false});
+  assert.deepEqual(platforms.resolvePlatformPresentation(undefined,'zh-CN'),{id:'',label:'通用媒体',icon:'fa-film',isBuiltin:false});
+  assert.deepEqual(platforms.resolvePlatformPresentation('','en'),{id:'',label:'Media',icon:'fa-film',isBuiltin:false});
 });
 
 });

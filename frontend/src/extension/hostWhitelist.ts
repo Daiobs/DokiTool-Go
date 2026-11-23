@@ -292,18 +292,28 @@ function isIpv4Literal(host: string): boolean {
   return false;
 }
 
+const RESERVED_HOST_LABELS = [
+  "localhost",
+  "local",
+  "internal",
+  "localdomain",
+  "home.arpa",
+  "invalid",
+  "lan",
+  "corp",
+  "intranet",
+  "private",
+] as const;
+
 function isPrivateOrReservedHost(host: string): boolean {
   if (!host) return true;
   if (host.startsWith("[") || host.includes(":")) {
     return true; // Reject all IPv6 literals
   }
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal")
-  ) {
-    return true;
+  for (const label of RESERVED_HOST_LABELS) {
+    if (host === label || host.endsWith(`.${label}`)) {
+      return true;
+    }
   }
   if (isIpv4Literal(host)) {
     return true;
@@ -568,4 +578,100 @@ export function isWhitelistedMediaUrl(
     hostname,
     reason: `媒体域名 ${hostname} 未收录于扩展白名单`,
   };
+}
+
+export interface NativeBrowserDownloadCheckResult {
+  safe: boolean;
+  hostname: string;
+  reason?: string;
+}
+
+/**
+ * Validates whether a direct media file URL is safe to hand off to Chrome's native
+ * `chrome.downloads.download({ url, filename })` API without requiring `<all_urls>`
+ * or invoking the Offscreen `fetch` engine.
+ *
+ * Accepts ONLY public HTTP/HTTPS DNS domains on standard ports (80/443), or an
+ * explicitly authorized `extraAllowedOrigins` entry, while rejecting unsafe chars,
+ * userinfo (`@`), `#fragment`, non-standard ports, IP literals, private/reserved
+ * suffixes, and `dokitool.com` / `*.dokitool.com`.
+ */
+export function isSafeNativeBrowserDownloadUrl(
+  rawUrl: string,
+  extraAllowedOrigins?: string[],
+): NativeBrowserDownloadCheckResult {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    return { safe: false, hostname: "", reason: "下载链接为空" };
+  }
+  const trimmed = rawUrl.trim();
+  if (
+    trimmed.length > 8192 ||
+    hasUnsafeUrlChars(trimmed) ||
+    hasRawEmptyPort(trimmed)
+  ) {
+    return { safe: false, hostname: "", reason: "下载链接包含非法字符或无效端口" };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { safe: false, hostname: "", reason: "下载链接格式无效" };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (!hostname) {
+    return { safe: false, hostname: "", reason: "下载链接缺少主机名" };
+  }
+
+  const schemeIdx = trimmed.indexOf("://");
+  const afterScheme = schemeIdx >= 0 ? trimmed.slice(schemeIdx + 3) : "";
+  const pathStart = afterScheme.search(/[/?#]/);
+  const authority =
+    pathStart >= 0 ? afterScheme.slice(0, pathStart) : afterScheme;
+  if (parsed.username || parsed.password || authority.includes("@")) {
+    return { safe: false, hostname, reason: "下载链接不允许包含凭据信息" };
+  }
+
+  if (parsed.hash || trimmed.includes("#")) {
+    return { safe: false, hostname, reason: "下载链接不允许包含片段锚点" };
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return { safe: false, hostname, reason: "仅允许 HTTP/HTTPS 下载链接" };
+  }
+
+  if (Array.isArray(extraAllowedOrigins)) {
+    for (const extra of extraAllowedOrigins) {
+      if (typeof extra === "string" && matchesExtraOrigin(parsed, extra)) {
+        return { safe: true, hostname };
+      }
+    }
+  }
+
+  if (parsed.port !== "") {
+    return {
+      safe: false,
+      hostname,
+      reason: `下载链接不允许非标准端口（:${parsed.port}）`,
+    };
+  }
+
+  if (!VALID_DNS_HOSTNAME.test(hostname) || isPrivateOrReservedHost(hostname)) {
+    return {
+      safe: false,
+      hostname,
+      reason: `下载域名 ${hostname} 不是合法的公开域名`,
+    };
+  }
+
+  if (hostname === "dokitool.com" || hostname.endsWith(".dokitool.com")) {
+    return {
+      safe: false,
+      hostname,
+      reason: `下载域名 ${hostname} 不允许通过浏览器直下路径访问`,
+    };
+  }
+
+  return { safe: true, hostname };
 }

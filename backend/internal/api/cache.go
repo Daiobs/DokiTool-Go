@@ -124,6 +124,7 @@ type cacheKey struct {
 type cachedResponse struct {
 	status     int
 	code       string
+	platform   string
 	body       []byte
 	retryAfter string
 }
@@ -168,7 +169,7 @@ func newParseCache(cfg CacheConfig) (*parseCache, error) {
 }
 
 func cacheEntrySize(key cacheKey, res cachedResponse) int64 {
-	return int64(len(key.route) + len(key.platform) + len(key.url) + len(key.itemID) + len(res.retryAfter) + len(res.body))
+	return int64(len(key.route) + len(key.platform) + len(key.url) + len(key.itemID) + len(res.platform) + len(res.retryAfter) + len(res.body))
 }
 
 func storeHitSeqMonotonic(dst *atomic.Uint64, seq uint64) {
@@ -442,6 +443,20 @@ func normalizeCacheURL(platform, source string) string {
 		b.WriteString(u.RawQuery)
 	}
 	return b.String()
+}
+
+// computeCacheTTLForPlatform applies computeCacheTTL and caps successful
+// Tier-2 generic fallback responses at defaultCacheTTL (60s) for short-TTL
+// long-tail caching.
+func computeCacheTTLForPlatform(platform string, payload unified.Object, now time.Time) (time.Duration, bool) {
+	ttl, ok := computeCacheTTL(payload, now)
+	if !ok {
+		return 0, false
+	}
+	if platform == PlatformGeneric && unified.Str(payload["code"]) == "OK" && ttl > defaultCacheTTL {
+		ttl = defaultCacheTTL
+	}
+	return ttl, true
 }
 
 // computeCacheTTL implements the Issue #102 PR 1 caching policy:

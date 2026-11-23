@@ -217,7 +217,7 @@ func PopulateMissingMP4Sizes(ctx context.Context, info *Info, prober SizeProber,
 			}
 			fCopy := f
 			fCopy.URL = cleanURL
-			if !isProgressiveMP4Format(fCopy, opts.AllowCodecLessProgressiveMP4) {
+			if !isProgressiveVideoFormat(fCopy, opts) {
 				continue
 			}
 			if !seen[cleanURL] {

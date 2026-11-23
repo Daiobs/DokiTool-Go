@@ -16,7 +16,7 @@ import type {
 import type {
   OwnerStatsResult,
   StatsSnapshot,
-} from "./statsTypes";
+} from "../monitor/statsTypes";
 import type {
   BatchUrlExtractResult,
   MatchedPlatformUrl,

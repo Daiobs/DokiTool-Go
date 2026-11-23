@@ -44,7 +44,11 @@ import {
   formatBatchItemIndex,
   sanitizeFilenameSegment,
 } from "./filenameSanitizer";
-import { validateApiBaseUrl } from "./hostWhitelist";
+import {
+  isSafeNativeBrowserDownloadUrl,
+  isWhitelistedMediaUrl,
+  validateApiBaseUrl,
+} from "./hostWhitelist";
 import {
   DEFAULT_DIRECT_FILE_MAX_CONCURRENCY,
   ExtensionDownloadError,
@@ -195,6 +199,11 @@ function isStandaloneAudioVariant(variant: ReadyVariant): boolean {
     (mime.startsWith("audio/") ||
       ext === "m4a" ||
       ext === "mp3" ||
+      ext === "aac" ||
+      ext === "opus" ||
+      ext === "ogg" ||
+      ext === "wav" ||
+      ext === "flac" ||
       ext === "webm")
   );
 }
@@ -210,6 +219,7 @@ function isDubbedAudioVariant(variant: ReadyVariant): boolean {
 
 interface ScoredCandidate {
   plan: SelectedVariantPlan;
+  isDownloadable: boolean;
   shortEdge: number;
   pixelArea: number;
   fps: number;
@@ -221,10 +231,85 @@ interface ScoredCandidate {
   isDefault: boolean;
 }
 
+function isPlanDirectlyDownloadable(
+  plan: SelectedVariantPlan,
+  context: TargetContext,
+  allowedOrigins: string[],
+): boolean {
+  const isWhitelisted = (url: string) =>
+    isWhitelistedMediaUrl(url, allowedOrigins).allowed;
+
+  if (plan.youtubeMux) {
+    return (
+      isWhitelisted(plan.youtubeMux.videoUrl) &&
+      isWhitelisted(plan.youtubeMux.audioUrl)
+    );
+  }
+  if (plan.dashMux) {
+    return (
+      plan.dashMux.videoRoutes.some(isWhitelisted) &&
+      plan.dashMux.audioRoutes.some(isWhitelisted)
+    );
+  }
+  if (plan.target.kind === "file") {
+    return (
+      plan.target.routes.some(isWhitelisted) ||
+      plan.target.routes.some(
+        (r) => isSafeNativeBrowserDownloadUrl(r, allowedOrigins).safe,
+      )
+    );
+  }
+  if (plan.target.kind === "hls" && plan.variant.delivery.kind === "hls") {
+    return deliveryRoutes(plan.variant.delivery.sources, context).some(
+      isWhitelisted,
+    );
+  }
+  if (
+    plan.target.kind === "segments" &&
+    plan.variant.delivery.kind === "segments"
+  ) {
+    const chunks: Chunk[] = [
+      ...(plan.variant.delivery.init ? [plan.variant.delivery.init] : []),
+      ...plan.variant.delivery.pieces,
+    ];
+    return (
+      chunks.length > 0 &&
+      chunks.every((chunk) =>
+        deliveryRoutes(chunk.sources, context).some(isWhitelisted),
+      )
+    );
+  }
+  if (plan.target.kind === "pair" && plan.variant.delivery.kind === "pair") {
+    return (
+      plan.variant.delivery.resources.length > 0 &&
+      plan.variant.delivery.resources.every((res) => {
+        const del = res.delivery;
+        if (del.kind === "segments") {
+          const chunks: Chunk[] = [
+            ...(del.init ? [del.init] : []),
+            ...del.pieces,
+          ];
+          return (
+            chunks.length > 0 &&
+            chunks.every((chunk) =>
+              deliveryRoutes(chunk.sources, context).some(isWhitelisted),
+            )
+          );
+        }
+        return deliveryRoutes(del.sources, context).some(isWhitelisted);
+      })
+    );
+  }
+  return false;
+}
+
 function compareScoredCandidatesDesc(
   a: ScoredCandidate,
   b: ScoredCandidate,
 ): number {
+  if (a.isDownloadable !== b.isDownloadable) {
+    return a.isDownloadable ? -1 : 1;
+  }
   if (a.hasPlayableAudio !== b.hasPlayableAudio) {
     return a.hasPlayableAudio ? -1 : 1;
   }
@@ -266,11 +351,16 @@ export function selectVariantByPreference(
   qualityPreference: QualityPreference,
   apiOrigin: string,
   now?: number,
+  extraAllowedOrigins?: string[],
 ): SelectedVariantPlan | null {
   if (!readyItem(item)) {
     return null;
   }
   const context: TargetContext = buildExtensionTargetContext(apiOrigin, now);
+  const allowedOrigins = buildEffectiveExtraOrigins(
+    apiOrigin,
+    extraAllowedOrigins,
+  );
   const readyVariants = item.variants.filter(readyVariant);
 
   // 1. Image / LivePhoto items always resolve as visual items even when qualityPreference === "audio"
@@ -315,6 +405,7 @@ export function selectVariantByPreference(
   if (qualityPreference === "audio") {
     const audioPlans: Array<{
       plan: SelectedVariantPlan;
+      isDownloadable: boolean;
       prefersM4a: boolean;
       notDubbed: boolean;
       bitrate: number;
@@ -336,8 +427,18 @@ export function selectVariantByPreference(
         ""
       ).toLowerCase();
       const mime = (variant.metadata?.mime_type || "").toLowerCase();
+      const candidatePlan: SelectedVariantPlan = {
+        variant,
+        target,
+        isAudioOnly: true,
+      };
       audioPlans.push({
-        plan: { variant, target, isAudioOnly: true },
+        plan: candidatePlan,
+        isDownloadable: isPlanDirectlyDownloadable(
+          candidatePlan,
+          context,
+          allowedOrigins,
+        ),
         prefersM4a:
           ext === "m4a" ||
           mime === "audio/mp4" ||
@@ -390,13 +491,19 @@ export function selectVariantByPreference(
           ""
         ).toLowerCase();
         const mime = (syntheticVariant.metadata?.mime_type || "").toLowerCase();
+        const attPlan: SelectedVariantPlan = {
+          variant: syntheticVariant,
+          target,
+          isAudioOnly: true,
+          ...(att.id ? { attachmentId: att.id } : {}),
+        };
         audioPlans.push({
-          plan: {
-            variant: syntheticVariant,
-            target,
-            isAudioOnly: true,
-            ...(att.id ? { attachmentId: att.id } : {}),
-          },
+          plan: attPlan,
+          isDownloadable: isPlanDirectlyDownloadable(
+            attPlan,
+            context,
+            allowedOrigins,
+          ),
           prefersM4a: ext === "m4a" || mime === "audio/mp4" || ext === "mp3",
           notDubbed: true,
           bitrate:
@@ -437,6 +544,9 @@ export function selectVariantByPreference(
 
     if (audioPlans.length > 0) {
       audioPlans.sort((a, b) => {
+        if (a.isDownloadable !== b.isDownloadable) {
+          return a.isDownloadable ? -1 : 1;
+        }
         if (a.notDubbed !== b.notDubbed) return a.notDubbed ? -1 : 1;
         if (a.prefersM4a !== b.prefersM4a) return a.prefersM4a ? -1 : 1;
         return b.bitrate - a.bitrate;
@@ -508,14 +618,20 @@ export function selectVariantByPreference(
       }
     }
 
+    const candidatePlan: SelectedVariantPlan = {
+      variant,
+      target,
+      isAudioOnly: item.type === "audio",
+      ...(youtubeMux ? { youtubeMux } : {}),
+      ...(dashMux ? { dashMux } : {}),
+    };
     candidates.push({
-      plan: {
-        variant,
-        target,
-        isAudioOnly: item.type === "audio",
-        ...(youtubeMux ? { youtubeMux } : {}),
-        ...(dashMux ? { dashMux } : {}),
-      },
+      plan: candidatePlan,
+      isDownloadable: isPlanDirectlyDownloadable(
+        candidatePlan,
+        context,
+        allowedOrigins,
+      ),
       shortEdge,
       pixelArea,
       fps,
@@ -540,21 +656,25 @@ export function selectVariantByPreference(
     return null;
   }
 
+  const preferredPool = candidates.some((c) => c.isDownloadable)
+    ? candidates.filter((c) => c.isDownloadable)
+    : candidates;
+
   if (qualityPreference === "1080p") {
-    const within1080 = candidates.filter(
+    const within1080 = preferredPool.filter(
       (c) => c.shortEdge > 0 && c.shortEdge <= 1080,
     );
     if (within1080.length > 0) {
       within1080.sort(compareScoredCandidatesDesc);
       return within1080[0].plan;
     }
-    const unknownRes = candidates.filter((c) => c.shortEdge === 0);
+    const unknownRes = preferredPool.filter((c) => c.shortEdge === 0);
     if (unknownRes.length > 0) {
       unknownRes.sort(compareScoredCandidatesDesc);
       return unknownRes[0].plan;
     }
     // All variants are > 1080p: pick the closest one above 1080p with playable audio
-    const above = [...candidates].sort((a, b) => {
+    const above = [...preferredPool].sort((a, b) => {
       if (a.hasPlayableAudio !== b.hasPlayableAudio) {
         return a.hasPlayableAudio ? -1 : 1;
       }
@@ -566,8 +686,8 @@ export function selectVariantByPreference(
     return above[0].plan;
   }
 
-  candidates.sort(compareScoredCandidatesDesc);
-  return candidates[0].plan;
+  preferredPool.sort(compareScoredCandidatesDesc);
+  return preferredPool[0].plan;
 }
 
 function inferExtensionVideoExtFromUrl(
@@ -987,6 +1107,7 @@ export function buildEnqueueItemsForMedia(
         qualityPreference,
         apiOrigin,
         options.now,
+        extraAllowedOrigins,
       );
     }
 
@@ -1281,13 +1402,34 @@ export function buildEnqueueItemsForMedia(
     isMultiItemCollection ||
     leaves.length > 1;
 
+  const allLeavesWhitelistedForZip = leaves.every((leaf) => {
+    const primaryWhitelisted = leaf.routes.some(
+      (r) => isWhitelistedMediaUrl(r, extraAllowedOrigins).allowed,
+    );
+    if (!primaryWhitelisted) return false;
+    if (leaf.segments && leaf.segments.length > 0) {
+      return leaf.segments.every((seg) => {
+        const segRoutes = seg.routes?.length
+          ? seg.routes
+          : seg.url
+            ? [seg.url]
+            : [];
+        return segRoutes.some(
+          (r) => isWhitelistedMediaUrl(r, extraAllowedOrigins).allowed,
+        );
+      });
+    }
+    return true;
+  });
+
   const canPackAsZip =
     batchSaveMode === "zip" &&
     (leaves.length > 1 || isMultiItemCollection) &&
     leaves.every(
       (leaf) =>
         leaf.specKind === "direct_file" || leaf.specKind === "segments",
-    );
+    ) &&
+    allLeavesWhitelistedForZip;
 
   if (canPackAsZip) {
     let knownTotalBytes = 0;

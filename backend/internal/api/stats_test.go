@@ -1923,3 +1923,163 @@ func TestStatsConcurrentRecordSnapshotSaveRace(t *testing.T) {
 		}
 	}
 }
+
+type stubYTDLPStatsSource struct {
+	snap ytengine.SlotStatsSnapshot
+}
+
+func (s stubYTDLPStatsSource) StatsSnapshot() ytengine.SlotStatsSnapshot {
+	return s.snap
+}
+
+func TestStatsGenericYTDLPAndGenericSlowAdmission(t *testing.T) {
+	// 1. Nil and freshly initialized Stats emit zero-valued admission.generic_slow and ytdlp_generic.
+	var nilStats *Stats
+	nilStats.SetGenericYTDLPEngine(stubYTDLPStatsSource{snap: ytengine.SlotStatsSnapshot{Enabled: true}})
+	nilSnap := nilStats.Snapshot()
+	if nilSnap.YTDLPGeneric.Enabled || nilSnap.YTDLPGeneric.ConcurrencyLimit != 0 || nilSnap.Admission.GenericSlow.ConcurrencyLimit != 0 {
+		t.Fatalf("nil Stats snapshot unexpected generic fields: ytdlp_generic=%+v generic_slow=%+v", nilSnap.YTDLPGeneric, nilSnap.Admission.GenericSlow)
+	}
+	rawNil, err := json.Marshal(nilSnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawNil), `"generic_slow":{`) || !strings.Contains(string(rawNil), `"ytdlp_generic":{`) {
+		t.Fatalf("nil Stats JSON missing generic_slow or ytdlp_generic keys: %s", string(rawNil))
+	}
+
+	// 2. Typed-nil *ytengine.Engine passed to SetGenericYTDLPEngine stays safe zero-value.
+	st := NewStats(nil)
+	var typedNilEng *ytengine.Engine
+	st.SetGenericYTDLPEngine(typedNilEng)
+	if got := st.Snapshot().YTDLPGeneric; got.Enabled || got.Active != 0 || got.ConcurrencyLimit != 0 {
+		t.Fatalf("typed-nil SetGenericYTDLPEngine produced non-zero snapshot: %+v", got)
+	}
+
+	// 3. Custom YTDLPStatsSource wired via SetGenericYTDLPEngine appears in ytdlp_generic without affecting ytdlp.
+	wantMock := ytengine.SlotStatsSnapshot{
+		Enabled:          true,
+		Active:           2,
+		Waiting:          1,
+		ConcurrencyLimit: 4,
+		Total: ytengine.ChannelSlotStatsSnapshot{
+			AcquiredCount: 9,
+			WaitCount:     3,
+			CanceledCount: 1,
+			WaitMSTotal:   450,
+			WaitMSMax:     220,
+		},
+	}
+	st.SetGenericYTDLPEngine(stubYTDLPStatsSource{snap: wantMock})
+	mockSnap := st.Snapshot()
+	if mockSnap.YTDLPGeneric != wantMock {
+		t.Fatalf("YTDLPGeneric = %+v, want %+v", mockSnap.YTDLPGeneric, wantMock)
+	}
+	if mockSnap.YTDLP.Enabled || mockSnap.YTDLP.ConcurrencyLimit != 0 {
+		t.Fatalf("YTDLP should remain zero when only generic source is set: %+v", mockSnap.YTDLP)
+	}
+
+	// 4. End-to-end HTTP /api/stats reports both admission.generic_slow and ytdlp_generic from live engines.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	ownerToken := randomPrintableToken(t, 48)
+	edgeKey := randomPrintableToken(t, 48)
+	gateDir := t.TempDir()
+	binPath := filepath.Join(gateDir, "yt-dlp-fake")
+	script := "#!/bin/sh\nset -eu\n" + `
+touch "` + gateDir + `/started"
+while [ ! -f "` + gateDir + `/release" ]; do
+  sleep 0.01
+done
+echo '{"id":"12345","extractor_key":"Vimeo","extractor":"vimeo","title":"Demo","formats":[{"format_id":"1","url":"https://cdn.vimeo.test/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a","width":1280,"height":720,"filesize":1024}]}'
+`
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(script))
+	baseEng, err := ytengine.New(ytengine.Config{
+		BinaryPath:     binPath,
+		AllowedHashes:  map[string]string{hex.EncodeToString(sum[:]): "yt-dlp-generic-stats-test"},
+		Resolver:       staticPublicResolver{},
+		MaxConcurrency: 2,
+		Timeout:        10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	genericEng := baseEng.
+		WithGenericConcurrency(3).
+		WithTargetPolicy(ytgeneric.AllowedGenericInputURL, ytgeneric.AllowedGenericOutboundHost).
+		WithExtractors(ytgeneric.GenericExtractorArgs()...)
+
+	c := makeStatsTestCatalog(t)
+	h, err := NewWithCacheConfig(c, nil, time.Now, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetGenericAdapter(ytgeneric.NewGenericNamed(genericEng, nil, staticPublicResolver{}))
+	h.Stats().SetYTDLPEngine(baseEng)
+	h.Stats().SetGenericYTDLPEngine(genericEng)
+
+	cfg := DefaultAdmissionConfig()
+	cfg.GenericSlowParse.GlobalConcurrency = 3
+	cfg.GenericSlowParse.QueueSize = 12
+	auth, err := NewOwnerAuth(ownerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := WithAdmissionWithOwner(h, nil, "caddy", edgeKey, cfg, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start one in-flight anonymous generic parse to observe active=1 in both admission.generic_slow and ytdlp_generic!
+	doneCh := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://vimeo.com/12345"), nil)
+		req.RemoteAddr = "127.0.0.1:44100"
+		req.Header.Set(edgeHeader, edgeKey)
+		req.Header.Set(clientHeader, "198.51.100.80")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		doneCh <- rec.Code
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, statErr := os.Stat(filepath.Join(gateDir, "started")); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for generic yt-dlp subprocess to start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	status, liveSnap := fetchStatsSnapshot(t, router, edgeKey, ownerToken, "198.51.100.99", "schema_version=1.0")
+	if status != http.StatusOK {
+		t.Fatalf("GET /api/stats status=%d", status)
+	}
+	if liveSnap.Admission.GenericSlow.Active != 1 || liveSnap.Admission.GenericSlow.ConcurrencyLimit != 3 || liveSnap.Admission.GenericSlow.QueueLimit != 12 {
+		t.Fatalf("unexpected live admission.generic_slow: %+v", liveSnap.Admission.GenericSlow)
+	}
+	if !liveSnap.YTDLPGeneric.Enabled || liveSnap.YTDLPGeneric.Active != 1 || liveSnap.YTDLPGeneric.ConcurrencyLimit != 3 {
+		t.Fatalf("unexpected live ytdlp_generic: %+v", liveSnap.YTDLPGeneric)
+	}
+	if !liveSnap.YTDLP.Enabled || liveSnap.YTDLP.Active != 0 || liveSnap.YTDLP.ConcurrencyLimit != 2 {
+		t.Fatalf("expected core ytdlp unaffected (active=0, limit=2), got %+v", liveSnap.YTDLP)
+	}
+
+	if err := os.WriteFile(filepath.Join(gateDir, "release"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-doneCh; code != http.StatusOK {
+		t.Fatalf("generic parse status=%d, want 200", code)
+	}
+
+	_, endSnap := fetchStatsSnapshot(t, router, edgeKey, ownerToken, "198.51.100.99", "schema_version=1.0")
+	if endSnap.Admission.GenericSlow.Active != 0 || endSnap.YTDLPGeneric.Active != 0 || endSnap.YTDLPGeneric.Total.AcquiredCount != 1 {
+		t.Fatalf("unexpected post-release generic stats: adm=%+v ytdlp_generic=%+v", endSnap.Admission.GenericSlow, endSnap.YTDLPGeneric)
+	}
+}

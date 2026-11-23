@@ -243,23 +243,31 @@ func (s *slotStats) recordContendedWait(chIdx int, d time.Duration, canceled boo
 	c.waitHist.observe(d)
 }
 
-// StatsSnapshot returns a point-in-time snapshot of shared yt-dlp concurrency slot gauges and per-channel wait counters.
+// StatsSnapshot returns a point-in-time snapshot of yt-dlp concurrency slot gauges and per-channel wait counters.
+// When the Engine has a dedicated subSem (fixed gate-ports generic sub-pool), it reports the sub-pool's
+// active/limit gauges and isolated subSlotStats rather than the shared Tier-1 semaphore.
 func (e *Engine) StatsSnapshot() SlotStatsSnapshot {
 	if e == nil {
 		return SlotStatsSnapshot{}
 	}
 	var out SlotStatsSnapshot
 	out.Enabled = e.enabled
-	if e.sem != nil {
-		out.Active = len(e.sem)
-		out.ConcurrencyLimit = cap(e.sem)
+	sem := e.sem
+	stats := e.slotStats
+	if e.subSem != nil {
+		sem = e.subSem
+		stats = e.subSlotStats
 	}
-	if e.slotStats == nil {
+	if sem != nil {
+		out.Active = len(sem)
+		out.ConcurrencyLimit = cap(sem)
+	}
+	if stats == nil {
 		return out
 	}
-	anon := e.slotStats.channels[chAnonIdx].snapshot()
-	owner := e.slotStats.channels[chOwnerIdx].snapshot()
-	waiting := e.slotStats.channels[chAnonIdx].waiting.Load() + e.slotStats.channels[chOwnerIdx].waiting.Load()
+	anon := stats.channels[chAnonIdx].snapshot()
+	owner := stats.channels[chOwnerIdx].snapshot()
+	waiting := stats.channels[chAnonIdx].waiting.Load() + stats.channels[chOwnerIdx].waiting.Load()
 	if waiting < 0 {
 		waiting = 0
 	}

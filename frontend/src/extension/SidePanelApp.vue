@@ -24,7 +24,7 @@ import {
   computeTodayVsYesterday,
   formatPercent,
   type TodayVsYesterdaySummary,
-} from "./statsTypes";
+} from "../monitor/statsTypes";
 import {
   DEFAULT_EXTENSION_SETTINGS,
   buildWorkFingerprint,
@@ -41,7 +41,9 @@ import {
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
 import {
+  extractActiveParseUrlsFromText,
   extractSupportedUrlsFromText,
+  matchActiveParseUrl,
   matchSupportedPlatformUrl,
 } from "./urlMatcher";
 
@@ -158,7 +160,7 @@ const isCurrentWorkSaved = computed<boolean>(() =>
 
 const batchUrlPreviewCount = computed<number>(() => {
   if (!batchRawText.value.trim()) return 0;
-  return extractSupportedUrlsFromText(batchRawText.value).items.length;
+  return extractActiveParseUrlsFromText(batchRawText.value).items.length;
 });
 
 const currentTabMatched = computed<MatchedPlatformUrl | null>(
@@ -246,7 +248,7 @@ async function refreshOwnerStatsSilently(options?: {
 }
 
 function handleOpenMonitorDashboard() {
-  void openMonitorDashboardTab();
+  void openMonitorDashboardTab(settings.value.apiBaseUrl);
 }
 
 // ============================================================================
@@ -260,18 +262,32 @@ function extractFirstSupportedUrl(rawText: string): MatchedPlatformUrl | null {
   return extracted.items[0] ?? null;
 }
 
+function extractFirstActiveParseUrl(
+  rawText: string,
+): MatchedPlatformUrl | null {
+  const direct = matchActiveParseUrl(rawText.trim());
+  if (direct) return direct;
+  const extracted = extractActiveParseUrlsFromText(rawText);
+  return extracted.items[0] ?? null;
+}
+
 async function runParseUrl(
   rawCandidate: string,
   origin: "tab" | "manual",
   options?: { forceRefresh?: boolean },
 ) {
-  const matched = extractFirstSupportedUrl(rawCandidate);
+  const matched =
+    origin === "tab"
+      ? extractFirstSupportedUrl(rawCandidate)
+      : extractFirstActiveParseUrl(rawCandidate);
   if (!matched) {
     parseGeneration += 1;
     isParsing.value = false;
     parseErrorStatus.value = undefined;
     parseError.value =
-      "未识别到支持的 14 个平台链接（本地隐私保护：未向后端发送任何请求）";
+      origin === "tab"
+        ? "未识别到支持的 14 个核心平台链接（本地隐私保护：未向后端发送任何请求）"
+        : "未识别到有效的公开媒体链接（已本地拦截内网、IP 与浏览器内部地址）";
     return;
   }
 
@@ -440,9 +456,10 @@ async function handlePendingIntent(intent: PendingPanelIntent | null) {
   pendingTabSyncOffer.value = null;
   urlInput.value = intent.url;
 
-  const matchedIntent = extractFirstSupportedUrl(intent.url);
+  const matchedIntent = extractFirstActiveParseUrl(intent.url);
   const isSameAsTab =
     Boolean(matchedIntent) &&
+    !matchedIntent?.isGeneric &&
     matchedIntent?.dedupeKey === tabSync.value?.matched?.dedupeKey;
   await runParseUrl(intent.url, isSameAsTab ? "tab" : "manual");
 }
@@ -871,7 +888,7 @@ onUnmounted(() => {
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
           </svg>
-          <span>当前标签页非支持平台（零外发请求）</span>
+          <span>当前标签页非自动跟随平台（零外发请求，长尾站点可手动粘贴或右键解析）</span>
         </div>
 
         <!-- Prominent 1-Click Parse Current Tab Button when autoFollowTab is off -->
@@ -897,7 +914,7 @@ onUnmounted(() => {
               spellcheck="false"
               autocomplete="off"
               class="sp-input sp-url-bar__input"
-              placeholder="粘贴作品链接或整段分享口令..."
+              placeholder="粘贴作品链接或分享口令（支持 14 核心平台及 TikTok/Vimeo/Reddit/SoundCloud 等长尾站点）..."
             />
             <button
               v-if="urlInput"
@@ -983,7 +1000,7 @@ onUnmounted(() => {
         >
           <div class="sp-empty-guide__title">极速素材收集已就绪</div>
           <ul class="sp-empty-guide__list">
-            <li>支持抖音、小红书、B站、微博、YouTube 4K60、X、IG、快手、最右、头条等 14 平台</li>
+            <li>支持抖音、小红书、B站、微博、YouTube 4K60、X、IG 等 14 核心平台，并支持主动粘贴解析 TikTok、Vimeo、Reddit、SoundCloud 等长尾站点</li>
             <li>网页任意卡片右键可「极速下载」或按 <kbd>Alt+Shift+D</kbd> 呼出本面板</li>
             <li>后台独立 Offscreen 引擎写盘，随时关掉侧边栏下载不断流</li>
           </ul>
