@@ -1,15 +1,16 @@
 import type { DownloadSnapshot, SourceProbe } from "../downloads/types";
 import type { DownloadTask, YouTubeHelperState } from "../types/media";
 import {
-  deliveryRoutes,
+  availableSources,
   readyItem,
   readyVariant,
+  sourceRoutes,
   sourceUrl,
 } from "../utils/mediaContract";
-import { extractDashMuxSpec } from "../extension/dashMuxSpec";
 import {
-  isRefererProtectedMediaRoute,
   isTbvideoVideoItem,
+  resolveProtectedExtensionAudioRoutes,
+  resolveWhitelistedExtensionMuxSpec,
 } from "../core/media";
 import type {
   WebExtEnqueuePayload,
@@ -812,7 +813,7 @@ export function useMediaDownload({
     if (!readyVariant(variant)) return null;
 
     if (variant.delivery.kind === "mux") {
-      const dashMux = extractDashMuxSpec(variant, apiContext);
+      const dashMux = resolveWhitelistedExtensionMuxSpec(variant, apiContext);
       if (!dashMux) return null;
       const filename = filenameFor(snapshot, dashMux.outputContainer, variant);
       const exactTotal =
@@ -823,10 +824,16 @@ export function useMediaDownload({
         filename,
         payload: {
           kind: "dash_mux",
-          platform: snapshot.platform || "bilibili",
+          platform: snapshot.platform || "media",
           title: snapshot.title || snapshot.item.title || filename,
           filename,
-          dashMux,
+          dashMux: {
+            videoRoutes: dashMux.videoRoutes,
+            audioRoutes: dashMux.audioRoutes,
+            ...(dashMux.videoSize ? { videoSize: dashMux.videoSize } : {}),
+            ...(dashMux.audioSize ? { audioSize: dashMux.audioSize } : {}),
+            outputContainer: "mp4",
+          },
           ...(exactTotal > 0 ? { sizeBytes: exactTotal } : {}),
           mimeType: "video/mp4",
         },
@@ -846,20 +853,22 @@ export function useMediaDownload({
       snapshot.item.type === "audio" &&
       variant.delivery.kind === "file"
     ) {
-      const fileSources = variant.delivery.sources;
-      const routes = deliveryRoutes(fileSources, apiContext);
-      if (
-        routes.length > 0 &&
-        routes.some((route, index) =>
-          isRefererProtectedMediaRoute(route, fileSources[index]),
-        )
-      ) {
+      const routes = resolveProtectedExtensionAudioRoutes(
+        { delivery: variant.delivery },
+        apiContext,
+      );
+      if (routes && routes.length > 0) {
         const audioBaseSnapshot: ItemSnapshot = {
           ...snapshot,
           isAttachment: false,
         };
         const filename = filenameFor(audioBaseSnapshot, "m4a", variant);
-        const sizeBytes = variant.delivery.sources[0]?.size_bytes;
+        const primaryRoute = routes[0];
+        const matchedSource = availableSources(
+          variant.delivery.sources,
+        ).find((src) => sourceRoutes(src, apiContext).includes(primaryRoute));
+        const sizeBytes =
+          matchedSource?.size_bytes ?? variant.delivery.sources[0]?.size_bytes;
         return runExtensionBridgeDownload({
           snapshot,
           retryId,

@@ -40,6 +40,7 @@ before(async () => {
   const muxSpec = await load('../src/core/media/muxSpec.ts', {
     '../../extension/dashMuxSpec': dashMuxSpec,
     '../../extension/hostWhitelist': hostWhitelist,
+    './cdnTransportHints': cdnTransportHints,
     './variantSort': variantSort,
   });
   const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {

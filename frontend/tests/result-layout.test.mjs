@@ -1113,3 +1113,189 @@ test('PR-C: ResultSection renders platform badge for built-in and long-tail plat
     view.app.unmount();
   }
 });
+
+test('PR #34 Round 2: unwhitelisted Tier-2 mux NEVER renders extension M4A card/guide in Music tab (both uninstalled & connected) and protected audio copy is platform-neutral', async () => {
+  const unwhitelistedTier2Data = {
+    platform: 'vimeo',
+    content_id: 'vimeo-unwhitelisted-1',
+    title: 'Unwhitelisted Tier-2 Mux Demo',
+    source_url: 'https://vimeo.com/999999',
+    default_item_id: 't2-item-1',
+    author: { name: 'Indie Creator', id: 'indie' },
+    items: [
+      {
+        id: 't2-item-1',
+        type: 'video',
+        default: { variant_id: 'mp4-720', url: 'https://cdn-unwhitelisted.example.org/720p.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://cdn-unwhitelisted.example.org/720p.mp4', {
+            width: 1280,
+            height: 720,
+            video_codec: 'h264',
+            has_audio: true,
+            container: 'mp4',
+            extension: 'mp4',
+            mime_type: 'video/mp4',
+            evidence: 'upstream',
+          }),
+          {
+            id: 'mux-1080-unwhitelisted',
+            label: '1080p',
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: 'avc1.640028',
+              audio_codec: 'mp4a.40.2',
+              container: 'mp4',
+              extension: 'mp4',
+              mime_type: 'video/mp4',
+              evidence: 'upstream',
+            },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              resources: [
+                {
+                  id: 'v-u',
+                  role: 'video',
+                  metadata: { width: 1920, height: 1080, evidence: 'upstream' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [{ id: 'sv-u', url: 'https://cdn-unwhitelisted.example.org/1080p.m4s' }],
+                  },
+                },
+                {
+                  id: 'a-u',
+                  role: 'audio',
+                  metadata: { audio_codec: 'mp4a.40.2', audio_bitrate_bps: 128000, evidence: 'upstream' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      {
+                        id: 'sa-u',
+                        url: 'https://cdn-unwhitelisted.example.org/audio.m4s',
+                        browser_fetch: 'blocked',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: unwhitelistedTier2Data });
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  // 1) Uninstalled state: zero Music tab, zero extension guide, zero .rs-ext-hint
+  const prevChrome = globalThis.chrome;
+  delete globalThis.chrome;
+  const uninstalledView = await mount(unwhitelistedTier2Data);
+  try {
+    assert.equal(uninstalledView.elements('rs-ext-hint').length, 0);
+    assert.equal(
+      uninstalledView.elements('rs-tab').some((n) => textOf(n).includes('音乐')),
+      false,
+      'unwhitelisted Tier-2 mux must NOT synthesize Music tab',
+    );
+    assert.equal(uninstalledView.elements('rs-bili-audio-guide').length, 0);
+    assert.equal(uninstalledView.elements('rs-bili-audio-connected').length, 0);
+  } finally {
+    uninstalledView.app.unmount();
+  }
+
+  // 2) Connected extension state: STILL zero Music tab and zero false extension M4A card!
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg?.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '4.1.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download'],
+            },
+          });
+        }
+      },
+    },
+  };
+  const connectedView = await mount(unwhitelistedTier2Data);
+  await connectedView.flush();
+  await new Promise((r) => setTimeout(r, 15));
+  await connectedView.flush();
+  try {
+    assert.equal(
+      connectedView.elements('rs-tab').some((n) => textOf(n).includes('音乐')),
+      false,
+      'connected extension must NOT synthesize unusable unwhitelisted Tier-2 mux audio in Music tab',
+    );
+    assert.equal(connectedView.elements('rs-bili-audio-connected').length, 0);
+    assert.equal(connectedView.elements('rs-bili-audio-guide').length, 0);
+  } finally {
+    connectedView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+
+  // 3) Whitelisted protected mux audio (non-Bilibili platform) renders platform-neutral copy (no "B 站" hardcode)
+  const genericProtectedAudioData = {
+    platform: 'vimeo',
+    content_id: 'vimeo-akamai-1',
+    title: 'Akamai Protected Mux',
+    source_url: 'https://vimeo.com/888888',
+    default_item_id: 'ak-1',
+    items: [
+      {
+        id: 'ak-1',
+        type: 'video',
+        default: { variant_id: 'mp4-720', url: 'https://vod-progressive.akamaized.net/720p.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://vod-progressive.akamaized.net/720p.mp4', { width: 1280, height: 720, has_audio: true, evidence: 'upstream' }),
+          {
+            id: 'mux-1080-ak',
+            label: '1080p',
+            metadata: { width: 1920, height: 1080, evidence: 'upstream' },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4' },
+              resources: [
+                {
+                  id: 'v-ak',
+                  role: 'video',
+                  delivery: { kind: 'file', sources: [{ id: 'sv-ak', url: 'https://vod-progressive.akamaized.net/1080.m4s' }] },
+                },
+                {
+                  id: 'a-ak',
+                  role: 'audio',
+                  delivery: {
+                    kind: 'file',
+                    sources: [{ id: 'sa-ak', url: 'https://vod-progressive.akamaized.net/audio.m4s', browser_fetch: 'blocked' }],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: genericProtectedAudioData });
+  delete globalThis.chrome;
+  const protectedView = await mount(genericProtectedAudioData);
+  try {
+    await protectedView.tab('音乐');
+    const guides = protectedView.elements('rs-bili-audio-guide');
+    assert.equal(guides.length, 1);
+    const guideText = textOf(guides[0]);
+    assert.ok(guideText.includes('源站来源头'), `expected platform-neutral copy, got: ${guideText}`);
+    assert.equal(guideText.includes('B 站'), false, 'protected audio guide must not hardcode B 站');
+  } finally {
+    protectedView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

@@ -7,9 +7,8 @@ import {
 } from "../../utils/mediaContract";
 import {
   buildCanonicalVariantDescriptor,
-  extractMuxSpec,
   extractWhitelistedMuxVariants,
-  isMuxSpecWhitelistedForExtension,
+  resolveWhitelistedExtensionMuxSpec,
   sortVariantsCanonical,
   summarizeMuxVariants,
   type MuxTierSummary,
@@ -63,11 +62,9 @@ export function buildAllQualityOptions(
       },
       context,
     );
-    const rawMux = readyVariant(variant)
-      ? extractMuxSpec(variant, context)
+    const dashMux = readyVariant(variant)
+      ? resolveWhitelistedExtensionMuxSpec(variant, context)
       : null;
-    const dashMux =
-      rawMux && isMuxSpecWhitelistedForExtension(rawMux) ? rawMux : null;
     const extensionMux = Boolean(allowExtensionDashMux && dashMux);
     const isActive = extensionMux
       ? active

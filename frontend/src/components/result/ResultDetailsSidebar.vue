@@ -3,7 +3,11 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick } from "vue";
 import AppIcon from "../AppIcon.vue";
 import ResultVariantPicker from "./ResultVariantPicker.vue";
 import { resourceSource, sourceUrl } from "../../utils/mediaContract";
-import { isRefererProtectedMediaRoute } from "../../core/media";
+import {
+  hasRefererProtectedAudioSource,
+  resolveProtectedExtensionAudioRoutes,
+  resolveWhitelistedExtensionMuxSpec,
+} from "../../core/media";
 import { apiConfig } from "../../services/apiConfig";
 import { t, formatDate } from "./resultI18n";
 
@@ -89,18 +93,9 @@ const isProtectedDashAudio = (attachment) => {
   ) {
     return false;
   }
-  if (
-    typeof attachment.id === "string" &&
-    attachment.id.startsWith("bilibili-audio-")
-  ) {
-    return true;
-  }
-  const src =
-    attachment.resource?.delivery?.kind === "file"
-      ? resourceSource(attachment.resource)
-      : null;
-  const rawUrl = src ? urlOf(src) : "";
-  return Boolean(rawUrl && isRefererProtectedMediaRoute(rawUrl, src));
+  return (
+    resolveProtectedExtensionAudioRoutes(attachment.resource, context) !== null
+  );
 };
 
 const isBilibiliDashAudio = isProtectedDashAudio;
@@ -110,9 +105,11 @@ const visibleAttachments = computed(() => {
   const list = props.attachments.filter((att) => {
     if (
       typeof att?.id === "string" &&
-      att.id.startsWith("bilibili-audio-") &&
+      (att.id.startsWith("bilibili-audio-") ||
+        att.id.startsWith("mux-audio-")) &&
       currentId &&
-      att.id !== `bilibili-audio-${currentId}`
+      att.id !== `bilibili-audio-${currentId}` &&
+      att.id !== `mux-audio-${currentId}`
     ) {
       return false;
     }
@@ -121,7 +118,11 @@ const visibleAttachments = computed(() => {
 
   if (
     currentId &&
-    !list.some((att) => att?.id === `bilibili-audio-${currentId}`) &&
+    !list.some(
+      (att) =>
+        att?.id === `bilibili-audio-${currentId}` ||
+        att?.id === `mux-audio-${currentId}`,
+    ) &&
     props.currentItem?.state !== "deferred" &&
     props.currentItem?.state !== "unavailable" &&
     Array.isArray(props.currentItem?.variants)
@@ -132,8 +133,26 @@ const visibleAttachments = computed(() => {
       if (variant?.state === "deferred" || variant?.delivery?.kind !== "mux") {
         continue;
       }
+      const isVariantWhitelisted =
+        resolveWhitelistedExtensionMuxSpec(variant, context) !== null;
       for (const res of variant.delivery.resources || []) {
         if (res?.role !== "audio" || res?.delivery?.kind !== "file") continue;
+        const protectedExtRoutes = resolveProtectedExtensionAudioRoutes(
+          res,
+          context,
+        );
+        const needsHeaderProtection = hasRefererProtectedAudioSource(
+          res,
+          context,
+        );
+        // Never synthesize an unusable dead link for unwhitelisted or blocked
+        // mux audio that neither Web nor the Chrome extension can fetch.
+        if (needsHeaderProtection && !protectedExtRoutes) {
+          continue;
+        }
+        if (!needsHeaderProtection && !isVariantWhitelisted) {
+          continue;
+        }
         const bitrate = Number(
           res.metadata?.audio_bitrate_bps || res.metadata?.bitrate_bps || 0,
         );
@@ -145,7 +164,7 @@ const visibleAttachments = computed(() => {
     }
     if (bestAudioLeaf) {
       list.push({
-        id: `bilibili-audio-${currentId}`,
+        id: `mux-audio-${currentId}`,
         role: "background_audio",
         title: "原声音频 (M4A)",
         resource: bestAudioLeaf,

@@ -10,11 +10,16 @@ import {
   deliveryRoutes,
   readyItem,
   readyVariant,
+  sourceRoutes,
   type TargetContext,
 } from "../../utils/mediaContract";
 import { formatCodecLabel } from "../../utils/mediaSources";
 import { extractDashMuxSpec } from "../../extension/dashMuxSpec";
-import { isWhitelistedMediaUrl } from "../../extension/hostWhitelist";
+import {
+  isWhitelistedMediaUrl,
+  validateApiBaseUrl,
+} from "../../extension/hostWhitelist";
+import { isRefererProtectedMediaRoute } from "./cdnTransportHints";
 import {
   resolveVariantResolution,
   videoCodecCompatibilityRank,
@@ -109,19 +114,82 @@ export function extractMuxSpec(
 }
 
 /**
+ * Resolves effective extra allowed origins for extension media whitelist checks.
+ * - Explicit `extraAllowedOrigins` always takes precedence.
+ * - Otherwise, ONLY when `context.apiOrigin` (or same-origin browser `location.origin`
+ *   when `apiOrigin` is empty) passes `validateApiBaseUrl` with `isLoopback === true`
+ *   (`http://127.0.0.1[:port]` / `http://localhost[:port]`), returns `[validated.origin]`.
+ * - Public HTTPS origins NEVER inject extra allowed origins (100% fail-closed).
+ */
+export function resolveAllowedOriginsFromContext(
+  context?: TargetContext,
+  extraAllowedOrigins?: string[],
+): string[] | undefined {
+  if (extraAllowedOrigins !== undefined) {
+    return extraAllowedOrigins;
+  }
+  const candidate =
+    context?.apiOrigin ||
+    (typeof location !== "undefined" && typeof location.origin === "string"
+      ? location.origin
+      : "");
+  if (!candidate) {
+    return undefined;
+  }
+  const validated = validateApiBaseUrl(candidate);
+  return validated.ok && validated.isLoopback ? [validated.origin] : undefined;
+}
+
+/**
+ * Extracts a `UnifiedMuxSpec` from a ready `delivery.kind === "mux"` variant
+ * and filters both `videoRoutes` and `audioRoutes` down to the subset allowed
+ * by the extension's strict host whitelist (including loopback `context.apiOrigin`
+ * when applicable). Returns `null` unless at least one video route AND one audio
+ * route pass the whitelist.
+ */
+export function resolveWhitelistedExtensionMuxSpec(
+  variant: ReadyVariant,
+  context: TargetContext = {},
+  extraAllowedOrigins?: string[],
+): UnifiedMuxSpec | null {
+  const spec = extractMuxSpec(variant, context);
+  if (!spec) return null;
+  const allowedOrigins = resolveAllowedOriginsFromContext(
+    context,
+    extraAllowedOrigins,
+  );
+  const allowed = (url: string) =>
+    isWhitelistedMediaUrl(url, allowedOrigins).allowed;
+  const videoRoutes = spec.videoRoutes.filter(allowed);
+  const audioRoutes = spec.audioRoutes.filter(allowed);
+  if (!videoRoutes.length || !audioRoutes.length) {
+    return null;
+  }
+  return {
+    ...spec,
+    videoRoutes,
+    audioRoutes,
+  };
+}
+
+/**
  * Returns true iff at least one video route AND at least one audio route of a
  * `UnifiedMuxSpec` fall within the extension's strict host whitelist (never
  * promising extension muxing for unwhitelisted third-party origins).
  */
 export function isMuxSpecWhitelistedForExtension(
   spec: UnifiedMuxSpec | null | undefined,
+  contextOrOrigins?: TargetContext | string[],
   extraAllowedOrigins?: string[],
 ): boolean {
   if (!spec || !spec.videoRoutes.length || !spec.audioRoutes.length) {
     return false;
   }
+  const allowedOrigins = Array.isArray(contextOrOrigins)
+    ? contextOrOrigins
+    : resolveAllowedOriginsFromContext(contextOrOrigins, extraAllowedOrigins);
   const allowed = (url: string) =>
-    isWhitelistedMediaUrl(url, extraAllowedOrigins).allowed;
+    isWhitelistedMediaUrl(url, allowedOrigins).allowed;
   return spec.videoRoutes.some(allowed) && spec.audioRoutes.some(allowed);
 }
 
@@ -149,12 +217,82 @@ export function extractWhitelistedMuxVariants(
   context: TargetContext = {},
   extraAllowedOrigins?: string[],
 ): ReadyVariant[] {
-  return extractAllMuxVariants(currentItem).filter((variant) =>
-    isMuxSpecWhitelistedForExtension(
-      extractMuxSpec(variant, context),
-      extraAllowedOrigins,
-    ),
+  return extractAllMuxVariants(currentItem).filter(
+    (variant) =>
+      resolveWhitelistedExtensionMuxSpec(
+        variant,
+        context,
+        extraAllowedOrigins,
+      ) !== null,
   );
+}
+
+/**
+ * Checks whether any available route of a file-delivered audio resource requires
+ * Referer/Origin header protection (e.g. `browser_fetch === "blocked"` or a
+ * protected audio host suffix), accurately pairing each `Source` with its own
+ * expanded URLs.
+ */
+export function hasRefererProtectedAudioSource(
+  resource: Pick<Resource, "delivery"> | null | undefined,
+  context: TargetContext = {},
+): boolean {
+  if (!resource || resource.delivery.kind !== "file") {
+    return false;
+  }
+  for (const src of availableSources(resource.delivery.sources, context.now)) {
+    for (const url of sourceRoutes(src, context)) {
+      if (isRefererProtectedMediaRoute(url, src)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolves the pre-filtered whitelisted routes for a Referer-protected standalone
+ * audio resource that must be downloaded via the Chrome extension.
+ *
+ * - Pairs each available `Source` with its own `sourceRoutes(src, context)` so
+ *   `fallback_urls` expansion can never cause index drift.
+ * - Returns `null` when the audio does NOT require extension header protection
+ *   OR when zero available routes pass the extension host whitelist.
+ */
+export function resolveProtectedExtensionAudioRoutes(
+  resource: Pick<Resource, "delivery"> | null | undefined,
+  context: TargetContext = {},
+  extraAllowedOrigins?: string[],
+): string[] | null {
+  if (!resource || resource.delivery.kind !== "file") {
+    return null;
+  }
+  const allowedOrigins = resolveAllowedOriginsFromContext(
+    context,
+    extraAllowedOrigins,
+  );
+  let needsProtection = false;
+  const seen = new Set<string>();
+  const whitelistedRoutes: string[] = [];
+
+  for (const src of availableSources(resource.delivery.sources, context.now)) {
+    for (const url of sourceRoutes(src, context)) {
+      if (isRefererProtectedMediaRoute(url, src)) {
+        needsProtection = true;
+      }
+      if (
+        !seen.has(url) &&
+        isWhitelistedMediaUrl(url, allowedOrigins).allowed
+      ) {
+        seen.add(url);
+        whitelistedRoutes.push(url);
+      }
+    }
+  }
+
+  return needsProtection && whitelistedRoutes.length > 0
+    ? whitelistedRoutes
+    : null;
 }
 
 function isAlternateAudioTrack(

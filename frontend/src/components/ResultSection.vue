@@ -13,12 +13,11 @@ import {
   sourceUrl,
 } from "../utils/mediaContract";
 import {
-  extractMuxSpec,
   isAudioOnlyVariant,
-  isMuxSpecWhitelistedForExtension,
   isSplitSilentVideoVariant,
   isTbvideoVideoItem,
   resolveEffectiveDefaultVariant,
+  resolveWhitelistedExtensionMuxSpec,
   shouldAutoUpgradeDefaultVariant,
 } from "../core/media";
 import {
@@ -158,9 +157,7 @@ const isActiveExtensionDashMux = computed(() =>
     canExtensionDashMux.value &&
       activeVariant.value &&
       readyVariant(activeVariant.value) &&
-      isMuxSpecWhitelistedForExtension(
-        extractMuxSpec(activeVariant.value, context),
-      ),
+      resolveWhitelistedExtensionMuxSpec(activeVariant.value, context) !== null,
   ),
 );
 const playableFallbackVideoUrl = computed(() => {

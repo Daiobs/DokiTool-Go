@@ -902,3 +902,298 @@ test("Capability Hub: enforces priority Connected Extension > Userscript > Web S
   );
   assert.equal(capabilityHub.LATEST_EXTENSION_VERSION, metaJson.version);
 });
+
+test("Round 2 regressions: loopback apiOrigin mux whitelist, mixed-route stripping, source/fallback pairing, and label-inferred 1080p60 > 1080p+ > 1080p", () => {
+  const prodContext = { apiOrigin: PROD_API_ORIGIN };
+  const loopbackContext = { apiOrigin: "http://127.0.0.1:4173" };
+
+  // 1. Loopback apiOrigin allows local 127.0.0.1:<port> mux streams while public HTTPS stays fail-closed
+  const loopbackMuxItem = {
+    id: "loopback-mux-1",
+    index: 0,
+    type: "video",
+    state: "ready",
+    default: null,
+    variants: [
+      {
+        id: "local-1080-mux",
+        label: "1080p",
+        state: "ready",
+        metadata: { width: 1920, height: 1080, video_codec: "avc1.640028" },
+        delivery: {
+          kind: "mux",
+          output: { container: "mp4", extension: "mp4" },
+          resources: [
+            {
+              id: "video",
+              role: "video",
+              delivery: {
+                kind: "file",
+                sources: [
+                  {
+                    id: "v-local",
+                    url: "http://127.0.0.1:4173/media/video-1080.mp4",
+                  },
+                ],
+              },
+            },
+            {
+              id: "audio",
+              role: "audio",
+              delivery: {
+                kind: "file",
+                sources: [
+                  {
+                    id: "a-local",
+                    url: "http://127.0.0.1:4173/media/audio.m4a",
+                    browser_fetch: "blocked",
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  assert.equal(
+    mediaKernel.resolveWhitelistedExtensionMuxSpec(
+      loopbackMuxItem.variants[0],
+      prodContext,
+    ),
+    null,
+    "public https apiOrigin must reject loopback mux URLs",
+  );
+  const loopbackResolved = mediaKernel.resolveWhitelistedExtensionMuxSpec(
+    loopbackMuxItem.variants[0],
+    loopbackContext,
+  );
+  assert.ok(loopbackResolved, "loopback apiOrigin must allow its own origin mux");
+  assert.deepEqual(loopbackResolved.videoRoutes, [
+    "http://127.0.0.1:4173/media/video-1080.mp4",
+  ]);
+  assert.deepEqual(loopbackResolved.audioRoutes, [
+    "http://127.0.0.1:4173/media/audio.m4a",
+  ]);
+  assert.equal(
+    mediaKernel.isMuxSpecWhitelistedForExtension(
+      mediaKernel.extractMuxSpec(loopbackMuxItem.variants[0], loopbackContext),
+      loopbackContext,
+    ),
+    true,
+  );
+  const loopbackWebOpts = resultPresentation.buildAllQualityOptions(
+    loopbackMuxItem,
+    null,
+    null,
+    loopbackContext,
+    { allowExtensionDashMux: true },
+  );
+  assert.equal(loopbackWebOpts[0].extensionMux, true);
+  assert.equal(loopbackWebOpts[0].downloadable, true);
+  assert.deepEqual(
+    mediaKernel.resolveProtectedExtensionAudioRoutes(
+      loopbackMuxItem.variants[0].delivery.resources[1],
+      loopbackContext,
+    ),
+    ["http://127.0.0.1:4173/media/audio.m4a"],
+  );
+  assert.equal(
+    mediaKernel.resolveProtectedExtensionAudioRoutes(
+      loopbackMuxItem.variants[0].delivery.resources[1],
+      prodContext,
+    ),
+    null,
+  );
+
+  // 2. Mixed whitelisted + unwhitelisted routes: strips unwhitelisted mirrors and preserves accurate per-Source fallback_urls pairing
+  const mixedMuxVariant = {
+    id: "mixed-mux",
+    label: "1080p",
+    state: "ready",
+    metadata: { width: 1920, height: 1080, video_codec: "avc1.640028" },
+    delivery: {
+      kind: "mux",
+      output: { container: "mp4", extension: "mp4" },
+      resources: [
+        {
+          id: "video",
+          role: "video",
+          delivery: {
+            kind: "file",
+            sources: [
+              {
+                id: "v-primary",
+                url: "https://upos-sz-mirrorcosov.bilivideo.com/v1080.m4s",
+                fallback_urls: ["https://upos-sz-mirrorcosov.bilivideo.com/v1080.m4s?cred=alt"],
+              },
+              {
+                id: "v-backup",
+                url: "https://cdn-unwhitelisted.example.org/v1080-backup.m4s",
+              },
+            ],
+          },
+        },
+        {
+          id: "audio",
+          role: "audio",
+          delivery: {
+            kind: "file",
+            sources: [
+              {
+                id: "a-unavail",
+                url: "https://cdn-unwhitelisted.example.org/dead.m4s",
+                availability: "unavailable",
+              },
+              {
+                id: "a-primary",
+                url: "https://vod-progressive.akamaized.net/audio-1.m4a",
+                fallback_urls: ["https://vod-progressive.akamaized.net/audio-1.m4a?cred=alt"],
+              },
+              {
+                id: "a-unwhitelisted-mirror",
+                url: "https://cdn-unwhitelisted.example.org/audio-mirror.m4a",
+              },
+              {
+                id: "a-blocked",
+                url: "https://upos-sz-mirrorcosov.bilivideo.com/audio-2.m4s",
+                browser_fetch: "blocked",
+              },
+            ],
+          },
+        },
+      ],
+    },
+  };
+  const filteredMux = mediaKernel.resolveWhitelistedExtensionMuxSpec(
+    mixedMuxVariant,
+    prodContext,
+  );
+  assert.ok(filteredMux);
+  assert.deepEqual(filteredMux.videoRoutes, [
+    "https://upos-sz-mirrorcosov.bilivideo.com/v1080.m4s",
+    "https://upos-sz-mirrorcosov.bilivideo.com/v1080.m4s?cred=alt",
+  ]);
+  assert.deepEqual(filteredMux.audioRoutes, [
+    "https://vod-progressive.akamaized.net/audio-1.m4a",
+    "https://vod-progressive.akamaized.net/audio-1.m4a?cred=alt",
+    "https://upos-sz-mirrorcosov.bilivideo.com/audio-2.m4s",
+  ]);
+  // Even with unavailable source + same-origin fallback_urls shifting array indices, source #3's browser_fetch="blocked" is paired accurately!
+  assert.deepEqual(
+    mediaKernel.resolveProtectedExtensionAudioRoutes(
+      mixedMuxVariant.delivery.resources[1],
+      prodContext,
+    ),
+    [
+      "https://vod-progressive.akamaized.net/audio-1.m4a",
+      "https://vod-progressive.akamaized.net/audio-1.m4a?cred=alt",
+      "https://upos-sz-mirrorcosov.bilivideo.com/audio-2.m4s",
+    ],
+  );
+  // Purely non-protected whitelisted audio (e.g. douyinvod without browser_fetch="blocked") returns null -> stays native Web audio
+  assert.equal(
+    mediaKernel.resolveProtectedExtensionAudioRoutes(
+      {
+        delivery: {
+          kind: "file",
+          sources: [
+            { id: "a-open", url: "https://v26-web.douyinvod.com/open.m4a" },
+          ],
+        },
+      },
+      prodContext,
+    ),
+    null,
+  );
+
+  // 3. Known 1920x1080 without numeric metadata.fps sorts 1080p60 > 1080p+ > 1080p identically on Web & Extension
+  const labelFpsMedia = {
+    schema_version: "1.0",
+    platform: "bilibili",
+    platform_name: "B站",
+    content_id: "label-fps-sort",
+    title: "标签帧率与高码率档位排序",
+    default_item_id: "item-fps",
+    items: [
+      {
+        id: "item-fps",
+        index: 0,
+        type: "video",
+        state: "ready",
+        default: { variant_id: "v-1080", source_id: "s-1080" },
+        variants: [
+          {
+            id: "v-1080",
+            label: "1080p",
+            state: "ready",
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: "avc1.640028",
+              has_audio: true,
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                { id: "s-1080", url: "https://upos-sz-mirrorcosov.bilivideo.com/1080.mp4" },
+              ],
+            },
+          },
+          {
+            id: "v-1080-plus",
+            label: "1080p+",
+            state: "ready",
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: "avc1.640028",
+              has_audio: true,
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                { id: "s-1080p", url: "https://upos-sz-mirrorcosov.bilivideo.com/1080plus.mp4" },
+              ],
+            },
+          },
+          {
+            id: "v-1080-60",
+            label: "1080p60",
+            state: "ready",
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: "avc1.640028",
+              has_audio: true,
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                { id: "s-1080-60", url: "https://upos-sz-mirrorcosov.bilivideo.com/1080p60.mp4" },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const webLabelOrder = resultPresentation
+    .buildAllQualityOptions(labelFpsMedia.items[0], null, null, prodContext)
+    .map((o) => o.variant.id);
+  const extLabelOrder = uiTargetHelpers
+    .buildSidePanelQualityOptions(labelFpsMedia, labelFpsMedia.items[0], PROD_API_ORIGIN)
+    .map((o) => o.variant.id);
+  assert.deepEqual(webLabelOrder, ["v-1080-60", "v-1080-plus", "v-1080"]);
+  assert.deepEqual(extLabelOrder, ["v-1080-60", "v-1080-plus", "v-1080"]);
+  assert.equal(
+    extensionDownload.selectVariantByPreference(
+      labelFpsMedia.items[0],
+      [],
+      "best",
+      PROD_API_ORIGIN,
+    ).variant.id,
+    "v-1080-60",
+  );
+});

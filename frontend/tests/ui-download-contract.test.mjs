@@ -4118,3 +4118,222 @@ test('PR 1 Web <-> Extension bridge download flow: Bilibili 1080p DASH mux & M4A
     else globalThis.chrome = prevChrome;
   }
 });
+
+test('PR #34 Round 2: WEB_EXT_ENQUEUE_MEDIA strips unwhitelisted fallback routes on mux & protected audio and never enqueues purely unwhitelisted targets', async () => {
+  const prevChrome = globalThis.chrome;
+  const enqueuedPayloads = [];
+  let seq = 1;
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '4.1.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download'],
+            },
+          });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+          enqueuedPayloads.push(msg.payload);
+          cb({ ok: true, data: { taskId: `r2-task-${seq++}`, status: 'queued' } });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+          cb({
+            ok: true,
+            data: {
+              taskId: msg.taskId,
+              status: 'completed',
+              phase: 'completed',
+              progress: 100,
+              loadedBytes: 1024,
+              totalBytes: 1024,
+              speedBytesPerSec: 0,
+              filename: 'done',
+            },
+          });
+        }
+      },
+    },
+  };
+
+  const mixedData = {
+    platform: 'vimeo',
+    content_id: 'mixed-routes-1',
+    title: '混排线路过滤实测',
+    source_url: 'https://vimeo.com/123456',
+    default_item_id: 'mix-item-1',
+    items: [
+      {
+        id: 'mix-item-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'mux-mixed', source_id: 's-v1', url: 'https://vod-progressive.akamaized.net/v1080.m4s' },
+        variants: [
+          {
+            id: 'mux-mixed',
+            label: '1080p',
+            state: 'ready',
+            metadata: { width: 1920, height: 1080, video_codec: 'avc1.640028', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              resources: [
+                {
+                  id: 'video',
+                  role: 'video',
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      {
+                        id: 'v-1',
+                        url: 'https://upos-sz-mirrorcos.bilivideo.com/v1080.m4s',
+                        fallback_urls: ['https://upos-sz-mirrorcos.bilivideo.com/v1080.m4s?cred=alt'],
+                        size_bytes: 12_000_000,
+                      },
+                      {
+                        id: 'v-2',
+                        url: 'https://cdn-unwhitelisted.example.org/v-secondary.m4s',
+                      },
+                    ],
+                  },
+                },
+                {
+                  id: 'audio',
+                  role: 'audio',
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      {
+                        id: 'a-1',
+                        url: 'https://upos-sz-mirrorcos.bilivideo.com/a128.m4s',
+                        size_bytes: 1_500_000,
+                      },
+                      {
+                        id: 'a-2',
+                        url: 'https://cdn-unwhitelisted.example.org/a-mirror.m4s',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            id: 'mux-unwhitelisted',
+            label: '1080p',
+            state: 'ready',
+            metadata: { width: 1920, height: 1080, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              resources: [
+                { id: 'vu', role: 'video', delivery: { kind: 'file', sources: [{ id: 'svu', url: 'https://cdn-unwhitelisted.example.org/v.m4s' }] } },
+                { id: 'au', role: 'audio', delivery: { kind: 'file', sources: [{ id: 'sau', url: 'https://cdn-unwhitelisted.example.org/a.m4s' }] } },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+    attachments: [
+      {
+        id: 'mux-audio-mix-item-1',
+        role: 'background_audio',
+        title: '原声音频 (M4A)',
+        resource: {
+          id: 'res-mixed-audio',
+          role: 'audio',
+          metadata: { audio_codec: 'mp4a.40.2', container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4' },
+          delivery: {
+            kind: 'file',
+            sources: [
+              {
+                id: 'sa-0',
+                url: 'https://vod-progressive.akamaized.net/audio-primary.m4a',
+                fallback_urls: ['https://vod-progressive.akamaized.net/audio-primary.m4a?cred=alt'],
+                size_bytes: 2_000_000,
+              },
+              {
+                id: 'sa-unwhitelisted',
+                url: 'https://cdn-unwhitelisted.example.org/audio-fallback.m4a',
+              },
+              {
+                id: 'sa-1',
+                url: 'https://upos-sz-mirrorcos.bilivideo.com/audio-protected.m4s',
+                browser_fetch: 'blocked',
+                size_bytes: 2_200_000,
+              },
+            ],
+          },
+        },
+      },
+      {
+        id: 'blocked-unwhitelisted-audio',
+        role: 'background_audio',
+        title: '未收录受限音轨',
+        resource: {
+          id: 'res-blocked-audio',
+          role: 'audio',
+          metadata: { audio_codec: 'mp4a.40.2', container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4' },
+          delivery: {
+            kind: 'file',
+            sources: [
+              {
+                id: 'sb-0',
+                url: 'https://cdn-unwhitelisted.example.org/blocked.m4s',
+                browser_fetch: 'blocked',
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+
+  try {
+    const { instance, store, selection } = harness(mixedData);
+    selection.choose({ variant_id: 'mux-mixed' });
+    await instance.downloadMainVideo();
+    await settled(store.downloads[0]);
+    assert.equal(store.downloads[0].status, 'completed');
+    assert.equal(enqueuedPayloads.length, 1);
+    assert.equal(enqueuedPayloads[0].kind, 'dash_mux');
+    assert.deepEqual(enqueuedPayloads[0].dashMux.videoRoutes, [
+      'https://upos-sz-mirrorcos.bilivideo.com/v1080.m4s',
+      'https://upos-sz-mirrorcos.bilivideo.com/v1080.m4s?cred=alt',
+    ]);
+    assert.deepEqual(enqueuedPayloads[0].dashMux.audioRoutes, [
+      'https://upos-sz-mirrorcos.bilivideo.com/a128.m4s',
+    ]);
+
+    // Protected audio with fallback_urls index shift strips unwhitelisted mirror and succeeds via extension
+    await instance.downloadMusic(mixedData.attachments[0]);
+    const audioTask = store.downloads.at(-1);
+    await settled(audioTask);
+    assert.equal(audioTask.status, 'completed');
+    assert.equal(enqueuedPayloads.length, 2);
+    assert.equal(enqueuedPayloads[1].kind, 'direct_download');
+    assert.deepEqual(enqueuedPayloads[1].routes, [
+      'https://vod-progressive.akamaized.net/audio-primary.m4a',
+      'https://vod-progressive.akamaized.net/audio-primary.m4a?cred=alt',
+      'https://upos-sz-mirrorcos.bilivideo.com/audio-protected.m4s',
+    ]);
+
+    // Purely unwhitelisted mux MUST NOT call WEB_EXT_ENQUEUE_MEDIA
+    selection.choose({ variant_id: 'mux-unwhitelisted' });
+    await instance.downloadMainVideo();
+    assert.equal(enqueuedPayloads.length, 2, 'purely unwhitelisted mux must never enqueue to extension');
+
+    // Purely unwhitelisted browser_fetch="blocked" audio MUST NOT call WEB_EXT_ENQUEUE_MEDIA
+    await instance.downloadMusic(mixedData.attachments[1]);
+    assert.equal(enqueuedPayloads.length, 2, 'purely unwhitelisted blocked audio must never enqueue to extension');
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
