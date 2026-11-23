@@ -312,7 +312,8 @@ const showProjectPromotions = false
 }
 
 .social-link:hover {
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
@@ -323,7 +324,9 @@ const showProjectPromotions = false
   align-items: center;
   gap: 0.5rem;
   padding: 0.5rem 1rem;
-  background: linear-gradient(135deg, #24292e 0%, #1b1f23 100%);
+  background-color: #24292e;
+  background-image: linear-gradient(135deg, #24292e 0%, #1b1f23 100%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   color: white;
   font-size: 0.8125rem;
   font-weight: 500;

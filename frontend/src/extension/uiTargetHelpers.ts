@@ -47,6 +47,15 @@ import {
   extractDashMuxSpec,
   extractVariantEarliestExpiresAtMs,
 } from "./dashMuxSpec";
+import {
+  buildCanonicalVariantDescriptor,
+  compareCanonicalVariantDesc,
+  hasMultiCollectionGroups,
+  inferDirectVideoExtension,
+  isTbvideoVideoItem,
+  resolvePreferredMediaTitle,
+  sortVariantsCanonical,
+} from "../core/media";
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
@@ -931,15 +940,8 @@ function inferVideoExtFromUrl(
         return ext === "jpeg" ? "jpg" : ext;
       }
     }
-    const host = parsed.hostname.toLowerCase();
-    if (host.endsWith(".toutiaovod.com")) return "mp4";
-    if (
-      hasTbvideo ||
-      platform === "zuiyou" ||
-      platform === "pipigx"
-    ) {
-      return "mp4";
-    }
+    const inferred = inferDirectVideoExtension(rawUrl, hasTbvideo);
+    if (inferred) return inferred;
     return undefined;
   } catch {
     return undefined;
@@ -1274,10 +1276,9 @@ export function buildSidePanelQualityOptions(
       ? { apiOrigin: resolvedApiOrigin, now: options.now }
       : { apiOrigin: resolvedApiOrigin };
   const attachments = media.attachments ?? [];
-  const isYouTube = media.platform === "youtube";
 
   const muxPairsByVariantId = new Map<string, ExtractedYouTubeMuxPair>();
-  if (isYouTube && item.type === "video") {
+  if (item.type === "video") {
     for (const v of item.variants) {
       if (readyVariant(v) && v.metadata?.has_audio === false) {
         const pair = selectYouTubeMuxPair(v, item.variants, attachments);
@@ -1341,8 +1342,7 @@ export function buildSidePanelQualityOptions(
           ? sourceUrl(target.source, copyCtx)
           : directUrl;
       const tbCandidate =
-        item.type === "video" &&
-        (media.platform === "pipigx" || media.platform === "zuiyou") &&
+        isTbvideoVideoItem(item) &&
         target.source.id &&
         item.tbvideo?.sources?.[target.source.id]
           ? item.tbvideo.sources[target.source.id]
@@ -1563,22 +1563,14 @@ export function buildSidePanelQualityOptions(
       sizeBytes =
         parsePositiveSafeBytes(resolvedSource?.size_bytes) +
         parsePositiveSafeBytes(muxPair.audioSource.size_bytes);
-      sizeLabel = isYouTube
-        ? formatYouTubeMuxOptionSize(
-            { variant, source: resolvedSource },
-            muxPairsByVariantId,
-            "zh-CN",
-          )
-        : formatMediaSize(sizeBytes, "zh-CN");
+      sizeLabel = formatYouTubeMuxOptionSize(
+        { variant, source: resolvedSource },
+        muxPairsByVariantId,
+        "zh-CN",
+      );
     } else {
       sizeBytes = parsePositiveSafeBytes(resolvedSource?.size_bytes);
-      sizeLabel = isYouTube
-        ? formatYouTubeMuxOptionSize(
-            { variant, source: resolvedSource },
-            muxPairsByVariantId,
-            "zh-CN",
-          )
-        : formatMediaSize(resolvedSource?.size_bytes, "zh-CN");
+      sizeLabel = formatMediaSize(resolvedSource?.size_bytes, "zh-CN");
     }
 
     const effW = Number(meta.width || videoLeafMeta?.width || 0) || 0;
@@ -1775,7 +1767,16 @@ export function buildSidePanelQualityOptions(
     }
   }
 
-  return qualityOptions;
+  return sortVariantsCanonical(qualityOptions, (opt, originalIndex) =>
+    buildCanonicalVariantDescriptor({
+      variant: opt.variant,
+      downloadable: opt.downloadable && opt.deliveryMode !== "external_only",
+      isAudioOnly: opt.isAudioOnly,
+      effectiveHasAudio: opt.effectiveHasAudio,
+      sizeBytes: opt.sizeBytes,
+      originalIndex,
+    }),
+  );
 }
 
 function compareVideoQualityDesc(
@@ -1783,35 +1784,29 @@ function compareVideoQualityDesc(
   b: SidePanelQualityOption,
   defaultVariantId?: string,
 ): number {
-  if (a.effectiveHasAudio !== b.effectiveHasAudio) {
-    return a.effectiveHasAudio ? -1 : 1;
-  }
-  if (a.shortEdge !== b.shortEdge) {
-    return b.shortEdge - a.shortEdge;
-  }
-  if (a.pixelArea !== b.pixelArea) {
-    return b.pixelArea - a.pixelArea;
-  }
-  if (a.fps !== b.fps) {
-    return b.fps - a.fps;
-  }
-  // Prefer MP4 container on identical resolution & FPS for maximum player compatibility
+  const cmp = compareCanonicalVariantDesc(
+    buildCanonicalVariantDescriptor({
+      variant: a.variant,
+      downloadable: a.downloadable && a.deliveryMode !== "external_only",
+      isAudioOnly: a.isAudioOnly,
+      effectiveHasAudio: a.effectiveHasAudio,
+      sizeBytes: a.sizeBytes,
+      originalIndex: 0,
+    }),
+    buildCanonicalVariantDescriptor({
+      variant: b.variant,
+      downloadable: b.downloadable && b.deliveryMode !== "external_only",
+      isAudioOnly: b.isAudioOnly,
+      effectiveHasAudio: b.effectiveHasAudio,
+      sizeBytes: b.sizeBytes,
+      originalIndex: 0,
+    }),
+  );
+  if (cmp !== 0) return cmp;
   const aMp4 = a.resolvedExt === "mp4" ? 1 : 0;
   const bMp4 = b.resolvedExt === "mp4" ? 1 : 0;
   if (aMp4 !== bMp4) {
     return bMp4 - aMp4;
-  }
-  // Prefer H.264 (AVC) > HEVC > AV1 > other codecs at identical resolution, FPS & container
-  const aCodecRank = uiVideoCodecPreferenceRank(a.videoCodec);
-  const bCodecRank = uiVideoCodecPreferenceRank(b.videoCodec);
-  if (aCodecRank !== bCodecRank) {
-    return bCodecRank - aCodecRank;
-  }
-  if (a.bitrateBps !== b.bitrateBps) {
-    return b.bitrateBps - a.bitrateBps;
-  }
-  if (a.sizeBytes !== b.sizeBytes) {
-    return b.sizeBytes - a.sizeBytes;
   }
   if (defaultVariantId) {
     const aDef = a.variant.id === defaultVariantId ? 1 : 0;
@@ -2077,13 +2072,7 @@ export function classifyMediaLayout(media: UnifiedMedia | null): MediaLayoutKind
   if (albumItems.length > 1 || hasLivePhoto) {
     return "album";
   }
-  const nonAlbumGroups = (media.groups ?? []).filter((g) => g.kind !== "album");
-  const hasMultiNonAlbumGroups =
-    nonAlbumGroups.length > 1 ||
-    nonAlbumGroups.some(
-      (g) => (g.total_count ?? 0) > 1 || (g.item_ids?.length ?? 0) > 1,
-    );
-  if (videoOrAudioItems.length > 1 || hasMultiNonAlbumGroups) {
+  if (videoOrAudioItems.length > 1 || hasMultiCollectionGroups(media)) {
     return "multi_video";
   }
   return "single";
@@ -2110,15 +2099,13 @@ export function resolveItemBaseName(
   media: UnifiedMedia,
   item?: MediaItem | null,
 ): string {
-  const workTitle = media.title?.trim() || "";
-  const itemTitle = item?.title?.trim() || "";
-  const authorName = media.author?.name?.trim() || "";
-  const platformFallback = `${media.platform}_${media.content_id?.trim() || "media"}`;
-
-  if (classifyMediaLayout(media) === "single") {
-    return workTitle || itemTitle || authorName || platformFallback;
-  }
-  return itemTitle || workTitle || authorName || platformFallback;
+  return resolvePreferredMediaTitle({
+    isSingleItem: classifyMediaLayout(media) === "single",
+    workTitle: media.title,
+    itemTitle: item?.title,
+    authorName: media.author?.name,
+    fallback: `${media.platform}_${media.content_id?.trim() || "media"}`,
+  });
 }
 
 function buildSegmentsSpecFromDelivery(

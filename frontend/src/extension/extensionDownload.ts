@@ -32,6 +32,13 @@ import {
   type YouTubeHelperPlayerPayload,
   type YouTubeHelperPlayerResult,
 } from "../utils/youtubeHelperCore";
+import {
+  buildCanonicalVariantDescriptor,
+  compareCanonicalVariantDesc,
+  inferDirectVideoExtension,
+  videoCodecCompatibilityRank,
+  type CanonicalVariantDescriptor,
+} from "../core/media";
 import { executeDashMux } from "./dashMuxDownload";
 import {
   computeEarliestExpiresAtMs,
@@ -129,35 +136,7 @@ export interface SelectedVariantPlan {
 }
 
 export function videoCodecPreferenceRank(rawCodec: unknown): number {
-  if (typeof rawCodec !== "string") return 0;
-  const lower = rawCodec.trim().toLowerCase();
-  if (!lower) return 0;
-  if (
-    lower === "h264" ||
-    lower === "h.264" ||
-    lower === "avc" ||
-    lower === "avc1" ||
-    lower.startsWith("avc1.") ||
-    lower === "avc3" ||
-    lower.startsWith("avc3.")
-  ) {
-    return 3;
-  }
-  if (
-    lower === "hevc" ||
-    lower === "h265" ||
-    lower === "h.265" ||
-    lower === "hev1" ||
-    lower.startsWith("hev1.") ||
-    lower === "hvc1" ||
-    lower.startsWith("hvc1.")
-  ) {
-    return 2;
-  }
-  if (lower === "av1" || lower === "av01" || lower.startsWith("av01.")) {
-    return 1;
-  }
-  return 0;
+  return videoCodecCompatibilityRank(rawCodec);
 }
 
 function resolveVariantVideoCodec(variant: ReadyVariant): string {
@@ -221,12 +200,7 @@ interface ScoredCandidate {
   plan: SelectedVariantPlan;
   isDownloadable: boolean;
   shortEdge: number;
-  pixelArea: number;
-  fps: number;
-  codecRank: number;
-  bitrate: number;
-  hasPlayableAudio: boolean;
-  isOriginalProvenance: boolean;
+  descriptor: CanonicalVariantDescriptor;
   isDirectFile: boolean;
   isDefault: boolean;
 }
@@ -307,30 +281,8 @@ function compareScoredCandidatesDesc(
   a: ScoredCandidate,
   b: ScoredCandidate,
 ): number {
-  if (a.isDownloadable !== b.isDownloadable) {
-    return a.isDownloadable ? -1 : 1;
-  }
-  if (a.hasPlayableAudio !== b.hasPlayableAudio) {
-    return a.hasPlayableAudio ? -1 : 1;
-  }
-  if (a.shortEdge !== b.shortEdge) {
-    return b.shortEdge - a.shortEdge;
-  }
-  if (a.pixelArea !== b.pixelArea) {
-    return b.pixelArea - a.pixelArea;
-  }
-  if (a.fps !== b.fps) {
-    return b.fps - a.fps;
-  }
-  if (a.isOriginalProvenance !== b.isOriginalProvenance) {
-    return a.isOriginalProvenance ? -1 : 1;
-  }
-  if (a.codecRank !== b.codecRank) {
-    return b.codecRank - a.codecRank;
-  }
-  if (a.bitrate !== b.bitrate) {
-    return b.bitrate - a.bitrate;
-  }
+  const cmp = compareCanonicalVariantDesc(a.descriptor, b.descriptor);
+  if (cmp !== 0) return cmp;
   if (a.isDirectFile !== b.isDirectFile) {
     return a.isDirectFile ? -1 : 1;
   }
@@ -558,7 +510,8 @@ export function selectVariantByPreference(
 
   // 3. Video (and fallback audio) ranking for "best" and "1080p"
   const candidates: ScoredCandidate[] = [];
-  for (const variant of readyVariants) {
+  for (let variantIndex = 0; variantIndex < readyVariants.length; variantIndex++) {
+    const variant = readyVariants[variantIndex];
     if (item.type !== "audio" && isStandaloneAudioVariant(variant)) {
       continue;
     }
@@ -568,32 +521,7 @@ export function selectVariantByPreference(
       continue;
     }
 
-    const videoLeafMeta =
-      variant.delivery.kind === "mux"
-        ? variant.delivery.resources.find((r) => r.role === "video")?.metadata
-        : undefined;
     const meta = variant.metadata;
-    const rawW = meta?.width || videoLeafMeta?.width || 0;
-    const rawH = meta?.height || videoLeafMeta?.height || 0;
-    const w = rawW > 0 ? rawW : 0;
-    const h = rawH > 0 ? rawH : 0;
-    const shortEdge =
-      w > 0 && h > 0
-        ? Math.min(w, h)
-        : h || w || inferShortEdgeFromLabel(variant.label);
-    const pixelArea = w > 0 && h > 0 ? w * h : shortEdge * shortEdge;
-    const rawFps = meta?.fps || videoLeafMeta?.fps || 0;
-    const fps = rawFps > 0 ? rawFps : 0;
-    const bitrate =
-      meta?.bitrate_bps ||
-      meta?.video_bitrate_bps ||
-      videoLeafMeta?.video_bitrate_bps ||
-      videoLeafMeta?.bitrate_bps ||
-      0;
-    const codecRank = videoCodecPreferenceRank(
-      resolveVariantVideoCodec(variant),
-    );
-
     let hasPlayableAudio = dashMux ? true : meta?.has_audio !== false;
     let youtubeMux: SelectedVariantPlan["youtubeMux"];
 
@@ -625,20 +553,24 @@ export function selectVariantByPreference(
       ...(youtubeMux ? { youtubeMux } : {}),
       ...(dashMux ? { dashMux } : {}),
     };
+    const isDownloadable = isPlanDirectlyDownloadable(
+      candidatePlan,
+      context,
+      allowedOrigins,
+    );
+    const descriptor = buildCanonicalVariantDescriptor({
+      variant,
+      downloadable: isDownloadable,
+      isAudioOnly: candidatePlan.isAudioOnly,
+      effectiveHasAudio: hasPlayableAudio,
+      originalIndex: variantIndex,
+    });
     candidates.push({
       plan: candidatePlan,
-      isDownloadable: isPlanDirectlyDownloadable(
-        candidatePlan,
-        context,
-        allowedOrigins,
-      ),
-      shortEdge,
-      pixelArea,
-      fps,
-      codecRank,
-      bitrate,
-      hasPlayableAudio,
-      isOriginalProvenance: variant.provenance === "original_endpoint",
+      isDownloadable,
+      shortEdge:
+        descriptor.shortEdge || inferShortEdgeFromLabel(variant.label),
+      descriptor,
       isDirectFile: variant.delivery.kind === "file",
       isDefault: item.default?.variant_id === variant.id,
     });
@@ -675,8 +607,8 @@ export function selectVariantByPreference(
     }
     // All variants are > 1080p: pick the closest one above 1080p with playable audio
     const above = [...preferredPool].sort((a, b) => {
-      if (a.hasPlayableAudio !== b.hasPlayableAudio) {
-        return a.hasPlayableAudio ? -1 : 1;
+      if (a.descriptor.effectiveHasAudio !== b.descriptor.effectiveHasAudio) {
+        return a.descriptor.effectiveHasAudio ? -1 : 1;
       }
       if (a.shortEdge !== b.shortEdge) {
         return a.shortEdge - b.shortEdge;
@@ -692,46 +624,10 @@ export function selectVariantByPreference(
 
 function inferExtensionVideoExtFromUrl(
   rawUrl: string,
-  platform?: string,
+  _platform?: string,
   hasTbvideo = false,
 ): string | undefined {
-  try {
-    const parsed = new URL(rawUrl);
-    const queryMime = (parsed.searchParams.get("mime_type") || "")
-      .trim()
-      .toLowerCase();
-    if (queryMime === "video_mp4" || queryMime === "video/mp4") return "mp4";
-    if (queryMime === "video_webm" || queryMime === "video/webm") return "webm";
-    if (queryMime === "video_quicktime" || queryMime === "video/quicktime") {
-      return "mov";
-    }
-    if (queryMime) return undefined;
-
-    const pathMatch = /\.([a-z0-9]{2,5})$/i.exec(parsed.pathname);
-    if (pathMatch) {
-      const ext = pathMatch[1].toLowerCase();
-      if (ext === "mp4" || ext === "m4v") return "mp4";
-      if (ext === "webm" || ext === "mov" || ext === "mkv") return ext;
-      return undefined;
-    }
-
-    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (host.endsWith(".toutiaovod.com") && parsed.pathname.length > 1) {
-      return "mp4";
-    }
-    if (
-      hasTbvideo ||
-      ((platform === "zuiyou" || platform === "pipigx") &&
-        (host.endsWith(".izuiyou.com") ||
-          host === "tbvideo.ixiaochuan.cn" ||
-          host.endsWith(".szsttkj.com")))
-    ) {
-      return "mp4";
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
+  return inferDirectVideoExtension(rawUrl, hasTbvideo);
 }
 
 function resolveExtensionForTarget(

@@ -264,7 +264,8 @@ watch(
   align-items: center;
   gap: 0.35rem;
   padding: 0.25rem 0.65rem;
-  background: linear-gradient(
+  background-color: #6d28d9;
+  background-image: linear-gradient(
     135deg,
     rgba(108, 92, 231, 0.9),
     rgba(168, 85, 247, 0.9)
@@ -426,7 +427,9 @@ watch(
   transform: none;
 }
 .rs-btn--primary {
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35), 0 1px 3px rgba(0, 0, 0, 0.1);
 }

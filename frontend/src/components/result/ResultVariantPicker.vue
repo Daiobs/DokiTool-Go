@@ -29,9 +29,7 @@ const emit = defineEmits(["select-quality", "toggle-show-all"]);
 const panelEl = ref(null);
 
 const visibleOtherOptions = computed(() =>
-  props.otherQualityOptions.filter(
-    (option) => !(props.isBilibili && option?.dashMux),
-  ),
+  props.otherQualityOptions.filter((option) => !option?.dashMux),
 );
 
 const focusFirstOption = () => {

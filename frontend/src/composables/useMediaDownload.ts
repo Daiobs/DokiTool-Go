@@ -7,6 +7,10 @@ import {
   sourceUrl,
 } from "../utils/mediaContract";
 import { extractDashMuxSpec } from "../extension/dashMuxSpec";
+import {
+  isRefererProtectedMediaRoute,
+  isTbvideoVideoItem,
+} from "../core/media";
 import type {
   WebExtEnqueuePayload,
   WebExtTaskPhase,
@@ -81,19 +85,6 @@ function extensionPhaseStatusText(phase: WebExtTaskPhase): string {
   }
 }
 
-function isBilibiliProtectedAudioUrl(rawUrl: string): boolean {
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    return (
-      host.endsWith(".bilivideo.com") ||
-      host.endsWith(".bilivideo.cn") ||
-      host.endsWith(".akamaized.net")
-    );
-  } catch {
-    return false;
-  }
-}
-
 export function useMediaDownload({
   videoStore,
   showToast,
@@ -102,10 +93,8 @@ export function useMediaDownload({
 }: UseMediaDownloadOptions) {
   const apiContext = { apiOrigin: apiConfig.baseUrl };
   const currentYouTubeHelper = (): YouTubeHelperState | undefined =>
-    videoStore.resultData?.platform === "youtube"
-      ? ((videoStore.resultData.extra as Record<string, unknown> | undefined)
-          ?.youtube_helper as YouTubeHelperState | undefined)
-      : undefined;
+    (videoStore.resultData?.extra as Record<string, unknown> | undefined)
+      ?.youtube_helper as YouTubeHelperState | undefined;
   const effectiveSelectedUrl = () => selection.currentVideoUrl.value;
   const archiveRetries = new Map<number, () => Promise<void>>();
   const videoRetries = new Map<
@@ -854,12 +843,17 @@ export function useMediaDownload({
 
     if (
       snapshot.isAttachment &&
-      snapshot.platform === "bilibili" &&
       snapshot.item.type === "audio" &&
       variant.delivery.kind === "file"
     ) {
-      const routes = deliveryRoutes(variant.delivery.sources, apiContext);
-      if (routes.length > 0 && routes.some(isBilibiliProtectedAudioUrl)) {
+      const fileSources = variant.delivery.sources;
+      const routes = deliveryRoutes(fileSources, apiContext);
+      if (
+        routes.length > 0 &&
+        routes.some((route, index) =>
+          isRefererProtectedMediaRoute(route, fileSources[index]),
+        )
+      ) {
         const audioBaseSnapshot: ItemSnapshot = {
           ...snapshot,
           isAttachment: false,
@@ -872,7 +866,7 @@ export function useMediaDownload({
           filename,
           payload: {
             kind: "direct_download",
-            platform: "bilibili",
+            platform: snapshot.platform || "media",
             title: snapshot.title || snapshot.item.title || filename,
             filename,
             routes,
@@ -1012,12 +1006,7 @@ export function useMediaDownload({
         if (target.kind === "file") {
           const hints = item.tbvideo;
           const tbvideo =
-            item.type === "video" &&
-            (snapshot.platform === "pipigx" ||
-              snapshot.platform === "zuiyou") &&
-            hints?.platform === snapshot.platform
-              ? hints
-              : undefined;
+            isTbvideoVideoItem(item) && hints ? hints : undefined;
           const sourceId = target.source.id;
           sourceContexts.set(id, {
             tbvideo: tbvideo && {

@@ -15,13 +15,41 @@ before(async () => {
     '../services/apiConfig': { apiConfig: { baseUrl: '' } },
     '../utils/youtubeHelperCore': youtubeHelperCore,
   };
-  for (const id of ['../utils/mediaSources', '../utils/mediaContract', '../composables/useVideoSelection']) {
+  for (const id of [
+    '../utils/mediaSources',
+    '../utils/mediaContract',
+    '../core/media/cdnTransportHints',
+    '../core/media/variantSort',
+    '../core/media/layoutAndFilename',
+    '../extension/hostWhitelist',
+    '../extension/dashMuxSpec',
+    '../core/media/muxSpec',
+    '../core/media/index',
+    '../composables/useVideoSelection',
+  ]) {
     const utilities = await readFile(new URL(`../src/${id.slice(3)}.ts`, import.meta.url), 'utf8');
     const module = { exports: {} };
     const compiled = await transformWithEsbuild(utilities, `${id}.ts`, { loader: 'ts', format: 'cjs' });
-    new Function('require', 'module', 'exports', compiled.code)(id => modules[id] || require(id), module, module.exports);
+    new Function('require', 'module', 'exports', compiled.code)(
+      (reqId) => {
+        if (modules[reqId]) return modules[reqId];
+        if (reqId === '../core/media' && modules['../core/media/index']) return modules['../core/media/index'];
+        if (reqId === './cdnTransportHints') return modules['../core/media/cdnTransportHints'];
+        if (reqId === './variantSort') return modules['../core/media/variantSort'];
+        if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
+        if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
+        if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
+        if (reqId === '../../utils/mediaSources') return modules['../utils/mediaSources'];
+        if (reqId === '../../extension/hostWhitelist') return modules['../extension/hostWhitelist'];
+        if (reqId === '../../extension/dashMuxSpec') return modules['../extension/dashMuxSpec'];
+        return require(reqId);
+      },
+      module,
+      module.exports,
+    );
     modules[id] = module.exports;
   }
+  modules['../core/media'] = modules['../core/media/index'];
   ({ useVideoSelection } = modules['../composables/useVideoSelection']);
   ({ validateMediaEnvelope } = modules['../utils/mediaContract']);
   ResultSection = await loadSfc(
@@ -682,10 +710,39 @@ test('Bilibili DASH mux variants: uncluttered uninstalled state (no purple banne
     assert.ok(enHintText.includes('1080p'));
     assert.ok(enHintText.includes('Install Chrome Extension'));
 
-    // 5. Non-Bilibili platforms do not show Bilibili extension hint
-    const nonBiliData = { ...biliData, platform: 'douyin', groups: undefined };
-    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonBiliData });
-    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: nonBiliData };
+    // 5. Capability-driven mux detection: ANY platform with delivery.kind === "mux" shows .rs-ext-hint,
+    // while a payload with higher_quality_variants but NO mux variants shows .rs-higher-quality-note instead.
+    const nonBiliMuxData = { ...biliData, platform: 'vimeo', groups: undefined };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonBiliMuxData });
+    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: nonBiliMuxData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(view.elements('rs-ext-hint').length, 1, 'non-Bilibili platform with mux variants still offers extension lossless mux');
+
+    const nonMuxHigherQualityData = {
+      ...biliData,
+      platform: 'douyin',
+      groups: undefined,
+      items: [{
+        ...biliItem,
+        variants: [
+          biliItem.variants[0],
+          {
+            id: 'adaptive-4k-dash',
+            label: '4K',
+            metadata: { width: 3840, height: 2160, evidence: 'upstream' },
+            delivery: {
+              kind: 'dash',
+              scope: 'adaptive',
+              sources: [{ id: 's-mpd', url: 'https://media.test/master.mpd' }],
+            },
+          },
+        ],
+        higher_quality_variants: [{ variant_id: 'adaptive-4k-dash', requires: ['dash'] }],
+      }],
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonMuxHigherQualityData });
+    view.state.value = { ...view.state.value, resultVersion: 21, locale: 'zh-CN', resultData: nonMuxHigherQualityData };
     view.state.value.selection.syncResult();
     await view.flush();
     assert.equal(view.elements('rs-ext-hint').length, 0);
@@ -757,16 +814,25 @@ test('Bilibili DASH mux variants: uncluttered uninstalled state (no purple banne
     assert.equal(connView.elements('rs-ext-hint').length, 0, 'bottom install hint must be hidden when extension is connected');
     assert.equal(connView.elements('rs-bili-dash-callout').length, 0);
 
-    // 3. Quality tab unlocks all 3 1080p DASH variants as directly clickable options alongside 720p!
+    // 3. Quality tab unlocks all 3 1080p DASH variants canonically sorted ABOVE 720p (H.264 > HEVC > AV1 > 720p)
+    // AND automatically upgrades active selection to 1080p H.264 upon extension connect!
     await connView.tab('画质选项');
     const items = connView.elements('rs-backup-item');
     assert.equal(items.length, 4, '720p + 3 unlocked 1080p DASH variants should all be selectable');
-    assert.equal(items[1].props['data-extension-mux'], true);
-    assert.ok(textOf(items[1]).includes('1080p'));
-    assert.ok(textOf(items[1]).includes('扩展无损合流'));
+    assert.equal(items[0].props['data-extension-mux'], true);
+    assert.ok(textOf(items[0]).includes('1080p'));
+    assert.ok(textOf(items[0]).includes('扩展无损合流'));
+    assert.ok(textOf(items[0]).includes('当前已选'), 'top-ranked 1080p H.264 must be auto-selected on extension connect');
+    assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'mux-1080p-avc' });
+    assert.ok(textOf(items[3]).includes('720p'), '720p durl sorts after unlocked 1080p DASH options');
 
-    // 4. Selecting 1080p DASH keeps playable 720p <video> preview, enables primary 下载视频 CTA, and emits download-main!
-    items[1].props.onClick();
+    // 4. Manual switch to 720p is respected; switching back to 1080p DASH keeps playable 720p <video> preview, enables primary 下载视频 CTA, and emits download-main!
+    items[3].props.onClick();
+    await connView.flush();
+    assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'durl-720p' });
+    assert.equal(connView.state.value.selection.hasManualChoice(biliItem.id), true);
+
+    items[0].props.onClick();
     await connView.flush();
     assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'mux-1080p-avc' });
     assert.equal(connView.elements('rs-video')[0].props.src, durlUrl, 'video stage keeps playable durl fallback while 1080p DASH is selected');

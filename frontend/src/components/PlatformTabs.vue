@@ -21,7 +21,7 @@ const getPlatforms = (locale) => platformTabs(locale)
         :class="[
           'px-4 py-2 rounded-lg font-medium text-sm transition-all flex items-center gap-2',
           currentPlatform === tab.key
-            ? 'bg-gradient-to-r from-indigo-500 to-purple-500 text-white shadow-lg'
+            ? 'bg-indigo-600 bg-gradient-to-r from-indigo-500 to-purple-500 text-white shadow-lg'
             : 'bg-white dark:bg-slate-800 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-slate-700 border border-gray-200 dark:border-slate-700'
         ]"
       >

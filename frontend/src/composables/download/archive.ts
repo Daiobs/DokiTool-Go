@@ -1,4 +1,5 @@
 import { acquireBufferedSlot } from "../../downloads/buffered";
+import { isTbvideoVideoItem } from "../../core/media";
 import type {
   Attachment,
   MediaItem,
@@ -235,14 +236,7 @@ export function createArchiveController(deps: {
     filename: string,
     retryId?: number,
   ): Promise<void> {
-    if (
-      snapshots.some(
-        (s) =>
-          s.item.type === "video" &&
-          (s.platform === "pipigx" || s.platform === "zuiyou"),
-      )
-    )
-      return;
+    if (snapshots.some((s) => isTbvideoVideoItem(s.item))) return;
     const taskSnapshots = [...snapshots];
     await runArchive(
       filename,

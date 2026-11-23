@@ -27,10 +27,30 @@ before(async () => {
     new Function('require', 'module', 'exports', compiled.code)(id => aliases[id] || modules[id] || require(id), module, module.exports);
     return module.exports;
   }
-  contract = modules['../utils/mediaContract'] = await load('../src/utils/mediaContract.ts');
-  labels = modules['../utils/mediaSources'] = await load('../src/utils/mediaSources.ts');
+  contract = modules['../utils/mediaContract'] = modules['../../utils/mediaContract'] = await load('../src/utils/mediaContract.ts');
+  labels = modules['../utils/mediaSources'] = modules['../../utils/mediaSources'] = await load('../src/utils/mediaSources.ts');
   modules['../utils/youtubeHelperCore'] = youtubeHelperCore;
   modules['../services/apiConfig'] = { apiConfig: { baseUrl: '' } };
+  const cdnTransportHints = await load('../src/core/media/cdnTransportHints.ts');
+  const variantSort = await load('../src/core/media/variantSort.ts');
+  const hostWhitelist = await load('../src/extension/hostWhitelist.ts');
+  const dashMuxSpec = await load('../src/extension/dashMuxSpec.ts', {
+    '../utils/mediaContract': contract,
+  });
+  const muxSpec = await load('../src/core/media/muxSpec.ts', {
+    '../../extension/dashMuxSpec': dashMuxSpec,
+    '../../extension/hostWhitelist': hostWhitelist,
+    './variantSort': variantSort,
+  });
+  const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {
+    './variantSort': variantSort,
+  });
+  modules['../core/media'] = {
+    ...cdnTransportHints,
+    ...muxSpec,
+    ...variantSort,
+    ...layoutAndFilename,
+  };
   ({ useVideoSelection } = await load('../src/composables/useVideoSelection.ts'));
   ResultSection = await loadSfc(
     new URL('../src/components/ResultSection.vue', import.meta.url),
@@ -369,7 +389,11 @@ test('compact quality cards preserve the server source, explicit versions and ac
   try {
     await view.click('画质选项');
     assert.equal(view.choices().length, 4, 'only downloadable files participate in compact display cards');
-    assert.equal(view.selection.currentSelection.value, null);
+    // Canonical auto-upgrade promotes 4K original_endpoint above 1080p default when user hasn't made a manual pick
+    assert.deepEqual(view.selection.currentSelection.value, { variant_id: 'raw', source_id: 'raw-source' });
+    assert.equal(view.selection.currentTarget.value.url, url('raw-source'));
+    // Explicit manual selection of a specific server route is preserved across compact/expanded toggling
+    view.selection.choose({ variant_id: '1080-hevc', source_id: 'hevc-b' }); await nextTick();
     assert.equal(view.selection.currentTarget.value.url, url('hevc-b'));
     assert.match(view.text(), /原画/);
     assert.doesNotMatch(view.text(), /原始入口/);

@@ -10746,15 +10746,17 @@ test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classific
       walk(root);
       return out;
     };
-    const hlsFallbackBtnLabels = collectButtons(extFallbacks[0]).map((b) =>
-      vimeoView.textOf(b).trim(),
-    );
-    assert.deepEqual(hlsFallbackBtnLabels, ["复制直链", "打开原帖"]);
+    // Canonical sort orders external_only options by descending resolution (4K DASH > 1080p HLS):
     // DASH mux fallback has no direct copyUrl, so it renders only 打开原帖 button
-    const dashFallbackBtnLabels = collectButtons(extFallbacks[1]).map((b) =>
+    const dashFallbackBtnLabels = collectButtons(extFallbacks[0]).map((b) =>
       vimeoView.textOf(b).trim(),
     );
     assert.deepEqual(dashFallbackBtnLabels, ["打开原帖"]);
+    // HLS fallback includes BOTH 复制直链 and 打开原帖 buttons
+    const hlsFallbackBtnLabels = collectButtons(extFallbacks[1]).map((b) =>
+      vimeoView.textOf(b).trim(),
+    );
+    assert.deepEqual(hlsFallbackBtnLabels, ["复制直链", "打开原帖"]);
   } finally {
     vimeoView.unmount();
   }
