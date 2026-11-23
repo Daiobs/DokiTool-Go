@@ -2109,15 +2109,29 @@ export function createOffscreenDownloadExecutor(
     const fileBlob = await sink.closeAndGetBlob();
     throwIfAborted(signal);
 
-    // OPFS temporary files (`*.tmp`) report `fileBlob.type === ""`, which Chromium's
-    // DownloadTargetDeterminer defaults to `text/plain` and rewrites to `.txt`!
-    // Wrapping `[fileBlob]` in a typed `Blob` preserves zero-copy OPFS disk backing in Blink
-    // while giving `chrome.downloads` the authoritative media MIME type.
+    // OPFS temporary files (`*.tmp`) report `fileBlob.type === ""` and temp names,
+    // which Chromium's DownloadTargetDeterminer can turn into `.txt` or UUID filenames.
+    // Wrapping `[fileBlob]` in a `File` with the leaf filename & authoritative MIME preserves
+    // zero-copy OPFS disk backing in Blink while giving `chrome.downloads` both name and type.
     const effectiveMime = resolveBlobMimeType(spec.filename, spec.mimeType);
-    const typedBlob =
-      fileBlob.type === effectiveMime
-        ? fileBlob
-        : new Blob([fileBlob], { type: effectiveMime });
+    const leafFilename =
+      (spec.filename || "")
+        .split(/[/\\]+/)
+        .map((segment) => segment.trim())
+        .filter(Boolean)
+        .pop() || "download.bin";
+    const isMatchingFile =
+      typeof File === "function" &&
+      fileBlob instanceof File &&
+      fileBlob.name === leafFilename &&
+      fileBlob.type === effectiveMime;
+    const typedBlob: Blob = isMatchingFile
+      ? fileBlob
+      : typeof File === "function"
+        ? new File([fileBlob], leafFilename, { type: effectiveMime })
+        : fileBlob.type === effectiveMime
+          ? fileBlob
+          : new Blob([fileBlob], { type: effectiveMime });
     const blobUrl = urlApi.createObjectURL(typedBlob);
     let resolveRelease!: () => void;
     const releasePromise = new Promise<void>((resolve) => {

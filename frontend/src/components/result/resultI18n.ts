@@ -93,6 +93,10 @@ const content: Record<string, Record<string, string>> = {
     extConnected: "扩展已连接",
     extConnectedTitle:
       "已连接 DokiTool Chrome 扩展，可直接解锁 DASH 无损合流下载",
+    extUpdateBadge: "有新版 v{version}",
+    extUpdateBadgeTitle:
+      "检测到新版本扩展 v{version}，点击打开升级指引（免油猴解锁 YouTube 4K60 & B 站 1080P 无损合流）",
+    reopenUpgradeNotice: "安装扩展解锁",
     extMuxTag: "扩展无损合流",
     extInstallHintWithRes: "需要 {res} 无损合流？",
     extInstallHintGeneric: "需要更高画质无损合流？",
@@ -196,6 +200,10 @@ const content: Record<string, Record<string, string>> = {
     extConnected: "Extension Connected",
     extConnectedTitle:
       "Connected to DokiTool Chrome Extension — lossless DASH mux downloads are unlocked",
+    extUpdateBadge: "Update v{version}",
+    extUpdateBadgeTitle:
+      "Extension v{version} is available — click to open the upgrade guide",
+    reopenUpgradeNotice: "Install Extension",
     extMuxTag: "Extension Mux",
     extInstallHintWithRes: "Need {res} lossless mux?",
     extInstallHintGeneric: "Need higher-quality lossless mux?",

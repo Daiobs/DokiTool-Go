@@ -1,5 +1,9 @@
 import { computed, ref, shallowRef, watch, type Ref } from "vue";
 import { apiConfig } from "../services/apiConfig";
+import type {
+  parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
+  pingInstalledExtension,
+} from "../services/extensionBridge";
 import type { pingYouTubeHelper } from "../utils/youtubeHelperCore";
 import type { useVideoStore } from "../stores/video";
 import type {
@@ -147,6 +151,8 @@ export function useVideoParser(options: {
   sessionStorage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
   reloadPage?: () => void;
   pingHelper?: typeof pingYouTubeHelper;
+  pingExtension?: typeof pingInstalledExtension;
+  parseYouTubeViaExtension?: typeof parseYouTubeViaExtensionFn;
 }) {
   const { videoStore, showToast } = options;
   const resolveSessionStorage = () => {
@@ -171,6 +177,22 @@ export function useVideoParser(options: {
         "../utils/youtubeHelperCore"
       );
       return ping(...args);
+    });
+  const pingExtension: typeof pingInstalledExtension =
+    options.pingExtension ??
+    (async (...args) => {
+      const { pingInstalledExtension: ping } = await import(
+        "../services/extensionBridge"
+      );
+      return ping(...args);
+    });
+  const parseYouTubeViaExtension: typeof parseYouTubeViaExtensionFn =
+    options.parseYouTubeViaExtension ??
+    (async (...args) => {
+      const { parseYouTubeViaExtension: parse } = await import(
+        "../services/extensionBridge"
+      );
+      return parse(...args);
     });
 
   const inputUrl = shallowRef(""),
@@ -303,6 +325,8 @@ export function useVideoParser(options: {
       signal: controller.signal,
       isCurrent: () => run === generation && !controller.signal.aborted,
       pingHelper,
+      pingExtension,
+      parseYouTubeViaExtension,
       requestStandardParse: () => requestStandardParse(url, controller.signal),
       fetchJSON,
       baseUrl: apiConfig.baseUrl,
@@ -445,6 +469,35 @@ export function useVideoParser(options: {
     });
   }
 
+  async function isYouTubeClientParseReady(): Promise<boolean> {
+    let extState: Awaited<ReturnType<typeof pingInstalledExtension>> | null =
+      null;
+    try {
+      extState = await pingExtension();
+    } catch {
+      extState = null;
+    }
+    const { resolveClientParseRoute } = await import("../core/capabilityHub");
+    const extRoute = resolveClientParseRoute(true, {
+      extensionConnected: Boolean(extState?.connected),
+      extensionVersion: extState?.version || "",
+      extensionCapabilities: extState?.capabilities ?? [],
+      userscriptReady: false,
+    });
+    if (extRoute.channel === "extension_client_parse") {
+      return true;
+    }
+    const ping = await pingHelper();
+    const fallbackRoute = resolveClientParseRoute(true, {
+      extensionConnected: Boolean(extState?.connected),
+      extensionVersion: extState?.version || "",
+      extensionCapabilities: extState?.capabilities ?? [],
+      userscriptReady: Boolean(ping.installed && ping.supported),
+      userscriptVersion: ping.version || undefined,
+    });
+    return fallbackRoute.channel === "userscript_client_parse";
+  }
+
   async function handleYouTubeHelperTabReturn(): Promise<boolean> {
     if (checkingHelperInstall) return false;
     const state = readHelperWaitState();
@@ -452,8 +505,7 @@ export function useVideoParser(options: {
 
     checkingHelperInstall = true;
     try {
-      const ping = await pingHelper();
-      if (ping.installed && ping.supported) {
+      if (await isYouTubeClientParseReady()) {
         clearHelperWaitState();
         needsManualHelperRefresh.value = false;
         if (state.platform && state.platform !== currentPlatform.value) {
@@ -499,8 +551,7 @@ export function useVideoParser(options: {
         inputUrl.value = state.url;
       }
 
-      const ping = await pingHelper();
-      if (ping.installed && ping.supported) {
+      if (await isYouTubeClientParseReady()) {
         clearHelperWaitState();
         needsManualHelperRefresh.value = false;
         if (inputUrl.value.trim()) {

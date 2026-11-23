@@ -248,6 +248,7 @@ export function useMediaDownload({
     selectionInFlight,
     selectionBusyNotice,
     downloadFile,
+    runExtensionBridgeDownload,
   });
 
   async function downloadFile(
@@ -395,6 +396,41 @@ export function useMediaDownload({
         return;
       }
       if (ytHelper?.status === "ready") {
+        if (ytHelper.provider === "extension") {
+          deliveryTasks.delete(deliveryId);
+          const ctx = sourceContexts.get(downloadId);
+          const matchedSource = (ctx?.sources ?? []).find(
+            (s) =>
+              comparableUrl(sourceUrl(s, apiContext)) === comparableUrl(url),
+          );
+          const knownSize = matchedSource?.size_bytes || 0;
+          const formatMime = ctx?.formatMime;
+          const selectionKey =
+            fileTaskSelections.get(downloadId) ||
+            JSON.stringify([
+              videoStore.resultVersion,
+              comparableUrl(url),
+              "ext-yt-direct",
+            ]);
+          await runExtensionBridgeDownload({
+            retryId: downloadId,
+            controller,
+            filename,
+            payload: {
+              kind: "youtube_direct",
+              platform: videoStore.resultData?.platform || "media",
+              title: videoStore.resultData?.title || filename,
+              filename,
+              url,
+              ...(knownSize ? { sizeBytes: knownSize } : {}),
+              ...(formatMime ? { mimeType: formatMime } : {}),
+            },
+            savePathLabel: "保存路径：Chrome 扩展后台下载",
+            startStatusText: "扩展后台保存中...",
+            selectionKey,
+          });
+          return;
+        }
         await ytController.runYouTubeDirectHelperDownload({
           url,
           filename,
@@ -593,8 +629,9 @@ export function useMediaDownload({
   }
 
   function runExtensionBridgeDownload(params: {
-    snapshot: ItemSnapshot;
+    snapshot?: ItemSnapshot;
     retryId?: number;
+    controller?: AbortController;
     filename: string;
     payload: WebExtEnqueuePayload;
     savePathLabel: string;
@@ -623,10 +660,11 @@ export function useMediaDownload({
         statusText: "正在连接 Chrome 扩展...",
       });
     fileTaskSelections.set(id, selectionKey);
-    const controller = new AbortController();
+    const controller = params.controller ?? new AbortController();
     const startedAt = Date.now();
     videoStore.updateDownload(id, {
       filename,
+      ...(payload.kind === "youtube_direct" ? { url: payload.url } : {}),
       abortController: controller,
       status: "preparing",
       statusText: "正在连接 Chrome 扩展...",
@@ -647,19 +685,37 @@ export function useMediaDownload({
       deliveryId: undefined,
       transport: undefined,
     });
-    videoRetries.set(id, () => enqueueItem(snapshot, id, false));
+    if (snapshot) {
+      videoRetries.set(id, () => enqueueItem(snapshot, id, false));
+    } else if (!videoRetries.has(id)) {
+      videoRetries.set(id, async () => {
+        const currentTask = taskFor(id);
+        if (currentTask?.url) {
+          await downloadFile(
+            currentTask.url,
+            currentTask.filename || filename,
+            id,
+            new AbortController(),
+            Date.now(),
+          );
+          return true;
+        }
+        return false;
+      });
+    }
 
     return (async () => {
+      let extTaskId: string | null = null;
+      let cancelListener: (() => void) | null = null;
       try {
         const bridge = await loadExtensionBridge();
         checkAbort(controller.signal);
         if (!ownsTask(id, controller)) return false;
 
         const enq = await bridge.enqueueMediaViaExtension(payload);
-        checkAbort(controller.signal);
-        if (!ownsTask(id, controller)) return false;
-
         if (!enq.ok) {
+          checkAbort(controller.signal);
+          if (!ownsTask(id, controller)) return false;
           const errMsg = enq.error || "连接 Chrome 扩展失败，请确认扩展已启用";
           videoStore.updateDownload(id, {
             status: "failed",
@@ -672,7 +728,21 @@ export function useMediaDownload({
           return false;
         }
 
-        const extTaskId = enq.data.taskId;
+        extTaskId = enq.data.taskId;
+        if (controller.signal.aborted || !ownsTask(id, controller)) {
+          void bridge.cancelExtensionTask(extTaskId).catch(() => {});
+          checkAbort(controller.signal);
+          return false;
+        }
+        cancelListener = () => {
+          if (extTaskId) {
+            void bridge.cancelExtensionTask(extTaskId).catch(() => {});
+          }
+        };
+        controller.signal.addEventListener("abort", cancelListener, {
+          once: true,
+        });
+
         videoStore.updateDownload(id, {
           status: "downloading",
           statusText: startStatusText,
@@ -688,6 +758,7 @@ export function useMediaDownload({
 
           const statusResp = await bridge.getExtensionTaskStatus(extTaskId);
           if (!ownsTask(id, controller)) return false;
+          checkAbort(controller.signal);
 
           if (!statusResp.ok) {
             consecutiveErrors++;
@@ -796,6 +867,11 @@ export function useMediaDownload({
           showToast(error.message, "error", 5000);
         }
         return false;
+      } finally {
+        if (cancelListener) {
+          controller.signal.removeEventListener("abort", cancelListener);
+          cancelListener = null;
+        }
       }
     })();
   }

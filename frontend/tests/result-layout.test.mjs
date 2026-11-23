@@ -8,8 +8,12 @@ import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
 import { loadSfc } from './helpers/loadSfc.mjs';
 
 const require = createRequire(import.meta.url);
-const originalGlobals = { window: globalThis.window, document: globalThis.document };
-let ResultSection, useVideoSelection, validateMediaEnvelope;
+const originalGlobals = {
+  window: globalThis.window,
+  document: globalThis.document,
+  requestAnimationFrame: globalThis.requestAnimationFrame,
+};
+let ResultSection, ExtensionDownloadModal, useVideoSelection, validateMediaEnvelope;
 before(async () => {
   const modules = {
     '../services/apiConfig': { apiConfig: { baseUrl: '' } },
@@ -61,6 +65,9 @@ before(async () => {
         './VideoPlaylist.vue': { default: { render: () => h('div', { class: 'test-playlist' }) } },
       },
     },
+  );
+  ExtensionDownloadModal = await loadSfc(
+    new URL('../src/components/ExtensionDownloadModal.vue', import.meta.url),
   );
 });
 after(() => Object.assign(globalThis, originalGlobals));
@@ -123,8 +130,15 @@ async function mount(data = video, desktop = true) {
     requestAnimationFrame(callback) { frames.set(++nextFrame, callback); return nextFrame; },
     cancelAnimationFrame: id => frames.delete(id),
     getComputedStyle(node) {
-      return hasClass(node, 'rs-info-col') ? { rowGap: '16px' }
-        : { borderTopWidth: '1px', borderBottomWidth: '1px' };
+      return {
+        transitionDelay: '0s',
+        transitionDuration: '0s',
+        animationDelay: '0s',
+        animationDuration: '0s',
+        ...(hasClass(node, 'rs-info-col')
+          ? { rowGap: '16px' }
+          : { borderTopWidth: '1px', borderBottomWidth: '1px' }),
+      };
     },
     ResizeObserver: class {
       nodes = new Set();
@@ -134,8 +148,12 @@ async function mount(data = video, desktop = true) {
       disconnect() { this.nodes.clear(); this.disconnects++; }
     },
   };
-  globalThis.document = { body: { style: {} } };
+  globalThis.requestAnimationFrame = globalThis.window.requestAnimationFrame;
+  globalThis.document = { body: { style: {}, offsetHeight: 0 } };
   const element = (type, text = '') => markRaw({ type, text, props: {}, children: [], parent: null, style: {},
+    ownerDocument: globalThis.document,
+    classList: { add() {}, remove() {} },
+    addEventListener() {}, removeEventListener() {},
     removeAttribute() {}, getAttribute(name) { return this.props[name]; },
     getBoundingClientRect() {
       reads++;
@@ -145,6 +163,7 @@ async function mount(data = video, desktop = true) {
     },
   });
   const detach = node => {
+    if (!node) return;
     if (node.parent) node.parent.children = node.parent.children.filter(item => item !== node);
     node.parent = null;
   };
@@ -184,6 +203,9 @@ async function mount(data = video, desktop = true) {
   await flush();
   return {
     app, state, dimensions, observers, frames, mediaListeners, listeners, elements, flush,
+    root, portal,
+    findAll: (pred, scope = root) => findAll(scope, pred),
+    portalFindAll: (pred) => findAll(portal, pred),
     reads: () => reads,
     main: () => elements('rs-main')[0],
     details: () => elements('rs-tab-panel--details')[0],
@@ -1297,5 +1319,358 @@ test('PR #34 Round 2: unwhitelisted Tier-2 mux NEVER renders extension M4A card/
     protectedView.app.unmount();
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
+  }
+});
+
+test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero body scroll lock, extension-first CTA, collapsed legacy userscript, dismiss/reopen)', async () => {
+  const prevChrome = globalThis.chrome;
+  delete globalThis.chrome;
+
+  const ytMissingData = {
+    platform: 'youtube',
+    content_id: 'I9JvDaciaFk',
+    title: 'YouTube Corner Notice Test',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-1',
+    items: [
+      {
+        id: 'yt-1',
+        type: 'video',
+        state: 'unavailable',
+        default: null,
+        default_unavailable_reason: 'unavailable',
+        error: { code: 'YOUTUBE_HELPER_REQUIRED', message: '需要本地解析能力' },
+      },
+    ],
+    extra: {
+      youtube_helper: {
+        status: 'missing',
+        min_version: '1.3.1',
+        script_url: '/helper/dokitool-youtube.user.js',
+        message: '需要本地解析能力',
+      },
+    },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: ytMissingData });
+
+  const view = await mount(ytMissingData);
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  let openExtensionCalls = 0;
+  let installHelperCalls = 0;
+  let refreshPageCalls = 0;
+  view.state.value = {
+    ...view.state.value,
+    needsManualHelperRefresh: false,
+    onOpenExtension() { openExtensionCalls++; },
+    onInstallYoutubeHelper() { installHelperCalls++; },
+    onRefreshYoutubeHelperPage() { refreshPageCalls++; },
+  };
+  await view.flush();
+
+  try {
+    // 1. Non-blocking corner notice in portal with ZERO body scroll lock and ZERO modal dialog attrs
+    assert.equal(globalThis.document.body.style.overflow || '', '', 'non-blocking corner notice must NOT lock body scroll');
+    const notice = () => view.portalFindAll(n => 'data-capability-upgrade-notice' in n.props)[0];
+    assert.ok(notice(), 'CapabilityUpgradeNotice should render in portal');
+    assert.equal(notice().props['data-notice-mode'], 'client_session');
+    assert.equal(notice().props.role, 'region');
+    assert.equal(notice().props['aria-modal'], undefined);
+    assert.equal(view.portalFindAll(n => 'data-yt-helper-modal' in n.props).length, 0);
+
+    // 2. Primary CTA opens extension modal
+    const primaryCta = view.portalFindAll(n => 'data-upgrade-open-extension' in n.props)[0];
+    assert.ok(primaryCta);
+    assert.equal(textOf(primaryCta), '安装 DokiTool 扩展（免油猴解锁 YouTube 4K60 & B 站 1080P）');
+    primaryCta.props.onClick();
+    await view.flush();
+    assert.equal(openExtensionCalls, 1);
+
+    // 3. Legacy userscript fallback starts collapsed with install link and no manual refresh button
+    const legacyDetails = () => view.portalFindAll(n => 'data-legacy-userscript-fallback' in n.props)[0];
+    assert.ok(legacyDetails());
+    assert.equal(legacyDetails().props.open, undefined);
+    assert.ok(textOf(legacyDetails()).includes('使用 Firefox 或旧版油猴脚本？'));
+    const installLink = view.portalFindAll(n => 'data-yt-helper-install-link' in n.props)[0];
+    assert.ok(installLink);
+    assert.equal(installLink.props.href, '/helper/dokitool-youtube.user.js');
+    installLink.props.onClick();
+    await view.flush();
+    assert.equal(installHelperCalls, 1);
+    assert.equal(view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props).length, 0);
+
+    // 4. needsManualHelperRefresh opens <details> and exposes manual refresh button
+    view.state.value = { ...view.state.value, needsManualHelperRefresh: true };
+    await view.flush();
+    assert.equal(legacyDetails().props.open, true);
+    const refreshBtn = view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props)[0];
+    assert.ok(refreshBtn);
+    assert.equal(textOf(refreshBtn), '刷新页面');
+    refreshBtn.props.onClick();
+    await view.flush();
+    assert.equal(refreshPageCalls, 1);
+
+    // 5. English locale copy
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(
+      textOf(view.portalFindAll(n => 'data-upgrade-open-extension' in n.props)[0]),
+      'Install DokiTool Extension (YouTube 4K60 & Bilibili 1080P)',
+    );
+    assert.ok(textOf(legacyDetails()).includes('Using Firefox or legacy userscript?'));
+    assert.equal(
+      textOf(view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props)[0]),
+      'Refresh Page',
+    );
+
+    // 6. Dismiss corner notice -> stage card shows updated reopen CTA (Install Extension / 安装扩展解锁) -> click reopens notice
+    view.state.value = { ...view.state.value, locale: 'zh-CN' };
+    await view.flush();
+    const closeBtn = view.portalFindAll(n => 'data-capability-upgrade-close' in n.props)[0];
+    assert.ok(closeBtn);
+    closeBtn.props.onClick();
+    await view.flush();
+    assert.equal(notice(), undefined);
+
+    const reopenBtn = () => view.findAll(n => 'data-yt-helper-reopen' in n.props)[0];
+    assert.ok(reopenBtn(), 'reopen button should appear after dismissing corner notice');
+    assert.equal(textOf(reopenBtn()), '安装扩展解锁');
+
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(reopenBtn()), 'Install Extension');
+
+    reopenBtn().props.onClick();
+    await view.flush();
+    assert.ok(notice(), 'clicking reopen button restores CapabilityUpgradeNotice');
+  } finally {
+    view.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 < 4.2.0, opens extension modal on click, and hides on 4.2.0', async () => {
+  const prevChrome = globalThis.chrome;
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  const mockChromeVersion = (version) => {
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg?.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version,
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+              },
+            });
+          }
+        },
+      },
+    };
+  };
+
+  // Case 1: Outdated installed extension (4.1.0 < 4.2.0) -> shows clickable extension-update-badge
+  mockChromeVersion('4.1.0');
+  const outdatedView = await mount(video);
+  let openExtensionCalls = 0;
+  outdatedView.state.value = {
+    ...outdatedView.state.value,
+    onOpenExtension() { openExtensionCalls++; },
+  };
+  await outdatedView.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await outdatedView.flush();
+
+  try {
+    assert.equal(
+      outdatedView.findAll(n => n.props['data-testid'] === 'extension-connected-badge').length,
+      1,
+    );
+    const updateBadge = () =>
+      outdatedView.findAll(n => n.props['data-testid'] === 'extension-update-badge')[0];
+    assert.ok(updateBadge(), 'expected extension-update-badge when installed 4.1.0 < 4.2.0');
+    assert.equal(textOf(updateBadge()), '有新版 v4.2.0');
+
+    updateBadge().props.onClick();
+    await outdatedView.flush();
+    assert.equal(openExtensionCalls, 1);
+
+    outdatedView.state.value = { ...outdatedView.state.value, locale: 'en' };
+    await outdatedView.flush();
+    assert.equal(textOf(updateBadge()), 'Update v4.2.0');
+  } finally {
+    outdatedView.app.unmount();
+  }
+
+  // Case 2: Up-to-date installed extension (4.2.0) -> hides extension-update-badge
+  mockChromeVersion('4.2.0');
+  const currentView = await mount(video);
+  await currentView.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await currentView.flush();
+
+  try {
+    assert.equal(
+      currentView.findAll(n => n.props['data-testid'] === 'extension-connected-badge').length,
+      1,
+    );
+    assert.equal(
+      currentView.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
+      0,
+      'extension-update-badge must be hidden when installed extension is already 4.2.0',
+    );
+  } finally {
+    currentView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test('P1 PR-2: extension-powered YouTube header ready status shows 免油猴无损合流 / No Userscript while preserving legacy userscript wording', async () => {
+  const prevChrome = globalThis.chrome;
+  delete globalThis.chrome;
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  const ytExtReadyData = {
+    platform: 'youtube',
+    title: 'YouTube Extension Bridge Ready',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-ext-1',
+    items: [fileItem('yt-ext-1', 'video', 'https://rr1---sn-ajoguc-5t.googlevideo.com/videoplayback?itag=18')],
+    extra: {
+      youtube_helper: {
+        status: 'ready',
+        provider: 'extension',
+        extensionVersion: '4.2.0',
+        version: '4.2.0',
+      },
+    },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: ytExtReadyData });
+
+  const view = await mount(ytExtReadyData);
+  try {
+    const hint = () => view.elements('rs-header-hint')[0];
+    assert.ok(hasClass(hint(), 'rs-header-hint--ready'));
+    assert.equal(textOf(hint()), '扩展 v4.2.0 已就绪 · 免油猴无损合流');
+    assert.match(hint().props.title, /DokiTool 扩展 \(v4\.2\.0\)已就绪/);
+
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(hint()), 'Extension v4.2.0 Ready · No Userscript');
+    assert.match(hint().props.title, /DokiTool Extension \(v4\.2\.0\) is ready/);
+
+    // Versionless extension ready fallback
+    const versionlessData = {
+      ...ytExtReadyData,
+      extra: { youtube_helper: { status: 'ready', provider: 'extension' } },
+    };
+    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: versionlessData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(textOf(hint()), '扩展已就绪 · 免油猴无损合流');
+
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(hint()), 'Extension Ready · No Userscript');
+  } finally {
+    view.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili/YouTube mux copy, and legacy random-ID upgrade note in zh-CN & en', async () => {
+  const prevWin = globalThis.window;
+  const prevRaf = globalThis.requestAnimationFrame;
+  const listeners = new Map();
+  globalThis.window = {
+    addEventListener(type, cb) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(cb);
+    },
+    removeEventListener(type, cb) {
+      listeners.get(type)?.delete(cb);
+    },
+    getComputedStyle: () => ({
+      transitionDelay: '0s',
+      transitionDuration: '0s',
+      animationDelay: '0s',
+      animationDuration: '0s',
+    }),
+  };
+  globalThis.requestAnimationFrame = (cb) => {
+    cb();
+    return 1;
+  };
+  const element = (type, text = '') =>
+    markRaw({
+      type,
+      text,
+      props: {},
+      children: [],
+      parent: null,
+      style: {},
+      classList: { add() {}, remove() {} },
+      addEventListener() {},
+      removeEventListener() {},
+    });
+  const detach = node => {
+    if (node.parent) node.parent.children = node.parent.children.filter(item => item !== node);
+    node.parent = null;
+  };
+  const portal = element('portal');
+  const renderer = createRenderer({
+    querySelector: () => portal,
+    createElement: element,
+    createText: text => element('#text', text),
+    createComment: text => element('#comment', text),
+    setText(node, text) { node.text = text; },
+    setElementText(node, text) { node.text = text; node.children = []; },
+    parentNode: node => node.parent,
+    nextSibling: node => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+    insert(node, parent, anchor) {
+      detach(node);
+      node.parent = parent;
+      const idx = parent.children.indexOf(anchor);
+      parent.children.splice(idx < 0 ? parent.children.length : idx, 0, node);
+    },
+    remove: detach,
+    patchProp(node, key, _, value) { node.props[key] = value; },
+  });
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  const locale = ref('zh-CN');
+  const root = element('root');
+  const app = renderer.createApp({
+    render: () => h(ExtensionDownloadModal, { locale: locale.value }),
+  });
+
+  app.mount(root);
+  await nextTick();
+  try {
+    const zhText = textOf(portal);
+    assert.ok(zhText.includes('v4.2.0'), `expected v4.2.0 badge in zh-CN modal, got: ${zhText}`);
+    assert.ok(zhText.includes('14 核心平台 + 1000+ 长尾站点'));
+    assert.ok(zhText.includes('B 站 1080P & YouTube 4K60 免油猴本地无损合流'));
+    assert.ok(zhText.includes('网页端自动联动'));
+    assert.ok(zhText.includes('如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。'));
+    assert.ok(zhText.includes('零 Cookie、零网页脚本注入'));
+
+    locale.value = 'en';
+    await nextTick();
+    const enText = textOf(portal);
+    assert.ok(enText.includes('v4.2.0'), `expected v4.2.0 badge in en modal, got: ${enText}`);
+    assert.ok(enText.includes('14 core platforms + 1,000+ long-tail sites'));
+    assert.ok(enText.includes('Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey'));
+    assert.ok(enText.includes('automatic Web page handshake'));
+    assert.ok(enText.includes('If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.'));
+    assert.ok(enText.includes('Zero cookies, zero page script injection'));
+  } finally {
+    app.unmount();
+    globalThis.window = prevWin;
+    globalThis.requestAnimationFrame = prevRaf;
   }
 });

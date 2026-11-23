@@ -430,10 +430,24 @@ export function createYouTubeExtensionBridge(
       rawMime && rawMime !== "text/plain" && rawMime !== "application/octet-stream"
         ? rawMime
         : inferredMime;
-    const typedBlob =
-      params.blobOrFile.type === effectiveMime
-        ? params.blobOrFile
-        : new Blob([params.blobOrFile], { type: effectiveMime });
+    const leafFilename =
+      (slotMeta.desiredRelativeFilename || params.cleanFilename || "")
+        .split(/[/\\]+/)
+        .map((segment) => segment.trim())
+        .filter(Boolean)
+        .pop() || "download.mp4";
+    const isMatchingFile =
+      typeof File === "function" &&
+      params.blobOrFile instanceof File &&
+      params.blobOrFile.name === leafFilename &&
+      params.blobOrFile.type === effectiveMime;
+    const typedBlob: Blob = isMatchingFile
+      ? params.blobOrFile
+      : typeof File === "function"
+        ? new File([params.blobOrFile], leafFilename, { type: effectiveMime })
+        : params.blobOrFile.type === effectiveMime
+          ? params.blobOrFile
+          : new Blob([params.blobOrFile], { type: effectiveMime });
     const blobUrl = urlApi.createObjectURL(typedBlob);
     let resolveRelease!: () => void;
     const releasePromise = new Promise<void>((resolve) => {

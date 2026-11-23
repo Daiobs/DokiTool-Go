@@ -133,7 +133,7 @@ const emit = defineEmits([
           class="rs-btn rs-btn--ghost"
           @click="emit('open-yt-helper-modal')"
         >
-          {{ locale === "en" ? "Install Helper" : "查看安装说明" }}</button
+          {{ t(locale, "reopenUpgradeNotice") }}</button
         ><button
           v-if="currentItem.resolve_url && !isResolving"
           class="rs-btn rs-btn--ghost"

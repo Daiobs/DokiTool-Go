@@ -601,6 +601,7 @@
 /frontend/src/extension/*
 !/frontend/src/extension/SidePanelApp.vue
 !/frontend/src/extension/background.ts
+!/frontend/src/extension/bg/
 !/frontend/src/extension/components/
 !/frontend/src/extension/dashMuxDownload.ts
 !/frontend/src/extension/dashMuxEngine.ts
@@ -867,12 +868,12 @@
 !/frontend/src/assets/platforms/xhs.ico
 !/frontend/src/assets/platforms/zuiyou.png
 /frontend/src/components/result/*
+!/frontend/src/components/result/CapabilityUpgradeNotice.vue
 !/frontend/src/components/result/ResultDetailsSidebar.vue
 !/frontend/src/components/result/ResultGalleryCard.vue
 !/frontend/src/components/result/ResultLivePhotoCard.vue
 !/frontend/src/components/result/ResultVariantPicker.vue
 !/frontend/src/components/result/ResultVideoStageCard.vue
-!/frontend/src/components/result/ResultYouTubeHelperModal.vue
 !/frontend/src/components/result/resultI18n.ts
 !/frontend/src/components/result/resultPresentation.ts
 /frontend/src/composables/download/*
@@ -886,6 +887,14 @@
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts
 !/frontend/src/core/media/variantSort.ts
+/frontend/src/extension/bg/*
+!/frontend/src/extension/bg/apiClient.ts
+!/frontend/src/extension/bg/dnrRules.ts
+!/frontend/src/extension/bg/downloadCoordinator.ts
+!/frontend/src/extension/bg/specRefresher.ts
+!/frontend/src/extension/bg/tabSyncPrivacyFirewall.ts
+!/frontend/src/extension/bg/types.ts
+!/frontend/src/extension/bg/webExternalBridge.ts
 /frontend/src/extension/components/*
 !/frontend/src/extension/components/SidePanelBatchQueue.vue
 !/frontend/src/extension/components/SidePanelDownloads.vue

@@ -4337,3 +4337,418 @@ test('PR #34 Round 2: WEB_EXT_ENQUEUE_MEDIA strips unwhitelisted fallback routes
     else globalThis.chrome = prevChrome;
   }
 });
+
+test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_EXT_PARSE_YOUTUBE, handles LOGIN_REQUIRED & transport fallback, and auto-resumes on tab return', async () => {
+  const prevChrome = globalThis.chrome;
+  const sentMessages = [];
+  let extParseMode = 'ok';
+  let extConnected = true;
+
+  const makeYouTubeMedia = (title = 'Extension Parsed 4K60 Video') => ({
+    platform: 'youtube',
+    content_id: 'I9JvDaciaFk',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    title,
+    default_item_id: 'yt-1',
+    items: [
+      {
+        id: 'yt-1',
+        type: 'video',
+        state: 'ready',
+        default: {
+          variant_id: 'v-360',
+          source_id: 's-360',
+          url: 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=18&id=o-p360',
+        },
+        variants: [
+          {
+            id: 'v-360',
+            label: '360p',
+            metadata: { width: 640, height: 360, has_audio: true, video_codec: 'avc1.42001E', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: { kind: 'file', sources: [{ id: 's-360', url: 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=18&id=o-p360', size_bytes: 5_000_000 }] },
+          },
+        ],
+      },
+    ],
+    extra: {
+      youtube_helper: { status: 'ready', version: '1.3.2' },
+    },
+  });
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(extId, msg, cb) {
+        sentMessages.push({ extId, msg });
+        if (msg.type === 'WEB_EXT_PING') {
+          if (!extConnected) {
+            cb({ ok: false, error: 'not installed', code: 'EXTENSION_UNAVAILABLE' });
+            return;
+          }
+          cb({
+            ok: true,
+            data: {
+              version: '4.2.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+            },
+          });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_PARSE_YOUTUBE') {
+          if (extParseMode === 'ok') {
+            cb({ ok: true, data: { media: makeYouTubeMedia() } });
+            return;
+          }
+          if (extParseMode === 'login_required') {
+            cb({ ok: false, code: 'LOGIN_REQUIRED', error: '当前出口 IP 需要验证，请切换节点后重试' });
+            return;
+          }
+          if (extParseMode === 'transport_timeout') {
+            cb({ ok: false, code: 'BRIDGE_TIMEOUT', error: '连接 Chrome 扩展超时' });
+            return;
+          }
+          cb({ ok: false, code: 'UNAVAILABLE', error: '视频不可播放' });
+        }
+      },
+    },
+  };
+
+  try {
+    const storageMap = new Map();
+    const mockSessionStorage = {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+      removeItem: (k) => storageMap.delete(k),
+    };
+
+    const createParserEnv = (pingHelperFn, opts = {}) => {
+      const store = {
+        resultData: null,
+        resultVersion: 0,
+        clearResult() { this.resultData = null; this.resultVersion++; },
+        setResult(d) { this.resultData = d; this.resultVersion++; },
+      };
+      const toasts = [];
+      let reloadCount = 0;
+      const inst = parser.useVideoParser({
+        videoStore: store,
+        locale: ref(opts.locale || 'zh-CN'),
+        showToast: (...args) => toasts.push(args),
+        sessionStorage: mockSessionStorage,
+        reloadPage: () => { reloadCount += 1; },
+        pingHelper: pingHelperFn,
+      });
+      return { store, toasts, inst, getReloadCount: () => reloadCount };
+    };
+
+    // 1) Extension connected with `youtube_parse`: parses via WEB_EXT_PARSE_YOUTUBE, sets provider="extension", NEVER calls userscript pingHelper
+    let pingHelperCalls = 0;
+    const envOk = createParserEnv(async () => {
+      pingHelperCalls++;
+      return { installed: false, version: null, supported: false };
+    });
+    envOk.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await envOk.inst.parseVideo();
+
+    assert.equal(pingHelperCalls, 0, 'userscript pingHelper MUST NOT be called when extension handles youtube_parse');
+    assert.equal(envOk.inst.parseError.value, '');
+    assert.equal(envOk.store.resultData?.title, 'Extension Parsed 4K60 Video');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.status, 'ready');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.provider, 'extension');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.version, '4.2.0');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.2.0');
+    const parseCall = sentMessages.find((m) => m.msg.type === 'WEB_EXT_PARSE_YOUTUBE');
+    assert.ok(parseCall);
+    assert.equal(parseCall.extId, 'ihamkldlkdibleacagiejklpfofapkpo');
+    assert.equal(parseCall.msg.videoId, 'I9JvDaciaFk');
+    assert.equal(parseCall.msg.locale, 'zh-CN');
+
+    // 2) Extension returns LOGIN_REQUIRED -> sets login_required with provider="extension" and NEVER falls back to userscript
+    extParseMode = 'login_required';
+    const envLogin = createParserEnv(async () => {
+      pingHelperCalls++;
+      return { installed: false, version: null, supported: false };
+    });
+    envLogin.inst.inputUrl.value = 'https://youtu.be/I9JvDaciaFk';
+    await envLogin.inst.parseVideo();
+    assert.equal(pingHelperCalls, 0);
+    assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.status, 'login_required');
+    assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.provider, 'extension');
+    assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.2.0');
+    assert.match(envLogin.inst.parseError.value, /需要验证/);
+    assert.equal(envLogin.toasts.at(-1)?.[1], 'error');
+
+    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> cleanly falls through to legacy userscript check
+    extParseMode = 'transport_timeout';
+    globalThis.fetch = async () => Response.json({
+      schema_version: '1.0',
+      code: 'OK',
+      data: makeYouTubeMedia('Server Redacted Preview'),
+    });
+    const envFallback = createParserEnv(async () => {
+      pingHelperCalls++;
+      return { installed: false, version: null, supported: false };
+    });
+    envFallback.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await envFallback.inst.parseVideo();
+    assert.equal(pingHelperCalls, 1, 'transport error must fall through to legacy userscript pingHelper');
+    assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.status, 'missing');
+
+    // 4) Tab return & resumePendingYouTubeHelperInstall detect connected extension with `youtube_parse`, clear wait state, and auto-re-parse with zero reload and zero userscript check
+    extParseMode = 'ok';
+    extConnected = true;
+    pingHelperCalls = 0;
+    const envTab = createParserEnv(async () => {
+      pingHelperCalls++;
+      return { installed: false, version: null, supported: false };
+    }, { locale: 'en' });
+    envTab.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    envTab.inst.markWaitingForYouTubeHelperInstall();
+    assert.ok(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY));
+
+    const resumedOnTab = await envTab.inst.handleYouTubeHelperTabReturn();
+    assert.equal(resumedOnTab, true);
+    assert.equal(envTab.getReloadCount(), 0);
+    assert.equal(pingHelperCalls, 0);
+    assert.equal(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY), null);
+    assert.equal(envTab.store.resultData?.extra?.youtube_helper?.provider, 'extension');
+    assert.equal(sentMessages.at(-1)?.msg?.locale, 'en');
+
+    // Also verify resumePendingYouTubeHelperInstall on page load
+    mockSessionStorage.setItem(
+      parser.YT_HELPER_INSTALL_WAIT_KEY,
+      JSON.stringify({
+        waiting: true,
+        url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+        platform: 'all',
+        reloaded: true,
+        updatedAt: Date.now(),
+      }),
+    );
+    const envResume = createParserEnv(async () => {
+      pingHelperCalls++;
+      return { installed: false, version: null, supported: false };
+    });
+    const resumedOnLoad = await envResume.inst.resumePendingYouTubeHelperInstall();
+    assert.equal(resumedOnLoad, true);
+    assert.equal(pingHelperCalls, 0);
+    assert.equal(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY), null);
+    assert.equal(envResume.store.resultData?.extra?.youtube_helper?.status, 'ready');
+    assert.equal(envResume.store.resultData?.extra?.youtube_helper?.provider, 'extension');
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test('P1 (PR-2) Web <-> Extension YouTube zero-userscript downloads: 4K60/1080p youtube_mux, standalone M4A youtube_direct, and WEB_EXT_CANCEL_TASK on card cancel', async () => {
+  const prevChrome = globalThis.chrome;
+  const url4kVp9 = 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=315&id=o-4k60vp9';
+  const url1080Avc = 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=137&id=o-1080avc';
+  const urlOpus = 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=251&id=o-opus';
+  const urlM4a = 'https://rr4---sn-test.googlevideo.com/videoplayback?expire=1794238131&itag=140&id=o-m4a';
+
+  const ytExtData = {
+    platform: 'youtube',
+    content_id: 'I9JvDaciaFk',
+    title: 'Zero Userscript 4K60 Demo',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-item-1',
+    extra: {
+      youtube_helper: {
+        status: 'ready',
+        provider: 'extension',
+        version: '4.2.0',
+        extensionVersion: '4.2.0',
+        script_url: '/helper/dokitool-youtube.user.js',
+      },
+    },
+    items: [
+      {
+        id: 'yt-item-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'v-4k60', source_id: 's-4k60', url: url4kVp9 },
+        variants: [
+          {
+            id: 'v-4k60',
+            label: '2160p60 (4K · 仅视频无声)',
+            metadata: { width: 3840, height: 2160, fps: 60, has_audio: false, video_codec: 'vp09.00.51.08', container: 'webm', extension: 'webm', mime_type: 'video/webm', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-4k60', url: url4kVp9, size_bytes: 120_000_000 }] },
+          },
+          {
+            id: 'v-1080',
+            label: '1080p (仅视频无声)',
+            metadata: { width: 1920, height: 1080, fps: 30, has_audio: false, video_codec: 'avc1.640028', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-1080', url: url1080Avc, size_bytes: 40_000_000 }] },
+          },
+          {
+            id: 'v-opus',
+            label: '仅音频 Opus (160 kbps)',
+            metadata: { has_audio: true, audio_codec: 'opus', bitrate_bps: 160_000, container: 'webm', extension: 'webm', mime_type: 'audio/webm', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-opus', url: urlOpus, size_bytes: 6_000_000 }] },
+          },
+          {
+            id: 'v-m4a',
+            label: '仅音频 M4A (128 kbps)',
+            metadata: { has_audio: true, audio_codec: 'mp4a.40.2', bitrate_bps: 128_000, container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4', evidence: 'upstream' },
+            delivery: { kind: 'file', sources: [{ id: 's-m4a', url: urlM4a, size_bytes: 5_000_000 }] },
+          },
+        ],
+      },
+    ],
+    attachments: [
+      {
+        id: 'yt-audio-m4a',
+        role: 'background_audio',
+        title: '原声音频 (M4A)',
+        resource: {
+          id: 'res-yt-m4a',
+          role: 'audio',
+          metadata: { has_audio: true, audio_codec: 'mp4a.40.2', bitrate_bps: 128_000, container: 'm4a', extension: 'm4a', mime_type: 'audio/mp4', evidence: 'probe' },
+          delivery: { kind: 'file', sources: [{ id: 's-att-m4a', url: urlM4a, size_bytes: 5_000_000 }] },
+        },
+      },
+    ],
+  };
+
+  const enqueuedPayloads = [];
+  const cancelledTaskIds = [];
+  let seq = 1;
+  const taskState = new Map();
+  let holdTaskId = null;
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+          const taskId = `yt-ext-task-${seq++}`;
+          enqueuedPayloads.push({ taskId, payload: msg.payload });
+          taskState.set(taskId, {
+            filename: msg.payload.filename,
+            totalBytes: msg.payload.sizeBytes || 10_000_000,
+            polls: 0,
+            cancelled: false,
+          });
+          if (msg.payload.kind === 'youtube_mux' && msg.payload.youtubeMux?.outputContainer === 'mp4') {
+            holdTaskId = taskId;
+          }
+          cb({ ok: true, data: { taskId, status: 'queued' } });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+          const st = taskState.get(msg.taskId);
+          st.polls++;
+          if (st.cancelled) {
+            cb({
+              ok: true,
+              data: {
+                taskId: msg.taskId,
+                status: 'cancelled',
+                phase: 'cancelled',
+                progress: 15,
+                loadedBytes: 1_000_000,
+                totalBytes: st.totalBytes,
+                speedBytesPerSec: 0,
+                filename: st.filename,
+              },
+            });
+            return;
+          }
+          if (msg.taskId === holdTaskId || st.polls === 1) {
+            cb({
+              ok: true,
+              data: {
+                taskId: msg.taskId,
+                status: 'muxing',
+                phase: 'muxing',
+                progress: 45,
+                loadedBytes: Math.round(st.totalBytes * 0.45),
+                totalBytes: st.totalBytes,
+                speedBytesPerSec: 8_000_000,
+                filename: st.filename,
+              },
+            });
+            return;
+          }
+          cb({
+            ok: true,
+            data: {
+              taskId: msg.taskId,
+              status: 'completed',
+              phase: 'completed',
+              progress: 100,
+              loadedBytes: st.totalBytes,
+              totalBytes: st.totalBytes,
+              speedBytesPerSec: 0,
+              filename: st.filename,
+            },
+          });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_CANCEL_TASK') {
+          cancelledTaskIds.push(msg.taskId);
+          const st = taskState.get(msg.taskId);
+          if (st) st.cancelled = true;
+          cb({ ok: true, data: { taskId: msg.taskId, cancelled: true } });
+        }
+      },
+    },
+  };
+
+  try {
+    const { instance, store, selection } = harness(ytExtData);
+
+    // 1) 4K60 VP9 split video -> WEB_EXT_ENQUEUE_MEDIA { kind: "youtube_mux" } (webm)
+    selection.choose({ variant_id: 'v-4k60', source_id: 's-4k60' });
+    await instance.downloadMainVideo();
+    await settled(store.downloads[0]);
+    assert.equal(store.downloads[0].status, 'completed');
+    assert.equal(store.downloads[0].savePath, 'extension');
+    assert.equal(store.downloads[0].savePathLabel, '保存路径：Chrome 扩展后台无损合流');
+    assert.equal(enqueuedPayloads.length, 1);
+    assert.equal(enqueuedPayloads[0].payload.kind, 'youtube_mux');
+    assert.equal(enqueuedPayloads[0].payload.mimeType, 'video/webm');
+    assert.equal(enqueuedPayloads[0].payload.sizeBytes, 126_000_000);
+    assert.deepEqual(enqueuedPayloads[0].payload.youtubeMux, {
+      videoUrl: url4kVp9,
+      audioUrl: urlOpus,
+      videoSize: 120_000_000,
+      audioSize: 6_000_000,
+      outputContainer: 'webm',
+    });
+
+    // 2) Standalone M4A audio attachment -> WEB_EXT_ENQUEUE_MEDIA { kind: "youtube_direct" } reusing downloadId (no false duplicate rejection)
+    instance.downloadMusic(ytExtData.attachments[0]);
+    await waitUntil(() => store.downloads.length === 2);
+    const audioTask = store.downloads[1];
+    await settled(audioTask);
+    assert.equal(audioTask.status, 'completed');
+    assert.equal(audioTask.savePath, 'extension');
+    assert.equal(audioTask.savePathLabel, '保存路径：Chrome 扩展后台下载');
+    assert.equal(enqueuedPayloads.length, 2);
+    assert.equal(enqueuedPayloads[1].payload.kind, 'youtube_direct');
+    assert.equal(enqueuedPayloads[1].payload.url, urlM4a);
+    assert.equal(enqueuedPayloads[1].payload.sizeBytes, 5_000_000);
+    assert.equal(enqueuedPayloads[1].payload.mimeType, 'audio/mp4');
+
+    // 3) 1080p AVC split video -> active youtube_mux cancelled by user -> immediately sends WEB_EXT_CANCEL_TASK
+    selection.choose({ variant_id: 'v-1080', source_id: 's-1080' });
+    const pendingCancel = instance.downloadMainVideo();
+    await waitUntil(() => store.downloads.length === 3 && store.downloads[2].status === 'downloading' && holdTaskId !== null);
+    assert.equal(enqueuedPayloads.length, 3);
+    assert.equal(enqueuedPayloads[2].payload.kind, 'youtube_mux');
+    assert.equal(enqueuedPayloads[2].payload.mimeType, 'video/mp4');
+    assert.equal(enqueuedPayloads[2].payload.youtubeMux.outputContainer, 'mp4');
+    assert.equal(enqueuedPayloads[2].payload.youtubeMux.videoUrl, url1080Avc);
+    assert.equal(enqueuedPayloads[2].payload.youtubeMux.audioUrl, urlM4a);
+
+    await instance.handleCancelDownload(store.downloads[2].id);
+    await pendingCancel;
+    assert.equal(store.downloads[2].status, 'cancelled');
+    assert.deepEqual(cancelledTaskIds, [holdTaskId], 'cancelling active Web download card must immediately send WEB_EXT_CANCEL_TASK');
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

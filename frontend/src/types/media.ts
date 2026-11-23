@@ -184,6 +184,8 @@ export interface Attachment {
 }
 export interface YouTubeHelperState {
   status: "ready" | "missing" | "outdated" | "login_required";
+  provider?: "extension" | "userscript";
+  extensionVersion?: string;
   version?: string | null;
   min_version?: string;
   script_url?: string;

@@ -62,6 +62,10 @@ const FILE_LINE_LIMITS = [
   { relDir: path.join("extension", "bg"), maxLines: 900 },
 ];
 
+const SINGLE_FILE_LINE_LIMITS = [
+  { relFile: path.join("extension", "background.ts"), maxLines: 900 },
+];
+
 function walkFiles(dir, exts) {
   if (!fs.existsSync(dir)) return [];
   const results = [];
@@ -229,6 +233,18 @@ export function runArchitectureBoundaryCheck(options = {}) {
           `[file-line-cap] ${rel}: ${lineCount} lines exceeds limit of ${maxLines}`,
         );
       }
+    }
+  }
+  for (const { relFile, maxLines } of SINGLE_FILE_LINE_LIMITS) {
+    const filePath = path.join(srcRoot, relFile);
+    if (!fs.existsSync(filePath)) continue;
+    lineCapFilesChecked++;
+    const lineCount = fs.readFileSync(filePath, "utf8").split("\n").length;
+    if (lineCount > maxLines) {
+      const rel = path.relative(frontendRoot, filePath);
+      violations.push(
+        `[file-line-cap] ${rel}: ${lineCount} lines exceeds limit of ${maxLines}`,
+      );
     }
   }
 

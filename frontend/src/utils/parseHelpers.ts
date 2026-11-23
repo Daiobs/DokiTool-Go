@@ -1,6 +1,14 @@
 import { supportedPlatforms } from "./platforms";
 import { withTbvideoItems } from "../services/tbvideo";
 import {
+  resolveClientParseRoute,
+  type ClientCapabilityEnvironment,
+} from "../core/capabilityHub";
+import type {
+  parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
+  pingInstalledExtension,
+} from "../services/extensionBridge";
+import {
   validateMediaEnvelope,
   readyItem,
   readyVariant,
@@ -17,6 +25,16 @@ import type {
   UnifiedMedia,
   YouTubeHelperState,
 } from "../types/media";
+
+const EXTENSION_PARSE_FALLBACK_ERROR_CODES = new Set<string>([
+  "NO_CHROME_RUNTIME",
+  "BRIDGE_TIMEOUT",
+  "EXTENSION_UNAVAILABLE",
+  "EMPTY_RESPONSE",
+  "BRIDGE_ERROR",
+  "UNSUPPORTED_ACTION",
+  "FORBIDDEN_ORIGIN",
+]);
 
 const ALIAS_PAIRS =
   "douyin:iesdouyin.com bilibili:b23.tv xiaohongshu:xhslink.com,rednote.com toutiao:toutiaoimg.com weibo:weibo.cn pipigx:ippzone.com x:twitter.com,t.co youtube:youtu.be instagram:instagr.am facebook:fb.watch";
@@ -181,7 +199,7 @@ export function buildFallbackYouTubeMedia(
               : "HELPER_REQUIRED",
           message:
             helperState.message ||
-            "需要安装并启用 DokiTool YouTube 助手脚本后方可解析下载",
+            "安装 DokiTool Chrome 扩展即可免油猴解析下载 YouTube（Firefox 可使用油猴脚本）",
         },
       },
     ],
@@ -197,6 +215,8 @@ export async function runYouTubeHelperParse(ctx: {
   signal: AbortSignal;
   isCurrent: () => boolean;
   pingHelper: typeof pingYouTubeHelper;
+  pingExtension?: typeof pingInstalledExtension;
+  parseYouTubeViaExtension?: typeof parseYouTubeViaExtensionFn;
   requestStandardParse: () => Promise<UnifiedMedia>;
   fetchJSON: (
     url: string,
@@ -209,6 +229,102 @@ export async function runYouTubeHelperParse(ctx: {
   setError: (message: string, duration?: number) => void;
 }): Promise<void> {
   const { videoId, signal, isCurrent } = ctx;
+
+  let bridgeMod: typeof import("../services/extensionBridge") | null = null;
+  const loadBridge = async () => {
+    if (!bridgeMod) {
+      bridgeMod = await import("../services/extensionBridge");
+    }
+    return bridgeMod;
+  };
+  const pingExt: typeof pingInstalledExtension =
+    ctx.pingExtension ??
+    (async (...args) => (await loadBridge()).pingInstalledExtension(...args));
+  const parseViaExt: typeof parseYouTubeViaExtensionFn =
+    ctx.parseYouTubeViaExtension ??
+    (async (...args) => (await loadBridge()).parseYouTubeViaExtension(...args));
+
+  // Step 1: Prefer connected DokiTool Chrome extension (`youtube_parse`) — zero Tampermonkey.
+  let extState: Awaited<ReturnType<typeof pingInstalledExtension>> | null =
+    null;
+  try {
+    extState = await pingExt();
+  } catch {
+    extState = null;
+  }
+  if (!isCurrent()) return;
+
+  const extEnv: ClientCapabilityEnvironment = {
+    extensionConnected: Boolean(extState?.connected),
+    extensionVersion: extState?.version || "",
+    extensionCapabilities: extState?.capabilities ?? [],
+    userscriptReady: false,
+  };
+  const parseRoute = resolveClientParseRoute(true, extEnv);
+  if (parseRoute.channel === "extension_client_parse") {
+    const resp = await parseViaExt(videoId, {
+      locale: ctx.locale === "en" ? "en" : "zh-CN",
+    });
+    if (!isCurrent()) return;
+
+    if (resp.ok && resp.data?.media) {
+      const normalized = withTbvideoItems(resp.data.media);
+      const existingHelper = normalized.extra?.youtube_helper as
+        | Partial<YouTubeHelperState>
+        | undefined;
+      const extVersion =
+        extState?.version || existingHelper?.extensionVersion || undefined;
+      const readyState: YouTubeHelperState = {
+        status: "ready",
+        provider: "extension",
+        version: extState?.version || existingHelper?.version || null,
+        ...(extVersion ? { extensionVersion: extVersion } : {}),
+        min_version: MIN_YOUTUBE_HELPER_VERSION,
+        script_url: YOUTUBE_HELPER_SCRIPT_URL,
+      };
+      const data: UnifiedMedia = {
+        ...normalized,
+        extra: {
+          ...(normalized.extra || {}),
+          youtube_helper: readyState,
+        },
+      };
+      ctx.onHelperReady();
+      ctx.setResult(data);
+      return;
+    }
+
+    if (!resp.ok && resp.code === "LOGIN_REQUIRED") {
+      const loginMsg =
+        resp.error || "当前网络出口被 YouTube 要求验证，请更换节点后重试";
+      const helperState: YouTubeHelperState = {
+        status: "login_required",
+        provider: "extension",
+        version: extState?.version || null,
+        ...(extState?.version ? { extensionVersion: extState.version } : {}),
+        min_version: MIN_YOUTUBE_HELPER_VERSION,
+        script_url: YOUTUBE_HELPER_SCRIPT_URL,
+        message: loginMsg,
+      };
+      ctx.setResult(buildFallbackYouTubeMedia(videoId, helperState));
+      ctx.setError(helperState.message!, 5000);
+      return;
+    }
+
+    if (!resp.ok) {
+      if (
+        !resp.code ||
+        !EXTENSION_PARSE_FALLBACK_ERROR_CODES.has(resp.code)
+      ) {
+        throw new Error(resp.error || "通过扩展解析 YouTube 失败");
+      }
+      // Bridge transport or unsupported action error -> fall through to legacy userscript check.
+    } else {
+      throw new Error("通过扩展解析 YouTube 失败");
+    }
+  }
+
+  // Step 2: Legacy userscript helper fallback when extension is absent or lacks `youtube_parse`.
   const ping = await ctx.pingHelper();
   if (!isCurrent()) return;
 
@@ -227,8 +343,8 @@ export async function runYouTubeHelperParse(ctx: {
       min_version: MIN_YOUTUBE_HELPER_VERSION,
       script_url: YOUTUBE_HELPER_SCRIPT_URL,
       message: ping.installed
-        ? `当前已安装的 YouTube 助手版本（v${ping.version}）低于最低要求（v${MIN_YOUTUBE_HELPER_VERSION}），请更新脚本后重试`
-        : "当前未检测到 YouTube 下载助手脚本，请按说明安装并启用后重试",
+        ? `当前已安装的 YouTube 助手版本（v${ping.version}）低于最低要求（v${MIN_YOUTUBE_HELPER_VERSION}），推荐安装 DokiTool 扩展或更新脚本后重试`
+        : "当前未检测到 DokiTool 扩展或 YouTube 助手脚本，请按说明安装并启用后重试",
     };
     let media: UnifiedMedia;
     try {
@@ -294,6 +410,7 @@ export async function runYouTubeHelperParse(ctx: {
     const loginMsg = "当前网络出口被 YouTube 要求验证，请更换节点后重试";
     const helperState: YouTubeHelperState = {
       status: "login_required",
+      provider: "userscript",
       version: ping.version,
       min_version: MIN_YOUTUBE_HELPER_VERSION,
       script_url: YOUTUBE_HELPER_SCRIPT_URL,
@@ -347,6 +464,7 @@ export async function runYouTubeHelperParse(ctx: {
   const finalized = withTbvideoItems(validateMediaEnvelope(finalizePayload));
   const readyState: YouTubeHelperState = {
     status: "ready",
+    provider: "userscript",
     version: ping.version,
     min_version: MIN_YOUTUBE_HELPER_VERSION,
     script_url: YOUTUBE_HELPER_SCRIPT_URL,

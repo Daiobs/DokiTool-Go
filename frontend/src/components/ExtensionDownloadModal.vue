@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import { LATEST_EXTENSION_VERSION } from "../core/capabilityHub";
 
 const props = withDefaults(
   defineProps<{
@@ -21,10 +22,10 @@ let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 const copy = computed(() =>
   props.locale === "en"
     ? {
-        badge: "Chrome MV3 Native Side Panel · Anonymous Ready",
+        badge: `Chrome MV3 Native Side Panel v${LATEST_EXTENSION_VERSION} · Anonymous Ready`,
         title: "DokiTool Chrome Extension",
         subtitle:
-          "Watermark-free downloads across 14 platforms, built-in YouTube 4K60 lossless muxing without Tampermonkey, background downloads that keep running when the side panel closes, zero cookies & zero page injection.",
+          "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
         closeLabel: "Close dialog",
         ctaLabel: "Download Extension (.zip)",
         ctaHint:
@@ -47,16 +48,16 @@ const copy = computed(() =>
           ' (or click "Load unpacked" in the top-left and select it), then pin the extension icon to your toolbar for one-click side panel access.',
         updateLabel: "Updates:",
         updateNote:
-          "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact.",
+          "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact. If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.",
         privacyLabel: "Privacy:",
         privacyNote:
-          "Zero cookies, zero page script injection, on-demand requests for the 14 supported platforms only, and zero outbound traffic on unsupported websites.",
+          "Zero cookies, zero page script injection, on-demand parsing for the 14 core platforms and user-initiated long-tail sites only, and zero outbound traffic during normal browsing on unsupported websites.",
       }
     : {
-        badge: "Chrome MV3 侧边栏原生扩展 · 匿名直用",
+        badge: `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
         title: "DokiTool Chrome 扩展",
         subtitle:
-          "支持 14 平台无水印视频、图集与实况照片下载，内置免油猴 YouTube 4K60 无损合流，关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
+          "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
         closeLabel: "关闭弹窗",
         ctaLabel: "下载 Chrome 扩展包（.zip）",
         ctaHint:
@@ -78,10 +79,10 @@ const copy = computed(() =>
           "（或点左上角「加载已解压的扩展程序」选中该文件夹），然后把扩展图标固定到工具栏即可一键打开侧边栏。",
         updateLabel: "后续更新：",
         updateNote:
-          "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。",
+          "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。",
         privacyLabel: "隐私边界：",
         privacyNote:
-          "零 Cookie、零网页脚本注入、仅对受支持 14 平台按需通信，非支持网站零外发请求。",
+          "零 Cookie、零网页脚本注入、仅对 14 核心平台及用户主动提交的长尾站点按需解析，日常浏览非支持网站零外发请求。",
       },
 );
 
@@ -148,7 +149,7 @@ onUnmounted(() => {
   <Teleport to="body">
     <Transition name="ext-modal" appear>
       <div
-        class="fixed inset-0 z-[200] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+        class="fixed inset-0 z-[10000] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
         role="dialog"
         aria-modal="true"
         aria-labelledby="extension-modal-title"
