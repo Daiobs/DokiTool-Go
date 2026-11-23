@@ -948,9 +948,10 @@ func (a *admission) statsSnapshot() AdmissionStatsSnapshot {
 		return AdmissionStatsSnapshot{}
 	}
 	return AdmissionStatsSnapshot{
-		Fast:  a.public.statsSnapshot(),
-		Slow:  a.slow.statsSnapshot(),
-		Owner: a.keys.Load().ownerStatsSnapshot(a.owner),
+		Fast:        a.public.statsSnapshot(),
+		Slow:        a.slow.statsSnapshot(),
+		GenericSlow: a.genericSlow.statsSnapshot(),
+		Owner:       a.keys.Load().ownerStatsSnapshot(a.owner),
 	}
 }
 

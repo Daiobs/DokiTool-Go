@@ -453,7 +453,6 @@ export async function verifyExtensionDist(
     "manifest.json",
     "background.js",
     "sidepanel.html",
-    "monitor.html",
     "offscreen.html",
     ...ICON_SIZES.map((s) => `icons/icon-${s}.png`),
   ];
@@ -510,30 +509,40 @@ export async function verifyExtensionDist(
     }
   }
 
-  // Static mediabunny isolation gate: Mp4OutputFormat and Mediabunny library
-  // markers MUST NEVER appear in background.js, assets/sidepanel-*.js, or
-  // assets/monitor-*.js (and Mediabunny library markers must never appear in
-  // any non-offscreen JS bundle; strictly confined to assets/offscreen-*.js).
+  // Static duplicate-monitor & mediabunny isolation gates:
+  // - monitor.html and assets/monitor-*.js MUST NOT exist in the extension bundle
+  //   (the Owner Parse Monitor Dashboard lives exclusively on Web `/monitor`).
+  // - Mp4OutputFormat and Mediabunny library markers MUST NEVER appear in
+  //   background.js or assets/sidepanel-*.js (and Mediabunny library markers
+  //   must never appear in any non-offscreen JS bundle; strictly confined to
+  //   assets/offscreen-*.js).
   const relPosixFiles = allFiles.map((abs) =>
     path.relative(outDir, abs).split(path.sep).join("/"),
   );
-  const sidepanelEntries = relPosixFiles.filter((rel) =>
-    /^assets\/sidepanel-[^/]+\.js$/i.test(rel),
-  );
+  if (relPosixFiles.includes("monitor.html")) {
+    throw new Error(
+      "Forbidden duplicate monitor.html found in extension build output (monitor dashboard lives on Web /monitor)",
+    );
+  }
   const monitorEntries = relPosixFiles.filter((rel) =>
     /^assets\/monitor-[^/]+\.js$/i.test(rel),
   );
+  if (monitorEntries.length > 0) {
+    throw new Error(
+      `Forbidden duplicate monitor bundle found in extension build output: ${monitorEntries.join(", ")}`,
+    );
+  }
+
+  const sidepanelEntries = relPosixFiles.filter((rel) =>
+    /^assets\/sidepanel-[^/]+\.js$/i.test(rel),
+  );
   if (sidepanelEntries.length === 0) {
     throw new Error("Missing built assets/sidepanel-*.js bundle");
-  }
-  if (monitorEntries.length === 0) {
-    throw new Error("Missing built assets/monitor-*.js bundle");
   }
 
   const strictEntryTargets = new Set([
     "background.js",
     ...sidepanelEntries,
-    ...monitorEntries,
   ]);
   const nonOffscreenJsFiles = relPosixFiles.filter(
     (rel) =>
@@ -660,7 +669,6 @@ export async function verifyExtensionZip(zipPath, expectedOutDir) {
     "manifest.json",
     "background.js",
     "sidepanel.html",
-    "monitor.html",
     "offscreen.html",
     ...ICON_SIZES.map((s) => `icons/icon-${s}.png`),
   ];
@@ -673,6 +681,20 @@ export async function verifyExtensionZip(zipPath, expectedOutDir) {
     if (bytes.length === 0) {
       throw new Error(`Empty required artifact in extension ZIP: ${rel}`);
     }
+  }
+
+  if (zipFiles.has("monitor.html")) {
+    throw new Error(
+      "Forbidden duplicate monitor.html found in extension ZIP (monitor dashboard lives on Web /monitor)",
+    );
+  }
+  const forbiddenMonitorZipEntries = [...zipFiles.keys()].filter((rel) =>
+    /^assets\/monitor-[^/]+\.js$/i.test(rel),
+  );
+  if (forbiddenMonitorZipEntries.length > 0) {
+    throw new Error(
+      `Forbidden duplicate monitor bundle found in extension ZIP: ${forbiddenMonitorZipEntries.join(", ")}`,
+    );
   }
 
   if (expectedOutDir) {
@@ -737,7 +759,7 @@ export async function buildExtension({
   await fsp.rm(resolvedOutDir, { recursive: true, force: true });
   await fsp.mkdir(resolvedOutDir, { recursive: true });
 
-  // 1. Build SidePanel + Monitor + Offscreen HTML & local assets via Vite
+  // 1. Build SidePanel + Offscreen HTML & local assets via Vite
   await viteBuild({
     configFile: false,
     root: extensionSrcDir,
@@ -767,7 +789,6 @@ export async function buildExtension({
       rollupOptions: {
         input: {
           sidepanel: path.join(extensionSrcDir, "sidepanel.html"),
-          monitor: path.join(extensionSrcDir, "monitor.html"),
           offscreen: path.join(extensionSrcDir, "offscreen.html"),
         },
       },

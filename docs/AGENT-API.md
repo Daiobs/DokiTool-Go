@@ -258,7 +258,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.4 `GET /api/stats` — 查询进程内只读运行统计快照
 
-提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `owner` 三池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`yt-dlp` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
+提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `generic_slow` / `owner` 四池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`ytdlp` 与 `ytdlp_generic` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
 
 - **认证**：**严格要求 `owner` 角色 Bearer 凭据**（`DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥）。缺失、错误、已停用（`enabled: false`）、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或未配置任何启用密钥时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）；携带合法 `agent` 或 `friend` 角色密钥访问时同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥 `unauthorized` 计数，不扣减匿名单 IP 配额）。**通过 `owner` 鉴权的 `/api/stats` 请求不占用并发槽位，也不计入 `requests` 解析统计**。
 - **HTTP 方法与查询参数**：
@@ -348,6 +348,19 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
           "wait_ms_total": 0,
           "wait_ms_max": 0
         },
+        "generic_slow": {
+          "active": 0,
+          "queued": 0,
+          "concurrency_limit": 2,
+          "queue_limit": 16,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        },
         "owner": {
           "active": 2,
           "queued": 0,
@@ -422,6 +435,62 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
               "buckets": {
                 "<=10": 0, "<=50": 0, "<=100": 0, "<=250": 1, "<=500": 1,
                 "<=1000": 1, "<=2500": 1, "<=5000": 1, "<=10000": 1, "<=30000": 1, "+Inf": 1
+              }
+            }
+          }
+        }
+      },
+      "ytdlp_generic": {
+        "enabled": false,
+        "active": 0,
+        "waiting": 0,
+        "concurrency_limit": 0,
+        "total": {
+          "acquired_count": 0,
+          "wait_count": 0,
+          "canceled_count": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0,
+          "wait_ms": {
+            "count": 0,
+            "sum_ms": 0,
+            "max_ms": 0,
+            "buckets": {
+              "<=10": 0, "<=50": 0, "<=100": 0, "<=250": 0, "<=500": 0,
+              "<=1000": 0, "<=2500": 0, "<=5000": 0, "<=10000": 0, "<=30000": 0, "+Inf": 0
+            }
+          }
+        },
+        "by_channel": {
+          "anonymous": {
+            "acquired_count": 0,
+            "wait_count": 0,
+            "canceled_count": 0,
+            "wait_ms_total": 0,
+            "wait_ms_max": 0,
+            "wait_ms": {
+              "count": 0,
+              "sum_ms": 0,
+              "max_ms": 0,
+              "buckets": {
+                "<=10": 0, "<=50": 0, "<=100": 0, "<=250": 0, "<=500": 0,
+                "<=1000": 0, "<=2500": 0, "<=5000": 0, "<=10000": 0, "<=30000": 0, "+Inf": 0
+              }
+            }
+          },
+          "owner": {
+            "acquired_count": 0,
+            "wait_count": 0,
+            "canceled_count": 0,
+            "wait_ms_total": 0,
+            "wait_ms_max": 0,
+            "wait_ms": {
+              "count": 0,
+              "sum_ms": 0,
+              "max_ms": 0,
+              "buckets": {
+                "<=10": 0, "<=50": 0, "<=100": 0, "<=250": 0, "<=500": 0,
+                "<=1000": 0, "<=2500": 0, "<=5000": 0, "<=10000": 0, "<=30000": 0, "+Inf": 0
               }
             }
           }
@@ -607,7 +676,8 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
   ```
 - **核心统计字段说明**：
   - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 遵循受控规范化模式 `^[a-z0-9][a-z0-9_:-]{0,31}$`（最长 32 字节），覆盖 14 个核心平台 ID、`"unknown"`、上限 64 个动态长尾提取器标识及溢出桶 `"ytdlp_other"`；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
-  - `admission.{fast,slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（`admission.owner` 汇总 `owner` 角色池快照，保持向后兼容）。
+  - `admission.{fast,slow,generic_slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（其中 `generic_slow` 独立反映第二级通用具名提取器兜底的 `PARSE_GENERIC` 准入池水位，`owner` 汇总 `owner` 角色池快照并保持向后兼容）。
+  - `ytdlp` 与 `ytdlp_generic`：两者采用相同的 `YTDLPStatsSnapshot` 结构，分别反映核心海外提取器共享并发槽位与第二级通用具名提取器独立隔离并发槽位（无论是否配置固定 `DOKITOOL_YTDLP_GATE_PORTS` 均独立统计通用子池水位与分渠道等待耗时）；未启用第二级通用兜底时，`ytdlp_generic.enabled` 为 `false` 且其余字段为 `0`。
   - `api_keys[*]`：按配置顺序返回每把已注册 API 密钥（最多 `64` 项，未配置时为空数组 `[]`；已停用密钥仍以 `enabled: false` 保留在列表中，绝不返回令牌或 SHA-256 摘要）的实时并发与累计指标，包含固定 22 个字段：`id`、`role`（`"owner"` / `"agent"` / `"friend"`）、`enabled`、`active`、`slow_active`、`queued`、`concurrency_limit`、`slow_concurrency_limit`、`queue_limit`、`requests_total`、`ok`、`errors`、`cache_hits`（零槽位缓存快路径命中次数）、`rate_limited`、`unauthorized`（角色或平台白名单拦截次数）、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`。`SIGHUP` 热重载时，相同 `id` 的密钥自动延续累计计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
   - `runtime`：只读脱敏返回 11 项运行开关（`version`、`shanghai_mode`、`shanghai_bilibili`、`bilibili_dash`、`youtube_helper`、`xhs_transport`、`ytdlp_enabled`、`ytdlp_generic_enabled`、`tbvideo_pipigx`、`tbvideo_zuiyou`、`stats_persistence_enabled`），绝不泄露任何宿主机路径、IP、URL 或凭据。

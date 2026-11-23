@@ -38,73 +38,20 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 		return nil, err
 	}
 
+	chIdx := channelIndex(ChannelFromContext(ctx))
 	if e.subSem != nil {
-		var releaseSubOnce sync.Once
-		releaseSub := func() {
-			releaseSubOnce.Do(func() {
-				<-e.subSem
-			})
+		releaseSub, subErr := acquireSlot(ctx, e.subSem, e.subSlotStats, chIdx)
+		if subErr != nil {
+			return nil, subErr
 		}
-		select {
-		case e.subSem <- struct{}{}:
-			if err := ctx.Err(); err != nil {
-				releaseSub()
-				return nil, classifyContextErr(err)
-			}
-			defer releaseSub()
-		case <-ctx.Done():
-			return nil, classifyContextErr(ctx.Err())
-		}
+		defer releaseSub()
 	}
 
-	var releaseOnce sync.Once
-	release := func() {
-		releaseOnce.Do(func() {
-			<-e.sem
-		})
+	release, slotErr := acquireSlot(ctx, e.sem, e.slotStats, chIdx)
+	if slotErr != nil {
+		return nil, slotErr
 	}
-	chIdx := channelIndex(ChannelFromContext(ctx))
-	select {
-	case e.sem <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			release()
-			return nil, classifyContextErr(err)
-		}
-		if e.slotStats != nil {
-			e.slotStats.recordUncontendedAcquire(chIdx)
-		}
-		defer release()
-	default:
-		waitStart := time.Now()
-		if e.slotStats != nil {
-			e.slotStats.incWaiting(chIdx)
-		}
-		select {
-		case e.sem <- struct{}{}:
-			waitDur := time.Since(waitStart)
-			if e.slotStats != nil {
-				e.slotStats.decWaiting(chIdx)
-			}
-			if err := ctx.Err(); err != nil {
-				release()
-				if e.slotStats != nil {
-					e.slotStats.recordContendedWait(chIdx, waitDur, true)
-				}
-				return nil, classifyContextErr(err)
-			}
-			if e.slotStats != nil {
-				e.slotStats.recordContendedWait(chIdx, waitDur, false)
-			}
-			defer release()
-		case <-ctx.Done():
-			waitDur := time.Since(waitStart)
-			if e.slotStats != nil {
-				e.slotStats.decWaiting(chIdx)
-				e.slotStats.recordContendedWait(chIdx, waitDur, true)
-			}
-			return nil, classifyContextErr(ctx.Err())
-		}
-	}
+	defer release()
 
 	callCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
@@ -161,6 +108,56 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 
 	info, _, extractErr := e.runSubprocess(callCtx, rawURL, effectiveProxy, tempDir)
 	return info, extractErr
+}
+
+func acquireSlot(ctx context.Context, sem chan struct{}, stats *slotStats, chIdx int) (func(), *Error) {
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			<-sem
+		})
+	}
+	select {
+	case sem <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			release()
+			return nil, classifyContextErr(err)
+		}
+		if stats != nil {
+			stats.recordUncontendedAcquire(chIdx)
+		}
+		return release, nil
+	default:
+		waitStart := time.Now()
+		if stats != nil {
+			stats.incWaiting(chIdx)
+		}
+		select {
+		case sem <- struct{}{}:
+			waitDur := time.Since(waitStart)
+			if stats != nil {
+				stats.decWaiting(chIdx)
+			}
+			if err := ctx.Err(); err != nil {
+				release()
+				if stats != nil {
+					stats.recordContendedWait(chIdx, waitDur, true)
+				}
+				return nil, classifyContextErr(err)
+			}
+			if stats != nil {
+				stats.recordContendedWait(chIdx, waitDur, false)
+			}
+			return release, nil
+		case <-ctx.Done():
+			waitDur := time.Since(waitStart)
+			if stats != nil {
+				stats.decWaiting(chIdx)
+				stats.recordContendedWait(chIdx, waitDur, true)
+			}
+			return nil, classifyContextErr(ctx.Err())
+		}
+	}
 }
 
 func (e *Engine) runSubprocess(callCtx context.Context, rawURL, effectiveProxy, tempDir string) (*Info, string, error) {

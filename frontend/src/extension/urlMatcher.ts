@@ -993,7 +993,13 @@ function isBlockedGenericHost(host: string): boolean {
     host.endsWith(".local") ||
     host.endsWith(".internal") ||
     host.endsWith(".localdomain") ||
+    host === "home.arpa" ||
     host.endsWith(".home.arpa") ||
+    host.endsWith(".invalid") ||
+    host.endsWith(".lan") ||
+    host.endsWith(".corp") ||
+    host.endsWith(".intranet") ||
+    host.endsWith(".private") ||
     host === "dokitool.com" ||
     host.endsWith(".dokitool.com")
   ) {
@@ -1010,7 +1016,8 @@ function isBlockedGenericHost(host: string): boolean {
  * 2. Otherwise accepts a valid public HTTP/HTTPS media page URL (standard port,
  *    public multi-label DNS host, non-empty path or query, length <= 2048) while
  *    locally blocking browser schemes, IP literals, userinfo, `localhost` /
- *    `*.local` / `*.internal` / `*.localdomain` / `*.home.arpa`, and `dokitool.com`.
+ *    `*.local` / `*.internal` / `*.localdomain` / `*.home.arpa` / `*.invalid` /
+ *    `*.lan` / `*.corp` / `*.intranet` / `*.private`, and `dokitool.com`.
  *
  * NEVER used for passive tab sync (`autoFollowTab` / `evaluateTabSyncState`)!
  */

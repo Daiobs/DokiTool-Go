@@ -2563,3 +2563,182 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 		t.Fatalf("expected all slots released, got subSem=%d sem=%d", len(genericEng.subSem), len(baseEng.sem))
 	}
 }
+
+func TestGenericEngineStatsSnapshotBothGateModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture requires unix")
+	}
+
+	modes := []struct {
+		name           string
+		fixedGatePorts bool
+		baseConc       int
+		genericLimit   int
+		wantLimit      int
+	}{
+		{
+			name:           "dynamic-ports-nil-gatePorts",
+			fixedGatePorts: false,
+			baseConc:       3,
+			genericLimit:   1,
+			wantLimit:      1,
+		},
+		{
+			name:           "fixed-gatePorts-subSem",
+			fixedGatePorts: true,
+			baseConc:       3,
+			genericLimit:   1,
+			wantLimit:      1,
+		},
+	}
+
+	for _, tc := range modes {
+		t.Run(tc.name, func(t *testing.T) {
+			gateDir := t.TempDir()
+			releaseFile := filepath.Join(gateDir, "release")
+			startedDir := filepath.Join(gateDir, "started")
+			if err := os.MkdirAll(startedDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			script := fmt.Sprintf(`
+url=""
+for a in "$@"; do url="$a"; done
+case "$url" in
+  */slow/*)
+    id=$(basename "$url")
+    : > %q/"$id"
+    while [ ! -f %q ]; do
+      sleep 0.01
+    done
+    ;;
+esac
+echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.example.com/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a"}]}'
+`, startedDir, releaseFile)
+
+			binPath, hashes := writeFakeYTDLP(t, script)
+			cfg := Config{
+				BinaryPath:     binPath,
+				AllowedHashes:  hashes,
+				MaxConcurrency: tc.baseConc,
+				Timeout:        5 * time.Second,
+			}
+			if tc.fixedGatePorts {
+				cfg.GatePorts = testGatePorts(t, tc.baseConc)
+			}
+			baseEng, err := New(cfg)
+			if err != nil || !baseEng.Enabled() {
+				t.Fatalf("New baseEng failed: %v", err)
+			}
+
+			genericEng := baseEng.
+				WithGenericConcurrency(tc.genericLimit).
+				WithExtractors("default", "-generic")
+
+			// Initial idle snapshot reports isolated concurrency_limit = 1 while baseEng reports 3.
+			baseInit := baseEng.StatsSnapshot()
+			genInit := genericEng.StatsSnapshot()
+			if !genInit.Enabled || genInit.Active != 0 || genInit.Waiting != 0 || genInit.ConcurrencyLimit != tc.wantLimit {
+				t.Fatalf("initial generic StatsSnapshot = %+v, want enabled=true active=0 waiting=0 limit=%d", genInit, tc.wantLimit)
+			}
+			if baseInit.ConcurrencyLimit != tc.baseConc {
+				t.Fatalf("initial base StatsSnapshot limit = %d, want %d", baseInit.ConcurrencyLimit, tc.baseConc)
+			}
+
+			// 1. Occupy the sole generic slot with an owner request.
+			firstDone := make(chan error, 1)
+			go func() {
+				_, exErr := genericEng.Extract(WithChannel(context.Background(), ChannelOwner), "https://vimeo.com/slow/g1")
+				firstDone <- exErr
+			}()
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if _, statErr := os.Stat(filepath.Join(startedDir, "g1")); statErr == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for g1 to start")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// 2. While g1 is active, launch a contended anonymous request that cancels on short timeout.
+			cancelCtx, cancel := context.WithTimeout(WithChannel(context.Background(), ChannelAnonymous), 90*time.Millisecond)
+			defer cancel()
+			_, cancelErr := genericEng.Extract(cancelCtx, "https://vimeo.com/fast/g-cancel")
+			var ce *Error
+			if !errors.As(cancelErr, &ce) || ce.Code != CodeUpstreamTimeout {
+				t.Fatalf("expected contended generic cancel timeout, got %v", cancelErr)
+			}
+
+			// 3. Launch a contended owner request that waits for g1, verify live Active==1 & Waiting==1, then release!
+			waitDone := make(chan error, 1)
+			go func() {
+				_, exErr := genericEng.Extract(WithChannel(context.Background(), ChannelOwner), "https://vimeo.com/fast/g-wait")
+				waitDone <- exErr
+			}()
+			waitDeadline := time.Now().Add(3 * time.Second)
+			var liveSnap SlotStatsSnapshot
+			for {
+				liveSnap = genericEng.StatsSnapshot()
+				if liveSnap.Active == 1 && liveSnap.Waiting == 1 {
+					break
+				}
+				if time.Now().After(waitDeadline) {
+					t.Fatalf("timed out waiting for generic active=1 waiting=1, got %+v", liveSnap)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if liveSnap.ConcurrencyLimit != tc.wantLimit {
+				t.Fatalf("live generic ConcurrencyLimit = %d, want %d", liveSnap.ConcurrencyLimit, tc.wantLimit)
+			}
+
+			// Also execute a Tier-1 baseEng extraction in parallel to prove baseEng stats stay separate from generic sub-pool metrics.
+			if _, baseErr := baseEng.Extract(WithChannel(context.Background(), ChannelAnonymous), "https://x.com/i/status/999"); baseErr != nil {
+				t.Fatalf("Tier-1 baseEng Extract failed: %v", baseErr)
+			}
+
+			time.Sleep(25 * time.Millisecond)
+			if err := os.WriteFile(releaseFile, []byte("go"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if exErr := <-firstDone; exErr != nil {
+				t.Fatalf("first generic Extract failed: %v", exErr)
+			}
+			if exErr := <-waitDone; exErr != nil {
+				t.Fatalf("contended generic Extract failed: %v", exErr)
+			}
+
+			finalGen := genericEng.StatsSnapshot()
+			if finalGen.Active != 0 || finalGen.Waiting != 0 || finalGen.ConcurrencyLimit != tc.wantLimit {
+				t.Fatalf("final generic gauges mismatch: %+v", finalGen)
+			}
+			// Total acquired: g1 (owner uncontended) + g-wait (owner contended) = 2;
+			// Total waits: g-cancel (anon canceled) + g-wait (owner acquired) = 2;
+			// Total canceled: g-cancel (anon) = 1.
+			if finalGen.Total.AcquiredCount != 2 || finalGen.Total.WaitCount != 2 || finalGen.Total.CanceledCount != 1 {
+				t.Fatalf("final generic totals mismatch: %+v", finalGen.Total)
+			}
+			if finalGen.ByChannel.Owner.AcquiredCount != 2 || finalGen.ByChannel.Owner.WaitCount != 1 || finalGen.ByChannel.Owner.CanceledCount != 0 || finalGen.ByChannel.Owner.WaitMSTotal < 15 {
+				t.Fatalf("final generic owner channel mismatch: %+v", finalGen.ByChannel.Owner)
+			}
+			if finalGen.ByChannel.Anonymous.AcquiredCount != 0 || finalGen.ByChannel.Anonymous.WaitCount != 1 || finalGen.ByChannel.Anonymous.CanceledCount != 1 || finalGen.ByChannel.Anonymous.WaitMSTotal < 50 {
+				t.Fatalf("final generic anonymous channel mismatch: %+v", finalGen.ByChannel.Anonymous)
+			}
+
+			finalBase := baseEng.StatsSnapshot()
+			if finalBase.ConcurrencyLimit != tc.baseConc || finalBase.Active != 0 || finalBase.Waiting != 0 {
+				t.Fatalf("final base gauges mismatch: %+v", finalBase)
+			}
+			// In fixed-port mode, baseEng shares sem so baseEng saw g1 + g-wait + Tier-1 (3 uncontended acquires, 0 waits/cancels).
+			// In dynamic-port mode, baseEng only saw Tier-1 (1 acquire, 0 waits/cancels).
+			wantBaseAcquired := uint64(1)
+			if tc.fixedGatePorts {
+				wantBaseAcquired = 3
+			}
+			if finalBase.Total.AcquiredCount != wantBaseAcquired || finalBase.Total.WaitCount != 0 || finalBase.Total.CanceledCount != 0 {
+				t.Fatalf("final base totals = %+v, want acquired=%d wait=0 canceled=0", finalBase.Total, wantBaseAcquired)
+			}
+		})
+	}
+}

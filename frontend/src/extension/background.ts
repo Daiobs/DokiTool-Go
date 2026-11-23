@@ -84,7 +84,7 @@ import {
   type SidePanelToBackgroundRequest,
   type TabSyncState,
 } from "./protocol";
-import { isValidStatsSnapshot } from "./statsTypes";
+import { isValidStatsSnapshot } from "../monitor/statsTypes";
 import {
   buildApiAuthHeaders,
   buildWorkFingerprint,

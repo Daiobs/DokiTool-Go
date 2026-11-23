@@ -91,6 +91,16 @@ snap.example.com {
         header Cache-Control "no-cache"
         file_server
     }
+    @monitor path /monitor /monitor.html
+    handle @monitor {
+        root * /srv/dokitool/current/frontend/dist
+        header Content-Type "text/html; charset=utf-8"
+        header Cache-Control "no-store"
+        header X-Robots-Tag "noindex, nofollow, noarchive"
+        header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        rewrite * /monitor.html
+        file_server
+    }
     handle {
         root * /srv/dokitool/current/frontend/dist
         route {

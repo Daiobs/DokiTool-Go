@@ -495,6 +495,13 @@ func TestGenericSlowPoolIsolationFromCorePools(t *testing.T) {
 	if wGen2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second concurrent generic request got %d, want 429", wGen2.Code)
 	}
+	if snap := h.Stats().Snapshot(); snap.Admission.GenericSlow.Active != 1 ||
+		snap.Admission.GenericSlow.ConcurrencyLimit != 1 ||
+		snap.Admission.GenericSlow.Full != 1 ||
+		snap.Admission.Slow.Active != 0 ||
+		snap.Admission.Fast.Active != 0 {
+		t.Fatalf("expected isolated admission.generic_slow live gauges (active=1, limit=1, full=1), got %+v", snap.Admission)
+	}
 
 	// 3. While genericSlow is 100% saturated, core SlowParse (YouTube, Instagram) AND core Fast Parse (Douyin) succeed immediately!
 	for idx, u := range []string{
@@ -510,6 +517,9 @@ func TestGenericSlowPoolIsolationFromCorePools(t *testing.T) {
 
 	close(releaseGeneric)
 	wg.Wait()
+	if snap := h.Stats().Snapshot(); snap.Admission.GenericSlow.Active != 0 || snap.Admission.GenericSlow.Full != 1 {
+		t.Fatalf("expected admission.generic_slow active=0 full=1 after release, got %+v", snap.Admission.GenericSlow)
+	}
 
 	// 4. Conversely, saturating core SlowParse (X) must NOT block genericSlow (Vimeo).
 	wg.Add(1)

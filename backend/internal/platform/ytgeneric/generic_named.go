@@ -91,6 +91,11 @@ func AllowedGenericOutboundHost(host string) bool {
 		h == "internal" || strings.HasSuffix(h, ".internal") ||
 		h == "localdomain" || strings.HasSuffix(h, ".localdomain") ||
 		h == "home.arpa" || strings.HasSuffix(h, ".home.arpa") ||
+		h == "invalid" || strings.HasSuffix(h, ".invalid") ||
+		h == "lan" || strings.HasSuffix(h, ".lan") ||
+		h == "corp" || strings.HasSuffix(h, ".corp") ||
+		h == "intranet" || strings.HasSuffix(h, ".intranet") ||
+		h == "private" || strings.HasSuffix(h, ".private") ||
 		h == "dokitool.com" || strings.HasSuffix(h, ".dokitool.com") {
 		return false
 	}

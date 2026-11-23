@@ -187,6 +187,9 @@ func run(args []string) error {
 	if ytCfg.engine != nil {
 		handler.Stats().SetYTDLPEngine(ytCfg.engine)
 	}
+	if ytCfg.genericEngine != nil {
+		handler.Stats().SetGenericYTDLPEngine(ytCfg.genericEngine)
+	}
 	shanghaiMode := "off"
 	shanghaiBilibili := false
 	if sp, ok := shanghai.(shresolver.StatsProvider); ok {
@@ -477,6 +480,7 @@ func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapt
 
 type ytdlpConfigResult struct {
 	engine         *ytengine.Engine
+	genericEngine  *ytengine.Engine
 	genericAdapter api.Adapter
 }
 
@@ -599,6 +603,7 @@ func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, exe
 			WithGenericConcurrency(genericConc).
 			WithTargetPolicy(ytgeneric.AllowedGenericInputURL, ytgeneric.AllowedGenericOutboundHost).
 			WithExtractors(ytgeneric.GenericExtractorArgs()...)
+		res.genericEngine = genericEngine
 		res.genericAdapter = ytgeneric.NewGenericNamed(
 			genericEngine,
 			ytengine.NewSizeProber(executor, ytgeneric.AllowedGenericMediaURL),

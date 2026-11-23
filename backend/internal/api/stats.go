@@ -551,11 +551,12 @@ type AdmissionPoolSnapshot struct {
 	WaitMSMax        uint64 `json:"wait_ms_max"`
 }
 
-// AdmissionStatsSnapshot summarizes the three queued admission pools (fast, slow, owner).
+// AdmissionStatsSnapshot summarizes the four queued admission pools (fast, slow, generic_slow, owner).
 type AdmissionStatsSnapshot struct {
-	Fast  AdmissionPoolSnapshot `json:"fast"`
-	Slow  AdmissionPoolSnapshot `json:"slow"`
-	Owner AdmissionPoolSnapshot `json:"owner"`
+	Fast        AdmissionPoolSnapshot `json:"fast"`
+	Slow        AdmissionPoolSnapshot `json:"slow"`
+	GenericSlow AdmissionPoolSnapshot `json:"generic_slow"`
+	Owner       AdmissionPoolSnapshot `json:"owner"`
 }
 
 // LatencyChannelBreakdown separates parse/resolve latency distributions by channel.
@@ -623,6 +624,11 @@ type RuntimeConfigSnapshot struct {
 	StatsPersistenceEnabled bool   `json:"stats_persistence_enabled"`
 }
 
+// YTDLPStatsSource provides a point-in-time yt-dlp concurrency slot snapshot.
+type YTDLPStatsSource interface {
+	StatsSnapshot() ytengine.SlotStatsSnapshot
+}
+
 // StatsSnapshot is the read-only data payload returned by GET /api/stats.
 type StatsSnapshot struct {
 	StartedAt      string                     `json:"started_at"`
@@ -633,6 +639,7 @@ type StatsSnapshot struct {
 	Admission      AdmissionStatsSnapshot     `json:"admission"`
 	APIKeys        []APIKeyStatsSnapshot      `json:"api_keys"`
 	YTDLP          ytengine.SlotStatsSnapshot `json:"ytdlp"`
+	YTDLPGeneric   ytengine.SlotStatsSnapshot `json:"ytdlp_generic"`
 	Shanghai       shresolver.StatsSnapshot   `json:"shanghai"`
 	ParseLatencyMS LatencyStatsSnapshot       `json:"parse_latency_ms"`
 	Runtime        RuntimeConfigSnapshot      `json:"runtime"`
@@ -872,6 +879,7 @@ type Stats struct {
 	cacheSrc               *parseCache
 	admSrc                 *admission
 	ytdlpSrc               *ytengine.Engine
+	ytdlpGenericSrc        YTDLPStatsSource
 	shSrc                  shresolver.StatsProvider
 	shSrcGen               uint64
 	lastSyncedShanghaiHits uint64
@@ -929,6 +937,20 @@ func (s *Stats) SetYTDLPEngine(engine *ytengine.Engine) {
 	}
 	s.mu.Lock()
 	s.ytdlpSrc = engine
+	s.mu.Unlock()
+}
+
+// SetGenericYTDLPEngine binds the isolated Tier-2 generic yt-dlp slot stats source
+// so Snapshot includes per-channel generic slot gauges and wait counters.
+func (s *Stats) SetGenericYTDLPEngine(src YTDLPStatsSource) {
+	if s == nil {
+		return
+	}
+	if eng, ok := src.(*ytengine.Engine); ok && eng == nil {
+		src = nil
+	}
+	s.mu.Lock()
+	s.ytdlpGenericSrc = src
 	s.mu.Unlock()
 }
 
@@ -1222,6 +1244,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	cacheSrc := s.cacheSrc
 	admSrc := s.admSrc
 	ytdlpSrc := s.ytdlpSrc
+	ytdlpGenericSrc := s.ytdlpGenericSrc
 	shSrc := s.shSrc
 	shGen := s.shSrcGen
 	s.mu.RUnlock()
@@ -1240,6 +1263,11 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	var ytdlpSnap ytengine.SlotStatsSnapshot
 	if ytdlpSrc != nil {
 		ytdlpSnap = ytdlpSrc.StatsSnapshot()
+	}
+
+	var ytdlpGenericSnap ytengine.SlotStatsSnapshot
+	if ytdlpGenericSrc != nil {
+		ytdlpGenericSnap = ytdlpGenericSrc.StatsSnapshot()
 	}
 
 	shSnap := shresolver.StatsSnapshot{Mode: "off"}
@@ -1331,11 +1359,12 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			ByChannel:             RequestChannelBreakdown{Anonymous: anonReq, Owner: ownerReq},
 			ByPlatformCodeChannel: cells,
 		},
-		Cache:     cacheSnap,
-		Admission: admSnap,
-		APIKeys:   apiKeys,
-		YTDLP:     ytdlpSnap,
-		Shanghai:  shSnap,
+		Cache:        cacheSnap,
+		Admission:    admSnap,
+		APIKeys:      apiKeys,
+		YTDLP:        ytdlpSnap,
+		YTDLPGeneric: ytdlpGenericSnap,
+		Shanghai:     shSnap,
 		ParseLatencyMS: LatencyStatsSnapshot{
 			Total:     latTotal,
 			ByChannel: LatencyChannelBreakdown{Anonymous: latAnon, Owner: latOwner},

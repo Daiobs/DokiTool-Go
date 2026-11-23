@@ -1,7 +1,6 @@
-import { PLATFORM_DOMAIN_SPECS } from "./urlMatcher";
-
 // ============================================================================
 // Backend `/api/stats?schema_version=1.0` Read-Only Data Contract
+// Self-contained module (zero extension, DOM, or Chrome API dependencies)
 // ============================================================================
 
 export interface HistogramBuckets {
@@ -82,6 +81,7 @@ export interface AdmissionPoolSnapshot {
 export interface AdmissionStatsSnapshot {
   fast: AdmissionPoolSnapshot;
   slow: AdmissionPoolSnapshot;
+  generic_slow?: AdmissionPoolSnapshot;
   owner: AdmissionPoolSnapshot;
 }
 
@@ -232,6 +232,7 @@ export interface StatsSnapshot {
   admission: AdmissionStatsSnapshot;
   api_keys: APIKeyStatsSnapshot[];
   ytdlp: YTDLPStatsSnapshot;
+  ytdlp_generic?: YTDLPStatsSnapshot;
   shanghai: ShanghaiStatsSnapshot;
   parse_latency_ms: LatencyStatsSnapshot;
   runtime: RuntimeConfigSnapshot;
@@ -255,6 +256,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isFiniteNum(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isValidAdmissionPool(raw: unknown): raw is AdmissionPoolSnapshot {
+  if (!isRecord(raw)) return false;
+  return (
+    isFiniteNum(raw.active) &&
+    isFiniteNum(raw.queued) &&
+    isFiniteNum(raw.concurrency_limit) &&
+    isFiniteNum(raw.queue_limit)
+  );
+}
+
+function isValidYtdlpSnapshot(raw: unknown): raw is YTDLPStatsSnapshot {
+  if (!isRecord(raw)) return false;
+  return isFiniteNum(raw.active) && isFiniteNum(raw.concurrency_limit);
 }
 
 function isValidRuntimeConfig(raw: unknown): raw is RuntimeConfigSnapshot {
@@ -346,14 +362,24 @@ export function isValidStatsSnapshot(raw: unknown): raw is StatsSnapshot {
     return false;
   }
 
+  if (
+    raw.admission.generic_slow !== undefined &&
+    !isValidAdmissionPool(raw.admission.generic_slow)
+  ) {
+    return false;
+  }
+
   if (!Array.isArray(raw.api_keys)) {
     return false;
   }
 
+  if (!isValidYtdlpSnapshot(raw.ytdlp)) {
+    return false;
+  }
+
   if (
-    !isRecord(raw.ytdlp) ||
-    !isFiniteNum(raw.ytdlp.active) ||
-    !isFiniteNum(raw.ytdlp.concurrency_limit)
+    raw.ytdlp_generic !== undefined &&
+    !isValidYtdlpSnapshot(raw.ytdlp_generic)
   ) {
     return false;
   }
@@ -390,12 +416,25 @@ export function isValidStatsSnapshot(raw: unknown): raw is StatsSnapshot {
 }
 
 // ============================================================================
-// Pure Data Aggregations & Formatters (Zero DOM / Chrome Dependency)
+// Pure Data Aggregations & Formatters (Zero DOM / Chrome / Extension Dependency)
 // ============================================================================
 
-const CORE_PLATFORM_LABEL_MAP = new Map<string, string>(
-  PLATFORM_DOMAIN_SPECS.map((spec) => [spec.id, spec.label]),
-);
+const CORE_PLATFORM_LABEL_MAP = new Map<string, string>([
+  ["douyin", "抖音"],
+  ["bilibili", "B站"],
+  ["weibo", "微博"],
+  ["toutiao", "今日头条"],
+  ["kuaishou", "快手"],
+  ["pipixia", "皮皮虾"],
+  ["pipigx", "皮皮搞笑"],
+  ["zuiyou", "最右"],
+  ["xiaohongshu", "小红书"],
+  ["x", "X / Twitter"],
+  ["youtube", "YouTube"],
+  ["instagram", "Instagram"],
+  ["facebook", "Facebook"],
+  ["tumblr", "Tumblr"],
+]);
 
 export function formatStatsPlatformLabel(platform: string): string {
   const key = typeof platform === "string" ? platform.trim().toLowerCase() : "";
@@ -419,6 +458,12 @@ export interface PlatformErrorBadge {
   severity: ErrorCodeSeverity;
 }
 
+export interface EffectiveSuccessRateSummary {
+  excludedCount: number;
+  effectiveTotal: number;
+  effectiveSuccessRate: number | null;
+}
+
 export interface PlatformHealthRow {
   platform: string;
   label: string;
@@ -426,6 +471,9 @@ export interface PlatformHealthRow {
   ok: number;
   failed: number;
   successRate: number | null;
+  excludedCount: number;
+  effectiveTotal: number;
+  effectiveSuccessRate: number | null;
   topErrors: PlatformErrorBadge[];
   p95Ms: number | null;
 }
@@ -437,6 +485,9 @@ export interface TodayVsYesterdaySummary {
   ok: number;
   failed: number;
   successRate: number | null;
+  excludedCount: number;
+  effectiveTotal: number;
+  effectiveSuccessRate: number | null;
   cacheHits: number;
   shanghaiHits: number;
   p50Ms: number;
@@ -447,6 +498,13 @@ export interface TodayVsYesterdaySummary {
   deltaTotal: number;
   deltaRatePct: number | null;
 }
+
+export const EXCLUDED_NON_UPSTREAM_CODES: ReadonlySet<string> = new Set([
+  "RATE_LIMITED",
+  "INVALID_INPUT",
+  "UNSUPPORTED_PLATFORM",
+  "UNAUTHORIZED",
+]);
 
 const DANGER_ERROR_CODES = new Set([
   "UPSTREAM_BLOCKED",
@@ -477,6 +535,43 @@ function safeRatePct(ok: number, total: number): number | null {
   return Math.max(0, Math.min(100, pct));
 }
 
+export function computeEffectiveSuccessRate(
+  ok: number,
+  total: number,
+  byCode: Record<string, number> | Map<string, number> | null | undefined,
+): EffectiveSuccessRateSummary {
+  const safeTotal = Number.isFinite(total) ? Math.max(0, total) : 0;
+  const safeOk = Number.isFinite(ok) ? Math.max(0, ok) : 0;
+
+  let excludedCount = 0;
+  if (byCode instanceof Map) {
+    for (const [rawCode, count] of byCode.entries()) {
+      if (!Number.isFinite(count) || count <= 0) continue;
+      const code = String(rawCode || "").trim().toUpperCase();
+      if (EXCLUDED_NON_UPSTREAM_CODES.has(code)) {
+        excludedCount += count;
+      }
+    }
+  } else if (byCode && typeof byCode === "object") {
+    for (const [rawCode, count] of Object.entries(byCode)) {
+      if (!Number.isFinite(count) || count <= 0) continue;
+      const code = String(rawCode || "").trim().toUpperCase();
+      if (EXCLUDED_NON_UPSTREAM_CODES.has(code)) {
+        excludedCount += count;
+      }
+    }
+  }
+
+  const effectiveTotal = Math.max(0, safeTotal - excludedCount);
+  const effectiveSuccessRate = safeRatePct(safeOk, effectiveTotal);
+
+  return {
+    excludedCount,
+    effectiveTotal,
+    effectiveSuccessRate,
+  };
+}
+
 export function computeTodayVsYesterday(
   stats: StatsSnapshot,
 ): TodayVsYesterdaySummary {
@@ -488,6 +583,20 @@ export function computeTodayVsYesterday(
   const ok = today?.ok ?? 0;
   const failed = today?.failed ?? 0;
   const successRate = safeRatePct(ok, total);
+
+  const todayByCode = new Map<string, number>();
+  const todayPlatforms = today?.by_platform;
+  if (todayPlatforms && typeof todayPlatforms === "object") {
+    for (const pStats of Object.values(todayPlatforms)) {
+      if (!pStats?.by_code || typeof pStats.by_code !== "object") continue;
+      for (const [rawCode, count] of Object.entries(pStats.by_code)) {
+        if (!Number.isFinite(count) || count <= 0) continue;
+        const code = rawCode.trim().toUpperCase();
+        todayByCode.set(code, (todayByCode.get(code) ?? 0) + count);
+      }
+    }
+  }
+  const effective = computeEffectiveSuccessRate(ok, total, todayByCode);
 
   const yesterdayTotal = yesterday?.total ?? 0;
   const yesterdaySuccessRate = yesterday
@@ -507,6 +616,9 @@ export function computeTodayVsYesterday(
     ok,
     failed,
     successRate,
+    excludedCount: effective.excludedCount,
+    effectiveTotal: effective.effectiveTotal,
+    effectiveSuccessRate: effective.effectiveSuccessRate,
     cacheHits: today?.cache_hits ?? 0,
     shanghaiHits: today?.shanghai_hits ?? 0,
     p50Ms: today?.latency_ms?.p50_ms ?? 0,
@@ -620,6 +732,12 @@ export function aggregatePlatformHealth(
         severity: classifyErrorCodeSeverity(code),
       }));
 
+    const effective = computeEffectiveSuccessRate(
+      entry.ok,
+      entry.total,
+      entry.byCode,
+    );
+
     rows.push({
       platform,
       label: formatStatsPlatformLabel(platform),
@@ -627,6 +745,9 @@ export function aggregatePlatformHealth(
       ok: entry.ok,
       failed: entry.failed,
       successRate: safeRatePct(entry.ok, entry.total),
+      excludedCount: effective.excludedCount,
+      effectiveTotal: effective.effectiveTotal,
+      effectiveSuccessRate: effective.effectiveSuccessRate,
       topErrors,
       p95Ms: entry.hasP95 ? entry.maxP95Ms : null,
     });

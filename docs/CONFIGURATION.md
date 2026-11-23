@@ -74,11 +74,11 @@
 | `DOKITOOL_STATS_SNAPSHOT_PATH` | 指定 `/api/stats` 统计快照的本地持久化文件路径（默认为空，纯内存运行不执行磁盘读写）；配置路径后，启动时加载未过期的近 30 天（`Asia/Shanghai` UTC+8）日桶与近 24 小时时桶，文件不存在则冷启动，若文件损坏或快照版本不匹配则打印告警并以安全空状态启动、不阻塞主服务；运行期每 5 分钟及收到 `SIGINT`/`SIGTERM` 停机时通过同目录临时文件 + `Sync` + 原子重命名以 `0600` 权限落盘；仅存聚合统计元数据，绝不写入 URL、IP 或令牌 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
-| `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
-| `DOKITOOL_YTDLP_YOUTUBE_ENABLED` | 控制是否注册并启用 YouTube 解析路由适配器（启用时在启动阶段强校验提取器可用性） | 否 |
-| `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（启用时在启动阶段强校验提取器可用性） | 否 |
+| `DOKITOOL_YTDLP_X_ENABLED` | 控制是否注册并启用 X 平台解析适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
+| `DOKITOOL_YTDLP_YOUTUBE_ENABLED` | 控制是否注册并启用 YouTube 服务端解析路由适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
+| `DOKITOOL_YTDLP_INSTAGRAM_ENABLED` | 控制是否注册并启用 Instagram 平台解析适配器（默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false`） | 否 |
 | `DOKITOOL_YTDLP_SITES` | 按逗号分隔指定启用的长尾海外平台标识集合（含未知标识或空项时拒绝启动；已退役标识静默忽略） | 否 |
-| `DOKITOOL_YTDLP_GENERIC_ENABLED` | 控制是否开启两级路由的第二级通用具名提取器兜底（仅响应 `GET /api/parse` 且 `platform=all` 或省略的非目录公网链接，严格禁用 `generic` 盲抓提取器；默认关闭 `false`，启用时强校验外部提取器可用性，传入非布尔值时拒绝启动） | 否 |
+| `DOKITOOL_YTDLP_GENERIC_ENABLED` | 控制是否开启两级路由的第二级通用具名提取器兜底（仅响应 `GET /api/parse` 且 `platform=all` 或省略的非目录公网链接，严格禁用 `generic` 盲抓提取器；默认关闭 `false`，传入非布尔值或并发参数越界时拒绝启动；启用后启动阶段严格校验官方 `yt-dlp` 版本与 SHA-256 摘要，若预检失败则记录告警并自动禁用 `yt-dlp` 平台路由、不阻塞纯 Go 国内平台启动，且 `/api/stats` 如实反映 `ytdlp_enabled: false` 与 `ytdlp_generic_enabled: false`） | 否 |
 | `DOKITOOL_YOUTUBE_HELPER` | 控制是否启用 YouTube 浏览器助手上下文与签名结算接口（启用时在启动阶段校验运行时与脚本文件摘要） | 否 |
 
 > **`DOKITOOL_BILIBILI_DASH` 灰度启用与回滚说明**：

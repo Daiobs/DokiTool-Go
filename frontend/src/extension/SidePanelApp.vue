@@ -24,7 +24,7 @@ import {
   computeTodayVsYesterday,
   formatPercent,
   type TodayVsYesterdaySummary,
-} from "./statsTypes";
+} from "../monitor/statsTypes";
 import {
   DEFAULT_EXTENSION_SETTINGS,
   buildWorkFingerprint,
@@ -248,7 +248,7 @@ async function refreshOwnerStatsSilently(options?: {
 }
 
 function handleOpenMonitorDashboard() {
-  void openMonitorDashboardTab();
+  void openMonitorDashboardTab(settings.value.apiBaseUrl);
 }
 
 // ============================================================================

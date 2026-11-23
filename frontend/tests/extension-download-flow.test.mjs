@@ -10877,3 +10877,587 @@ test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classific
     bg.dispose();
   }
 });
+
+function createOwnerStatsFixture() {
+  const emptyBuckets = {
+    "<=10": 10,
+    "<=50": 40,
+    "<=100": 80,
+    "<=250": 120,
+    "<=500": 160,
+    "<=1000": 190,
+    "<=2500": 210,
+    "<=5000": 218,
+    "<=10000": 220,
+    "<=30000": 220,
+    "+Inf": 220,
+  };
+  const emptyHist = {
+    count: 220,
+    sum_ms: 48_000,
+    max_ms: 4200,
+    buckets: emptyBuckets,
+  };
+  const emptySlot = {
+    acquired_count: 20,
+    wait_count: 1,
+    canceled_count: 0,
+    wait_ms_total: 120,
+    wait_ms_max: 60,
+    wait_ms: emptyHist,
+  };
+  const emptyShanghai = {
+    hits: 24,
+    fallbacks: 2,
+    canceled: 0,
+    queue_waits: 1,
+    queue_granted: 1,
+    queue_timeouts: 0,
+    queue_wait_ms_total: 40,
+    queue_wait_ms_max: 40,
+  };
+  return {
+    started_at: "2026-11-20T08:00:00Z",
+    generated_at: "2026-11-22T15:30:00Z",
+    uptime_seconds: 199_800,
+    requests: {
+      total: 220,
+      by_channel: { anonymous: 80, owner: 140 },
+      by_platform_code_channel: [
+        { platform: "douyin", code: "OK", channel: "owner", count: 140 },
+      ],
+    },
+    cache: {
+      enabled: true,
+      entries: 64,
+      bytes: 2_621_440,
+      max_entries: 1000,
+      max_bytes: 67_108_864,
+      total: { hits: 90, misses: 30, singleflight_shared: 5, uncacheable: 2 },
+      by_channel: {
+        anonymous: { hits: 30, misses: 15, singleflight_shared: 2, uncacheable: 1 },
+        owner: { hits: 60, misses: 15, singleflight_shared: 3, uncacheable: 1 },
+      },
+    },
+    admission: {
+      fast: {
+        active: 1,
+        queued: 0,
+        concurrency_limit: 8,
+        queue_limit: 32,
+        waited: 0,
+        granted: 100,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+      slow: {
+        active: 0,
+        queued: 0,
+        concurrency_limit: 4,
+        queue_limit: 16,
+        waited: 0,
+        granted: 20,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+      owner: {
+        active: 1,
+        queued: 0,
+        concurrency_limit: 6,
+        queue_limit: 24,
+        waited: 0,
+        granted: 80,
+        timeout: 0,
+        full: 0,
+        canceled: 0,
+        wait_ms_total: 0,
+        wait_ms_max: 0,
+      },
+    },
+    api_keys: [],
+    ytdlp: {
+      enabled: true,
+      concurrency_limit: 3,
+      active: 1,
+      waiting: 0,
+      total: emptySlot,
+      by_channel: { anonymous: emptySlot, owner: emptySlot },
+    },
+    shanghai: {
+      enabled: true,
+      mode: "pull",
+      waiting_workers: 2,
+      queued_tasks: 0,
+      pending_tasks: 0,
+      total: emptyShanghai,
+      by_channel: { anonymous: emptyShanghai, owner: emptyShanghai },
+      by_platform: { douyin: emptyShanghai, bilibili: emptyShanghai },
+    },
+    parse_latency_ms: {
+      total: emptyHist,
+      by_channel: { anonymous: emptyHist, owner: emptyHist },
+    },
+    runtime: {
+      version: "v4.1.0-r2",
+      shanghai_mode: "pull",
+      shanghai_bilibili: true,
+      bilibili_dash: true,
+      youtube_helper: true,
+      xhs_transport: "chrome131",
+      ytdlp_enabled: true,
+      ytdlp_generic_enabled: true,
+      tbvideo_pipigx: true,
+      tbvideo_zuiyou: true,
+      stats_persistence_enabled: true,
+    },
+    daily: [
+      {
+        date: "2026-11-21",
+        total: 100,
+        ok: 90,
+        failed: 10,
+        cache_hits: 20,
+        shanghai_hits: 10,
+        latency_ms: { p50_ms: 150, p95_ms: 800, max_ms: 2000 },
+        by_platform: {},
+      },
+      {
+        date: "2026-11-22",
+        total: 120,
+        ok: 114,
+        failed: 6,
+        cache_hits: 38,
+        shanghai_hits: 24,
+        latency_ms: { p50_ms: 140, p95_ms: 820, max_ms: 3100 },
+        by_platform: {},
+      },
+    ],
+    hourly: [
+      {
+        hour_start: "2026-11-22T15:00:00+08:00",
+        total: 20,
+        ok: 19,
+        failed: 1,
+        cache_hits: 8,
+      },
+    ],
+  };
+}
+
+test("[PR-C Round 2] uiTargetHelpers.openMonitorDashboardTab: opens Web ${apiOrigin}/monitor, supports loopback, reuses /monitor or /monitor.html tabs, rejects invalid apiBaseUrl, and never appends query/hash/token", async () => {
+  const prevChrome = globalThis.chrome;
+  try {
+    // 1) Outside Chrome extension runtime -> false
+    delete globalThis.chrome;
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), false);
+
+    // 2) Invalid apiBaseUrl inputs -> false with zero chrome.tabs calls
+    const invalidCalls = [];
+    globalThis.chrome = {
+      tabs: {
+        query: async (q) => {
+          invalidCalls.push(["query", q]);
+          return [];
+        },
+        update: async (id, props) => {
+          invalidCalls.push(["update", id, props]);
+        },
+        create: async (props) => {
+          invalidCalls.push(["create", props]);
+        },
+      },
+    };
+    for (const badBase of [
+      "   ",
+      "http://evil.com",
+      "https://192.168.1.1",
+      "https://snap.dokitool.com/subpath",
+      "https://snap.dokitool.com?token=secret",
+      "https://snap.dokitool.com#token=secret",
+      "javascript:alert(1)",
+      "https://portal.intranet",
+    ]) {
+      assert.equal(
+        await uiTargetHelpersMod.openMonitorDashboardTab(badBase),
+        false,
+        `expected invalid apiBaseUrl to return false: ${badBase}`,
+      );
+    }
+    assert.equal(invalidCalls.length, 0, "invalid apiBaseUrl must issue zero tabs API calls");
+
+    // 3) Default apiBaseUrl (undefined & "") opens https://snap.dokitool.com/monitor when absent
+    const calls = { query: [], update: [], windowUpdate: [], create: [] };
+    let existingTabs = [];
+    globalThis.chrome = {
+      tabs: {
+        query: async (q) => {
+          calls.query.push(q);
+          return existingTabs;
+        },
+        update: async (id, props) => {
+          calls.update.push({ id, props });
+        },
+        create: async (props) => {
+          calls.create.push(props);
+        },
+      },
+      windows: {
+        update: async (wid, props) => {
+          calls.windowUpdate.push({ wid, props });
+        },
+      },
+    };
+
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), true);
+    assert.deepEqual(calls.query[0], {
+      url: [
+        "https://snap.dokitool.com/monitor",
+        "https://snap.dokitool.com/monitor.html",
+      ],
+    });
+    assert.deepEqual(calls.create, [
+      { url: "https://snap.dokitool.com/monitor", active: true },
+    ]);
+    assert.equal(calls.create[0].url.includes("?"), false);
+    assert.equal(calls.create[0].url.includes("#"), false);
+
+    // Empty string also defaults to https://snap.dokitool.com/monitor
+    calls.create.length = 0;
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(""), true);
+    assert.deepEqual(calls.create, [
+      { url: "https://snap.dokitool.com/monitor", active: true },
+    ]);
+
+    // 4) Reuses existing /monitor tab without calling tabs.create
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    existingTabs = [
+      { id: 42, windowId: 7, url: "https://snap.dokitool.com/monitor" },
+    ];
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("https://snap.dokitool.com/"),
+      true,
+    );
+    assert.deepEqual(calls.update, [{ id: 42, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 7, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+
+    // 5) Reuses existing /monitor.html tab without calling tabs.create
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    existingTabs = [
+      { id: 55, windowId: 9, url: "https://snap.dokitool.com/monitor.html" },
+    ];
+    assert.equal(await uiTargetHelpersMod.openMonitorDashboardTab(), true);
+    assert.deepEqual(calls.update, [{ id: 55, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 9, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+
+    // 6) Loopback http://127.0.0.1:18080/ -> opens http://127.0.0.1:18080/monitor when absent
+    calls.create.length = 0;
+    calls.update.length = 0;
+    existingTabs = [];
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("http://127.0.0.1:18080/"),
+      true,
+    );
+    assert.deepEqual(calls.create, [
+      { url: "http://127.0.0.1:18080/monitor", active: true },
+    ]);
+    assert.equal(calls.create[0].url.includes("?"), false);
+    assert.equal(calls.create[0].url.includes("#"), false);
+
+    // 7) Real Chrome portless match-pattern fallback when tabs.query throws on explicit port
+    calls.create.length = 0;
+    calls.update.length = 0;
+    calls.windowUpdate.length = 0;
+    globalThis.chrome.tabs.query = async ({ url }) => {
+      const patterns = Array.isArray(url) ? url : [url];
+      if (patterns.some((p) => /:\d+\//.test(p))) {
+        throw new Error("Invalid url pattern");
+      }
+      return [
+        { id: 88, windowId: 1, url: "http://127.0.0.1:9999/monitor" },
+        { id: 89, windowId: 2, url: "http://127.0.0.1:18080/monitor.html" },
+      ];
+    };
+    assert.equal(
+      await uiTargetHelpersMod.openMonitorDashboardTab("http://127.0.0.1:18080"),
+      true,
+    );
+    assert.deepEqual(calls.update, [{ id: 89, props: { active: true } }]);
+    assert.deepEqual(calls.windowUpdate, [{ wid: 2, props: { focused: true } }]);
+    assert.equal(calls.create.length, 0);
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: silent on anonymous/401, renders on 200 owner, and opens Web ${apiBaseUrl}/monitor with zero token in URL", async () => {
+  assert.equal(
+    protocol.isSidePanelRequest({ type: "FETCH_OWNER_STATS" }),
+    true,
+  );
+
+  // Part A: Background FETCH_OWNER_STATS RPC
+  const sampleStats = createOwnerStatsFixture();
+  const rpcFetchCalls = [];
+  const rpcStore = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  const rpcEnv = createMockMv3Environment();
+  const rpcBg = backgroundMod.createBackgroundController({
+    chrome: rpcEnv.chrome,
+    storage: rpcStore,
+    now: () => 1_760_000_000_000,
+    fetchImpl: async (url, init) => {
+      rpcFetchCalls.push({ url: String(url), init });
+      const auth = init?.headers?.Authorization || "";
+      if (auth === "Bearer owner-secret-key") {
+        return new Response(
+          JSON.stringify({ schema_version: "1.0", code: "OK", data: sampleStats }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (auth === "Bearer bad-schema-key") {
+        return new Response(
+          JSON.stringify({ schema_version: "1.0", code: "OK", data: { broken: true } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "INVALID_INPUT",
+          error: { code: "UNAUTHORIZED", message: "owner token required" },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+  await rpcBg.init();
+
+  const sendBgRpc = (msg) =>
+    new Promise((resolvePromise) => {
+      rpcBg.handleRuntimeMessage(msg, {}, resolvePromise);
+    });
+
+  try {
+    // 1) Empty token -> 0 network calls, NO_TOKEN 401
+    const noTokenRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(noTokenRes.ok, false);
+    assert.equal(noTokenRes.status, 401);
+    assert.equal(noTokenRes.code, "NO_TOKEN");
+    assert.equal(rpcFetchCalls.length, 0);
+
+    // 2) Friend token -> 401 UNAUTHORIZED with cookie-free / no-store options
+    await rpcStore.updateSettings({ bearerToken: "friend-secret-key" });
+    const friendRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(friendRes.ok, false);
+    assert.equal(friendRes.status, 401);
+    assert.equal(friendRes.code, "UNAUTHORIZED");
+    assert.equal(rpcFetchCalls.length, 1);
+    assert.equal(
+      rpcFetchCalls[0].url,
+      "https://snap.dokitool.com/api/stats?schema_version=1.0",
+    );
+    assert.equal(rpcFetchCalls[0].init.credentials, "omit");
+    assert.equal(rpcFetchCalls[0].init.referrerPolicy, "no-referrer");
+    assert.equal(rpcFetchCalls[0].init.cache, "no-store");
+    assert.equal(
+      rpcFetchCalls[0].init.headers.Authorization,
+      "Bearer friend-secret-key",
+    );
+
+    // 3) Owner token -> 200 OK with validated StatsSnapshot
+    await rpcStore.updateSettings({ bearerToken: "owner-secret-key" });
+    const ownerRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(ownerRes.ok, true);
+    assert.equal(ownerRes.data.apiOrigin, "https://snap.dokitool.com");
+    assert.equal(ownerRes.data.fetchedAt, 1_760_000_000_000);
+    assert.equal(ownerRes.data.stats.runtime.version, "v4.1.0-r2");
+
+    // 4) Malformed 200 payload rejected cleanly
+    await rpcStore.updateSettings({ bearerToken: "bad-schema-key" });
+    const badRes = await sendBgRpc({ type: "FETCH_OWNER_STATS" });
+    assert.equal(badRes.ok, false);
+    assert.equal(badRes.code, "STATS_FAILED");
+  } finally {
+    rpcBg.dispose();
+  }
+
+  // Part B: Mounted SidePanelApp.vue owner stats capsule behavior
+  const SidePanelApp = await loadSidePanelSfc("../src/extension/SidePanelApp.vue");
+  const prevChrome = globalThis.chrome;
+
+  async function mountScenario({ token = "", apiBaseUrl } = {}) {
+    const fetchUrls = [];
+    const tabCreateCalls = [];
+    const store = storage.createExtensionStorage({
+      local: storage.createMemoryStorageArea(),
+      session: storage.createMemoryStorageArea(),
+    });
+    const patch = {};
+    if (token) patch.bearerToken = token;
+    if (apiBaseUrl) patch.apiBaseUrl = apiBaseUrl;
+    if (Object.keys(patch).length > 0) {
+      await store.updateSettings(patch);
+    }
+
+    const env = createMockMv3Environment();
+    env.chrome.tabs.create = async (props) => {
+      tabCreateCalls.push(props);
+      return { id: 201 };
+    };
+    env.chrome.tabs.update = async () => ({});
+
+    const bg = backgroundMod.createBackgroundController({
+      chrome: env.chrome,
+      storage: store,
+      fetchImpl: async (url, init) => {
+        fetchUrls.push(String(url));
+        if (
+          String(url).includes("/api/stats") &&
+          init?.headers?.Authorization === `Bearer ${token}` &&
+          token.startsWith("owner-")
+        ) {
+          return new Response(
+            JSON.stringify({ schema_version: "1.0", code: "OK", data: sampleStats }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "INVALID_INPUT",
+            error: { code: "UNAUTHORIZED", message: "forbidden" },
+          }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    await bg.init();
+    globalThis.chrome = env.chrome;
+
+    const view = mountSfcTree(SidePanelApp);
+    await new Promise((r) => setTimeout(r, 40));
+    await view.flush();
+
+    return {
+      view,
+      fetchUrls,
+      tabCreateCalls,
+      findByTestId: (id) =>
+        view.findAll((n) => n.props?.["data-testid"] === id),
+      cleanup() {
+        view.unmount();
+        bg.dispose();
+      },
+    };
+  }
+
+  try {
+    // 1) Anonymous mode -> zero /api/stats fetch, pill hidden, zero alerts/toasts
+    const anon = await mountScenario({ token: "" });
+    try {
+      assert.equal(anon.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        anon.fetchUrls.some((u) => u.includes("/api/stats")),
+        false,
+        "anonymous SidePanel must never request /api/stats",
+      );
+      assert.equal(
+        anon.view.findAll((n) => n.props?.role === "alert").length,
+        0,
+      );
+      assert.equal(
+        anon.view.findAll((n) => n.props?.role === "status").length,
+        0,
+      );
+    } finally {
+      anon.cleanup();
+    }
+
+    // 2) Friend 401 -> pill hidden silently with zero alert/toast
+    const friend = await mountScenario({ token: "friend-tok-123" });
+    try {
+      assert.equal(friend.findByTestId("owner-stats-pill").length, 0);
+      assert.equal(
+        friend.fetchUrls.some((u) => u.includes("/api/stats")),
+        true,
+      );
+      assert.equal(
+        friend.view.findAll((n) => n.props?.role === "alert").length,
+        0,
+      );
+      assert.equal(
+        friend.view.findAll((n) => n.props?.role === "status").length,
+        0,
+      );
+    } finally {
+      friend.cleanup();
+    }
+
+    // 3) Owner 200 (default production origin) -> renders pill and opens https://snap.dokitool.com/monitor
+    const prodOwner = await mountScenario({ token: "owner-prod-secret-xyz" });
+    try {
+      const pills = prodOwner.findByTestId("owner-stats-pill");
+      assert.equal(pills.length, 1);
+      const pillText = prodOwner.view.textOf(pills[0]);
+      assert.match(pillText, /今日 120 次/);
+      assert.match(pillText, /95\.0%/);
+      assert.match(pillText, /上海 2 节点/);
+      assert.match(pillText, /解析监控大盘/);
+      assert.equal(
+        prodOwner.view.textOf().includes("owner-prod-secret-xyz"),
+        false,
+        "SidePanel DOM must never expose raw bearerToken",
+      );
+
+      const openBtn = prodOwner.findByTestId("open-monitor-dashboard-btn")[0];
+      await prodOwner.view.fire(openBtn, "onClick");
+      assert.deepEqual(prodOwner.tabCreateCalls, [
+        { url: "https://snap.dokitool.com/monitor", active: true },
+      ]);
+      const openedUrl = prodOwner.tabCreateCalls[0].url;
+      assert.equal(openedUrl.includes("owner-prod-secret-xyz"), false);
+      assert.equal(openedUrl.includes("?"), false);
+      assert.equal(openedUrl.includes("#"), false);
+    } finally {
+      prodOwner.cleanup();
+    }
+
+    // 4) Owner 200 (custom loopback apiBaseUrl) -> opens http://127.0.0.1:18080/monitor with zero token in URL
+    const loopbackOwner = await mountScenario({
+      token: "owner-loopback-secret-999",
+      apiBaseUrl: "http://127.0.0.1:18080/",
+    });
+    try {
+      assert.equal(loopbackOwner.findByTestId("owner-stats-pill").length, 1);
+      const openBtn = loopbackOwner.findByTestId("open-monitor-dashboard-btn")[0];
+      await loopbackOwner.view.fire(openBtn, "onClick");
+      assert.deepEqual(loopbackOwner.tabCreateCalls, [
+        { url: "http://127.0.0.1:18080/monitor", active: true },
+      ]);
+      const openedUrl = loopbackOwner.tabCreateCalls[0].url;
+      assert.equal(openedUrl.includes("owner-loopback-secret-999"), false);
+      assert.equal(openedUrl.includes("?"), false);
+      assert.equal(openedUrl.includes("#"), false);
+    } finally {
+      loopbackOwner.cleanup();
+    }
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

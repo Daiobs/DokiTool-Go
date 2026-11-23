@@ -37,6 +37,7 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/zuiyou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/probe"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
@@ -948,6 +949,9 @@ func TestServeStatsWiringYTDLPAndShanghai(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, `"mode":"pull"`) || !strings.Contains(body, `"concurrency_limit":2`) || !strings.Contains(body, `"by_platform":{"douyin":`) || !strings.Contains(body, `"bilibili":`) {
 		t.Fatalf("expected pull shanghai mode, by_platform.{douyin,bilibili}, and ytdlp concurrency_limit=2 in /api/stats, got %s", body)
+	}
+	if !strings.Contains(body, `"generic_slow":{`) || !strings.Contains(body, `"ytdlp_generic":{"enabled":false,`) {
+		t.Fatalf("expected admission.generic_slow and disabled ytdlp_generic in /api/stats, got %s", body)
 	}
 }
 
@@ -2290,9 +2294,9 @@ func TestYTDLPGenericConfigurationAndStartupValidation(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("configureYTDLPFull err=%v, wantErr=%v", err, tc.wantErr)
 			}
-			if (res.engine != nil) != tc.wantEngine || (res.genericAdapter != nil) != tc.wantGenericEnabled {
-				t.Fatalf("engine=%v genericAdapter=%v, want engine=%v generic=%v",
-					res.engine != nil, res.genericAdapter != nil, tc.wantEngine, tc.wantGenericEnabled)
+			if (res.engine != nil) != tc.wantEngine || (res.genericAdapter != nil) != tc.wantGenericEnabled || (res.genericEngine != nil) != tc.wantGenericEnabled {
+				t.Fatalf("engine=%v genericEngine=%v genericAdapter=%v, want engine=%v generic=%v",
+					res.engine != nil, res.genericEngine != nil, res.genericAdapter != nil, tc.wantEngine, tc.wantGenericEnabled)
 			}
 			if c.Has(api.PlatformGeneric) {
 				t.Fatal("catalog must never register internal sentinel PlatformGeneric")
@@ -2305,6 +2309,12 @@ func TestYTDLPGenericConfigurationAndStartupValidation(t *testing.T) {
 			if res.genericAdapter != nil {
 				h.SetGenericAdapter(res.genericAdapter)
 			}
+			if res.engine != nil {
+				h.Stats().SetYTDLPEngine(res.engine)
+			}
+			if res.genericEngine != nil {
+				h.Stats().SetGenericYTDLPEngine(res.genericEngine)
+			}
 			h.Stats().SetRuntimeConfig(api.RuntimeConfigSnapshot{
 				Version:             version,
 				YTDLPEnabled:        res.engine != nil,
@@ -2313,6 +2323,54 @@ func TestYTDLPGenericConfigurationAndStartupValidation(t *testing.T) {
 			snap := h.Stats().Snapshot()
 			if snap.Runtime.YTDLPEnabled != tc.wantEngine || snap.Runtime.YTDLPGenericEnabled != tc.wantGenericEnabled {
 				t.Fatalf("runtime snapshot=%+v, want ytdlp=%v generic=%v", snap.Runtime, tc.wantEngine, tc.wantGenericEnabled)
+			}
+			if snap.YTDLPGeneric.Enabled != tc.wantGenericEnabled {
+				t.Fatalf("ytdlp_generic.enabled=%v, want %v (snap=%+v)", snap.YTDLPGeneric.Enabled, tc.wantGenericEnabled, snap.YTDLPGeneric)
+			}
+			if tc.wantGenericEnabled {
+				if snap.YTDLPGeneric.ConcurrencyLimit != 3 || snap.YTDLP.ConcurrencyLimit != 2 {
+					t.Fatalf("unexpected concurrency limits: ytdlp_generic=%d ytdlp=%d, want 3/2", snap.YTDLPGeneric.ConcurrencyLimit, snap.YTDLP.ConcurrencyLimit)
+				}
+			} else if snap.YTDLPGeneric.ConcurrencyLimit != 0 {
+				t.Fatalf("expected zero ytdlp_generic.concurrency_limit when disabled, got %d", snap.YTDLPGeneric.ConcurrencyLimit)
+			}
+
+			admCfg, err := api.LoadAdmissionConfig(func(k string) string { return tc.env[k] })
+			if err != nil {
+				t.Fatalf("LoadAdmissionConfig failed: %v", err)
+			}
+			ownerTok := randomHexToken(t, 24)
+			auth, err := api.NewOwnerAuth(ownerTok)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, err := api.WithAdmissionWithOwner(h, nil, "direct", "", admCfg, auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/stats?schema_version=1.0", nil)
+			req.RemoteAddr = "127.0.0.1:40200"
+			req.Header.Set("Authorization", "Bearer "+ownerTok)
+			rec := httptest.NewRecorder()
+			entry.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET /api/stats status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var statsEnv struct {
+				Data api.StatsSnapshot `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &statsEnv); err != nil {
+				t.Fatalf("unmarshal /api/stats: %v", err)
+			}
+			wantGenAdmLimit := ytgeneric.DefaultGenericConcurrency
+			if tc.wantGenericEnabled {
+				wantGenAdmLimit = 3
+			}
+			if statsEnv.Data.Admission.GenericSlow.ConcurrencyLimit != wantGenAdmLimit {
+				t.Fatalf("admission.generic_slow.concurrency_limit=%d, want %d", statsEnv.Data.Admission.GenericSlow.ConcurrencyLimit, wantGenAdmLimit)
+			}
+			if statsEnv.Data.YTDLPGeneric.Enabled != tc.wantGenericEnabled {
+				t.Fatalf("HTTP ytdlp_generic.enabled=%v, want %v", statsEnv.Data.YTDLPGeneric.Enabled, tc.wantGenericEnabled)
 			}
 		})
 	}

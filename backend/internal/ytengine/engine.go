@@ -92,6 +92,7 @@ type Engine struct {
 	envPath             string
 	gatePorts           *gatePortPool
 	slotStats           *slotStats
+	subSlotStats        *slotStats
 	extractors          []string
 }
 
@@ -465,7 +466,8 @@ func normalizeExtractors(raw []string) []string {
 // semaphore and fresh slotStats so generic traffic never contends with Tier-1.
 // When gatePorts is non-nil (fixed DOKITOOL_YTDLP_GATE_PORTS), the copy retains
 // the shared semaphore and port pool so total listeners never exceed configured
-// fixed ports, and attaches a dedicated subSem capped at min(limit, cap(e.sem)).
+// fixed ports, and attaches a dedicated subSem with fresh subSlotStats capped
+// at min(limit, cap(e.sem)).
 func (e *Engine) WithGenericConcurrency(limit int) *Engine {
 	if e == nil {
 		return NewDisabled("yt-dlp engine is nil")
@@ -481,6 +483,7 @@ func (e *Engine) WithGenericConcurrency(limit int) *Engine {
 		cp.sem = make(chan struct{}, limit)
 		cp.subSem = nil
 		cp.slotStats = newSlotStats()
+		cp.subSlotStats = nil
 		return &cp
 	}
 	subLimit := limit
@@ -488,6 +491,7 @@ func (e *Engine) WithGenericConcurrency(limit int) *Engine {
 		subLimit = cap(e.sem)
 	}
 	cp.subSem = make(chan struct{}, subLimit)
+	cp.subSlotStats = newSlotStats()
 	return &cp
 }
 

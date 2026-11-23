@@ -74,7 +74,10 @@ import {
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
 } from "./protocol";
-import { normalizeExtensionThemeMode } from "./storage";
+import {
+  DEFAULT_EXTENSION_SETTINGS,
+  normalizeExtensionThemeMode,
+} from "./storage";
 import { PLATFORM_DOMAIN_SPECS } from "./urlMatcher";
 
 export const MAX_EXTENSION_ZIP_BYTES = 500 * 1024 * 1024;
@@ -482,45 +485,87 @@ export function openSafeHttpTab(rawUrl: string): boolean {
 }
 
 /**
- * Opens the built-in Owner Parse Monitor Dashboard (`monitor.html`) in a browser tab.
- * Reuses an already-open tab for the same extension page URL when `chrome.tabs.query`
- * and `chrome.tabs.update` are available; otherwise opens a new tab via `chrome.tabs.create`.
- * Safe no-op (`false`) outside a Chrome extension runtime.
+ * Opens the Web Owner Parse Monitor Dashboard (`${apiOrigin}/monitor`) in a browser tab.
+ * Validates `apiBaseUrl` (defaulting to `DEFAULT_EXTENSION_SETTINGS.apiBaseUrl`), NEVER
+ * appends query params, `#hash`, or any Bearer token, and reuses an already-open
+ * `/monitor` or `/monitor.html` tab for the same origin when `chrome.tabs.query` and
+ * `chrome.tabs.update` are available; otherwise opens a new tab via `chrome.tabs.create`.
+ * Safe no-op (`false`) on invalid URLs or outside a Chrome extension runtime.
  */
-export async function openMonitorDashboardTab(): Promise<boolean> {
-  const { runtime, tabs, windows } = getChromeNamespace();
-  if (!runtime?.getURL) {
+export async function openMonitorDashboardTab(
+  apiBaseUrl?: string,
+): Promise<boolean> {
+  const validated = validateApiBaseUrl(
+    apiBaseUrl || DEFAULT_EXTENSION_SETTINGS.apiBaseUrl,
+  );
+  if (!validated.ok) {
     return false;
   }
-  let monitorUrl = "";
-  try {
-    monitorUrl = runtime.getURL("monitor.html");
-  } catch {
-    return false;
-  }
-  if (!monitorUrl) return false;
+
+  const monitorUrl = `${validated.origin}/monitor`;
+  const monitorHtmlUrl = `${validated.origin}/monitor.html`;
+  const { tabs, windows } = getChromeNamespace();
+
+  const findMatchingTab = (
+    candidates: unknown,
+    requireExplicitUrl: boolean,
+  ): ChromeTabRecordLike | undefined => {
+    if (!Array.isArray(candidates)) return undefined;
+    return candidates.find((tab) => {
+      if (typeof tab?.id !== "number" || !Number.isInteger(tab.id)) {
+        return false;
+      }
+      if (typeof tab.url !== "string" || !tab.url) {
+        return !requireExplicitUrl;
+      }
+      return (
+        tab.url === monitorUrl ||
+        tab.url === `${monitorUrl}/` ||
+        tab.url === monitorHtmlUrl
+      );
+    });
+  };
+
+  const activateTab = async (existing: ChromeTabRecordLike): Promise<boolean> => {
+    if (typeof existing.id !== "number" || !tabs?.update) return false;
+    await tabs.update(existing.id, { active: true });
+    if (typeof existing.windowId === "number" && windows?.update) {
+      try {
+        await windows.update(existing.windowId, { focused: true });
+      } catch {
+        // Best-effort window focus
+      }
+    }
+    return true;
+  };
 
   if (tabs?.query && tabs?.update) {
     try {
-      const existingTabs = await tabs.query({ url: monitorUrl });
-      const existing = Array.isArray(existingTabs)
-        ? existingTabs.find(
-            (tab) => typeof tab?.id === "number" && Number.isInteger(tab.id),
-          )
-        : undefined;
-      if (existing && typeof existing.id === "number") {
-        await tabs.update(existing.id, { active: true });
-        if (typeof existing.windowId === "number" && windows?.update) {
-          try {
-            await windows.update(existing.windowId, { focused: true });
-          } catch {
-            // Best-effort window focus
-          }
-        }
-        return true;
+      const existingTabs = await tabs.query({
+        url: [monitorUrl, monitorHtmlUrl],
+      });
+      const existing = findMatchingTab(existingTabs, false);
+      if (existing) {
+        return await activateTab(existing);
       }
     } catch {
-      // Fall through to tabs.create
+      // Chrome MV3 match patterns forbid explicit ports (e.g. http://127.0.0.1:18080).
+      // Retry with portless host patterns and strictly filter by exact tab.url.
+      try {
+        const parsedOrigin = new URL(validated.origin);
+        if (parsedOrigin.port !== "") {
+          const portlessOrigin = `${parsedOrigin.protocol}//${parsedOrigin.hostname}`;
+          const fallbackTabs = await tabs.query({
+            url: [`${portlessOrigin}/monitor`, `${portlessOrigin}/monitor.html`],
+          });
+          const existing = findMatchingTab(fallbackTabs, true);
+          if (existing) {
+            return await activateTab(existing);
+          }
+        }
+      } catch {
+        // Fall through to tabs.create
+      }
     }
   }
 

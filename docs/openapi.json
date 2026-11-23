@@ -2469,6 +2469,7 @@
         "required": [
           "fast",
           "slow",
+          "generic_slow",
           "owner"
         ],
         "properties": {
@@ -2476,6 +2477,9 @@
             "$ref": "#/components/schemas/AdmissionPoolSnapshot"
           },
           "slow": {
+            "$ref": "#/components/schemas/AdmissionPoolSnapshot"
+          },
+          "generic_slow": {
             "$ref": "#/components/schemas/AdmissionPoolSnapshot"
           },
           "owner": {
@@ -2673,7 +2677,7 @@
           "concurrency_limit": {
             "type": "integer",
             "minimum": 0,
-            "description": "Configured DOKITOOL_YTDLP_CONCURRENCY limit."
+            "description": "Configured yt-dlp subprocess concurrency limit (DOKITOOL_YTDLP_CONCURRENCY or DOKITOOL_YTDLP_GENERIC_CONCURRENCY)."
           },
           "total": {
             "$ref": "#/components/schemas/YTDLPChannelSlotStats"
@@ -3244,6 +3248,7 @@
           "cache",
           "admission",
           "ytdlp",
+          "ytdlp_generic",
           "shanghai",
           "parse_latency_ms",
           "api_keys",
@@ -3275,6 +3280,9 @@
             "$ref": "#/components/schemas/AdmissionStatsSnapshot"
           },
           "ytdlp": {
+            "$ref": "#/components/schemas/YTDLPStatsSnapshot"
+          },
+          "ytdlp_generic": {
             "$ref": "#/components/schemas/YTDLPStatsSnapshot"
           },
           "shanghai": {

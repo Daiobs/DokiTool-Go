@@ -841,7 +841,6 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
       "manifest.json",
       "background.js",
       "sidepanel.html",
-      "monitor.html",
       "offscreen.html",
       "icons/icon-16.png",
       "icons/icon-32.png",
@@ -855,21 +854,32 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
       );
     }
 
-    // Verify mediabunny library is strictly isolated to offscreen (0 occurrences in background, sidepanel, monitor)
+    assert.equal(
+      existsSync(join(prodOut, "monitor.html")),
+      false,
+      "duplicate monitor.html must NOT be emitted into dist-extension",
+    );
+
+    // Verify duplicate monitor bundles are absent and mediabunny library is strictly
+    // isolated to offscreen (0 occurrences in background.js and all non-offscreen JS)
     const assetEntries = await readdir(join(prodOut, "assets"));
     const sidepanelBundles = assetEntries.filter((f) =>
       /^sidepanel-.*\.js$/.test(f),
     );
     const monitorBundles = assetEntries.filter((f) =>
-      /^monitor-.*\.js$/.test(f),
+      /^monitor-.*\.js$/i.test(f),
     );
     assert.ok(sidepanelBundles.length > 0, "expected assets/sidepanel-*.js");
-    assert.ok(monitorBundles.length > 0, "expected assets/monitor-*.js");
-    for (const rel of [
+    assert.equal(
+      monitorBundles.length,
+      0,
+      "duplicate assets/monitor-*.js must NOT be emitted into dist-extension",
+    );
+    const strictEntryFiles = [
       "background.js",
       ...sidepanelBundles.map((f) => `assets/${f}`),
-      ...monitorBundles.map((f) => `assets/${f}`),
-    ]) {
+    ];
+    for (const rel of strictEntryFiles) {
       const code = await readFile(join(prodOut, rel), "utf8");
       assert.equal(
         /\bMp4OutputFormat\b/.test(code),
@@ -877,7 +887,20 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
         `${rel} must not contain Mp4OutputFormat`,
       );
       assert.equal(
-        /MediabunnyVideoHandler|mediabunny loaded|Mediabunny Codec Registry/.test(
+        /MediabunnyVideoHandler|MediabunnySoundHandler|mediabunny loaded|Mediabunny Codec Registry/.test(
+          code,
+        ),
+        false,
+        `${rel} must not bundle Mediabunny library`,
+      );
+    }
+    const nonOffscreenAssetJs = assetEntries.filter(
+      (f) => f.endsWith(".js") && !/^offscreen-.*\.js$/i.test(f),
+    );
+    for (const rel of nonOffscreenAssetJs.map((f) => `assets/${f}`)) {
+      const code = await readFile(join(prodOut, rel), "utf8");
+      assert.equal(
+        /MediabunnyVideoHandler|MediabunnySoundHandler|mediabunny loaded|Mediabunny Codec Registry/.test(
           code,
         ),
         false,
@@ -952,19 +975,49 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
     );
     await writeFile(sidepanelHtmlPath, origSidepanelHtml, "utf8");
 
-    // Tampering monitor bundle with Mp4OutputFormat MUST fail verifyExtensionDist mediabunny isolation gate
-    const firstMonitorBundlePath = join(prodOut, "assets", monitorBundles[0]);
-    const origMonitorJs = await readFile(firstMonitorBundlePath, "utf8");
+    // Tampering sidepanel bundle or background.js with Mp4OutputFormat MUST fail verifyExtensionDist mediabunny isolation gate
+    const firstSidepanelBundlePath = join(prodOut, "assets", sidepanelBundles[0]);
+    const origSidepanelJs = await readFile(firstSidepanelBundlePath, "utf8");
     await writeFile(
-      firstMonitorBundlePath,
-      `${origMonitorJs}\n/* Mp4OutputFormat */\n`,
+      firstSidepanelBundlePath,
+      `${origSidepanelJs}\n/* Mp4OutputFormat */\n`,
       "utf8",
     );
     await assert.rejects(
       () => verifyExtensionDist(prodOut, { devLoopback: false }),
       /Mediabunny isolation violation/,
     );
-    await writeFile(firstMonitorBundlePath, origMonitorJs, "utf8");
+    await writeFile(firstSidepanelBundlePath, origSidepanelJs, "utf8");
+
+    const backgroundJsPath = join(prodOut, "background.js");
+    const origBackgroundJs = await readFile(backgroundJsPath, "utf8");
+    await writeFile(
+      backgroundJsPath,
+      `${origBackgroundJs}\n/* Mp4OutputFormat */\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /Mediabunny isolation violation/,
+    );
+    await writeFile(backgroundJsPath, origBackgroundJs, "utf8");
+
+    // Re-introducing duplicate monitor.html or assets/monitor-*.js MUST fail verifyExtensionDist
+    const strayMonitorHtml = join(prodOut, "monitor.html");
+    await writeFile(strayMonitorHtml, "<!doctype html><html></html>\n", "utf8");
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /Forbidden duplicate monitor\.html/,
+    );
+    await rm(strayMonitorHtml, { force: true });
+
+    const strayMonitorJs = join(prodOut, "assets", "monitor-deadbeef.js");
+    await writeFile(strayMonitorJs, "console.log('monitor');\n", "utf8");
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /Forbidden duplicate monitor bundle/,
+    );
+    await rm(strayMonitorJs, { force: true });
   } finally {
     await rm(prodOut, { recursive: true, force: true });
     await rm(devOut, { recursive: true, force: true });
@@ -1029,7 +1082,18 @@ test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-fo
     assert.ok(parsedZip.files["manifest.json"], "manifest.json must sit directly at ZIP root");
     assert.ok(parsedZip.files["background.js"], "background.js must sit directly at ZIP root");
     assert.ok(parsedZip.files["sidepanel.html"], "sidepanel.html must sit directly at ZIP root");
-    assert.ok(parsedZip.files["monitor.html"], "monitor.html must sit directly at ZIP root");
+    assert.equal(
+      parsedZip.files["monitor.html"],
+      undefined,
+      "duplicate monitor.html must NOT exist in extension ZIP",
+    );
+    assert.equal(
+      Object.keys(parsedZip.files).some((name) =>
+        /^assets\/monitor-.*\.js$/i.test(name),
+      ),
+      false,
+      "duplicate assets/monitor-*.js must NOT exist in extension ZIP",
+    );
     assert.ok(parsedZip.files["offscreen.html"], "offscreen.html must sit directly at ZIP root");
     assert.ok(parsedZip.files["icons/icon-128.png"], "icons/icon-128.png must sit at root icons/");
 
@@ -1090,6 +1154,40 @@ test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-fo
     await assert.rejects(
       () => verifyExtensionZip(badManifestZipPath),
       /127\.0\.0\.1|localhost/,
+    );
+
+    // 6. verifyExtensionZip rejects a ZIP containing stray monitor.html or assets/monitor-*.js
+    const baseZipEntries = [];
+    for (const [name, entry] of Object.entries(parsedZip.files)) {
+      baseZipEntries.push({
+        path: name,
+        data: await entry.async("nodebuffer"),
+      });
+    }
+    const strayMonitorHtmlZip = join(tmpBase, "stray-monitor-html.zip");
+    await writeFile(
+      strayMonitorHtmlZip,
+      createDeterministicZipBuffer([
+        ...baseZipEntries,
+        { path: "monitor.html", data: "<!doctype html><html></html>\n" },
+      ]),
+    );
+    await assert.rejects(
+      () => verifyExtensionZip(strayMonitorHtmlZip),
+      /Forbidden duplicate monitor\.html/,
+    );
+
+    const strayMonitorJsZip = join(tmpBase, "stray-monitor-js.zip");
+    await writeFile(
+      strayMonitorJsZip,
+      createDeterministicZipBuffer([
+        ...baseZipEntries,
+        { path: "assets/monitor-deadbeef.js", data: "console.log('monitor');\n" },
+      ]),
+    );
+    await assert.rejects(
+      () => verifyExtensionZip(strayMonitorJsZip),
+      /Forbidden duplicate monitor bundle/,
     );
   } finally {
     await rm(tmpBase, { recursive: true, force: true });
@@ -1628,5 +1726,89 @@ test("PR-C security static gate: zero v-html / innerHTML anywhere in frontend/sr
       false,
       `Forbidden v-html / innerHTML detected in ${file}`,
     );
+  }
+});
+
+test("PR-C Round 2 (Task 4.4 #2): isSafeNativeBrowserDownloadUrl explicit default-port and mismatched-port enforcement", () => {
+  // Explicit scheme-matching default ports normalize cleanly and MUST pass
+  for (const safePortUrl of [
+    "https://cdn.vimeo.com:443/v.mp4",
+    "http://cdn.vimeo.com:80/v.mp4",
+  ]) {
+    const res = hostWhitelist.isSafeNativeBrowserDownloadUrl(safePortUrl);
+    assert.equal(
+      res.safe,
+      true,
+      `expected safe default-port URL ${safePortUrl} (reason: ${res.reason})`,
+    );
+  }
+
+  // Non-standard or scheme-mismatched ports MUST be rejected
+  for (const unsafePortUrl of [
+    "https://cdn.vimeo.com:8443/v.mp4",
+    "http://cdn.vimeo.com:443/v.mp4",
+    "https://cdn.vimeo.com:80/v.mp4",
+  ]) {
+    const res = hostWhitelist.isSafeNativeBrowserDownloadUrl(unsafePortUrl);
+    assert.equal(
+      res.safe,
+      false,
+      `expected rejected port URL ${unsafePortUrl}`,
+    );
+  }
+});
+
+test("PR-C Round 2 (Task 4.4 #3): reserved TLD suffixes (.invalid/.lan/.corp/.intranet/.private) blocked across hostWhitelist and urlMatcher while keeping .test/.example allowed", () => {
+  const reservedSubdomainHosts = [
+    "app.invalid",
+    "nas.lan",
+    "git.corp",
+    "portal.intranet",
+    "vault.private",
+  ];
+  const reservedBareHosts = [
+    "invalid",
+    "lan",
+    "corp",
+    "intranet",
+    "private",
+  ];
+
+  for (const host of [...reservedSubdomainHosts, ...reservedBareHosts]) {
+    assert.equal(
+      hostWhitelist.isSafeNativeBrowserDownloadUrl(`https://${host}/v.mp4`).safe,
+      false,
+      `isSafeNativeBrowserDownloadUrl must reject reserved host ${host}`,
+    );
+    assert.equal(
+      hostWhitelist.validateApiBaseUrl(`https://${host}`).ok,
+      false,
+      `validateApiBaseUrl must reject reserved host ${host}`,
+    );
+    assert.equal(
+      urlMatcher.matchActiveParseUrl(`https://${host}/video/123`),
+      null,
+      `matchActiveParseUrl must reject reserved host ${host}`,
+    );
+  }
+
+  // RFC 2606 .test and .example MUST remain allowed for test/fixture compatibility
+  for (const allowedHost of ["media.site.test", "media.site.example"]) {
+    assert.equal(
+      hostWhitelist.isSafeNativeBrowserDownloadUrl(`https://${allowedHost}/v.mp4`).safe,
+      true,
+      `isSafeNativeBrowserDownloadUrl must keep ${allowedHost} allowed`,
+    );
+    assert.equal(
+      hostWhitelist.validateApiBaseUrl(`https://${allowedHost}`).ok,
+      true,
+      `validateApiBaseUrl must keep ${allowedHost} allowed`,
+    );
+    const matched = urlMatcher.matchActiveParseUrl(`https://${allowedHost}/video/123`);
+    assert.ok(
+      matched,
+      `matchActiveParseUrl must keep ${allowedHost} allowed`,
+    );
+    assert.equal(matched.platform, "generic");
   }
 });

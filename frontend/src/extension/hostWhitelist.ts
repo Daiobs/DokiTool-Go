@@ -292,20 +292,28 @@ function isIpv4Literal(host: string): boolean {
   return false;
 }
 
+const RESERVED_HOST_LABELS = [
+  "localhost",
+  "local",
+  "internal",
+  "localdomain",
+  "home.arpa",
+  "invalid",
+  "lan",
+  "corp",
+  "intranet",
+  "private",
+] as const;
+
 function isPrivateOrReservedHost(host: string): boolean {
   if (!host) return true;
   if (host.startsWith("[") || host.includes(":")) {
     return true; // Reject all IPv6 literals
   }
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    host.endsWith(".localdomain") ||
-    host.endsWith(".home.arpa")
-  ) {
-    return true;
+  for (const label of RESERVED_HOST_LABELS) {
+    if (host === label || host.endsWith(`.${label}`)) {
+      return true;
+    }
   }
   if (isIpv4Literal(host)) {
     return true;
