@@ -9,6 +9,7 @@ defineProps({
   alignDetails: Boolean,
   locale: String,
   platform: String,
+  disableVideoPreload: Boolean,
   currentItem: Object,
   activeVariant: Object,
   activeVideoUrl: String,
@@ -82,7 +83,7 @@ const emit = defineEmits([
         :key="playerKey"
         :data-playback-key="playerKey"
         :src="activeVideoUrl"
-        :preload="platform === 'youtube' ? 'none' : undefined"
+        :preload="disableVideoPreload ? 'none' : undefined"
         controls
         class="rs-music-player"
         @error="emit('playback-error', $event)"
@@ -93,7 +94,7 @@ const emit = defineEmits([
         :key="playerKey"
         :data-playback-key="playerKey"
         :src="activeVideoUrl || undefined"
-        :preload="platform === 'youtube' ? 'none' : undefined"
+        :preload="disableVideoPreload ? 'none' : undefined"
         controls
         referrerpolicy="no-referrer"
         class="rs-video"
@@ -435,7 +436,9 @@ const emit = defineEmits([
   transform: none;
 }
 .rs-btn--primary {
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35), 0 1px 3px rgba(0, 0, 0, 0.1);
 }
@@ -445,7 +448,9 @@ const emit = defineEmits([
     0 2px 6px rgba(0, 0, 0, 0.12);
 }
 .rs-btn--accent {
-  background: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+  background-color: #9333ea;
+  background-image: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   box-shadow: 0 4px 16px rgba(168, 85, 247, 0.35), 0 1px 3px rgba(0, 0, 0, 0.1);
 }

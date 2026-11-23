@@ -390,7 +390,8 @@ body {
 }
 
 .sp-btn--primary {
-  background: linear-gradient(
+  background-color: #4f46e5;
+  background-image: linear-gradient(
     135deg,
     var(--sp-accent-start) 0%,
     var(--sp-accent-mid) 52%,
@@ -399,6 +400,16 @@ body {
   color: #ffffff;
   border-color: var(--sp-btn-primary-border);
   box-shadow: var(--sp-accent-glow);
+}
+
+@media (forced-colors: active) {
+  .sp-btn--primary {
+    forced-color-adjust: auto;
+    background-image: none;
+    background-color: Highlight;
+    color: HighlightText;
+    border: 1px solid ButtonText;
+  }
 }
 
 .sp-btn--primary:hover:not(:disabled) {

@@ -1,4 +1,12 @@
 import { confirmedFormatMime, extensionsFor } from "../../downloads/file";
+import {
+  canAttemptSignedDirectAttachment,
+  inferDirectVideoExtension,
+  isCorsBlockedDirectUrl,
+  isExtensionlessDirectMp4Url,
+  resolveAdaptiveQualityFilenameTag,
+  resolvePreferredMediaTitle,
+} from "../../core/media";
 import type {
   DownloadTask,
   MediaItem,
@@ -58,6 +66,7 @@ export interface ItemSnapshot {
   version: number;
   selectionKey: string;
   platform?: string;
+  hasClientHelper?: boolean;
   isAttachment?: boolean;
   resource?: {
     id: string;
@@ -142,111 +151,25 @@ export function triggerBrowserDownload(
 }
 
 export function isToutiaovodVideoUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
-      return false;
-    }
-    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (!host.endsWith(".toutiaovod.com") || host === ".toutiaovod.com") {
-      return false;
-    }
-    return parsed.pathname.length > 1;
-  } catch {
-    return false;
-  }
+  return isExtensionlessDirectMp4Url(rawUrl);
 }
 
 export function inferredVideoFileExtension(
   rawUrl: string,
-  platform?: string,
+  _platform?: string,
   hasTbvideo = false,
 ): string | undefined {
-  try {
-    const parsed = new URL(rawUrl);
-    const queryMime = (parsed.searchParams.get("mime_type") || "")
-      .trim()
-      .toLowerCase();
-    if (queryMime === "video_mp4" || queryMime === "video/mp4") {
-      return "mp4";
-    }
-    if (queryMime === "video_webm" || queryMime === "video/webm") {
-      return "webm";
-    }
-    if (queryMime === "video_quicktime" || queryMime === "video/quicktime") {
-      return "mov";
-    }
-    if (queryMime) {
-      return undefined;
-    }
-    const pathLower = parsed.pathname.toLowerCase();
-    const pathExtMatch = /\.([a-z0-9]{2,5})$/.exec(pathLower);
-    if (pathExtMatch) {
-      const pathExt = pathExtMatch[1];
-      if (pathExt === "mp4" || pathExt === "m4v") return "mp4";
-      if (pathExt === "webm" || pathExt === "mov" || pathExt === "mkv") {
-        return pathExt;
-      }
-      return undefined;
-    }
-    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (isToutiaovodVideoUrl(rawUrl)) {
-      return "mp4";
-    }
-    if (
-      hasTbvideo ||
-      ((platform === "zuiyou" || platform === "pipigx") &&
-        (host === "web-v01.izuiyou.com" ||
-          host === "tbvideo.ixiaochuan.cn" ||
-          host === "video01.szsttkj.com" ||
-          host === "video03.szsttkj.com" ||
-          host === "xlal-ppvideo.szsttkj.com"))
-    ) {
-      return "mp4";
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
+  return inferDirectVideoExtension(rawUrl, hasTbvideo);
 }
 
 export function isCorsBlockedDirectCdn(rawUrl: string): boolean {
-  if (isToutiaovodVideoUrl(rawUrl)) {
-    return true;
-  }
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase();
-    return host === "googlevideo.com" || host.endsWith(".googlevideo.com");
-  } catch {
-    return false;
-  }
+  return isCorsBlockedDirectUrl(rawUrl);
 }
 
 // URL parameters only indicate that a direct attachment attempt can be made;
 // they never prove that the actual upstream HTTP response is a verified attachment.
 export function canAttemptDirectAttachment(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase();
-    if (host !== "googlevideo.com" && !host.endsWith(".googlevideo.com")) {
-      return false;
-    }
-    if (parsed.pathname.replace(/\/+$/, "") !== "/videoplayback") {
-      return false;
-    }
-    const itag = parsed.searchParams.get("itag")?.trim() ?? "";
-    const title = parsed.searchParams.get("title")?.trim() ?? "";
-    if (itag !== "18" || !title) {
-      return false;
-    }
-    const sparams = (parsed.searchParams.get("sparams") ?? "")
-      .split(",")
-      .map((s) => s.trim().toLowerCase());
-    return !sparams.includes("title");
-  } catch {
-    return false;
-  }
+  return canAttemptSignedDirectAttachment(rawUrl);
 }
 
 export function formatYouTubeSavePathLabel(mode?: string): string | undefined {
@@ -393,7 +316,7 @@ export function createTransferMonitor(
   };
 }
 
-export function resolveYouTubeTrackSuffix(
+export function resolveAdaptiveTrackSuffix(
   snapshot: ItemSnapshot,
   variant?: {
     label?: string;
@@ -407,29 +330,14 @@ export function resolveYouTubeTrackSuffix(
   },
   ext?: string,
 ): string | undefined {
-  if (snapshot.platform !== "youtube") return undefined;
-  const mime = String(variant?.metadata?.mime_type || "").toLowerCase();
-  if (
-    snapshot.item.type === "audio" ||
-    ext === "m4a" ||
-    mime.startsWith("audio/") ||
-    (variant?.metadata?.has_audio === true &&
-      !variant?.metadata?.video_codec &&
-      !variant?.metadata?.width &&
-      !variant?.metadata?.height)
-  ) {
-    return "audio";
-  }
-  const w = Number(variant?.metadata?.width);
-  const h = Number(variant?.metadata?.height);
-  if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
-    return `${Math.min(w, h)}p`;
-  }
-  const labelMatch = String(variant?.label || "").match(/(\d{3,4}p)/i);
-  if (labelMatch) {
-    return labelMatch[1].toLowerCase();
-  }
-  return undefined;
+  return resolveAdaptiveQualityFilenameTag({
+    enabled: Boolean(
+      snapshot.hasClientHelper || variant?.metadata?.has_audio === false,
+    ),
+    itemType: snapshot.item.type,
+    extension: ext,
+    variant,
+  });
 }
 
 export const filenameFor = (
@@ -446,40 +354,28 @@ export const filenameFor = (
     };
   },
 ): string => {
-  const workTitle = (snapshot.title ?? "").trim();
-  const itemTitle = (snapshot.item.title ?? "").trim();
-  const authorName = (snapshot.author ?? "").trim();
   const platformFallback =
     snapshot.platform && snapshot.contentId
       ? `${snapshot.platform}_${snapshot.contentId}`
       : "";
   const isSingleItem = snapshot.total <= 1;
-
-  let rawTitle: string;
-  if (snapshot.platform === "youtube" && snapshot.item.type === "audio") {
-    rawTitle =
-      workTitle ||
-      itemTitle.replace(/\s*\((?:M4A|WEBM)[^)]*\)$/i, "") ||
-      authorName ||
-      platformFallback;
-  } else if (isSingleItem) {
-    // Single-item works (e.g. Bilibili single-P): prioritize main work title `media.title`
-    // over single-P `item.title` (preventing raw `mmexport*.mp4` filename pollution).
-    rawTitle =
-      (snapshot.isAttachment && itemTitle ? itemTitle : "") ||
-      workTitle ||
-      itemTitle ||
-      authorName ||
-      platformFallback;
-  } else {
-    rawTitle = itemTitle || workTitle || authorName || platformFallback;
-  }
+  const rawTitle = resolvePreferredMediaTitle({
+    isSingleItem,
+    isAttachment: snapshot.isAttachment,
+    isStandaloneAudioItem: Boolean(
+      snapshot.hasClientHelper && snapshot.item.type === "audio",
+    ),
+    workTitle: snapshot.title,
+    itemTitle: snapshot.item.title,
+    authorName: snapshot.author,
+    fallback: platformFallback,
+  });
 
   return buildMediaFilename({
     title: rawTitle,
     index: isSingleItem ? undefined : snapshot.item.index,
     total: snapshot.total,
-    suffix: resolveYouTubeTrackSuffix(snapshot, variant, extension),
+    suffix: resolveAdaptiveTrackSuffix(snapshot, variant, extension),
     fallback: platformFallback || snapshot.item.id,
     extension,
   });
@@ -558,6 +454,10 @@ export function createSnapshotHelpers(deps: {
       contentId: videoStore.resultData?.content_id,
       total: videoStore.resultData?.items?.length ?? 1,
       platform: videoStore.resultData?.platform,
+      hasClientHelper: Boolean(
+        (videoStore.resultData?.extra as Record<string, unknown> | undefined)
+          ?.youtube_helper,
+      ),
       version: videoStore.resultVersion,
     });
   };

@@ -12,7 +12,14 @@ import {
   getDownloadTarget,
   sourceUrl,
 } from "../utils/mediaContract";
-import { extractDashMuxSpec } from "../extension/dashMuxSpec";
+import {
+  isAudioOnlyVariant,
+  isSplitSilentVideoVariant,
+  isTbvideoVideoItem,
+  resolveEffectiveDefaultVariant,
+  resolveWhitelistedExtensionMuxSpec,
+  shouldAutoUpgradeDefaultVariant,
+} from "../core/media";
 import {
   variantLabel,
   groupVariantsForDisplay,
@@ -28,8 +35,8 @@ import {
   formatHeaderReadyTitle,
   buildPlayerQualityTagText,
   resolvePrimaryDownloadCtaLabel,
-  extractBilibiliDashMuxVariants,
-  summarizeBilibiliDashMuxVariants,
+  extractMuxVariants,
+  summarizeMuxTiers,
 } from "./result/resultPresentation";
 
 const props = defineProps({
@@ -87,17 +94,13 @@ const markImageBroken = (raw) => {
 
 const currentItem = computed(() => props.selection?.currentVideo.value || null);
 const target = computed(() => props.selection?.currentTarget.value || null);
-const isBilibili = computed(() => props.resultData?.platform === "bilibili");
-const bilibiliDashMuxVariants = computed(() =>
-  extractBilibiliDashMuxVariants(props.resultData?.platform, currentItem.value),
+const muxVariants = computed(() =>
+  extractMuxVariants(currentItem.value, context),
 );
-const bilibiliDashSummary = computed(() =>
-  summarizeBilibiliDashMuxVariants(bilibiliDashMuxVariants.value),
-);
-const youtubeHelper = computed(() =>
-  props.resultData?.platform === "youtube"
-    ? props.resultData?.extra?.youtube_helper || null
-    : null,
+const hasMuxVariants = computed(() => muxVariants.value.length > 0);
+const bilibiliDashSummary = computed(() => summarizeMuxTiers(muxVariants.value));
+const youtubeHelper = computed(
+  () => props.resultData?.extra?.youtube_helper || null,
 );
 const isYouTubeHelperBlocked = computed(
   () =>
@@ -154,7 +157,7 @@ const isActiveExtensionDashMux = computed(() =>
     canExtensionDashMux.value &&
       activeVariant.value &&
       readyVariant(activeVariant.value) &&
-      extractDashMuxSpec(activeVariant.value, context),
+      resolveWhitelistedExtensionMuxSpec(activeVariant.value, context) !== null,
   ),
 );
 const playableFallbackVideoUrl = computed(() => {
@@ -188,16 +191,11 @@ const metadata = computed(() => activeVariant.value?.metadata || {});
 const attachments = computed(() => props.resultData?.attachments || []);
 
 const isYouTubeAudioOnlyVariant = (variant) =>
-  props.resultData?.platform === "youtube" &&
-  variant?.metadata?.has_audio === true &&
-  !variant?.metadata?.video_codec &&
-  !variant?.metadata?.width &&
-  !variant?.metadata?.height;
+  Boolean(youtubeHelper.value) && isAudioOnlyVariant(variant);
 const isActiveYouTubeSplitVideo = computed(
   () =>
-    props.resultData?.platform === "youtube" &&
-    currentItem.value?.type === "video" &&
-    activeVariant.value?.metadata?.has_audio === false,
+    Boolean(youtubeHelper.value) &&
+    isSplitSilentVideoVariant(currentItem.value, activeVariant.value),
 );
 const isActiveYouTubeAudioOnly = computed(() =>
   isYouTubeAudioOnlyVariant(activeVariant.value),
@@ -205,7 +203,6 @@ const isActiveYouTubeAudioOnly = computed(() =>
 const youtubeMuxPairsByVariantId = computed(() => {
   const map = new Map();
   if (
-    props.resultData?.platform !== "youtube" ||
     !isYouTubeHelperReady.value ||
     currentItem.value?.type !== "video" ||
     !readyItem(currentItem.value)
@@ -271,11 +268,10 @@ const activeCollection = computed(
 );
 const selectedCount = computed(() => props.selection?.selectedCount.value || 0);
 const batchZipAvailable = computed(() => {
-  if (!["pipigx", "zuiyou"].includes(props.resultData?.platform)) return true;
   const items = selectedCount.value
     ? props.selection.getBatchVideos()
     : props.selection.list.value;
-  return !items.some((item) => item.type === "video");
+  return !items.some((item) => isTbvideoVideoItem(item));
 });
 const selectedTotal = computed(() => props.selection?.total.value || 0);
 const isResolving = computed(() =>
@@ -288,8 +284,45 @@ const allQualityOptions = computed(() =>
     props.selection?.currentSelection.value,
     target.value,
     context,
-    { allowExtensionDashMux: canExtensionDashMux.value },
+    {
+      allowExtensionDashMux: canExtensionDashMux.value,
+      muxPairsByVariantId: youtubeMuxPairsByVariantId.value,
+    },
   ),
+);
+watch(
+  () => [
+    props.resultVersion,
+    currentItem.value?.id,
+    currentItem.value?.state,
+    readyItem(currentItem.value) ? currentItem.value.variants.length : 0,
+    canExtensionDashMux.value,
+  ],
+  () => {
+    const item = currentItem.value;
+    if (!item || !readyItem(item) || !item.default?.variant_id) return;
+    if (typeof props.selection?.applyAutoChoice !== "function") return;
+    if (props.selection?.hasManualChoice?.(item.id)) return;
+    const options = allQualityOptions.value;
+    const best = resolveEffectiveDefaultVariant(options, null);
+    const defaultOption =
+      options.find((opt) => opt.variant.id === item.default?.variant_id) ||
+      null;
+    if (!shouldAutoUpgradeDefaultVariant(defaultOption, best)) return;
+    const currentVariantId =
+      props.selection?.currentSelection?.value?.variant_id ||
+      item.default.variant_id;
+    if (best && best.variant.id !== currentVariantId) {
+      props.selection.applyAutoChoice(
+        {
+          variant_id: best.variant.id,
+          ...(best.source?.id ? { source_id: best.source.id } : {}),
+        },
+        item.id,
+      );
+    }
+  },
+  { immediate: true },
 );
 const showAllQualityVariants = ref(false);
 const downloadableQualityOptions = computed(() =>
@@ -804,6 +837,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :align-details="hasDetailsBaseline"
           :locale="locale"
           :platform="resultData?.platform"
+          :disable-video-preload="Boolean(youtubeHelper)"
           :current-item="currentItem"
           :active-variant="activeVariant"
           :active-video-url="activeVideoUrl"
@@ -907,7 +941,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         :show-all-quality-variants="showAllQualityVariants"
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
-        :is-bilibili="isBilibili"
+        :is-bilibili="hasMuxVariants"
         :is-multi="Boolean(isMulti)"
         :is-extension-connected="isExtensionConnected"
         :bilibili-dash-summary="bilibiliDashSummary"
@@ -1399,7 +1433,8 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #10b981, #34d399);
+  background-color: #10b981;
+  background-image: linear-gradient(135deg, #10b981, #34d399);
   border-radius: 50%;
   flex-shrink: 0;
   color: #fff;

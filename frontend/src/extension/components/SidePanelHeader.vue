@@ -295,7 +295,8 @@ const authStatus = computed<{
   width: 26px;
   height: 26px;
   border-radius: 8px;
-  background: linear-gradient(
+  background-color: #4f46e5;
+  background-image: linear-gradient(
     135deg,
     var(--sp-accent-start) 0%,
     var(--sp-accent-end) 100%

@@ -420,9 +420,9 @@ export function createYouTubeDownloadController(deps: {
     ) => Promise<boolean>;
   }): Promise<boolean> | null {
     const { snapshot, retryId, refresh, separateOnly, enqueueItem } = params;
-    if (snapshot.platform !== "youtube") return null;
     const ytHelper = currentYouTubeHelper();
-    if (ytHelper && ytHelper.status !== "ready") {
+    if (!ytHelper) return null;
+    if (ytHelper.status !== "ready") {
       showToast(
         ytHelper.message || "请先安装并启用 YouTube 下载助手脚本后再下载",
         "warning",

@@ -1,12 +1,17 @@
 import type { DownloadSnapshot, SourceProbe } from "../downloads/types";
 import type { DownloadTask, YouTubeHelperState } from "../types/media";
 import {
-  deliveryRoutes,
+  availableSources,
   readyItem,
   readyVariant,
+  sourceRoutes,
   sourceUrl,
 } from "../utils/mediaContract";
-import { extractDashMuxSpec } from "../extension/dashMuxSpec";
+import {
+  isTbvideoVideoItem,
+  resolveProtectedExtensionAudioRoutes,
+  resolveWhitelistedExtensionMuxSpec,
+} from "../core/media";
 import type {
   WebExtEnqueuePayload,
   WebExtTaskPhase,
@@ -81,19 +86,6 @@ function extensionPhaseStatusText(phase: WebExtTaskPhase): string {
   }
 }
 
-function isBilibiliProtectedAudioUrl(rawUrl: string): boolean {
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    return (
-      host.endsWith(".bilivideo.com") ||
-      host.endsWith(".bilivideo.cn") ||
-      host.endsWith(".akamaized.net")
-    );
-  } catch {
-    return false;
-  }
-}
-
 export function useMediaDownload({
   videoStore,
   showToast,
@@ -102,10 +94,8 @@ export function useMediaDownload({
 }: UseMediaDownloadOptions) {
   const apiContext = { apiOrigin: apiConfig.baseUrl };
   const currentYouTubeHelper = (): YouTubeHelperState | undefined =>
-    videoStore.resultData?.platform === "youtube"
-      ? ((videoStore.resultData.extra as Record<string, unknown> | undefined)
-          ?.youtube_helper as YouTubeHelperState | undefined)
-      : undefined;
+    (videoStore.resultData?.extra as Record<string, unknown> | undefined)
+      ?.youtube_helper as YouTubeHelperState | undefined;
   const effectiveSelectedUrl = () => selection.currentVideoUrl.value;
   const archiveRetries = new Map<number, () => Promise<void>>();
   const videoRetries = new Map<
@@ -823,7 +813,7 @@ export function useMediaDownload({
     if (!readyVariant(variant)) return null;
 
     if (variant.delivery.kind === "mux") {
-      const dashMux = extractDashMuxSpec(variant, apiContext);
+      const dashMux = resolveWhitelistedExtensionMuxSpec(variant, apiContext);
       if (!dashMux) return null;
       const filename = filenameFor(snapshot, dashMux.outputContainer, variant);
       const exactTotal =
@@ -834,10 +824,16 @@ export function useMediaDownload({
         filename,
         payload: {
           kind: "dash_mux",
-          platform: snapshot.platform || "bilibili",
+          platform: snapshot.platform || "media",
           title: snapshot.title || snapshot.item.title || filename,
           filename,
-          dashMux,
+          dashMux: {
+            videoRoutes: dashMux.videoRoutes,
+            audioRoutes: dashMux.audioRoutes,
+            ...(dashMux.videoSize ? { videoSize: dashMux.videoSize } : {}),
+            ...(dashMux.audioSize ? { audioSize: dashMux.audioSize } : {}),
+            outputContainer: "mp4",
+          },
           ...(exactTotal > 0 ? { sizeBytes: exactTotal } : {}),
           mimeType: "video/mp4",
         },
@@ -854,25 +850,32 @@ export function useMediaDownload({
 
     if (
       snapshot.isAttachment &&
-      snapshot.platform === "bilibili" &&
       snapshot.item.type === "audio" &&
       variant.delivery.kind === "file"
     ) {
-      const routes = deliveryRoutes(variant.delivery.sources, apiContext);
-      if (routes.length > 0 && routes.some(isBilibiliProtectedAudioUrl)) {
+      const routes = resolveProtectedExtensionAudioRoutes(
+        { delivery: variant.delivery },
+        apiContext,
+      );
+      if (routes && routes.length > 0) {
         const audioBaseSnapshot: ItemSnapshot = {
           ...snapshot,
           isAttachment: false,
         };
         const filename = filenameFor(audioBaseSnapshot, "m4a", variant);
-        const sizeBytes = variant.delivery.sources[0]?.size_bytes;
+        const primaryRoute = routes[0];
+        const matchedSource = availableSources(
+          variant.delivery.sources,
+        ).find((src) => sourceRoutes(src, apiContext).includes(primaryRoute));
+        const sizeBytes =
+          matchedSource?.size_bytes ?? variant.delivery.sources[0]?.size_bytes;
         return runExtensionBridgeDownload({
           snapshot,
           retryId,
           filename,
           payload: {
             kind: "direct_download",
-            platform: "bilibili",
+            platform: snapshot.platform || "media",
             title: snapshot.title || snapshot.item.title || filename,
             filename,
             routes,
@@ -1012,12 +1015,7 @@ export function useMediaDownload({
         if (target.kind === "file") {
           const hints = item.tbvideo;
           const tbvideo =
-            item.type === "video" &&
-            (snapshot.platform === "pipigx" ||
-              snapshot.platform === "zuiyou") &&
-            hints?.platform === snapshot.platform
-              ? hints
-              : undefined;
+            isTbvideoVideoItem(item) && hints ? hints : undefined;
           const sourceId = target.source.id;
           sourceContexts.set(id, {
             tbvideo: tbvideo && {

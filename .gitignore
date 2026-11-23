@@ -224,6 +224,7 @@
 /frontend/scripts/*
 !/frontend/scripts/build-extension.mjs
 !/frontend/scripts/build-youtube-helper.mjs
+!/frontend/scripts/check-architecture-boundaries.mjs
 !/frontend/scripts/check-load-budget.mjs
 !/frontend/scripts/generate-brand-assets.mjs
 !/frontend/scripts/generate-platform-catalog.mjs
@@ -239,6 +240,7 @@
 !/frontend/src/assets/
 !/frontend/src/components/
 !/frontend/src/composables/
+!/frontend/src/core/
 !/frontend/src/downloads/
 !/frontend/src/extension/
 !/frontend/src/generated/
@@ -251,6 +253,7 @@
 !/frontend/src/types/
 !/frontend/src/utils/
 /frontend/tests/*
+!/frontend/tests/architecture-media-kernel.test.mjs
 !/frontend/tests/archive-route-fallback.test.mjs
 !/frontend/tests/download-bridge.test.mjs
 !/frontend/tests/download-manager.test.mjs
@@ -580,6 +583,10 @@
 !/frontend/src/composables/useMediaDownload.ts
 !/frontend/src/composables/useVideoParser.ts
 !/frontend/src/composables/useVideoSelection.ts
+/frontend/src/core/*
+!/frontend/src/core/capabilityHub.ts
+!/frontend/src/core/extensionReleaseMeta.json
+!/frontend/src/core/media/
 /frontend/src/downloads/*
 !/frontend/src/downloads/blob.ts
 !/frontend/src/downloads/bridge.ts
@@ -873,6 +880,12 @@
 !/frontend/src/composables/download/helpers.ts
 !/frontend/src/composables/download/taskControls.ts
 !/frontend/src/composables/download/youtubeMux.ts
+/frontend/src/core/media/*
+!/frontend/src/core/media/cdnTransportHints.ts
+!/frontend/src/core/media/index.ts
+!/frontend/src/core/media/layoutAndFilename.ts
+!/frontend/src/core/media/muxSpec.ts
+!/frontend/src/core/media/variantSort.ts
 /frontend/src/extension/components/*
 !/frontend/src/extension/components/SidePanelBatchQueue.vue
 !/frontend/src/extension/components/SidePanelDownloads.vue

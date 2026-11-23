@@ -1,4 +1,4 @@
-import { readFile, access } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -31,8 +31,7 @@ function toFilePath(input) {
 
 async function fileExists(candidate) {
   try {
-    await access(candidate);
-    return true;
+    return (await stat(candidate)).isFile();
   } catch {
     return false;
   }

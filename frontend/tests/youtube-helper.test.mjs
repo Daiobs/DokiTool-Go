@@ -4615,10 +4615,10 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
         "50.0 MB · 1440p60 (2K)",
         "约 42.0 MB · 1012p60",
         "约 25.0 MB · 720p",
-        "大小未知 · 自适应",
         "12.0 MB · 360p (含音频)",
-        "7.0 MB · 仅音频 M4A (128 kbps)",
+        "大小未知 · 自适应",
         "大小未知 · 仅音频 WEBM (160 kbps)",
+        "7.0 MB · 仅音频 M4A (128 kbps)",
         "3.0 MB · 音轨",
       ]);
 

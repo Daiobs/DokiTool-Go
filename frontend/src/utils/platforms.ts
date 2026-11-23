@@ -96,6 +96,11 @@ export const POPULAR_PLATFORMS: ReadonlyArray<{
 export const platformEnName = (id: string, name = ""): string =>
   /^[a-z0-9 ._-]+$/i.test(name) ? name : id ? id[0].toUpperCase() + id.slice(1) : name;
 
+export {
+  platformUsesTbvideo,
+  type TbvideoPlatform,
+} from "../core/media/cdnTransportHints";
+
 export interface PlatformPresentation {
   id: string;
   label: string;

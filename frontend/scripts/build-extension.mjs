@@ -119,6 +119,16 @@ export async function createExtensionManifest({ devLoopback = false } = {}) {
     "utf8",
   );
   const pkg = JSON.parse(pkgRaw);
+  let releaseMetaVersion = "";
+  try {
+    const metaRaw = await fsp.readFile(
+      path.join(frontendRoot, "src", "core", "extensionReleaseMeta.json"),
+      "utf8",
+    );
+    releaseMetaVersion = String(JSON.parse(metaRaw)?.version || "").trim();
+  } catch {
+    releaseMetaVersion = "";
+  }
   const hostWhitelist = await loadHostWhitelistModule();
   const { host_permissions, optional_host_permissions } =
     hostWhitelist.buildManifestHostPermissions({ devLoopback });
@@ -134,7 +144,7 @@ export async function createExtensionManifest({ devLoopback = false } = {}) {
     manifest_version: 3,
     key: DOKITOOL_EXTENSION_MANIFEST_KEY,
     name: "DokiTool 素材下载助手",
-    version: String(pkg.version || "1.0.0"),
+    version: releaseMetaVersion || String(pkg.version || "1.0.0"),
     description:
       "DokiTool 多平台无水印短视频、图集、实况照片与 YouTube 4K60 无损合流侧边栏下载扩展（零 Cookie、显式白名单、后台保活落盘）",
     permissions: [...EXPECTED_PERMISSIONS],

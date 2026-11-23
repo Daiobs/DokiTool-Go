@@ -1,4 +1,5 @@
 import type { Source } from "../types/media";
+import { isTbvideoVideoItem } from "../core/media";
 import {
   sourceAvailable,
   sourceRoutes,
@@ -424,11 +425,7 @@ export async function probeFileTarget<
   if (item.type === "live_photo") {
     return target;
   }
-  if (
-    item.type === "video" &&
-    (platform === "pipigx" || platform === "zuiyou") &&
-    item.tbvideo?.platform === platform
-  ) {
+  if (isTbvideoVideoItem(item)) {
     return target;
   }
   const sources =

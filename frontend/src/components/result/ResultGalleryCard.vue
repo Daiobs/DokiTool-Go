@@ -466,7 +466,9 @@ onUnmounted(() => {
   transform: scale(0.96);
 }
 .rs-btn--primary {
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35), 0 1px 3px rgba(0, 0, 0, 0.1);
 }

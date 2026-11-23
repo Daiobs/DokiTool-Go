@@ -88,7 +88,7 @@ const content: Record<string, Record<string, string>> = {
     biliDashOpenGuide: "打开扩展安装指引",
     biliDashMuxCap: "DASH 无损合流",
     biliDashAudioExplain:
-      "该 B 站独立 DASH 音轨需附带 B 站来源头才能读取，网页直连会被拒绝；安装 DokiTool Chrome 扩展即可零 Cookie 一键保存原声 M4A。",
+      "该独立音轨需附带源站来源头才能读取，网页直连会被拒绝；安装 DokiTool Chrome 扩展即可零 Cookie 一键保存原声 M4A。",
     biliDashAudioCta: "安装 Chrome 扩展保存原声 M4A",
     extConnected: "扩展已连接",
     extConnectedTitle:
@@ -191,7 +191,7 @@ const content: Record<string, Record<string, string>> = {
     biliDashOpenGuide: "Open Extension Guide",
     biliDashMuxCap: "DASH Lossless Mux",
     biliDashAudioExplain:
-      "This standalone Bilibili DASH audio track requires Bilibili referer headers and cannot be fetched directly in the web page. Install the DokiTool Chrome Extension for cookie-free one-click M4A saving.",
+      "This standalone audio track requires origin referer headers and cannot be fetched directly in the web page. Install the DokiTool Chrome Extension for cookie-free one-click M4A saving.",
     biliDashAudioCta: "Get Chrome Extension for M4A Audio",
     extConnected: "Extension Connected",
     extConnectedTitle:

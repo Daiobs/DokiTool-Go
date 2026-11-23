@@ -45,7 +45,17 @@ body,
 }
 
 .btn-primary-gradient {
-  @apply bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white font-semibold py-3 px-6 rounded-xl transition-all duration-300 transform hover:-translate-y-0.5 hover:shadow-lg hover:shadow-indigo-500/30;
+  @apply bg-indigo-600 bg-gradient-to-r from-indigo-500 to-purple-500 hover:bg-indigo-700 hover:from-indigo-600 hover:to-purple-600 text-white font-semibold py-3 px-6 rounded-xl transition-all duration-300 transform hover:-translate-y-0.5 hover:shadow-lg hover:shadow-indigo-500/30;
+  background-color: #4f46e5;
+  background-image: linear-gradient(to right, #6366f1, #a855f7);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.btn-primary-gradient:hover {
+  background-color: #4338ca;
+  background-image: linear-gradient(to right, #4f46e5, #9333ea);
+  color: #ffffff;
 }
 
 .card-shadow {
@@ -61,7 +71,22 @@ body,
 }
 
 .tab-active {
-  @apply bg-gradient-to-r from-indigo-500 to-purple-500 text-white;
+  @apply bg-indigo-600 bg-gradient-to-r from-indigo-500 to-purple-500 text-white;
+  background-color: #4f46e5;
+  background-image: linear-gradient(to right, #6366f1, #a855f7);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+@media (forced-colors: active) {
+  .btn-primary-gradient,
+  .tab-active {
+    forced-color-adjust: auto;
+    background-image: none;
+    background-color: Highlight;
+    color: HighlightText;
+    border: 1px solid ButtonText;
+  }
 }
 
 .loading-pulse {

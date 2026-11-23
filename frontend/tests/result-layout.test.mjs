@@ -15,13 +15,41 @@ before(async () => {
     '../services/apiConfig': { apiConfig: { baseUrl: '' } },
     '../utils/youtubeHelperCore': youtubeHelperCore,
   };
-  for (const id of ['../utils/mediaSources', '../utils/mediaContract', '../composables/useVideoSelection']) {
+  for (const id of [
+    '../utils/mediaSources',
+    '../utils/mediaContract',
+    '../core/media/cdnTransportHints',
+    '../core/media/variantSort',
+    '../core/media/layoutAndFilename',
+    '../extension/hostWhitelist',
+    '../extension/dashMuxSpec',
+    '../core/media/muxSpec',
+    '../core/media/index',
+    '../composables/useVideoSelection',
+  ]) {
     const utilities = await readFile(new URL(`../src/${id.slice(3)}.ts`, import.meta.url), 'utf8');
     const module = { exports: {} };
     const compiled = await transformWithEsbuild(utilities, `${id}.ts`, { loader: 'ts', format: 'cjs' });
-    new Function('require', 'module', 'exports', compiled.code)(id => modules[id] || require(id), module, module.exports);
+    new Function('require', 'module', 'exports', compiled.code)(
+      (reqId) => {
+        if (modules[reqId]) return modules[reqId];
+        if (reqId === '../core/media' && modules['../core/media/index']) return modules['../core/media/index'];
+        if (reqId === './cdnTransportHints') return modules['../core/media/cdnTransportHints'];
+        if (reqId === './variantSort') return modules['../core/media/variantSort'];
+        if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
+        if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
+        if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
+        if (reqId === '../../utils/mediaSources') return modules['../utils/mediaSources'];
+        if (reqId === '../../extension/hostWhitelist') return modules['../extension/hostWhitelist'];
+        if (reqId === '../../extension/dashMuxSpec') return modules['../extension/dashMuxSpec'];
+        return require(reqId);
+      },
+      module,
+      module.exports,
+    );
     modules[id] = module.exports;
   }
+  modules['../core/media'] = modules['../core/media/index'];
   ({ useVideoSelection } = modules['../composables/useVideoSelection']);
   ({ validateMediaEnvelope } = modules['../utils/mediaContract']);
   ResultSection = await loadSfc(
@@ -682,10 +710,39 @@ test('Bilibili DASH mux variants: uncluttered uninstalled state (no purple banne
     assert.ok(enHintText.includes('1080p'));
     assert.ok(enHintText.includes('Install Chrome Extension'));
 
-    // 5. Non-Bilibili platforms do not show Bilibili extension hint
-    const nonBiliData = { ...biliData, platform: 'douyin', groups: undefined };
-    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonBiliData });
-    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: nonBiliData };
+    // 5. Capability-driven mux detection: ANY platform with delivery.kind === "mux" shows .rs-ext-hint,
+    // while a payload with higher_quality_variants but NO mux variants shows .rs-higher-quality-note instead.
+    const nonBiliMuxData = { ...biliData, platform: 'vimeo', groups: undefined };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonBiliMuxData });
+    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: nonBiliMuxData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+    assert.equal(view.elements('rs-ext-hint').length, 1, 'non-Bilibili platform with mux variants still offers extension lossless mux');
+
+    const nonMuxHigherQualityData = {
+      ...biliData,
+      platform: 'douyin',
+      groups: undefined,
+      items: [{
+        ...biliItem,
+        variants: [
+          biliItem.variants[0],
+          {
+            id: 'adaptive-4k-dash',
+            label: '4K',
+            metadata: { width: 3840, height: 2160, evidence: 'upstream' },
+            delivery: {
+              kind: 'dash',
+              scope: 'adaptive',
+              sources: [{ id: 's-mpd', url: 'https://media.test/master.mpd' }],
+            },
+          },
+        ],
+        higher_quality_variants: [{ variant_id: 'adaptive-4k-dash', requires: ['dash'] }],
+      }],
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: nonMuxHigherQualityData });
+    view.state.value = { ...view.state.value, resultVersion: 21, locale: 'zh-CN', resultData: nonMuxHigherQualityData };
     view.state.value.selection.syncResult();
     await view.flush();
     assert.equal(view.elements('rs-ext-hint').length, 0);
@@ -757,16 +814,25 @@ test('Bilibili DASH mux variants: uncluttered uninstalled state (no purple banne
     assert.equal(connView.elements('rs-ext-hint').length, 0, 'bottom install hint must be hidden when extension is connected');
     assert.equal(connView.elements('rs-bili-dash-callout').length, 0);
 
-    // 3. Quality tab unlocks all 3 1080p DASH variants as directly clickable options alongside 720p!
+    // 3. Quality tab unlocks all 3 1080p DASH variants canonically sorted ABOVE 720p (H.264 > HEVC > AV1 > 720p)
+    // AND automatically upgrades active selection to 1080p H.264 upon extension connect!
     await connView.tab('画质选项');
     const items = connView.elements('rs-backup-item');
     assert.equal(items.length, 4, '720p + 3 unlocked 1080p DASH variants should all be selectable');
-    assert.equal(items[1].props['data-extension-mux'], true);
-    assert.ok(textOf(items[1]).includes('1080p'));
-    assert.ok(textOf(items[1]).includes('扩展无损合流'));
+    assert.equal(items[0].props['data-extension-mux'], true);
+    assert.ok(textOf(items[0]).includes('1080p'));
+    assert.ok(textOf(items[0]).includes('扩展无损合流'));
+    assert.ok(textOf(items[0]).includes('当前已选'), 'top-ranked 1080p H.264 must be auto-selected on extension connect');
+    assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'mux-1080p-avc' });
+    assert.ok(textOf(items[3]).includes('720p'), '720p durl sorts after unlocked 1080p DASH options');
 
-    // 4. Selecting 1080p DASH keeps playable 720p <video> preview, enables primary 下载视频 CTA, and emits download-main!
-    items[1].props.onClick();
+    // 4. Manual switch to 720p is respected; switching back to 1080p DASH keeps playable 720p <video> preview, enables primary 下载视频 CTA, and emits download-main!
+    items[3].props.onClick();
+    await connView.flush();
+    assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'durl-720p' });
+    assert.equal(connView.state.value.selection.hasManualChoice(biliItem.id), true);
+
+    items[0].props.onClick();
     await connView.flush();
     assert.deepEqual(connView.state.value.selection.currentSelection.value, { variant_id: 'mux-1080p-avc' });
     assert.equal(connView.elements('rs-video')[0].props.src, durlUrl, 'video stage keeps playable durl fallback while 1080p DASH is selected');
@@ -1045,5 +1111,191 @@ test('PR-C: ResultSection renders platform badge for built-in and long-tail plat
     assert.equal(downloadMainCalls, 2);
   } finally {
     view.app.unmount();
+  }
+});
+
+test('PR #34 Round 2: unwhitelisted Tier-2 mux NEVER renders extension M4A card/guide in Music tab (both uninstalled & connected) and protected audio copy is platform-neutral', async () => {
+  const unwhitelistedTier2Data = {
+    platform: 'vimeo',
+    content_id: 'vimeo-unwhitelisted-1',
+    title: 'Unwhitelisted Tier-2 Mux Demo',
+    source_url: 'https://vimeo.com/999999',
+    default_item_id: 't2-item-1',
+    author: { name: 'Indie Creator', id: 'indie' },
+    items: [
+      {
+        id: 't2-item-1',
+        type: 'video',
+        default: { variant_id: 'mp4-720', url: 'https://cdn-unwhitelisted.example.org/720p.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://cdn-unwhitelisted.example.org/720p.mp4', {
+            width: 1280,
+            height: 720,
+            video_codec: 'h264',
+            has_audio: true,
+            container: 'mp4',
+            extension: 'mp4',
+            mime_type: 'video/mp4',
+            evidence: 'upstream',
+          }),
+          {
+            id: 'mux-1080-unwhitelisted',
+            label: '1080p',
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: 'avc1.640028',
+              audio_codec: 'mp4a.40.2',
+              container: 'mp4',
+              extension: 'mp4',
+              mime_type: 'video/mp4',
+              evidence: 'upstream',
+            },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              resources: [
+                {
+                  id: 'v-u',
+                  role: 'video',
+                  metadata: { width: 1920, height: 1080, evidence: 'upstream' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [{ id: 'sv-u', url: 'https://cdn-unwhitelisted.example.org/1080p.m4s' }],
+                  },
+                },
+                {
+                  id: 'a-u',
+                  role: 'audio',
+                  metadata: { audio_codec: 'mp4a.40.2', audio_bitrate_bps: 128000, evidence: 'upstream' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      {
+                        id: 'sa-u',
+                        url: 'https://cdn-unwhitelisted.example.org/audio.m4s',
+                        browser_fetch: 'blocked',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: unwhitelistedTier2Data });
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  // 1) Uninstalled state: zero Music tab, zero extension guide, zero .rs-ext-hint
+  const prevChrome = globalThis.chrome;
+  delete globalThis.chrome;
+  const uninstalledView = await mount(unwhitelistedTier2Data);
+  try {
+    assert.equal(uninstalledView.elements('rs-ext-hint').length, 0);
+    assert.equal(
+      uninstalledView.elements('rs-tab').some((n) => textOf(n).includes('音乐')),
+      false,
+      'unwhitelisted Tier-2 mux must NOT synthesize Music tab',
+    );
+    assert.equal(uninstalledView.elements('rs-bili-audio-guide').length, 0);
+    assert.equal(uninstalledView.elements('rs-bili-audio-connected').length, 0);
+  } finally {
+    uninstalledView.app.unmount();
+  }
+
+  // 2) Connected extension state: STILL zero Music tab and zero false extension M4A card!
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg?.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '4.1.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download'],
+            },
+          });
+        }
+      },
+    },
+  };
+  const connectedView = await mount(unwhitelistedTier2Data);
+  await connectedView.flush();
+  await new Promise((r) => setTimeout(r, 15));
+  await connectedView.flush();
+  try {
+    assert.equal(
+      connectedView.elements('rs-tab').some((n) => textOf(n).includes('音乐')),
+      false,
+      'connected extension must NOT synthesize unusable unwhitelisted Tier-2 mux audio in Music tab',
+    );
+    assert.equal(connectedView.elements('rs-bili-audio-connected').length, 0);
+    assert.equal(connectedView.elements('rs-bili-audio-guide').length, 0);
+  } finally {
+    connectedView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+
+  // 3) Whitelisted protected mux audio (non-Bilibili platform) renders platform-neutral copy (no "B 站" hardcode)
+  const genericProtectedAudioData = {
+    platform: 'vimeo',
+    content_id: 'vimeo-akamai-1',
+    title: 'Akamai Protected Mux',
+    source_url: 'https://vimeo.com/888888',
+    default_item_id: 'ak-1',
+    items: [
+      {
+        id: 'ak-1',
+        type: 'video',
+        default: { variant_id: 'mp4-720', url: 'https://vod-progressive.akamaized.net/720p.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://vod-progressive.akamaized.net/720p.mp4', { width: 1280, height: 720, has_audio: true, evidence: 'upstream' }),
+          {
+            id: 'mux-1080-ak',
+            label: '1080p',
+            metadata: { width: 1920, height: 1080, evidence: 'upstream' },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4' },
+              resources: [
+                {
+                  id: 'v-ak',
+                  role: 'video',
+                  delivery: { kind: 'file', sources: [{ id: 'sv-ak', url: 'https://vod-progressive.akamaized.net/1080.m4s' }] },
+                },
+                {
+                  id: 'a-ak',
+                  role: 'audio',
+                  delivery: {
+                    kind: 'file',
+                    sources: [{ id: 'sa-ak', url: 'https://vod-progressive.akamaized.net/audio.m4s', browser_fetch: 'blocked' }],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: genericProtectedAudioData });
+  delete globalThis.chrome;
+  const protectedView = await mount(genericProtectedAudioData);
+  try {
+    await protectedView.tab('音乐');
+    const guides = protectedView.elements('rs-bili-audio-guide');
+    assert.equal(guides.length, 1);
+    const guideText = textOf(guides[0]);
+    assert.ok(guideText.includes('源站来源头'), `expected platform-neutral copy, got: ${guideText}`);
+    assert.equal(guideText.includes('B 站'), false, 'protected audio guide must not hardcode B 站');
+  } finally {
+    protectedView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
   }
 });

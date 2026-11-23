@@ -239,8 +239,9 @@ const markCoverBroken = (raw: string): void => {
   color: var(--color-primary);
 }
 .vlib-tab--on {
-  background: linear-gradient(135deg, var(--color-primary), var(--color-secondary, var(--color-primary)));
-  border-color: transparent;
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, var(--color-primary, #6366f1), var(--color-secondary, #8b5cf6));
+  border-color: rgba(255, 255, 255, 0.16);
   color: #fff;
 }
 .vlib-tab:disabled {

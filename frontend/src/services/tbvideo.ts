@@ -1,7 +1,11 @@
 import type { MediaItem, UnifiedMedia } from "../types/media";
+import {
+  platformUsesTbvideo,
+  type TbvideoPlatform,
+} from "../core/media/cdnTransportHints";
 
 export interface TbvideoItem {
-  platform: "pipigx" | "zuiyou";
+  platform: TbvideoPlatform;
   pid: string;
   vid: string;
   sources: Record<string, string>;
@@ -22,9 +26,9 @@ function objectURL(raw: unknown): raw is string {
 /** Bind public download hints to the item from this particular parse/resolve response.
  * Empty/missing hints still select manual delivery. Preview reads the original source. */
 export function withTbvideoItems(media: UnifiedMedia): UnifiedMedia {
-  const platform = media.platform;
-  if (platform !== "pipigx" && platform !== "zuiyou") return media;
   const extra = media.extra?.tbvideo;
+  const platform = media.platform;
+  if (!platformUsesTbvideo(platform)) return media;
   const items = record(extra) && record(extra.items) ? extra.items : {};
   const pid = record(extra) && typeof extra.pid === "string" ? extra.pid : media.content_id || "";
   return { ...media, items: media.items.map((item: MediaItem) => {

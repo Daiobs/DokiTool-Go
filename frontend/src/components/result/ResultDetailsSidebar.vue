@@ -3,6 +3,11 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick } from "vue";
 import AppIcon from "../AppIcon.vue";
 import ResultVariantPicker from "./ResultVariantPicker.vue";
 import { resourceSource, sourceUrl } from "../../utils/mediaContract";
+import {
+  hasRefererProtectedAudioSource,
+  resolveProtectedExtensionAudioRoutes,
+  resolveWhitelistedExtensionMuxSpec,
+} from "../../core/media";
 import { apiConfig } from "../../services/apiConfig";
 import { t, formatDate } from "./resultI18n";
 
@@ -80,20 +85,31 @@ const stats = computed(() =>
 const EXT_ICON_PATH =
   "M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z";
 
-const isBilibiliDashAudio = (attachment) =>
-  Boolean(
-    props.isBilibili &&
-      typeof attachment?.id === "string" &&
-      attachment.id.startsWith("bilibili-audio-"),
+const isProtectedDashAudio = (attachment) => {
+  if (!attachment) return false;
+  if (
+    attachment.role !== "background_audio" &&
+    attachment.resource?.role !== "audio"
+  ) {
+    return false;
+  }
+  return (
+    resolveProtectedExtensionAudioRoutes(attachment.resource, context) !== null
   );
+};
+
+const isBilibiliDashAudio = isProtectedDashAudio;
 
 const visibleAttachments = computed(() => {
   const currentId = props.currentItem?.id;
   const list = props.attachments.filter((att) => {
     if (
-      isBilibiliDashAudio(att) &&
+      typeof att?.id === "string" &&
+      (att.id.startsWith("bilibili-audio-") ||
+        att.id.startsWith("mux-audio-")) &&
       currentId &&
-      att.id !== `bilibili-audio-${currentId}`
+      att.id !== `bilibili-audio-${currentId}` &&
+      att.id !== `mux-audio-${currentId}`
     ) {
       return false;
     }
@@ -101,9 +117,12 @@ const visibleAttachments = computed(() => {
   });
 
   if (
-    props.isBilibili &&
     currentId &&
-    !list.some((att) => att?.id === `bilibili-audio-${currentId}`) &&
+    !list.some(
+      (att) =>
+        att?.id === `bilibili-audio-${currentId}` ||
+        att?.id === `mux-audio-${currentId}`,
+    ) &&
     props.currentItem?.state !== "deferred" &&
     props.currentItem?.state !== "unavailable" &&
     Array.isArray(props.currentItem?.variants)
@@ -114,8 +133,26 @@ const visibleAttachments = computed(() => {
       if (variant?.state === "deferred" || variant?.delivery?.kind !== "mux") {
         continue;
       }
+      const isVariantWhitelisted =
+        resolveWhitelistedExtensionMuxSpec(variant, context) !== null;
       for (const res of variant.delivery.resources || []) {
         if (res?.role !== "audio" || res?.delivery?.kind !== "file") continue;
+        const protectedExtRoutes = resolveProtectedExtensionAudioRoutes(
+          res,
+          context,
+        );
+        const needsHeaderProtection = hasRefererProtectedAudioSource(
+          res,
+          context,
+        );
+        // Never synthesize an unusable dead link for unwhitelisted or blocked
+        // mux audio that neither Web nor the Chrome extension can fetch.
+        if (needsHeaderProtection && !protectedExtRoutes) {
+          continue;
+        }
+        if (!needsHeaderProtection && !isVariantWhitelisted) {
+          continue;
+        }
         const bitrate = Number(
           res.metadata?.audio_bitrate_bps || res.metadata?.bitrate_bps || 0,
         );
@@ -127,7 +164,7 @@ const visibleAttachments = computed(() => {
     }
     if (bestAudioLeaf) {
       list.push({
-        id: `bilibili-audio-${currentId}`,
+        id: `mux-audio-${currentId}`,
         role: "background_audio",
         title: "原声音频 (M4A)",
         resource: bestAudioLeaf,
@@ -1050,7 +1087,9 @@ onUnmounted(() => {
   transform: none;
 }
 .rs-btn--primary {
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  background-color: #4f46e5;
+  background-image: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   box-shadow: 0 4px 16px rgba(108, 92, 231, 0.35), 0 1px 3px rgba(0, 0, 0, 0.1);
 }

@@ -2211,7 +2211,8 @@ async function handleBatchZipSave() {
   right: 4px;
   padding: 1px 5px;
   border-radius: 4px;
-  background: linear-gradient(135deg, #6366f1, #ec4899);
+  background-color: #6366f1;
+  background-image: linear-gradient(135deg, #6366f1, #ec4899);
   color: #ffffff;
   font-size: 9.5px;
   font-weight: 700;
@@ -2515,7 +2516,8 @@ async function handleBatchZipSave() {
 }
 
 .sp-mixed-type--live {
-  background: linear-gradient(135deg, #6366f1, #ec4899);
+  background-color: #6366f1;
+  background-image: linear-gradient(135deg, #6366f1, #ec4899);
   color: #ffffff;
 }
 

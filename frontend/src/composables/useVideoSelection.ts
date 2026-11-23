@@ -2,6 +2,7 @@ import { computed, ref } from "vue";
 import type { MediaItem, MediaSelection } from "../types/media";
 import type { useVideoStore } from "../stores/video";
 import { getDownloadTarget } from "../utils/mediaContract";
+import { hasMultiCollectionGroups, nonAlbumGroupsOf } from "../core/media";
 import { apiConfig } from "../services/apiConfig";
 
 /** Selection is an explicit identity; resolving an item never resets the user's choice. */
@@ -14,23 +15,15 @@ export function useVideoSelection({
     sectionIndex = ref(0),
     selectedSet = ref(new Set<number>());
   const choices = ref(new Map<string, MediaSelection>());
+  const manualItemIds = ref(new Set<string>());
   const list = computed(() =>
     (videoStore.resultData?.items || []).filter((item) =>
       ["video", "audio"].includes(item.type),
     ),
   );
-  const collections = computed(() =>
-    (videoStore.resultData?.groups || []).filter(
-      (group) => group.kind !== "album",
-    ),
-  );
-  const hasCollections = computed(
-    () =>
-      collections.value.length > 1 ||
-      collections.value.some(
-        (group) =>
-          (group.total_count ?? 0) > 1 || (group.item_ids?.length ?? 0) > 1,
-      ),
+  const collections = computed(() => nonAlbumGroupsOf(videoStore.resultData));
+  const hasCollections = computed(() =>
+    hasMultiCollectionGroups(videoStore.resultData),
   );
   const visibleList = computed(() => {
     const group = hasCollections.value
@@ -75,11 +68,34 @@ export function useVideoSelection({
     );
   function choose(choice: MediaSelection, itemId = selectedItemId.value) {
     choices.value = new Map(choices.value).set(itemId, { ...choice });
+    const nextManual = new Set(manualItemIds.value);
+    nextManual.add(itemId);
+    manualItemIds.value = nextManual;
+  }
+  function applyAutoChoice(
+    choice: MediaSelection,
+    itemId = selectedItemId.value,
+  ) {
+    if (!itemId || manualItemIds.value.has(itemId)) return;
+    const prev = choices.value.get(itemId);
+    if (
+      prev?.variant_id === choice.variant_id &&
+      prev?.source_id === choice.source_id
+    ) {
+      return;
+    }
+    choices.value = new Map(choices.value).set(itemId, { ...choice });
+  }
+  function hasManualChoice(itemId = selectedItemId.value): boolean {
+    return Boolean(itemId && manualItemIds.value.has(itemId));
   }
   function resetDefault(itemId = selectedItemId.value) {
     const next = new Map(choices.value);
     next.delete(itemId);
     choices.value = next;
+    const nextManual = new Set(manualItemIds.value);
+    nextManual.delete(itemId);
+    manualItemIds.value = nextManual;
   }
   function selectIndex(index: number) {
     const item = visibleList.value[index];
@@ -125,6 +141,7 @@ export function useVideoSelection({
   function syncResult() {
     const data = videoStore.resultData;
     choices.value = new Map();
+    manualItemIds.value = new Set();
     selectedSet.value = new Set();
     sectionIndex.value = 0;
     selectedItemId.value =
@@ -156,6 +173,8 @@ export function useVideoSelection({
         selectedItemId.value = id;
     },
     choose,
+    applyAutoChoice,
+    hasManualChoice,
     resetDefault,
     selectionFor: (id: string) => choices.value.get(id) || null,
     selectIndex,
