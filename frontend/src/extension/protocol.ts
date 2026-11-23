@@ -14,6 +14,10 @@ import type {
   SavedWorkRecord,
 } from "./storage";
 import type {
+  OwnerStatsResult,
+  StatsSnapshot,
+} from "./statsTypes";
+import type {
   BatchUrlExtractResult,
   MatchedPlatformUrl,
   PlatformId,
@@ -26,11 +30,13 @@ export type {
   ExtensionSettingsPatch,
   ExtensionThemeMode,
   MatchedPlatformUrl,
+  OwnerStatsResult,
   PanelIntentMode,
   PendingPanelIntent,
   PlatformId,
   QualityPreference,
   SavedWorkRecord,
+  StatsSnapshot,
 };
 
 export const SIDEPANEL_PORT_NAME = "dokitool-sidepanel" as const;
@@ -230,6 +236,7 @@ export type SidePanelToBackgroundRequest =
       apiBaseUrl?: string;
       bearerToken?: string;
     }
+  | { type: "FETCH_OWNER_STATS" }
   | {
       type: "PARSE_URL";
       url: string;
@@ -268,6 +275,7 @@ export interface SidePanelResponseMap {
   GET_INITIAL_STATE: ExtensionStateSnapshot;
   UPDATE_SETTINGS: { settings: ExtensionSettings };
   TEST_CONNECTION: ConnectionCheckResult;
+  FETCH_OWNER_STATS: OwnerStatsResult;
   PARSE_URL: {
     media: UnifiedMedia;
     matched: MatchedPlatformUrl;
@@ -392,6 +400,7 @@ const SIDEPANEL_REQUEST_TYPES = new Set<SidePanelToBackgroundRequest["type"]>([
   "GET_INITIAL_STATE",
   "UPDATE_SETTINGS",
   "TEST_CONNECTION",
+  "FETCH_OWNER_STATS",
   "PARSE_URL",
   "RESOLVE_LAZY_ITEM",
   "ENQUEUE_DOWNLOADS",

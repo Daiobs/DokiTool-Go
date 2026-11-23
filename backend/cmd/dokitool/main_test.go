@@ -1918,3 +1918,263 @@ func TestBilibiliDASHSwitchValidationAndWiring(t *testing.T) {
 		}
 	}
 }
+
+func TestServeStatsRuntimeConfigAndPersistenceAcrossRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGTERM subprocess persistence test requires unix signals")
+	}
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "stats-snapshot.json")
+	ownerTok := randomHexToken(t, 24)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	startServe := func(extraEnv ...string) (string, *exec.Cmd, chan error, func() string) {
+		t.Helper()
+		probeLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listenAddr := probeLn.Addr().String()
+		_ = probeLn.Close()
+
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDokitoolMainSubprocessHelper$")
+		args := []string{"serve", "-listen", listenAddr, "-client-identity", "direct", "-xhs-page-transport", "chrome131"}
+		env := append(os.Environ(),
+			"DOKITOOL_TEST_MAIN_ARGS="+strings.Join(args, "\n"),
+			"DOKITOOL_OWNER_TOKEN="+ownerTok,
+			"DOKITOOL_BILIBILI_DASH=true",
+			"DOKITOOL_TBVIDEO_REWRITE_PIPIGX=false",
+			"DOKITOOL_TBVIDEO_REWRITE_ZUIYOU=true",
+			api.EnvStatsSnapshotPath+"="+snapPath,
+		)
+		env = append(env, extraEnv...)
+		cmd.Env = env
+
+		var logMu sync.Mutex
+		var logBuf bytes.Buffer
+		logWriter := writerFunc(func(p []byte) (int, error) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			return logBuf.Write(p)
+		})
+		cmd.Stdout = logWriter
+		cmd.Stderr = logWriter
+
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to start dokitool serve subprocess: %v", err)
+		}
+		var exited atomic.Bool
+		waitDone := make(chan error, 1)
+		go func() {
+			err := cmd.Wait()
+			exited.Store(true)
+			waitDone <- err
+		}()
+		t.Cleanup(func() {
+			if !exited.Load() && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				<-waitDone
+			}
+		})
+
+		getLogs := func() string {
+			logMu.Lock()
+			defer logMu.Unlock()
+			return logBuf.String()
+		}
+
+		readyDeadline := time.Now().Add(5 * time.Second)
+		for {
+			resp, reqErr := client.Get("http://" + listenAddr + "/api/platforms?schema_version=1.0")
+			if reqErr == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					break
+				}
+			}
+			if time.Now().After(readyDeadline) {
+				t.Fatalf("dokitool serve subprocess did not become ready on %s; logs=%s", listenAddr, getLogs())
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		return listenAddr, cmd, waitDone, getLogs
+	}
+
+	doReq := func(listenAddr, path, tok string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "http://"+listenAddr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %s failed: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, body
+	}
+
+	fetchStats := func(listenAddr string) (api.StatsSnapshot, []byte) {
+		t.Helper()
+		code, body := doReq(listenAddr, "/api/stats?schema_version=1.0", ownerTok)
+		if code != http.StatusOK {
+			t.Fatalf("GET /api/stats status=%d body=%s", code, string(body))
+		}
+		var env struct {
+			Data api.StatsSnapshot `json:"data"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatalf("unmarshal /api/stats failed: %v\nbody=%s", err, string(body))
+		}
+		return env.Data, body
+	}
+
+	stopServe := func(cmd *exec.Cmd, waitDone chan error) {
+		t.Helper()
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("SIGTERM failed: %v", err)
+		}
+		select {
+		case waitErr := <-waitDone:
+			if waitErr != nil {
+				t.Fatalf("dokitool serve subprocess exited with error on SIGTERM: %v", waitErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("dokitool serve subprocess did not exit within 5s after SIGTERM")
+		}
+	}
+
+	// Run 1: cold start, record 3 parse outcomes, verify runtime switches & zero secret/path leakage, then SIGTERM flush!
+	addr1, cmd1, wait1, logs1 := startServe()
+	for i := 0; i < 2; i++ {
+		if code, _ := doReq(addr1, "/api/parse?schema_version=1.0&url=not-a-valid-url", ""); code != http.StatusBadRequest {
+			t.Fatalf("anon invalid parse #%d got %d, want 400", i+1, code)
+		}
+	}
+	if code, _ := doReq(addr1, "/api/parse?schema_version=1.0&url=not-a-valid-url", ownerTok); code != http.StatusBadRequest {
+		t.Fatalf("owner invalid parse got %d, want 400", code)
+	}
+
+	snap1, raw1 := fetchStats(addr1)
+	if snap1.Runtime.Version != version ||
+		snap1.Runtime.ShanghaiMode != "off" ||
+		snap1.Runtime.ShanghaiBilibili ||
+		!snap1.Runtime.BilibiliDASH ||
+		snap1.Runtime.YouTubeHelper ||
+		snap1.Runtime.XHSTransport != "chrome131" ||
+		snap1.Runtime.YTDLPEnabled ||
+		snap1.Runtime.YTDLPGenericEnabled ||
+		snap1.Runtime.TBVideoPipigx ||
+		!snap1.Runtime.TBVideoZuiyou ||
+		!snap1.Runtime.StatsPersistenceEnabled {
+		t.Fatalf("unexpected runtime config snapshot: %+v", snap1.Runtime)
+	}
+	if len(snap1.Daily) != api.DailyStatsWindowDays || len(snap1.Hourly) != api.HourlyStatsWindowHours {
+		t.Fatalf("unexpected daily/hourly lengths: %d/%d", len(snap1.Daily), len(snap1.Hourly))
+	}
+	wantDate := snap1.Daily[len(snap1.Daily)-1].Date
+	wantHour := snap1.Hourly[len(snap1.Hourly)-1].HourStart
+	if snap1.Daily[len(snap1.Daily)-1].Total != 3 || snap1.Hourly[len(snap1.Hourly)-1].Total != 3 {
+		t.Fatalf("expected 3 recorded parses in today/current-hour, got daily=%+v hourly=%+v", snap1.Daily[len(snap1.Daily)-1], snap1.Hourly[len(snap1.Hourly)-1])
+	}
+	for _, secret := range []string{dir, snapPath, ownerTok[:12]} {
+		if strings.Contains(string(raw1), secret) {
+			t.Fatalf("/api/stats leaked sensitive value %q", secret)
+		}
+	}
+
+	stopServe(cmd1, wait1)
+	for _, secret := range []string{dir, ownerTok[:12]} {
+		if strings.Contains(logs1(), secret) {
+			t.Fatalf("run 1 logs leaked sensitive value %q: %s", secret, logs1())
+		}
+	}
+
+	// Verify snapshot file permissions (0600) and zero leftover .tmp files.
+	info, err := os.Stat(snapPath)
+	if err != nil {
+		t.Fatalf("expected stats snapshot file after SIGTERM: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("snapshot file mode = %o, want 0600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "stats-snapshot.json" {
+		t.Fatalf("unexpected directory contents after SIGTERM flush: %v", entries)
+	}
+
+	// Run 2: restart against the same snapshot path -> daily & hourly totals survive restart identically!
+	addr2, cmd2, wait2, logs2 := startServe()
+	snap2, _ := fetchStats(addr2)
+	if snap2.Requests.Total != 0 {
+		t.Fatalf("expected process-lifetime requests.total=0 immediately after restart, got %d", snap2.Requests.Total)
+	}
+	var survivedDaily, survivedHourly uint64
+	for _, d := range snap2.Daily {
+		if d.Date == wantDate {
+			survivedDaily = d.Total
+		}
+	}
+	for _, h := range snap2.Hourly {
+		if h.HourStart == wantHour {
+			survivedHourly = h.Total
+		}
+	}
+	if survivedDaily != 3 || survivedHourly != 3 {
+		t.Fatalf("persisted stats did not survive restart: wantDate=%s daily=%d wantHour=%s hourly=%d", wantDate, survivedDaily, wantHour, survivedHourly)
+	}
+	stopServe(cmd2, wait2)
+	for _, secret := range []string{dir, ownerTok[:12]} {
+		if strings.Contains(logs2(), secret) {
+			t.Fatalf("run 2 logs leaked sensitive value %q: %s", secret, logs2())
+		}
+	}
+
+	// Run 3: corrupt snapshot file -> fail-soft startup (must NOT block!), safe warning with zero path leak, empty history!
+	if err := os.WriteFile(snapPath, []byte("{corrupt-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addr3, cmd3, wait3, logs3 := startServe()
+	snap3, _ := fetchStats(addr3)
+	if !snap3.Runtime.StatsPersistenceEnabled {
+		t.Fatal("expected stats_persistence_enabled=true even after fail-soft corrupt load")
+	}
+	if snap3.Daily[len(snap3.Daily)-1].Total != 0 || snap3.Hourly[len(snap3.Hourly)-1].Total != 0 {
+		t.Fatalf("expected empty history after corrupt snapshot load, got daily=%+v hourly=%+v", snap3.Daily[len(snap3.Daily)-1], snap3.Hourly[len(snap3.Hourly)-1])
+	}
+	stopServe(cmd3, wait3)
+
+	allLogs3 := logs3()
+	if !strings.Contains(allLogs3, "stats snapshot load skipped") {
+		t.Fatalf("expected fail-soft warning in run 3 logs, got: %s", allLogs3)
+	}
+	for _, secret := range []string{dir, ownerTok[:12]} {
+		if strings.Contains(allLogs3, secret) {
+			t.Fatalf("run 3 logs leaked sensitive value %q: %s", secret, allLogs3)
+		}
+	}
+	// Graceful shutdown should have replaced the corrupt file with a valid schema_version=1 snapshot!
+	healedRaw, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatalf("read healed snapshot failed: %v", err)
+	}
+	var healedMeta struct {
+		SchemaVersion int    `json:"schema_version"`
+		Timezone      string `json:"timezone"`
+	}
+	if err := json.Unmarshal(healedRaw, &healedMeta); err != nil || healedMeta.SchemaVersion != 1 || healedMeta.Timezone != "Asia/Shanghai" {
+		t.Fatalf("expected healed schema_version=1 Asia/Shanghai snapshot after SIGTERM, got %s (err=%v)", string(healedRaw), err)
+	}
+}

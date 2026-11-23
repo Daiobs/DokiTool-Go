@@ -176,6 +176,7 @@ interface ChromePortLike {
 interface ChromeRuntimeLike {
   id?: string;
   lastError?: { message?: string };
+  getURL?: (path: string) => string;
   sendMessage?: (
     message: unknown,
     callback?: (response: unknown) => void,
@@ -204,20 +205,45 @@ interface ChromePermissionsLike {
   contains?: (permissions: { origins: string[] }) => Promise<boolean>;
 }
 
+interface ChromeTabRecordLike {
+  id?: number;
+  windowId?: number;
+  url?: string;
+}
+
 interface ChromeTabsLike {
-  create?: (createProperties: { url: string; active?: boolean }) => Promise<unknown> | void;
+  create?: (createProperties: {
+    url: string;
+    active?: boolean;
+  }) => Promise<unknown> | void;
+  query?: (queryInfo: {
+    url?: string | string[];
+  }) => Promise<ChromeTabRecordLike[]>;
+  update?: (
+    tabId: number,
+    updateProperties: { active?: boolean },
+  ) => Promise<unknown> | void;
+}
+
+interface ChromeWindowsLike {
+  update?: (
+    windowId: number,
+    updateInfo: { focused?: boolean },
+  ) => Promise<unknown> | void;
 }
 
 function getChromeNamespace(): {
   runtime?: ChromeRuntimeLike;
   permissions?: ChromePermissionsLike;
   tabs?: ChromeTabsLike;
+  windows?: ChromeWindowsLike;
 } {
   const g = globalThis as unknown as {
     chrome?: {
       runtime?: ChromeRuntimeLike;
       permissions?: ChromePermissionsLike;
       tabs?: ChromeTabsLike;
+      windows?: ChromeWindowsLike;
     };
   };
   return g.chrome ?? {};
@@ -451,6 +477,61 @@ export function openSafeHttpTab(rawUrl: string): boolean {
     window.open(safeHref, "_blank", "noopener,noreferrer");
     return true;
   }
+  return false;
+}
+
+/**
+ * Opens the built-in Owner Parse Monitor Dashboard (`monitor.html`) in a browser tab.
+ * Reuses an already-open tab for the same extension page URL when `chrome.tabs.query`
+ * and `chrome.tabs.update` are available; otherwise opens a new tab via `chrome.tabs.create`.
+ * Safe no-op (`false`) outside a Chrome extension runtime.
+ */
+export async function openMonitorDashboardTab(): Promise<boolean> {
+  const { runtime, tabs, windows } = getChromeNamespace();
+  if (!runtime?.getURL) {
+    return false;
+  }
+  let monitorUrl = "";
+  try {
+    monitorUrl = runtime.getURL("monitor.html");
+  } catch {
+    return false;
+  }
+  if (!monitorUrl) return false;
+
+  if (tabs?.query && tabs?.update) {
+    try {
+      const existingTabs = await tabs.query({ url: monitorUrl });
+      const existing = Array.isArray(existingTabs)
+        ? existingTabs.find(
+            (tab) => typeof tab?.id === "number" && Number.isInteger(tab.id),
+          )
+        : undefined;
+      if (existing && typeof existing.id === "number") {
+        await tabs.update(existing.id, { active: true });
+        if (typeof existing.windowId === "number" && windows?.update) {
+          try {
+            await windows.update(existing.windowId, { focused: true });
+          } catch {
+            // Best-effort window focus
+          }
+        }
+        return true;
+      }
+    } catch {
+      // Fall through to tabs.create
+    }
+  }
+
+  if (tabs?.create) {
+    try {
+      await tabs.create({ url: monitorUrl, active: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   return false;
 }
 

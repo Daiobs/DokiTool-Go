@@ -28,6 +28,18 @@ const (
 	// PlatformUnknown is the bounded fallback platform label for missing, malformed, or unsupported URLs.
 	PlatformUnknown = "unknown"
 
+	// PlatformYTDLPOther is the bounded spill bucket for valid dynamic platform keys beyond MaxDynamicPlatforms.
+	PlatformYTDLPOther = "ytdlp_other"
+
+	// MaxDynamicPlatforms caps the number of distinct non-core dynamic platform keys retained in telemetry.
+	MaxDynamicPlatforms = 64
+
+	// DailyStatsWindowDays is the fixed number of Asia/Shanghai calendar days retained in daily stats.
+	DailyStatsWindowDays = 30
+
+	// HourlyStatsWindowHours is the fixed number of Asia/Shanghai clock hours retained in hourly stats.
+	HourlyStatsWindowHours = 24
+
 	// OutcomeUnauthorized records HTTP 401 bearer authentication rejections in telemetry
 	// while keeping the public unified-v1 HTTP wire code as INVALID_INPUT.
 	OutcomeUnauthorized = "UNAUTHORIZED"
@@ -40,9 +52,59 @@ const (
 	chOwnerIdx = 1
 	numCh      = 2
 
-	numPlatforms    = 15
-	numOutcomeCodes = 13
+	numCorePlatforms   = 14
+	platformUnknownIdx = 14
+	numPlatforms       = 15
+
+	outcomeOKIdx          = 0
+	outcomeInternalErrIdx = 11
+	numOutcomeCodes       = 13
+
+	shanghaiOffsetSeconds int64 = 8 * 3600
 )
+
+// shanghaiZone is a fixed UTC+8 location with zero host tzdata dependency.
+var shanghaiZone = time.FixedZone("Asia/Shanghai", int(shanghaiOffsetSeconds))
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b < 0 {
+		q--
+	}
+	return q
+}
+
+func shanghaiDayID(t time.Time) int64 {
+	return floorDiv(t.Unix()+shanghaiOffsetSeconds, 86400)
+}
+
+func formatShanghaiDayID(dayID int64) string {
+	return time.Unix(dayID*86400, 0).UTC().Format("2006-01-02")
+}
+
+func shanghaiHourID(t time.Time) int64 {
+	return floorDiv(t.Unix(), 3600)
+}
+
+func formatShanghaiHourID(hourID int64) string {
+	return time.Unix(hourID*3600, 0).In(shanghaiZone).Format(time.RFC3339)
+}
+
+func dailySlotIndex(dayID int64) int {
+	mod := dayID % DailyStatsWindowDays
+	if mod < 0 {
+		mod += DailyStatsWindowDays
+	}
+	return int(mod)
+}
+
+func hourlySlotIndex(hourID int64) int {
+	mod := hourID % HourlyStatsWindowHours
+	if mod < 0 {
+		mod += HourlyStatsWindowHours
+	}
+	return int(mod)
+}
 
 // HistogramBuckets aliases ytengine.HistogramBuckets so API telemetry shares one exact schema.
 type HistogramBuckets = ytengine.HistogramBuckets
@@ -98,7 +160,7 @@ func KnownOutcomeCodes() []string {
 	return out
 }
 
-func platformIndex(raw string) int {
+func corePlatformIndex(raw string) int {
 	switch raw {
 	case "douyin":
 		return 0
@@ -129,8 +191,41 @@ func platformIndex(raw string) int {
 	case "tumblr":
 		return 13
 	default:
-		return 14 // PlatformUnknown
+		return -1
 	}
+}
+
+func platformIndex(raw string) int {
+	if idx := corePlatformIndex(raw); idx >= 0 {
+		return idx
+	}
+	return platformUnknownIdx
+}
+
+// IsValidDynamicPlatformKey reports whether raw is a valid bounded dynamic platform identifier
+// matching ^[a-z0-9][a-z0-9_:-]{0,31}$ and excluding reserved meta tokens ("", "all", "unknown").
+func IsValidDynamicPlatformKey(raw string) bool {
+	if len(raw) == 0 || len(raw) > 32 {
+		return false
+	}
+	if raw == "all" || raw == PlatformUnknown {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		isLower := c >= 'a' && c <= 'z'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 {
+			if !isLower && !isDigit {
+				return false
+			}
+			continue
+		}
+		if !isLower && !isDigit && c != '_' && c != ':' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // NormalizePlatform maps any platform string onto the closed 15-element set.
@@ -228,6 +323,63 @@ var latencyBucketBounds = [10]time.Duration{
 	5000 * time.Millisecond,
 	10000 * time.Millisecond,
 	30000 * time.Millisecond,
+}
+
+var latencyBucketUpperMS = [10]uint64{
+	10,
+	50,
+	100,
+	250,
+	500,
+	1000,
+	2500,
+	5000,
+	10000,
+	30000,
+}
+
+func observeLatencyBins(bins *[11]uint64, maxMS *uint64, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	ms := uint64(d / time.Millisecond)
+	if ms > *maxMS {
+		*maxMS = ms
+	}
+	idx := len(latencyBucketBounds)
+	for i, bound := range latencyBucketBounds {
+		if d <= bound {
+			idx = i
+			break
+		}
+	}
+	bins[idx]++
+}
+
+func computeLatencyQuantileMS(bins [11]uint64, maxMS uint64, pct uint64) uint64 {
+	var total uint64
+	for _, n := range bins {
+		total += n
+	}
+	if total == 0 {
+		return 0
+	}
+	q, r := total/100, total%100
+	target := q*pct + (r*pct+99)/100
+	if target == 0 {
+		target = 1
+	}
+	var cum uint64
+	for i := 0; i < len(latencyBucketUpperMS); i++ {
+		cum += bins[i]
+		if cum >= target {
+			if latencyBucketUpperMS[i] > maxMS {
+				return maxMS
+			}
+			return latencyBucketUpperMS[i]
+		}
+	}
+	return maxMS
 }
 
 type apiAtomicHistogram struct {
@@ -418,6 +570,59 @@ type LatencyStatsSnapshot struct {
 	ByChannel LatencyChannelBreakdown `json:"by_channel"`
 }
 
+// DailyLatencySummary reports daily millisecond latency percentiles and maximum.
+type DailyLatencySummary struct {
+	P50MS uint64 `json:"p50_ms"`
+	P95MS uint64 `json:"p95_ms"`
+	MaxMS uint64 `json:"max_ms"`
+}
+
+// DailyPlatformStats reports per-platform daily aggregate counts, outcome code breakdown, and P95 latency.
+type DailyPlatformStats struct {
+	Total  uint64            `json:"total"`
+	OK     uint64            `json:"ok"`
+	Failed uint64            `json:"failed"`
+	ByCode map[string]uint64 `json:"by_code"`
+	P95MS  uint64            `json:"p95_ms"`
+}
+
+// DailyStatsBucket reports one Asia/Shanghai (UTC+8) natural day aggregate bucket.
+type DailyStatsBucket struct {
+	Date         string                        `json:"date"`
+	Total        uint64                        `json:"total"`
+	OK           uint64                        `json:"ok"`
+	Failed       uint64                        `json:"failed"`
+	CacheHits    uint64                        `json:"cache_hits"`
+	ShanghaiHits uint64                        `json:"shanghai_hits"`
+	LatencyMS    DailyLatencySummary           `json:"latency_ms"`
+	ByPlatform   map[string]DailyPlatformStats `json:"by_platform"`
+}
+
+// HourlyStatsBucket reports one Asia/Shanghai (UTC+8) clock hour aggregate bucket.
+type HourlyStatsBucket struct {
+	HourStart string `json:"hour_start"`
+	Total     uint64 `json:"total"`
+	OK        uint64 `json:"ok"`
+	Failed    uint64 `json:"failed"`
+	CacheHits uint64 `json:"cache_hits"`
+}
+
+// RuntimeConfigSnapshot exposes strictly redacted, read-only deployment feature switches.
+// It never includes URLs, IPs, tokens, secrets, or local file paths.
+type RuntimeConfigSnapshot struct {
+	Version                 string `json:"version"`
+	ShanghaiMode            string `json:"shanghai_mode"`
+	ShanghaiBilibili        bool   `json:"shanghai_bilibili"`
+	BilibiliDASH            bool   `json:"bilibili_dash"`
+	YouTubeHelper           bool   `json:"youtube_helper"`
+	XHSTransport            string `json:"xhs_transport"`
+	YTDLPEnabled            bool   `json:"ytdlp_enabled"`
+	YTDLPGenericEnabled     bool   `json:"ytdlp_generic_enabled"`
+	TBVideoPipigx           bool   `json:"tbvideo_pipigx"`
+	TBVideoZuiyou           bool   `json:"tbvideo_zuiyou"`
+	StatsPersistenceEnabled bool   `json:"stats_persistence_enabled"`
+}
+
 // StatsSnapshot is the read-only data payload returned by GET /api/stats.
 type StatsSnapshot struct {
 	StartedAt      string                     `json:"started_at"`
@@ -430,6 +635,9 @@ type StatsSnapshot struct {
 	YTDLP          ytengine.SlotStatsSnapshot `json:"ytdlp"`
 	Shanghai       shresolver.StatsSnapshot   `json:"shanghai"`
 	ParseLatencyMS LatencyStatsSnapshot       `json:"parse_latency_ms"`
+	Runtime        RuntimeConfigSnapshot      `json:"runtime"`
+	Daily          []DailyStatsBucket         `json:"daily"`
+	Hourly         []HourlyStatsBucket        `json:"hourly"`
 }
 
 type cacheAtomicCounters struct {
@@ -448,8 +656,207 @@ func (c *cacheAtomicCounters) snapshot() CacheChannelCounts {
 	}
 }
 
+type dynamicPlatformCounters struct {
+	outcomes [numOutcomeCodes][numCh]uint64
+}
+
+type dailyPlatformRecord struct {
+	byCode      [numOutcomeCodes]uint64
+	latencyBins [11]uint64
+	maxMS       uint64
+}
+
+func (r *dailyPlatformRecord) snapshot() (DailyPlatformStats, bool) {
+	if r == nil {
+		return DailyPlatformStats{}, false
+	}
+	var total uint64
+	byCode := make(map[string]uint64, 4)
+	for c := 0; c < numOutcomeCodes; c++ {
+		if n := r.byCode[c]; n > 0 {
+			total += n
+			byCode[knownOutcomeCodes[c]] = n
+		}
+	}
+	if total == 0 {
+		return DailyPlatformStats{}, false
+	}
+	okCount := r.byCode[outcomeOKIdx]
+	return DailyPlatformStats{
+		Total:  total,
+		OK:     okCount,
+		Failed: total - okCount,
+		ByCode: byCode,
+		P95MS:  computeLatencyQuantileMS(r.latencyBins, r.maxMS, 95),
+	}, true
+}
+
+type dailyBucket struct {
+	valid        bool
+	dayID        int64
+	total        uint64
+	ok           uint64
+	failed       uint64
+	cacheHits    uint64
+	shanghaiHits uint64
+	latencyBins  [11]uint64
+	maxMS        uint64
+	byPlatform   map[string]*dailyPlatformRecord
+}
+
+func (b *dailyBucket) reset(dayID int64) {
+	*b = dailyBucket{
+		valid: true,
+		dayID: dayID,
+	}
+}
+
+func (b *dailyBucket) getOrCreatePlatform(platform string) *dailyPlatformRecord {
+	if b.byPlatform == nil {
+		b.byPlatform = make(map[string]*dailyPlatformRecord, 4)
+	}
+	rec := b.byPlatform[platform]
+	if rec == nil {
+		rec = &dailyPlatformRecord{}
+		b.byPlatform[platform] = rec
+	}
+	return rec
+}
+
+func (b *dailyBucket) snapshotForDay(dayID int64) DailyStatsBucket {
+	out := DailyStatsBucket{
+		Date:       formatShanghaiDayID(dayID),
+		ByPlatform: make(map[string]DailyPlatformStats),
+	}
+	if !b.valid || b.dayID != dayID {
+		return out
+	}
+	out.Total = b.total
+	out.OK = b.ok
+	out.Failed = b.failed
+	out.CacheHits = b.cacheHits
+	out.ShanghaiHits = b.shanghaiHits
+	out.LatencyMS = DailyLatencySummary{
+		P50MS: computeLatencyQuantileMS(b.latencyBins, b.maxMS, 50),
+		P95MS: computeLatencyQuantileMS(b.latencyBins, b.maxMS, 95),
+		MaxMS: b.maxMS,
+	}
+	for plat, rec := range b.byPlatform {
+		if ps, nonZero := rec.snapshot(); nonZero {
+			out.ByPlatform[plat] = ps
+		}
+	}
+	return out
+}
+
+type hourlyBucket struct {
+	valid     bool
+	hourID    int64
+	total     uint64
+	ok        uint64
+	failed    uint64
+	cacheHits uint64
+}
+
+func (b *hourlyBucket) reset(hourID int64) {
+	*b = hourlyBucket{
+		valid:  true,
+		hourID: hourID,
+	}
+}
+
+func (b *hourlyBucket) snapshotForHour(hourID int64) HourlyStatsBucket {
+	out := HourlyStatsBucket{
+		HourStart: formatShanghaiHourID(hourID),
+	}
+	if !b.valid || b.hourID != hourID {
+		return out
+	}
+	out.Total = b.total
+	out.OK = b.ok
+	out.Failed = b.failed
+	out.CacheHits = b.cacheHits
+	return out
+}
+
+func emptyDailyBuckets(now time.Time) []DailyStatsBucket {
+	todayID := shanghaiDayID(now)
+	out := make([]DailyStatsBucket, DailyStatsWindowDays)
+	for i := 0; i < DailyStatsWindowDays; i++ {
+		dID := todayID - int64(DailyStatsWindowDays-1-i)
+		out[i] = DailyStatsBucket{
+			Date:       formatShanghaiDayID(dID),
+			ByPlatform: make(map[string]DailyPlatformStats),
+		}
+	}
+	return out
+}
+
+func emptyHourlyBuckets(now time.Time) []HourlyStatsBucket {
+	curHourID := shanghaiHourID(now)
+	out := make([]HourlyStatsBucket, HourlyStatsWindowHours)
+	for i := 0; i < HourlyStatsWindowHours; i++ {
+		hID := curHourID - int64(HourlyStatsWindowHours-1-i)
+		out[i] = HourlyStatsBucket{
+			HourStart: formatShanghaiHourID(hID),
+		}
+	}
+	return out
+}
+
+func sanitizeVersionString(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	b.Grow(len(trimmed))
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if c >= 0x20 && c != 0x7f {
+			b.WriteByte(c)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" {
+		return "unknown"
+	}
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	return out
+}
+
+func normalizeShanghaiMode(raw string) string {
+	switch raw {
+	case "direct", "pull":
+		return raw
+	default:
+		return "off"
+	}
+}
+
+func normalizeXHSTransport(raw string) string {
+	if raw == "chrome131" {
+		return "chrome131"
+	}
+	return "standard"
+}
+
+func normalizeRuntimeConfig(cfg RuntimeConfigSnapshot, shSnap shresolver.StatsSnapshot, hasShSrc bool) RuntimeConfigSnapshot {
+	cfg.Version = sanitizeVersionString(cfg.Version)
+	cfg.ShanghaiMode = normalizeShanghaiMode(cfg.ShanghaiMode)
+	if cfg.ShanghaiMode == "off" && hasShSrc {
+		if inferred := normalizeShanghaiMode(shSnap.Mode); inferred != "off" {
+			cfg.ShanghaiMode = inferred
+		}
+	}
+	cfg.XHSTransport = normalizeXHSTransport(cfg.XHSTransport)
+	return cfg
+}
+
 // Stats collects bounded-cardinality in-process aggregate telemetry across admission,
-// caching/singleflight, yt-dlp concurrency slots, and Shanghai resolution.
+// caching/singleflight, yt-dlp concurrency slots, Shanghai resolution, and Asia/Shanghai time windows.
 type Stats struct {
 	startedAt time.Time
 	clock     func() time.Time
@@ -457,12 +864,23 @@ type Stats struct {
 	outcomes [numPlatforms][numOutcomeCodes][numCh]atomic.Uint64
 	cacheCh  [numCh]cacheAtomicCounters
 	latency  [numCh]apiAtomicHistogram
+	hasShSrc atomic.Bool
 
-	mu       sync.RWMutex
-	cacheSrc *parseCache
-	admSrc   *admission
-	ytdlpSrc *ytengine.Engine
-	shSrc    shresolver.StatsProvider
+	saveMu sync.Mutex
+
+	mu                     sync.RWMutex
+	cacheSrc               *parseCache
+	admSrc                 *admission
+	ytdlpSrc               *ytengine.Engine
+	shSrc                  shresolver.StatsProvider
+	shSrcGen               uint64
+	lastSyncedShanghaiHits uint64
+	runtimeCfg             RuntimeConfigSnapshot
+
+	dynamicPlatforms map[string]*dynamicPlatformCounters
+	dynamicOther     dynamicPlatformCounters
+	daily            [DailyStatsWindowDays]dailyBucket
+	hourly           [HourlyStatsWindowHours]hourlyBucket
 }
 
 // NewStats constructs an in-process aggregate telemetry collector.
@@ -472,8 +890,9 @@ func NewStats(clock func() time.Time) *Stats {
 		clock = time.Now
 	}
 	return &Stats{
-		startedAt: clock().UTC(),
-		clock:     clock,
+		startedAt:        clock().UTC(),
+		clock:            clock,
+		dynamicPlatforms: make(map[string]*dynamicPlatformCounters),
 	}
 }
 
@@ -521,6 +940,101 @@ func (s *Stats) SetShanghaiSource(provider shresolver.StatsProvider) {
 	}
 	s.mu.Lock()
 	s.shSrc = provider
+	s.shSrcGen++
+	s.lastSyncedShanghaiHits = 0
+	s.mu.Unlock()
+	s.hasShSrc.Store(provider != nil)
+}
+
+// SetRuntimeConfig records the strictly redacted read-only runtime switches exposed by GET /api/stats.
+func (s *Stats) SetRuntimeConfig(cfg RuntimeConfigSnapshot) {
+	if s == nil {
+		return
+	}
+	cfg.Version = sanitizeVersionString(cfg.Version)
+	cfg.ShanghaiMode = normalizeShanghaiMode(cfg.ShanghaiMode)
+	cfg.XHSTransport = normalizeXHSTransport(cfg.XHSTransport)
+	s.mu.Lock()
+	s.runtimeCfg = cfg
+	s.mu.Unlock()
+}
+
+func (s *Stats) getDailyBucketLocked(now time.Time) *dailyBucket {
+	dayID := shanghaiDayID(now)
+	b := &s.daily[dailySlotIndex(dayID)]
+	if !b.valid || b.dayID != dayID {
+		b.reset(dayID)
+	}
+	return b
+}
+
+func (s *Stats) getHourlyBucketLocked(now time.Time) *hourlyBucket {
+	hourID := shanghaiHourID(now)
+	b := &s.hourly[hourlySlotIndex(hourID)]
+	if !b.valid || b.hourID != hourID {
+		b.reset(hourID)
+	}
+	return b
+}
+
+func (s *Stats) recordWindowOutcomeLocked(now time.Time, platform string, cIdx int, elapsed time.Duration) {
+	db := s.getDailyBucketLocked(now)
+	db.total++
+	if cIdx == outcomeOKIdx {
+		db.ok++
+	} else {
+		db.failed++
+	}
+	observeLatencyBins(&db.latencyBins, &db.maxMS, elapsed)
+	prec := db.getOrCreatePlatform(platform)
+	prec.byCode[cIdx]++
+	observeLatencyBins(&prec.latencyBins, &prec.maxMS, elapsed)
+
+	hb := s.getHourlyBucketLocked(now)
+	hb.total++
+	if cIdx == outcomeOKIdx {
+		hb.ok++
+	} else {
+		hb.failed++
+	}
+}
+
+func (s *Stats) readShanghaiSnapshot() (shresolver.StatsSnapshot, uint64, bool) {
+	if s == nil || !s.hasShSrc.Load() {
+		return shresolver.StatsSnapshot{Mode: "off"}, 0, false
+	}
+	s.mu.RLock()
+	shSrc := s.shSrc
+	gen := s.shSrcGen
+	s.mu.RUnlock()
+	if shSrc == nil {
+		return shresolver.StatsSnapshot{Mode: "off"}, gen, false
+	}
+	return shSrc.ShanghaiStatsSnapshot(), gen, true
+}
+
+func (s *Stats) applyShanghaiDeltaLocked(now time.Time, shSnap shresolver.StatsSnapshot, shGen uint64, hasSh bool) {
+	if !hasSh || s.shSrc == nil || s.shSrcGen != shGen {
+		return
+	}
+	curHits := shSnap.Total.Hits
+	if curHits > s.lastSyncedShanghaiHits {
+		delta := curHits - s.lastSyncedShanghaiHits
+		s.lastSyncedShanghaiHits = curHits
+		s.getDailyBucketLocked(now).shanghaiHits += delta
+	}
+}
+
+func (s *Stats) syncShanghaiHits(now time.Time) {
+	if s == nil || !s.hasShSrc.Load() {
+		return
+	}
+	shSnap, shGen, hasSh := s.readShanghaiSnapshot()
+	if !hasSh {
+		return
+	}
+	s.mu.Lock()
+	s.applyShanghaiDeltaLocked(now, shSnap, shGen, hasSh)
 	s.mu.Unlock()
 }
 
@@ -535,6 +1049,71 @@ func (s *Stats) RecordParse(platform, code, channel string, elapsed time.Duratio
 	ch := channelIdx(channel)
 	s.outcomes[pIdx][cIdx][ch].Add(1)
 	s.latency[ch].observe(elapsed)
+
+	now := s.now()
+	shSnap, shGen, hasSh := s.readShanghaiSnapshot()
+	s.mu.Lock()
+	s.recordWindowOutcomeLocked(now, knownPlatforms[pIdx], cIdx, elapsed)
+	s.applyShanghaiDeltaLocked(now, shSnap, shGen, hasSh)
+	s.mu.Unlock()
+}
+
+// RecordDynamicParse records one completed parse outcome supporting both core platforms and
+// bounded dynamic platform keys (up to MaxDynamicPlatforms distinct keys; excess keys spill to ytdlp_other).
+func (s *Stats) RecordDynamicParse(platform, code, channel string, elapsed time.Duration) {
+	if s == nil {
+		return
+	}
+	cIdx := outcomeCodeIndex(code)
+	ch := channelIdx(channel)
+	s.latency[ch].observe(elapsed)
+
+	now := s.now()
+	shSnap, shGen, hasSh := s.readShanghaiSnapshot()
+
+	if pIdx := corePlatformIndex(platform); pIdx >= 0 {
+		s.outcomes[pIdx][cIdx][ch].Add(1)
+		s.mu.Lock()
+		s.recordWindowOutcomeLocked(now, knownPlatforms[pIdx], cIdx, elapsed)
+		s.applyShanghaiDeltaLocked(now, shSnap, shGen, hasSh)
+		s.mu.Unlock()
+		return
+	}
+	if !IsValidDynamicPlatformKey(platform) {
+		s.outcomes[platformUnknownIdx][cIdx][ch].Add(1)
+		s.mu.Lock()
+		s.recordWindowOutcomeLocked(now, PlatformUnknown, cIdx, elapsed)
+		s.applyShanghaiDeltaLocked(now, shSnap, shGen, hasSh)
+		s.mu.Unlock()
+		return
+	}
+
+	s.mu.Lock()
+	recordedPlat := platform
+	if platform == PlatformYTDLPOther {
+		s.dynamicOther.outcomes[cIdx][ch]++
+	} else {
+		if s.dynamicPlatforms == nil {
+			s.dynamicPlatforms = make(map[string]*dynamicPlatformCounters)
+		}
+		rec, exists := s.dynamicPlatforms[platform]
+		if !exists {
+			if len(s.dynamicPlatforms) < MaxDynamicPlatforms {
+				rec = &dynamicPlatformCounters{}
+				s.dynamicPlatforms[platform] = rec
+			} else {
+				recordedPlat = PlatformYTDLPOther
+			}
+		}
+		if rec != nil {
+			rec.outcomes[cIdx][ch]++
+		} else {
+			s.dynamicOther.outcomes[cIdx][ch]++
+		}
+	}
+	s.recordWindowOutcomeLocked(now, recordedPlat, cIdx, elapsed)
+	s.applyShanghaiDeltaLocked(now, shSnap, shGen, hasSh)
+	s.mu.Unlock()
 }
 
 func (s *Stats) recordCacheHit(channel string) {
@@ -542,6 +1121,11 @@ func (s *Stats) recordCacheHit(channel string) {
 		return
 	}
 	s.cacheCh[channelIdx(channel)].hits.Add(1)
+	now := s.now()
+	s.mu.Lock()
+	s.getDailyBucketLocked(now).cacheHits++
+	s.getHourlyBucketLocked(now).cacheHits++
+	s.mu.Unlock()
 }
 
 func (s *Stats) recordCacheMiss(channel string) {
@@ -568,19 +1152,25 @@ func (s *Stats) recordCacheUncacheable(channel string) {
 // Snapshot captures a point-in-time read-only view of all aggregate counters and gauges.
 func (s *Stats) Snapshot() StatsSnapshot {
 	if s == nil {
-		now := time.Now().UTC().Format(time.RFC3339)
+		nowRaw := time.Now()
+		nowStr := nowRaw.UTC().Format(time.RFC3339)
+		shOff := shresolver.StatsSnapshot{Mode: "off"}
 		return StatsSnapshot{
-			StartedAt:   now,
-			GeneratedAt: now,
+			StartedAt:   nowStr,
+			GeneratedAt: nowStr,
 			Requests: RequestStatsSnapshot{
 				ByPlatformCodeChannel: make([]PlatformOutcomeCount, 0),
 			},
 			APIKeys:  make([]APIKeyStatsSnapshot, 0),
-			Shanghai: shresolver.StatsSnapshot{Mode: "off"},
+			Shanghai: shOff,
+			Runtime:  normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
+			Daily:    emptyDailyBuckets(nowRaw),
+			Hourly:   emptyHourlyBuckets(nowRaw),
 		}
 	}
 
-	now := s.now().UTC()
+	nowRaw := s.now()
+	now := nowRaw.UTC()
 	uptime := int64(now.Sub(s.startedAt).Seconds())
 	if uptime < 0 {
 		uptime = 0
@@ -633,6 +1223,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	admSrc := s.admSrc
 	ytdlpSrc := s.ytdlpSrc
 	shSrc := s.shSrc
+	shGen := s.shSrcGen
 	s.mu.RUnlock()
 
 	if cacheSrc != nil {
@@ -656,6 +1247,77 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		shSnap = shSrc.ShanghaiStatsSnapshot()
 	}
 
+	s.mu.Lock()
+	s.applyShanghaiDeltaLocked(nowRaw, shSnap, shGen, shSrc != nil)
+
+	if len(s.dynamicPlatforms) > 0 {
+		dynKeys := make([]string, 0, len(s.dynamicPlatforms))
+		for k := range s.dynamicPlatforms {
+			dynKeys = append(dynKeys, k)
+		}
+		slices.Sort(dynKeys)
+		for _, k := range dynKeys {
+			rec := s.dynamicPlatforms[k]
+			for c := 0; c < numOutcomeCodes; c++ {
+				if anonCount := rec.outcomes[c][chAnonIdx]; anonCount > 0 {
+					anonReq += anonCount
+					cells = append(cells, PlatformOutcomeCount{
+						Platform: k,
+						Code:     knownOutcomeCodes[c],
+						Channel:  ChannelAnonymous,
+						Count:    anonCount,
+					})
+				}
+				if ownerCount := rec.outcomes[c][chOwnerIdx]; ownerCount > 0 {
+					ownerReq += ownerCount
+					cells = append(cells, PlatformOutcomeCount{
+						Platform: k,
+						Code:     knownOutcomeCodes[c],
+						Channel:  ChannelOwner,
+						Count:    ownerCount,
+					})
+				}
+			}
+		}
+	}
+	for c := 0; c < numOutcomeCodes; c++ {
+		if anonCount := s.dynamicOther.outcomes[c][chAnonIdx]; anonCount > 0 {
+			anonReq += anonCount
+			cells = append(cells, PlatformOutcomeCount{
+				Platform: PlatformYTDLPOther,
+				Code:     knownOutcomeCodes[c],
+				Channel:  ChannelAnonymous,
+				Count:    anonCount,
+			})
+		}
+		if ownerCount := s.dynamicOther.outcomes[c][chOwnerIdx]; ownerCount > 0 {
+			ownerReq += ownerCount
+			cells = append(cells, PlatformOutcomeCount{
+				Platform: PlatformYTDLPOther,
+				Code:     knownOutcomeCodes[c],
+				Channel:  ChannelOwner,
+				Count:    ownerCount,
+			})
+		}
+	}
+
+	todayID := shanghaiDayID(nowRaw)
+	daily := make([]DailyStatsBucket, DailyStatsWindowDays)
+	for i := 0; i < DailyStatsWindowDays; i++ {
+		dID := todayID - int64(DailyStatsWindowDays-1-i)
+		daily[i] = s.daily[dailySlotIndex(dID)].snapshotForDay(dID)
+	}
+
+	curHourID := shanghaiHourID(nowRaw)
+	hourly := make([]HourlyStatsBucket, HourlyStatsWindowHours)
+	for i := 0; i < HourlyStatsWindowHours; i++ {
+		hID := curHourID - int64(HourlyStatsWindowHours-1-i)
+		hourly[i] = s.hourly[hourlySlotIndex(hID)].snapshotForHour(hID)
+	}
+
+	runtimeCfg := normalizeRuntimeConfig(s.runtimeCfg, shSnap, shSrc != nil)
+	s.mu.Unlock()
+
 	latAnon := s.latency[chAnonIdx].snapshot()
 	latOwner := s.latency[chOwnerIdx].snapshot()
 	latTotal := mergeHistograms(latAnon, latOwner)
@@ -678,6 +1340,9 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			Total:     latTotal,
 			ByChannel: LatencyChannelBreakdown{Anonymous: latAnon, Owner: latOwner},
 		},
+		Runtime: runtimeCfg,
+		Daily:   daily,
+		Hourly:  hourly,
 	}
 }
 

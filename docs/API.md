@@ -11,7 +11,7 @@
 | `GET /api/parse` | `schema_version=1.0`（必填）；`url` 为分享 URL 或包含 URL 的分享文本（必填）；可选 `platform` 为目录中的平台 ID（`all` 或省略时自动按域名识别）；可选 `debug=1` 返回规范化全量版本。 |
 | `GET /api/resolve` | `schema_version=1.0`（必填）；使用后端给出的 `resolve_url`，携带原分享 `url`、`platform` 与不透明的 `item_id`（必填，长度 `<= 256`）解析指定分集；同样支持 `debug=1`。客户端不能从 ID 拼平台参数或借用其他分 P 的地址。 |
 | `GET /api/platforms` | `schema_version=1.0`（必填）；返回当前已启用平台的公开目录。 |
-| `GET /api/stats` | 可选 `schema_version=1.0`；仅限 `owner` 角色 Bearer 凭据访问（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥），返回进程内请求、缓存、准入池与各 API 密钥池（`data.api_keys`）运行统计快照；`agent` / `friend` 角色密钥访问时返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。 |
+| `GET /api/stats` | 可选 `schema_version=1.0`；仅限 `owner` 角色 Bearer 凭据访问（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥），返回进程内请求、缓存、准入池、各 API 密钥池（`data.api_keys`）、只读脱敏运行开关（`data.runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`data.daily`）与近 24 小时时桶（`data.hourly`）快照；`agent` / `friend` 角色密钥访问时返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。 |
 | `GET /api/youtube/context` | `schema_version=1.0`（必填）；在启用 `DOKITOOL_YOUTUBE_HELPER` 时返回当前缓存的 YouTube `player_id`、`signature_timestamp` 与固定客户端参数，供同源用户脚本在浏览器端请求播放清单。未启用时返回 `404`。 |
 | `POST /api/youtube/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收浏览器端用户脚本提交的流清单载荷（`<= 512 KiB`），在无权限 Deno `ejs` 沙箱内完成签名解算并返回标准统一媒体 v1 结果。未启用时返回 `404`。 |
 
@@ -26,6 +26,10 @@ curl --get 'https://snap.example.com/api/parse' \
 **Bearer 多密钥角色隔离与鉴权后零槽位缓存快路径**：`/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口可选携带 `Authorization: Bearer <token>`（支持 `DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥及 `DOKITOOL_API_KEYS_FILE` 中的 `owner` / `agent` / `friend` 角色密钥，每把密钥拥有独立的并发池、慢解析子并发上限 `slow_concurrency`、速率桶与 FIFO 队列；配置与 `SIGHUP` 热重载见 [CONFIGURATION.md](CONFIGURATION.md)）：
 - **角色与平台白名单边界**：`/api/stats` 严格仅允许 `owner` 角色访问（`agent` / `friend` 密钥访问返回 HTTP `401`）；若密钥配置了 `platforms` 平台白名单，请求白名单外的平台（无论缓存命中与否）同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
 - **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：通过鉴权与平台白名单校验后，命中进程内新鲜缓存的 `GET /api/parse` 与 `GET /api/resolve` 请求，以及 `GET /api/platforms` 与命中缓存的 `GET /api/youtube/context` 请求，仅校验该密钥的快读速率桶即直接返回响应，**占用 `0` 个密钥并发槽位**，不会因该密钥并发池被慢请求占满而排队阻塞。
+- **`GET /api/stats` 监控扩展字段（`runtime` / `daily` / `hourly`）**：除累计请求、缓存、准入池、`ytdlp`、`shanghai`、`parse_latency_ms` 与 `api_keys` 外，`data` 同步返回三组只读脱敏字段（完整 Schema 见 [docs/openapi.json](openapi.json)）：
+  - `data.runtime`：当前进程 11 项只读运行开关（`version`、`shanghai_mode`、`shanghai_bilibili`、`bilibili_dash`、`youtube_helper`、`xhs_transport`、`ytdlp_enabled`、`ytdlp_generic_enabled`、`tbvideo_pipigx`、`tbvideo_zuiyou`、`stats_persistence_enabled`），绝不暴露任何 URL、IP、路径或凭据；
+  - `data.daily`：按 `Asia/Shanghai`（UTC+8）自然日升序排列的滚动日桶数组（最多 30 天），每项含 `date`（`YYYY-MM-DD`）、`total`、`ok`、`failed`、`cache_hits`、`shanghai_hits`、`latency_ms`（`p50_ms` / `p95_ms` / `max_ms`）及 `by_platform`（按平台汇总总量、成功/失败数、`by_code` 错误分布与 `p95_ms`；平台键覆盖 14 个核心平台、`unknown`、受控上限 64 个规范化长尾提取器标识及溢出桶 `ytdlp_other`）；
+  - `data.hourly`：按 `Asia/Shanghai`（`+08:00`）整点升序排列的滚动时桶数组（最多 24 小时），每项含 `hour_start`（RFC 3339）、`total`、`ok`、`failed`、`cache_hits`。配置 `DOKITOOL_STATS_SNAPSHOT_PATH` 后，日桶与时桶会按原子写盘跨重启保留（见 [CONFIGURATION.md](CONFIGURATION.md)）。
 
 目录响应为 `{"schema_version":"1.0","code":"OK","data":{"platforms":[...]}}`。每个平台包含 `id/name/site_url/capabilities`，可选 `icon`；不会返回内部文件路径。唯一注册源是 `backend/config/platforms.json`，同时供后端路由、CLI 导出和前端构建快照使用。运行中的页面也会获取目录，失败时保留构建快照。没有专用展示图标的新平台使用通用图标，不影响解析。
 

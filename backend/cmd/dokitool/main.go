@@ -184,12 +184,33 @@ func run(args []string) error {
 	if ytEngine != nil {
 		handler.Stats().SetYTDLPEngine(ytEngine)
 	}
+	shanghaiMode := "off"
+	shanghaiBilibili := false
 	if sp, ok := shanghai.(shresolver.StatsProvider); ok {
 		handler.Stats().SetShanghaiSource(sp)
+		shanghaiMode = sp.ShanghaiStatsSnapshot().Mode
 	}
-	if err := configureYouTubeHelper(c, handler, executor, os.Getenv); err != nil {
+	if sw, ok := shanghai.(interface{ BilibiliEnabled() bool }); ok {
+		shanghaiBilibili = sw.BilibiliEnabled()
+	}
+	youtubeHelperEnabled, err := configureYouTubeHelperWithState(c, handler, executor, os.Getenv)
+	if err != nil {
 		return err
 	}
+	statsSnapshotPath := strings.TrimSpace(os.Getenv(api.EnvStatsSnapshotPath))
+	handler.Stats().SetRuntimeConfig(api.RuntimeConfigSnapshot{
+		Version:                 version,
+		ShanghaiMode:            shanghaiMode,
+		ShanghaiBilibili:        shanghaiBilibili,
+		BilibiliDASH:            bilibiliDASH,
+		YouTubeHelper:           youtubeHelperEnabled,
+		XHSTransport:            *xhsTransport,
+		YTDLPEnabled:            ytEngine != nil,
+		YTDLPGenericEnabled:     false,
+		TBVideoPipigx:           pipigxSave,
+		TBVideoZuiyou:           zuiyouSave,
+		StatsPersistenceEnabled: statsSnapshotPath != "",
+	})
 	// The route is present even without a configured key, where it returns the
 	// PHP-compatible legacy 503 media envelope without issuing network calls.
 	handler.SetWeiboRelay(weibo.NewMediaRelay(os.Getenv("SNAP_MEDIA_SIGNING_KEY")))
@@ -205,6 +226,9 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if statsSnapshotPath != "" {
+		_ = handler.Stats().LoadSnapshot(statsSnapshotPath, log.Printf)
+	}
 	server := &http.Server{Addr: *listen, Handler: entry, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -215,6 +239,8 @@ func run(args []string) error {
 	defer stopKeyReload()
 	stopStatsLog := handler.Stats().StartPeriodicLog(ctx, api.DefaultStatsLogInterval, log.Printf)
 	defer stopStatsLog()
+	stopStatsSnap := handler.Stats().StartPeriodicSnapshot(ctx, statsSnapshotPath, api.DefaultStatsSnapshotInterval, log.Printf)
+	defer stopStatsSnap()
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	log.Printf("DokiTool Go API %s listening on %s; admission=%+v", version, *listen, limits)
@@ -227,7 +253,14 @@ func run(args []string) error {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 310*time.Second)
 		defer cancel()
-		return server.Shutdown(shutdown)
+		shutdownErr := server.Shutdown(shutdown)
+		stopStatsSnap()
+		if statsSnapshotPath != "" {
+			if saveErr := handler.Stats().SaveSnapshot(statsSnapshotPath); saveErr != nil {
+				log.Printf("dokitool: final stats snapshot save failed: %v", saveErr)
+			}
+		}
+		return shutdownErr
 	}
 }
 
@@ -537,30 +570,35 @@ func newXEngine(baseEngine *ytengine.Engine) *ytengine.Engine {
 // Deno + yt-dlp/ejs runtime assets pass SHA-256 verification.
 // Verification failure disables only the YouTube helper without affecting other platforms.
 func configureYouTubeHelper(c *catalog.Catalog, handler *api.Handler, executor fetch.Executor, getenv func(string) string) error {
+	_, err := configureYouTubeHelperWithState(c, handler, executor, getenv)
+	return err
+}
+
+func configureYouTubeHelperWithState(c *catalog.Catalog, handler *api.Handler, executor fetch.Executor, getenv func(string) string) (bool, error) {
 	raw := getenv("DOKITOOL_YOUTUBE_HELPER")
 	if raw == "" {
-		return nil
+		return false, nil
 	}
 	enabled, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fmt.Errorf("DOKITOOL_YOUTUBE_HELPER must be a boolean")
+		return false, fmt.Errorf("DOKITOOL_YOUTUBE_HELPER must be a boolean")
 	}
 	if !enabled {
-		return nil
+		return false, nil
 	}
 	helper, err := youtube.NewHelperFromEnv(executor, getenv, time.Now)
 	if err != nil {
 		log.Printf("dokitool: youtube helper runtime preflight failed (youtube helper disabled): %v", err)
-		return nil
+		return false, nil
 	}
 	if c != nil && !c.Has("youtube") {
 		if err := c.Register(catalog.YouTubePlatform()); err != nil {
-			return err
+			return false, err
 		}
 	}
 	sb := helper.Sandbox()
 	log.Printf("dokitool: youtube helper runtime verified (deno_version=%s, deno_asset=%s, deno_sha256=%s, ejs_version=%s, lib_sha256=%s, core_sha256=%s)",
 		youtube.PinnedDenoVersion, sb.DenoAsset(), sb.DenoSHA256(), youtube.PinnedEJSVersion, sb.LibSHA256(), sb.CoreSHA256())
 	handler.SetYouTubeHelper(helper)
-	return nil
+	return true, nil
 }

@@ -29,6 +29,14 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
 6. **浅色 / 深色 / 跟随系统主题切换与动态工具栏状态**
    - 侧边栏支持 **浅色（Light）/ 深色（Dark）/ 跟随系统（System）** 三态主题切换，即时持久化保存且与系统深浅色联动。
    - 后台下载或极速下载进行时，扩展工具栏图标实时更新 **百分比进度角标（Badge）** 与 **动态悬停提示（Tooltip）**，无需展开侧边栏即可一眼掌握当前任务进度与完成状态。
+7. **管理员只读状态胶囊与内置宽屏解析监控大盘（`monitor.html`）**
+   - **侧边栏只读状态胶囊（严格 `owner` 权限隔离）**：仅当用户在设置中配置了 `owner` 角色 Bearer Token 且后台 `GET /api/stats?schema_version=1.0` 返回 `200 OK` 时，侧边栏才会展示紧凑的管理员状态胶囊，一眼呈现今日解析次数、今日成功率、上海节点在线状态灯以及 **「解析监控大盘 ↗」** 入口按钮；匿名访客（未配置 Token，不向 `/api/stats` 发起请求）或普通 `friend` / `agent` 角色密钥（服务端返回 `401`）下该状态胶囊静默隐藏，绝不弹出任何报错提示。
+   - **内置宽屏解析监控大盘（`monitor.html`）**：点击状态胶囊中的 **「解析监控大盘 ↗」** 按钮后，在扩展独立宽屏标签页打开内置 `monitor.html`（自动复用已打开标签页）。页面纯本地原生 SVG + CSS 渲染（零第三方图表库、零外链脚本），与侧边栏共享三态主题并支持手动刷新及页面切入后台时自动暂停的 30 秒自动刷新，涵盖五大只读观测模块：
+     - **核心指标卡**：今日解析总量与成功率（含较昨日变化）、缓存命中率与内存占用、上海节点在线 Worker 数与命中率、后端版本与在线时长；
+     - **运行时开关矩阵与并发池水位**：只读展示后端 `runtime` 全部 11 项脱敏开关，以及 `fast` / `slow` / `owner` 准入池与 `yt-dlp` 槽位实时活跃与排队水位条；
+     - **原生 SVG 趋势图**：支持「近 7 天 / 近 30 天」切换的日度成功/失败堆叠柱状图 + 成功率折线图，以及「近 24 小时」请求波动堆叠柱状图（按 `Asia/Shanghai` UTC+8 统计，支持悬停明细）；
+     - **平台每日解析健康度总览表**：支持「今日 / 昨日 / 近 7 天 / 近 30 天 / 启动以来」五档窗口切换与排序，展示各平台（含核心平台与长尾平台）解析量、成功率进度条、高亮错误码标签与 P95 延迟；
+     - **多 Key 调用统计表**：脱敏展示各已配置 API Key 的 `id`、角色、启用状态、请求/成功/错误/缓存命中/限流/越权次数与当前并发占用（绝不显示令牌或摘要）。
 
 ---
 
@@ -83,6 +91,7 @@ npm run build:extension:zip
 - **专属 Bearer Token**：
   - 由用户本人粘贴保存于扩展隔离的 `chrome.storage.local`（绝不写入网页存储或会话存储）；
   - 点击 **「测试连通性」** 会请求 `GET /api/platforms?schema_version=1.0`：凭据有效显示 `200 已就绪`；凭据错误或已停用明确返回 `401 认证凭据无效`；留空保存则进入匿名模式（完全省略 `Authorization` 请求头）；
+  - 当保存的凭据属于 `owner` 角色时，侧边栏会自动解锁只读管理员状态胶囊及内置宽屏 **解析监控大盘（`monitor.html`）** 入口；使用 `friend` / `agent` 角色凭据或匿名模式时，该入口静默隐藏且不影响常规解析与下载；
   - 若使用限定平台的受限密钥（如仅授权部分平台的 `friend` 密钥）解析未授权平台，侧边栏会原样展示服务端返回的 `当前凭据无权访问该平台`。
 - **下载偏好**：可配置默认子目录前缀（如 `DokiTool`，内置跨平台非法字符、路径穿越 `..` 与 Windows 保留设备名清洗）、默认批量保存方式（子文件夹逐个保存 / 打包 ZIP）、默认画质偏好（最高画质 / 1080p 优先 / 仅音频）以及是否自动跟随标签页。
 
@@ -92,4 +101,4 @@ npm run build:extension:zip
 
 - **零网页注入、零 `<all_urls>` 通配符**：`manifest.json` 不声明任何 `content_scripts`，不包含 `cookies`、`scripting`、`debugger`、`webRequestBlocking` 或未受限的 `declarativeNetRequest` 权限；`host_permissions` 仅列出 `https://snap.dokitool.com/*` 与 14 个平台显式媒体 CDN 域名。
 - **浏览隐私防火墙**：标签页 URL 先在扩展本地执行 14 平台域名与路径语法匹配；访问任何非支持网站、`chrome://`、`file://` 或内网页面时均静默忽略，**向后端发送 0 请求**。
-- **全链路无 Cookie 直连与零服务端媒体中转**：扩展发往后端 API 与各平台媒体 CDN（含 B 站 DASH `.m4s` 音视频流）的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则（含针对 B 站防盗链的 Rule `1004`）剥离 `Cookie` 与扩展 `Origin` 头；全部媒体数据与 `Mediabunny` 无损合流均在用户本机浏览器内完成，服务端不中转媒体流量，亦不触碰浏览器已登录的站点账号状态或干扰正常网页浏览。
+- **全链路无 Cookie 直连、零服务端媒体中转与监控页隔离**：扩展发往后端 API（含只读 `/api/stats` 监控查询）与各平台媒体 CDN（含 B 站 DASH `.m4s` 音视频流）的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则（含针对 B 站防盗链的 Rule `1004`）剥离 `Cookie` 与扩展 `Origin` 头；内置 `monitor.html` 同样严格遵守 MV3 CSP（零内联脚本、零外部 CDN 资源、零第三方图表库），`Mediabunny` 严格隔离于 `offscreen` 打包产物内而不进入 `background`、`sidepanel` 或 `monitor`；全部媒体数据与 `Mediabunny` 无损合流均在用户本机浏览器内完成，服务端不中转媒体流量，亦不触碰浏览器已登录的站点账号状态或干扰正常网页浏览。
