@@ -159,9 +159,9 @@ func validAnonymousCookieValue(v string) bool {
 
 func extractAnonymousVisitorCookies(raw []*http.Cookie, now time.Time) ([]*http.Cookie, time.Time) {
 	var (
-		sub        *http.Cookie
-		subp       *http.Cookie
-		earliest   time.Time
+		sub         *http.Cookie
+		subp        *http.Cookie
+		earliest    time.Time
 		hasEarliest bool
 	)
 	for _, ck := range raw {

@@ -2549,9 +2549,9 @@ func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
 
 	// 1. Direct unit checks on computeCacheTTLForResult across normal, safety-margin, generic, and Shanghai fallback modes.
 	distantExp := baseNow.Add(2 * time.Hour).Format(time.RFC3339)
-	midExp := baseNow.Add(400 * time.Second).Format(time.RFC3339)  // 400s - 60s = 340s (between 300s and 600s)
-	nearExp := baseNow.Add(72 * time.Second).Format(time.RFC3339)  // 72s - 60s = 12s (< 15s Shanghai cap)
-	tooSoon := baseNow.Add(69 * time.Second).Format(time.RFC3339)  // 69s - 60s = 9s (< 10s minCacheTTL)
+	midExp := baseNow.Add(400 * time.Second).Format(time.RFC3339) // 400s - 60s = 340s (between 300s and 600s)
+	nearExp := baseNow.Add(72 * time.Second).Format(time.RFC3339) // 72s - 60s = 12s (< 15s Shanghai cap)
+	tooSoon := baseNow.Add(69 * time.Second).Format(time.RFC3339) // 69s - 60s = 9s (< 10s minCacheTTL)
 
 	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, ""), baseNow, false); !ok || ttl != 300*time.Second {
 		t.Fatalf("normal no-expiry TTL = (%v, %v), want (300s, true)", ttl, ok)
