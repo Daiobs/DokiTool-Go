@@ -1388,3 +1388,245 @@ test("Bilibili DASH security boundary: hostWhitelist & DNR Rule 1004 permit offi
     { header: "Cookie", operation: "remove" },
   ]);
 });
+
+test("PR-C urlMatcher: matchSupportedPlatformUrl stays strict 14-core while matchActiveParseUrl & extractActiveParseUrlsFromText accept long-tail sites and block unsafe/local/bare URLs", () => {
+  const longTailSamples = [
+    ["https://vimeo.com/123456", "vimeo.com", "generic:url:vimeo.com/123456"],
+    [
+      "https://www.tiktok.com/@creator/video/7123456789?utm_source=share&is_from_webapp=1#top",
+      "tiktok.com",
+      "generic:url:www.tiktok.com/@creator/video/7123456789",
+    ],
+    [
+      "https://www.reddit.com/r/videos/comments/abc123/demo/",
+      "reddit.com",
+      "generic:url:www.reddit.com/r/videos/comments/abc123/demo",
+    ],
+    [
+      "https://soundcloud.com/artist-name/cool-track?si=tracking123",
+      "soundcloud.com",
+      "generic:url:soundcloud.com/artist-name/cool-track",
+    ],
+    [
+      "https://bandcamp.com/?id=42",
+      "bandcamp.com",
+      "generic:url:bandcamp.com/?id=42",
+    ],
+  ];
+
+  for (const [sampleUrl, expectedLabel, expectedDedupe] of longTailSamples) {
+    // Privacy firewall core-14 matcher MUST still reject every long-tail site!
+    assert.equal(
+      urlMatcher.matchSupportedPlatformUrl(sampleUrl),
+      null,
+      `matchSupportedPlatformUrl must stay strictly 14-core for ${sampleUrl}`,
+    );
+
+    const active = urlMatcher.matchActiveParseUrl(sampleUrl);
+    assert.ok(active, `matchActiveParseUrl must accept ${sampleUrl}`);
+    assert.equal(active.platform, "generic");
+    assert.equal(active.platformLabel, expectedLabel);
+    assert.equal(active.dedupeKey, expectedDedupe);
+    assert.equal(active.isLikelyFeedOrHome, false);
+    assert.equal(active.isGeneric, true);
+    assert.equal(active.url.includes("#"), false, "fragment must be stripped");
+  }
+
+  // Core-14 URLs still delegate directly to matchSupportedPlatformUrl
+  const ytCore = urlMatcher.matchActiveParseUrl(
+    "https://www.youtube.com/watch?v=I9JvDaciaFk",
+  );
+  assert.ok(ytCore);
+  assert.equal(ytCore.platform, "youtube");
+  assert.equal(ytCore.youtubeVideoId, "I9JvDaciaFk");
+  assert.equal(ytCore.isGeneric, undefined);
+
+  // Security & hygiene rejections on matchActiveParseUrl
+  const longUrl = `https://vimeo.com/${"a".repeat(2040)}`;
+  assert.ok(longUrl.length > 2048);
+  for (const blockedUrl of [
+    "",
+    "   ",
+    longUrl,
+    "chrome://extensions",
+    "chrome-extension://abcdefghijklmnopabcdefghijklmnop/sidepanel.html",
+    "file:///etc/passwd",
+    "about:blank",
+    "javascript:alert(1)",
+    "http://127.0.0.1/video/1",
+    "https://192.168.1.1/video/1",
+    "http://0x7f000001/video/1",
+    "https://[::1]/video/1",
+    "http://localhost/video/1",
+    "https://sub.localhost/video/1",
+    "https://printer.local/video/1",
+    "https://metadata.internal/latest",
+    "https://box.localdomain/video/1",
+    "https://router.home.arpa/video/1",
+    "https://dokitool.com/video/1",
+    "https://snap.dokitool.com/api/parse",
+    "https://vimeo.com:8443/123456",
+    "http://vimeo.com:443/123456",
+    "https://user:pass@vimeo.com/123456",
+    "https://intranet/video/1",
+    "https://vimeo.com",
+    "https://vimeo.com/",
+    "https://vimeo.com///",
+    "https://vimeo.com/#frag",
+  ]) {
+    assert.equal(
+      urlMatcher.matchActiveParseUrl(blockedUrl),
+      null,
+      `matchActiveParseUrl must reject ${blockedUrl}`,
+    );
+  }
+
+  // Batch extractor mixes core-14 + long-tail, deduplicates tracking variants, and ignores unsafe/plain lines
+  const mixedBatch = [
+    "看看这个 B 站视频 https://www.bilibili.com/video/BV1uv411q7Mv?spm_id_from=333",
+    "Vimeo 推荐 https://vimeo.com/123456?utm_source=copy",
+    "https://vimeo.com/123456",
+    "TikTok 分享 https://www.tiktok.com/@creator/video/7123456789?is_from_webapp=1",
+    "https://soundcloud.com/artist/track-1",
+    "纯文字备注，没有链接",
+    "chrome://settings/privacy",
+    "file:///Users/demo/secret.mp4",
+    "http://192.168.1.10/cam.mp4",
+    "http://localhost/admin",
+    "https://snap.dokitool.com/api/parse",
+    "https://vimeo.com/",
+  ].join("\n");
+
+  const extracted = urlMatcher.extractActiveParseUrlsFromText(mixedBatch);
+  assert.equal(extracted.items.length, 4);
+  assert.deepEqual(
+    extracted.items.map((it) => `${it.platform}:${it.platformLabel}`),
+    [
+      "bilibili:B站",
+      "generic:vimeo.com",
+      "generic:tiktok.com",
+      "generic:soundcloud.com",
+    ],
+  );
+  assert.equal(extracted.duplicateCount, 1);
+  assert.equal(extracted.ignoredLineCount, 7);
+});
+
+test("PR-C hostWhitelist: PRODUCTION_HOST_PERMISSIONS stays unchanged & isSafeNativeBrowserDownloadUrl enforces public DNS safety", () => {
+  // Ensure NO long-tail domains or wildcards were added to PRODUCTION_HOST_PERMISSIONS
+  for (const forbiddenSub of [
+    "<all_urls>",
+    "*://*/*",
+    "http://*/*",
+    "https://*/*",
+    "vimeocdn",
+    "tiktokcdn",
+    "redd.it",
+    "sndcdn",
+  ]) {
+    assert.equal(
+      hostWhitelist.PRODUCTION_HOST_PERMISSIONS.some((p) =>
+        p.includes(forbiddenSub),
+      ),
+      false,
+      `PRODUCTION_HOST_PERMISSIONS must not contain ${forbiddenSub}`,
+    );
+  }
+
+  // Safe public CDN direct file URLs pass
+  for (const safeUrl of [
+    "https://skyfire.vimeocdn.com/exp=1/video-1080p.mp4",
+    "https://v16-webapp.tiktokcdn.com/video/tos/a.mp4",
+    "http://v.redd.it/abc123/DASH_720.mp4",
+    "https://cf-media.sndcdn.com/track.mp3?Policy=xyz",
+    "https://cdn.example.org/@artist/clip.mp4",
+  ]) {
+    const res = hostWhitelist.isSafeNativeBrowserDownloadUrl(safeUrl);
+    assert.equal(
+      res.safe,
+      true,
+      `expected safe native download URL: ${safeUrl} (reason: ${res.reason})`,
+    );
+  }
+
+  // Extra allowed origin matches loopback / custom API origin
+  assert.equal(
+    hostWhitelist.isSafeNativeBrowserDownloadUrl(
+      "http://127.0.0.1:18080/mock-media.mp4",
+      ["http://127.0.0.1:18080"],
+    ).safe,
+    true,
+  );
+  assert.equal(
+    hostWhitelist.isSafeNativeBrowserDownloadUrl(
+      "http://127.0.0.1:18080/mock-media.mp4",
+      ["http://127.0.0.1/*"],
+    ).safe,
+    true,
+  );
+
+  // Unsafe URLs rejected strictly
+  const over8k = `https://cdn.vimeo.com/${"x".repeat(8200)}.mp4`;
+  for (const badUrl of [
+    "",
+    "   ",
+    over8k,
+    "https://cdn.vimeo.com/a b.mp4",
+    "https://cdn.vimeo.com/a\\b.mp4",
+    "https://cdn.vimeo.com:/v.mp4",
+    "https://user:pass@cdn.vimeo.com/v.mp4",
+    "https://user@cdn.vimeo.com/v.mp4",
+    "https://@cdn.vimeo.com/v.mp4",
+    "https://cdn.vimeo.com/v.mp4#frag",
+    "file:///etc/passwd",
+    "chrome://extensions",
+    "blob:https://vimeo.com/123",
+    "data:video/mp4;base64,AAAA",
+    "https://cdn.vimeo.com:8443/v.mp4",
+    "http://cdn.vimeo.com:443/v.mp4",
+    "http://127.0.0.1:18080/v.mp4",
+    "https://192.168.1.1/v.mp4",
+    "https://10.0.0.5/v.mp4",
+    "https://[::1]/v.mp4",
+    "https://localhost/v.mp4",
+    "https://sub.localhost/v.mp4",
+    "https://nas.local/v.mp4",
+    "https://meta.internal/v.mp4",
+    "https://box.localdomain/v.mp4",
+    "https://router.home.arpa/v.mp4",
+    "https://singlelabel/v.mp4",
+    "https://dokitool.com/v.mp4",
+    "https://snap.dokitool.com/v.mp4",
+  ]) {
+    const res = hostWhitelist.isSafeNativeBrowserDownloadUrl(badUrl);
+    assert.equal(res.safe, false, `expected unsafe native download URL: ${badUrl}`);
+  }
+});
+
+test("PR-C security static gate: zero v-html / innerHTML anywhere in frontend/src/extension/", async () => {
+  const extDir = resolve(
+    fileURLToPath(new URL("../src/extension", import.meta.url)),
+  );
+  async function walk(dir) {
+    const out = [];
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...(await walk(full)));
+      } else if (/\.(ts|js|vue|html)$/.test(entry.name)) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+  const files = await walk(extDir);
+  assert.ok(files.length > 0);
+  for (const file of files) {
+    const content = await readFile(file, "utf8");
+    assert.equal(
+      /\bv-html\b|\binnerHTML\b/.test(content),
+      false,
+      `Forbidden v-html / innerHTML detected in ${file}`,
+    );
+  }
+});

@@ -2178,3 +2178,142 @@ func TestServeStatsRuntimeConfigAndPersistenceAcrossRestart(t *testing.T) {
 		t.Fatalf("expected healed schema_version=1 Asia/Shanghai snapshot after SIGTERM, got %s (err=%v)", string(healedRaw), err)
 	}
 }
+
+func TestYTDLPGenericConfigurationAndStartupValidation(t *testing.T) {
+	// 1. Invalid DOKITOOL_YTDLP_GENERIC_ENABLED fails startup before listener bind without echoing raw value.
+	for _, invalid := range []string{"auto", "yes_please", " true", "2"} {
+		t.Setenv("DOKITOOL_YTDLP_GENERIC_ENABLED", invalid)
+		t.Setenv("DOKITOOL_YTDLP_GENERIC_CONCURRENCY", "")
+		occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+		occupied.Close()
+		if runErr == nil || !strings.Contains(runErr.Error(), "DOKITOOL_YTDLP_GENERIC_ENABLED must be a boolean") {
+			t.Fatalf("want DOKITOOL_YTDLP_GENERIC_ENABLED startup error for %q, got %v", invalid, runErr)
+		}
+		if strings.Contains(runErr.Error(), invalid) {
+			t.Fatalf("startup error echoed raw invalid value %q: %v", invalid, runErr)
+		}
+	}
+
+	// 2. Invalid DOKITOOL_YTDLP_GENERIC_CONCURRENCY fails startup before listener bind without echoing raw value.
+	for _, invalid := range []string{"0", "-2", "25", "badconcurrency"} {
+		t.Setenv("DOKITOOL_YTDLP_GENERIC_ENABLED", "")
+		t.Setenv("DOKITOOL_YTDLP_GENERIC_CONCURRENCY", invalid)
+		occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runErr := run([]string{"serve", "-listen", occupied.Addr().String(), "-client-identity", "direct"})
+		occupied.Close()
+		if runErr == nil || !strings.Contains(runErr.Error(), "DOKITOOL_YTDLP_GENERIC_CONCURRENCY must be an integer between 1 and 24") {
+			t.Fatalf("want DOKITOOL_YTDLP_GENERIC_CONCURRENCY startup error for %q, got %v", invalid, runErr)
+		}
+		if strings.Contains(runErr.Error(), "badconcurrency") {
+			t.Fatalf("startup error echoed raw invalid value %q: %v", invalid, runErr)
+		}
+	}
+
+	// 3. Unit tests for configureYTDLPFull + runtime.ytdlp_generic_enabled wiring.
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "yt-dlp")
+	payload := []byte("#!/bin/sh\necho '{}' \n")
+	if err := os.WriteFile(fakeBin, payload, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	hexSum := hex.EncodeToString(sum[:])
+
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-generic-cmd-test"
+	defer func() {
+		if hadOrig {
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
+		} else {
+			delete(ytengine.OfficialSHA256Sums, hexSum)
+		}
+	}()
+
+	cases := []struct {
+		name               string
+		env                map[string]string
+		wantEngine         bool
+		wantGenericEnabled bool
+		wantErr            bool
+	}{
+		{
+			name:               "default-off",
+			env:                nil,
+			wantEngine:         false,
+			wantGenericEnabled: false,
+		},
+		{
+			name: "generic-only-missing-binary-fails-soft",
+			env: map[string]string{
+				"DOKITOOL_YTDLP_GENERIC_ENABLED": "true",
+				"DOKITOOL_YTDLP_BINARY":          filepath.Join(dir, "missing-yt-dlp"),
+			},
+			wantEngine:         false,
+			wantGenericEnabled: false,
+		},
+		{
+			name: "generic-only-verified-binary-enables-without-core-ytdlp-switches",
+			env: map[string]string{
+				"DOKITOOL_YTDLP_GENERIC_ENABLED":     "true",
+				"DOKITOOL_YTDLP_GENERIC_CONCURRENCY": "3",
+				"DOKITOOL_YTDLP_BINARY":              fakeBin,
+			},
+			wantEngine:         true,
+			wantGenericEnabled: true,
+		},
+		{
+			name: "x-only-keeps-generic-disabled",
+			env: map[string]string{
+				"DOKITOOL_YTDLP_X_ENABLED": "true",
+				"DOKITOOL_YTDLP_BINARY":    fakeBin,
+			},
+			wantEngine:         true,
+			wantGenericEnabled: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := catalog.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapters := map[string]api.Adapter{}
+			res, err := configureYTDLPFull(c, adapters, fetch.New(), x.TombstoneFallbackOff, func(k string) string { return tc.env[k] })
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("configureYTDLPFull err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if (res.engine != nil) != tc.wantEngine || (res.genericAdapter != nil) != tc.wantGenericEnabled {
+				t.Fatalf("engine=%v genericAdapter=%v, want engine=%v generic=%v",
+					res.engine != nil, res.genericAdapter != nil, tc.wantEngine, tc.wantGenericEnabled)
+			}
+			if c.Has(api.PlatformGeneric) {
+				t.Fatal("catalog must never register internal sentinel PlatformGeneric")
+			}
+
+			h, err := api.New(c, adapters, time.Now, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.genericAdapter != nil {
+				h.SetGenericAdapter(res.genericAdapter)
+			}
+			h.Stats().SetRuntimeConfig(api.RuntimeConfigSnapshot{
+				Version:             version,
+				YTDLPEnabled:        res.engine != nil,
+				YTDLPGenericEnabled: h.GenericEnabled(),
+			})
+			snap := h.Stats().Snapshot()
+			if snap.Runtime.YTDLPEnabled != tc.wantEngine || snap.Runtime.YTDLPGenericEnabled != tc.wantGenericEnabled {
+				t.Fatalf("runtime snapshot=%+v, want ytdlp=%v generic=%v", snap.Runtime, tc.wantEngine, tc.wantGenericEnabled)
+			}
+		})
+	}
+}

@@ -21,12 +21,19 @@ type platformTrait struct {
 	strictInput2048 bool
 }
 
+// PlatformGeneric is the internal Tier-2 routing and API-key scope sentinel
+// for named yt-dlp generic fallback requests when DOKITOOL_YTDLP_GENERIC_ENABLED
+// is enabled. It is never published in catalog.Envelope() and never returned as
+// data.platform in unified-v1 responses.
+const PlatformGeneric = "ytdlp_generic"
+
 var platformTraits = map[string]platformTrait{
-	"x":         {slowEngine: true, strictInput2048: true},
-	"youtube":   {slowEngine: true, strictInput2048: false},
-	"instagram": {slowEngine: true, strictInput2048: true},
-	"facebook":  {slowEngine: true, strictInput2048: true},
-	"tumblr":    {slowEngine: true, strictInput2048: true},
+	"x":             {slowEngine: true, strictInput2048: true},
+	"youtube":       {slowEngine: true, strictInput2048: false},
+	"instagram":     {slowEngine: true, strictInput2048: true},
+	"facebook":      {slowEngine: true, strictInput2048: true},
+	"tumblr":        {slowEngine: true, strictInput2048: true},
+	PlatformGeneric: {slowEngine: true, strictInput2048: true},
 }
 
 func traitsForPlatform(platform string) platformTrait {

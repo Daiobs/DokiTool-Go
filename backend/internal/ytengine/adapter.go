@@ -31,6 +31,8 @@ type AdaptOptions struct {
 	EnableHLS                    bool
 	AllowCodecLessProgressiveMP4 bool
 	SingleStreamHLSOnly          bool
+	AllowAudioOnly               bool
+	AllowProgressiveWebM         bool
 }
 
 // SanitizeMediaURL strips URL fragments and validates the URL against allowedMediaURL.
@@ -126,6 +128,9 @@ func AdaptInfo(info *Info, opts AdaptOptions, now int64) unified.Object {
 	if !hasDeliverableItem {
 		if opts.SingleStreamHLSOnly && hasUnsupportedSingleStreamHLSFormat(entries, info, opts.AllowedMediaURL) {
 			return unified.ContractError("NO_MEDIA", "暂不支持该视频的非 fMP4（TS-HLS）流媒体格式", false)
+		}
+		if opts.AllowAudioOnly {
+			return unified.ContractError("NO_MEDIA", "该内容未包含可解析的视频或音频媒体", false)
 		}
 		return unified.ContractError("NO_MEDIA", "该内容未包含可解析的视频媒体", false)
 	}
@@ -228,15 +233,22 @@ func buildEntryVideoItem(entry, parent *Info, opts AdaptOptions, position, total
 	}
 	entryKey := resolveEntryKey(entry, opts.ContentID, position)
 	itemTitle := resolveItemTitle(entry, parent, opts.ContentID, position, total)
-	variants, audioAttachment := buildEntryVariants(entry, parent, entryKey, itemTitle, opts, now)
+	variants, audioAttachment, itemType := buildEntryVariantsWithType(entry, parent, entryKey, itemTitle, opts, now)
 	if len(variants) == 0 {
 		return nil, nil
 	}
+	if itemType == "" {
+		itemType = "video"
+	}
+	itemPrefix := "video-"
+	if itemType == "audio" {
+		itemPrefix = "audio-"
+	}
 
-	itemID := "video-" + shortDigest(opts.PlatformID+":item:"+opts.ContentID+":"+entryKey)
+	itemID := itemPrefix + shortDigest(opts.PlatformID+":item:"+opts.ContentID+":"+entryKey)
 	item := unified.Object{
 		"id":          itemID,
-		"type":        "video",
+		"type":        itemType,
 		"index":       int64(position),
 		"default":     nil,
 		"variants":    variants,

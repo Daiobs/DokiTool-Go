@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -101,6 +102,7 @@ type AdmissionConfig struct {
 	Parse            PoolConfig
 	Resolve          PoolConfig
 	SlowParse        PoolConfig
+	GenericSlowParse PoolConfig
 	Catalog          PoolConfig
 	Relay            PoolConfig
 	Reports          PoolConfig
@@ -147,6 +149,16 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			QueueWait:         DefaultSlowParseQueueWait,
 			QueueSize:         DefaultSlowParseQueueSize,
 		},
+		GenericSlowParse: PoolConfig{
+			ClientBurst:       3,
+			ClientRPS:         6.0 / 60,
+			GlobalBurst:       12,
+			GlobalRPS:         4,
+			ClientConcurrency: 1,
+			GlobalConcurrency: ytgeneric.DefaultGenericConcurrency,
+			QueueWait:         DefaultSlowParseQueueWait,
+			QueueSize:         16,
+		},
 		Catalog: PoolConfig{
 			ClientBurst:       20,
 			ClientRPS:         5,
@@ -189,6 +201,7 @@ func (c AdmissionConfig) Validate() error {
 		{"PARSE", c.Parse, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"RESOLVE", c.Resolve, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"PARSE_SLOW", c.SlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"PARSE_GENERIC", c.GenericSlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"CATALOG", c.Catalog, 4096, 0, 0},
 		{"WEIBO", c.Relay, 4096, 0, 0},
 		{"REPORT", c.Reports, 4096, 0, 0},
@@ -250,6 +263,13 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 		}
 		c.SlowParse.GlobalConcurrency = value
 	}
+	if raw := strings.TrimSpace(getenv("DOKITOOL_YTDLP_GENERIC_CONCURRENCY")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > ytengine.MaxConcurrency {
+			return AdmissionConfig{}, fmt.Errorf("DOKITOOL_YTDLP_GENERIC_CONCURRENCY must be an integer between 1 and %d", ytengine.MaxConcurrency)
+		}
+		c.GenericSlowParse.GlobalConcurrency = value
+	}
 	for _, entry := range []struct {
 		name string
 		p    *PoolConfig
@@ -257,6 +277,7 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 		{"PARSE", &c.Parse},
 		{"RESOLVE", &c.Resolve},
 		{"PARSE_SLOW", &c.SlowParse},
+		{"PARSE_GENERIC", &c.GenericSlowParse},
 		{"CATALOG", &c.Catalog},
 		{"WEIBO", &c.Relay},
 		{"REPORT", &c.Reports},
@@ -303,6 +324,7 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 		{"PARSE", &c.Parse, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"RESOLVE", &c.Resolve, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"PARSE_SLOW", &c.SlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"PARSE_GENERIC", &c.GenericSlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 	} {
 		waitKey := "DOKITOOL_" + entry.name + "_QUEUE_WAIT"
 		if raw := strings.TrimSpace(getenv(waitKey)); raw != "" {

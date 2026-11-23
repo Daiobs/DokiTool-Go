@@ -377,6 +377,7 @@
 !/backend/internal/api/cache_test.go
 !/backend/internal/api/capacity_test.go
 !/backend/internal/api/douyin_test.go
+!/backend/internal/api/generic_named_test.go
 !/backend/internal/api/handler.go
 !/backend/internal/api/handler_test.go
 !/backend/internal/api/kuaishou_http_test.go
@@ -788,6 +789,8 @@
 !/backend/internal/platform/youtube/parser_test.go
 !/backend/internal/platform/youtube/testdata/
 /backend/internal/platform/ytgeneric/*
+!/backend/internal/platform/ytgeneric/generic_named.go
+!/backend/internal/platform/ytgeneric/generic_named_test.go
 !/backend/internal/platform/ytgeneric/parser.go
 !/backend/internal/platform/ytgeneric/parser_test.go
 !/backend/internal/platform/ytgeneric/sites.go

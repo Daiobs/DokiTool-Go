@@ -12,7 +12,7 @@
 
 ### 1.1 主支持范围（Agent 批量直下目标）
 
-个人 Agent 通道的核心设计目标是**抖音（`douyin`）、X（`x`）及其他返回公开 CDN 直链的平台**（如快手 `kuaishou`、哔哩哔哩 `bilibili`、小红书 `xiaohongshu`、今日头条 `toutiao`、皮皮虾 `pipixia`、皮皮搞笑 `pipigx`、最右图片 `zuiyou`、Instagram `instagram`、Facebook `facebook`、Tumblr `tumblr`）。这些平台的媒体字节由客户端直接向平台 CDN 拉取，服务端仅负责解析与统一契约输出，不中转任何媒体流量。
+个人 Agent 通道的核心设计目标是**抖音（`douyin`）、X（`x`）及其他返回公开 CDN 直链的平台**（如快手 `kuaishou`、哔哩哔哩 `bilibili`、小红书 `xiaohongshu`、今日头条 `toutiao`、皮皮虾 `pipixia`、皮皮搞笑 `pipigx`、最右图片 `zuiyou`、Instagram `instagram`、Facebook `facebook`、Tumblr `tumblr`）。当服务端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，`GET /api/parse` 在 `platform=all`（或省略 `platform`）模式下还支持第二级通用具名提取器兜底（覆盖 Vimeo、TikTok、Reddit、SoundCloud 等长尾公网站点，严格禁用 `generic` 盲抓提取器，返回规范化动态 `data.platform` 标识）；若密钥配置了非空 `platforms` 白名单，须在白名单中显式包含 `"ytdlp_generic"` 方可访问第二级通用兜底（未配置 `platforms` 的密钥默认允许全部核心平台与第二级通用兜底）。这些平台的媒体字节由客户端直接向平台 CDN 拉取，服务端仅负责解析与统一契约输出，不中转任何媒体流量。
 
 ### 1.2 不在主批量范围内的平台
 
@@ -95,13 +95,13 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.1 `GET /api/parse` — 解析分享链接或分享口令文本
 
-- **认证**：可选 `Authorization: Bearer <token>`（支持 `owner`、`agent`、`friend` 三种角色；携带时先校验可选 `platforms` 白名单〔不允许则返回 HTTP `401`〕，命中进程内新鲜缓存时直接走零槽位缓存快路径，未命中缓存时进入该密钥独立的并发池与等待队列；不带时命中新鲜缓存走匿名 `Catalog` 池，未命中走匿名快/慢解析池限流）。
+- **认证**：可选 `Authorization: Bearer <token>`（支持 `owner`、`agent`、`friend` 三种角色；携带时先校验可选 `platforms` 白名单〔第二级通用兜底需非空白名单包含 `"ytdlp_generic"`，否则返回 HTTP `401`〕，命中进程内新鲜缓存时直接走零槽位缓存快路径，未命中缓存时进入该密钥独立的并发池与等待队列〔第二级通用兜底计入 `slow_concurrency` 慢解析子并发上限〕；不带时命中新鲜缓存走匿名 `Catalog` 池，未命中按两级路由分别进入匿名快解析池、核心慢解析池或独立隔离的 `PARSE_GENERIC` 长尾慢解析池）。
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
   | `schema_version` | **是** | 固定为 `"1.0"`。缺失、数组形式（如 `schema_version[]=`）或值不等于 `"1.0"` 时返回 HTTP `409`（`code: "INVALID_INPUT"`）。 |
-  | `url` | **是** | 作品分享链接或包含单个 `http(s)` 链接的分享口令文本（整体长度 `<= 8192` 字节；海外 `yt-dlp` 平台提取出的 URL 长度 `<= 2048` 字节）。服务端自动提取首个 `http(s)` URL 并剥离尾随标点。 |
-  | `platform` | 否 | 指定平台 ID（见 `/api/platforms`）或 `"all"`。省略或传 `"all"` 时按 URL 域名自动识别；显式指定时若与链接实际平台不一致则返回 HTTP `400`（`code: "INVALID_INPUT"`）。 |
+  | `url` | **是** | 作品分享链接或包含单个 `http(s)` 链接的分享口令文本（整体长度 `<= 8192` 字节；海外 `yt-dlp` 平台与第二级通用兜底提取出的 URL 长度 `<= 2048` 字节，且第二级通用兜底额外拒绝 `#fragment`、内网/本机主机名、本站域名及空路径+空查询）。服务端自动提取首个 `http(s)` URL 并剥离尾随标点。 |
+  | `platform` | 否 | 指定平台 ID（见 `/api/platforms`）或 `"all"`。省略或传 `"all"` 时执行两级路由：优先按域名命中核心目录；若服务端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED`，未命中核心目录的合法公网链接自动进入第二级通用具名提取器兜底并返回规范化动态 `data.platform`（缓存 TTL 上限 `60s`）。显式指定具体平台 ID 时绝不触发第二级通用兜底，与链接实际平台不一致则返回 HTTP `400`。 |
   | `debug` | 否 | 传 `"1"` 时启用完整规范化诊断视图（保留被默认产品视图折叠的同规格备选 `mux` 等候选）；省略或传其他值均按常规产品视图处理。常规批量下载无需传 `debug=1`。 |
 
 - **成功响应（HTTP `200 OK`）示例**：
@@ -725,6 +725,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | **X（`x`）常规图文与视频推文** | 默认优先走纯 Go 官方 Syndication 快路径（无需拉起 `yt-dlp` 子进程）；仅在 Syndication 未命中或需回退时才请求 `yt-dlp` 槽位。 | **`4–8`**（若大批链接含需回退的复杂推文，建议降至 **`1–2`**）。 |
 | **快手、小红书、皮皮虾等纯 Go 平台** | 纯 Go 无状态抓取与探测，无子进程开销。 | **`4–8`**（建议不超过 `DOKITOOL_OWNER_CONCURRENCY`）。 |
 | **Instagram、Facebook、Tumblr** | 每次未命中缓存的解析均需申请全局共享的 `DOKITOOL_YTDLP_CONCURRENCY` 子进程信号量（默认 `2`，可配置范围 `1..24`）。 | **`<= 1–2`**（默认配置下建议 `1`，留出余量避免长时间占满全部提取器槽位）。 |
+| **第二级通用具名提取器长尾站点（`DOKITOOL_YTDLP_GENERIC_ENABLED`）** | 独立隔离的 `PARSE_GENERIC` 准入池与 `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` 并发上限（默认 `2`，与核心快/慢池隔离；认证密钥同时受自身 `slow_concurrency` 约束）；成功缓存 TTL 上限 `60s`。 | **`1`**（长尾站点响应耗时波动较大，建议低并发串行或小批量提交）。 |
 
 > **提示**：解析与 CDN 媒体文件下载可以流水线解耦——例如保持 `4` 个并发协程调用 `/api/parse`，拿到直链后立即交给 `4–8` 个独立的 CDN 下载协程流式落盘。
 
@@ -732,8 +733,8 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 
 - **默认启用**：主后端内置上限为 `4096` 条、`64 MiB` 的并发读锁（`RWMutex`）LRU 结果缓存及同键并发请求合并（`singleflight`）。相同 `(route, platform, normalized_url, item_id, debug)` 的并发或短时重复请求只会访问一次上游平台。
 - **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：携带有效 Bearer 密钥请求 `GET /api/parse` 或 `GET /api/resolve` 时，若目标平台通过该密钥的 `platforms` 白名单校验且进程内缓存存在未过期条目，服务端仅校验该密钥的快读速率桶（`rps > 0` 时为 `max(rps*4, 20.0)` / `max(burst*4, 64)`；`rps == 0` 不限速），在纯读锁下直接返回缓存响应并累加该密钥的 `cache_hits`，**占用 `0` 个 `keyPool` 并发槽位**——即使该密钥的全部并发槽位正被慢上游解析占满，新鲜缓存命中仍能毫秒级即时返回。
-- **动态 TTL（`10s..180s`）**：
-  - 若响应内包含任何 `expires_at`，缓存寿命取 **`min(180s, earliest_expires_at - now - 60s)`**；若扣除 `60s` 安全余量后不足 `10s`，则不写入缓存，确保缓存绝不返回即将过期的直链。
+- **动态 TTL（`10s..180s`；第二级通用长尾上限 `60s`）**：
+  - 若响应内包含任何 `expires_at`，核心平台缓存寿命取 **`min(180s, earliest_expires_at - now - 60s)`**（第二级通用具名提取器响应额外封顶在 **`60s`**）；若扣除 `60s` 安全余量后不足 `10s`，则不写入缓存，确保缓存绝不返回即将过期的直链。
   - 若响应不含 `expires_at`，成功响应缓存 **`60s`**。
   - `404 CONTENT_UNAVAILABLE` 负缓存 **`10s`**；`429`、`5xx` 及其他错误不缓存。
   - **`weibo` 与 `youtube` 永久不缓存且不合并**（在 `/api/stats` 中计入 `cache.by_channel.*.uncacheable`）。

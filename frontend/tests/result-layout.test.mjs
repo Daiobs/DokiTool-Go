@@ -925,3 +925,142 @@ test('Bilibili DASH audio attachment suppresses broken web <audio>/direct downlo
     view.app.unmount();
   }
 });
+
+test('PR-C: ResultSection renders platform badge for built-in and long-tail platforms, supports multi-quality switching, and renders audio-only items accurately', async () => {
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  const findFirst = (nodes, pred) => {
+    for (const node of nodes) {
+      if (pred(node)) return node;
+      const found = findFirst(node.children || [], pred);
+      if (found) return found;
+    }
+    return null;
+  };
+  const classText = node => {
+    const cls = node?.props?.class;
+    if (Array.isArray(cls)) return cls.flat().join(' ');
+    return String(cls || '');
+  };
+
+  // 1. Built-in platform badge (Douyin) in zh-CN & en
+  const view = await mount(video);
+  let downloadMainCalls = 0;
+  view.state.value = {
+    ...view.state.value,
+    onDownloadMain() { downloadMainCalls++; },
+  };
+  await view.flush();
+  try {
+    const badge = () => view.elements('rs-header-badge--platform')[0];
+    assert.ok(badge(), 'platform badge should render');
+    assert.equal(badge().props['data-testid'], 'result-platform-badge');
+    assert.equal(badge().props['data-platform'], 'douyin');
+    assert.equal(badge().props['data-platform-builtin'], 'true');
+    assert.equal(textOf(badge()), '抖音');
+    assert.match(classText(findFirst([badge()], n => n.type === 'i')), /\bfa-music\b/);
+
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(badge()), 'Douyin');
+
+    // 2. Long-tail video platform (Vimeo) with multi-quality switching & direct download
+    const vimeo1080 = 'https://vod.vimeo.test/123456/1080p.mp4';
+    const vimeo720 = 'https://vod.vimeo.test/123456/720p.mp4';
+    const vimeoData = {
+      platform: 'vimeo',
+      title: 'Vimeo Scenic Demo',
+      source_url: 'https://vimeo.com/123456',
+      items: [{
+        id: 'vimeo-1',
+        type: 'video',
+        default: { variant_id: 'v-1080', url: vimeo1080 },
+        variants: [
+          fileVariant('v-1080', vimeo1080, { width: 1920, height: 1080, video_codec: 'h264', has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' }),
+          fileVariant('v-720', vimeo720, { width: 1280, height: 720, video_codec: 'h264', has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' }),
+        ],
+      }],
+      default_item_id: 'vimeo-1',
+      author: { name: 'Filmmaker', id: 'filmmaker' },
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: vimeoData });
+    view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: vimeoData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+
+    assert.equal(badge().props['data-testid'], 'result-platform-badge');
+    assert.equal(badge().props['data-platform'], 'vimeo');
+    assert.equal(badge().props['data-platform-builtin'], 'false');
+    assert.equal(textOf(badge()), 'Vimeo');
+    assert.ok(hasClass(badge(), 'rs-header-badge--platform-generic'));
+    assert.match(classText(findFirst([badge()], n => n.type === 'i')), /\bfa-film\b/);
+    assert.equal(view.elements('rs-video')[0].props.src, vimeo1080);
+    assert.equal(view.baseline()['--rs-details-column-height'], '602px', 'desktop alignment baseline stays intact for long-tail video');
+
+    await view.tab('画质选项');
+    assert.equal(view.elements('rs-backup-item').length, 2);
+    view.elements('rs-backup-item')[1].props.onClick();
+    await view.flush();
+    assert.equal(view.elements('rs-video')[0].props.src, vimeo720);
+    view.elements('rs-btn--primary')[0].props.onClick();
+    await view.flush();
+    assert.equal(downloadMainCalls, 1);
+
+    // 3. Unknown long-tail platform identifiers (site_9gag, custom_site)
+    for (const [dynamicId, wantLabel] of [['site_9gag', '9GAG'], ['custom_site', 'Custom Site']]) {
+      const dynamicData = { ...vimeoData, platform: dynamicId };
+      validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: dynamicData });
+      view.state.value = { ...view.state.value, resultVersion: view.state.value.resultVersion + 1, resultData: dynamicData };
+      view.state.value.selection.syncResult();
+      await view.flush();
+      assert.equal(badge().props['data-platform'], dynamicId);
+      assert.equal(badge().props['data-platform-builtin'], 'false');
+      assert.equal(textOf(badge()), wantLabel);
+      assert.match(classText(findFirst([badge()], n => n.type === 'i')), /\bfa-film\b/);
+    }
+
+    // 4. Audio-only long-tail platform (SoundCloud): renders <audio>, Audio mediaTypeBadge, Download Audio CTA, and SoundCloud badge
+    const scAudioUrl = 'https://cdn.soundcloud.test/tracks/demo-320.mp3';
+    const scData = {
+      platform: 'soundcloud',
+      title: 'Ambient Track',
+      source_url: 'https://soundcloud.com/artist/track',
+      items: [{
+        id: 'audio-sc-1',
+        type: 'audio',
+        default: { variant_id: 'mp3-320', url: scAudioUrl },
+        variants: [
+          fileVariant('mp3-320', scAudioUrl, { has_audio: true, audio_codec: 'mp3', audio_bitrate_bps: 320000, container: 'mp3', extension: 'mp3', mime_type: 'audio/mpeg', evidence: 'upstream' }),
+        ],
+      }],
+      default_item_id: 'audio-sc-1',
+    };
+    validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: scData });
+    view.state.value = { ...view.state.value, resultVersion: view.state.value.resultVersion + 1, locale: 'zh-CN', resultData: scData };
+    view.state.value.selection.syncResult();
+    await view.flush();
+
+    assert.equal(badge().props['data-platform'], 'soundcloud');
+    assert.equal(badge().props['data-platform-builtin'], 'false');
+    assert.equal(textOf(badge()), 'SoundCloud');
+    assert.match(classText(findFirst([badge()], n => n.type === 'i')), /\bfa-headphones\b/);
+
+    const audioTypeBadge = view.elements('rs-header-badge--audio')[0];
+    assert.ok(audioTypeBadge, 'audio items should render rs-header-badge--audio instead of video');
+    assert.equal(textOf(audioTypeBadge), '音频');
+    assert.equal(view.elements('rs-header-badge--video').length, 0);
+    assert.equal(view.elements('rs-video').length, 0);
+    assert.equal(view.elements('rs-music-player').length, 1);
+    assert.equal(view.elements('rs-music-player')[0].props.src, scAudioUrl);
+    assert.equal(textOf(view.elements('rs-btn--primary')[0]), '下载音频');
+
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    assert.equal(textOf(view.elements('rs-header-badge--audio')[0]), 'Audio');
+    assert.equal(textOf(view.elements('rs-btn--primary')[0]), 'Download Audio');
+    view.elements('rs-btn--primary')[0].props.onClick();
+    await view.flush();
+    assert.equal(downloadMainCalls, 2);
+  } finally {
+    view.app.unmount();
+  }
+});

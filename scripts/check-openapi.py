@@ -1009,6 +1009,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
     optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
     valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms)
     require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
+    valid_key_platforms = valid_platforms | {"ytdlp_generic"}
 
     allowed_fields = {
         "id", "role", "enabled", "token_sha256",
@@ -1108,7 +1109,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
             require(len(plats) == len(set(plats)), f"keys[{idx}].platforms must not contain duplicates")
             for plat in plats:
                 require(
-                    isinstance(plat, str) and plat in valid_platforms,
+                    isinstance(plat, str) and plat in valid_key_platforms,
                     f"keys[{idx}].platforms contains invalid platform {plat!r}",
                 )
 

@@ -40,9 +40,14 @@ import {
 } from "./filenameSanitizer";
 import {
   LOOPBACK_HOST_PERMISSIONS,
+  isSafeNativeBrowserDownloadUrl,
+  isWhitelistedMediaUrl,
   validateApiBaseUrl,
 } from "./hostWhitelist";
-import { buildExtensionTargetContext } from "./uiTargetHelpers";
+import {
+  buildExtensionTargetContext,
+  formatPlatformDisplayName,
+} from "./uiTargetHelpers";
 import {
   COMMAND_OPEN_SIDEPANEL,
   CONTEXT_MENU_INSPECT_ID,
@@ -86,7 +91,10 @@ import {
   createExtensionStorage,
   type ExtensionStorageController,
 } from "./storage";
-import { matchSupportedPlatformUrl } from "./urlMatcher";
+import {
+  matchActiveParseUrl,
+  matchSupportedPlatformUrl,
+} from "./urlMatcher";
 
 // ============================================================================
 // Minimal Structural Chrome MV3 Types (Zero `@types/chrome` Dependency)
@@ -1564,9 +1572,9 @@ export function createBackgroundController(
     if (ctx.resolveUrl && ctx.resolveUrl.startsWith("/api/resolve?")) {
       freshMedia = await resolveLazyItemInternal(ctx.resolveUrl, settings, signal);
     } else if (ctx.parseUrl) {
-      const matched = matchSupportedPlatformUrl(ctx.parseUrl);
+      const matched = matchActiveParseUrl(ctx.parseUrl);
       if (!matched) {
-        throw new Error("刷新链接不在受支持平台白名单内");
+        throw new Error("刷新链接无效或不受允许");
       }
       freshMedia = await parseSupportedUrlInternal(matched, settings, signal);
       const deferredMatch = freshMedia.items.find(
@@ -2041,6 +2049,254 @@ export function createBackgroundController(
       scheduleOffscreenIdleCloseIfIdle();
       return;
     }
+
+    const validatedSpecApi = validateApiBaseUrl(enrichedSpec.apiOrigin);
+    const effectiveAllowedOrigins = Array.from(
+      new Set([
+        ...(enrichedSpec.extraAllowedOrigins ?? []),
+        ...(validatedSpecApi.ok ? [validatedSpecApi.origin] : []),
+      ]),
+    );
+    const isWhitelistedRoute = (rawUrl: string): boolean =>
+      isWhitelistedMediaUrl(rawUrl, effectiveAllowedOrigins).allowed;
+
+    const failUnwhitelistedInBackground = async (params: {
+      message: string;
+      unwhitelistedHost?: string;
+      fallbackUrl?: string;
+    }): Promise<void> => {
+      const current = tasks.get(taskId);
+      if (!current || current.status === "cancelled") {
+        scheduleOffscreenIdleCloseIfIdle();
+        notifyIfCompletelyIdle();
+        return;
+      }
+      tasks.set(taskId, {
+        ...current,
+        status: "failed",
+        statusText: "未授权媒体域名",
+        speed: 0,
+        error: params.message,
+        lastErrorCode: "UNWHITELISTED_CDN",
+        ...(params.unwhitelistedHost
+          ? { unwhitelistedHost: params.unwhitelistedHost }
+          : {}),
+        ...(params.fallbackUrl ? { fallbackUrl: params.fallbackUrl } : {}),
+        updatedAt: nowFn(),
+        retryPayload: { kind: "spec", spec: enrichedSpec },
+      });
+      updateBadge("failed");
+      await broadcastTasksUpdated();
+      scheduleOffscreenIdleCloseIfIdle();
+      notifyIfCompletelyIdle();
+    };
+
+    // Zero-`<all_urls>` routing guard BEFORE launching offscreen.html:
+    // - Case A (`direct_file`): whitelisted -> Offscreen OPFS; non-whitelisted -> native `chrome.downloads.download`
+    // - Case B (`dash_mux` | `hls` | `segments` | `youtube_mux` | `batch_zip`): non-whitelisted -> fail cleanly with UNWHITELISTED_CDN
+    if (enrichedSpec.kind === "direct_file") {
+      const hasWhitelistedRoute = enrichedSpec.routes.some(isWhitelistedRoute);
+      if (!hasWhitelistedRoute) {
+        const nativeUrl = enrichedSpec.routes.find(
+          (r) =>
+            isSafeNativeBrowserDownloadUrl(r, effectiveAllowedOrigins).safe,
+        );
+        if (!nativeUrl) {
+          const firstRoute = enrichedSpec.routes[0] || "";
+          const check = firstRoute
+            ? isSafeNativeBrowserDownloadUrl(
+                firstRoute,
+                effectiveAllowedOrigins,
+              )
+            : { safe: false, hostname: "", reason: "缺少可用下载线路" };
+          await failUnwhitelistedInBackground({
+            message: check.reason || "下载链接不符合安全规则，已拦截下载",
+            unwhitelistedHost: check.hostname || undefined,
+            fallbackUrl: latestBeforeStart.fallbackUrl || firstRoute || undefined,
+          });
+          return;
+        }
+
+        if (!chromeApi.downloads?.download) {
+          tasks.set(taskId, {
+            ...latestBeforeStart,
+            status: "failed",
+            statusText: "保存失败",
+            speed: 0,
+            error: "chrome.downloads API 不可用",
+            fallbackUrl: nativeUrl,
+            updatedAt: nowFn(),
+            retryPayload: { kind: "spec", spec: enrichedSpec },
+          });
+          updateBadge("failed");
+          await broadcastTasksUpdated();
+          scheduleOffscreenIdleCloseIfIdle();
+          notifyIfCompletelyIdle();
+          return;
+        }
+
+        const safeFilename = sanitizeRelativeDownloadPath(enrichedSpec.filename);
+        let downloadId: number;
+        try {
+          downloadId = await chromeApi.downloads.download({
+            url: nativeUrl,
+            filename: safeFilename,
+            saveAs: false,
+            conflictAction: "uniquify",
+          });
+        } catch (err) {
+          const current = tasks.get(taskId);
+          if (current && current.status !== "cancelled") {
+            const errMsg =
+              err instanceof Error && err.message
+                ? err.message
+                : "调用浏览器原生下载失败";
+            tasks.set(taskId, {
+              ...current,
+              status: "failed",
+              statusText: "保存失败",
+              speed: 0,
+              error: errMsg,
+              fallbackUrl: nativeUrl,
+              updatedAt: nowFn(),
+              retryPayload: { kind: "spec", spec: enrichedSpec },
+            });
+            updateBadge("failed");
+            await broadcastTasksUpdated();
+          }
+          scheduleOffscreenIdleCloseIfIdle();
+          notifyIfCompletelyIdle();
+          return;
+        }
+
+        const afterDownloadStart = tasks.get(taskId);
+        if (!afterDownloadStart || afterDownloadStart.status === "cancelled") {
+          void chromeApi.downloads?.cancel?.(downloadId)?.catch?.(() => {});
+          scheduleOffscreenIdleCloseIfIdle();
+          notifyIfCompletelyIdle();
+          return;
+        }
+
+        const record: PendingBlobDownloadRecord = {
+          downloadId,
+          taskId,
+          blobUrl: "",
+          filename: safeFilename,
+        };
+        pendingBlobDownloads.set(downloadId, record);
+
+        tasks.set(taskId, {
+          ...afterDownloadStart,
+          filename: safeFilename,
+          status: "downloading",
+          statusText: "浏览器原生下载中...",
+          total: enrichedSpec.sizeBytes ?? afterDownloadStart.total,
+          chromeDownloadId: downloadId,
+          fallbackUrl: nativeUrl,
+          updatedAt: nowFn(),
+          retryPayload: { kind: "spec", spec: enrichedSpec },
+        });
+        updateBadge();
+        await broadcastTasksUpdated();
+
+        // Replay if `onChanged` fired synchronously during `downloads.download`
+        const earlyDelta = earlyDownloadDeltas.get(downloadId);
+        if (earlyDelta) {
+          earlyDownloadDeltas.delete(downloadId);
+          void trackBackgroundJob(handleDownloadTerminalDelta(record, earlyDelta));
+        }
+        return;
+      }
+    } else if (
+      enrichedSpec.kind === "hls" ||
+      enrichedSpec.kind === "segments" ||
+      enrichedSpec.kind === "dash_mux" ||
+      enrichedSpec.kind === "youtube_mux" ||
+      enrichedSpec.kind === "batch_zip"
+    ) {
+      const STREAM_UNWHITELISTED_MSG =
+        "该长尾流媒体（HLS/合流）域名不在扩展白名单内，请复制直链或打开原帖下载";
+      let badRoute: string | undefined;
+
+      if (enrichedSpec.kind === "hls") {
+        if (!enrichedSpec.routes.some(isWhitelistedRoute)) {
+          badRoute = enrichedSpec.routes[0] || "";
+        }
+      } else if (enrichedSpec.kind === "segments") {
+        if (!enrichedSpec.routes.some(isWhitelistedRoute)) {
+          badRoute = enrichedSpec.routes[0] || "";
+        } else if (enrichedSpec.segments?.length) {
+          for (const seg of enrichedSpec.segments) {
+            const segRoutes = seg.routes?.length
+              ? seg.routes
+              : seg.url
+                ? [seg.url]
+                : [];
+            if (!segRoutes.some(isWhitelistedRoute)) {
+              badRoute = segRoutes[0] || "";
+              break;
+            }
+          }
+        }
+      } else if (enrichedSpec.kind === "dash_mux") {
+        const videoRoutes = enrichedSpec.dashMux?.videoRoutes ?? [];
+        const audioRoutes = enrichedSpec.dashMux?.audioRoutes ?? [];
+        if (!videoRoutes.some(isWhitelistedRoute)) {
+          badRoute = videoRoutes[0] || "";
+        } else if (!audioRoutes.some(isWhitelistedRoute)) {
+          badRoute = audioRoutes[0] || "";
+        }
+      } else if (enrichedSpec.kind === "youtube_mux") {
+        const videoUrl = enrichedSpec.youtubeMux?.videoUrl ?? "";
+        const audioUrl = enrichedSpec.youtubeMux?.audioUrl ?? "";
+        if (!videoUrl || !isWhitelistedRoute(videoUrl)) {
+          badRoute = videoUrl;
+        } else if (!audioUrl || !isWhitelistedRoute(audioUrl)) {
+          badRoute = audioUrl;
+        }
+      } else if (enrichedSpec.kind === "batch_zip") {
+        for (const entry of enrichedSpec.zipEntries ?? []) {
+          if (!entry.routes.some(isWhitelistedRoute)) {
+            badRoute = entry.routes[0] || "";
+            break;
+          }
+          if (entry.segments?.length) {
+            for (const seg of entry.segments) {
+              const segRoutes = seg.routes?.length
+                ? seg.routes
+                : seg.url
+                  ? [seg.url]
+                  : [];
+              if (!segRoutes.some(isWhitelistedRoute)) {
+                badRoute = segRoutes[0] || "";
+                break;
+              }
+            }
+            if (badRoute !== undefined) break;
+          }
+        }
+      }
+
+      if (badRoute !== undefined) {
+        const check = badRoute
+          ? isWhitelistedMediaUrl(badRoute, effectiveAllowedOrigins)
+          : { allowed: false, hostname: "" };
+        await failUnwhitelistedInBackground({
+          message:
+            enrichedSpec.kind === "batch_zip"
+              ? "该长尾站点媒体域名不在扩展打包白名单内，请使用子文件夹方式原生下载"
+              : STREAM_UNWHITELISTED_MSG,
+          unwhitelistedHost: check.hostname || undefined,
+          fallbackUrl:
+            latestBeforeStart.fallbackUrl ||
+            enrichedSpec.routes[0] ||
+            badRoute ||
+            undefined,
+        });
+        return;
+      }
+    }
+
     const updatedTask: ExtensionDownloadTask = {
       ...latestBeforeStart,
       status: enrichedSpec.kind === "youtube_mux" ? "muxing" : "downloading",
@@ -2386,14 +2642,14 @@ export function createBackgroundController(
     const seenKeys = new Set<string>();
     const matchedList: MatchedPlatformUrl[] = [];
     for (const rawUrl of req.urls) {
-      const matched = matchSupportedPlatformUrl(rawUrl);
+      const matched = matchActiveParseUrl(rawUrl);
       if (!matched || seenKeys.has(matched.dedupeKey)) continue;
       seenKeys.add(matched.dedupeKey);
       matchedList.push(matched);
     }
 
     if (matchedList.length === 0) {
-      throw new Error("未提取到受支持平台的有效分享链接");
+      throw new Error("未提取到有效的公开媒体链接");
     }
 
     const groupBatchId = nextId("batch");
@@ -2544,11 +2800,13 @@ export function createBackgroundController(
       outcome = userCancelled ? undefined : "failed";
     }
 
-    await sendReleaseBlobToOffscreen({
-      taskId: record.taskId,
-      blobUrl: record.blobUrl,
-      opfsTempName: record.opfsTempName,
-    });
+    if (record.blobUrl) {
+      await sendReleaseBlobToOffscreen({
+        taskId: record.taskId,
+        blobUrl: record.blobUrl,
+        opfsTempName: record.opfsTempName,
+      });
+    }
 
     updateBadge(outcome);
     await broadcastTasksUpdated(savedWorkUpdated);
@@ -2830,7 +3088,7 @@ export function createBackgroundController(
   };
 
   const runSilentQuickDownload = async (rawCandidateUrl: string): Promise<void> => {
-    const matched = matchSupportedPlatformUrl(rawCandidateUrl);
+    const matched = matchActiveParseUrl(rawCandidateUrl);
     if (!matched) {
       const taskId = nextId("task");
       const ts = nowFn();
@@ -2840,12 +3098,12 @@ export function createBackgroundController(
         filename: "unsupported",
         platform: "unknown",
         status: "failed",
-        statusText: "非支持平台",
+        statusText: "非有效媒体链接",
         percent: 0,
         loaded: 0,
         total: 0,
         speed: 0,
-        error: "该链接不属于受支持的 14 个平台（零外发请求）",
+        error: "该链接格式无效或属于受保护的本地/内网地址（零外发请求）",
         createdAt: ts,
         updatedAt: ts,
       });
@@ -3009,22 +3267,31 @@ export function createBackgroundController(
       }
 
       case "PARSE_URL": {
-        const matched = matchSupportedPlatformUrl(req.url);
+        const matched = matchActiveParseUrl(req.url);
         if (!matched) {
-          return errRpc("仅支持解析 14 个白名单平台的有效分享链接", {
+          return errRpc("请输入有效的公开媒体链接（已本地拦截内网、IP 与浏览器内部地址）", {
             code: "UNSUPPORTED_PLATFORM",
             status: 400,
           });
         }
         const settings = await storage.getSettings();
         const media = await parseSupportedUrlInternal(matched, settings);
+        const resolvedPlatform = media.platform?.trim() || matched.platform;
+        const enrichedMatched: MatchedPlatformUrl = {
+          ...matched,
+          platform: resolvedPlatform,
+          platformLabel:
+            (media.platform?.trim()
+              ? formatPlatformDisplayName(media.platform.trim())
+              : "") || matched.platformLabel,
+        };
         const workFingerprint = buildWorkFingerprint(media);
         const isSaved = workFingerprint
           ? await storage.isWorkSaved(workFingerprint)
           : false;
         return okRpc({
           media,
-          matched,
+          matched: enrichedMatched,
           workFingerprint,
           isSaved,
         });
@@ -3063,11 +3330,16 @@ export function createBackgroundController(
           updatedAt: nowFn(),
         });
 
-        if (
-          typeof task.chromeDownloadId === "number" &&
-          chromeApi.downloads?.cancel
-        ) {
-          void chromeApi.downloads.cancel(task.chromeDownloadId).catch(() => {});
+        if (typeof task.chromeDownloadId === "number") {
+          const pendingRec = pendingBlobDownloads.get(task.chromeDownloadId);
+          if (pendingRec && !pendingRec.blobUrl) {
+            pendingBlobDownloads.delete(task.chromeDownloadId);
+          }
+          if (chromeApi.downloads?.cancel) {
+            void chromeApi.downloads
+              .cancel(task.chromeDownloadId)
+              .catch(() => {});
+          }
         }
         if (offscreenDocumentOpen) {
           void sendToOffscreen(
@@ -3128,7 +3400,7 @@ export function createBackgroundController(
           return okRpc({ task: resetTask });
         }
 
-        const matched = matchSupportedPlatformUrl(retryPayload.url);
+        const matched = matchActiveParseUrl(retryPayload.url);
         if (!matched) {
           return errRpc("重试链接无效", { code: "UNSUPPORTED_URL" });
         }

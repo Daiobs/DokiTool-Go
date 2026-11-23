@@ -116,12 +116,13 @@ export const PLATFORM_DOMAIN_SPECS: readonly PlatformDomainSpec[] = [
 ] as const;
 
 export interface MatchedPlatformUrl {
-  platform: PlatformId;
+  platform: PlatformId | "generic" | string;
   platformLabel: string;
   url: string;
   dedupeKey: string;
   youtubeVideoId?: string;
   isLikelyFeedOrHome: boolean;
+  isGeneric?: boolean;
 }
 
 export interface BatchUrlExtractResult {
@@ -296,7 +297,7 @@ function extractYouTubeId(url: URL): string | undefined {
   return YOUTUBE_VIDEO_ID_RE.test(candidate) ? candidate : undefined;
 }
 
-function fallbackDedupeKey(platform: PlatformId, url: URL): string {
+function fallbackDedupeKey(platform: PlatformId | "generic", url: URL): string {
   const host = url.hostname.toLowerCase();
   const cleanPath =
     url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : "/";
@@ -963,6 +964,121 @@ export function extractSupportedUrlsFromText(
     for (const rawToken of tokens) {
       const candidate = cleanCandidateToken(rawToken);
       const matched = matchSupportedPlatformUrl(candidate);
+      if (!matched) continue;
+
+      matchedAnyInLine = true;
+      if (seenKeys.has(matched.dedupeKey)) {
+        duplicateCount++;
+      } else {
+        seenKeys.add(matched.dedupeKey);
+        items.push(matched);
+      }
+    }
+
+    if (!matchedAnyInLine) {
+      ignoredLineCount++;
+    }
+  }
+
+  return { items, ignoredLineCount, duplicateCount };
+}
+
+const MAX_ACTIVE_GENERIC_URL_LENGTH = 2048;
+
+function isBlockedGenericHost(host: string): boolean {
+  if (!host.includes(".")) return true;
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".localdomain") ||
+    host.endsWith(".home.arpa") ||
+    host === "dokitool.com" ||
+    host.endsWith(".dokitool.com")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Matches a user-initiated active parse URL (manual paste, batch queue,
+ * right-click inspect/quick-download, or retry/refresh).
+ *
+ * 1. Tries `matchSupportedPlatformUrl(rawUrl)` first (exact 14 core platforms).
+ * 2. Otherwise accepts a valid public HTTP/HTTPS media page URL (standard port,
+ *    public multi-label DNS host, non-empty path or query, length <= 2048) while
+ *    locally blocking browser schemes, IP literals, userinfo, `localhost` /
+ *    `*.local` / `*.internal` / `*.localdomain` / `*.home.arpa`, and `dokitool.com`.
+ *
+ * NEVER used for passive tab sync (`autoFollowTab` / `evaluateTabSyncState`)!
+ */
+export function matchActiveParseUrl(rawUrl: string): MatchedPlatformUrl | null {
+  const coreMatched = matchSupportedPlatformUrl(rawUrl);
+  if (coreMatched) return coreMatched;
+
+  if (typeof rawUrl !== "string" || rawUrl.length > MAX_ACTIVE_GENERIC_URL_LENGTH) {
+    return null;
+  }
+
+  const parsed = validateAndParseHttpUrl(rawUrl);
+  if (!parsed) return null;
+
+  const host = parsed.hostname.toLowerCase();
+  if (isBlockedGenericHost(host)) {
+    return null;
+  }
+
+  // Require non-empty path or query so bare home/root domains are rejected locally
+  if (parsed.pathname.replace(/\/+/g, "") === "" && parsed.search === "") {
+    return null;
+  }
+
+  const platformLabel =
+    host.startsWith("www.") && host.length > 4 ? host.slice(4) : host;
+
+  return {
+    platform: "generic",
+    platformLabel,
+    url: parsed.toString(),
+    dedupeKey: fallbackDedupeKey("generic", parsed),
+    isLikelyFeedOrHome: false,
+    isGeneric: true,
+  };
+}
+
+/**
+ * Extracts and deduplicates all actively parseable URLs (14 core platforms plus
+ * valid public long-tail media page URLs) from multi-line text or mixed share copy,
+ * while ignoring plain text, browser schemes, IPs, local/private hosts, and `dokitool.com`.
+ */
+export function extractActiveParseUrlsFromText(
+  text: string,
+): BatchUrlExtractResult {
+  if (typeof text !== "string" || !text.trim()) {
+    return { items: [], ignoredLineCount: 0, duplicateCount: 0 };
+  }
+
+  const items: MatchedPlatformUrl[] = [];
+  const seenKeys = new Set<string>();
+  let ignoredLineCount = 0;
+  let duplicateCount = 0;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const tokens = line.match(EMBEDDED_URL_TOKEN_RE);
+    if (!tokens || tokens.length === 0) {
+      ignoredLineCount++;
+      continue;
+    }
+
+    let matchedAnyInLine = false;
+    for (const rawToken of tokens) {
+      const candidate = cleanCandidateToken(rawToken);
+      const matched = matchActiveParseUrl(candidate);
       if (!matched) continue;
 
       matchedAnyInLine = true;

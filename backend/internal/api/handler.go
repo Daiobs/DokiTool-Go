@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -42,6 +43,7 @@ type YouTubeHelper interface {
 type Handler struct {
 	catalog             *catalog.Catalog
 	adapters            map[string]Adapter
+	genericAdapter      Adapter
 	now                 func() time.Time
 	publicMedia         PublicMedia
 	weiboRelay          http.Handler
@@ -107,6 +109,42 @@ func (h *Handler) SetWeiboRelay(relay http.Handler) { h.weiboRelay = relay }
 // When unset, /api/youtube/context and /api/youtube/finalize return 404.
 func (h *Handler) SetYouTubeHelper(helper YouTubeHelper) { h.youtubeHelper = helper }
 
+// SetGenericAdapter registers the optional Tier-2 named-extractor yt-dlp fallback
+// adapter before server startup. When unset, non-catalog URLs return UNSUPPORTED_PLATFORM.
+func (h *Handler) SetGenericAdapter(adapter Adapter) {
+	if h == nil {
+		return
+	}
+	h.genericAdapter = adapter
+}
+
+// GenericEnabled reports whether the optional Tier-2 generic named-extractor fallback is active.
+func (h *Handler) GenericEnabled() bool {
+	return h != nil && h.genericAdapter != nil
+}
+
+func (h *Handler) adapterForPlatform(platform string) Adapter {
+	if h == nil {
+		return nil
+	}
+	if platform == PlatformGeneric {
+		return h.genericAdapter
+	}
+	return h.adapters[platform]
+}
+
+func (h *Handler) recordParseTelemetry(routePlatform, dynamicPlatform, code, channel string, elapsed time.Duration) {
+	if routePlatform == PlatformGeneric {
+		if dynamicPlatform != "" && IsValidDynamicPlatformKey(dynamicPlatform) {
+			h.stats.RecordDynamicParse(dynamicPlatform, code, channel, elapsed)
+		} else {
+			h.stats.RecordParse(PlatformUnknown, code, channel, elapsed)
+		}
+		return
+	}
+	h.stats.RecordParse(routePlatform, code, channel, elapsed)
+}
+
 // HasCachedYouTubeContext reports whether the configured YouTube helper currently
 // holds a fresh in-memory player context that can be served without upstream/Deno work.
 func (h *Handler) HasCachedYouTubeContext() bool {
@@ -134,16 +172,26 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 	if !scalar || source == "" || !h.catalog.ValidInputURL(source) {
 		return cacheKey{}, "", false
 	}
-	platform := h.catalog.PlatformForURL(source)
-	if platform == "" || h.adapters[platform] == nil {
-		return cacheKey{}, "", false
-	}
 	requested, requestedScalar := queryValue(rawQuery, "platform")
 	if !queryPresent(rawQuery, "platform") {
 		requested, requestedScalar = "all", true
 	}
-	if !requestedScalar || (requested != "all" && (requested != platform || !h.catalog.Has(requested))) {
+	if !requestedScalar {
 		return cacheKey{}, "", false
+	}
+	platform := h.catalog.PlatformForURL(source)
+	if platform == "" {
+		if h.genericAdapter == nil || path != "/api/parse" || requested != "all" || !ytgeneric.AllowedGenericInputURL(source) {
+			return cacheKey{}, "", false
+		}
+		platform = PlatformGeneric
+	} else {
+		if h.adapters[platform] == nil {
+			return cacheKey{}, "", false
+		}
+		if requested != "all" && (requested != platform || !h.catalog.Has(requested)) {
+			return cacheKey{}, "", false
+		}
 	}
 	if !cacheableRequest(platform, source) {
 		return cacheKey{}, "", false
@@ -191,7 +239,7 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 	}
 	if key != nil && !key.AllowsPlatform(platform) {
 		key.recordUnauthorized()
-		h.stats.RecordParse(platform, OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
+		h.recordParseTelemetry(platform, "", OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
 		rejectUnauthorizedWithMessage(w, r, parser, "当前凭据无权访问该平台")
 		return true
 	}
@@ -200,12 +248,39 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 	h.stats.recordCacheHit(ChannelOwner)
-	h.stats.RecordParse(platform, res.code, ChannelOwner, time.Since(wallStart))
+	h.recordParseTelemetry(platform, res.platform, res.code, ChannelOwner, time.Since(wallStart))
 	if key != nil {
 		key.recordCachedParseStatus(res.status)
 	}
 	writeResponse(w, res)
 	return true
+}
+
+// ClassifyParseRoute classifies a parse/resolve request into Tier-1 catalog
+// platform or Tier-2 generic named-extractor fallback.
+func (h *Handler) ClassifyParseRoute(path, rawQuery string) (platform string, isGeneric bool) {
+	if h == nil || h.catalog == nil {
+		return "", false
+	}
+	input, scalar := queryValue(rawQuery, "url")
+	if !scalar || input == "" {
+		return "", false
+	}
+	source := InputURL(input)
+	if source == "" {
+		return "", false
+	}
+	if p := h.catalog.PlatformForURL(source); p != "" {
+		return p, false
+	}
+	requested, requestedScalar := queryValue(rawQuery, "platform")
+	if !queryPresent(rawQuery, "platform") {
+		requested, requestedScalar = "all", true
+	}
+	if h.genericAdapter != nil && path == "/api/parse" && requestedScalar && requested == "all" && h.catalog.ValidInputURL(source) && ytgeneric.AllowedGenericInputURL(source) {
+		return PlatformGeneric, true
+	}
+	return "", false
 }
 
 // ParsePlatform reports the registered catalog platform matched by a scalar url
@@ -424,21 +499,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 400, "请输入对应平台的有效分享链接")
 		return
 	}
-	if platform == "" || (requested != "all" && !h.catalog.Has(requested)) {
-		h.stats.RecordParse(platform, "UNSUPPORTED_PLATFORM", channel, time.Since(wallStart))
-		send(w, 400, unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false))
-		return
-	}
-	if requested != "all" && requested != platform {
-		h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
-		sendError(w, 400, "链接与所选平台不匹配，请切换对应平台或选择自动识别")
-		return
+	if platform == "" {
+		if h.genericAdapter != nil && path == "/api/parse" && requested == "all" {
+			if !ytgeneric.AllowedGenericInputURL(source) {
+				h.stats.RecordParse(PlatformUnknown, "INVALID_INPUT", channel, time.Since(wallStart))
+				sendError(w, 400, "请输入有效的公网分享链接")
+				return
+			}
+			platform = PlatformGeneric
+		} else {
+			h.stats.RecordParse(platform, "UNSUPPORTED_PLATFORM", channel, time.Since(wallStart))
+			send(w, 400, unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false))
+			return
+		}
+	} else {
+		if requested != "all" && !h.catalog.Has(requested) {
+			h.stats.RecordParse(platform, "UNSUPPORTED_PLATFORM", channel, time.Since(wallStart))
+			send(w, 400, unified.ContractError("UNSUPPORTED_PLATFORM", "暂不支持该平台链接解析", false))
+			return
+		}
+		if requested != "all" && requested != platform {
+			h.stats.RecordParse(platform, "INVALID_INPUT", channel, time.Since(wallStart))
+			sendError(w, 400, "链接与所选平台不匹配，请切换对应平台或选择自动识别")
+			return
+		}
 	}
 	if !authAllowsPlatform(r.Context(), platform) {
 		if authKey, viaAdm := authKeyFromContext(r.Context()); authKey != nil && !viaAdm {
 			authKey.recordUnauthorized()
 		}
-		h.stats.RecordParse(platform, OutcomeUnauthorized, channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, "", OutcomeUnauthorized, channel, time.Since(wallStart))
 		sendError(w, http.StatusUnauthorized, "当前凭据无权访问该平台")
 		return
 	}
@@ -448,9 +538,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 400, "缺少有效的媒体条目标识")
 		return
 	}
-	adapter := h.adapters[platform]
+	adapter := h.adapterForPlatform(platform)
 	if adapter == nil {
-		h.stats.RecordParse(platform, "SERVICE_NOT_CONFIGURED", channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, "", "SERVICE_NOT_CONFIGURED", channel, time.Since(wallStart))
 		sendError(w, 503, "解析服务未配置完成")
 		return
 	}
@@ -465,7 +555,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), parseTimeout)
 		defer cancel()
 		res := h.runUncachedParse(ctx, path, platform, source, resolveItemID, debugView)
-		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
@@ -493,7 +583,7 @@ func (h *Handler) serveCachedParse(
 		if authKey, _ := authKeyFromContext(r.Context()); authKey != nil {
 			authKey.counters.cacheHits.Add(1)
 		}
-		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
@@ -504,7 +594,7 @@ func (h *Handler) serveCachedParse(
 		if authKey, _ := authKeyFromContext(r.Context()); authKey != nil {
 			authKey.counters.cacheHits.Add(1)
 		}
-		h.stats.RecordParse(platform, res.code, channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
@@ -532,7 +622,7 @@ func (h *Handler) serveCachedParse(
 
 	select {
 	case <-call.done:
-		h.stats.RecordParse(platform, call.res.code, channel, time.Since(wallStart))
+		h.recordParseTelemetry(platform, call.res.platform, call.res.code, channel, time.Since(wallStart))
 		writeResponse(w, call.res)
 	case <-r.Context().Done():
 		h.cache.onWaiterCanceled(key, call)
@@ -616,7 +706,7 @@ func (h *Handler) runSingleflight(
 	res, payload, encOK = h.executeParse(ctx, path, platform, source, itemID, debug, h.now())
 	finishNow = h.now()
 	if encOK && payload != nil {
-		ttl, cacheable = computeCacheTTL(payload, finishNow)
+		ttl, cacheable = computeCacheTTLForPlatform(platform, payload, finishNow)
 	}
 	completed = true
 }
@@ -635,12 +725,15 @@ func (h *Handler) executeParse(
 			retOK = false
 		}
 	}()
-	adapter := h.adapters[platform]
-	now := nowTime.Unix()
 	errorResult := func(status int, message string) (cachedResponse, unified.Object, bool) {
 		res, _ := encodeResponse(status, contractErrorForStatus(status, message))
 		return res, nil, false
 	}
+	adapter := h.adapterForPlatform(platform)
+	if adapter == nil {
+		return errorResult(503, "解析服务未配置完成")
+	}
+	now := nowTime.Unix()
 
 	payload, err := adapter.Parse(ctx, source, now)
 	if err != nil {
@@ -655,11 +748,24 @@ func (h *Handler) executeParse(
 		return res, payload, ok
 	}
 	data := unified.Map(payload["data"])
-	if unified.Str(data["platform"]) != platform {
+	actualPlatform := unified.Str(data["platform"])
+	if platform == PlatformGeneric {
+		if !IsValidDynamicPlatformKey(actualPlatform) ||
+			corePlatformIndex(actualPlatform) >= 0 ||
+			h.catalog.Has(actualPlatform) ||
+			actualPlatform == "generic" ||
+			actualPlatform == PlatformGeneric {
+			return errorResult(502, "内部解析接口平台不一致")
+		}
+	} else if actualPlatform != platform {
 		return errorResult(502, "内部解析接口平台不一致")
 	}
 	if h.publicMedia != nil {
-		payload, err = h.publicMedia(ctx, platform, payload, now)
+		targetPlatform := platform
+		if platform == PlatformGeneric {
+			targetPlatform = actualPlatform
+		}
+		payload, err = h.publicMedia(ctx, targetPlatform, payload, now)
 		if err != nil {
 			return errorResult(503, "媒体服务尚未配置，请联系站点维护者")
 		}
@@ -670,7 +776,7 @@ func (h *Handler) executeParse(
 			res, ok := encodeResponse(status, payload)
 			return res, payload, ok
 		}
-		if unified.Str(unified.Map(payload["data"])["platform"]) != platform {
+		if unified.Str(unified.Map(payload["data"])["platform"]) != targetPlatform {
 			return errorResult(502, "内部解析接口平台不一致")
 		}
 	}
@@ -696,6 +802,9 @@ func (h *Handler) executeParse(
 		return errorResult(502, "解析接口合同校验失败")
 	}
 	res, ok := encodeResponse(200, payload)
+	if platform == PlatformGeneric && ok {
+		res.platform = actualPlatform
+	}
 	return res, payload, ok
 }
 

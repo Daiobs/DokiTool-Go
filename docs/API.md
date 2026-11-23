@@ -8,7 +8,7 @@
 
 | 方法与路径 | 参数与用途 |
 | --- | --- |
-| `GET /api/parse` | `schema_version=1.0`（必填）；`url` 为分享 URL 或包含 URL 的分享文本（必填）；可选 `platform` 为目录中的平台 ID（`all` 或省略时自动按域名识别）；可选 `debug=1` 返回规范化全量版本。 |
+| `GET /api/parse` | `schema_version=1.0`（必填）；`url` 为分享 URL 或包含 URL 的分享文本（必填）；可选 `platform` 为目录中的平台 ID（`all` 或省略时按两级路由自动识别：优先命中核心平台目录；当服务端开启 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，未命中核心目录的合法公网链接会路由至第二级通用具名提取器兜底）；可选 `debug=1` 返回规范化全量版本。 |
 | `GET /api/resolve` | `schema_version=1.0`（必填）；使用后端给出的 `resolve_url`，携带原分享 `url`、`platform` 与不透明的 `item_id`（必填，长度 `<= 256`）解析指定分集；同样支持 `debug=1`。客户端不能从 ID 拼平台参数或借用其他分 P 的地址。 |
 | `GET /api/platforms` | `schema_version=1.0`（必填）；返回当前已启用平台的公开目录。 |
 | `GET /api/stats` | 可选 `schema_version=1.0`；仅限 `owner` 角色 Bearer 凭据访问（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥），返回进程内请求、缓存、准入池、各 API 密钥池（`data.api_keys`）、只读脱敏运行开关（`data.runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`data.daily`）与近 24 小时时桶（`data.hourly`）快照；`agent` / `friend` 角色密钥访问时返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。 |
@@ -24,7 +24,10 @@ curl --get 'https://snap.example.com/api/parse' \
 上面是格式示例，不是有效平台样本。分享 token、签名参数必须保持完整；不要把实际 token 或返回的签名 URL 写进公开日志、Issue 和夹具。
 
 **Bearer 多密钥角色隔离与鉴权后零槽位缓存快路径**：`/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口可选携带 `Authorization: Bearer <token>`（支持 `DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥及 `DOKITOOL_API_KEYS_FILE` 中的 `owner` / `agent` / `friend` 角色密钥，每把密钥拥有独立的并发池、慢解析子并发上限 `slow_concurrency`、速率桶与 FIFO 队列；配置与 `SIGHUP` 热重载见 [CONFIGURATION.md](CONFIGURATION.md)）：
-- **角色与平台白名单边界**：`/api/stats` 严格仅允许 `owner` 角色访问（`agent` / `friend` 密钥访问返回 HTTP `401`）；若密钥配置了 `platforms` 平台白名单，请求白名单外的平台（无论缓存命中与否）同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
+- **角色与平台白名单边界**：`/api/stats` 严格仅允许 `owner` 角色访问（`agent` / `friend` 密钥访问返回 HTTP `401`）；若密钥配置了非空 `platforms` 平台白名单，请求白名单外的平台（以及未在白名单中显式声明 `"ytdlp_generic"` 时触发的第二级通用具名提取器兜底，无论缓存命中与否）同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
+- **两级解析路由与独立长尾隔离池（`DOKITOOL_YTDLP_GENERIC_ENABLED`）**：
+  - **第一级（核心目录优先）**：命中 `/api/platforms` 已注册核心平台的链接始终走各自专用解析器与快/慢池，行为与配额完全不变；
+  - **第二级（通用具名提取器兜底）**：仅在 `DOKITOOL_YTDLP_GENERIC_ENABLED=true`、路由为 `GET /api/parse` 且 `platform` 省略或为 `all` 时启用（`/api/resolve` 与显式指定 `platform=<id>` 绝不触发）。未命中核心目录的输入须通过严格公网分享链接校验（拒绝 `#fragment`、IP 字面量、`localhost` / `*.local` / `*.internal`、本站域名、非 80/443 端口、空路径与空查询参数及超过 `2048` 字节的链接；不合法时直接返回 `400 INVALID_INPUT`）。合法链接路由至独立隔离的 `PARSE_GENERIC` 准入池与受限子进程并发槽位（与核心快/慢池完全隔离），严格禁用 `generic` 盲抓提取器；解析成功后 `data.platform` 返回规范化动态平台标识（如 `vimeo`、`tiktok`、`reddit`、`soundcloud` 等，绝不暴露内部路由标识 `"ytdlp_generic"`），成功结果进入进程内短时缓存（TTL 上限 `60s`），无法识别的站点返回 `400 UNSUPPORTED_PLATFORM`（不污染动态统计桶）。
 - **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：通过鉴权与平台白名单校验后，命中进程内新鲜缓存的 `GET /api/parse` 与 `GET /api/resolve` 请求，以及 `GET /api/platforms` 与命中缓存的 `GET /api/youtube/context` 请求，仅校验该密钥的快读速率桶即直接返回响应，**占用 `0` 个密钥并发槽位**，不会因该密钥并发池被慢请求占满而排队阻塞。
 - **`GET /api/stats` 监控扩展字段（`runtime` / `daily` / `hourly`）**：除累计请求、缓存、准入池、`ytdlp`、`shanghai`、`parse_latency_ms` 与 `api_keys` 外，`data` 同步返回三组只读脱敏字段（完整 Schema 见 [docs/openapi.json](openapi.json)）：
   - `data.runtime`：当前进程 11 项只读运行开关（`version`、`shanghai_mode`、`shanghai_bilibili`、`bilibili_dash`、`youtube_helper`、`xhs_transport`、`ytdlp_enabled`、`ytdlp_generic_enabled`、`tbvideo_pipigx`、`tbvideo_zuiyou`、`stats_persistence_enabled`），绝不暴露任何 URL、IP、路径或凭据；
@@ -128,8 +131,8 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 
 | 业务错误码 | HTTP 状态码 | 触发场景与契约语义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | `400` / `401` / `405` / `409` / `410` | 缺少或非法的 `url` / `item_id`；链接与显式指定的 `platform` 不匹配；缺少或不匹配的 `schema_version`（`409`）；不支持的 HTTP 方法（`405`）；已退役旧路径（`410`）；无效/已停用/畸形 `Authorization` 头、`/api/stats` 缺失凭据或由非 `owner`（`agent` / `friend`）凭据调用、或 Bearer 密钥请求超出其 `platforms` 平台白名单（均为 HTTP `401`，`retryable: false`）；以及特定短链或链接形态限制（如 X `t.co` 短链受控单跳展开后未指向有效 X / Twitter 推文页，Facebook `fb.watch` 短链需登录展开提示先在浏览器打开并复制 `facebook.com` 完整视频链接，抖音 `mix_id` 合集链接、小红书缺失 `xsec_token` 同属此类）。 |
-| `UNSUPPORTED_PLATFORM` | `400` | 输入包含合法的 `http(s)` 公开域名链接，但该域名不属于任何当前已启用的平台（例如未接入站点，或当前实例未启用的可选平台域名），或查询参数显式传入了未注册的 `platform` ID。 |
+| `INVALID_INPUT` | `400` / `401` / `405` / `409` / `410` | 缺少或非法的 `url` / `item_id`；链接与显式指定的 `platform` 不匹配；开启第二级通用兜底时传入含 `#fragment`、内网/本机主机名、本站域名、空路径+空查询或超过 2048 字节的非公网分享链接；缺少或不匹配的 `schema_version`（`409`）；不支持的 HTTP 方法（`405`）；已退役旧路径（`410`）；无效/已停用/畸形 `Authorization` 头、`/api/stats` 缺失凭据或由非 `owner`（`agent` / `friend`）凭据调用、或 Bearer 密钥请求超出其 `platforms` 平台白名单（含未授权 `"ytdlp_generic"` 作用域的通用兜底请求，均为 HTTP `401`，`retryable: false`）；以及特定短链或链接形态限制（如 X `t.co` 短链受控单跳展开后未指向有效 X / Twitter 推文页，Facebook `fb.watch` 短链需登录展开提示先在浏览器打开并复制 `facebook.com` 完整视频链接，抖音 `mix_id` 合集链接、小红书缺失 `xsec_token` 同属此类）。 |
+| `UNSUPPORTED_PLATFORM` | `400` | 输入包含合法的 `http(s)` 公开域名链接，但该域名不属于任何当前已启用的核心平台（未开启 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时直接返回，或开启第二级通用兜底后没有任何具名提取器匹配该链接），或查询参数显式传入了未注册的 `platform` ID，或对非目录链接调用了 `/api/resolve`。 |
 | `UPSTREAM_BLOCKED` | `403` | 上游平台拒绝匿名公开读取或要求登录验证：<br>• **X 受限推文（`TweetTombstone`）**：年龄限制、敏感内容或需登录查看的推文在默认配置（`-x-tombstone-fallback=off`）下返回 `403 UPSTREAM_BLOCKED`；若服务端显式启用 `-x-tombstone-fallback=fxtwitter`，则在遇到 `TweetTombstone` 时向 `api.fxtwitter.com` 查询公开元数据，仍被拒绝或不可读时保持失败关闭。<br>• **Facebook / Instagram 登录与权限限制**：Facebook 私密/年龄受限视频，以及 Instagram Stories（`/stories/`）、私密长短码链接与需登录查看的帖子均返回 `403 UPSTREAM_BLOCKED`。 |
 | `NO_MEDIA` | `404` | 目标内容公开可访问，但作品本身不包含任何受支持的媒体资源：例如 **X 纯文本推文**（无视频也无图片）、仅含不受支持流格式的视频，或空图文帖。 |
 | `CONTENT_UNAVAILABLE` | `404` | 目标作品不存在、已被作者或平台删除，或 `/api/resolve` 请求的 `item_id` 在作品中不存在或不可用。 |

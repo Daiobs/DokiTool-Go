@@ -2278,3 +2278,288 @@ func TestSortAudioFormatsStrictWeakOrdering(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifyStderrUnsupportedURLFlag(t *testing.T) {
+	unsupportedCases := []string{
+		"ERROR: Unsupported URL: https://example.com/article/123",
+		"ERROR: No suitable extractor found for URL https://example.com/article/123",
+	}
+	for _, msg := range unsupportedCases {
+		got := classifyStderr(msg, errors.New("exit status 1"))
+		if got.Code != CodeContentUnavailable || got.Retryable || !got.UnsupportedURL {
+			t.Fatalf("classifyStderr(%q) = %+v, want Code=CONTENT_UNAVAILABLE Retryable=false UnsupportedURL=true", msg, got)
+		}
+		if got.Message != "未找到可用的媒体，或该内容已不可访问" {
+			t.Fatalf("classifyStderr(%q).Message = %q, want backwards-compatible Tier-1 message", msg, got.Message)
+		}
+	}
+
+	nonUnsupportedCases := []struct {
+		stderr   string
+		wantCode ErrorCode
+	}{
+		{"ERROR: [twitter] 123: No video could be found in this tweet", CodeContentUnavailable},
+		{"ERROR: [vimeo] 123: HTTP Error 404: Not Found", CodeContentUnavailable},
+		{"ERROR: [vimeo] 123: HTTP Error 429: Too Many Requests", CodeRateLimited},
+		{"ERROR: [vimeo] 123: Private video; please sign in", CodeUpstreamBlocked},
+		{"ERROR: [vimeo] 123: timed out", CodeUpstreamTimeout},
+		{"ERROR: upstream blocked by outbound security policy", CodeUpstreamBlocked},
+	}
+	for _, tc := range nonUnsupportedCases {
+		got := classifyStderr(tc.stderr, errors.New("exit status 1"))
+		if got.Code != tc.wantCode || got.UnsupportedURL {
+			t.Fatalf("classifyStderr(%q) = %+v, want Code=%s UnsupportedURL=false", tc.stderr, got, tc.wantCode)
+		}
+	}
+}
+
+func TestWithGenericConcurrencyDynamicPortsIsolation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture requires unix")
+	}
+
+	// Nil receiver fails closed cleanly.
+	var nilEng *Engine
+	if disabled := nilEng.WithGenericConcurrency(2); disabled == nil || disabled.Enabled() {
+		t.Fatalf("expected disabled engine for nil.WithGenericConcurrency, got %+v", disabled)
+	}
+
+	gateDir := t.TempDir()
+	releaseFile := filepath.Join(gateDir, "release")
+	startedDir := filepath.Join(gateDir, "started")
+	if err := os.MkdirAll(startedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block only URLs containing "/slow/"; fast URLs return immediately.
+	script := fmt.Sprintf(`
+url=""
+for a in "$@"; do url="$a"; done
+case "$url" in
+  */slow/*)
+    id=$(basename "$url")
+    : > %q/"$id"
+    while [ ! -f %q ]; do
+      sleep 0.02
+    done
+    ;;
+esac
+echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.example.com/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a"}]}'
+`, startedDir, releaseFile)
+
+	binPath, hashes := writeFakeYTDLP(t, script)
+	baseEng, err := New(Config{
+		BinaryPath:     binPath,
+		AllowedHashes:  hashes,
+		MaxConcurrency: 2,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil || !baseEng.Enabled() {
+		t.Fatalf("New baseEng failed: %v", err)
+	}
+
+	// Clamping & defaults.
+	if got := cap(baseEng.WithGenericConcurrency(0).sem); got != DefaultConcurrency {
+		t.Fatalf("WithGenericConcurrency(0) cap = %d, want %d", got, DefaultConcurrency)
+	}
+	if got := cap(baseEng.WithGenericConcurrency(-3).sem); got != DefaultConcurrency {
+		t.Fatalf("WithGenericConcurrency(-3) cap = %d, want %d", got, DefaultConcurrency)
+	}
+	if got := cap(baseEng.WithGenericConcurrency(1).sem); got != 1 {
+		t.Fatalf("WithGenericConcurrency(1) cap = %d, want 1", got)
+	}
+	if got := cap(baseEng.WithGenericConcurrency(999).sem); got != MaxConcurrency {
+		t.Fatalf("WithGenericConcurrency(999) cap = %d, want %d", got, MaxConcurrency)
+	}
+
+	genericEng := baseEng.WithGenericConcurrency(2)
+	if genericEng.sem == baseEng.sem {
+		t.Fatal("dynamic-port WithGenericConcurrency must allocate an independent semaphore")
+	}
+	if genericEng.subSem != nil {
+		t.Fatal("dynamic-port WithGenericConcurrency must not attach subSem")
+	}
+	if genericEng.slotStats == baseEng.slotStats {
+		t.Fatal("dynamic-port WithGenericConcurrency must allocate fresh slotStats")
+	}
+
+	// Saturate all 2 generic slots.
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	for i := 1; i <= 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, exErr := genericEng.Extract(context.Background(), fmt.Sprintf("https://vimeo.com/slow/g%d", idx))
+			errCh <- exErr
+		}(i)
+	}
+
+	// Wait until both generic subprocesses have entered execution.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		entries, _ := os.ReadDir(startedDir)
+		if len(entries) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 2 generic slots to saturate; started=%d", len(entries))
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// A 3rd generic call must block on genericEng.sem and fail fast on short context timeout.
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer waitCancel()
+	_, waitErr := genericEng.Extract(waitCtx, "https://vimeo.com/fast/g3")
+	var waitEErr *Error
+	if !errors.As(waitErr, &waitEErr) || waitEErr.Code != CodeUpstreamTimeout {
+		t.Fatalf("expected 3rd generic call to time out waiting on generic semaphore, got %v", waitErr)
+	}
+
+	// Meanwhile Tier-1 baseEng must execute immediately with ZERO wait contention.
+	start := time.Now()
+	if _, baseErr := baseEng.Extract(context.Background(), "https://x.com/i/status/123"); baseErr != nil {
+		t.Fatalf("Tier-1 baseEng.Extract failed while genericEng saturated: %v", baseErr)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("Tier-1 baseEng was delayed by saturated genericEng: %v", elapsed)
+	}
+	if snap := baseEng.StatsSnapshot(); snap.Total.WaitCount != 0 || snap.Total.AcquiredCount != 1 {
+		t.Fatalf("expected zero Tier-1 contention, got %+v", snap)
+	}
+	if gSnap := genericEng.StatsSnapshot(); gSnap.Total.CanceledCount != 1 || gSnap.Active != 2 {
+		t.Fatalf("expected isolated generic slot stats (active=2, canceled=1), got %+v", gSnap)
+	}
+
+	// Release blocked generic workers and confirm clean completion.
+	if err := os.WriteFile(releaseFile, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	close(errCh)
+	for exErr := range errCh {
+		if exErr != nil {
+			t.Fatalf("generic Extract failed after release: %v", exErr)
+		}
+	}
+}
+
+func TestWithGenericConcurrencyFixedGatePortsSubSemaphore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fixture requires unix")
+	}
+
+	gateDir := t.TempDir()
+	releaseFile := filepath.Join(gateDir, "release")
+	startedDir := filepath.Join(gateDir, "started")
+	if err := os.MkdirAll(startedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	script := fmt.Sprintf(`
+url=""
+for a in "$@"; do url="$a"; done
+case "$url" in
+  */slow/*)
+    id=$(basename "$url")
+    : > %q/"$id"
+    while [ ! -f %q ]; do
+      sleep 0.02
+    done
+    ;;
+esac
+echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.example.com/v.mp4","ext":"mp4","protocol":"https","vcodec":"avc1","acodec":"mp4a"}]}'
+`, startedDir, releaseFile)
+
+	binPath, hashes := writeFakeYTDLP(t, script)
+	ports := testGatePorts(t, 3)
+	baseEng, err := New(Config{
+		BinaryPath:     binPath,
+		AllowedHashes:  hashes,
+		MaxConcurrency: 3,
+		GatePorts:      ports,
+		Timeout:        5 * time.Second,
+	})
+	if err != nil || !baseEng.Enabled() {
+		t.Fatalf("New fixed-port baseEng failed: %v", err)
+	}
+
+	// Capping subSem to min(limit, cap(e.sem)).
+	capped := baseEng.WithGenericConcurrency(10)
+	if capped.sem != baseEng.sem || capped.gatePorts != baseEng.gatePorts {
+		t.Fatal("fixed-port WithGenericConcurrency must share sem and gatePorts")
+	}
+	if capped.subSem == nil || cap(capped.subSem) != 3 {
+		t.Fatalf("expected subSem cap = min(10, 3) = 3, got %v", capped.subSem)
+	}
+
+	// Limit generic to 1 while baseEng has 3 fixed ports, and verify chaining preserves subSem.
+	genericEng := baseEng.
+		WithGenericConcurrency(1).
+		WithExtractors("default", "-generic")
+	if genericEng.sem != baseEng.sem || genericEng.gatePorts != baseEng.gatePorts {
+		t.Fatal("chained fixed-port generic engine must share sem and gatePorts")
+	}
+	if genericEng.subSem == nil || cap(genericEng.subSem) != 1 {
+		t.Fatalf("expected chained subSem cap = 1, got %v", genericEng.subSem)
+	}
+
+	// Occupy the single generic subSem slot (and 1 of 3 shared sem slots).
+	doneCh := make(chan error, 1)
+	go func() {
+		_, exErr := genericEng.Extract(context.Background(), "https://vimeo.com/slow/g1")
+		doneCh <- exErr
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		entries, _ := os.ReadDir(startedDir)
+		if len(entries) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for first generic call to enter execution")
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// A 2nd generic request must block on subSem and time out even though 2 shared sem slots are free.
+	g2Ctx, g2Cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer g2Cancel()
+	_, g2Err := genericEng.Extract(g2Ctx, "https://vimeo.com/fast/g2")
+	var g2EErr *Error
+	if !errors.As(g2Err, &g2EErr) || g2EErr.Code != CodeUpstreamTimeout {
+		t.Fatalf("expected 2nd generic call to block on subSem and time out, got %v", g2Err)
+	}
+
+	// Meanwhile Tier-1 baseEng can still run 2 concurrent extractions using the remaining 2 shared slots.
+	var tier1WG sync.WaitGroup
+	tier1Errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		tier1WG.Add(1)
+		go func(idx int) {
+			defer tier1WG.Done()
+			_, tErr := baseEng.Extract(context.Background(), fmt.Sprintf("https://x.com/i/status/%d", 100+idx))
+			tier1Errs <- tErr
+		}(i)
+	}
+	tier1WG.Wait()
+	close(tier1Errs)
+	for tErr := range tier1Errs {
+		if tErr != nil {
+			t.Fatalf("Tier-1 Extract failed while generic subSem saturated: %v", tErr)
+		}
+	}
+
+	// Release first generic call and verify subSem is freed cleanly.
+	if err := os.WriteFile(releaseFile, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if exErr := <-doneCh; exErr != nil {
+		t.Fatalf("first generic Extract failed after release: %v", exErr)
+	}
+	if len(genericEng.subSem) != 0 || len(baseEng.sem) != 0 {
+		t.Fatalf("expected all slots released, got subSem=%d sem=%d", len(genericEng.subSem), len(baseEng.sem))
+	}
+}

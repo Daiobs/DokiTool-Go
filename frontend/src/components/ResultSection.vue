@@ -16,6 +16,7 @@ import {
   groupVariantsForDisplay,
 } from "../utils/mediaSources";
 import { selectYouTubeMuxPair } from "../utils/youtubeHelperCore";
+import { resolvePlatformPresentation } from "../utils/platforms";
 import { apiConfig } from "../services/apiConfig";
 import { t, stripSilentOnlyNotice } from "./result/resultI18n";
 import {
@@ -339,30 +340,61 @@ const playerQualityTagText = computed(() =>
     props.locale,
   ),
 );
-const primaryDownloadLabel = computed(() =>
-  resolvePrimaryDownloadCtaLabel({
+const primaryDownloadLabel = computed(() => {
+  if (
+    !needsQualitySelection.value &&
+    currentItem.value?.type === "audio" &&
+    !isActiveYouTubeAudioOnly.value
+  ) {
+    return t(props.locale, "downloadAudio");
+  }
+  return resolvePrimaryDownloadCtaLabel({
     locale: props.locale,
     needsQualitySelection: needsQualitySelection.value,
     isActiveYouTubeSplitVideo: isActiveYouTubeSplitVideo.value,
     hasActiveYouTubeMuxPair: Boolean(activeYouTubeMuxPair.value),
     isActiveYouTubeAudioOnly: isActiveYouTubeAudioOnly.value,
     activeVariant: activeVariant.value,
-  }),
+  });
+});
+const platformPresentation = computed(() =>
+  resolvePlatformPresentation(
+    props.resultData?.platform,
+    props.locale,
+    currentItem.value?.type,
+  ),
 );
-const mediaTypeBadge = computed(() => ({
-  icon: hasImages.value ? "fa-images" : "fa-play",
-  text: isMulti.value
-    ? t(props.locale, "collection")
-    : t(
-        props.locale,
-        currentItem.value?.type === "live_photo"
-          ? "live"
-          : currentItem.value?.type === "image"
-            ? "images"
-            : "video",
-      ),
-  style: hasImages.value ? "image" : "video",
-}));
+const mediaTypeBadge = computed(() => {
+  const itemType = currentItem.value?.type;
+  const isAudio = !hasImages.value && itemType === "audio";
+  const isLive = !isMulti.value && !hasImages.value && itemType === "live_photo";
+  return {
+    icon: hasImages.value
+      ? "fa-images"
+      : isAudio
+        ? "fa-music"
+        : "fa-play",
+    text: isMulti.value
+      ? t(props.locale, "collection")
+      : t(
+          props.locale,
+          itemType === "live_photo"
+            ? "live"
+            : itemType === "image"
+              ? "images"
+              : itemType === "audio"
+                ? "audio"
+                : "video",
+        ),
+    style: hasImages.value
+      ? "image"
+      : isLive
+        ? "live"
+        : isAudio
+          ? "audio"
+          : "video",
+  };
+});
 
 const activeTab = ref("info");
 const sidebarRef = ref(null);
@@ -565,6 +597,22 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
             <div class="rs-status-dot-pulse"></div>
           </div>
           <span class="rs-header-title">{{ t(locale, "resultTitle") }}</span
+          ><span
+            v-if="platformPresentation.id"
+            data-testid="result-platform-badge"
+            :data-platform="platformPresentation.id"
+            :data-platform-builtin="
+              platformPresentation.isBuiltin ? 'true' : 'false'
+            "
+            class="rs-header-badge rs-header-badge--platform"
+            :class="{
+              'rs-header-badge--platform-generic':
+                !platformPresentation.isBuiltin,
+            }"
+            ><AppIcon :class="['fas', platformPresentation.icon]" /><span
+              class="rs-header-badge-label"
+              >{{ platformPresentation.label }}</span
+            ></span
           ><span
             class="rs-header-badge"
             :class="'rs-header-badge--' + mediaTypeBadge.style"
@@ -891,6 +939,11 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   align-items: center;
   gap: 0.75rem;
 }
+.rs-header-left {
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 0.5rem 0.625rem;
+}
 .rs-status-dot-wrapper {
   position: relative;
   width: 1rem;
@@ -943,7 +996,32 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   border-radius: 999px;
   font-size: 0.7rem;
   font-weight: 600;
+  white-space: nowrap;
   transition: all var(--t-fast);
+}
+.rs-header-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rs-header-badge--platform {
+  background: linear-gradient(
+    135deg,
+    rgba(15, 23, 42, 0.08),
+    rgba(15, 23, 42, 0.04)
+  );
+  color: var(--c-fg-2);
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  max-width: 11rem;
+}
+.rs-header-badge--platform-generic {
+  background: linear-gradient(
+    135deg,
+    rgba(6, 182, 212, 0.16),
+    rgba(108, 92, 231, 0.12)
+  );
+  color: #0e7490;
+  border: 1px solid rgba(6, 182, 212, 0.28);
 }
 .rs-header-badge--video {
   background: linear-gradient(
@@ -953,6 +1031,15 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   );
   color: var(--c-accent);
   border: 1px solid rgba(108, 92, 231, 0.25);
+}
+.rs-header-badge--audio {
+  background: linear-gradient(
+    135deg,
+    rgba(16, 185, 129, 0.2),
+    rgba(6, 182, 212, 0.12)
+  );
+  color: #047857;
+  border: 1px solid rgba(16, 185, 129, 0.28);
 }
 .rs-header-badge--image {
   background: linear-gradient(
@@ -971,6 +1058,33 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   );
   color: var(--c-danger);
   border: 1px solid rgba(239, 68, 68, 0.25);
+}
+:global(.dark) .rs-header-badge--platform {
+  background: linear-gradient(
+    135deg,
+    rgba(148, 163, 184, 0.18),
+    rgba(148, 163, 184, 0.1)
+  );
+  color: #e2e8f0;
+  border-color: rgba(148, 163, 184, 0.28);
+}
+:global(.dark) .rs-header-badge--platform-generic {
+  background: linear-gradient(
+    135deg,
+    rgba(34, 211, 238, 0.18),
+    rgba(129, 140, 248, 0.16)
+  );
+  color: #67e8f9;
+  border-color: rgba(34, 211, 238, 0.3);
+}
+:global(.dark) .rs-header-badge--audio {
+  background: linear-gradient(
+    135deg,
+    rgba(16, 185, 129, 0.22),
+    rgba(6, 182, 212, 0.14)
+  );
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.32);
 }
 .rs-header-badge:hover {
   transform: translateY(-1px);

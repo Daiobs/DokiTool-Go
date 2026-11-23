@@ -70,7 +70,7 @@
       "get": {
         "operationId": "parseMedia",
         "summary": "Parse a share URL or share text into Unified Media v1 items",
-        "description": "Extracts normalized media items, variants, and direct CDN delivery sources for a supported public post. Accepts optional Bearer credentials (`DOKITOOL_OWNER_TOKEN` or named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` with `owner`, `agent`, or `friend` roles): each key uses an isolated per-key execution pool (`concurrency`, `slow_concurrency`, rate bucket, and FIFO queue) instead of the anonymous per-IP rate limiter, enforces optional per-key `platforms` scope (returning HTTP 401 `INVALID_INPUT` for disallowed platforms), and serves fresh in-process cache hits via the post-auth zero-slot cache fast-path without consuming per-key concurrency slots. Tokens passed in query parameters (e.g. `?token=...`) are ignored without error and processed as anonymous visitor requests.",
+        "description": "Extracts normalized media items, variants, and direct CDN delivery sources for a supported public post using two-tier routing: Tier-1 matches registered core catalog domains first with unchanged platform adapters and quotas; when `DOKITOOL_YTDLP_GENERIC_ENABLED` is active and `platform` is omitted or `all`, Tier-2 routes valid public non-catalog URLs (<= 2048 bytes, no fragment/localhost/internal/self-domain/empty path+query) through an isolated generic slow admission pool (`PARSE_GENERIC`) to named yt-dlp extractors (strictly disabling the blind `generic` web scraper), returning a normalized dynamic `data.platform` (cached up to 60s; unsupported sites return 400 `UNSUPPORTED_PLATFORM`). Explicit `platform=<id>` and `/api/resolve` never trigger Tier-2 generic fallback. Accepts optional Bearer credentials (`DOKITOOL_OWNER_TOKEN` or named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` with `owner`, `agent`, or `friend` roles): each key uses an isolated per-key execution pool (`concurrency`, `slow_concurrency`, rate bucket, and FIFO queue) instead of the anonymous per-IP rate limiter, enforces optional per-key `platforms` scope (non-empty allowlists must explicitly include `\"ytdlp_generic\"` to access Tier-2 generic fallback, returning HTTP 401 `INVALID_INPUT` for disallowed platforms/scopes), and serves fresh in-process cache hits via the post-auth zero-slot cache fast-path without consuming per-key concurrency slots. Tokens passed in query parameters (e.g. `?token=...`) are ignored without error and processed as anonymous visitor requests.",
         "security": [
           {},
           {
@@ -266,7 +266,7 @@
       "BearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Bearer API credential read from `DOKITOOL_OWNER_TOKEN` (implicit `id: \"owner\"`, `role: \"owner\"`) or named SHA-256 keys configured in `DOKITOOL_API_KEYS_FILE` (`owner`, `agent`, and `friend` roles; up to 64 total keys; 32-512 printable non-whitespace ASCII bytes; total `Authorization` header <= 1024 bytes). Invalid, disabled (`enabled: false`), malformed, duplicate, or oversized headers—or requests when no matching enabled key exists—return HTTP 401 (`code: \"INVALID_INPUT\"`) and consume the anonymous per-IP burst bucket (`Burst=4`, `0.2/s`), turning repeated failures into HTTP 429 (`code: \"RATE_LIMITED\"`). Valid `agent` or `friend` keys calling `/api/stats`, or keys requesting a platform outside their per-key `platforms` allowlist, also receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`, guarded by the per-key fast-read bucket without charging the anonymous IP bucket). Tokens in query parameters (e.g. `?token=...`) are never accepted: on `/api/parse`, `/api/resolve`, and `/api/platforms` they are ignored without error and processed as anonymous visitor requests (while exposing the secret in logs and shell history); only `/api/stats` rejects extra query parameters with HTTP 400 (`INVALID_INPUT`) once authenticated."
+        "description": "Bearer API credential read from `DOKITOOL_OWNER_TOKEN` (implicit `id: \"owner\"`, `role: \"owner\"`) or named SHA-256 keys configured in `DOKITOOL_API_KEYS_FILE` (`owner`, `agent`, and `friend` roles; up to 64 total keys; 32-512 printable non-whitespace ASCII bytes; total `Authorization` header <= 1024 bytes). Invalid, disabled (`enabled: false`), malformed, duplicate, or oversized headers—or requests when no matching enabled key exists—return HTTP 401 (`code: \"INVALID_INPUT\"`) and consume the anonymous per-IP burst bucket (`Burst=4`, `0.2/s`), turning repeated failures into HTTP 429 (`code: \"RATE_LIMITED\"`). Valid `agent` or `friend` keys calling `/api/stats`, or keys requesting a platform outside their per-key `platforms` allowlist (including Tier-2 generic fallback when a non-empty allowlist omits `\"ytdlp_generic\"`), also receive HTTP 401 (`code: \"INVALID_INPUT\"`, `retryable: false`, guarded by the per-key fast-read bucket without charging the anonymous IP bucket). Tokens in query parameters (e.g. `?token=...`) are never accepted: on `/api/parse`, `/api/resolve`, and `/api/platforms` they are ignored without error and processed as anonymous visitor requests (while exposing the secret in logs and shell history); only `/api/stats` rejects extra query parameters with HTTP 400 (`INVALID_INPUT`) once authenticated."
       }
     },
     "headers": {
@@ -322,7 +322,7 @@
         "name": "platform",
         "in": "query",
         "required": false,
-        "description": "Optional expected platform ID (`all` or omitted for automatic detection).",
+        "description": "Optional expected core platform ID (`all` or omitted for automatic Tier-1 catalog detection, plus Tier-2 named-extractor generic fallback on `/api/parse` when `DOKITOOL_YTDLP_GENERIC_ENABLED` is active).",
         "schema": {
           "$ref": "#/components/schemas/PlatformQuery"
         }
@@ -3056,7 +3056,7 @@
           },
           "ytdlp_generic_enabled": {
             "type": "boolean",
-            "description": "Whether generic long-tail yt-dlp sites are enabled."
+            "description": "Whether Tier-2 named-extractor yt-dlp generic fallback (DOKITOOL_YTDLP_GENERIC_ENABLED) is active."
           },
           "tbvideo_pipigx": {
             "type": "boolean",

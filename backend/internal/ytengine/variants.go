@@ -38,8 +38,14 @@ type classifiedFormats struct {
 }
 
 func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts AdaptOptions, now int64) (unified.Array, unified.Object) {
+	variants, audioAttachment, _ := buildEntryVariantsWithType(entry, parent, entryKey, itemTitle, opts, now)
+	return variants, audioAttachment
+}
+
+func buildEntryVariantsWithType(entry, parent *Info, entryKey, itemTitle string, opts AdaptOptions, now int64) (unified.Array, unified.Object, string) {
 	if opts.SingleStreamHLSOnly {
-		return buildSingleStreamHLSVariants(entry, parent, entryKey, opts, now)
+		variants, audioAttachment := buildSingleStreamHLSVariants(entry, parent, entryKey, opts, now)
+		return variants, audioAttachment, "video"
 	}
 
 	classified := classifyEntryFormats(entry, opts)
@@ -53,7 +59,7 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 	// 1. High-Resolution DASH Video-Only Tracks as Directly Downloadable Files (kind == "file", has_audio == false).
 	variants = appendDASHVideoVariants(variants, seenVariantIDs, filteredDASHVideo, entryKey, opts, now)
 
-	// 2. Deliverable Progressive MP4s with Embedded Audio (kind == "file")
+	// 2. Deliverable Progressive MP4/WebM Files with Embedded Audio (kind == "file")
 	variants = appendProgressiveMP4Variants(variants, seenVariantIDs, dedupedMP4, hasSplitSilentTracks, entryKey, itemTitle, opts, now)
 
 	// 3. Standalone Audio Tracks (both as downloadable file variants and as a background_audio attachment)
@@ -69,7 +75,15 @@ func buildEntryVariants(entry, parent *Info, entryKey, itemTitle string, opts Ad
 		variants = appendAdaptiveHLSVariants(variants, seenVariantIDs, classified.hlsVideo, classified.hlsAudio, entryKey, opts, now)
 	}
 
-	return variants, audioAttachment
+	// 5. Audio-only entries (e.g., SoundCloud / Bandcamp) when explicitly opted in and no video variants exist.
+	if opts.AllowAudioOnly && len(variants) == 0 && len(classified.dashAudio) > 0 {
+		audioVariants := appendAudioOnlyVariants(variants, seenVariantIDs, classified.dashAudio, entryKey, opts, now)
+		if len(audioVariants) > 0 {
+			return audioVariants, nil, "audio"
+		}
+	}
+
+	return variants, audioAttachment, "video"
 }
 
 func buildSingleStreamHLSVariants(entry, parent *Info, entryKey string, opts AdaptOptions, now int64) (unified.Array, unified.Object) {
@@ -134,7 +148,7 @@ func shouldInheritEntryDimensions(entry *Info, opts AdaptOptions, hasAnyAudioInE
 		}
 		fCopy := f
 		fCopy.URL = cleanURL
-		if isProgressiveMP4Format(fCopy, opts.AllowCodecLessProgressiveMP4) ||
+		if isProgressiveVideoFormat(fCopy, opts) ||
 			(opts.AllowCodecLessProgressiveMP4 && !hasAnyAudioInEntry && isSilentCodecLessMP4(fCopy)) {
 			uniqueProgressiveMP4URLs[cleanURL] = true
 		}
@@ -168,7 +182,7 @@ func classifyEntryFormats(entry *Info, opts AdaptOptions) classifiedFormats {
 			out.hlsAudio = append(out.hlsAudio, f)
 			continue
 		}
-		if isProgressiveMP4Format(f, opts.AllowCodecLessProgressiveMP4) ||
+		if isProgressiveVideoFormat(f, opts) ||
 			(opts.AllowCodecLessProgressiveMP4 && !hasAnyAudioInEntry && isSilentCodecLessMP4(f)) {
 			if inheritEntryDimensions && f.Width == nil && f.Height == nil {
 				w, h := *entry.Width, *entry.Height
@@ -182,7 +196,7 @@ func classifyEntryFormats(entry *Info, opts AdaptOptions) classifiedFormats {
 			out.dashVideo = append(out.dashVideo, f)
 			continue
 		}
-		if isHTTPDASHAudioOnly(f) {
+		if isHTTPDASHAudioOnly(f) || (opts.AllowAudioOnly && isProgressiveAudioExtensionFormat(f)) {
 			out.dashAudio = append(out.dashAudio, f)
 			continue
 		}
@@ -270,7 +284,11 @@ func appendProgressiveMP4Variants(
 	now int64,
 ) unified.Array {
 	for i, f := range dedupedMP4 {
-		formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("mp4-%d", i+1))
+		fallbackExt := "mp4"
+		if strings.EqualFold(strings.TrimSpace(f.Ext), "webm") {
+			fallbackExt = "webm"
+		}
+		formatKey := nonEmptyOr(f.FormatID, fmt.Sprintf("%s-%d", fallbackExt, i+1))
 		hasAudio := resolveFormatHasAudio(f.ACodec)
 		titleForAttachment := ""
 		if hasAudio != nil && *hasAudio {
@@ -382,6 +400,55 @@ func appendStandaloneAudioVariantsAndAttachment(
 		}
 	}
 	return variants, audioAttachment
+}
+
+func appendAudioOnlyVariants(
+	variants unified.Array,
+	seenVariantIDs map[string]bool,
+	dashAudioFormats []Format,
+	entryKey string,
+	opts AdaptOptions,
+	now int64,
+) unified.Array {
+	seenURL := make(map[string]bool, len(dashAudioFormats))
+	seenContainerBitrate := make(map[string]bool, len(dashAudioFormats))
+	for i, candAudio := range dashAudioFormats {
+		if seenURL[candAudio.URL] {
+			continue
+		}
+		container, extension, mimeType, ok := resolveAudioFileFormatWithCodecFallback(candAudio)
+		if !ok {
+			continue
+		}
+		abrKbps := int64(math.Round(derefFloat(pickBitrateKbps(candAudio.ABR, candAudio.TBR))))
+		dedupKey := fmt.Sprintf("%s:%d", container, abrKbps)
+		if seenContainerBitrate[dedupKey] {
+			continue
+		}
+		candKey := nonEmptyOr(candAudio.FormatID, fmt.Sprintf("audio-%s-%d", extension, i+1))
+		audioSources := buildFormatSourcesWithContext(candAudio, opts, entryKey, candKey, "", now)
+		if len(audioSources) == 0 {
+			continue
+		}
+		audioVariantID := "v-" + shortDigest(opts.PlatformID+":audio-file:"+entryKey+":"+candKey)
+		if seenVariantIDs[audioVariantID] {
+			continue
+		}
+		seenURL[candAudio.URL] = true
+		seenContainerBitrate[dedupKey] = true
+		seenVariantIDs[audioVariantID] = true
+		audioMeta := buildAudioFileMetadataWithFormat(candAudio, container, extension, mimeType)
+		variants = append(variants, unified.Object{
+			"id":       audioVariantID,
+			"label":    formatAudioVariantLabelWithExt(candAudio, extension),
+			"metadata": audioMeta,
+			"delivery": unified.Object{
+				"kind":    "file",
+				"sources": audioSources,
+			},
+		})
+	}
+	return variants
 }
 
 func appendAdaptiveHLSVariants(
@@ -504,7 +571,14 @@ func formatSilentVideoSuffix(vf Format) string {
 }
 
 func formatAudioVariantLabel(af Format) string {
+	return formatAudioVariantLabelWithExt(af, "")
+}
+
+func formatAudioVariantLabelWithExt(af Format, fallbackExt string) string {
 	ext := strings.ToUpper(strings.TrimSpace(af.Ext))
+	if ext == "" {
+		ext = strings.ToUpper(strings.TrimSpace(fallbackExt))
+	}
 	if ext == "" || ext == "MP4" {
 		ext = "M4A"
 	}
@@ -529,16 +603,64 @@ func formatAudioAttachmentTitle(itemTitle string, af Format) string {
 	return fmt.Sprintf("%s (%s)", base, ext)
 }
 
-func buildAudioFileMetadata(af Format) unified.Object {
-	ext := strings.ToLower(strings.TrimSpace(af.Ext))
-	container := "mp4"
-	extension := "m4a"
-	mimeType := "audio/mp4"
-	if ext == "webm" {
-		container = "webm"
-		extension = "webm"
-		mimeType = "audio/webm"
+func resolveAudioFileFormat(af Format) (container, extension, mimeType string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(af.Ext)) {
+	case "mp3":
+		return "mp3", "mp3", "audio/mpeg", true
+	case "m4a", "mp4":
+		return "mp4", "m4a", "audio/mp4", true
+	case "webm":
+		return "webm", "webm", "audio/webm", true
+	case "ogg":
+		return "ogg", "ogg", "audio/ogg", true
+	case "opus":
+		return "ogg", "opus", "audio/ogg", true
+	case "flac":
+		return "flac", "flac", "audio/flac", true
+	case "wav":
+		return "wav", "wav", "audio/wav", true
+	default:
+		return "", "", "", false
 	}
+}
+
+func resolveAudioFileFormatWithCodecFallback(af Format) (container, extension, mimeType string, ok bool) {
+	if c, e, m, matched := resolveAudioFileFormat(af); matched {
+		return c, e, m, true
+	}
+	if strings.TrimSpace(af.Ext) != "" {
+		return "", "", "", false
+	}
+	ac := strings.ToLower(cleanCodec(af.ACodec))
+	switch {
+	case strings.HasPrefix(ac, "mp3"):
+		return "mp3", "mp3", "audio/mpeg", true
+	case strings.HasPrefix(ac, "mp4a") || strings.HasPrefix(ac, "aac"):
+		return "mp4", "m4a", "audio/mp4", true
+	case strings.HasPrefix(ac, "opus"):
+		return "ogg", "opus", "audio/ogg", true
+	case strings.HasPrefix(ac, "vorbis"):
+		return "ogg", "ogg", "audio/ogg", true
+	case strings.HasPrefix(ac, "flac"):
+		return "flac", "flac", "audio/flac", true
+	case strings.HasPrefix(ac, "pcm") || strings.HasPrefix(ac, "wav"):
+		return "wav", "wav", "audio/wav", true
+	default:
+		return "", "", "", false
+	}
+}
+
+func buildAudioFileMetadata(af Format) unified.Object {
+	container, extension, mimeType, ok := resolveAudioFileFormat(af)
+	if !ok {
+		container = "mp4"
+		extension = "m4a"
+		mimeType = "audio/mp4"
+	}
+	return buildAudioFileMetadataWithFormat(af, container, extension, mimeType)
+}
+
+func buildAudioFileMetadataWithFormat(af Format, container, extension, mimeType string) unified.Object {
 	meta := unified.Object{
 		"has_audio": true,
 		"evidence":  "upstream",
@@ -807,6 +929,57 @@ func isProgressiveMP4Format(f Format, allowCodecLess bool) bool {
 		}
 	}
 	return true
+}
+
+func isProgressiveWebMFormat(f Format) bool {
+	proto := strings.ToLower(strings.TrimSpace(f.Protocol))
+	if proto != "https" && proto != "http" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(f.Ext)) != "webm" {
+		return false
+	}
+	u, err := url.Parse(f.URL)
+	if err != nil {
+		return false
+	}
+	urlPath := strings.ToLower(u.Path)
+	if strings.HasSuffix(urlPath, ".m3u8") || strings.HasSuffix(urlPath, ".mpd") {
+		return false
+	}
+	return cleanCodec(f.VCodec) != "" && cleanCodec(f.ACodec) != ""
+}
+
+func isProgressiveVideoFormat(f Format, opts AdaptOptions) bool {
+	return isProgressiveMP4Format(f, opts.AllowCodecLessProgressiveMP4) ||
+		(opts.AllowProgressiveWebM && isProgressiveWebMFormat(f))
+}
+
+func isProgressiveAudioExtensionFormat(f Format) bool {
+	proto := strings.ToLower(strings.TrimSpace(f.Protocol))
+	if proto != "https" && proto != "http" {
+		return false
+	}
+	u, err := url.Parse(f.URL)
+	if err != nil {
+		return false
+	}
+	urlPath := strings.ToLower(u.Path)
+	if strings.HasSuffix(urlPath, ".m3u8") || strings.HasSuffix(urlPath, ".mpd") {
+		return false
+	}
+	if strings.TrimSpace(f.VCodec) != "" && !isNoCodec(f.VCodec) {
+		return false
+	}
+	if isNoCodec(f.ACodec) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(f.Ext)) {
+	case "mp3", "m4a", "ogg", "opus", "flac", "wav":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSilentCodecLessMP4(f Format) bool {

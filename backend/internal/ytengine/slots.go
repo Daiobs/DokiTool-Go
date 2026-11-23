@@ -38,6 +38,25 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 		return nil, err
 	}
 
+	if e.subSem != nil {
+		var releaseSubOnce sync.Once
+		releaseSub := func() {
+			releaseSubOnce.Do(func() {
+				<-e.subSem
+			})
+		}
+		select {
+		case e.subSem <- struct{}{}:
+			if err := ctx.Err(); err != nil {
+				releaseSub()
+				return nil, classifyContextErr(err)
+			}
+			defer releaseSub()
+		case <-ctx.Done():
+			return nil, classifyContextErr(ctx.Err())
+		}
+	}
+
 	var releaseOnce sync.Once
 	release := func() {
 		releaseOnce.Do(func() {
@@ -275,10 +294,11 @@ func classifyStderr(stderrText string, runErr error) *Error {
 	case strings.Contains(lower, "unsupported url") ||
 		strings.Contains(lower, "no suitable extractor"):
 		return &Error{
-			Code:      CodeContentUnavailable,
-			Message:   "未找到可用的媒体，或该内容已不可访问",
-			Retryable: false,
-			Cause:     runErr,
+			Code:           CodeContentUnavailable,
+			Message:        "未找到可用的媒体，或该内容已不可访问",
+			Retryable:      false,
+			UnsupportedURL: true,
+			Cause:          runErr,
 		}
 	case strings.Contains(lower, "429") ||
 		strings.Contains(lower, "too many requests") ||
