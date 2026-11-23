@@ -8,6 +8,7 @@ export type MonitorThemeMode = "system" | "light" | "dark";
 export type OwnerTokenSource = "session" | "local" | null;
 
 export const MONITOR_THEME_STORAGE_KEY = "dokitool_monitor_theme";
+export const MONITOR_AUTO_REFRESH_STORAGE_KEY = "dokitool_monitor_auto_refresh";
 export const OWNER_TOKEN_SESSION_KEY = "dokitool_monitor_owner_token_session";
 export const OWNER_TOKEN_LOCAL_KEY = "dokitool_monitor_owner_token_local";
 
@@ -141,6 +142,64 @@ export function getNextMonitorTheme(mode: MonitorThemeMode): MonitorThemeMode {
   if (normalized === "system") return "light";
   if (normalized === "light") return "dark";
   return "system";
+}
+
+// ============================================================================
+// Auto-Refresh Preference Persistence & CSP-Safe Clipboard Copy
+// ============================================================================
+
+export function readMonitorAutoRefresh(): boolean {
+  return (
+    safeStorageGet(getLocalStorage(), MONITOR_AUTO_REFRESH_STORAGE_KEY) === "1"
+  );
+}
+
+export function writeMonitorAutoRefresh(enabled: boolean): void {
+  safeStorageSet(
+    getLocalStorage(),
+    MONITOR_AUTO_REFRESH_STORAGE_KEY,
+    enabled ? "1" : "0",
+  );
+}
+
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  const value = typeof text === "string" ? text : "";
+  if (!value) return false;
+  try {
+    if (
+      typeof globalThis.navigator !== "undefined" &&
+      globalThis.navigator?.clipboard &&
+      typeof globalThis.navigator.clipboard.writeText === "function"
+    ) {
+      await globalThis.navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // Fall back to execCommand below when clipboard API is blocked
+  }
+
+  if (
+    typeof document === "undefined" ||
+    typeof document.createElement !== "function" ||
+    !document.body ||
+    typeof document.execCommand !== "function"
+  ) {
+    return false;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.className = "mon-sr-only";
+  document.body.appendChild(textarea);
+  try {
+    textarea.select();
+    return Boolean(document.execCommand("copy"));
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+  }
 }
 
 // ============================================================================

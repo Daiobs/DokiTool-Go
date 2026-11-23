@@ -14,6 +14,7 @@ const props = defineProps<{
   connection: ConnectionCheckResult | null;
   mode: PanelViewMode;
   batchUrlCount?: number;
+  ownerConfirmed?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -50,7 +51,7 @@ const themeToggleMeta = computed<{
 });
 
 const authStatus = computed<{
-  tone: "ready" | "anon" | "error";
+  tone: "owner" | "ready" | "anon" | "error";
   label: string;
   title: string;
 }>(() => {
@@ -60,6 +61,16 @@ const authStatus = computed<{
       tone: "error",
       label: "未连通",
       title: `${props.connection.message}（点击打开设置检查后端或凭据）`,
+    };
+  }
+  if (hasToken && props.ownerConfirmed) {
+    const countSuffix = props.connection?.platformCount
+      ? ` · 已加载 ${props.connection.platformCount} 平台`
+      : "";
+    return {
+      tone: "owner",
+      label: "Owner 已就绪",
+      title: `管理员（Owner）凭据已验证${countSuffix}（点击管理设置）`,
     };
   }
   if (hasToken) {
@@ -107,6 +118,7 @@ const authStatus = computed<{
           class="sp-auth-pill"
           :class="`sp-auth-pill--${authStatus.tone}`"
           :title="authStatus.title"
+          data-testid="header-auth-pill"
           @click="emit('open-settings')"
         >
           <span class="sp-auth-pill__dot" />
@@ -340,6 +352,17 @@ const authStatus = computed<{
   border-radius: 50%;
   flex-shrink: 0;
   background: var(--sp-dot-idle);
+}
+
+.sp-auth-pill--owner {
+  background: var(--sp-accent-soft);
+  border-color: var(--sp-accent-border);
+  color: var(--sp-accent-text-strong);
+}
+
+.sp-auth-pill--owner .sp-auth-pill__dot {
+  background: var(--sp-accent-solid);
+  box-shadow: var(--sp-accent-dot-glow);
 }
 
 .sp-auth-pill--ready {

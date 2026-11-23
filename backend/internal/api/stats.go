@@ -31,6 +31,10 @@ const (
 	// PlatformYTDLPOther is the bounded spill bucket for valid dynamic platform keys beyond MaxDynamicPlatforms.
 	PlatformYTDLPOther = "ytdlp_other"
 
+	// PlatformYTDLPUnmatched is the dedicated bounded telemetry bucket for Tier-2 generic parse
+	// failures where no named yt-dlp extractor matched (decoupled from pre-routing "unknown").
+	PlatformYTDLPUnmatched = "ytdlp_unmatched"
+
 	// MaxDynamicPlatforms caps the number of distinct non-core dynamic platform keys retained in telemetry.
 	MaxDynamicPlatforms = 64
 
@@ -887,6 +891,7 @@ type Stats struct {
 
 	dynamicPlatforms map[string]*dynamicPlatformCounters
 	dynamicOther     dynamicPlatformCounters
+	dynamicUnmatched dynamicPlatformCounters
 	daily            [DailyStatsWindowDays]dailyBucket
 	hourly           [HourlyStatsWindowHours]hourlyBucket
 }
@@ -1114,6 +1119,8 @@ func (s *Stats) RecordDynamicParse(platform, code, channel string, elapsed time.
 	recordedPlat := platform
 	if platform == PlatformYTDLPOther {
 		s.dynamicOther.outcomes[cIdx][ch]++
+	} else if platform == PlatformYTDLPUnmatched {
+		s.dynamicUnmatched.outcomes[cIdx][ch]++
 	} else {
 		if s.dynamicPlatforms == nil {
 			s.dynamicPlatforms = make(map[string]*dynamicPlatformCounters)
@@ -1322,6 +1329,26 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			ownerReq += ownerCount
 			cells = append(cells, PlatformOutcomeCount{
 				Platform: PlatformYTDLPOther,
+				Code:     knownOutcomeCodes[c],
+				Channel:  ChannelOwner,
+				Count:    ownerCount,
+			})
+		}
+	}
+	for c := 0; c < numOutcomeCodes; c++ {
+		if anonCount := s.dynamicUnmatched.outcomes[c][chAnonIdx]; anonCount > 0 {
+			anonReq += anonCount
+			cells = append(cells, PlatformOutcomeCount{
+				Platform: PlatformYTDLPUnmatched,
+				Code:     knownOutcomeCodes[c],
+				Channel:  ChannelAnonymous,
+				Count:    anonCount,
+			})
+		}
+		if ownerCount := s.dynamicUnmatched.outcomes[c][chOwnerIdx]; ownerCount > 0 {
+			ownerReq += ownerCount
+			cells = append(cells, PlatformOutcomeCount{
+				Platform: PlatformYTDLPUnmatched,
 				Code:     knownOutcomeCodes[c],
 				Channel:  ChannelOwner,
 				Count:    ownerCount,

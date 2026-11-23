@@ -180,7 +180,7 @@ func (s *Stats) LoadSnapshot(path string, logf func(string, ...any)) error {
 
 	newDyn := make(map[string]*dynamicPlatformCounters)
 	for _, rawKey := range doc.DynamicPlatforms {
-		if corePlatformIndex(rawKey) >= 0 || rawKey == PlatformYTDLPOther {
+		if corePlatformIndex(rawKey) >= 0 || rawKey == PlatformYTDLPOther || rawKey == PlatformYTDLPUnmatched {
 			continue
 		}
 		if !IsValidDynamicPlatformKey(rawKey) {
@@ -214,6 +214,8 @@ func (s *Stats) LoadSnapshot(path string, logf func(string, ...any)) error {
 				normPlat = rawPlat
 			} else if rawPlat == PlatformYTDLPOther {
 				normPlat = PlatformYTDLPOther
+			} else if rawPlat == PlatformYTDLPUnmatched {
+				normPlat = PlatformYTDLPUnmatched
 			} else if IsValidDynamicPlatformKey(rawPlat) {
 				if _, exists := newDyn[rawPlat]; exists {
 					normPlat = rawPlat

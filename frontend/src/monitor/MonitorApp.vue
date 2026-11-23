@@ -3,13 +3,16 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   applyMonitorTheme,
   clearStoredOwnerToken,
+  copyTextToClipboard,
   fetchSameOriginOwnerStats,
   getNextMonitorTheme,
+  readMonitorAutoRefresh,
   readMonitorTheme,
   readStoredOwnerToken,
   saveOwnerToken,
   stripUrlQueryAndHash,
   validateOwnerBearerToken,
+  writeMonitorAutoRefresh,
   writeMonitorTheme,
   type MonitorThemeMode,
   type OwnerTokenSource,
@@ -20,12 +23,14 @@ import {
   buildHourlyChartPoints,
   computeTodayVsYesterday,
   formatBytesCompact,
+  formatMonitorVersionBadge,
   formatPercent,
   formatUptimeDuration,
   resolveYtdlpQueuedCount,
   type AdmissionPoolSnapshot,
   type DailyChartPoint,
   type HourlyChartPoint,
+  type MonitorVersionBadge,
   type PlatformHealthRange,
   type PlatformHealthRow,
   type StatsSnapshot,
@@ -51,12 +56,16 @@ interface RuntimeSwitchRow {
   key: string;
   label: string;
   valueText: string;
+  fullValue?: string;
+  copyable?: boolean;
   tone: "on" | "off" | "accent";
 }
 
 interface PoolWatermarkRow {
   id: string;
   label: string;
+  kind: "admission" | "slot";
+  kindLabel: string;
   active: number;
   limit: number;
   queued: number;
@@ -123,11 +132,15 @@ const rememberDevice = ref<boolean>(false);
 const submitting = ref<boolean>(false);
 const authError = ref<string>("");
 
-// Auto-refresh (optional 30s toggle, pauses on hidden tab & refreshes on return)
+// Auto-refresh (optional 30s toggle, persisted in localStorage, pauses on hidden tab & refreshes on return)
 const autoRefreshEnabled = ref<boolean>(false);
 const pausedByVisibility = ref<boolean>(false);
 let autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let fetchGeneration = 0;
+
+// Version copy feedback state
+const copiedVersionSource = ref<"kpi" | "matrix" | null>(null);
+let copiedVersionTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Chart state
 const dailyChartDays = ref<7 | 30>(7);
@@ -230,6 +243,22 @@ const shanghaiModeLabel = computed<string>(() => {
   return "未启用 (off)";
 });
 
+const shanghaiPlatformBreakdown = computed(() => {
+  const byPlat = stats.value?.shanghai?.by_platform;
+  const safeCount = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+  return {
+    douyinHits: safeCount(byPlat?.douyin?.hits),
+    douyinFallbacks: safeCount(byPlat?.douyin?.fallbacks),
+    bilibiliHits: safeCount(byPlat?.bilibili?.hits),
+    bilibiliFallbacks: safeCount(byPlat?.bilibili?.fallbacks),
+  };
+});
+
+const versionInfo = computed<MonitorVersionBadge>(() =>
+  formatMonitorVersionBadge(stats.value?.runtime?.version),
+);
+
 const uptimeText = computed<string>(() =>
   stats.value ? formatUptimeDuration(stats.value.uptime_seconds) : "—",
 );
@@ -237,11 +266,14 @@ const uptimeText = computed<string>(() =>
 const runtimeSwitches = computed<RuntimeSwitchRow[]>(() => {
   const rt = stats.value?.runtime;
   if (!rt) return [];
+  const ver = versionInfo.value;
   return [
     {
       key: "version",
       label: "后端版本",
-      valueText: rt.version || "unknown",
+      valueText: ver.display,
+      fullValue: ver.full,
+      copyable: true,
       tone: "accent",
     },
     {
@@ -330,13 +362,15 @@ const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
     return {
       id,
       label,
+      kind: "admission",
+      kindLabel: "排队放行",
       active,
       limit,
       queued: Math.max(0, safePool.queued || 0),
       queueLimit: Math.max(0, safePool.queue_limit || 0),
       ratioPct,
       tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `等待 ${safePool.waited ?? 0} · 放行 ${safePool.granted ?? 0} · 超时 ${safePool.timeout ?? 0} · 满载 ${safePool.full ?? 0}`,
+      footSummary: `排队放行 · 本次启动等待 ${safePool.waited ?? 0} · 放行 ${safePool.granted ?? 0} · 超时 ${safePool.timeout ?? 0} · 满载 ${safePool.full ?? 0}`,
     };
   };
 
@@ -354,13 +388,15 @@ const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
     return {
       id,
       label,
+      kind: "slot",
+      kindLabel: "共享总网关槽位",
       active,
       limit,
       queued,
       queueLimit: null,
       ratioPct,
       tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `累计获取 ${safeSlot.total?.acquired_count ?? 0} · 等待 ${safeSlot.total?.wait_count ?? 0} · 最大等待 ${safeSlot.total?.wait_ms_max ?? 0} ms`,
+      footSummary: `共享总网关槽位 · 本次启动获取 ${safeSlot.total?.acquired_count ?? 0} · 等待 ${safeSlot.total?.wait_count ?? 0} · 最大等待 ${safeSlot.total?.wait_ms_max ?? 0} ms`,
     };
   };
 
@@ -373,7 +409,7 @@ const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
       s.admission.generic_slow,
     ),
     makeAdmissionRow("owner", "Owner 专属池 (owner)", s.admission.owner),
-    makeYtdlpRow("ytdlp", "yt-dlp 并发槽位", s.ytdlp),
+    makeYtdlpRow("ytdlp", "yt-dlp 并发槽位 (ytdlp)", s.ytdlp),
     makeYtdlpRow(
       "ytdlp_generic",
       "yt-dlp 通用长尾槽位 (ytdlp_generic)",
@@ -461,6 +497,27 @@ const apiKeyRows = computed(() => stats.value?.api_keys ?? []);
 // Auth Unlock, Lock & Refresh State Machine
 // ============================================================================
 
+function clearCopiedVersionTimer() {
+  if (copiedVersionTimer !== null) {
+    clearTimeout(copiedVersionTimer);
+    copiedVersionTimer = null;
+  }
+}
+
+async function handleCopyVersion(source: "kpi" | "matrix") {
+  const full = versionInfo.value.full;
+  if (!full) return;
+  const copied = await copyTextToClipboard(full);
+  if (!copied) return;
+  clearCopiedVersionTimer();
+  copiedVersionSource.value = source;
+  copiedVersionTimer = setTimeout(() => {
+    copiedVersionSource.value = null;
+    copiedVersionTimer = null;
+  }, 1800);
+  (copiedVersionTimer as { unref?: () => void })?.unref?.();
+}
+
 function clearAutoRefreshTimer() {
   if (autoRefreshTimer !== null) {
     clearInterval(autoRefreshTimer);
@@ -471,7 +528,9 @@ function clearAutoRefreshTimer() {
 function lockDashboard(reasonError = "") {
   fetchGeneration += 1;
   clearAutoRefreshTimer();
+  clearCopiedVersionTimer();
   clearStoredOwnerToken();
+  copiedVersionSource.value = null;
   autoRefreshEnabled.value = false;
   pausedByVisibility.value = false;
   activeToken = "";
@@ -518,6 +577,8 @@ async function handleUnlock() {
       authError.value = "";
       tokenInput.value = "";
       showToken.value = false;
+      autoRefreshEnabled.value = readMonitorAutoRefresh();
+      syncAutoRefreshTimer();
       return;
     }
 
@@ -610,6 +671,7 @@ function syncAutoRefreshTimer() {
 function handleToggleAutoRefresh() {
   if (!stats.value) return;
   autoRefreshEnabled.value = !autoRefreshEnabled.value;
+  writeMonitorAutoRefresh(autoRefreshEnabled.value);
   syncAutoRefreshTimer();
 }
 
@@ -713,6 +775,8 @@ onMounted(async () => {
       lastFetchedAt.value = res.fetchedAt;
       staleError.value = "";
       authError.value = "";
+      autoRefreshEnabled.value = readMonitorAutoRefresh();
+      syncAutoRefreshTimer();
       return;
     }
 
@@ -734,6 +798,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   clearAutoRefreshTimer();
+  clearCopiedVersionTimer();
   if (typeof document !== "undefined") {
     document.removeEventListener("visibilitychange", handleVisibilityChange);
   }
@@ -791,7 +856,14 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="mon-brand__meta">
-              <span class="mon-brand__origin">{{ currentOrigin }}</span>
+              <a
+                href="/"
+                class="mon-brand__origin mon-brand__origin-link"
+                title="返回主站首页"
+                data-testid="monitor-home-link"
+              >
+                {{ currentOrigin }}
+              </a>
               <span v-if="stats">最后刷新：{{ formattedFetchedTime }}</span>
               <span>统计时区：Asia/Shanghai (UTC+8)</span>
             </div>
@@ -1096,7 +1168,7 @@ onUnmounted(() => {
           </article>
 
           <!-- KPI 3: Cache Hit Rate & Memory Occupancy -->
-          <article class="mon-kpi mon-kpi--success">
+          <article class="mon-kpi mon-kpi--success" data-testid="kpi-cache">
             <div class="mon-kpi__label">
               <span>缓存命中率 &amp; 内存占用</span>
               <span
@@ -1109,7 +1181,12 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="mon-kpi__main">
-              <span class="mon-kpi__value">{{ cacheHitRateText }}</span>
+              <span
+                class="mon-kpi__value"
+                title="按本次启动以来的内存缓存命中与未命中计算"
+              >
+                {{ cacheHitRateText }}
+              </span>
               <span class="mon-text-muted mon-mono">
                 {{ formatBytesCompact(stats.cache.bytes) }} /
                 {{ formatBytesCompact(stats.cache.max_bytes) }}
@@ -1120,13 +1197,13 @@ onUnmounted(() => {
               <span>今日命中 {{ todaySummary.cacheHits }}</span>
             </div>
             <div class="mon-kpi__meta">
-              <span>累计命中 {{ stats.cache.total.hits }} / 未中 {{ stats.cache.total.misses }}</span>
+              <span>本次启动命中 {{ stats.cache.total.hits }} / 未命中 {{ stats.cache.total.misses }}</span>
               <span>合流复用 {{ stats.cache.total.singleflight_shared }}</span>
             </div>
           </article>
 
           <!-- KPI 4: Shanghai Exit Nodes & Hit Rate -->
-          <article class="mon-kpi mon-kpi--warn">
+          <article class="mon-kpi mon-kpi--warn" data-testid="kpi-shanghai">
             <div class="mon-kpi__label">
               <span>上海出口节点 &amp; 命中率</span>
               <span class="sp-badge sp-badge--muted">{{ shanghaiModeLabel }}</span>
@@ -1143,27 +1220,51 @@ onUnmounted(() => {
                 />
                 {{ stats.shanghai.waiting_workers }} 节点
               </span>
-              <span class="sp-badge sp-badge--accent">
-                命中率 {{ shanghaiHitRateText }}
+              <span
+                class="sp-badge sp-badge--accent"
+                title="按本次启动以来的上海出口命中与回退计算"
+              >
+                本次启动命中率 {{ shanghaiHitRateText }}
               </span>
             </div>
             <div class="mon-kpi__meta">
               <span>今日上海命中 {{ todaySummary.shanghaiHits }}</span>
-              <span>累计命中 {{ stats.shanghai.total.hits }} / 回退 {{ stats.shanghai.total.fallbacks }}</span>
+              <span>本次启动命中 {{ stats.shanghai.total.hits }} / 回退 {{ stats.shanghai.total.fallbacks }}</span>
+            </div>
+            <div
+              class="mon-shanghai-breakdown"
+              data-testid="kpi-shanghai-platforms"
+            >
+              <span class="mon-shanghai-chip">
+                <strong>抖音</strong> 命中 {{ shanghaiPlatformBreakdown.douyinHits }} / 回退 {{ shanghaiPlatformBreakdown.douyinFallbacks }}
+              </span>
+              <span class="mon-shanghai-chip">
+                <strong>B 站</strong> 命中 {{ shanghaiPlatformBreakdown.bilibiliHits }} / 回退 {{ shanghaiPlatformBreakdown.bilibiliFallbacks }}
+              </span>
             </div>
             <div class="mon-kpi__meta">
               <span>排队任务 {{ stats.shanghai.queued_tasks }} · 执行中 {{ stats.shanghai.pending_tasks }}</span>
-              <span>超时 {{ stats.shanghai.total.queue_timeouts }}</span>
+              <span>本次启动超时 {{ stats.shanghai.total.queue_timeouts }}</span>
             </div>
           </article>
 
           <!-- KPI 5: Version & Uptime -->
-          <article class="mon-kpi">
+          <article class="mon-kpi" data-testid="kpi-version-uptime">
             <div class="mon-kpi__label">
               <span>服务版本 &amp; 在线时长</span>
-              <span class="sp-badge sp-badge--accent mon-mono">
-                {{ stats.runtime.version }}
-              </span>
+              <button
+                type="button"
+                class="sp-badge sp-badge--accent mon-mono mon-version-btn"
+                :class="{
+                  'mon-version-btn--copied': copiedVersionSource === 'kpi',
+                }"
+                :title="`点击复制完整版本: ${versionInfo.full}`"
+                :aria-label="`复制完整后端版本 ${versionInfo.full}`"
+                data-testid="kpi-version-badge"
+                @click="handleCopyVersion('kpi')"
+              >
+                {{ copiedVersionSource === "kpi" ? "已复制" : versionInfo.display }}
+              </button>
             </div>
             <div class="mon-kpi__main">
               <span class="mon-kpi__value mon-kpi__value--compact">
@@ -1171,11 +1272,11 @@ onUnmounted(() => {
               </span>
             </div>
             <div class="mon-kpi__meta">
-              <span>启动以来累计 {{ stats.requests.total }} 次</span>
+              <span>本次启动请求 {{ stats.requests.total }} 次</span>
               <span>匿名 {{ stats.requests.by_channel.anonymous }} · Owner {{ stats.requests.by_channel.owner }}</span>
             </div>
             <div class="mon-kpi__meta">
-              <span>最大耗时 {{ stats.parse_latency_ms.total.max_ms }} ms</span>
+              <span>本次启动最大耗时 {{ stats.parse_latency_ms.total.max_ms }} ms</span>
               <span>持久化 {{ stats.runtime.stats_persistence_enabled ? "已开启" : "纯内存" }}</span>
             </div>
           </article>
@@ -1217,7 +1318,22 @@ onUnmounted(() => {
                   <span class="mon-switch-item__name">{{ item.label }}</span>
                   <span class="mon-switch-item__key">{{ item.key }}</span>
                 </div>
+                <button
+                  v-if="item.copyable"
+                  type="button"
+                  class="mon-switch-pill mon-switch-pill--accent mon-version-btn"
+                  :class="{
+                    'mon-version-btn--copied': copiedVersionSource === 'matrix',
+                  }"
+                  :title="`点击复制完整版本: ${item.fullValue || item.valueText}`"
+                  :aria-label="`复制完整后端版本 ${item.fullValue || item.valueText}`"
+                  data-testid="runtime-version-pill"
+                  @click="handleCopyVersion('matrix')"
+                >
+                  {{ copiedVersionSource === "matrix" ? "已复制" : item.valueText }}
+                </button>
                 <span
+                  v-else
                   class="mon-switch-pill"
                   :class="`mon-switch-pill--${item.tone}`"
                 >
@@ -1233,8 +1349,8 @@ onUnmounted(() => {
               <div class="mon-card__title-group">
                 <h2 class="mon-card__title">并发池实时水位</h2>
                 <span class="mon-card__subtitle">
-                  admission (fast / slow / generic_slow / owner) 与 yt-dlp /
-                  ytdlp_generic 信号量活跃与排队状态
+                  准入排队放行池（fast / slow / generic_slow / owner）与 yt-dlp /
+                  ytdlp_generic 共享总网关槽位实时水位
                 </span>
               </div>
               <span class="sp-badge sp-badge--muted">
@@ -1250,7 +1366,19 @@ onUnmounted(() => {
                 :data-pool-id="pool.id"
               >
                 <div class="mon-pool-row__top">
-                  <span class="mon-pool-row__name">{{ pool.label }}</span>
+                  <div class="mon-pool-row__title">
+                    <span class="mon-pool-row__name">{{ pool.label }}</span>
+                    <span
+                      class="mon-pool-kind"
+                      :class="
+                        pool.kind === 'admission'
+                          ? 'mon-pool-kind--admission'
+                          : 'mon-pool-kind--slot'
+                      "
+                    >
+                      {{ pool.kindLabel }}
+                    </span>
+                  </div>
                   <span class="mon-pool-row__usage">
                     活跃 {{ pool.active }} / {{ pool.limit }}
                     <template v-if="pool.queueLimit !== null">

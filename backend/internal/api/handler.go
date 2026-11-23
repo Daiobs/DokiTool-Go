@@ -29,6 +29,10 @@ func (f AdapterFunc) Parse(ctx context.Context, source string, now int64) (unifi
 	return f(ctx, source, now)
 }
 
+type attributedAdapter interface {
+	ParseWithPlatform(context.Context, string, int64) (unified.Object, string, error)
+}
+
 // PublicMedia applies provider-specific source eligibility/signing before public
 // filtering. A future Weibo registration must provide this boundary as well.
 type PublicMedia func(context.Context, string, unified.Object, int64) (unified.Object, error)
@@ -711,6 +715,20 @@ func (h *Handler) runSingleflight(
 	completed = true
 }
 
+func (h *Handler) resolveGenericFailurePlatform(attributed string) string {
+	if attributed != "" &&
+		attributed != PlatformGeneric &&
+		attributed != PlatformYTDLPOther &&
+		attributed != PlatformYTDLPUnmatched &&
+		attributed != "generic" &&
+		IsValidDynamicPlatformKey(attributed) &&
+		corePlatformIndex(attributed) < 0 &&
+		(h == nil || h.catalog == nil || !h.catalog.Has(attributed)) {
+		return attributed
+	}
+	return PlatformYTDLPUnmatched
+}
+
 func (h *Handler) executeParse(
 	ctx context.Context,
 	path, platform, source, itemID string,
@@ -721,30 +739,52 @@ func (h *Handler) executeParse(
 		if p := recover(); p != nil {
 			h.logRecoveredParsePanic(platform, p)
 			res = h.internalErrorResponse()
+			if platform == PlatformGeneric {
+				res.platform = PlatformYTDLPUnmatched
+			}
 			retPayload = nil
 			retOK = false
 		}
 	}()
-	errorResult := func(status int, message string) (cachedResponse, unified.Object, bool) {
+	errorResult := func(status int, message, failurePlatform string) (cachedResponse, unified.Object, bool) {
 		res, _ := encodeResponse(status, contractErrorForStatus(status, message))
+		if platform == PlatformGeneric {
+			res.platform = h.resolveGenericFailurePlatform(failurePlatform)
+		}
 		return res, nil, false
 	}
 	adapter := h.adapterForPlatform(platform)
 	if adapter == nil {
-		return errorResult(503, "解析服务未配置完成")
+		return errorResult(503, "解析服务未配置完成", "")
 	}
 	now := nowTime.Unix()
 
-	payload, err := adapter.Parse(ctx, source, now)
+	var (
+		payload            unified.Object
+		attributedPlatform string
+		err                error
+	)
+	if platform == PlatformGeneric {
+		if aa, ok := adapter.(attributedAdapter); ok {
+			payload, attributedPlatform, err = aa.ParseWithPlatform(ctx, source, now)
+		} else {
+			payload, err = adapter.Parse(ctx, source, now)
+		}
+	} else {
+		payload, err = adapter.Parse(ctx, source, now)
+	}
 	if err != nil {
-		return errorResult(502, "上游返回不完整或不符合媒体合同的数据")
+		return errorResult(502, "上游返回不完整或不符合媒体合同的数据", attributedPlatform)
 	}
 	if err := unified.ValidateEnvelopeAt(payload, now); err != nil {
-		return errorResult(502, "解析接口合同校验失败")
+		return errorResult(502, "解析接口合同校验失败", attributedPlatform)
 	}
 	status := Status(payload)
 	if status != 200 {
 		res, ok := encodeResponse(status, payload)
+		if platform == PlatformGeneric {
+			res.platform = h.resolveGenericFailurePlatform(attributedPlatform)
+		}
 		return res, payload, ok
 	}
 	data := unified.Map(payload["data"])
@@ -754,11 +794,13 @@ func (h *Handler) executeParse(
 			corePlatformIndex(actualPlatform) >= 0 ||
 			h.catalog.Has(actualPlatform) ||
 			actualPlatform == "generic" ||
-			actualPlatform == PlatformGeneric {
-			return errorResult(502, "内部解析接口平台不一致")
+			actualPlatform == PlatformGeneric ||
+			actualPlatform == PlatformYTDLPOther ||
+			actualPlatform == PlatformYTDLPUnmatched {
+			return errorResult(502, "内部解析接口平台不一致", "")
 		}
 	} else if actualPlatform != platform {
-		return errorResult(502, "内部解析接口平台不一致")
+		return errorResult(502, "内部解析接口平台不一致", "")
 	}
 	if h.publicMedia != nil {
 		targetPlatform := platform
@@ -767,17 +809,20 @@ func (h *Handler) executeParse(
 		}
 		payload, err = h.publicMedia(ctx, targetPlatform, payload, now)
 		if err != nil {
-			return errorResult(503, "媒体服务尚未配置，请联系站点维护者")
+			return errorResult(503, "媒体服务尚未配置，请联系站点维护者", actualPlatform)
 		}
 		if err := unified.ValidateEnvelopeAt(payload, now); err != nil {
-			return errorResult(502, "解析接口合同校验失败")
+			return errorResult(502, "解析接口合同校验失败", actualPlatform)
 		}
 		if status := Status(payload); status != 200 {
 			res, ok := encodeResponse(status, payload)
+			if platform == PlatformGeneric {
+				res.platform = actualPlatform
+			}
 			return res, payload, ok
 		}
 		if unified.Str(unified.Map(payload["data"])["platform"]) != targetPlatform {
-			return errorResult(502, "内部解析接口平台不一致")
+			return errorResult(502, "内部解析接口平台不一致", actualPlatform)
 		}
 	}
 	payload = unified.PublicView(payload, debug, now)
@@ -799,7 +844,7 @@ func (h *Handler) executeParse(
 		data["default_item_id"] = itemID
 	}
 	if err := unified.ValidateEnvelopeAt(payload, now); err != nil {
-		return errorResult(502, "解析接口合同校验失败")
+		return errorResult(502, "解析接口合同校验失败", actualPlatform)
 	}
 	res, ok := encodeResponse(200, payload)
 	if platform == PlatformGeneric && ok {

@@ -22,7 +22,6 @@ import {
 } from "./protocol";
 import {
   computeTodayVsYesterday,
-  formatPercent,
   type TodayVsYesterdaySummary,
 } from "../monitor/statsTypes";
 import {
@@ -102,6 +101,7 @@ let bridgeHandle: { dispose: () => void } | null = null;
 // Read-only owner telemetry capsule state (silently populated ONLY on 200 OK)
 const OWNER_STATS_THROTTLE_MS = 15_000;
 const ownerStats = ref<OwnerStatsResult | null>(null);
+const refreshingOwnerStats = ref<boolean>(false);
 let ownerStatsGeneration = 0;
 let lastOwnerStatsCredentialKey = "";
 let lastOwnerStatsFetchAt = 0;
@@ -118,17 +118,26 @@ const ownerTodaySummary = computed<TodayVsYesterdaySummary | null>(() =>
   ownerStats.value ? computeTodayVsYesterday(ownerStats.value.stats) : null,
 );
 
-const ownerTodayRateText = computed<string>(() => {
+function formatOwnerRatePct(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate)) return "—";
+  return `${Math.max(0, Math.min(100, rate)).toFixed(1)}%`;
+}
+
+const ownerDisplayRate = computed<number | null>(() => {
   const s = ownerTodaySummary.value;
-  if (!s || s.total <= 0) return "—";
-  return formatPercent(s.ok, s.total, 1);
+  if (!s || s.total <= 0) return null;
+  return s.effectiveSuccessRate;
 });
 
+const ownerTodayRateText = computed<string>(() =>
+  formatOwnerRatePct(ownerDisplayRate.value),
+);
+
 const ownerTodayRateTone = computed<"ok" | "warn" | "danger" | "idle">(() => {
-  const s = ownerTodaySummary.value;
-  if (!s || s.successRate === null) return "idle";
-  if (s.successRate >= 95) return "ok";
-  if (s.successRate >= 80) return "warn";
+  const rate = ownerDisplayRate.value;
+  if (rate === null) return "idle";
+  if (rate >= 95) return "ok";
+  if (rate >= 80) return "warn";
   return "danger";
 });
 
@@ -143,12 +152,17 @@ const ownerShanghaiOnline = computed<boolean>(
   () => ownerShanghaiWorkers.value > 0,
 );
 
-const ownerShanghaiTitle = computed<string>(() => {
+const ownerMetricsTitle = computed<string>(() => {
+  const s = ownerTodaySummary.value;
+  if (!s) return "点击刷新统计";
+  const effText = formatOwnerRatePct(s.effectiveSuccessRate);
+  const rawText = formatOwnerRatePct(s.successRate);
   const sh = ownerStats.value?.stats.shanghai;
-  if (!sh || sh.mode === "off") {
-    return "上海出口节点未启用";
-  }
-  return `上海出口 (${sh.mode}) · 在线 Worker ${ownerShanghaiWorkers.value} · 待处理 ${sh.queued_tasks}`;
+  const shPart =
+    !sh || sh.mode === "off"
+      ? "上海出口未启用"
+      : `上海出口 (${sh.mode}) · 在线 ${ownerShanghaiWorkers.value} 节点`;
+  return `有效成功率 ${effText}（剔除限流/无效 ${s.excludedCount} 次） · 原始成功率 ${rawText}（成功 ${s.ok} / 失败 ${s.failed}） · ${shPart} · 点击刷新`;
 });
 
 const isCurrentWorkSaved = computed<boolean>(() =>
@@ -197,6 +211,7 @@ function showToast(
 
 async function refreshOwnerStatsSilently(options?: {
   force?: boolean;
+  manual?: boolean;
   targetSettings?: ExtensionSettings;
 }) {
   const target = options?.targetSettings ?? settings.value;
@@ -207,6 +222,7 @@ async function refreshOwnerStatsSilently(options?: {
     lastOwnerStatsCredentialKey = "";
     lastOwnerStatsFetchAt = 0;
     ownerStats.value = null;
+    refreshingOwnerStats.value = false;
     return;
   }
 
@@ -227,6 +243,9 @@ async function refreshOwnerStatsSilently(options?: {
   lastOwnerStatsCredentialKey = credKey;
   lastOwnerStatsFetchAt = now;
   const myGen = ++ownerStatsGeneration;
+  if (options?.manual) {
+    refreshingOwnerStats.value = true;
+  }
 
   try {
     const rpc = await sendSidePanelRequest({ type: "FETCH_OWNER_STATS" });
@@ -237,14 +256,23 @@ async function refreshOwnerStatsSilently(options?: {
     }
     if (rpc.ok) {
       ownerStats.value = rpc.data;
-    } else {
+    } else if (!options?.manual || rpc.status === 401) {
       ownerStats.value = null;
     }
   } catch {
-    if (myGen === ownerStatsGeneration) {
+    if (myGen === ownerStatsGeneration && !options?.manual) {
       ownerStats.value = null;
     }
+  } finally {
+    if (myGen === ownerStatsGeneration && options?.manual) {
+      refreshingOwnerStats.value = false;
+    }
   }
+}
+
+function handleManualRefreshOwnerStats() {
+  if (refreshingOwnerStats.value) return;
+  void refreshOwnerStatsSilently({ force: true, manual: true });
 }
 
 function handleOpenMonitorDashboard() {
@@ -781,6 +809,7 @@ onUnmounted(() => {
       :settings="settings"
       :connection="connection"
       :batch-url-count="batchUrlPreviewCount"
+      :owner-confirmed="showOwnerStatsPill"
       @toggle-auto-follow="handleToggleAutoFollowHeader"
       @cycle-theme="handleCycleThemeHeader"
       @open-settings="settingsOpen = true"
@@ -792,11 +821,17 @@ onUnmounted(() => {
       class="sp-owner-pill"
       data-testid="owner-stats-pill"
     >
-      <div class="sp-owner-pill__metrics">
-        <span
-          class="sp-owner-pill__item"
-          :title="`今日成功 ${ownerTodaySummary.ok} / 失败 ${ownerTodaySummary.failed}`"
-        >
+      <button
+        type="button"
+        class="sp-owner-pill__metrics"
+        :class="{ 'sp-owner-pill__metrics--refreshing': refreshingOwnerStats }"
+        :disabled="refreshingOwnerStats"
+        :title="ownerMetricsTitle"
+        :aria-label="ownerMetricsTitle"
+        data-testid="owner-stats-refresh-btn"
+        @click="handleManualRefreshOwnerStats"
+      >
+        <span class="sp-owner-pill__item">
           <span
             class="sp-owner-pill__dot"
             :class="`sp-owner-pill__dot--${ownerTodayRateTone}`"
@@ -808,15 +843,13 @@ onUnmounted(() => {
           <span
             class="sp-owner-pill__rate"
             :class="`sp-owner-pill__rate--${ownerTodayRateTone}`"
+            data-testid="owner-stats-rate"
           >
             {{ ownerTodayRateText }}
           </span>
         </span>
 
-        <span
-          class="sp-owner-pill__item sp-owner-pill__shanghai"
-          :title="ownerShanghaiTitle"
-        >
+        <span class="sp-owner-pill__item sp-owner-pill__shanghai">
           <span
             class="sp-owner-pill__dot"
             :class="
@@ -827,7 +860,24 @@ onUnmounted(() => {
           />
           <span>上海 {{ ownerShanghaiWorkers }} 节点</span>
         </span>
-      </div>
+
+        <svg
+          class="sp-owner-pill__refresh-icon"
+          :class="{ 'sp-spin': refreshingOwnerStats }"
+          viewBox="0 0 24 24"
+          width="11"
+          height="11"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.1"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+          <polyline points="21 3 21 9 15 9" />
+        </svg>
+      </button>
 
       <button
         type="button"
@@ -1084,11 +1134,49 @@ onUnmounted(() => {
 }
 
 .sp-owner-pill__metrics {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
+  padding: 2px 5px;
+  margin: -2px -5px;
+  border: none;
+  border-radius: var(--sp-radius-xs);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 150ms ease, opacity 150ms ease;
+}
+
+.sp-owner-pill__metrics:hover:not(:disabled) {
+  background: var(--sp-ghost-bg);
+}
+
+.sp-owner-pill__metrics:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sp-focus-ring);
+}
+
+.sp-owner-pill__metrics--refreshing {
+  opacity: 0.68;
+  cursor: progress;
+}
+
+.sp-owner-pill__refresh-icon {
+  flex-shrink: 0;
+  color: var(--sp-text-muted);
+  opacity: 0.7;
+  transition: opacity 150ms ease, color 150ms ease;
+}
+
+.sp-owner-pill__metrics:hover .sp-owner-pill__refresh-icon,
+.sp-owner-pill__metrics--refreshing .sp-owner-pill__refresh-icon {
+  opacity: 1;
+  color: var(--sp-accent-text);
 }
 
 .sp-owner-pill__item {

@@ -2205,7 +2205,7 @@
         "type": "string",
         "pattern": "^[a-z0-9][a-z0-9_:-]{0,31}$",
         "maxLength": 32,
-        "description": "Core 14 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), or 'ytdlp_other'."
+        "description": "Core 14 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), 'ytdlp_unmatched', or 'ytdlp_other'."
       },
       "StatsOutcomeCode": {
         "type": "string",

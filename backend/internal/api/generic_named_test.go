@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -227,7 +229,7 @@ func TestTwoTierRoutingPrecedenceAndGuards(t *testing.T) {
 		t.Fatalf("bad inputs unexpectedly invoked genericAdapter: before=%d after=%d", genericCallsBefore, genericCalls.Load())
 	}
 
-	// 7. Generic adapter returning UNSUPPORTED_PLATFORM records under PlatformUnknown (no dynamic slot pollution).
+	// 7. Generic adapter returning UNSUPPORTED_PLATFORM records under PlatformYTDLPUnmatched (decoupled from unknown, zero dynamic slot pollution).
 	{
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://unsupported.example.org/watch/1"), nil))
@@ -239,10 +241,18 @@ func TestTwoTierRoutingPrecedenceAndGuards(t *testing.T) {
 			t.Fatalf("unsupported generic code=%q", unified.Str(env["code"]))
 		}
 		snap := h.Stats().Snapshot()
+		var unmatchedUnsupported uint64
 		for _, cell := range snap.Requests.ByPlatformCodeChannel {
 			if cell.Platform == PlatformGeneric || cell.Platform == "unsupported" {
 				t.Fatalf("unexpected platform cell in stats: %+v", cell)
 			}
+			if cell.Platform == PlatformYTDLPUnmatched && cell.Code == "UNSUPPORTED_PLATFORM" {
+				unmatchedUnsupported += cell.Count
+			}
+		}
+		if unmatchedUnsupported != 1 {
+			t.Fatalf("expected 1 UNSUPPORTED_PLATFORM cell under %q, got %d (cells=%+v)",
+				PlatformYTDLPUnmatched, unmatchedUnsupported, snap.Requests.ByPlatformCodeChannel)
 		}
 	}
 }
@@ -250,7 +260,7 @@ func TestTwoTierRoutingPrecedenceAndGuards(t *testing.T) {
 func TestGenericAdapterFailClosedOnInvalidDynamicPlatform(t *testing.T) {
 	const baseNow = int64(1793448000)
 	c := makeGenericTestCatalog(t)
-	for _, badPlat := range []string{"douyin", "x", "generic", PlatformGeneric, "unknown", "all"} {
+	for _, badPlat := range []string{"douyin", "x", "generic", PlatformGeneric, PlatformYTDLPOther, PlatformYTDLPUnmatched, "unknown", "all"} {
 		t.Run(badPlat, func(t *testing.T) {
 			h, err := New(c, nil, func() time.Time { return time.Unix(baseNow, 0) }, nil)
 			if err != nil {
@@ -791,4 +801,194 @@ func TestGenericAuthenticatedKeyCountsAgainstSlowConcurrency(t *testing.T) {
 
 	close(release)
 	wg.Wait()
+}
+
+type stubGenericExtractor struct {
+	extract func(context.Context, string) (*ytengine.Info, error)
+}
+
+func (s *stubGenericExtractor) Enabled() bool { return true }
+
+func (s *stubGenericExtractor) Extract(ctx context.Context, rawURL string) (*ytengine.Info, error) {
+	return s.extract(ctx, rawURL)
+}
+
+type mapNetIPResolver map[string][]netip.Addr
+
+func (r mapNetIPResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	if ips, ok := r[host]; ok {
+		return ips, nil
+	}
+	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+}
+
+func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
+	nowTime := time.Date(2026, 11, 22, 6, 0, 0, 0, time.UTC)
+	c := makeGenericTestCatalog(t)
+
+	h, err := New(c, nil, func() time.Time { return nowTime }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var tiktokCalls atomic.Int32
+	parser := ytgeneric.NewGenericNamed(
+		&stubGenericExtractor{
+			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
+				switch {
+				case strings.Contains(rawURL, "vimeo.com/blocked"):
+					return nil, &ytengine.Error{
+						Code:      ytengine.CodeUpstreamBlocked,
+						Message:   "私密视频",
+						Extractor: "Vimeo",
+					}
+				case strings.Contains(rawURL, "tiktok.com/@demo/video/404"):
+					tiktokCalls.Add(1)
+					return nil, &ytengine.Error{
+						Code:      ytengine.CodeContentUnavailable,
+						Message:   "视频已删除",
+						Extractor: "TikTok",
+					}
+				case strings.Contains(rawURL, "dailymotion.com/video/timeout"):
+					return nil, &ytengine.Error{
+						Code:      ytengine.CodeUpstreamTimeout,
+						Message:   "上游连接超时",
+						Retryable: true,
+						Cause:     errors.New("ERROR: [dailymotion] timeout: timed out"),
+					}
+				case strings.Contains(rawURL, "soundcloud.com/artist/empty"):
+					return &ytengine.Info{
+						ID:           "sc-empty",
+						ExtractorKey: "Soundcloud",
+						Formats:      nil,
+					}, nil
+				case strings.Contains(rawURL, "example.org/blog/post"):
+					return nil, &ytengine.Error{
+						Code:           ytengine.CodeContentUnavailable,
+						Message:        "未找到可用的媒体",
+						UnsupportedURL: true,
+					}
+				case strings.Contains(rawURL, "example.org/generic-fail"):
+					return nil, &ytengine.Error{
+						Code:      ytengine.CodeUpstreamUnavailable,
+						Message:   "解析失败",
+						Retryable: true,
+						Extractor: "generic",
+					}
+				default:
+					return nil, errors.New("unexpected url: " + rawURL)
+				}
+			},
+		},
+		nil,
+		mapNetIPResolver{
+			"ssrf.example.org": {netip.MustParseAddr("127.0.0.1")},
+		},
+	)
+	h.SetGenericAdapter(parser)
+
+	doGet := func(rawQuery string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&"+rawQuery, nil))
+		return w
+	}
+
+	// 1. Pre-routing invalid inputs MUST stay in "unknown" (3 requests).
+	if w := doGet("url=not-a-valid-url"); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad text status=%d", w.Code)
+	}
+	if w := doGet("url=" + url.QueryEscape("https://127.0.0.1/video/1")); w.Code != http.StatusBadRequest {
+		t.Fatalf("loopback ip status=%d", w.Code)
+	}
+	if w := doGet(""); w.Code != http.StatusBadRequest {
+		t.Fatalf("missing url status=%d", w.Code)
+	}
+
+	// 2. Named Tier-2 failures attribute to their exact normalized platforms.
+	if w := doGet("url=" + url.QueryEscape("https://vimeo.com/blocked")); w.Code != http.StatusForbidden {
+		t.Fatalf("vimeo blocked status=%d body=%s", w.Code, w.Body.String())
+	}
+	// TikTok CONTENT_UNAVAILABLE is cached for 10s; second call hits cache and must STILL attribute to "tiktok"!
+	if w := doGet("url=" + url.QueryEscape("https://www.tiktok.com/@demo/video/404")); w.Code != http.StatusNotFound {
+		t.Fatalf("tiktok 404 #1 status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := doGet("url=" + url.QueryEscape("https://www.tiktok.com/@demo/video/404")); w.Code != http.StatusNotFound {
+		t.Fatalf("tiktok 404 #2 (cached) status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tiktokCalls.Load() != 1 {
+		t.Fatalf("expected 1 tiktok extract call (2nd cached), got %d", tiktokCalls.Load())
+	}
+	if w := doGet("url=" + url.QueryEscape("https://www.dailymotion.com/video/timeout")); w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("dailymotion timeout status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := doGet("url=" + url.QueryEscape("https://soundcloud.com/artist/empty")); w.Code != http.StatusNotFound {
+		t.Fatalf("soundcloud NO_MEDIA status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 3. Unmatched Tier-2 failures (Unsupported URL, [generic], DNS SSRF) attribute to "ytdlp_unmatched".
+	if w := doGet("url=" + url.QueryEscape("https://example.org/blog/post")); w.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported url status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := doGet("url=" + url.QueryEscape("https://example.org/generic-fail")); w.Code != http.StatusBadGateway {
+		t.Fatalf("generic fail status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := doGet("url=" + url.QueryEscape("https://ssrf.example.org/video/1")); w.Code != http.StatusForbidden {
+		t.Fatalf("ssrf fail status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	snap := h.Stats().Snapshot()
+	cells := snap.Requests.ByPlatformCodeChannel
+	for _, cell := range cells {
+		if cell.Platform == PlatformGeneric {
+			t.Fatalf("internal sentinel %q leaked into stats: %+v", PlatformGeneric, cell)
+		}
+	}
+
+	// Verify exact attribution in by_platform_code_channel
+	if got := lookupCellCount(cells, PlatformUnknown, "INVALID_INPUT", ChannelAnonymous); got != 3 {
+		t.Fatalf("unknown INVALID_INPUT = %d, want 3 (cells=%+v)", got, cells)
+	}
+	// Ensure zero Tier-2 failures leaked into "unknown"
+	for _, cell := range cells {
+		if cell.Platform == PlatformUnknown && cell.Code != "INVALID_INPUT" {
+			t.Fatalf("Tier-2 failure leaked into unknown: %+v", cell)
+		}
+	}
+
+	if got := lookupCellCount(cells, "vimeo", "UPSTREAM_BLOCKED", ChannelAnonymous); got != 1 {
+		t.Fatalf("vimeo UPSTREAM_BLOCKED = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, "tiktok", "CONTENT_UNAVAILABLE", ChannelAnonymous); got != 2 {
+		t.Fatalf("tiktok CONTENT_UNAVAILABLE (1 miss + 1 cache hit) = %d, want 2", got)
+	}
+	if got := lookupCellCount(cells, "dailymotion", "UPSTREAM_TIMEOUT", ChannelAnonymous); got != 1 {
+		t.Fatalf("dailymotion UPSTREAM_TIMEOUT = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, "soundcloud", "NO_MEDIA", ChannelAnonymous); got != 1 {
+		t.Fatalf("soundcloud NO_MEDIA = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, PlatformYTDLPUnmatched, "UNSUPPORTED_PLATFORM", ChannelAnonymous); got != 1 {
+		t.Fatalf("ytdlp_unmatched UNSUPPORTED_PLATFORM = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, PlatformYTDLPUnmatched, "UPSTREAM_UNAVAILABLE", ChannelAnonymous); got != 1 {
+		t.Fatalf("ytdlp_unmatched UPSTREAM_UNAVAILABLE = %d, want 1", got)
+	}
+	if got := lookupCellCount(cells, PlatformYTDLPUnmatched, "UPSTREAM_BLOCKED", ChannelAnonymous); got != 1 {
+		t.Fatalf("ytdlp_unmatched UPSTREAM_BLOCKED = %d, want 1", got)
+	}
+
+	// Verify daily[29].ByPlatform reflects the exact same separation!
+	dayPlats := snap.Daily[29].ByPlatform
+	if dayPlats[PlatformUnknown].Total != 3 {
+		t.Fatalf("daily unknown total = %d, want 3 (%+v)", dayPlats[PlatformUnknown].Total, dayPlats[PlatformUnknown])
+	}
+	if dayPlats[PlatformYTDLPUnmatched].Total != 3 {
+		t.Fatalf("daily ytdlp_unmatched total = %d, want 3 (%+v)", dayPlats[PlatformYTDLPUnmatched].Total, dayPlats[PlatformYTDLPUnmatched])
+	}
+	if dayPlats["vimeo"].ByCode["UPSTREAM_BLOCKED"] != 1 ||
+		dayPlats["tiktok"].ByCode["CONTENT_UNAVAILABLE"] != 2 ||
+		dayPlats["dailymotion"].ByCode["UPSTREAM_TIMEOUT"] != 1 ||
+		dayPlats["soundcloud"].ByCode["NO_MEDIA"] != 1 {
+		t.Fatalf("unexpected daily named Tier-2 platform stats: %+v", dayPlats)
+	}
 }
