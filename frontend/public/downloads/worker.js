@@ -258,9 +258,19 @@ function hasNonIdentityEncoding(headers) {
   return enc !== "" && enc !== "identity";
 }
 
-function acceptsByteRanges(headers) {
+function parsePositiveIntHeader(headers, name) {
+  const raw = headers.get(name)?.trim() || "";
+  if (!/^\d+$/.test(raw)) return 0;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function acceptsByteRanges(headers, allowOmitted = false) {
   const raw = headers.get("accept-ranges")?.trim().toLowerCase() || "";
-  return raw.split(",").some(token => token.trim() === "bytes");
+  if (!raw) return allowOmitted;
+  const tokens = raw.split(",").map(token => token.trim()).filter(Boolean);
+  if (!tokens.length || tokens.includes("none")) return false;
+  return tokens.includes("bytes");
 }
 
 function createRangeScheduler(task, config) {
@@ -460,6 +470,7 @@ function createRangeScheduler(task, config) {
     },
     commitSwitch() {
       switched = true;
+      if (!task.state.total && total > 0) task.state.total = total;
       const reader = task.reader;
       task.reader = undefined;
       void reader?.cancel().catch(() => {}).finally(() => { try { reader.releaseLock(); } catch {} });
@@ -531,18 +542,23 @@ async function prepare(task) {
       Object.assign(task.state, metadata);
       task.initialAttempt = attempt;
       task.cleanupInitialAttempt = () => task.controller.signal.removeEventListener("abort", abortAttempt);
-      const rangeEligible =
+      const rangeAllowedByHeaders =
         credentials === "omit" &&
-        metadata.total >= RANGE_THRESHOLD_BYTES &&
-        acceptsByteRanges(response.headers) &&
         !hasNonIdentityEncoding(response.headers) &&
-        first.value.length < metadata.total;
+        acceptsByteRanges(response.headers, true);
+      const rangeCandidateTotal = metadata.total > 0
+        ? metadata.total
+        : (rangeAllowedByHeaders ? parsePositiveIntHeader(response.headers, "content-length") : 0);
+      const rangeEligible =
+        rangeAllowedByHeaders &&
+        rangeCandidateTotal >= RANGE_THRESHOLD_BYTES &&
+        first.value.length < rangeCandidateTotal;
       const chunk0End = rangeEligible
-        ? Math.min(metadata.total, Math.max(RANGE_CHUNK_SIZE, first.value.length))
+        ? Math.min(rangeCandidateTotal, Math.max(RANGE_CHUNK_SIZE, first.value.length))
         : 0;
-      const rangeConfig = rangeEligible && chunk0End < metadata.total ? {
+      const rangeConfig = rangeEligible && chunk0End < rangeCandidateTotal ? {
         url,
-        total: metadata.total,
+        total: rangeCandidateTotal,
         chunk0End,
         initialETag: strongETag(response.headers.get("etag")),
       } : null;

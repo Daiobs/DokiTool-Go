@@ -1317,10 +1317,10 @@ test('multi-range falls back silently to initial 200 stream when 206 is unsuppor
     assert.equal((await h.query(1)).status, 'completed', `${name}: completed cleanly`);
   }
 
-  // Same-origin relay URLs (credentials: same-origin) and missing Accept-Ranges must never issue Range probes.
+  // Same-origin relay URLs (credentials: same-origin) and explicit Accept-Ranges: none must never issue Range probes.
   for (const [name, url, headers] of [
     ['same-origin', `${origin}/api/media/weibo?ticket=abc`, { 'accept-ranges': 'bytes' }],
-    ['no-accept-ranges', 'https://cdn.test/no-range.mp4', {}],
+    ['accept-ranges-none', 'https://cdn.test/no-range.mp4', { 'accept-ranges': 'none' }],
   ]) {
     let rangeCount = 0;
     const h = harness(async (_url, options) => {
@@ -1466,4 +1466,122 @@ test('multi-range retries transient post-switch chunk error and fails closed on 
   const driftRes = await hDrift.download(1);
   await assert.rejects(driftRes.arrayBuffer(), /ETag/);
   assert.equal((await hDrift.query(1)).status, 'failed');
+});
+
+test('multi-range activates on real-browser CORS responses without Content-Encoding or Accept-Ranges and falls back safely on mismatch or none', async t => {
+  const payload = makeRangePayload(6 * 1024 * 1024 + 55);
+  const expectedDigest = sha256(payload);
+  const makeCorsResponse = (body, init) => {
+    const resp = new Response(body, init);
+    Object.defineProperty(resp, 'type', { value: 'cors' });
+    return resp;
+  };
+
+  // 1. Real-browser CORS response: no Content-Encoding, no Accept-Ranges, no sourceSizes -> activates multi-Range once 206 Content-Range matches Content-Length.
+  const rangeCalls = [];
+  let initialCancelledAt = -1;
+  const hCors = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      return makeCorsResponse(makeChunkedStream(payload, 512 * 1024, {
+        onCancel(at) { initialCancelledAt = at; },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(payload.length),
+        },
+      });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    assert.ok(m, `unexpected Range header: ${rangeHeader}`);
+    const start = Number(m[1]), end = Number(m[2]);
+    rangeCalls.push({ start, end });
+    const slice = payload.subarray(start, end + 1);
+    return makeCorsResponse(slice, {
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(slice.length),
+        'content-range': `bytes ${start}-${end}/${payload.length}`,
+      },
+    });
+  });
+  t.after(() => hCors.close());
+
+  await hCors.admit(1);
+  const corsRes = await hCors.download(1);
+  // Pre-switch decodedLength contract must remain unchanged (no premature Content-Length header on unverified CORS wire length).
+  assert.equal(corsRes.headers.get('content-length'), null);
+  const corsBuf = Buffer.from(await corsRes.arrayBuffer());
+  assert.equal(corsBuf.length, payload.length);
+  assert.equal(sha256(corsBuf), expectedDigest);
+  assert.equal(rangeCalls.length, 3, '6 MiB + 55 B after 2 MiB chunk 0 = 3 Range chunks');
+  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 2 * 1024 * 1024 + 512 * 1024,
+    `initial CORS 200 stream should cancel at 2 MiB boundary, cancelled at ${initialCancelledAt}`);
+  const corsSnap = await hCors.query(1);
+  assert.equal(corsSnap.status, 'completed');
+  assert.equal(corsSnap.loaded, payload.length);
+  assert.equal(corsSnap.total, payload.length, 'task.state.total should promote after verified 206 switch');
+
+  // 2. Hidden gzip on CORS 200: wire Content-Length (5 MiB) < actual decoded body (6 MiB + 55 B) and 206 Content-Range reports uncompressed total -> falls back cleanly without failing length check.
+  const wireCompressedLen = 5 * 1024 * 1024;
+  let mismatchProbes = 0;
+  const hMismatch = harness(async (_url, options) => {
+    if (options.headers?.Range) {
+      mismatchProbes++;
+      const start = 2 * 1024 * 1024, end = 4 * 1024 * 1024 - 1;
+      return makeCorsResponse(payload.subarray(start, end + 1), {
+        status: 206,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(end - start + 1),
+          'content-range': `bytes ${start}-${end}/${payload.length}`,
+        },
+      });
+    }
+    return makeCorsResponse(makeChunkedStream(payload, 512 * 1024), {
+      status: 200,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(wireCompressedLen),
+      },
+    });
+  });
+  t.after(() => hMismatch.close());
+
+  await hMismatch.admit(1);
+  const mismatchRes = await hMismatch.download(1);
+  assert.equal(mismatchRes.headers.get('content-length'), null);
+  const mismatchBuf = Buffer.from(await mismatchRes.arrayBuffer());
+  assert.equal(mismatchBuf.length, payload.length);
+  assert.equal(sha256(mismatchBuf), expectedDigest);
+  assert.equal(mismatchProbes, 1, 'single 206 probe should fail on total mismatch and fall back');
+  const mismatchSnap = await hMismatch.query(1);
+  assert.equal(mismatchSnap.status, 'completed');
+  assert.equal(mismatchSnap.loaded, payload.length);
+  assert.equal(mismatchSnap.total, 0, 'task.state.total must stay 0 on fallback to unverified CORS 200 stream');
+
+  // 3. CORS 200 with explicit Accept-Ranges: none -> zero Range probes issued.
+  let noneProbes = 0;
+  const hNone = harness(async (_url, options) => {
+    if (options.headers?.Range) noneProbes++;
+    return makeCorsResponse(makeChunkedStream(payload, 1024 * 1024), {
+      status: 200,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(payload.length),
+        'accept-ranges': 'none',
+      },
+    });
+  });
+  t.after(() => hNone.close());
+
+  await hNone.admit(1);
+  const noneBuf = Buffer.from(await (await hNone.download(1)).arrayBuffer());
+  assert.equal(sha256(noneBuf), expectedDigest);
+  assert.equal(noneProbes, 0, 'explicit Accept-Ranges: none must never issue Range probes');
+  const noneSnap = await hNone.query(1);
+  assert.equal(noneSnap.status, 'completed');
+  assert.equal(noneSnap.total, 0);
 });
