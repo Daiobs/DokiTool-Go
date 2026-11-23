@@ -42,6 +42,7 @@ export type {
 export const SIDEPANEL_PORT_NAME = "dokitool-sidepanel" as const;
 export const OFFSCREEN_PORT_NAME = "dokitool-offscreen" as const;
 export const EXTENSION_OPFS_TEMP_PREFIX = "dokitool-ext-" as const;
+export const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo" as const;
 
 export const OFFSCREEN_HEARTBEAT_INTERVAL_MS = 20_000 as const;
 export const OFFSCREEN_IDLE_CLOSE_MS = 60_000 as const;
@@ -392,9 +393,98 @@ export type OffscreenChannelMessage =
   | BackgroundToOffscreenRequest
   | OffscreenToBackgroundMessage;
 
+// ============================================================================
+// Web SPA <-> Installed Extension External Bridge Contracts (Zero-Secret)
+// ============================================================================
+
+export type WebBridgeCapability = "dash_mux" | "direct_download";
+
+export interface WebExtDashMuxPayload {
+  videoRoutes: string[];
+  audioRoutes: string[];
+  videoSize?: number;
+  audioSize?: number;
+  outputContainer?: "mp4";
+}
+
+export type WebExtEnqueuePayload =
+  | {
+      kind: "dash_mux";
+      platform: string;
+      title?: string;
+      filename: string;
+      dashMux: WebExtDashMuxPayload;
+      sizeBytes?: number;
+      mimeType?: string;
+    }
+  | {
+      kind: "direct_download";
+      platform: string;
+      title?: string;
+      filename: string;
+      routes: string[];
+      sizeBytes?: number;
+      mimeType?: string;
+    };
+
+export type WebToExtensionRequest =
+  | { type: "WEB_EXT_PING" }
+  | {
+      type: "WEB_EXT_ENQUEUE_MEDIA";
+      payload: WebExtEnqueuePayload;
+    }
+  | {
+      type: "WEB_EXT_GET_TASK_STATUS";
+      taskId: string;
+    };
+
+export interface WebExtPingData {
+  version: string;
+  extensionId: string;
+  capabilities: WebBridgeCapability[];
+}
+
+export interface WebExtEnqueueMediaData {
+  taskId: string;
+  status: ExtensionTaskStatus;
+}
+
+export type WebExtTaskPhase =
+  | "queued"
+  | "downloading"
+  | "muxing"
+  | "saving"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface WebExtTaskStatusData {
+  taskId: string;
+  status: ExtensionTaskStatus;
+  phase: WebExtTaskPhase;
+  progress: number;
+  loadedBytes: number;
+  totalBytes: number;
+  speedBytesPerSec: number;
+  filename: string;
+  error?: string;
+}
+
+export interface WebToExtensionResponseMap {
+  WEB_EXT_PING: WebExtPingData;
+  WEB_EXT_ENQUEUE_MEDIA: WebExtEnqueueMediaData;
+  WEB_EXT_GET_TASK_STATUS: WebExtTaskStatusData;
+}
+
 export type AnyExtensionRuntimeMessage =
   | SidePanelChannelMessage
   | OffscreenChannelMessage;
+
+const WEB_TO_EXTENSION_REQUEST_TYPES = new Set<WebToExtensionRequest["type"]>([
+  "WEB_EXT_PING",
+  "WEB_EXT_ENQUEUE_MEDIA",
+  "WEB_EXT_GET_TASK_STATUS",
+]);
 
 const SIDEPANEL_REQUEST_TYPES = new Set<SidePanelToBackgroundRequest["type"]>([
   "GET_INITIAL_STATE",
@@ -476,5 +566,16 @@ export function isOffscreenToBackgroundMessage(
   return (
     hasMessageType(msg) &&
     OFFSCREEN_TO_BG_TYPES.has(msg.type as OffscreenToBackgroundMessage["type"])
+  );
+}
+
+export function isWebToExtensionRequest(
+  msg: unknown,
+): msg is WebToExtensionRequest {
+  return (
+    hasMessageType(msg) &&
+    WEB_TO_EXTENSION_REQUEST_TYPES.has(
+      msg.type as WebToExtensionRequest["type"],
+    )
   );
 }

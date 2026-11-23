@@ -623,6 +623,7 @@
 !/frontend/src/monitor/statsTypes.ts
 /frontend/src/services/*
 !/frontend/src/services/apiConfig.ts
+!/frontend/src/services/extensionBridge.ts
 !/frontend/src/services/operationLogger.js
 !/frontend/src/services/retryManager.js
 !/frontend/src/services/secureApiClient.ts

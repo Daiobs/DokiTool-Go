@@ -3821,3 +3821,300 @@ test('copy-url button remains enabled and emits exact activeVideoUrl on YouTube 
     }
   }
 });
+
+test('PR 1 single-video filename priority: Bilibili single-P with mmexport item.title stays single-video and uses media.title with clean fallback chain', async () => {
+  const singlePBili = {
+    platform: 'bilibili',
+    content_id: 'BV1SinglePWeb99',
+    title: 'B站单P视频主标题',
+    author: { name: '测试UP主' },
+    default_item_id: 'p1',
+    groups: [
+      { id: 'parts', kind: 'multipart', title: '分P', total_count: 1, item_ids: ['p1'] },
+    ],
+    items: [
+      {
+        id: 'p1',
+        type: 'video',
+        index: 1,
+        title: 'mmexport1794208831102.mp4',
+        state: 'ready',
+        default: { variant_id: 'v720', source_id: 's720', url: 'https://upos-sz-mirrorcos.bilivideo.com/single-720.mp4' },
+        variants: [
+          {
+            id: 'v720',
+            label: '720P',
+            metadata: { width: 1280, height: 720, has_audio: true, container: 'mp4', extension: 'mp4' },
+            delivery: { kind: 'file', sources: [{ id: 's720', url: 'https://upos-sz-mirrorcos.bilivideo.com/single-720.mp4', size_bytes: 4 }] },
+          },
+        ],
+      },
+    ],
+  };
+
+  const { instance, store, selection } = harness(singlePBili);
+  assert.equal(selection.hasCollections.value, false, 'single-P group total_count=1 must not activate hasCollections');
+  assert.equal(selection.isMulti.value, false, 'single-P Bilibili must remain pure single-video');
+
+  await instance.downloadMainVideo();
+  await settled(store.downloads[0]);
+  assert.equal(store.downloads[0].status, 'completed');
+  assert.equal(store.downloads[0].filename, 'B站单P视频主标题.mp4');
+  assert.equal(store.downloads[0].filename.includes('mmexport'), false);
+  assert.equal(store.downloads[0].filename.includes('_P1'), false);
+
+  // Fallback chain when media.title is empty: item.title (stripped of redundant .mp4) -> author -> platform_contentId
+  const noMainTitle = { ...singlePBili, title: '' };
+  const hFallbackItem = harness(noMainTitle);
+  await hFallbackItem.instance.downloadMainVideo();
+  await settled(hFallbackItem.store.downloads[0]);
+  assert.equal(hFallbackItem.store.downloads[0].filename, 'mmexport1794208831102.mp4');
+  assert.equal(hFallbackItem.store.downloads[0].filename.endsWith('.mp4.mp4'), false);
+
+  const onlyAuthor = {
+    ...singlePBili,
+    title: '',
+    items: [{ ...singlePBili.items[0], title: '' }],
+  };
+  const hFallbackAuthor = harness(onlyAuthor);
+  await hFallbackAuthor.instance.downloadMainVideo();
+  await settled(hFallbackAuthor.store.downloads[0]);
+  assert.equal(hFallbackAuthor.store.downloads[0].filename, '测试UP主.mp4');
+
+  const onlyPlatformId = {
+    ...onlyAuthor,
+    author: undefined,
+  };
+  const hFallbackId = harness(onlyPlatformId);
+  await hFallbackId.instance.downloadMainVideo();
+  await settled(hFallbackId.store.downloads[0]);
+  assert.equal(hFallbackId.store.downloads[0].filename, 'bilibili_BV1SinglePWeb99.mp4');
+});
+
+test('PR 1 Web <-> Extension bridge download flow: Bilibili 1080p DASH mux & M4A audio handoff, status polling, retry, and cancel', async () => {
+  const prevChrome = globalThis.chrome;
+  const biliDashData = {
+    platform: 'bilibili',
+    content_id: 'BV1BridgeTest1',
+    title: 'B站联动无损合流测试',
+    default_item_id: 'p1',
+    groups: [
+      { id: 'parts', kind: 'multipart', title: '分P', total_count: 1, item_ids: ['p1'] },
+    ],
+    items: [
+      {
+        id: 'p1',
+        type: 'video',
+        index: 1,
+        title: 'mmexport999999999.mp4',
+        state: 'ready',
+        default: { variant_id: 'durl-720', source_id: 's-720', url: 'https://upos-sz-mirrorcos.bilivideo.com/durl-720.mp4' },
+        variants: [
+          {
+            id: 'dash-1080',
+            label: '1080P 高清',
+            metadata: { width: 1920, height: 1080, has_audio: true, video_codec: 'avc1.640032', bitrate_bps: 3_000_000, container: 'mp4', extension: 'mp4' },
+            delivery: {
+              kind: 'mux',
+              output: { container: 'mp4', extension: 'mp4' },
+              resources: [
+                {
+                  id: 'v-1080',
+                  role: 'video',
+                  metadata: { width: 1920, height: 1080, video_codec: 'avc1.640032' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      { id: 's-1080', url: 'https://upos-sz-mirrorcos.bilivideo.com/dash-1080.m4s', access: 'direct', size_bytes: 20_000_000 },
+                    ],
+                  },
+                },
+                {
+                  id: 'a-30280',
+                  role: 'audio',
+                  metadata: { audio_codec: 'mp4a.40.2' },
+                  delivery: {
+                    kind: 'file',
+                    sources: [
+                      { id: 's-audio', url: 'https://upos-sz-mirrorcos.bilivideo.com/dash-audio.m4s', access: 'direct', size_bytes: 3_000_000 },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            id: 'durl-720',
+            label: '720P 高清',
+            metadata: { width: 1280, height: 720, has_audio: true, video_codec: 'avc1.64001F', container: 'mp4', extension: 'mp4' },
+            delivery: {
+              kind: 'file',
+              sources: [
+                { id: 's-720', url: 'https://upos-sz-mirrorcos.bilivideo.com/durl-720.mp4', size_bytes: 8_000_000 },
+              ],
+            },
+          },
+        ],
+        attachments: [
+          {
+            id: 'dash-audio-30280',
+            kind: 'background_audio',
+            title: '原声音频',
+            resource: {
+              id: 'r-audio-30280',
+              role: 'audio',
+              metadata: { audio_codec: 'mp4a.40.2', bitrate_bps: 192_000, container: 'm4a', extension: 'm4a' },
+              delivery: {
+                kind: 'file',
+                sources: [
+                  { id: 's-audio', url: 'https://upos-sz-mirrorcos.bilivideo.com/dash-audio.m4s', access: 'direct', size_bytes: 3_000_000 },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  const sentMessages = [];
+  let pollCounter = 0;
+  let shouldFailFirstMux = true;
+  let nextTaskSeq = 1;
+  const taskPollCounts = new Map();
+  const taskMeta = new Map();
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(extId, msg, cb) {
+        sentMessages.push({ extId, msg });
+        if (msg.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '1.2.3',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download'],
+            },
+          });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+          const taskId = `ext-task-${nextTaskSeq++}`;
+          taskPollCounts.set(taskId, 0);
+          taskMeta.set(taskId, {
+            kind: msg.payload.kind,
+            filename: msg.payload.filename,
+            fail: msg.payload.kind === 'dash_mux' && shouldFailFirstMux,
+          });
+          if (msg.payload.kind === 'dash_mux' && shouldFailFirstMux) {
+            shouldFailFirstMux = false;
+          }
+          cb({ ok: true, data: { taskId, status: 'queued' } });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+          pollCounter++;
+          const n = (taskPollCounts.get(msg.taskId) || 0) + 1;
+          taskPollCounts.set(msg.taskId, n);
+          const meta = taskMeta.get(msg.taskId);
+          if (meta.fail) {
+            cb({
+              ok: true,
+              data: {
+                taskId: msg.taskId,
+                status: 'failed',
+                phase: 'failed',
+                progress: 12,
+                loadedBytes: 1_000_000,
+                totalBytes: 23_000_000,
+                speedBytesPerSec: 0,
+                filename: meta.filename,
+                error: '模拟 CDN 临时中断',
+              },
+            });
+            return;
+          }
+          if (n === 1) {
+            cb({
+              ok: true,
+              data: {
+                taskId: msg.taskId,
+                status: 'muxing',
+                phase: 'muxing',
+                progress: 82,
+                loadedBytes: 20_000_000,
+                totalBytes: 23_000_000,
+                speedBytesPerSec: 4_000_000,
+                filename: meta.filename,
+              },
+            });
+            return;
+          }
+          cb({
+            ok: true,
+            data: {
+              taskId: msg.taskId,
+              status: 'completed',
+              phase: 'completed',
+              progress: 100,
+              loadedBytes: 23_000_000,
+              totalBytes: 23_000_000,
+              speedBytesPerSec: 0,
+              filename: meta.filename,
+            },
+          });
+        }
+      },
+    },
+  };
+
+  try {
+    const { instance, store, selection, toasts } = harness(biliDashData);
+    selection.choose({ variant_id: 'dash-1080', source_id: 's-1080' });
+
+    // 1) First attempt fails via extension status -> user retries -> completes cleanly!
+    await instance.downloadMainVideo();
+    await settled(store.downloads[0]);
+    assert.equal(store.downloads[0].status, 'failed');
+    assert.equal(store.downloads[0].filename, 'B站联动无损合流测试.mp4');
+    assert.match(store.downloads[0].error, /模拟 CDN 临时中断/);
+
+    const firstEnqueue = sentMessages.find((m) => m.msg.type === 'WEB_EXT_ENQUEUE_MEDIA');
+    assert.equal(firstEnqueue.extId, 'ihamkldlkdibleacagiejklpfofapkpo');
+    assert.equal(firstEnqueue.msg.payload.kind, 'dash_mux');
+    assert.equal(firstEnqueue.msg.payload.filename, 'B站联动无损合流测试.mp4');
+    assert.deepEqual(firstEnqueue.msg.payload.dashMux.videoRoutes, [
+      'https://upos-sz-mirrorcos.bilivideo.com/dash-1080.m4s',
+    ]);
+    assert.deepEqual(firstEnqueue.msg.payload.dashMux.audioRoutes, [
+      'https://upos-sz-mirrorcos.bilivideo.com/dash-audio.m4s',
+    ]);
+
+    // Retry re-runs extension bridge handoff and succeeds through muxing -> completed
+    instance.handleRetryDownload(store.downloads[0].id);
+    await waitUntil(() => store.downloads[0].status === 'completed');
+    assert.equal(store.downloads[0].percent, 100);
+    assert.equal(store.downloads[0].statusText, '已通过扩展保存');
+    assert.ok(pollCounter >= 2);
+    assert.ok(toasts.some((t) => String(t[0]).includes('已通过 Chrome 扩展保存')));
+
+    // 2) Protected Bilibili DASH M4A audio attachment hands off via direct_download
+    const audioAttachment = biliDashData.items[0].attachments[0];
+    await instance.downloadMusic(audioAttachment);
+    const audioTask = store.downloads.at(-1);
+    await settled(audioTask);
+    assert.equal(audioTask.status, 'completed');
+    assert.equal(audioTask.filename, 'B站联动无损合流测试.m4a');
+    const audioEnqueue = sentMessages
+      .filter((m) => m.msg.type === 'WEB_EXT_ENQUEUE_MEDIA')
+      .at(-1);
+    assert.equal(audioEnqueue.msg.payload.kind, 'direct_download');
+    assert.deepEqual(audioEnqueue.msg.payload.routes, [
+      'https://upos-sz-mirrorcos.bilivideo.com/dash-audio.m4s',
+    ]);
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

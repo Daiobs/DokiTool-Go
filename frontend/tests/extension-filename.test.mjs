@@ -4,22 +4,27 @@ import { fileURLToPath } from "node:url";
 import { build, stop } from "esbuild";
 
 let sanitizer;
+let uiHelpers;
 
 before(async () => {
-  const absEntry = fileURLToPath(
-    new URL("../src/extension/filenameSanitizer.ts", import.meta.url),
-  );
-  const bundled = await build({
-    entryPoints: [absEntry],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-  });
-  const code = bundled.outputFiles[0].text;
-  sanitizer = await import(
-    `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-  );
+  const bundleMod = async (rel) => {
+    const absEntry = fileURLToPath(new URL(rel, import.meta.url));
+    const bundled = await build({
+      entryPoints: [absEntry],
+      bundle: true,
+      write: false,
+      platform: "node",
+      format: "esm",
+    });
+    const code = bundled.outputFiles[0].text;
+    return import(
+      `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
+    );
+  };
+  [sanitizer, uiHelpers] = await Promise.all([
+    bundleMod("../src/extension/filenameSanitizer.ts"),
+    bundleMod("../src/extension/uiTargetHelpers.ts"),
+  ]);
 });
 
 after(() => {
@@ -187,5 +192,113 @@ test("filenameSanitizer: formats subfolder + 001 batch item indices cleanly", ()
       ext: "webp",
     }),
     "千张大图集/0007.webp",
+  );
+});
+
+test("single-video resolveItemBaseName prioritizes media.title over raw mmexport item.title and avoids subfolder / 001_ prefix", () => {
+  const mkSingleBili = (overrides = {}) => ({
+    platform: "bilibili",
+    content_id: "BV1mmExport01",
+    title: "如何用 Go 构建高性能下载服务",
+    author: { name: "硬核UP主" },
+    groups: [
+      {
+        id: "parts",
+        kind: "multipart",
+        total_count: 1,
+        item_ids: ["BV1mmExport01-p1"],
+      },
+    ],
+    items: [
+      {
+        id: "BV1mmExport01-p1",
+        type: "video",
+        index: 1,
+        title: "mmexport1794208831102.mp4",
+        default: {
+          variant_id: "v720",
+          url: "https://upos-sz-mirrorcos.bilivideo.com/single.mp4",
+        },
+        variants: [
+          {
+            id: "v720",
+            label: "720p",
+            metadata: { width: 1280, height: 720, extension: "mp4", has_audio: true },
+            delivery: {
+              kind: "file",
+              sources: [{ url: "https://upos-sz-mirrorcos.bilivideo.com/single.mp4" }],
+            },
+          },
+        ],
+      },
+    ],
+    ...overrides,
+  });
+
+  // 1) Main media.title wins over mmexport item.title; NO subfolder, NO 001_ prefix
+  const media1 = mkSingleBili();
+  assert.equal(uiHelpers.classifyMediaLayout(media1), "single");
+  assert.equal(
+    uiHelpers.resolveItemBaseName(media1, media1.items[0]),
+    "如何用 Go 构建高性能下载服务",
+  );
+  const opts = uiHelpers.buildSidePanelQualityOptions(
+    media1,
+    media1.items[0],
+    "https://snap.dokitool.com",
+  );
+  const enq1 = uiHelpers.buildSingleDownloadEnqueueItem({
+    media: media1,
+    item: media1.items[0],
+    option: opts[0],
+    settings: {
+      apiBaseUrl: "https://snap.dokitool.com",
+      bearerToken: "",
+      qualityPreference: "best",
+      batchSaveMode: "subfolder",
+      subfolderPrefix: "",
+      themeMode: "system",
+    },
+  });
+  assert.equal(enq1.spec.filename, "如何用 Go 构建高性能下载服务.mp4");
+  assert.equal(enq1.spec.filename.includes("/"), false);
+  assert.equal(enq1.spec.filename.includes("001_"), false);
+  assert.equal(enq1.spec.filename.includes("mmexport"), false);
+
+  // 2) Fallback chain when media.title is empty: item.title -> author -> platform_contentId
+  const media2 = mkSingleBili({ title: "" });
+  assert.equal(
+    uiHelpers.resolveItemBaseName(media2, media2.items[0]),
+    "mmexport1794208831102.mp4",
+  );
+  const enq2 = uiHelpers.buildSingleDownloadEnqueueItem({
+    media: media2,
+    item: media2.items[0],
+    option: opts[0],
+    settings: {
+      apiBaseUrl: "https://snap.dokitool.com",
+      bearerToken: "",
+      qualityPreference: "best",
+      batchSaveMode: "subfolder",
+      subfolderPrefix: "",
+      themeMode: "system",
+    },
+  });
+  assert.equal(enq2.spec.filename, "mmexport1794208831102.mp4");
+
+  const media3 = mkSingleBili({
+    title: "",
+    items: [{ ...media1.items[0], title: "" }],
+  });
+  assert.equal(uiHelpers.resolveItemBaseName(media3, media3.items[0]), "硬核UP主");
+
+  const media4 = mkSingleBili({
+    title: "",
+    author: undefined,
+    items: [{ ...media1.items[0], title: "" }],
+  });
+  assert.equal(
+    uiHelpers.resolveItemBaseName(media4, media4.items[0]),
+    "bilibili_BV1mmExport01",
   );
 });

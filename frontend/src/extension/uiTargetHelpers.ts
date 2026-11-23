@@ -1939,24 +1939,30 @@ export function buildPrimarySingleCtaLabel(params: {
       ? `${tier}${fpsSuffix}`
       : tier || option.titleLabel;
 
-  if (option.isDashMux) {
-    const labelTier =
-      option.titleLabel && /1080p\+/i.test(option.titleLabel)
-        ? option.titleLabel
-        : tierWithFps;
-    return labelTier && labelTier !== "画质未知"
-      ? `下载 ${labelTier} 无损合流 (${extUpper})`
-      : `下载无损合流 (${extUpper})`;
-  }
+  const qualityTag =
+    option.isDashMux && option.titleLabel && /1080p\+/i.test(option.titleLabel)
+      ? option.titleLabel
+      : tierWithFps;
 
-  if (option.muxPair || option.effectiveHasAudio) {
-    return tierWithFps && tierWithFps !== "画质未知"
-      ? `下载 ${tierWithFps} 有声视频 (${extUpper})`
-      : `下载有声视频 (${extUpper})`;
-  }
-  return tierWithFps && tierWithFps !== "画质未知"
-    ? `下载 ${tierWithFps} 视频 (${extUpper})`
+  return qualityTag && qualityTag !== "画质未知"
+    ? `下载视频 (${qualityTag})`
     : `下载视频 (${extUpper})`;
+}
+
+export function buildBatchPrimaryCtaLabel(params: {
+  checkedCount: number;
+  checkableTotalCount: number;
+  preparing?: { current: number; total: number } | null;
+}): string {
+  if (params.preparing) {
+    return `正在解析分P (${params.preparing.current}/${params.preparing.total})...`;
+  }
+  const selected = Math.max(0, Math.floor(params.checkedCount));
+  const total = Math.max(0, Math.floor(params.checkableTotalCount));
+  if (total > 0 && selected >= total) {
+    return `下载全部 (${total})`;
+  }
+  return `下载已选 (${selected}/${total})`;
 }
 
 // ============================================================================
@@ -2072,7 +2078,12 @@ export function classifyMediaLayout(media: UnifiedMedia | null): MediaLayoutKind
     return "album";
   }
   const nonAlbumGroups = (media.groups ?? []).filter((g) => g.kind !== "album");
-  if (videoOrAudioItems.length > 1 || nonAlbumGroups.length > 0) {
+  const hasMultiNonAlbumGroups =
+    nonAlbumGroups.length > 1 ||
+    nonAlbumGroups.some(
+      (g) => (g.total_count ?? 0) > 1 || (g.item_ids?.length ?? 0) > 1,
+    );
+  if (videoOrAudioItems.length > 1 || hasMultiNonAlbumGroups) {
     return "multi_video";
   }
   return "single";
@@ -2084,6 +2095,30 @@ function resolveWorkBaseTitle(media: UnifiedMedia): string {
     media.author?.name?.trim() ||
     `${media.platform}_${media.content_id || "media"}`
   );
+}
+
+/**
+ * Resolves the clean base filename stem for a media item:
+ * - Single-video/single-item layout (`classifyMediaLayout(media) === "single"`):
+ *   ALWAYS prioritizes `media.title` over single-P `item.title` (preventing raw
+ *   upload filenames like `mmexport1794208831102.mp4`), falling back to
+ *   `item.title` -> `author.name` -> `platform_contentId`.
+ * - Multi-P / multi-item layout: prioritizes distinct `item.title` -> `media.title`
+ *   -> `author.name` -> `platform_contentId`.
+ */
+export function resolveItemBaseName(
+  media: UnifiedMedia,
+  item?: MediaItem | null,
+): string {
+  const workTitle = media.title?.trim() || "";
+  const itemTitle = item?.title?.trim() || "";
+  const authorName = media.author?.name?.trim() || "";
+  const platformFallback = `${media.platform}_${media.content_id?.trim() || "media"}`;
+
+  if (classifyMediaLayout(media) === "single") {
+    return workTitle || itemTitle || authorName || platformFallback;
+  }
+  return itemTitle || workTitle || authorName || platformFallback;
 }
 
 function buildSegmentsSpecFromDelivery(
@@ -2322,11 +2357,11 @@ export function buildSingleDownloadEnqueueItem(params: {
 }): EnqueueDownloadItem {
   const { media, item, option, settings, workFingerprint } = params;
   const apiOrigin = resolveSafeApiOrigin(settings.apiBaseUrl);
-  const workTitle = resolveWorkBaseTitle(media);
+  const baseName = resolveItemBaseName(media, item);
   const stem =
     option.kind === "attachment" && option.attachment?.title?.trim()
-      ? `${workTitle}_${option.attachment.title.trim()}`
-      : item.title?.trim() || workTitle;
+      ? `${baseName}_${option.attachment.title.trim()}`
+      : baseName;
 
   const filename = buildSafeDownloadPath({
     prefix: settings.subfolderPrefix,
@@ -2645,7 +2680,7 @@ export function buildChecklistZipEnqueueItem(params: {
   ) {
     return {
       ok: false,
-      reason: "该平台视频不支持内存打包 ZIP，请使用「按标题存子文件夹」直接落盘",
+      reason: "该平台视频不支持内存打包 ZIP，请使用「存子文件夹」直接落盘",
     };
   }
 
@@ -2673,27 +2708,27 @@ export function buildChecklistZipEnqueueItem(params: {
       return {
         ok: false,
         reason:
-          "YouTube 4K/高画质分离流需使用「按标题存子文件夹」逐集无损合流（零内存上限）",
+          "YouTube 4K/高画质分离流需使用「存子文件夹」逐集无损合流（零内存上限）",
       };
     }
     if (sub.spec.kind === "dash_mux") {
       return {
         ok: false,
         reason:
-          "DASH 音视频分离流需使用「按标题存子文件夹」逐集无损合流（零内存上限）",
+          "DASH 音视频分离流需使用「存子文件夹」逐集无损合流（零内存上限）",
       };
     }
     if (sub.spec.kind === "hls") {
       return {
         ok: false,
-        reason: "HLS 流媒体分片条目请使用「按标题存子文件夹」流式落盘",
+        reason: "HLS 流媒体分片条目请使用「存子文件夹」流式落盘",
       };
     }
     if (!hasWhitelistedRoute(sub.spec.routes, extraAllowedOrigins)) {
       return {
         ok: false,
         reason:
-          "该长尾站点媒体域名不在扩展打包白名单内，请使用「按标题存子文件夹」直接通过浏览器原生保存",
+          "该长尾站点媒体域名不在扩展打包白名单内，请使用「存子文件夹」直接通过浏览器原生保存",
       };
     }
     if (
@@ -2709,7 +2744,7 @@ export function buildChecklistZipEnqueueItem(params: {
       return {
         ok: false,
         reason:
-          "该长尾站点媒体域名不在扩展打包白名单内，请使用「按标题存子文件夹」直接通过浏览器原生保存",
+          "该长尾站点媒体域名不在扩展打包白名单内，请使用「存子文件夹」直接通过浏览器原生保存",
       };
     }
     const size = parsePositiveSafeBytes(sub.spec.sizeBytes);
@@ -2717,7 +2752,7 @@ export function buildChecklistZipEnqueueItem(params: {
     if (knownBytes > MAX_EXTENSION_ZIP_BYTES) {
       return {
         ok: false,
-        reason: "已选文件体积超过 500 MB 打包上限，请使用「按标题存子文件夹」（无体积限制）",
+        reason: "已选文件体积超过 500 MB 打包上限，请使用「存子文件夹」（无体积限制）",
       };
     }
 

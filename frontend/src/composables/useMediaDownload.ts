@@ -1,6 +1,16 @@
 import type { DownloadSnapshot, SourceProbe } from "../downloads/types";
 import type { DownloadTask, YouTubeHelperState } from "../types/media";
-import { sourceUrl } from "../utils/mediaContract";
+import {
+  deliveryRoutes,
+  readyItem,
+  readyVariant,
+  sourceUrl,
+} from "../utils/mediaContract";
+import { extractDashMuxSpec } from "../extension/dashMuxSpec";
+import type {
+  WebExtEnqueuePayload,
+  WebExtTaskPhase,
+} from "../extension/protocol";
 import { reportTbvideo } from "../../public/downloads/tbvideo.js";
 import { apiConfig } from "../services/apiConfig";
 import {
@@ -32,6 +42,57 @@ export { MAX_ARCHIVE_BYTES };
 
 const loadStreaming = () => import("../downloads/streaming");
 const loadDownloadManager = () => import("../downloads/manager");
+const loadExtensionBridge = () => import("../services/extensionBridge");
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("Aborted", "AbortError"));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    (timer as { unref?: () => void })?.unref?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function extensionPhaseStatusText(phase: WebExtTaskPhase): string {
+  switch (phase) {
+    case "queued":
+      return "扩展排队中...";
+    case "downloading":
+      return "扩展下载中...";
+    case "muxing":
+      return "扩展无损合流中...";
+    case "saving":
+      return "扩展写盘保存中...";
+    case "completed":
+      return "已通过扩展保存";
+    case "cancelled":
+      return "已取消";
+    default:
+      return "扩展下载失败";
+  }
+}
+
+function isBilibiliProtectedAudioUrl(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return (
+      host.endsWith(".bilivideo.com") ||
+      host.endsWith(".bilivideo.cn") ||
+      host.endsWith(".akamaized.net")
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function useMediaDownload({
   videoStore,
@@ -541,6 +602,298 @@ export function useMediaDownload({
     }
   }
 
+  function runExtensionBridgeDownload(params: {
+    snapshot: ItemSnapshot;
+    retryId?: number;
+    filename: string;
+    payload: WebExtEnqueuePayload;
+    savePathLabel: string;
+    startStatusText: string;
+    selectionKey: string;
+  }): Promise<boolean> {
+    const {
+      snapshot,
+      retryId,
+      filename,
+      payload,
+      savePathLabel,
+      startStatusText,
+      selectionKey,
+    } = params;
+
+    if (selectionInFlight(selectionKey, retryId)) {
+      selectionBusyNotice();
+      return Promise.resolve(false);
+    }
+
+    const id =
+      retryId ??
+      videoStore.addDownload({
+        filename,
+        statusText: "正在连接 Chrome 扩展...",
+      });
+    fileTaskSelections.set(id, selectionKey);
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    videoStore.updateDownload(id, {
+      filename,
+      abortController: controller,
+      status: "preparing",
+      statusText: "正在连接 Chrome 扩展...",
+      savePath: "extension",
+      savePathLabel,
+      error: null,
+      nativeAvailable: false,
+      refreshAvailable: false,
+      loaded: 0,
+      total: payload.sizeBytes ?? 0,
+      transferred: 0,
+      progressKind: "bytes",
+      elapsed: 0,
+      speed: 0,
+      averageSpeed: 0,
+      percent: 0,
+      observation: undefined,
+      deliveryId: undefined,
+      transport: undefined,
+    });
+    videoRetries.set(id, () => enqueueItem(snapshot, id, false));
+
+    return (async () => {
+      try {
+        const bridge = await loadExtensionBridge();
+        checkAbort(controller.signal);
+        if (!ownsTask(id, controller)) return false;
+
+        const enq = await bridge.enqueueMediaViaExtension(payload);
+        checkAbort(controller.signal);
+        if (!ownsTask(id, controller)) return false;
+
+        if (!enq.ok) {
+          const errMsg = enq.error || "连接 Chrome 扩展失败，请确认扩展已启用";
+          videoStore.updateDownload(id, {
+            status: "failed",
+            statusText: "扩展下载失败",
+            error: errMsg,
+            speed: 0,
+            abortController: null,
+          });
+          showToast(errMsg, "error", 5000);
+          return false;
+        }
+
+        const extTaskId = enq.data.taskId;
+        videoStore.updateDownload(id, {
+          status: "downloading",
+          statusText: startStatusText,
+          percent: 0,
+        });
+
+        let consecutiveErrors = 0;
+        let pollAttempt = 0;
+        while (!controller.signal.aborted && ownsTask(id, controller)) {
+          await abortableDelay(pollAttempt === 0 ? 40 : 300, controller.signal);
+          pollAttempt++;
+          if (!ownsTask(id, controller)) return false;
+
+          const statusResp = await bridge.getExtensionTaskStatus(extTaskId);
+          if (!ownsTask(id, controller)) return false;
+
+          if (!statusResp.ok) {
+            consecutiveErrors++;
+            if (consecutiveErrors >= 5) {
+              const errMsg =
+                statusResp.error || "与 Chrome 扩展通信中断，请检查扩展下载队列";
+              videoStore.updateDownload(id, {
+                status: "failed",
+                statusText: "扩展下载失败",
+                error: errMsg,
+                speed: 0,
+                abortController: null,
+              });
+              showToast(errMsg, "error", 5000);
+              return false;
+            }
+            continue;
+          }
+
+          consecutiveErrors = 0;
+          const st = statusResp.data;
+          const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+          const displayName = st.filename || filename;
+
+          if (st.status === "completed") {
+            videoStore.updateDownload(id, {
+              filename: displayName,
+              status: "completed",
+              statusText: "已通过扩展保存",
+              percent: 100,
+              loaded: st.loadedBytes || st.totalBytes,
+              total: st.totalBytes || st.loadedBytes,
+              transferred: st.loadedBytes || st.totalBytes,
+              speed: 0,
+              elapsed,
+              averageSpeed:
+                (st.loadedBytes || st.totalBytes) > 0
+                  ? (st.loadedBytes || st.totalBytes) / elapsed
+                  : 0,
+              abortController: null,
+            });
+            showToast(`已通过 Chrome 扩展保存：${displayName}`);
+            return true;
+          }
+
+          if (st.status === "failed") {
+            const errMsg = st.error || "Chrome 扩展下载失败";
+            videoStore.updateDownload(id, {
+              filename: displayName,
+              status: "failed",
+              statusText: "扩展下载失败",
+              error: errMsg,
+              speed: 0,
+              elapsed,
+              abortController: null,
+            });
+            showToast(errMsg, "error", 5000);
+            return false;
+          }
+
+          if (st.status === "cancelled") {
+            videoStore.updateDownload(id, {
+              filename: displayName,
+              status: "cancelled",
+              statusText: "已取消",
+              error: null,
+              speed: 0,
+              elapsed,
+              abortController: null,
+            });
+            return false;
+          }
+
+          videoStore.updateDownload(id, {
+            filename: displayName,
+            status: st.phase === "queued" ? "queued" : "downloading",
+            statusText: extensionPhaseStatusText(st.phase),
+            percent: Math.max(0, Math.min(99, Math.round(st.progress || 0))),
+            loaded: st.loadedBytes || 0,
+            total: st.totalBytes || payload.sizeBytes || 0,
+            transferred: st.loadedBytes || 0,
+            speed: st.speedBytesPerSec || 0,
+            elapsed,
+            averageSpeed:
+              st.loadedBytes > 0 ? st.loadedBytes / elapsed : 0,
+          });
+        }
+        return false;
+      } catch (error) {
+        if (!ownsTask(id, controller)) return false;
+        const cancelled =
+          controller.signal.aborted ||
+          (error instanceof Error && error.name === "AbortError");
+        videoStore.updateDownload(id, {
+          status: cancelled ? "cancelled" : "failed",
+          statusText: cancelled ? "已取消" : "扩展下载失败",
+          error: cancelled
+            ? null
+            : error instanceof Error
+              ? error.message
+              : "扩展下载失败",
+          speed: 0,
+          abortController: null,
+        });
+        if (!cancelled && error instanceof Error && error.message) {
+          showToast(error.message, "error", 5000);
+        }
+        return false;
+      }
+    })();
+  }
+
+  function tryHandleExtensionBridgeEnqueue(
+    snapshot: ItemSnapshot,
+    retryId?: number,
+  ): Promise<boolean> | null {
+    if (!readyItem(snapshot.item)) return null;
+    const variantId =
+      snapshot.choice?.variant_id || snapshot.item.default?.variant_id;
+    const variant = variantId
+      ? snapshot.item.variants.find((candidate) => candidate.id === variantId)
+      : undefined;
+    if (!readyVariant(variant)) return null;
+
+    if (variant.delivery.kind === "mux") {
+      const dashMux = extractDashMuxSpec(variant, apiContext);
+      if (!dashMux) return null;
+      const filename = filenameFor(snapshot, dashMux.outputContainer, variant);
+      const exactTotal =
+        (dashMux.videoSize || 0) + (dashMux.audioSize || 0);
+      return runExtensionBridgeDownload({
+        snapshot,
+        retryId,
+        filename,
+        payload: {
+          kind: "dash_mux",
+          platform: snapshot.platform || "bilibili",
+          title: snapshot.title || snapshot.item.title || filename,
+          filename,
+          dashMux,
+          ...(exactTotal > 0 ? { sizeBytes: exactTotal } : {}),
+          mimeType: "video/mp4",
+        },
+        savePathLabel: "保存路径：Chrome 扩展后台无损合流",
+        startStatusText: "扩展已接管，正在无损合流...",
+        selectionKey: JSON.stringify([
+          snapshot.version,
+          snapshot.item.id,
+          variant.id,
+          "ext-dash-mux",
+        ]),
+      });
+    }
+
+    if (
+      snapshot.isAttachment &&
+      snapshot.platform === "bilibili" &&
+      snapshot.item.type === "audio" &&
+      variant.delivery.kind === "file"
+    ) {
+      const routes = deliveryRoutes(variant.delivery.sources, apiContext);
+      if (routes.length > 0 && routes.some(isBilibiliProtectedAudioUrl)) {
+        const audioBaseSnapshot: ItemSnapshot = {
+          ...snapshot,
+          isAttachment: false,
+        };
+        const filename = filenameFor(audioBaseSnapshot, "m4a", variant);
+        const sizeBytes = variant.delivery.sources[0]?.size_bytes;
+        return runExtensionBridgeDownload({
+          snapshot,
+          retryId,
+          filename,
+          payload: {
+            kind: "direct_download",
+            platform: "bilibili",
+            title: snapshot.title || snapshot.item.title || filename,
+            filename,
+            routes,
+            ...(sizeBytes ? { sizeBytes } : {}),
+            mimeType: "audio/mp4",
+          },
+          savePathLabel: "保存路径：Chrome 扩展后台下载",
+          startStatusText: "扩展后台保存原声中...",
+          selectionKey: JSON.stringify([
+            snapshot.version,
+            snapshot.item.id,
+            variant.id,
+            "ext-direct-audio",
+          ]),
+        });
+      }
+    }
+
+    return null;
+  }
+
   function enqueueItem(
     snapshot: ItemSnapshot,
     retryId?: number,
@@ -555,6 +908,9 @@ export function useMediaDownload({
       enqueueItem,
     });
     if (ytSplitTask !== null) return ytSplitTask;
+
+    const extBridgeTask = tryHandleExtensionBridgeEnqueue(snapshot, retryId);
+    if (extBridgeTask !== null) return extBridgeTask;
 
     const selected = fileSelectionKey(snapshot);
     if (selectionInFlight(selected, retryId)) {

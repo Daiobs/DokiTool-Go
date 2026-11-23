@@ -1020,15 +1020,21 @@ export function buildEnqueueItemsForMedia(
     media.title?.trim() ||
     candidateItems.find((i) => i.title?.trim())?.title?.trim() ||
     media.author?.name?.trim() ||
-    media.content_id?.trim() ||
-    media.platform ||
-    "download";
+    (media.content_id?.trim()
+      ? `${media.platform}_${media.content_id.trim()}`
+      : media.platform || "download");
 
   const workFingerprint = buildWorkFingerprint(media) || undefined;
+  const allGroups = media.groups ?? [];
+  const hasMultiGroups =
+    allGroups.length > 1 ||
+    allGroups.some(
+      (g) => (g.total_count ?? 0) > 1 || (g.item_ids?.length ?? 0) > 1,
+    );
   const isMultiItemCollection =
     media.items.length > 1 ||
     candidateItems.length > 1 ||
-    Boolean(media.groups && media.groups.length > 0);
+    hasMultiGroups;
 
   const leaves: PreparedLeafItem[] = [];
   const totalCount = Math.max(media.items.length, candidateItems.length);
@@ -1133,7 +1139,16 @@ export function buildEnqueueItemsForMedia(
       item.title?.trim() && item.title.trim() !== media.title?.trim()
         ? item.title.trim()
         : undefined;
-    const itemDisplayTitle = item.title?.trim() || rawWorkTitle;
+    const singleItemStem =
+      media.title?.trim() ||
+      item.title?.trim() ||
+      media.author?.name?.trim() ||
+      (media.content_id?.trim()
+        ? `${media.platform}_${media.content_id.trim()}`
+        : media.platform || "download");
+    const itemDisplayTitle = isMultiItemCollection
+      ? item.title?.trim() || rawWorkTitle
+      : singleItemStem;
     const fallbackUrl = item.source_url || media.source_url;
     const parseUrlForItem =
       item.source_url?.trim() ||
@@ -1212,7 +1227,7 @@ export function buildEnqueueItemsForMedia(
             resource: motionRes,
             context,
             title: itemDisplayTitle,
-            entryStem: distinctEpisodeTitle,
+            entryStem: isMultiItemCollection ? distinctEpisodeTitle : singleItemStem,
             index: isMultiItemCollection ? itemNumber : undefined,
             totalCount,
             fallbackUrl,
@@ -1225,7 +1240,7 @@ export function buildEnqueueItemsForMedia(
             resource: imageRes,
             context,
             title: itemDisplayTitle,
-            entryStem: distinctEpisodeTitle,
+            entryStem: isMultiItemCollection ? distinctEpisodeTitle : singleItemStem,
             index: isMultiItemCollection ? itemNumber : undefined,
             totalCount,
             fallbackUrl,

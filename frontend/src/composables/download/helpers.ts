@@ -52,10 +52,13 @@ export interface ItemSnapshot {
   choice: MediaSelection | null;
   pinned?: boolean;
   title?: string;
+  author?: string;
+  contentId?: string;
   total: number;
   version: number;
   selectionKey: string;
   platform?: string;
+  isAttachment?: boolean;
   resource?: {
     id: string;
     role: Resource["role"];
@@ -443,17 +446,41 @@ export const filenameFor = (
     };
   },
 ): string => {
-  const rawTitle =
-    snapshot.platform === "youtube" && snapshot.item.type === "audio"
-      ? snapshot.title ||
-        (snapshot.item.title || "").replace(/\s*\((?:M4A|WEBM)[^)]*\)$/i, "")
-      : snapshot.item.title || snapshot.title;
+  const workTitle = (snapshot.title ?? "").trim();
+  const itemTitle = (snapshot.item.title ?? "").trim();
+  const authorName = (snapshot.author ?? "").trim();
+  const platformFallback =
+    snapshot.platform && snapshot.contentId
+      ? `${snapshot.platform}_${snapshot.contentId}`
+      : "";
+  const isSingleItem = snapshot.total <= 1;
+
+  let rawTitle: string;
+  if (snapshot.platform === "youtube" && snapshot.item.type === "audio") {
+    rawTitle =
+      workTitle ||
+      itemTitle.replace(/\s*\((?:M4A|WEBM)[^)]*\)$/i, "") ||
+      authorName ||
+      platformFallback;
+  } else if (isSingleItem) {
+    // Single-item works (e.g. Bilibili single-P): prioritize main work title `media.title`
+    // over single-P `item.title` (preventing raw `mmexport*.mp4` filename pollution).
+    rawTitle =
+      (snapshot.isAttachment && itemTitle ? itemTitle : "") ||
+      workTitle ||
+      itemTitle ||
+      authorName ||
+      platformFallback;
+  } else {
+    rawTitle = itemTitle || workTitle || authorName || platformFallback;
+  }
+
   return buildMediaFilename({
     title: rawTitle,
-    index: snapshot.item.index,
+    index: isSingleItem ? undefined : snapshot.item.index,
     total: snapshot.total,
     suffix: resolveYouTubeTrackSuffix(snapshot, variant, extension),
-    fallback: snapshot.item.id,
+    fallback: platformFallback || snapshot.item.id,
     extension,
   });
 };
@@ -527,6 +554,8 @@ export function createSnapshotHelpers(deps: {
       pinned: Boolean(choice?.source_id),
       selectionKey: JSON.stringify(choice),
       title: videoStore.resultData?.title,
+      author: videoStore.resultData?.author?.name,
+      contentId: videoStore.resultData?.content_id,
       total: videoStore.resultData?.items?.length ?? 1,
       platform: videoStore.resultData?.platform,
       version: videoStore.resultVersion,

@@ -5,6 +5,7 @@ import {
   requiredCapabilities,
   sourceAvailable,
 } from "../../utils/mediaContract";
+import { extractDashMuxSpec } from "../../extension/dashMuxSpec";
 import { formatCodecLabel, formatMediaSize } from "../../utils/mediaSources";
 import type { ReadyVariant } from "../../types/media";
 import {
@@ -20,8 +21,10 @@ export function buildAllQualityOptions(
   currentSelection: any,
   currentTarget: any,
   context: { apiOrigin: string },
+  options?: { allowExtensionDashMux?: boolean },
 ) {
   if (!readyItem(currentItem)) return [];
+  const allowExtensionDashMux = Boolean(options?.allowExtensionDashMux);
   return currentItem.variants.map((variant: any) => {
     const active =
       (currentSelection?.variant_id || currentItem.default?.variant_id) ===
@@ -48,18 +51,26 @@ export function buildAllQualityOptions(
       },
       context,
     );
+    const dashMux = readyVariant(variant)
+      ? extractDashMuxSpec(variant, context)
+      : null;
+    const extensionMux = Boolean(allowExtensionDashMux && dashMux);
+    const isActive = extensionMux
+      ? active
+      : active &&
+        currentTarget?.kind === downloadTarget.kind &&
+        (downloadTarget.kind !== "file" ||
+          currentTarget.url === downloadTarget.url);
     return {
       variant,
       source: downloadTarget.kind === "file" ? downloadTarget.source : source,
-      active:
-        active &&
-        currentTarget?.kind === downloadTarget.kind &&
-        (downloadTarget.kind !== "file" ||
-          currentTarget.url === downloadTarget.url),
+      active: isActive,
       downloadTarget,
-      downloadable: ["file", "hls", "segments", "pair"].includes(
-        downloadTarget.kind,
-      ),
+      dashMux,
+      extensionMux,
+      downloadable:
+        ["file", "hls", "segments", "pair"].includes(downloadTarget.kind) ||
+        extensionMux,
       capabilities: readyVariant(variant)
         ? requiredCapabilities(variant.delivery)
         : [],
@@ -67,11 +78,75 @@ export function buildAllQualityOptions(
   });
 }
 
+function estimateDashOptionSizeLabel(
+  option: any,
+  locale?: string,
+  itemDurationMs?: number,
+): string {
+  const dashMux = option?.dashMux;
+  if (!dashMux) return formatMediaSize(undefined, locale);
+  const vExact = parsePositiveSafeBytes(dashMux.videoSize);
+  const aExact = parsePositiveSafeBytes(dashMux.audioSize);
+  if (vExact > 0 && aExact > 0 && Number.isSafeInteger(vExact + aExact)) {
+    return formatMediaSize(vExact + aExact, locale);
+  }
+  const variant = option.variant;
+  const resources =
+    variant?.state !== "deferred" && variant?.delivery?.kind === "mux"
+      ? variant.delivery.resources
+      : [];
+  const vMeta = resources.find((r: any) => r?.role === "video")?.metadata;
+  const aMeta = resources.find((r: any) => r?.role === "audio")?.metadata;
+  const durationMs =
+    Number(
+      variant?.metadata?.duration_ms ||
+        vMeta?.duration_ms ||
+        aMeta?.duration_ms ||
+        itemDurationMs ||
+        0,
+    ) || 0;
+  const videoBps =
+    Number(
+      variant?.metadata?.video_bitrate_bps ||
+        vMeta?.video_bitrate_bps ||
+        vMeta?.bitrate_bps ||
+        0,
+    ) || 0;
+  const audioBps =
+    Number(
+      variant?.metadata?.audio_bitrate_bps ||
+        aMeta?.audio_bitrate_bps ||
+        aMeta?.bitrate_bps ||
+        0,
+    ) || 0;
+  const combinedBps =
+    videoBps + audioBps || Number(variant?.metadata?.bitrate_bps || 0) || 0;
+  const estimatedBytes =
+    combinedBps > 0 && durationMs > 0
+      ? Math.round((combinedBps * durationMs) / 8000)
+      : 0;
+  if (estimatedBytes > 0) {
+    const base = formatMediaSize(estimatedBytes, locale);
+    if (locale === "en") {
+      return base.startsWith("<") ? base : `~${base}`;
+    }
+    return `约 ${base}`;
+  }
+  if (vExact + aExact > 0) {
+    return formatMediaSize(vExact + aExact, locale);
+  }
+  return formatMediaSize(undefined, locale);
+}
+
 export function formatYouTubeMuxOptionSize(
   option: any,
   muxPairsByVariantId: Map<string, any>,
   locale?: string,
+  itemDurationMs?: number,
 ): string {
+  if (option?.extensionMux && option?.dashMux) {
+    return estimateDashOptionSizeLabel(option, locale, itemDurationMs);
+  }
   const pair = option?.variant?.id
     ? muxPairsByVariantId.get(option.variant.id)
     : null;

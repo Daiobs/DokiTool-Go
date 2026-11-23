@@ -10,8 +10,13 @@ import { fileURLToPath } from "node:url";
 import { build, stop } from "esbuild";
 import JSZip from "jszip";
 import {
+  DOKITOOL_EXTENSION_ID,
+  DOKITOOL_EXTENSION_MANIFEST_KEY,
+  DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES,
+  PROD_EXTERNALLY_CONNECTABLE_MATCHES,
   buildExtension,
   createDeterministicZipBuffer,
+  deriveExtensionIdFromManifestKey,
   packageExtensionZip,
   verifyExtensionDist,
   verifyExtensionZip,
@@ -22,6 +27,8 @@ let dnrRules;
 let urlMatcher;
 let storage;
 let protocol;
+let backgroundMod;
+let extensionBridge;
 let youtubeHelperSource = "";
 
 async function bundleTsModule(relPath) {
@@ -40,18 +47,29 @@ async function bundleTsModule(relPath) {
 }
 
 before(async () => {
-  [hostWhitelist, dnrRules, urlMatcher, storage, protocol, youtubeHelperSource] =
-    await Promise.all([
-      bundleTsModule("../src/extension/hostWhitelist.ts"),
-      bundleTsModule("../src/extension/dnrRules.ts"),
-      bundleTsModule("../src/extension/urlMatcher.ts"),
-      bundleTsModule("../src/extension/storage.ts"),
-      bundleTsModule("../src/extension/protocol.ts"),
-      readFile(
-        new URL("../src/utils/youtubeHelperCore.js", import.meta.url),
-        "utf8",
-      ),
-    ]);
+  globalThis.__DOKITOOL_EXT_TEST__ = true;
+  [
+    hostWhitelist,
+    dnrRules,
+    urlMatcher,
+    storage,
+    protocol,
+    backgroundMod,
+    extensionBridge,
+    youtubeHelperSource,
+  ] = await Promise.all([
+    bundleTsModule("../src/extension/hostWhitelist.ts"),
+    bundleTsModule("../src/extension/dnrRules.ts"),
+    bundleTsModule("../src/extension/urlMatcher.ts"),
+    bundleTsModule("../src/extension/storage.ts"),
+    bundleTsModule("../src/extension/protocol.ts"),
+    bundleTsModule("../src/extension/background.ts"),
+    bundleTsModule("../src/services/extensionBridge.ts"),
+    readFile(
+      new URL("../src/utils/youtubeHelperCore.js", import.meta.url),
+      "utf8",
+    ),
+  ]);
 });
 
 beforeEach(() => {
@@ -803,6 +821,14 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
     const prodManifest = prodBuilt.manifest;
 
     assert.equal(prodManifest.manifest_version, 3);
+    assert.equal(prodManifest.key, DOKITOOL_EXTENSION_MANIFEST_KEY);
+    assert.equal(
+      deriveExtensionIdFromManifestKey(prodManifest.key),
+      DOKITOOL_EXTENSION_ID,
+    );
+    assert.deepEqual(prodManifest.externally_connectable, {
+      matches: PROD_EXTERNALLY_CONNECTABLE_MATCHES,
+    });
     assert.deepEqual(prodManifest.permissions, [
       "sidePanel",
       "offscreen",
@@ -923,16 +949,82 @@ test("build-extension.mjs: builds valid MV3 dist, isolates loopback to optional_
       true,
     );
     assert.deepEqual(devBuilt.manifest.optional_host_permissions, []);
+    assert.equal(devBuilt.manifest.key, DOKITOOL_EXTENSION_MANIFEST_KEY);
+    assert.deepEqual(devBuilt.manifest.externally_connectable, {
+      matches: DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES,
+    });
 
     // A --dev-loopback build MUST be rejected by the production security gate!
     await assert.rejects(
       () => verifyExtensionDist(devOut, { devLoopback: false }),
-      /127\.0\.0\.1|localhost/,
+      /127\.0\.0\.1|localhost|externally_connectable/,
     );
 
-    // Tampering with permissions, <all_urls>, content_scripts, or external scripts MUST fail verifyExtensionDist!
+    // Tampering with key, externally_connectable, permissions, <all_urls>, content_scripts, or external scripts MUST fail verifyExtensionDist!
     const manifestPath = join(prodOut, "manifest.json");
     const origManifestText = await readFile(manifestPath, "utf8");
+
+    await writeFile(
+      manifestPath,
+      JSON.stringify({ ...prodManifest, key: undefined }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /key/,
+    );
+
+    await writeFile(
+      manifestPath,
+      JSON.stringify({ ...prodManifest, key: "AAAA" }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /key|extension ID/,
+    );
+
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...prodManifest,
+        externally_connectable: { matches: ["https://snap.dokitool.com/*", "http://127.0.0.1/*"] },
+      }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /externally_connectable/,
+    );
+
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...prodManifest,
+        externally_connectable: { matches: ["https://*.dokitool.com/*"] },
+      }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /externally_connectable/,
+    );
+
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...prodManifest,
+        externally_connectable: {
+          matches: ["https://snap.dokitool.com/*"],
+          ids: ["*"],
+        },
+      }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => verifyExtensionDist(prodOut, { devLoopback: false }),
+      /externally_connectable\.ids/,
+    );
 
     await writeFile(
       manifestPath,
@@ -1810,5 +1902,432 @@ test("PR-C Round 2 (Task 4.4 #3): reserved TLD suffixes (.invalid/.lan/.corp/.in
       `matchActiveParseUrl must keep ${allowedHost} allowed`,
     );
     assert.equal(matched.platform, "generic");
+  }
+});
+
+test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero secret leakage, URL whitelist, filename sanitization, task-ownership isolation, and extensionBridge client", async () => {
+  assert.equal(protocol.DOKITOOL_EXTENSION_ID, DOKITOOL_EXTENSION_ID);
+  assert.equal(extensionBridge.DOKITOOL_EXTENSION_ID, DOKITOOL_EXTENSION_ID);
+  assert.equal(
+    deriveExtensionIdFromManifestKey(DOKITOOL_EXTENSION_MANIFEST_KEY),
+    "ihamkldlkdibleacagiejklpfofapkpo",
+  );
+
+  // 1) validateExternalWebSender: prod manifest allows ONLY https://snap.dokitool.com
+  const prodManifest = {
+    version: "1.2.3",
+    externally_connectable: { matches: PROD_EXTERNALLY_CONNECTABLE_MATCHES },
+  };
+  const devManifest = {
+    version: "1.2.3",
+    externally_connectable: { matches: DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES },
+  };
+
+  assert.deepEqual(
+    backgroundMod.validateExternalWebSender(
+      { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+      prodManifest,
+    ),
+    { allowed: true, origin: "https://snap.dokitool.com", isLoopback: false },
+  );
+
+  for (const badSender of [
+    null,
+    {},
+    { origin: "http://snap.dokitool.com", url: "http://snap.dokitool.com/" },
+    { origin: "https://evil.snap.dokitool.com", url: "https://evil.snap.dokitool.com/" },
+    { origin: "https://snap.dokitool.com.evil.test", url: "https://snap.dokitool.com.evil.test/" },
+    { origin: "http://127.0.0.1:5173", url: "http://127.0.0.1:5173/" },
+    { origin: "http://localhost:5173", url: "http://localhost:5173/" },
+    { origin: "https://snap.dokitool.com", url: "https://evil.example.com/" },
+    { id: "otherextensionid1234567890abcdef", origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+  ]) {
+    const check = backgroundMod.validateExternalWebSender(badSender, prodManifest);
+    assert.equal(
+      check.allowed,
+      false,
+      `prod validateExternalWebSender must reject ${JSON.stringify(badSender)}`,
+    );
+  }
+
+  // Dev loopback manifest allows http://127.0.0.1:* and http://localhost:* while still rejecting evil/LAN/HTTPS-loopback
+  assert.deepEqual(
+    backgroundMod.validateExternalWebSender(
+      { origin: "http://127.0.0.1:5173", url: "http://127.0.0.1:5173/result" },
+      devManifest,
+    ),
+    { allowed: true, origin: "http://127.0.0.1:5173", isLoopback: true },
+  );
+  assert.deepEqual(
+    backgroundMod.validateExternalWebSender(
+      { origin: "http://localhost:3000", url: "http://localhost:3000/" },
+      devManifest,
+    ),
+    { allowed: true, origin: "http://localhost:3000", isLoopback: true },
+  );
+  for (const badDevSender of [
+    { origin: "https://127.0.0.1:5173", url: "https://127.0.0.1:5173/" },
+    { origin: "http://192.168.1.10:5173", url: "http://192.168.1.10:5173/" },
+    { origin: "https://evil.example.com", url: "https://evil.example.com/" },
+  ]) {
+    assert.equal(
+      backgroundMod.validateExternalWebSender(badDevSender, devManifest).allowed,
+      false,
+      `dev validateExternalWebSender must reject ${JSON.stringify(badDevSender)}`,
+    );
+  }
+
+  // 2) Full BackgroundController onMessageExternal RPC security verification
+  const localArea = storage.createMemoryStorageArea();
+  const sessionArea = storage.createMemoryStorageArea();
+  const extStore = storage.createExtensionStorage({
+    local: localArea,
+    session: sessionArea,
+  });
+  await extStore.updateSettings({
+    bearerToken: "doki_top_secret_token_never_leak",
+    apiBaseUrl: "https://snap.dokitool.com",
+    subfolderPrefix: "DokiClips",
+  });
+
+  const externalListeners = [];
+  const offscreenMessages = [];
+  const dispatchedDownloads = [];
+  const mockChrome = {
+    runtime: {
+      id: DOKITOOL_EXTENSION_ID,
+      getManifest: () => prodManifest,
+      getURL: (p) => `chrome-extension://${DOKITOOL_EXTENSION_ID}/${p}`,
+      onMessage: { addListener() {}, removeListener() {} },
+      onMessageExternal: {
+        addListener(fn) { externalListeners.push(fn); },
+        removeListener(fn) {
+          const i = externalListeners.indexOf(fn);
+          if (i >= 0) externalListeners.splice(i, 1);
+        },
+      },
+      onConnect: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onStartup: { addListener() {} },
+      sendMessage: async (msg) => {
+        offscreenMessages.push(msg);
+        if (msg?.type === "OFFSCREEN_PING") return { ok: true };
+        return { ok: true };
+      },
+      getContexts: async () => [{ contextType: "OFFSCREEN_DOCUMENT" }],
+    },
+    declarativeNetRequest: {
+      getDynamicRules: async () => [],
+      updateDynamicRules: async () => {},
+    },
+    downloads: {
+      download: async (opts) => {
+        dispatchedDownloads.push(opts);
+        return dispatchedDownloads.length;
+      },
+      onChanged: { addListener() {}, removeListener() {} },
+    },
+    offscreen: {
+      createDocument: async () => {},
+      closeDocument: async () => {},
+    },
+    tabs: {
+      onActivated: { addListener() {} },
+      onUpdated: { addListener() {} },
+      onRemoved: { addListener() {} },
+    },
+    action: {
+      setBadgeText: async () => {},
+      setBadgeBackgroundColor: async () => {},
+    },
+  };
+
+  const bg = backgroundMod.createBackgroundController({
+    chrome: mockChrome,
+    storage: extStore,
+  });
+
+  const sendExternal = (msg, sender = { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" }) =>
+    new Promise((resolveResp) => {
+      assert.equal(externalListeners.length, 1, "background must register chrome.runtime.onMessageExternal");
+      externalListeners[0](msg, sender, (resp) => resolveResp(resp));
+    });
+
+  try {
+    // Unauthorized sender rejected with FORBIDDEN_ORIGIN
+    const evilPing = await sendExternal(
+      { type: "WEB_EXT_PING" },
+      { origin: "https://evil.example.com", url: "https://evil.example.com/" },
+    );
+    assert.equal(evilPing.ok, false);
+    assert.equal(evilPing.code, "FORBIDDEN_ORIGIN");
+
+    // Unsupported/internal actions rejected with UNSUPPORTED_ACTION
+    for (const forbiddenMsg of [
+      { type: "GET_INITIAL_STATE" },
+      { type: "SAVE_SETTINGS", patch: { bearerToken: "hijack" } },
+      { type: "FETCH_OWNER_STATS" },
+    ]) {
+      const resp = await sendExternal(forbiddenMsg);
+      assert.equal(resp.ok, false);
+      assert.equal(resp.code, "UNSUPPORTED_ACTION");
+      assert.equal(
+        JSON.stringify(resp).includes("doki_top_secret_token_never_leak"),
+        false,
+      );
+    }
+
+    // WEB_EXT_PING returns strictly scoped version/extensionId/capabilities & zero secrets
+    const pingResp = await sendExternal({ type: "WEB_EXT_PING" });
+    assert.deepEqual(pingResp, {
+      ok: true,
+      data: {
+        version: "1.2.3",
+        extensionId: DOKITOOL_EXTENSION_ID,
+        capabilities: ["dash_mux", "direct_download"],
+      },
+    });
+    assert.equal(
+      JSON.stringify(pingResp).includes("doki_top_secret_token_never_leak"),
+      false,
+    );
+
+    // WEB_EXT_ENQUEUE_MEDIA rejects unwhitelisted/PCDN URLs
+    const badDashResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "dash_mux",
+        platform: "bilibili",
+        title: "PCDN Attack",
+        filename: "attack.mp4",
+        dashMux: {
+          videoRoutes: ["https://w9e959o.edge.mountaintoys.cn/v1/stream.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/audio.m4s"],
+          outputContainer: "mp4",
+        },
+      },
+    });
+    assert.equal(badDashResp.ok, false);
+    assert.equal(badDashResp.code, "UNWHITELISTED_CDN");
+
+    const badDirectResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "direct_download",
+        platform: "bilibili",
+        title: "Evil Host",
+        filename: "evil.m4a",
+        routes: ["https://evil.example.com/secret.m4a"],
+      },
+    });
+    assert.equal(badDirectResp.ok, false);
+    assert.equal(badDirectResp.code, "UNWHITELISTED_CDN");
+
+    // WEB_EXT_ENQUEUE_MEDIA accepts whitelisted DASH mux and sanitizes traversal/reserved filename
+    const enqueueDashResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "dash_mux",
+        platform: "bilibili",
+        title: "B站单P 1080p 测试",
+        filename: "../../CON.mp4",
+        dashMux: {
+          videoRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/v-1080.m4s"],
+          audioRoutes: ["https://upos-sz-mirrorcos.bilivideo.com/a-30280.m4s"],
+          videoSize: 20_000_000,
+          audioSize: 3_000_000,
+          outputContainer: "mp4",
+        },
+      },
+    });
+    assert.equal(enqueueDashResp.ok, true);
+    assert.ok(enqueueDashResp.data.taskId);
+    const webDashTaskId = enqueueDashResp.data.taskId;
+
+    // WEB_EXT_GET_TASK_STATUS returns ONLY sanitized progress fields for web-bridge task
+    const dashStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: webDashTaskId,
+    });
+    assert.equal(dashStatus.ok, true);
+    assert.equal(dashStatus.data.taskId, webDashTaskId);
+    assert.ok(dashStatus.data.filename.endsWith(".mp4"), "dash_mux must enforce .mp4 extension");
+    assert.equal(dashStatus.data.filename.includes(".."), false, "must sanitize traversal");
+    assert.equal(dashStatus.data.filename, "DokiClips/_CON.mp4");
+
+    // Unknown/executable suffix (.exe) is never allowed as final output extension
+    const enqueueExeResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "direct_download",
+        platform: "bilibili",
+        title: "Exe Guard",
+        filename: "../../payload.exe",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/safe.mp4"],
+      },
+    });
+    assert.equal(enqueueExeResp.ok, true);
+    const exeStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: enqueueExeResp.data.taskId,
+    });
+    assert.equal(exeStatus.ok, true);
+    assert.equal(exeStatus.data.filename.endsWith(".exe"), false);
+    assert.equal(exeStatus.data.filename.endsWith(".mp4"), true);
+    assert.equal(exeStatus.data.filename.includes(".."), false);
+    assert.deepEqual(
+      Object.keys(dashStatus.data).sort(),
+      ["filename", "loadedBytes", "phase", "progress", "speedBytesPerSec", "status", "taskId", "totalBytes"],
+    );
+    assert.equal(
+      JSON.stringify(dashStatus).includes("doki_top_secret_token_never_leak"),
+      false,
+    );
+    assert.equal(
+      JSON.stringify(dashStatus).includes("bilivideo.com"),
+      false,
+      "status response must not echo raw CDN URLs",
+    );
+
+    // Direct download preserves .m4a extension
+    const enqueueAudioResp = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "direct_download",
+        platform: "bilibili",
+        title: "B站原声",
+        filename: "B站原声.m4a",
+        mimeType: "audio/mp4",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/audio-only.m4s"],
+      },
+    });
+    assert.equal(enqueueAudioResp.ok, true);
+    const audioStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: enqueueAudioResp.data.taskId,
+    });
+    assert.equal(audioStatus.ok, true);
+    assert.equal(audioStatus.data.filename, "DokiClips/B站原声.m4a");
+
+    // SidePanel-created taskId MUST NOT be queryable via WEB_EXT_GET_TASK_STATUS!
+    const internalResp = await new Promise((resolveInternal) => {
+      bg.handleRuntimeMessage(
+        {
+          type: "ENQUEUE_DOWNLOADS",
+          items: [
+            {
+              title: "Internal SidePanel Task",
+              platform: "bilibili",
+              spec: {
+                kind: "direct_file",
+                apiOrigin: "https://snap.dokitool.com",
+                routes: ["https://upos-sz-mirrorcos.bilivideo.com/internal.mp4"],
+                filename: "internal.mp4",
+              },
+            },
+          ],
+        },
+        { id: DOKITOOL_EXTENSION_ID },
+        (r) => resolveInternal(r),
+      );
+    });
+    assert.equal(internalResp.ok, true);
+    const internalTaskId = internalResp.data.tasks[0].taskId;
+    const crossTaskStatus = await sendExternal({
+      type: "WEB_EXT_GET_TASK_STATUS",
+      taskId: internalTaskId,
+    });
+    assert.equal(crossTaskStatus.ok, false);
+    assert.equal(crossTaskStatus.code, "TASK_NOT_FOUND");
+  } finally {
+    bg.dispose();
+  }
+
+  // 3) Web extensionBridge.ts client behavior (missing runtime, lastError, timeout, connected)
+  const prevChrome = globalThis.chrome;
+  try {
+    delete globalThis.chrome;
+    assert.deepEqual(await extensionBridge.pingInstalledExtension({ timeoutMs: 50 }), {
+      connected: false,
+      version: "",
+      extensionId: "",
+      capabilities: [],
+    });
+
+    // lastError path
+    globalThis.chrome = {
+      runtime: {
+        lastError: { message: "Could not establish connection." },
+        sendMessage(_id, _msg, cb) { cb(undefined); },
+      },
+    };
+    assert.equal((await extensionBridge.pingInstalledExtension({ timeoutMs: 50 })).connected, false);
+
+    // Timeout path (callback never invoked)
+    globalThis.chrome = {
+      runtime: {
+        sendMessage() {},
+      },
+    };
+    assert.equal((await extensionBridge.pingInstalledExtension({ timeoutMs: 50 })).connected, false);
+
+    // Connected path with exact DOKITOOL_EXTENSION_ID verification
+    const sent = [];
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(extId, msg, cb) {
+          sent.push({ extId, msg });
+          if (msg.type === "WEB_EXT_PING") {
+            cb({
+              ok: true,
+              data: {
+                version: "1.2.3",
+                extensionId: DOKITOOL_EXTENSION_ID,
+                capabilities: ["dash_mux", "direct_download"],
+              },
+            });
+          } else if (msg.type === "WEB_EXT_ENQUEUE_MEDIA") {
+            cb({ ok: true, data: { taskId: "web-task-1", status: "queued" } });
+          } else if (msg.type === "WEB_EXT_GET_TASK_STATUS") {
+            cb({
+              ok: true,
+              data: {
+                taskId: "web-task-1",
+                status: "completed",
+                phase: "completed",
+                progress: 100,
+                loadedBytes: 1024,
+                totalBytes: 1024,
+                speedBytesPerSec: 0,
+                filename: "clip.mp4",
+              },
+            });
+          }
+        },
+      },
+    };
+    const info = await extensionBridge.pingInstalledExtension({ timeoutMs: 200 });
+    assert.deepEqual(info, {
+      connected: true,
+      version: "1.2.3",
+      extensionId: DOKITOOL_EXTENSION_ID,
+      capabilities: ["dash_mux", "direct_download"],
+    });
+    assert.equal(extensionBridge.hasExtensionCapability(info, "dash_mux"), true);
+    const enq = await extensionBridge.enqueueMediaViaExtension({
+      kind: "direct_download",
+      platform: "bilibili",
+      title: "clip",
+      filename: "clip.mp4",
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/clip.mp4"],
+    });
+    assert.deepEqual(enq, { ok: true, data: { taskId: "web-task-1", status: "queued" } });
+    const st = await extensionBridge.getExtensionTaskStatus("web-task-1");
+    assert.equal(st.ok, true);
+    assert.equal(st.data.status, "completed");
+    assert.ok(sent.every((entry) => entry.extId === DOKITOOL_EXTENSION_ID));
+  } finally {
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
   }
 });

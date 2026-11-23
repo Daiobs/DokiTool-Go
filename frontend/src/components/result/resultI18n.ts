@@ -90,6 +90,16 @@ const content: Record<string, Record<string, string>> = {
     biliDashAudioExplain:
       "该 B 站独立 DASH 音轨需附带 B 站来源头才能读取，网页直连会被拒绝；安装 DokiTool Chrome 扩展即可零 Cookie 一键保存原声 M4A。",
     biliDashAudioCta: "安装 Chrome 扩展保存原声 M4A",
+    extConnected: "扩展已连接",
+    extConnectedTitle:
+      "已连接 DokiTool Chrome 扩展，可直接解锁 DASH 无损合流下载",
+    extMuxTag: "扩展无损合流",
+    extInstallHintWithRes: "需要 {res} 无损合流？",
+    extInstallHintGeneric: "需要更高画质无损合流？",
+    extInstallHintCta: "安装 Chrome 扩展",
+    extAudioConnectedExplain:
+      "已连接 DokiTool Chrome 扩展，可直接零 Cookie 保存原声 M4A。",
+    extAudioDownloadCta: "通过扩展保存原声 M4A",
   },
   en: {
     resultTitle: "Result",
@@ -183,6 +193,16 @@ const content: Record<string, Record<string, string>> = {
     biliDashAudioExplain:
       "This standalone Bilibili DASH audio track requires Bilibili referer headers and cannot be fetched directly in the web page. Install the DokiTool Chrome Extension for cookie-free one-click M4A saving.",
     biliDashAudioCta: "Get Chrome Extension for M4A Audio",
+    extConnected: "Extension Connected",
+    extConnectedTitle:
+      "Connected to DokiTool Chrome Extension — lossless DASH mux downloads are unlocked",
+    extMuxTag: "Extension Mux",
+    extInstallHintWithRes: "Need {res} lossless mux?",
+    extInstallHintGeneric: "Need higher-quality lossless mux?",
+    extInstallHintCta: "Install Chrome Extension",
+    extAudioConnectedExplain:
+      "Connected to DokiTool Chrome Extension — save original M4A audio directly without cookies.",
+    extAudioDownloadCta: "Save M4A Audio via Extension",
   },
 };
 

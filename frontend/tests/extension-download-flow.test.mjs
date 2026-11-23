@@ -3116,13 +3116,38 @@ test("P1-4 & P2-5: Mixed image + video posts (1img+1vid, 2img+1vid, 2vid+1img, L
       const n = tc.media.items.length;
       assert.match(renderedText, /图片/, `${tc.name} shows 图片 badge`);
       assert.match(renderedText, /视频/, `${tc.name} shows 视频 badge`);
-      assert.ok(
-        renderedText.includes(`按标题存子文件夹 · 已选条目 (${n}/${n})`),
-        `${tc.name} renders mixed subfolder button count`,
+      assert.equal(
+        renderedText.includes("仅下当前集") || renderedText.includes("仅下当前项"),
+        false,
+        `${tc.name} must not render redundant top current-item strip`,
       );
+      assert.equal(
+        renderedText.includes("按标题存子文件夹"),
+        false,
+        `${tc.name} must not render verbose subfolder button sentence`,
+      );
+      const subfolderPill = view.findAll(
+        (node) => node.type === "button" && node.props["data-save-mode"] === "subfolder",
+      )[0];
+      const zipPill = view.findAll(
+        (node) => node.type === "button" && node.props["data-save-mode"] === "zip",
+      )[0];
+      assert.ok(subfolderPill, `${tc.name} renders 存子文件夹 segmented pill`);
+      assert.ok(zipPill, `${tc.name} renders 打包 ZIP segmented pill`);
+      assert.equal(view.textOf(subfolderPill).trim(), "存子文件夹");
+      assert.equal(view.textOf(zipPill).trim(), "打包 ZIP");
+
+      const primaryBtn = () =>
+        view.findAll(
+          (node) =>
+            node.type === "button" &&
+            typeof node.props.class === "string" &&
+            node.props.class.includes("sp-batch-actions__primary"),
+        )[0];
+      assert.ok(primaryBtn(), `${tc.name} renders unified primary download button`);
       assert.ok(
-        renderedText.includes(`打包 ZIP (${n})`),
-        `${tc.name} renders mixed ZIP button count`,
+        view.textOf(primaryBtn()).includes(`下载全部 (${n})`),
+        `${tc.name} primary button shows 下载全部 (n) when all selected, got: ${view.textOf(primaryBtn())}`,
       );
 
       // Click the video item in the mixed list -> stage switches to <video> AND shows quality variant cards!
@@ -3141,7 +3166,7 @@ test("P1-4 & P2-5: Mixed image + video posts (1img+1vid, 2img+1vid, 2vid+1img, L
       assert.match(stageVideos[0].props.src, /_1080\.mp4$/);
       assert.match(view.textOf(), /画质与音轨选择/, `${tc.name} shows quality selector for video item`);
 
-      // Switch video item's quality variant to 720p and click Subfolder + ZIP buttons!
+      // Switch video item's quality variant to 720p and click unified primary download button (subfolder mode)
       const variant720Btn = view.findAll(
         (node) =>
           node.type === "button" &&
@@ -3153,13 +3178,7 @@ test("P1-4 & P2-5: Mixed image + video posts (1img+1vid, 2img+1vid, 2vid+1img, L
       await view.fire(variant720Btn, "onClick");
       assert.match(view.findAll((node) => node.type === "video")[0].props.src, /_720\.mp4$/);
 
-      const subfolderBtn = view.findAll(
-        (node) =>
-          node.type === "button" &&
-          typeof node.props.class === "string" &&
-          node.props.class.includes("sp-batch-actions__subfolder"),
-      )[0];
-      await view.fire(subfolderBtn, "onClick");
+      await view.fire(primaryBtn(), "onClick");
       assert.equal(emittedEnqueues.length, 1);
       assert.equal(emittedEnqueues[0].items.length, n);
       assert.match(
@@ -3168,17 +3187,34 @@ test("P1-4 & P2-5: Mixed image + video posts (1img+1vid, 2img+1vid, 2vid+1img, L
         "Chosen 720p variant honored in mixed subfolder download",
       );
 
-      // Test 全选 / 反选 checkboxes
+      // Switch save-mode toggle to 打包 ZIP and click primary -> enqueues batch_zip
+      await view.fire(zipPill, "onClick");
+      await view.fire(primaryBtn(), "onClick");
+      assert.equal(emittedEnqueues.length, 2);
+      assert.equal(emittedEnqueues[1].items.length, 1);
+      assert.equal(emittedEnqueues[1].items[0].spec.kind, "batch_zip");
+      await view.fire(subfolderPill, "onClick");
+
+      // Test 全选 / 反选 / partial selection checkboxes
       const invertBtn = view.findAll(
         (node) => node.type === "button" && view.textOf(node).trim() === "反选",
       )[0];
       await view.fire(invertBtn, "onClick");
-      assert.ok(view.textOf().includes(`按标题存子文件夹 · 已选条目 (0/${n})`));
+      assert.ok(view.textOf(primaryBtn()).includes(`下载已选 (0/${n})`));
       const selectAllBtn = view.findAll(
         (node) => node.type === "button" && view.textOf(node).trim() === "全选",
       )[0];
       await view.fire(selectAllBtn, "onClick");
-      assert.ok(view.textOf().includes(`按标题存子文件夹 · 已选条目 (${n}/${n})`));
+      assert.ok(view.textOf(primaryBtn()).includes(`下载全部 (${n})`));
+
+      const firstCheck = view.findAll(
+        (node) =>
+          node.type === "button" &&
+          typeof node.props.class === "string" &&
+          node.props.class.includes("sp-ep-row__check"),
+      )[0];
+      await view.fire(firstCheck, "onClick", { stopPropagation() {} });
+      assert.ok(view.textOf(primaryBtn()).includes(`下载已选 (${n - 1}/${n})`));
     } finally {
       view.unmount();
     }
@@ -5506,7 +5542,7 @@ test("Bilibili DASH SidePanel UI: buildSidePanelQualityOptions & SidePanelResult
       "https://upos-sz-mirrorcos.bilivideo.com/p1-durl-720p.mp4",
     );
 
-    // Primary CTA clearly says "下载 1080p 无损合流 (MP4)"
+    // Primary CTA clearly says "下载视频 (1080p)"
     const mainBtn = view.findAll(
       (n) =>
         n.type === "button" &&
@@ -5515,9 +5551,10 @@ test("Bilibili DASH SidePanel UI: buildSidePanelQualityOptions & SidePanelResult
     )[0];
     assert.ok(mainBtn);
     assert.ok(
-      view.textOf(mainBtn).includes("下载 1080p 无损合流 (MP4)"),
-      `expected primary CTA label, got: ${view.textOf(mainBtn)}`,
+      view.textOf(mainBtn).includes("下载视频 (1080p)"),
+      `expected concise primary CTA label, got: ${view.textOf(mainBtn)}`,
     );
+    assert.equal(view.textOf(mainBtn).includes("无损合流"), false);
 
     // 复制直链 button is disabled with explanatory tooltip for dash_mux
     const copyBtn = view.findAll(
@@ -11459,5 +11496,409 @@ test("[PR-C Round 2] FETCH_OWNER_STATS RPC & SidePanelApp.vue owner-stats-pill: 
   } finally {
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
+  }
+});
+
+test("PR 1 UX: single-P Bilibili stays single-video with clean media.title filename, while true multi-P and albums use compact save-mode pills and unified primary CTA", async () => {
+  const SidePanelResult = await loadSidePanelSfc(
+    "../src/extension/components/SidePanelResult.vue",
+  );
+  const baseSettings = {
+    apiBaseUrl: "https://snap.dokitool.com",
+    bearerToken: "",
+    subfolderPrefix: "",
+    batchSaveMode: "subfolder",
+    qualityPreference: "best",
+    autoFollowTab: false,
+    theme: "system",
+  };
+
+  // 1) Single-P Bilibili video returning groups:[{id:"parts", total_count:1}] and raw mmexport part title
+  const singlePBiliMedia = {
+    platform: "bilibili",
+    content_id: "BV1SingleP1234",
+    title: "B站单P真实主标题测试",
+    source_url: "https://www.bilibili.com/video/BV1SingleP1234",
+    default_item_id: "p1",
+    groups: [
+      {
+        id: "parts",
+        kind: "multipart",
+        title: "分P",
+        total_count: 1,
+        item_ids: ["p1"],
+      },
+    ],
+    items: [
+      {
+        id: "p1",
+        type: "video",
+        index: 1,
+        title: "mmexport1794208831102.mp4",
+        state: "ready",
+        default: {
+          variant_id: "durl-720p",
+          source_id: "s-720",
+          url: "https://upos-sz-mirrorcos.bilivideo.com/single-720.mp4",
+        },
+        variants: [
+          {
+            id: "dash-1080p",
+            label: "1080P 高清",
+            metadata: {
+              width: 1920,
+              height: 1080,
+              video_codec: "avc1.640032",
+              bitrate_bps: 2_800_000,
+              has_audio: true,
+              container: "mp4",
+              extension: "mp4",
+            },
+            delivery: {
+              kind: "mux",
+              output: { container: "mp4", extension: "mp4" },
+              resources: [
+                {
+                  id: "v-1080",
+                  role: "video",
+                  metadata: { width: 1920, height: 1080, video_codec: "avc1.640032" },
+                  delivery: {
+                    kind: "file",
+                    sources: [
+                      {
+                        id: "s-1080",
+                        url: "https://upos-sz-mirrorcos.bilivideo.com/single-1080.m4s",
+                        size_bytes: 18_000_000,
+                      },
+                    ],
+                  },
+                },
+                {
+                  id: "a-30280",
+                  role: "audio",
+                  metadata: { audio_codec: "mp4a.40.2" },
+                  delivery: {
+                    kind: "file",
+                    sources: [
+                      {
+                        id: "s-audio",
+                        url: "https://upos-sz-mirrorcos.bilivideo.com/single-audio.m4s",
+                        size_bytes: 2_000_000,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            id: "durl-720p",
+            label: "720P 高清",
+            metadata: {
+              width: 1280,
+              height: 720,
+              video_codec: "avc1.64001F",
+              has_audio: true,
+              container: "mp4",
+              extension: "mp4",
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "s-720",
+                  url: "https://upos-sz-mirrorcos.bilivideo.com/single-720.mp4",
+                  size_bytes: 9_000_000,
+                },
+              ],
+            },
+          },
+        ],
+        attachments: [
+          {
+            id: "dash-audio-30280",
+            role: "audio",
+            metadata: {
+              bitrate_bps: 192_000,
+              audio_codec: "mp4a.40.2",
+              container: "m4a",
+              extension: "m4a",
+            },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "s-audio",
+                  url: "https://upos-sz-mirrorcos.bilivideo.com/single-audio.m4s",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  assert.equal(uiTargetHelpersMod.classifyMediaLayout(singlePBiliMedia), "single");
+  const singleOpts = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    singlePBiliMedia,
+    singlePBiliMedia.items[0],
+    "https://snap.dokitool.com",
+  );
+  const dash1080Opt = singleOpts.find((o) => o.isDashMux);
+  assert.ok(dash1080Opt);
+  const singleEnqueue = uiTargetHelpersMod.buildSingleDownloadEnqueueItem({
+    media: singlePBiliMedia,
+    item: singlePBiliMedia.items[0],
+    option: dash1080Opt,
+    settings: baseSettings,
+  });
+  assert.ok(singleEnqueue);
+  assert.equal(singleEnqueue.spec.filename, "B站单P真实主标题测试.mp4");
+  assert.equal(singleEnqueue.spec.filename.includes("/"), false);
+  assert.equal(singleEnqueue.spec.filename.includes("mmexport"), false);
+  assert.equal(singleEnqueue.spec.filename.includes("001_"), false);
+
+  const bgSingleItems = extensionDownloadMod.buildEnqueueItemsForMedia(singlePBiliMedia, {
+    qualityPreference: "best",
+    batchSaveMode: "subfolder",
+    subfolderPrefix: "",
+  });
+  assert.equal(bgSingleItems.length, 1);
+  assert.equal(bgSingleItems[0].spec.filename, "B站单P真实主标题测试.mp4");
+  assert.equal(bgSingleItems[0].spec.filename.includes("/"), false);
+
+  // Mount SidePanelResult for single-P Bilibili -> pure single-video UI!
+  const singleView = mountSfcTree(SidePanelResult, {
+    media: singlePBiliMedia,
+    workFingerprint: "bilibili:BV1SingleP1234",
+    isSaved: false,
+    settings: baseSettings,
+    resolvingItemIds: new Set(),
+  });
+  try {
+    await singleView.flush();
+    const text = singleView.textOf();
+    assert.equal(text.includes("分P"), false, "single-P Bilibili must NOT render 分P list");
+    assert.equal(text.includes("存子文件夹"), false, "single-P Bilibili must NOT render subfolder toggle");
+    assert.equal(text.includes("打包 ZIP"), false, "single-P Bilibili must NOT render ZIP toggle");
+    assert.equal(text.includes("仅下当前集"), false, "single-P Bilibili must NOT render 仅下当前集");
+    const mainBtn = singleView.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-cta-row__main"),
+    )[0];
+    assert.ok(mainBtn);
+    assert.ok(singleView.textOf(mainBtn).includes("下载视频 (1080p)"));
+  } finally {
+    singleView.unmount();
+  }
+
+  // 2) True 2-P Bilibili video -> multi_video layout, subfolder episode naming, compact pills + unified primary CTA
+  const multiPBiliMedia = {
+    platform: "bilibili",
+    content_id: "BV1MultiP5678",
+    title: "B站两集课程",
+    source_url: "https://www.bilibili.com/video/BV1MultiP5678",
+    default_item_id: "p1",
+    groups: [
+      {
+        id: "parts",
+        kind: "multipart",
+        title: "分P",
+        total_count: 2,
+        item_ids: ["p1", "p2"],
+      },
+    ],
+    items: [
+      {
+        id: "p1",
+        type: "video",
+        index: 1,
+        title: "第一集",
+        state: "ready",
+        default: {
+          variant_id: "v1-720",
+          source_id: "s1",
+          url: "https://upos-sz-mirrorcos.bilivideo.com/ep1-720.mp4",
+        },
+        variants: [
+          {
+            id: "v1-720",
+            label: "720P",
+            metadata: { width: 1280, height: 720, has_audio: true, extension: "mp4" },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "s1",
+                  url: "https://upos-sz-mirrorcos.bilivideo.com/ep1-720.mp4",
+                  size_bytes: 5_000_000,
+                },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        id: "p2",
+        type: "video",
+        index: 2,
+        title: "第二集",
+        state: "ready",
+        default: {
+          variant_id: "v2-720",
+          source_id: "s2",
+          url: "https://upos-sz-mirrorcos.bilivideo.com/ep2-720.mp4",
+        },
+        variants: [
+          {
+            id: "v2-720",
+            label: "720P",
+            metadata: { width: 1280, height: 720, has_audio: true, extension: "mp4" },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "s2",
+                  url: "https://upos-sz-mirrorcos.bilivideo.com/ep2-720.mp4",
+                  size_bytes: 6_000_000,
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  assert.equal(uiTargetHelpersMod.classifyMediaLayout(multiPBiliMedia), "multi_video");
+  const bgMultiItems = extensionDownloadMod.buildEnqueueItemsForMedia(multiPBiliMedia, {
+    qualityPreference: "best",
+    batchSaveMode: "subfolder",
+    subfolderPrefix: "",
+  });
+  assert.deepEqual(
+    bgMultiItems.map((it) => it.spec.filename),
+    ["B站两集课程/001_第一集.mp4", "B站两集课程/002_第二集.mp4"],
+  );
+
+  const multiEnqueues = [];
+  const multiView = mountSfcTree(
+    SidePanelResult,
+    {
+      media: multiPBiliMedia,
+      workFingerprint: "bilibili:BV1MultiP5678",
+      isSaved: false,
+      settings: baseSettings,
+      resolvingItemIds: new Set(),
+    },
+    { onEnqueueDownloads: (payload) => multiEnqueues.push(payload) },
+  );
+  try {
+    await multiView.flush();
+    const text = multiView.textOf();
+    assert.equal(text.includes("仅下当前集"), false, "multi_video must NOT render top 仅下当前集 bar");
+    assert.equal(text.includes("按标题存子文件夹"), false, "multi_video must NOT use verbose subfolder CTA text");
+    const primaryBtn = () =>
+      multiView.findAll(
+        (n) =>
+          n.type === "button" &&
+          typeof n.props.class === "string" &&
+          n.props.class.includes("sp-batch-actions__primary"),
+      )[0];
+    assert.ok(multiView.textOf(primaryBtn()).includes("下载全部 (2)"));
+
+    // Uncheck 1 episode -> primary CTA updates to 下载已选 (1/2)
+    const checks = multiView.findAll(
+      (n) =>
+        n.type === "button" &&
+        typeof n.props.class === "string" &&
+        n.props.class.includes("sp-ep-row__check"),
+    );
+    await multiView.fire(checks[0], "onClick", { stopPropagation() {} });
+    assert.ok(multiView.textOf(primaryBtn()).includes("下载已选 (1/2)"));
+
+    // Re-check -> switch to 打包 ZIP pill -> clicking primary enqueues batch_zip
+    await multiView.fire(checks[0], "onClick", { stopPropagation() {} });
+    const zipPill = multiView.findAll(
+      (n) => n.type === "button" && n.props["data-save-mode"] === "zip",
+    )[0];
+    await multiView.fire(zipPill, "onClick");
+    await multiView.fire(primaryBtn(), "onClick");
+    assert.equal(multiEnqueues.length, 1);
+    assert.equal(multiEnqueues[0].items[0].spec.kind, "batch_zip");
+  } finally {
+    multiView.unmount();
+  }
+
+  // 3) Album (>= 2 images) layout uses compact save-mode pills + unified primary CTA
+  const albumMedia = {
+    platform: "xiaohongshu",
+    content_id: "xhs-album-3",
+    title: "三图测试图集",
+    items: [1, 2, 3].map((idx) => ({
+      id: `img-${idx}`,
+      type: "image",
+      index: idx,
+      state: "ready",
+      default: {
+        variant_id: "v0",
+        source_id: "s0",
+        url: `https://sns-webpic-qc.xhscdn.com/album-${idx}.jpg`,
+      },
+      variants: [
+        {
+          id: "v0",
+          metadata: { extension: "jpg" },
+          delivery: {
+            kind: "file",
+            sources: [
+              {
+                id: "s0",
+                url: `https://sns-webpic-qc.xhscdn.com/album-${idx}.jpg`,
+                size_bytes: 1_000_000,
+              },
+            ],
+          },
+        },
+      ],
+    })),
+  };
+  assert.equal(uiTargetHelpersMod.classifyMediaLayout(albumMedia), "album");
+  const albumEnqueues = [];
+  const albumView = mountSfcTree(
+    SidePanelResult,
+    {
+      media: albumMedia,
+      workFingerprint: "xiaohongshu:xhs-album-3",
+      isSaved: false,
+      settings: baseSettings,
+      resolvingItemIds: new Set(),
+    },
+    { onEnqueueDownloads: (payload) => albumEnqueues.push(payload) },
+  );
+  try {
+    await albumView.flush();
+    assert.equal(albumView.textOf().includes("按标题存子文件夹"), false);
+    assert.equal(albumView.textOf().includes("仅下当前项"), false);
+    const primaryBtn = () =>
+      albumView.findAll(
+        (n) =>
+          n.type === "button" &&
+          typeof n.props.class === "string" &&
+          n.props.class.includes("sp-batch-actions__primary"),
+      )[0];
+    assert.ok(albumView.textOf(primaryBtn()).includes("下载全部 (3)"));
+    const zipPill = albumView.findAll(
+      (n) => n.type === "button" && n.props["data-save-mode"] === "zip",
+    )[0];
+    await albumView.fire(zipPill, "onClick");
+    await albumView.fire(primaryBtn(), "onClick");
+    assert.equal(albumEnqueues.length, 1);
+    assert.equal(albumEnqueues[0].items[0].spec.kind, "batch_zip");
+  } finally {
+    albumView.unmount();
   }
 });

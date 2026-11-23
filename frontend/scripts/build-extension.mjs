@@ -28,6 +28,43 @@ const mediabunnyLicensePath = path.join(
 
 export const ICON_SIZES = Object.freeze([16, 32, 48, 128]);
 
+export const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo";
+
+export const DOKITOOL_EXTENSION_MANIFEST_KEY =
+  "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1H7x6y1gizzFTJNvaVoImjO/bVzcAK2Yf2yVsV/8Cci1ODkiJbJkEm0B5BdLh8TCfvaIh2KvO170x8/xCkI1vGQwVqYTRfFUffTXAfPRPt0ih4IPmkfR4Onof0b1avZ8zD76WxRb0fv094afOItMzygdpHeCL50v1gCvIazVo6b+B5ZgX+WTtp2u/ULNvjiE9Cz0cPUepsgoNov0kRG3sK2e58YO0pRBxrd4dwZFxTNzWekYEmmxMDeZGqUaSRClSXeQVw+lSM3NsvXzxK2tlPbbt0DH2MXiR0SQcmvbvP40H0AamKLWYcJTEYCsMbVBRWuXMagJr9/kEtXA6sNYrQIDAQAB";
+
+export const PROD_EXTERNALLY_CONNECTABLE_MATCHES = Object.freeze([
+  "https://snap.dokitool.com/*",
+]);
+
+export const DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES = Object.freeze([
+  "https://snap.dokitool.com/*",
+  "http://127.0.0.1/*",
+  "http://localhost/*",
+]);
+
+export function deriveExtensionIdFromManifestKey(keyBase64) {
+  if (typeof keyBase64 !== "string" || !keyBase64.trim()) {
+    throw new Error("manifest.key must be a non-empty base64 string");
+  }
+  const normalized = keyBase64.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+=*$/.test(normalized)) {
+    throw new Error("manifest.key is not valid base64");
+  }
+  const der = Buffer.from(normalized, "base64");
+  if (der.length === 0) {
+    throw new Error("manifest.key decoded to empty bytes");
+  }
+  const hexPrefix = crypto
+    .createHash("sha256")
+    .update(der)
+    .digest("hex")
+    .slice(0, 32);
+  return Array.from(hexPrefix, (ch) =>
+    String.fromCharCode(97 + Number.parseInt(ch, 16)),
+  ).join("");
+}
+
 export const EXPECTED_PERMISSIONS = Object.freeze([
   "sidePanel",
   "offscreen",
@@ -95,6 +132,7 @@ export async function createExtensionManifest({ devLoopback = false } = {}) {
 
   return {
     manifest_version: 3,
+    key: DOKITOOL_EXTENSION_MANIFEST_KEY,
     name: "DokiTool 素材下载助手",
     version: String(pkg.version || "1.0.0"),
     description:
@@ -123,6 +161,11 @@ export async function createExtensionManifest({ devLoopback = false } = {}) {
     },
     host_permissions,
     optional_host_permissions,
+    externally_connectable: {
+      matches: devLoopback
+        ? [...DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES]
+        : [...PROD_EXTERNALLY_CONNECTABLE_MATCHES],
+    },
     content_security_policy: {
       extension_pages: "script-src 'self'; object-src 'self';",
     },
@@ -355,6 +398,55 @@ function validateExtensionManifest(manifest, { devLoopback = false } = {}) {
 
   if (manifest.content_scripts !== undefined) {
     throw new Error("manifest.content_scripts must be undefined (zero content script injection)");
+  }
+
+  if (typeof manifest.key !== "string" || !manifest.key.trim()) {
+    throw new Error("manifest.key must be a non-empty RSA SPKI DER base64 string");
+  }
+  const derivedExtId = deriveExtensionIdFromManifestKey(manifest.key);
+  if (derivedExtId !== DOKITOOL_EXTENSION_ID) {
+    throw new Error(
+      `manifest.key derived extension ID mismatch (expected ${DOKITOOL_EXTENSION_ID}, got ${derivedExtId})`,
+    );
+  }
+
+  const extConn = manifest.externally_connectable;
+  if (!extConn || typeof extConn !== "object" || !Array.isArray(extConn.matches)) {
+    throw new Error(
+      "manifest.externally_connectable.matches must be a non-empty array",
+    );
+  }
+  if (extConn.ids !== undefined) {
+    throw new Error(
+      "manifest.externally_connectable.ids must be undefined (no arbitrary extension IPC)",
+    );
+  }
+  const expectedExtConnMatches = devLoopback
+    ? DEV_LOOPBACK_EXTERNALLY_CONNECTABLE_MATCHES
+    : PROD_EXTERNALLY_CONNECTABLE_MATCHES;
+  for (const matchPattern of extConn.matches) {
+    if (typeof matchPattern !== "string") {
+      throw new Error("manifest.externally_connectable.matches entries must be strings");
+    }
+    if (
+      FORBIDDEN_HOST_WILDCARDS.includes(matchPattern) ||
+      matchPattern.includes("*.") ||
+      matchPattern.includes("://*")
+    ) {
+      throw new Error(
+        `Forbidden wildcard in manifest.externally_connectable.matches: ${matchPattern}`,
+      );
+    }
+  }
+  const uniqueExtConnMatches = Array.from(new Set(extConn.matches));
+  const extConnExactMatch =
+    uniqueExtConnMatches.length === extConn.matches.length &&
+    uniqueExtConnMatches.length === expectedExtConnMatches.length &&
+    expectedExtConnMatches.every((m) => uniqueExtConnMatches.includes(m));
+  if (!extConnExactMatch) {
+    throw new Error(
+      `manifest.externally_connectable.matches mismatch (expected=${expectedExtConnMatches.join(",")}; actual=${extConn.matches.join(",")})`,
+    );
   }
 
   if (!Array.isArray(manifest.permissions)) {
