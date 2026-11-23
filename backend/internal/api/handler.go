@@ -707,10 +707,11 @@ func (h *Handler) runSingleflight(
 		payload unified.Object
 		encOK   bool
 	)
-	res, payload, encOK = h.executeParse(ctx, path, platform, source, itemID, debug, h.now())
+	parseCtx, shanghaiFallback := unified.WithShanghaiFallbackTracker(ctx)
+	res, payload, encOK = h.executeParse(parseCtx, path, platform, source, itemID, debug, h.now())
 	finishNow = h.now()
 	if encOK && payload != nil {
-		ttl, cacheable = computeCacheTTLForPlatform(platform, payload, finishNow)
+		ttl, cacheable = computeCacheTTLForResult(platform, payload, finishNow, shanghaiFallback())
 	}
 	completed = true
 }

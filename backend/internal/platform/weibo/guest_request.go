@@ -3,11 +3,13 @@ package weibo
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/url"
 	"strconv"
 
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -17,10 +19,12 @@ import (
 type guestExchange func(context.Context, string, *string, string) (unified.Object, error)
 
 type guestSession struct {
-	exchange    guestExchange
-	attempted   bool
-	nonce       func() string
-	lastRawJSON string
+	exchange        guestExchange
+	attempted       bool
+	nonce           func() string
+	lastRawJSON     string
+	seededFromCache bool
+	refreshGuest    func(ctx context.Context, referer string) bool
 }
 
 func newGuestSession(exchange guestExchange) *guestSession {
@@ -43,7 +47,11 @@ func (s *guestSession) request(ctx context.Context, address string, post *string
 	}
 	result, err := s.exchange(ctx, address, post, referer)
 	if err != nil || result == nil {
-		return unified.Object{"error": true, "status": 0, "body": "", "url": address}
+		out := unified.Object{"error": true, "status": 0, "body": "", "url": address}
+		if errors.Is(err, fetch.ErrRedirect) {
+			out["_redirect_block"] = true
+		}
+		return out
 	}
 	return result
 }
@@ -106,10 +114,14 @@ func (s *guestSession) startGuest(ctx context.Context, referer string) bool {
 func (s *guestSession) jsonRequest(ctx context.Context, address string, post *string, referer string) unified.Object {
 	s.lastRawJSON = ""
 	first := s.request(ctx, address, post, referer)
-	if failure := legacyTransportFailure(first); failure != nil {
-		return unified.Object{"failure": failure}
+	staleCacheBlocked := s.seededFromCache && !s.attempted &&
+		(phpGuestNumber(first["status"]) == 403 || phpGuestNumber(first["status"]) == 401 || first["_redirect_block"] == true)
+	if !staleCacheBlocked {
+		if failure := legacyTransportFailure(first); failure != nil {
+			return unified.Object{"failure": failure}
+		}
 	}
-	if legacyIsVisitor(first) {
+	if staleCacheBlocked || legacyIsVisitor(first) {
 		if s.attempted {
 			return unified.Object{"failure": unified.Object{"code": 503, "msg": "微博匿名访客会话仍受限制，请稍后重试"}}
 		}
@@ -118,9 +130,16 @@ func (s *guestSession) jsonRequest(ctx context.Context, address string, post *st
 		if value, present := first["url"]; present && value != nil {
 			guestReferer = unified.Str(value)
 		}
-		if !s.startGuest(ctx, guestReferer) {
+		refreshed := false
+		if s.refreshGuest != nil {
+			refreshed = s.refreshGuest(ctx, guestReferer)
+		} else {
+			refreshed = s.startGuest(ctx, guestReferer)
+		}
+		if !refreshed {
 			return unified.Object{"failure": unified.Object{"code": 503, "msg": "微博匿名访客会话暂不可用，请稍后重试"}}
 		}
+		s.seededFromCache = false
 		first = s.request(ctx, address, post, referer)
 		if failure := legacyTransportFailure(first); failure != nil {
 			return unified.Object{"failure": failure}

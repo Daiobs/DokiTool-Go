@@ -103,6 +103,9 @@ func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Ob
 	if finish != nil {
 		finish(matched)
 	}
+	if shCall != nil && !matched {
+		unified.MarkShanghaiFallback(ctx)
+	}
 	if len(unified.Slice(data["items"])) == 0 {
 		return unified.ContractError("NO_MEDIA", "作品未提供可用媒体", false), nil
 	}

@@ -92,7 +92,7 @@
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
-| `DOKITOOL_YTDLP_BINARY` | 指定受官方发布摘要锁定校验的外部提取器可执行文件路径 | 否 |
+| `DOKITOOL_YTDLP_BINARY` | 指定受官方发布摘要锁定校验的外部提取器路径（支持官方单文件二进制与零解压 `yt-dlp` Python zipapp，均须匹配 `OfficialSHA256Sums` 中的锁定 SHA-256） | 否 |
 | `DOKITOOL_YTDLP_CONCURRENCY` | 指定核心海外提取器平台共享的最大并发子进程数 | 否 |
 | `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` | 指定第二级通用具名提取器兜底独立隔离的最大并发子进程数（整数 `1..24`，默认 `2`；与核心慢解析池及核心 `yt-dlp` 槽位严格隔离，非法或越界值在启动阶段即拒绝运行） | 否 |
 | `DOKITOOL_YTDLP_TIMEOUT` | 指定单次外部提取器子进程调用的超时时长 | 否 |
@@ -102,8 +102,13 @@
 | `DOKITOOL_EJS_DIR` | 指定存放受摘要校验的 YouTube 签名解算脚本文件的目录路径 | 否 |
 | `DOKITOOL_EJS_CONCURRENCY` | 指定 Deno 签名解算沙箱允许的最大并发子进程数 | 否 |
 | `DOKITOOL_EJS_TIMEOUT` | 指定单次 Deno 签名解算子进程执行的超时时长 | 否 |
-| `PATH` | 系统可执行文件搜索路径，用于定位提取器或启动自检所需的运行时 | 否 |
+| `PATH` | 系统可执行文件搜索路径，用于定位提取器或启动自检所需的运行时（注入子进程前会自动剥离相对路径与全局可写目录） | 否 |
 | `SYSTEMROOT` | Windows 环境下向净化后的提取器子进程透传的系统根目录路径 | 否 |
+
+> **`yt-dlp` 零解压 Python Zipapp 运维切换说明（推荐用于海外解析加速）**：
+> - **消除每次冷启动约 35 MiB PyInstaller 解压开销**：官方 Release 同批次提供的 `yt-dlp`（Python zipapp，含 `#!/usr/bin/env python3` 与 ZIP 头）的 SHA-256 已同步锁定于 `backend/internal/ytengine/engine.go` 的 `OfficialSHA256Sums` 中（随 `scripts/bump-runtime-pins.py` 自动同步更新）。
+> - **宿主机前置条件**：宿主机具备符合该 `yt-dlp` 版本要求的系统 `python3`（通常 Python 3.10+）且位于安全 `PATH`（绝对路径、非全局可写目录、可执行权限）中。
+> - **切换与回滚步骤**：将与当前 `PinnedVersion` 匹配的官方 `yt-dlp` zipapp 放至受控目录（如 `0644` 或 `0755` 权限）并核对 `sha256sum`，通过 systemd drop-in 将 `DOKITOOL_YTDLP_BINARY` 指向该 zipapp 路径并重启 `dokitool-go.service`。启动时 `ytengine` 会自动校验 SHA-256、使用安全 `PATH` 中的 `python3` 执行 `--version` 自检，并在子进程环境中固定开启 `PYTHONDONTWRITEBYTECODE=1` 与 `PYTHONNOUSERSITE=1`（零 `_MEI*` 临时解压、零 `.pyc` 写入）；如需回滚，只需将 `DOKITOOL_YTDLP_BINARY` 改回 `yt-dlp_linux` 并重启即可。
 
 ### 4. 准入控制限流与并发池
 

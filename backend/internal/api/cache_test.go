@@ -666,7 +666,7 @@ func TestParseCacheTTLRulesAndClockExpiry(t *testing.T) {
 	const startUnix int64 = 1793448000
 	c := loadCacheTestCatalog(t)
 
-	t.Run("missing-expires_at-uses-60s-and-reparses-after-expiry", func(t *testing.T) {
+	t.Run("missing-expires_at-uses-300s-and-reparses-after-expiry", func(t *testing.T) {
 		var nowSec atomic.Int64
 		nowSec.Store(startUnix)
 		var calls atomic.Int32
@@ -681,7 +681,7 @@ func TestParseCacheTTLRulesAndClockExpiry(t *testing.T) {
 		}
 
 		path := "/api/parse?schema_version=1.0&url=https://www.douyin.com/video/1001"
-		for _, delta := range []int64{0, 30, 59} {
+		for _, delta := range []int64{0, 150, 299} {
 			nowSec.Store(startUnix + delta)
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
@@ -690,18 +690,18 @@ func TestParseCacheTTLRulesAndClockExpiry(t *testing.T) {
 			}
 		}
 		if calls.Load() != 1 {
-			t.Fatalf("expected 1 upstream call before 60s TTL, got %d", calls.Load())
+			t.Fatalf("expected 1 upstream call before 300s default TTL, got %d", calls.Load())
 		}
 
-		nowSec.Store(startUnix + 60)
+		nowSec.Store(startUnix + 300)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusOK || calls.Load() != 2 {
-			t.Fatalf("expected re-parse at +60s: status=%d calls=%d", w.Code, calls.Load())
+			t.Fatalf("expected re-parse at +300s: status=%d calls=%d", w.Code, calls.Load())
 		}
 	})
 
-	t.Run("long-expires_at-capped-at-180s", func(t *testing.T) {
+	t.Run("long-expires_at-capped-at-600s", func(t *testing.T) {
 		var nowSec atomic.Int64
 		nowSec.Store(startUnix)
 		var calls atomic.Int32
@@ -717,7 +717,7 @@ func TestParseCacheTTLRulesAndClockExpiry(t *testing.T) {
 		}
 
 		path := "/api/parse?schema_version=1.0&url=https://www.douyin.com/video/1002"
-		for _, delta := range []int64{0, 120, 179} {
+		for _, delta := range []int64{0, 300, 599} {
 			nowSec.Store(startUnix + delta)
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
@@ -726,14 +726,14 @@ func TestParseCacheTTLRulesAndClockExpiry(t *testing.T) {
 			}
 		}
 		if calls.Load() != 1 {
-			t.Fatalf("expected cached hit through +179s, got calls=%d", calls.Load())
+			t.Fatalf("expected cached hit through +599s, got calls=%d", calls.Load())
 		}
 
-		nowSec.Store(startUnix + 180)
+		nowSec.Store(startUnix + 600)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusOK || calls.Load() != 2 {
-			t.Fatalf("expected re-parse at +180s cap: status=%d calls=%d", w.Code, calls.Load())
+			t.Fatalf("expected re-parse at +600s cap: status=%d calls=%d", w.Code, calls.Load())
 		}
 	})
 
@@ -2541,4 +2541,86 @@ func TestParseCacheLockFreeReadHitsLazyLRUAndConcurrentRace(t *testing.T) {
 			t.Fatalf("cache bounds violated after concurrent race stress: entries=%d bytes=%d", entries, usedBytes)
 		}
 	})
+}
+
+func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
+	const startUnix int64 = 1793448000
+	baseNow := time.Unix(startUnix, 0).UTC()
+
+	// 1. Direct unit checks on computeCacheTTLForResult across normal, safety-margin, generic, and Shanghai fallback modes.
+	distantExp := baseNow.Add(2 * time.Hour).Format(time.RFC3339)
+	midExp := baseNow.Add(400 * time.Second).Format(time.RFC3339) // 400s - 60s = 340s (between 300s and 600s)
+	nearExp := baseNow.Add(72 * time.Second).Format(time.RFC3339) // 72s - 60s = 12s (< 15s Shanghai cap)
+	tooSoon := baseNow.Add(69 * time.Second).Format(time.RFC3339) // 69s - 60s = 9s (< 10s minCacheTTL)
+
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, ""), baseNow, false); !ok || ttl != 300*time.Second {
+		t.Fatalf("normal no-expiry TTL = (%v, %v), want (300s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, distantExp), baseNow, false); !ok || ttl != 600*time.Second {
+		t.Fatalf("normal distant-expiry TTL = (%v, %v), want (600s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, midExp), baseNow, false); !ok || ttl != 340*time.Second {
+		t.Fatalf("normal safety-margin TTL = (%v, %v), want (340s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, distantExp), baseNow, true); !ok || ttl != 15*time.Second {
+		t.Fatalf("douyin Shanghai degraded TTL = (%v, %v), want (15s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("bilibili", makeSyntheticEnvelope("bilibili", "https://www.bilibili.com/video/BV1234567890", startUnix, distantExp), baseNow, true); !ok || ttl != 15*time.Second {
+		t.Fatalf("bilibili Shanghai degraded TTL = (%v, %v), want (15s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, nearExp), baseNow, true); !ok || ttl != 12*time.Second {
+		t.Fatalf("media safety margin must still beat 15s Shanghai cap: got (%v, %v), want (12s, true)", ttl, ok)
+	}
+	if ttl, ok := computeCacheTTLForResult("douyin", makeSyntheticEnvelope("douyin", "https://www.douyin.com/video/1", startUnix, tooSoon), baseNow, true); ok || ttl != 0 {
+		t.Fatalf("sub-10s safety margin must remain uncached even on Shanghai fallback: got (%v, %v)", ttl, ok)
+	}
+
+	// 2. End-to-end Handler test: degraded Douyin parse (marked via unified.MarkShanghaiFallback) expires at +15s,
+	//    then recovers cleanly and caches for 600s!
+	c := loadCacheTestCatalog(t)
+	var nowSec atomic.Int64
+	nowSec.Store(startUnix)
+	var degraded atomic.Bool
+	degraded.Store(true)
+	var calls atomic.Int32
+
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(ctx context.Context, src string, now int64) (unified.Object, error) {
+			calls.Add(1)
+			if degraded.Load() {
+				unified.MarkShanghaiFallback(ctx)
+			}
+			exp := time.Unix(now+3600, 0).UTC().Format(time.RFC3339)
+			return makeSyntheticEnvelope("douyin", src, now, exp), nil
+		}),
+	}, func() time.Time { return time.Unix(nowSec.Load(), 0).UTC() }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqPath := "/api/parse?schema_version=1.0&url=https://www.douyin.com/video/7704056737233499999"
+	// Initial degraded call
+	if w := httptest.NewRecorder(); func() int { h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil)); return w.Code }() != http.StatusOK {
+		t.Fatal("initial degraded call failed")
+	}
+	// At +14s: still hits 15s degraded cache.
+	nowSec.Store(startUnix + 14)
+	if w := httptest.NewRecorder(); func() int { h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil)); return w.Code }() != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("expected degraded cache hit at +14s, calls=%d", calls.Load())
+	}
+	// Shanghai recovers; at +15s degraded cache expires and re-parses!
+	degraded.Store(false)
+	nowSec.Store(startUnix + 15)
+	if w := httptest.NewRecorder(); func() int { h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil)); return w.Code }() != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("expected degraded cache expiry at +15s, calls=%d", calls.Load())
+	}
+	// Healthy result is now cached for 600s (+15s -> +614s stays hit, +615s expires).
+	nowSec.Store(startUnix + 15 + 599)
+	if w := httptest.NewRecorder(); func() int { h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil)); return w.Code }() != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("expected recovered cache hit through +599s, calls=%d", calls.Load())
+	}
+	nowSec.Store(startUnix + 15 + 600)
+	if w := httptest.NewRecorder(); func() int { h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil)); return w.Code }() != http.StatusOK || calls.Load() != 3 {
+		t.Fatalf("expected recovered cache expiry at +600s, calls=%d", calls.Load())
+	}
 }

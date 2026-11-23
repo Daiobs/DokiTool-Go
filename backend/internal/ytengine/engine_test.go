@@ -2,6 +2,7 @@
 package ytengine
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -2819,5 +2820,208 @@ esac
 	eErr = nil
 	if !errors.As(err, &eErr) || !eErr.UnsupportedURL || eErr.Extractor != "" {
 		t.Fatalf("unsupported err = %#v, want UnsupportedURL=true Extractor=''", eErr)
+	}
+}
+
+func buildRealPythonZipapp(t *testing.T, mainPy string, helperPy string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.WriteString("#!/usr/bin/env python3\n")
+	zw := zip.NewWriter(&buf)
+	for name, body := range map[string]string{
+		"__main__.py": mainPy,
+		"helper.py":   helperPy,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zipapp archive: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestRealPythonZipappZeroExtractionAndSafeEnvPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix python3 zipapp fixture")
+	}
+
+	// 1. OfficialSHA256Sums must pin the official zero-extraction "yt-dlp" zipapp asset.
+	hasOfficialZipapp := false
+	for _, asset := range OfficialSHA256Sums {
+		if asset == "yt-dlp" {
+			hasOfficialZipapp = true
+			break
+		}
+	}
+	if !hasOfficialZipapp {
+		t.Fatal("OfficialSHA256Sums is missing pinned zero-extraction \"yt-dlp\" zipapp asset")
+	}
+
+	realPython3 := lookupPython3InPath(os.Getenv("PATH"))
+	if realPython3 == "" {
+		t.Skip("python3 not found in PATH")
+	}
+
+	// 2. Prepare poisoned PATH components: relative ".", world-writable dir with fake python3, and non-executable python3.
+	worldWritableDir := filepath.Join(t.TempDir(), "world-writable")
+	if err := os.Mkdir(worldWritableDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(worldWritableDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	hijackPy := filepath.Join(worldWritableDir, "python3")
+	if err := os.WriteFile(hijackPy, []byte("#!/bin/sh\necho hijacked >&2\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	nonExecDir := t.TempDir()
+	nonExecPy := filepath.Join(nonExecDir, "python3")
+	if err := os.WriteFile(nonExecPy, []byte("#!/bin/sh\nexit 98\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	poisonedPath := strings.Join([]string{
+		".",
+		"relative/bin",
+		worldWritableDir,
+		nonExecDir,
+		os.Getenv("PATH"),
+	}, string(os.PathListSeparator))
+
+	gotPy := lookupPython3InPath(poisonedPath)
+	if gotPy == "" || gotPy == hijackPy || gotPy == nonExecPy {
+		t.Fatalf("lookupPython3InPath selected unsafe candidate %q (hijack=%q nonExec=%q)", gotPy, hijackPy, nonExecPy)
+	}
+	sanitized := safeEnvPath(poisonedPath)
+	for _, seg := range filepath.SplitList(sanitized) {
+		if seg == "." || seg == "relative/bin" || seg == worldWritableDir {
+			t.Fatalf("safeEnvPath retained unsafe PATH segment %q in %q", seg, sanitized)
+		}
+	}
+	if fallbackPath := safeEnvPath(""); fallbackPath != defaultSafeEnvPath {
+		t.Fatalf("safeEnvPath(\"\") = %q, want %q", fallbackPath, defaultSafeEnvPath)
+	}
+
+	// 3. Build a genuine archive/zip Python zipapp (mode 0755 & 0644) and verify isolated execution + zero .pyc writes.
+	helperPy := "MARKER = 'zipapp-helper-ok'\n"
+	mainPy := fmt.Sprintf(`import json, os, sys
+import helper
+
+if '--version' in sys.argv:
+    print(%q)
+    sys.exit(0)
+
+if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':
+    sys.stderr.write('missing PYTHONDONTWRITEBYTECODE=1\n')
+    sys.exit(2)
+if os.environ.get('PYTHONNOUSERSITE') != '1':
+    sys.stderr.write('missing PYTHONNOUSERSITE=1\n')
+    sys.exit(3)
+
+path_entries = os.environ.get('PATH', '').split(os.pathsep)
+if '.' in path_entries or %q in path_entries:
+    sys.stderr.write('unsafe PATH leaked: ' + os.environ.get('PATH', '') + '\n')
+    sys.exit(4)
+
+print(json.dumps({
+    'id': 'real-zipapp-1',
+    'title': helper.MARKER,
+    'formats': [{
+        'format_id': '18',
+        'url': 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18',
+        'ext': 'mp4',
+        'protocol': 'https',
+        'width': 1280,
+        'height': 720,
+        'vcodec': 'avc1.42001E',
+        'acodec': 'mp4a.40.2',
+    }],
+}))
+`, PinnedVersion, worldWritableDir)
+
+	zipBytes := buildRealPythonZipapp(t, mainPy, helperPy)
+	sum := sha256.Sum256(zipBytes)
+	digest := hex.EncodeToString(sum[:])
+
+	for _, mode := range []os.FileMode{0o644, 0o755} {
+		zipDir := t.TempDir()
+		zipPath := filepath.Join(zipDir, "yt-dlp")
+		if err := os.WriteFile(zipPath, zipBytes, mode); err != nil {
+			t.Fatal(err)
+		}
+		eng, err := New(Config{
+			BinaryPath:    zipPath,
+			AllowedHashes: map[string]string{digest: "yt-dlp"},
+			EnvPath:       poisonedPath,
+		})
+		if err != nil || !eng.Enabled() {
+			t.Fatalf("mode %#o: expected real zipapp engine to be enabled, got err=%v", mode, err)
+		}
+		if !eng.UsingPythonZipapp() {
+			t.Fatalf("mode %#o: expected UsingPythonZipapp() == true", mode)
+		}
+		info, err := eng.Extract(context.Background(), "https://www.youtube.com/watch?v=aqz-KE-bpKQ")
+		if err != nil || info == nil || info.ID != "real-zipapp-1" || info.Title != "zipapp-helper-ok" {
+			t.Fatalf("mode %#o: real zipapp extraction failed: info=%+v err=%v", mode, info, err)
+		}
+		entries, err := os.ReadDir(zipDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".pyc") || entry.Name() == "__pycache__" {
+				t.Fatalf("mode %#o: unexpected bytecode artifact written in zipapp dir: %s", mode, entry.Name())
+			}
+		}
+	}
+
+	// 4. Executable #!/usr/bin/env python3 script (non-zipapp) executes directly under buildIsolatedEnv with sanitized PATH.
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "yt-dlp")
+	scriptBody := fmt.Sprintf(`#!/usr/bin/env python3
+import json, os, sys
+if %q in os.environ.get('PATH', '').split(os.pathsep):
+    sys.exit(5)
+print(json.dumps({
+    'id': 'env-python3-script',
+    'title': 'Env Python3 Script',
+    'formats': [{
+        'format_id': '18',
+        'url': 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18',
+        'ext': 'mp4',
+        'protocol': 'https',
+        'width': 1280,
+        'height': 720,
+        'vcodec': 'avc1.42001E',
+        'acodec': 'mp4a.40.2',
+    }],
+}))
+`, worldWritableDir)
+	if err := os.WriteFile(scriptPath, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptSum := sha256.Sum256([]byte(scriptBody))
+	scriptDigest := hex.EncodeToString(scriptSum[:])
+	scriptEng, err := New(Config{
+		BinaryPath:    scriptPath,
+		AllowedHashes: map[string]string{scriptDigest: "yt-dlp"},
+		EnvPath:       poisonedPath,
+	})
+	if err != nil || !scriptEng.Enabled() {
+		t.Fatalf("expected #!/usr/bin/env python3 script engine to be enabled, got err=%v", err)
+	}
+	if scriptEng.UsingPythonZipapp() {
+		t.Fatal("expected UsingPythonZipapp() == false for executable plain python3 script without zip payload")
+	}
+	scriptInfo, err := scriptEng.Extract(context.Background(), "https://www.youtube.com/watch?v=aqz-KE-bpKQ")
+	if err != nil || scriptInfo == nil || scriptInfo.ID != "env-python3-script" {
+		t.Fatalf("expected #!/usr/bin/env python3 direct execution to succeed, got info=%+v err=%v", scriptInfo, err)
 	}
 }

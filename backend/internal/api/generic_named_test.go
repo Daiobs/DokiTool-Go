@@ -570,12 +570,12 @@ func TestGenericShortTTLCacheCapAndDynamicTelemetry(t *testing.T) {
 		mu.Unlock()
 	}
 
-	// Unit check: computeCacheTTLForPlatform caps PlatformGeneric OK responses at defaultCacheTTL (60s)
-	// even when earliest_expires_at is 5 minutes ahead (where core platforms get 180s).
-	longExpiry := nowTime.Add(5 * time.Minute).Format(time.RFC3339)
+	// Unit check: computeCacheTTLForPlatform caps PlatformGeneric OK responses at genericCacheTTL (60s)
+	// even when earliest_expires_at is 15 minutes ahead (where core platforms get maxCacheTTL 600s).
+	longExpiry := nowTime.Add(15 * time.Minute).Format(time.RFC3339)
 	genPayload := makeGenericOKPayload("vimeo", "https://vimeo.com/314159", nowTime.Unix(), longExpiry)
-	if ttl, ok := computeCacheTTLForPlatform(PlatformGeneric, genPayload, nowTime); !ok || ttl != defaultCacheTTL {
-		t.Fatalf("PlatformGeneric capped TTL = (%v, %v), want (%v, true)", ttl, ok, defaultCacheTTL)
+	if ttl, ok := computeCacheTTLForPlatform(PlatformGeneric, genPayload, nowTime); !ok || ttl != genericCacheTTL {
+		t.Fatalf("PlatformGeneric capped TTL = (%v, %v), want (%v, true)", ttl, ok, genericCacheTTL)
 	}
 	if ttl, ok := computeCacheTTLForPlatform("douyin", genPayload, nowTime); !ok || ttl != maxCacheTTL {
 		t.Fatalf("Tier-1 douyin TTL = (%v, %v), want (%v, true)", ttl, ok, maxCacheTTL)

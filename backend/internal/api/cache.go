@@ -28,8 +28,10 @@ const (
 	minCacheMaxBytes     int64 = 1024      // 1 KiB
 	maxCacheMaxBytes     int64 = 512 << 20 // 512 MiB
 
-	defaultCacheTTL            = 60 * time.Second
-	maxCacheTTL                = 180 * time.Second
+	defaultCacheTTL            = 300 * time.Second
+	maxCacheTTL                = 600 * time.Second
+	genericCacheTTL            = 60 * time.Second
+	shanghaiFallbackCacheTTL   = 15 * time.Second
 	minCacheTTL                = 10 * time.Second
 	expirySafetyMargin         = 60 * time.Second
 	contentUnavailableCacheTTL = 10 * time.Second
@@ -446,21 +448,36 @@ func normalizeCacheURL(platform, source string) string {
 }
 
 // computeCacheTTLForPlatform applies computeCacheTTL and caps successful
-// Tier-2 generic fallback responses at defaultCacheTTL (60s) for short-TTL
+// Tier-2 generic fallback responses at genericCacheTTL (60s) for short-TTL
 // long-tail caching.
 func computeCacheTTLForPlatform(platform string, payload unified.Object, now time.Time) (time.Duration, bool) {
+	return computeCacheTTLForResult(platform, payload, now, false)
+}
+
+// computeCacheTTLForResult applies tiered caching TTLs:
+//   - Core OK responses: up to 600s (clamped by earliest_expires_at - now - 60s),
+//     or 300s default when no expires_at is present.
+//   - Tier-2 generic OK responses: capped at 60s.
+//   - Shanghai-enabled platforms (Douyin / Bilibili) that degraded/fell back to
+//     overseas routes: capped at 15s so the cache self-heals promptly on recovery.
+func computeCacheTTLForResult(platform string, payload unified.Object, now time.Time, shanghaiFallback bool) (time.Duration, bool) {
 	ttl, ok := computeCacheTTL(payload, now)
 	if !ok {
 		return 0, false
 	}
-	if platform == PlatformGeneric && unified.Str(payload["code"]) == "OK" && ttl > defaultCacheTTL {
-		ttl = defaultCacheTTL
+	if unified.Str(payload["code"]) == "OK" {
+		if platform == PlatformGeneric && ttl > genericCacheTTL {
+			ttl = genericCacheTTL
+		}
+		if shanghaiFallback && (platform == "douyin" || platform == "bilibili") && ttl > shanghaiFallbackCacheTTL {
+			ttl = shanghaiFallbackCacheTTL
+		}
 	}
 	return ttl, true
 }
 
-// computeCacheTTL implements the Issue #102 PR 1 caching policy:
-//   - code == "OK": TTL = min(180s, earliest_expires_at - now - 60s), or 60s
+// computeCacheTTL implements tiered caching TTL bounds:
+//   - code == "OK": TTL = min(600s, earliest_expires_at - now - 60s), or 300s
 //     when no expires_at exists anywhere in the response; skip if TTL < 10s.
 //   - code == "CONTENT_UNAVAILABLE": TTL = 10s.
 //   - all other codes: never cached.

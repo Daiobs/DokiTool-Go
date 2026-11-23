@@ -16,6 +16,12 @@ const STALLED_MS = 15_000;
 const SPEED_WINDOW_MS = 2000;
 const CLAIM_MS = 60_000;
 const RETAIN_MS = HISTORY_MS;
+const RANGE_THRESHOLD_BYTES = 4 * 1024 * 1024;
+const RANGE_CHUNK_SIZE = 2 * 1024 * 1024;
+const MAX_RANGE_CONCURRENCY = 4;
+const MAX_WINDOW_CHUNKS = 4;
+const RANGE_DELIVER_SLICE_BYTES = 256 * 1024;
+const MAX_RANGE_CHUNK_RETRIES = 2;
 const tasks = new Map();
 const history = new Map();
 const queue = [];
@@ -173,7 +179,13 @@ function settle(task, status, error) {
     task.outputController?.error(status === "cancelled" ? abortError() : new Error(error || "下载失败"));
   }
   task.outputController = undefined;
+  task.range?.abort();
+  task.range = undefined;
   task.controller.abort();
+  task.cleanupInitialAttempt?.();
+  task.cleanupInitialAttempt = undefined;
+  task.initialAttempt?.abort();
+  task.initialAttempt = undefined;
   const reader = task.reader;
   task.reader = undefined;
   void reader?.cancel().catch(() => {}).finally(() => { reader.releaseLock(); });
@@ -226,6 +238,276 @@ async function timed(task, operation) {
   }
 }
 
+function parseContentRange(header) {
+  if (typeof header !== "string") return null;
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec(header.trim());
+  if (!match) return null;
+  const start = Number(match[1]), end = Number(match[2]), total = Number(match[3]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || !Number.isSafeInteger(total) ||
+      start < 0 || end < start || total <= 0 || end >= total) return null;
+  return { start, end, total };
+}
+
+function strongETag(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed && !/^w\//i.test(trimmed) ? trimmed : "";
+}
+
+function hasNonIdentityEncoding(headers) {
+  const enc = headers.get("content-encoding")?.trim().toLowerCase() || "";
+  return enc !== "" && enc !== "identity";
+}
+
+function parsePositiveIntHeader(headers, name) {
+  const raw = headers.get(name)?.trim() || "";
+  if (!/^\d+$/.test(raw)) return 0;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function acceptsByteRanges(headers, allowOmitted = false) {
+  const raw = headers.get("accept-ranges")?.trim().toLowerCase() || "";
+  if (!raw) return allowOmitted;
+  const tokens = raw.split(",").map(token => token.trim()).filter(Boolean);
+  if (!tokens.length || tokens.includes("none")) return false;
+  return tokens.includes("bytes");
+}
+
+function createRangeScheduler(task, config) {
+  const { url, total, chunk0End } = config;
+  const totalRangeChunks = Math.ceil((total - chunk0End) / RANGE_CHUNK_SIZE);
+  const rangeController = new AbortController();
+  const activeControllers = new Set();
+  const activeReaders = new Set();
+  const inFlight = new Set();
+  const buffered = new Map();
+  let state = "idle"; // "idle" | "probing" | "active" | "fallback" | "failed" | "aborted"
+  let switched = false;
+  let expectedETag = config.initialETag;
+  let nextScheduleIdx = 0;
+  let nextDeliverIdx = 0;
+  let deliverOffset = 0;
+  let fatalError = null;
+  let waiter = null;
+
+  function clearWaiter(err) {
+    if (!waiter) return;
+    const current = waiter;
+    waiter = null;
+    if (err) current.reject(err);
+    else current.resolve();
+  }
+
+  function cancelAllWorkers() {
+    rangeController.abort();
+    for (const ctrl of [...activeControllers]) ctrl.abort();
+    activeControllers.clear();
+    for (const reader of [...activeReaders]) void reader.cancel().catch(() => {});
+    activeReaders.clear();
+    inFlight.clear();
+    buffered.clear();
+  }
+
+  function fallback() {
+    if (state === "fallback" || state === "failed" || state === "aborted") return;
+    state = "fallback";
+    cancelAllWorkers();
+    clearWaiter();
+  }
+
+  function fail(error) {
+    if (state === "failed" || state === "aborted") return;
+    state = "failed";
+    fatalError = error instanceof Error ? error : new Error(String(error || "分片下载失败"));
+    cancelAllWorkers();
+    clearWaiter(fatalError);
+  }
+
+  function abort() {
+    if (state === "aborted") return;
+    state = "aborted";
+    cancelAllWorkers();
+    clearWaiter(abortError());
+  }
+
+  function pump() {
+    if (state !== "active" || rangeController.signal.aborted || task.controller.signal.aborted) return;
+    while (
+      nextScheduleIdx < totalRangeChunks &&
+      inFlight.size < MAX_RANGE_CONCURRENCY &&
+      (nextScheduleIdx - nextDeliverIdx) < MAX_WINDOW_CHUNKS
+    ) {
+      const idx = nextScheduleIdx++;
+      void fetchChunk(idx, false);
+    }
+  }
+
+  async function fetchChunk(idx, isProbe) {
+    const start = chunk0End + idx * RANGE_CHUNK_SIZE;
+    const end = Math.min(total - 1, start + RANGE_CHUNK_SIZE - 1);
+    const expectedLen = end - start + 1;
+    inFlight.add(idx);
+
+    const nonRetryable = message => Object.assign(new Error(message), { retryable: false });
+
+    try {
+      for (let attempt = 0; ; attempt++) {
+        if (rangeController.signal.aborted || task.controller.signal.aborted) return;
+        const reqCtrl = new AbortController();
+        const onAbort = () => reqCtrl.abort();
+        activeControllers.add(reqCtrl);
+        rangeController.signal.addEventListener("abort", onAbort, { once: true });
+        task.controller.signal.addEventListener("abort", onAbort, { once: true });
+        let reader;
+        try {
+          const resp = await fetch(url, {
+            signal: reqCtrl.signal,
+            mode: "cors",
+            credentials: "omit",
+            referrerPolicy: "no-referrer",
+            cache: "no-store",
+            headers: { Range: `bytes=${start}-${end}` },
+          });
+          if (rangeController.signal.aborted || task.controller.signal.aborted) {
+            void resp?.body?.cancel?.().catch(() => {});
+            return;
+          }
+          if (resp.status !== 206 || resp.type === "opaque" || !resp.body) {
+            void resp?.body?.cancel?.().catch(() => {});
+            throw nonRetryable(`分片响应异常（HTTP ${resp.status}）`);
+          }
+          if (hasNonIdentityEncoding(resp.headers)) {
+            void resp.body.cancel().catch(() => {});
+            throw nonRetryable("分片响应包含不支持的压缩编码");
+          }
+          const cr = parseContentRange(resp.headers.get("content-range"));
+          if (!cr || cr.start !== start || cr.end !== end || cr.total !== total) {
+            void resp.body.cancel().catch(() => {});
+            throw nonRetryable("分片范围与来源声明不一致");
+          }
+          const rawCL = resp.headers.get("content-length")?.trim();
+          if (rawCL && (!/^\d+$/.test(rawCL) || Number(rawCL) !== expectedLen)) {
+            void resp.body.cancel().catch(() => {});
+            throw nonRetryable("分片长度与来源声明不一致");
+          }
+          const rawETag = resp.headers.get("etag")?.trim() || "";
+          const chunkStrong = strongETag(rawETag);
+          if (expectedETag) {
+            if (rawETag && rawETag !== expectedETag) {
+              void resp.body.cancel().catch(() => {});
+              throw nonRetryable("资源 ETag 已变化，请重新下载");
+            }
+          } else if (chunkStrong) {
+            expectedETag = chunkStrong;
+          }
+
+          if (isProbe && state === "probing") {
+            state = "active";
+            pump();
+          }
+
+          const buf = new Uint8Array(expectedLen);
+          let offset = 0;
+          reader = resp.body.getReader();
+          activeReaders.add(reader);
+          for (;;) {
+            if (rangeController.signal.aborted || task.controller.signal.aborted) return;
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value?.length) continue;
+            if (offset + value.length > expectedLen) {
+              throw nonRetryable("分片长度超出来源声明");
+            }
+            buf.set(value, offset);
+            offset += value.length;
+          }
+          if (rangeController.signal.aborted || task.controller.signal.aborted) return;
+          if (offset !== expectedLen) {
+            throw new Error("分片传输不完整");
+          }
+          if (state !== "active") return;
+          buffered.set(idx, buf);
+          inFlight.delete(idx);
+          if (idx === nextDeliverIdx) clearWaiter();
+          pump();
+          return;
+        } catch (error) {
+          if (rangeController.signal.aborted || task.controller.signal.aborted) return;
+          if (!switched) {
+            fallback();
+            return;
+          }
+          const canRetry = error?.retryable !== false && attempt < MAX_RANGE_CHUNK_RETRIES;
+          if (!canRetry) {
+            fail(error);
+            return;
+          }
+        } finally {
+          rangeController.signal.removeEventListener("abort", onAbort);
+          task.controller.signal.removeEventListener("abort", onAbort);
+          activeControllers.delete(reqCtrl);
+          if (reader) {
+            activeReaders.delete(reader);
+            void reader.cancel().catch(() => {}).finally(() => { try { reader.releaseLock(); } catch {} });
+          }
+        }
+      }
+    } finally {
+      inFlight.delete(idx);
+    }
+  }
+
+  return {
+    chunk0End,
+    isProbing: () => state === "probing",
+    isActive: () => state === "active",
+    hasReadySlice: () => state === "failed" || buffered.has(nextDeliverIdx) || nextDeliverIdx >= totalRangeChunks,
+    startProbe() {
+      if (state !== "idle") return;
+      state = "probing";
+      nextScheduleIdx = 1;
+      void fetchChunk(0, true);
+    },
+    commitSwitch() {
+      switched = true;
+      if (!task.state.total && total > 0) task.state.total = total;
+      const reader = task.reader;
+      task.reader = undefined;
+      void reader?.cancel().catch(() => {}).finally(() => { try { reader.releaseLock(); } catch {} });
+      task.cleanupInitialAttempt?.();
+      task.cleanupInitialAttempt = undefined;
+      task.initialAttempt?.abort();
+      task.initialAttempt = undefined;
+      pump();
+    },
+    fallback,
+    abort,
+    waitReady() {
+      if (task.controller.signal.aborted || state === "aborted") return Promise.reject(abortError());
+      if (fatalError) return Promise.reject(fatalError);
+      if (buffered.has(nextDeliverIdx) || nextDeliverIdx >= totalRangeChunks) return Promise.resolve();
+      return new Promise((resolve, reject) => { waiter = { resolve, reject }; });
+    },
+    nextSlice() {
+      if (task.controller.signal.aborted || state === "aborted") throw abortError();
+      if (fatalError) throw fatalError;
+      if (nextDeliverIdx >= totalRangeChunks) return { done: true };
+      const chunk = buffered.get(nextDeliverIdx);
+      if (!chunk) return null;
+      const sliceEnd = Math.min(chunk.length, deliverOffset + RANGE_DELIVER_SLICE_BYTES);
+      const slice = chunk.subarray(deliverOffset, sliceEnd);
+      deliverOffset = sliceEnd;
+      if (deliverOffset >= chunk.length) {
+        buffered.delete(nextDeliverIdx);
+        nextDeliverIdx++;
+        deliverOffset = 0;
+        pump();
+      }
+      return { done: false, value: slice };
+    },
+  };
+}
+
 function mediaHeaders(response, filename, formatMime, sourceSize) {
   if (response.status !== 200 || response.headers.has("content-range") || response.type === "opaque" || !response.body) throw new Error(`资源不是完整文件响应（HTTP ${response.status}）`);
   const format = attachmentFormat(filename, response.headers.get("content-type"), formatMime, { allowUnknownMedia: true });
@@ -244,8 +526,9 @@ async function prepare(task) {
     try {
       task.state.url = url;
       publish(task, true);
+      const credentials = new URL(url).origin === self.location.origin ? "same-origin" : "omit";
       response = await timed(task, () => fetch(url, {
-        signal: attempt.signal, mode: "cors", credentials: new URL(url).origin === self.location.origin ? "same-origin" : "omit",
+        signal: attempt.signal, mode: "cors", credentials,
         referrerPolicy: "no-referrer", cache: "no-store",
       }));
       const metadata = mediaHeaders(response, task.state.filename, task.formatMime, task.sourceSizes?.[url]);
@@ -257,14 +540,38 @@ async function prepare(task) {
       if (metadata.total && first.value.length > metadata.total) throw new Error("下载长度与来源声明不一致");
       if (task.controller.signal.aborted) throw abortError();
       Object.assign(task.state, metadata);
+      task.initialAttempt = attempt;
+      task.cleanupInitialAttempt = () => task.controller.signal.removeEventListener("abort", abortAttempt);
+      const rangeAllowedByHeaders =
+        credentials === "omit" &&
+        !hasNonIdentityEncoding(response.headers) &&
+        acceptsByteRanges(response.headers, true);
+      const rangeCandidateTotal = metadata.total > 0
+        ? metadata.total
+        : (rangeAllowedByHeaders ? parsePositiveIntHeader(response.headers, "content-length") : 0);
+      const rangeEligible =
+        rangeAllowedByHeaders &&
+        rangeCandidateTotal >= RANGE_THRESHOLD_BYTES &&
+        first.value.length < rangeCandidateTotal;
+      const chunk0End = rangeEligible
+        ? Math.min(rangeCandidateTotal, Math.max(RANGE_CHUNK_SIZE, first.value.length))
+        : 0;
+      const rangeConfig = rangeEligible && chunk0End < rangeCandidateTotal ? {
+        url,
+        total: rangeCandidateTotal,
+        chunk0End,
+        initialETag: strongETag(response.headers.get("etag")),
+      } : null;
       // Keep this attempt alive; cancelling the task aborts its source request as well.
-      return { first: first.value, mime: metadata.mime };
+      return { first: first.value, mime: metadata.mime, rangeConfig };
     } catch (error) {
       lastError = error;
       attempt.abort();
       void task.reader?.cancel().catch(() => {});
       if (!task.reader) void response?.body?.cancel().catch(() => {});
       task.reader = undefined;
+      task.initialAttempt = undefined;
+      task.cleanupInitialAttempt = undefined;
       task.controller.signal.removeEventListener("abort", abortAttempt);
       if (task.controller.signal.aborted) throw abortError();
     }
@@ -289,6 +596,9 @@ async function attachment(task) {
   if (task.controller.signal.aborted) throw abortError();
   task.timing = transferTiming(prepareStarted, performance.now());
   let first = prepared.first;
+  const range = prepared.rangeConfig ? createRangeScheduler(task, prepared.rangeConfig) : null;
+  task.range = range;
+  let deliveryMode = "initial";
   task.state.status = "downloading";
   task.transferStartedAt = Date.now();
   task.speedSamples = [{ at: task.transferStartedAt, loaded: 0 }];
@@ -299,10 +609,39 @@ async function attachment(task) {
       try {
         if (task.controller.signal.aborted) throw abortError();
         task.lastPullAt = Date.now();
-        task.timing?.pull(!!first);
-        const item = first ? { value: first, done: false } : await timed(task, () => task.reader.read());
-        task.timing?.received();
-        first = undefined;
+        if (deliveryMode === "initial" && range && !first && task.state.loaded === range.chunk0End) {
+          if (range.isActive()) {
+            range.commitSwitch();
+            deliveryMode = "range";
+          } else if (range.isProbing()) {
+            range.fallback();
+          }
+        }
+        let item;
+        if (deliveryMode === "range") {
+          const readyNow = range.hasReadySlice();
+          task.timing?.pull(readyNow);
+          if (!readyNow) await timed(task, () => range.waitReady());
+          task.timing?.received();
+          item = range.nextSlice();
+          if (!item) throw new Error("分片调度状态异常");
+        } else {
+          if (first && range) range.startProbe();
+          task.timing?.pull(!!first);
+          item = first ? { value: first, done: false } : await timed(task, () => task.reader.read());
+          task.timing?.received();
+          first = undefined;
+          if (!item.done && range && task.state.loaded + item.value.length >= range.chunk0End) {
+            if (range.isActive()) {
+              const keep = range.chunk0End - task.state.loaded;
+              if (keep < item.value.length) item = { value: item.value.subarray(0, keep), done: false };
+              range.commitSwitch();
+              deliveryMode = "range";
+            } else if (range.isProbing() && task.state.loaded + item.value.length > range.chunk0End) {
+              range.fallback();
+            }
+          }
+        }
         if (item.done) {
           if (!task.state.loaded || (task.state.total && task.state.loaded !== task.state.total)) throw new Error("下载不完整，请重新下载");
           controller.close();

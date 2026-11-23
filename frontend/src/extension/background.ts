@@ -292,6 +292,7 @@ export interface BackgroundControllerDeps {
   now?: () => number;
   offscreenIdleCloseMs?: number;
   badgeSuccessDurationMs?: number;
+  badgeProgressThrottleMs?: number;
   tabSyncDebounceMs?: number;
   youtubeTabSyncDebounceMs?: number;
   maxBatchDownloadConcurrency?: number;
@@ -309,6 +310,7 @@ export interface BackgroundController {
 }
 
 export const DEFAULT_ACTION_TITLE = "打开 DokiTool 侧边栏" as const;
+export const DEFAULT_BADGE_PROGRESS_THROTTLE_MS = 1_000 as const;
 
 export interface ActionIndicatorState {
   badgeText: string;
@@ -857,6 +859,10 @@ export function createBackgroundController(
   const offscreenIdleCloseMs =
     deps?.offscreenIdleCloseMs ?? OFFSCREEN_IDLE_CLOSE_MS;
   const badgeSuccessDurationMs = deps?.badgeSuccessDurationMs ?? 3_000;
+  const badgeProgressThrottleMs = Math.max(
+    0,
+    deps?.badgeProgressThrottleMs ?? DEFAULT_BADGE_PROGRESS_THROTTLE_MS,
+  );
   const tabSyncDebounceMs = deps?.tabSyncDebounceMs ?? TAB_SYNC_DEBOUNCE_MS;
   const youtubeTabSyncDebounceMs =
     deps?.youtubeTabSyncDebounceMs ?? YOUTUBE_TAB_SYNC_DEBOUNCE_MS;
@@ -876,6 +882,9 @@ export function createBackgroundController(
   let inFlightOffscreenRpcs = 0;
   let offscreenIdleTimer: ReturnType<typeof setTimeout> | null = null;
   let badgeClearTimer: ReturnType<typeof setTimeout> | null = null;
+  let badgeThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  let hasProgressBadgeFlushed = false;
+  let lastProgressBadgeFlushAt = 0;
   let tabSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let lastActionBadgeText: string | null = null;
   let lastActionBadgeColor: string | null = null;
@@ -979,10 +988,17 @@ export function createBackgroundController(
     });
   };
 
-  const updateBadge = (
+  const clearBadgeThrottleTimer = (): void => {
+    if (badgeThrottleTimer !== null) {
+      clearTimeout(badgeThrottleTimer);
+      badgeThrottleTimer = null;
+    }
+  };
+
+  const applyBadge = (
     terminalOutcome?: "completed" | "failed" | "clear",
-  ): void => {
-    if (disposed || !chromeApi.action) return;
+  ): boolean => {
+    if (disposed || !chromeApi.action) return false;
     // Preserve terminal "!" / "✓" indicators when a late cancel/abort callback
     // invokes `updateBadge()` without an explicit terminal outcome while idle.
     if (
@@ -990,7 +1006,7 @@ export function createBackgroundController(
       terminalOutcome === undefined &&
       (lastActionBadgeText === "!" || lastActionBadgeText === "✓")
     ) {
-      return;
+      return false;
     }
     const indicator = computeActionIndicator(getOrderedTasks(), terminalOutcome);
 
@@ -999,11 +1015,13 @@ export function createBackgroundController(
       badgeClearTimer = null;
     }
 
+    let emitted = false;
     if (
       indicator.badgeColor !== undefined &&
       indicator.badgeColor !== lastActionBadgeColor
     ) {
       lastActionBadgeColor = indicator.badgeColor;
+      emitted = true;
       void chromeApi.action.setBadgeBackgroundColor({
         color: indicator.badgeColor,
       });
@@ -1011,11 +1029,13 @@ export function createBackgroundController(
 
     if (indicator.badgeText !== lastActionBadgeText) {
       lastActionBadgeText = indicator.badgeText;
+      emitted = true;
       void chromeApi.action.setBadgeText({ text: indicator.badgeText });
     }
 
     if (indicator.title !== lastActionTitle) {
       lastActionTitle = indicator.title;
+      emitted = true;
       void chromeApi.action.setTitle?.({ title: indicator.title });
     }
 
@@ -1027,6 +1047,63 @@ export function createBackgroundController(
         }
       }, badgeSuccessDurationMs);
       (badgeClearTimer as { unref?: () => void })?.unref?.();
+    }
+
+    return emitted;
+  };
+
+  const updateBadge = (
+    terminalOutcome?: "completed" | "failed" | "clear",
+    options?: { progressOnly?: boolean },
+  ): void => {
+    if (disposed || !chromeApi.action) return;
+    const isProgressOnly =
+      options?.progressOnly === true && terminalOutcome === undefined;
+    if (
+      isProgressOnly &&
+      sidePanelPorts.size === 0 &&
+      badgeProgressThrottleMs > 0
+    ) {
+      const now = nowFn();
+      const elapsed = hasProgressBadgeFlushed
+        ? Math.max(0, now - lastProgressBadgeFlushAt)
+        : Number.POSITIVE_INFINITY;
+      if (elapsed < badgeProgressThrottleMs) {
+        if (badgeThrottleTimer === null) {
+          const waitMs = Math.max(1, badgeProgressThrottleMs - elapsed);
+          badgeThrottleTimer = setTimeout(() => {
+            badgeThrottleTimer = null;
+            if (disposed) return;
+            const emitted = applyBadge(undefined);
+            if (emitted) {
+              hasProgressBadgeFlushed = true;
+              lastProgressBadgeFlushAt = nowFn();
+            }
+          }, waitMs);
+          (badgeThrottleTimer as { unref?: () => void })?.unref?.();
+        }
+        return;
+      }
+      clearBadgeThrottleTimer();
+      const emitted = applyBadge(undefined);
+      if (emitted) {
+        hasProgressBadgeFlushed = true;
+        lastProgressBadgeFlushAt = now;
+      }
+      return;
+    }
+
+    clearBadgeThrottleTimer();
+    if (!isProgressOnly) {
+      hasProgressBadgeFlushed = false;
+      lastProgressBadgeFlushAt = 0;
+      applyBadge(terminalOutcome);
+    } else {
+      const emitted = applyBadge(undefined);
+      if (emitted) {
+        hasProgressBadgeFlushed = true;
+        lastProgressBadgeFlushAt = nowFn();
+      }
     }
   };
 
@@ -3702,6 +3779,7 @@ export function createBackgroundController(
         clearOffscreenIdleTimer();
         const task = tasks.get(msg.taskId);
         if (task && !FINISHED_TASK_STATUSES.has(task.status)) {
+          const prevStatus = task.status;
           tasks.set(msg.taskId, {
             ...task,
             status: msg.status,
@@ -3712,7 +3790,7 @@ export function createBackgroundController(
             speed: msg.speed,
             updatedAt: nowFn(),
           });
-          updateBadge();
+          updateBadge(undefined, { progressOnly: prevStatus === msg.status });
           await broadcastTasksUpdated();
         }
         return okRpc({ received: true });
@@ -4126,6 +4204,9 @@ export function createBackgroundController(
   chromeApi.runtime.onConnect?.addListener((port) => {
     if (port.name === SIDEPANEL_PORT_NAME) {
       sidePanelPorts.add(port);
+      if (badgeThrottleTimer !== null) {
+        updateBadge();
+      }
       port.onDisconnect?.addListener(() => {
         sidePanelPorts.delete(port);
       });
@@ -4237,6 +4318,7 @@ export function createBackgroundController(
       if (disposed) return;
       disposed = true;
       clearOffscreenIdleTimer();
+      clearBadgeThrottleTimer();
       if (badgeClearTimer !== null) {
         clearTimeout(badgeClearTimer);
         badgeClearTimer = null;
