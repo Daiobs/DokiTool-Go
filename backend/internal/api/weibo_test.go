@@ -130,9 +130,10 @@ func TestWeiboHTTPParseAndResolveSignedMedia(t *testing.T) {
 				if !ok || decoded["u"] != weiboCDNURL {
 					t.Fatal("signed ticket no longer verifies against original provider URL")
 				}
-				if strings.Contains(string(writerBody(payload)), weiboCDNURL) {
-					t.Fatal("public response leaked raw playable media URL")
+				if selected["direct_url"] != nil {
+					t.Fatal("default must stay on signed relay URL without direct_url")
 				}
+				sawDirectURL := false
 				for _, value := range unified.Slice(item["variants"]) {
 					variant := unified.Map(value)
 					for _, sourceValue := range unified.Slice(unified.Map(variant["delivery"])["sources"]) {
@@ -140,7 +141,18 @@ func TestWeiboHTTPParseAndResolveSignedMedia(t *testing.T) {
 						if source["access"] != "relay" && unified.SourceUsable(source, weiboFrozenNow) {
 							t.Fatal("ready source bypassed signing")
 						}
+						if source["access"] == "relay" {
+							if !strings.HasPrefix(unified.Str(source["url"]), "/api/media/weibo?ticket=") {
+								t.Fatalf("relay source url = %v, want signed ticket", source["url"])
+							}
+							if unified.Str(source["direct_url"]) == weiboCDNURL {
+								sawDirectURL = true
+							}
+						}
 					}
+				}
+				if !sawDirectURL {
+					t.Fatalf("expected verified HTTPS direct_url=%s on anonymous Weibo relay source", weiboCDNURL)
 				}
 			})
 		}

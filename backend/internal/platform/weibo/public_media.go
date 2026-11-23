@@ -2,11 +2,36 @@ package weibo
 
 import (
 	"context"
+	"net/url"
+	"strings"
 	"time"
 
 	media "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
+
+// upgradeWeiboHTTPToHTTPS losslessly upgrades cleartext http://*.weibocdn.com
+// URLs (without explicit ports, userinfo, fragments, or non-ASCII characters)
+// to https:// while preserving exact path, percent-encoding, and query bytes.
+func upgradeWeiboHTTPToHTTPS(raw string) string {
+	if len(raw) < 7 || !strings.EqualFold(raw[:7], "http://") {
+		return raw
+	}
+	for _, r := range raw {
+		if r <= 0x20 || r >= 0x7f || r == '\\' || r == '#' {
+			return raw
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || u.Port() != "" || strings.HasSuffix(u.Host, ":") {
+		return raw
+	}
+	host := strings.ToLower(u.Hostname())
+	if !strings.HasSuffix(host, ".weibocdn.com") || len(host) <= len(".weibocdn.com") {
+		return raw
+	}
+	return "https" + raw[4:]
+}
 
 // PreparePublicWithOwner dispatches authenticated owner requests to PrepareOwner
 // (direct provider URLs without relay ticket minting) while keeping anonymous
@@ -115,7 +140,7 @@ func signSource(source unified.Object, key string, now int64, recognized *int) {
 	if source == nil {
 		return
 	}
-	raw := unified.Str(source["url"])
+	raw := upgradeWeiboHTTPToHTTPS(unified.Str(source["url"]))
 	if !media.AllowedURL(raw) {
 		source["availability"] = "unavailable"
 		return
@@ -142,6 +167,7 @@ func signSource(source unified.Object, key string, now int64, recognized *int) {
 	}
 	source["url"] = ticket
 	source["access"] = "relay"
+	source["direct_url"] = raw
 	source["expires_at"] = time.Unix(expiry, 0).UTC().Format(time.RFC3339)
 }
 
@@ -171,11 +197,13 @@ func prepareOwnerSource(source unified.Object, recognized *int) {
 	if source == nil {
 		return
 	}
-	raw := unified.Str(source["url"])
+	raw := upgradeWeiboHTTPToHTTPS(unified.Str(source["url"]))
 	if !media.AllowedURL(raw) {
 		source["availability"] = "unavailable"
 		return
 	}
+	source["url"] = raw
+	delete(source, "direct_url")
 	*recognized = *recognized + 1
 	if previous, ok := source["expires_at"]; ok && previous != nil {
 		if _, err := time.Parse(time.RFC3339Nano, unified.Str(previous)); err != nil {

@@ -42,6 +42,7 @@ import {
   LOOPBACK_HOST_PERMISSIONS,
   validateApiBaseUrl,
 } from "./hostWhitelist";
+import { buildExtensionTargetContext } from "./uiTargetHelpers";
 import {
   COMMAND_OPEN_SIDEPANEL,
   CONTEXT_MENU_INSPECT_ID,
@@ -1476,7 +1477,7 @@ export function createBackgroundController(
     const validated = validateApiBaseUrl(settings.apiBaseUrl);
     const apiOrigin = validated.ok ? validated.origin : originalSpec.apiOrigin;
     const now = nowFn();
-    const targetCtx: TargetContext = { apiOrigin, now };
+    const targetCtx: TargetContext = buildExtensionTargetContext(apiOrigin, now);
 
     let freshMedia: UnifiedMedia;
     if (ctx.resolveUrl && ctx.resolveUrl.startsWith("/api/resolve?")) {

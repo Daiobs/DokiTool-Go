@@ -126,7 +126,7 @@ func TestHandlerWithDetailSupportsBilibiliAndRejectsInvalidTasks(t *testing.T) {
 		}
 		return fetch.Response{
 			StatusCode: http.StatusOK,
-			Body:       []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=4102444800&upsig=dom","backup_url":["http://cn-insecure.bilivideo.com/drop.mp4?deadline=4102444800","https://evilbilivideo.com/drop.mp4?deadline=4102444800"]}]}}`),
+			Body:       []byte(`{"code":0,"data":{"quality":64,"durl":[{"url":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-64.mp4?deadline=4102444800&upsig=dom","backup_url":["https://cn-zjhz-cu-01-01.bilivideo.com/drop-cn.mp4?deadline=4102444800","http://upos-sz-mirrorcos.bilivideo.com/drop.mp4?deadline=4102444800","https://evilbilivideo.com/drop.mp4?deadline=4102444800"]}]}}`),
 		}, nil
 	})
 	p := probe.New(exec, douyin.AllowedMediaURL).WithTimeout(shresolver.ProbeTimeout)

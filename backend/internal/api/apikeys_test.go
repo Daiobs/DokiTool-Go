@@ -450,13 +450,27 @@ func TestMultiKeyRolesDisabledPlatformScopeWeiboDirectAndStatsSchema(t *testing.
 	weiboTarget := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://weibo.com/1234567890/AbC")
 	for _, tok := range []string{ownerTok, agentTok, friendScopedTok} {
 		rec := sendReq(http.MethodGet, weiboTarget, "198.51.100.32", tok)
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "https://f.video.weibocdn.com/direct-hd.mp4") || strings.Contains(rec.Body.String(), "/api/media/weibo?ticket=") {
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "https://f.video.weibocdn.com/direct-hd.mp4") || strings.Contains(rec.Body.String(), "/api/media/weibo?ticket=") || strings.Contains(rec.Body.String(), `"direct_url"`) {
 			t.Fatalf("authenticated Weibo response did not return direct URL: code=%d body=%s", rec.Code, rec.Body.String())
 		}
 	}
 	recAnonWeibo := sendReq(http.MethodGet, weiboTarget, "198.51.100.33", "")
-	if recAnonWeibo.Code != http.StatusOK || strings.Contains(recAnonWeibo.Body.String(), "weibocdn.com") || !strings.Contains(recAnonWeibo.Body.String(), "/api/media/weibo?ticket=") {
-		t.Fatalf("anonymous Weibo response did not use signed relay: code=%d body=%s", recAnonWeibo.Code, recAnonWeibo.Body.String())
+	if recAnonWeibo.Code != http.StatusOK {
+		t.Fatalf("anonymous Weibo response status=%d body=%s", recAnonWeibo.Code, recAnonWeibo.Body.String())
+	}
+	anonWeiboPayload, err := unified.Decode(recAnonWeibo.Body.Bytes())
+	if err != nil {
+		t.Fatalf("anonymous Weibo invalid JSON: %v", err)
+	}
+	anonWeiboItem := unified.Map(unified.Slice(unified.Map(anonWeiboPayload["data"])["items"])[0])
+	anonWeiboDef := unified.Map(anonWeiboItem["default"])
+	if anonWeiboDef["access"] != "relay" || !strings.HasPrefix(unified.Str(anonWeiboDef["url"]), "/api/media/weibo?ticket=") {
+		t.Fatalf("anonymous Weibo default did not use signed relay: %v", anonWeiboDef)
+	}
+	anonWeiboVariant := unified.Map(unified.Slice(anonWeiboItem["variants"])[0])
+	anonWeiboSrc := unified.Map(unified.Slice(unified.Map(anonWeiboVariant["delivery"])["sources"])[0])
+	if anonWeiboSrc["access"] != "relay" || !strings.HasPrefix(unified.Str(anonWeiboSrc["url"]), "/api/media/weibo?ticket=") || anonWeiboSrc["direct_url"] != "https://f.video.weibocdn.com/direct-hd.mp4?size=1080" {
+		t.Fatalf("anonymous Weibo source did not pair signed relay with direct_url: %v", anonWeiboSrc)
 	}
 
 	// 5. Inspect /api/stats JSON contract: exact 22 fields per api_keys entry, non-nil slice when empty, zero secrets.

@@ -186,6 +186,42 @@ class ContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     contract.validate(response)
 
+    def test_relay_direct_url_contract(self):
+        response = example(2)
+        source = variant(response)['delivery']['sources'][0]
+        source.update(
+            url='/api/media/weibo?ticket=abc.def',
+            access='relay',
+            direct_url='https://f.video.weibocdn.com/hd.mp4?token=1',
+        )
+        item(response)['default'].update(
+            url='/api/media/weibo?ticket=abc.def',
+            access='relay',
+        )
+        unchanged = deepcopy(response)
+        contract.validate(response)
+        self.assertEqual(response, unchanged)
+
+        for label, access, direct in [
+            ('non-relay', 'direct', 'https://f.video.weibocdn.com/hd.mp4'),
+            ('http-scheme', 'relay', 'http://f.video.weibocdn.com/hd.mp4'),
+            ('fragment', 'relay', 'https://f.video.weibocdn.com/hd.mp4#frag'),
+            ('userinfo', 'relay', 'https://user:pass@f.video.weibocdn.com/hd.mp4'),
+            ('relative-api', 'relay', '/api/media/weibo?ticket=abc'),
+            ('empty', 'relay', ''),
+        ]:
+            with self.subTest(case=label):
+                bad = example(2)
+                src = variant(bad)['delivery']['sources'][0]
+                if access == 'relay':
+                    src.update(url='/api/media/weibo?ticket=abc.def', access='relay', direct_url=direct)
+                    item(bad)['default'].update(url='/api/media/weibo?ticket=abc.def', access='relay')
+                else:
+                    src.update(url='https://media.example.test/video.mp4', access='direct', direct_url=direct)
+                    item(bad)['default'].update(url='https://media.example.test/video.mp4', access='direct')
+                with self.assertRaises(ValueError):
+                    contract.validate(bad)
+
     def test_reordering_and_browser_fetch_do_not_reselect(self):
         r = example(18)
         selected = deepcopy(item(r)['default'])

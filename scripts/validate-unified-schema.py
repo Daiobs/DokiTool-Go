@@ -95,6 +95,13 @@ def sources_valid(sources):
                         'credential fallback must have the same HTTPS origin')
                 require(alternate not in seen, 'duplicate credential fallback URL')
                 seen.add(alternate)
+        if 'direct_url' in source:
+            require(source.get('access', 'direct') == 'relay',
+                    'direct_url requires a relay source')
+            validate_url(source['direct_url'])
+            parsed_direct = urlsplit(source['direct_url'])
+            require(parsed_direct.scheme == 'https',
+                    'direct_url must use HTTPS')
 
 
 def requirements(delivery):

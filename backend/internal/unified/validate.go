@@ -64,6 +64,17 @@ func ValidateSource(source Object, generatedAt *int64) error {
 			seen[alternate] = true
 		}
 	}
+	if rawDirect, exists := source["direct_url"]; exists {
+		direct, ok := rawDirect.(string)
+		parsedDirect, parseErr := url.Parse(direct)
+		rawDirectParsed, rawOK := splitRawURL(direct)
+		if !ok || Str(source["access"]) != "relay" || unsafeURLByte(direct) ||
+			parseErr != nil || !rawOK || rawDirectParsed.userInfo ||
+			parsedDirect.Scheme != "https" || parsedDirect.User != nil || parsedDirect.Fragment != "" ||
+			MediaURL(direct) != direct {
+			return fmt.Errorf("direct_url requires a relay source and a valid direct HTTPS URL")
+		}
+	}
 	if nonNullField(source, "expires_at") {
 		if _, ok := parseContractTime(Str(source["expires_at"])); generatedAt == nil || !ok {
 			return fmt.Errorf("expiry needs valid generation time")

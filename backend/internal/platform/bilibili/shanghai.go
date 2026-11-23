@@ -49,12 +49,12 @@ var (
 	shanghaiBVID = regexp.MustCompile(`^BV1[0-9A-Za-z]{9}$`)
 )
 
-// ShanghaiDURLPiece holds validated https://*.bilivideo.com URLs for one MP4 segment.
+// ShanghaiDURLPiece holds validated https://upos-*.bilivideo.com URLs for one MP4 segment.
 type ShanghaiDURLPiece struct {
 	URLs []string `json:"urls"`
 }
 
-// ShanghaiDashTrack holds validated https://*.bilivideo.com URLs for one DASH video or audio track.
+// ShanghaiDashTrack holds validated https://upos-*.bilivideo.com URLs for one DASH video or audio track.
 type ShanghaiDashTrack struct {
 	ID      int64    `json:"id"`
 	CodecID int64    `json:"codecid,omitempty"`
@@ -431,6 +431,20 @@ func AllowedBrowserFetchURL(raw string) bool {
 	return hasSubdomain(host, ".bilivideo.com")
 }
 
+// AllowedShanghaiMediaURL reports whether raw is a direct HTTPS official national
+// UPOS backbone Bilibili CDN URL (strictly single-label https://upos-*.bilivideo.com).
+// Regional ISP edge nodes (cn-*.bilivideo.com), MCDN (*.mcdn.bilivideo.com),
+// *.bilivideo.cn, and third-party PCDN domains are strictly rejected so cross-ISP
+// TLS/connection stalls never enter Shanghai routes or become item.default.
+func AllowedShanghaiMediaURL(raw string) bool {
+	host, ok := httpsDirectHost(raw)
+	if !ok || !hasSubdomain(host, ".bilivideo.com") {
+		return false
+	}
+	prefix := host[:len(host)-len(".bilivideo.com")]
+	return !strings.Contains(prefix, ".") && strings.HasPrefix(prefix, "upos-") && len(prefix) > len("upos-")
+}
+
 // MediaURLDeadline extracts a single unambiguous 10-digit Unix epoch deadline
 // query parameter from a validated https://*.bilivideo.com URL.
 func MediaURLDeadline(raw string) (int64, bool) {
@@ -480,11 +494,11 @@ func parseMediaURLDeadline(raw string) (int64, bool) {
 	return exp, found
 }
 
-// ValidateShanghaiMediaURL checks that raw is a valid https://*.bilivideo.com URL
+// ValidateShanghaiMediaURL checks that raw is a valid https://upos-*.bilivideo.com URL
 // carrying a valid deadline query parameter. If raw has no deadline parameter at all,
 // requireDeadline controls whether it is rejected.
 func ValidateShanghaiMediaURL(raw string, requireDeadline bool) (int64, bool) {
-	if !AllowedBrowserFetchURL(raw) {
+	if !AllowedShanghaiMediaURL(raw) {
 		return 0, false
 	}
 	u, err := url.Parse(raw)
@@ -529,8 +543,8 @@ type shanghaiPlayFetchResult struct {
 }
 
 // FetchShanghaiPlay queries Bilibili's official non-VIP html5 playurl endpoint
-// for (bvid, cid) without cookies, validates every candidate URL against
-// https://*.bilivideo.com, and returns the bounded domestic stream set.
+// for (bvid, cid) without cookies, validates every candidate URL strictly against
+// https://upos-*.bilivideo.com, and returns the bounded domestic stream set.
 // Parallel DASH fetching defaults to disabled; use FetchShanghaiPlayWithOptions
 // to opt in.
 func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string, cid int64) (*ShanghaiPlay, error) {
@@ -539,13 +553,14 @@ func FetchShanghaiPlay(ctx context.Context, executor fetch.Executor, bvid string
 
 // FetchShanghaiPlayWithOptions queries Bilibili's official non-VIP playurl
 // endpoints for (bvid, cid) without cookies, validates every candidate URL
-// against https://*.bilivideo.com (prioritizing upos-*.bilivideo.com for DASH
-// and discarding any non-conforming URL), and returns the bounded domestic
-// stream set. When opts.EnableDASH is false, strictly the single html5 durl
-// request is issued. When opts.EnableDASH is true, html5 durl and DASH
-// try_look=1 run in parallel with a bounded grace timeout once domestic durl
-// succeeds; partial failure is tolerated when at least one validated domestic
-// route is obtained.
+// strictly against https://upos-*.bilivideo.com (rejecting regional cn-* edge
+// nodes, MCDN, and PCDN hosts), and returns the bounded domestic stream set.
+// When opts.EnableDASH is false, strictly the single html5 durl request is
+// issued. When opts.EnableDASH is true, html5 durl and DASH try_look=1 run in
+// parallel with a bounded grace timeout once domestic durl succeeds; partial
+// failure is tolerated when at least one validated domestic UPOS route is
+// obtained. If no valid upos-*.bilivideo.com route exists, an error is returned
+// so Japan cleanly falls back to overseas routes.
 func FetchShanghaiPlayWithOptions(ctx context.Context, executor fetch.Executor, bvid string, cid int64, opts ShanghaiPlayOptions) (*ShanghaiPlay, error) {
 	if executor == nil || !ValidBVID(bvid) || !ValidCID(cid) {
 		return nil, errInvalidShanghaiInput
@@ -683,7 +698,7 @@ func extractShanghaiDURLPieces(durlData object) (int64, []ShanghaiDURLPiece) {
 		if part == nil {
 			return 0, nil
 		}
-		urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]), false)
+		urls := collectValidDomesticURLs(part["url"], unified.Slice(part["backup_url"]))
 		if len(urls) == 0 {
 			return 0, nil
 		}
@@ -748,7 +763,7 @@ func extractShanghaiDashTracks(entries array) []ShanghaiDashTrack {
 		codecs := sanitizeASCIIField(unified.Str(raw["codecs"]), 64)
 		primary := pick(raw["baseUrl"], raw["base_url"], "")
 		backups := unified.Slice(pick(raw["backupUrl"], raw["backup_url"]))
-		urls := collectValidDomesticURLs(primary, backups, true)
+		urls := collectValidDomesticURLs(primary, backups)
 		if len(urls) == 0 {
 			continue
 		}
@@ -762,48 +777,31 @@ func extractShanghaiDashTracks(entries array) []ShanghaiDashTrack {
 	return tracks
 }
 
-func collectValidDomesticURLs(primary any, backups array, prioritizeUPOS bool) []string {
-	var upos, other []string
+func collectValidDomesticURLs(primary any, backups array) []string {
+	var out []string
 	seen := map[string]bool{}
 	add := func(candidate any) {
+		if len(out) >= MaxShanghaiTrackURLs {
+			return
+		}
 		raw, ok := candidate.(string)
 		if !ok || raw == "" || seen[raw] {
 			return
 		}
-		// Pre-return check on Shanghai: require https + *.bilivideo.com subdomain
-		// and reject any malformed deadline query parameter if present.
+		// Pre-return check on Shanghai: require official national UPOS backbone
+		// https://upos-*.bilivideo.com and reject any malformed deadline query parameter.
 		if _, valid := ValidateShanghaiMediaURL(raw, false); !valid {
 			return
 		}
 		seen[raw] = true
-		if prioritizeUPOS {
-			if host, ok := httpsDirectHost(raw); ok && strings.HasPrefix(host, "upos-") {
-				upos = append(upos, raw)
-				return
-			}
-		}
-		other = append(other, raw)
+		out = append(out, raw)
 	}
 	add(primary)
 	for _, b := range backups {
 		add(b)
 	}
-	total := len(upos) + len(other)
-	if total == 0 {
+	if len(out) == 0 {
 		return nil
-	}
-	out := make([]string, 0, min(total, MaxShanghaiTrackURLs))
-	for _, u := range upos {
-		if len(out) >= MaxShanghaiTrackURLs {
-			return out
-		}
-		out = append(out, u)
-	}
-	for _, u := range other {
-		if len(out) >= MaxShanghaiTrackURLs {
-			return out
-		}
-		out = append(out, u)
 	}
 	return out
 }

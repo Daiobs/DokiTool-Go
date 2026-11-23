@@ -782,7 +782,7 @@ func (r *staticPendingShanghaiResolver) ResolveBilibiliPending(context.Context, 
 func TestWithDASHShanghaiRouteMerge(t *testing.T) {
 	const (
 		now     int64 = 1800000000
-		shDURL        = "https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		shDURL        = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
 		jpDURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
 		shVid80       = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
 		jpVid80       = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
@@ -1085,7 +1085,7 @@ func TestWithDASHGraceTimeoutAfterDURLSuccessAndFallbackOnDURLFailure(t *testing
 func TestDisabledDASHIgnoresUpgradedShanghaiDASHTracks(t *testing.T) {
 	const (
 		now     int64 = 1800000000
-		shDURL        = "https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
+		shDURL        = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
 		jpDURL        = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/101-64.mp4?deadline=1800007200"
 		shVid80       = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-80-avc.m4s?deadline=1800007200"
 		shAud         = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/101-30280.m4s?deadline=1800007200"

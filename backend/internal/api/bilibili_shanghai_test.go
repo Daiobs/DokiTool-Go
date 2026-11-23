@@ -328,11 +328,11 @@ func TestBilibiliShanghaiScenario1NormalMergeAndBrowserFetch(t *testing.T) {
 	baseNow := time.Date(2026, 11, 15, 1, 0, 0, 0, time.UTC)
 	dl := baseNow.Unix() + 7200
 
-	shDURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-80.mp4?deadline=%d", dl)
+	shDURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-80.mp4?deadline=%d", dl)
 	jpDURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/101/101-1-80.mp4?deadline=%d", dl)
-	shVid80 := fmt.Sprintf("https://cn-zj-hz-01-02.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=%d", dl)
+	shVid80 := fmt.Sprintf("https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=%d", dl)
 	jpVid80 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/101/101-1-30080.m4s?deadline=%d", dl)
-	shAud := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=%d", dl)
+	shAud := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=%d", dl)
 	jpAud := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/101/101-1-30280.m4s?deadline=%d", dl)
 
 	jpEntered := make(chan struct{}, 1)
@@ -551,7 +551,18 @@ func TestBilibiliShanghaiScenarios3And4InvalidHostAndHTTPSchemeRejected(t *testi
 		{
 			name:      "scenario4-broker-rejects-untrusted-wire-http-scheme",
 			bvid:      "BV1234567895",
-			badURLs:   []string{fmt.Sprintf("http://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/105/105-1-64.mp4?deadline=%d", dl)},
+			badURLs:   []string{fmt.Sprintf("http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/105/105-1-64.mp4?deadline=%d", dl)},
+			rawBypass: true,
+		},
+		{
+			name:    "scenario4b-worker-discards-cn-regional-isp-and-mcdn-nodes",
+			bvid:    "BV1234567801",
+			badURLs: []string{fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/105/105-1-64.mp4?deadline=%d", dl), fmt.Sprintf("https://xy123.mcdn.bilivideo.com/v.mp4?deadline=%d", dl)},
+		},
+		{
+			name:      "scenario4b-broker-rejects-untrusted-wire-cn-regional-isp-node",
+			bvid:      "BV1234567802",
+			badURLs:   []string{fmt.Sprintf("https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/00/01/105/105-1-64.mp4?deadline=%d", dl)},
 			rawBypass: true,
 		},
 	}
@@ -659,12 +670,12 @@ func TestBilibiliShanghaiScenario5QualityTierMismatch(t *testing.T) {
 	t.Run("partial-overlap-japan-tier-list-authoritative", func(t *testing.T) {
 		const bvid = "BV1234567896"
 		const cid int64 = 106
-		sh1080 := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/106/106-1-30080.m4s?deadline=%d", dl)
-		sh720 := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/106/106-1-30064.m4s?deadline=%d", dl)
-		sh720HEVC := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/106/106-1-30066.m4s?deadline=%d", dl)
+		sh1080 := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/106/106-1-30080.m4s?deadline=%d", dl)
+		sh720 := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/106/106-1-30064.m4s?deadline=%d", dl)
+		sh720HEVC := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/106/106-1-30066.m4s?deadline=%d", dl)
 		jp720 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/106/106-1-30064.m4s?deadline=%d", dl)
 		jp480 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/106/106-1-30032.m4s?deadline=%d", dl)
-		shAud := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/106/106-1-30280.m4s?deadline=%d", dl)
+		shAud := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/106/106-1-30280.m4s?deadline=%d", dl)
 		jpAud := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/106/106-1-30280.m4s?deadline=%d", dl)
 
 		jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
@@ -743,7 +754,7 @@ func TestBilibiliShanghaiScenario5QualityTierMismatch(t *testing.T) {
 	t.Run("zero-overlap-counts-as-fallback", func(t *testing.T) {
 		const bvid = "BV1234567897"
 		const cid int64 = 107
-		sh1080 := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/01/107/107-1-80.mp4?deadline=%d", dl)
+		sh1080 := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/01/107/107-1-80.mp4?deadline=%d", dl)
 		jp480 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/01/107/107-1-32.mp4?deadline=%d", dl)
 
 		jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
@@ -1009,7 +1020,7 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 		cid := u.Query().Get("cid")
 		// Shanghai URL expires in 90s -> earliest_expires_at - now - 60s = 30s cache TTL!
 		shDL := h.nowUnix() + 90
-		shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/02/%s/%s-1-80.mp4?deadline=%d", cid, cid, shDL)
+		shURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/02/%s/%s-1-80.mp4?deadline=%d", cid, cid, shDL)
 		body, _ := json.Marshal(map[string]any{
 			"code": 0,
 			"data": map[string]any{
@@ -1055,7 +1066,7 @@ func TestBilibiliShanghaiScenario7MultiPResolveAndEarliestExpiryCacheTTL(t *test
 	resP2 := unified.Map(unified.Slice(resData["items"])[1])
 	assertAllBilivideoSourcesBrowserFetchAllowed(t, resP2)
 	p2URLs := collectVariantSourceURLs(unified.Map(unified.Slice(resP2["variants"])[0]))
-	if len(p2URLs) != 2 || !strings.Contains(p2URLs[0], "cn-sh-fx-01-01.bilivideo.com") || !strings.Contains(p2URLs[0], "/2002/") || !strings.Contains(p2URLs[1], "upos-sz-mirrorcosov.bilivideo.com") {
+	if len(p2URLs) != 2 || !strings.Contains(p2URLs[0], "upos-sz-mirrorcos.bilivideo.com") || !strings.Contains(p2URLs[0], "/2002/") || !strings.Contains(p2URLs[1], "upos-sz-mirrorcosov.bilivideo.com") {
 		t.Fatalf("unexpected P2 resolved URLs: %v", p2URLs)
 	}
 
@@ -1115,7 +1126,7 @@ func TestBilibiliShanghaiDisabledDefaultWithUpgradedWorkerAndDouyinActive(t *tes
 		u, _ := url.Parse(req.URL)
 		cid := u.Query().Get("cid")
 		shDL := h.nowUnix() + 7200
-		shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/03/%s/%s-1-80.mp4?deadline=%d", cid, cid, shDL)
+		shURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/03/%s/%s-1-80.mp4?deadline=%d", cid, cid, shDL)
 		body, _ := json.Marshal(map[string]any{
 			"code": 0,
 			"data": map[string]any{
@@ -1210,7 +1221,7 @@ func TestBilibiliShanghaiDASHFlagConvergenceEndToEnd(t *testing.T) {
 	baseNow := time.Date(2026, 11, 15, 4, 0, 0, 0, time.UTC)
 	dl := baseNow.Unix() + 7200
 
-	shDURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/04/4001/4001-1-64.mp4?deadline=%d", dl)
+	shDURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/04/4001/4001-1-64.mp4?deadline=%d", dl)
 	jpDURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/04/4001/4001-1-64.mp4?deadline=%d", dl)
 	shVid80 := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/04/4001/4001-1-30080.m4s?deadline=%d", dl)
 	jpVid80 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/04/4001/4001-1-30080.m4s?deadline=%d", dl)
@@ -1409,6 +1420,232 @@ func TestBilibiliShanghaiDASHFlagConvergenceEndToEnd(t *testing.T) {
 				if len(unified.Slice(data["attachments"])) != 1 {
 					t.Fatalf("expected 1 audio attachment, got %v", data["attachments"])
 				}
+			}
+		})
+	}
+}
+
+// Scenario 8: Shanghai returns regional cn-*.bilivideo.com on DURL/DASH:
+//   - Case A (cn-* only everywhere): Shanghai returns empty route, Japan falls back cleanly
+//     on both item.default (DURL) and DASH tracks; bilibili.fallbacks == 1, zero cn-* leak.
+//   - Case B (cn-* only on DURL, mixed cn-*/PCDN + upos-* on DASH): item.default stays Japan's
+//     DURL (never promotes cn-*), while DASH tracks & audio attachment prepend domestic upos-*.
+func TestBilibiliShanghaiCNNodesFilteredAndFallbackToJapan(t *testing.T) {
+	const (
+		bvid       = "BV1234567890"
+		cid  int64 = 5001
+	)
+	baseNow := time.Date(2026, 11, 15, 5, 0, 0, 0, time.UTC)
+	dl := baseNow.Unix() + 7200
+
+	cnDURL := fmt.Sprintf("https://cn-jstz-cu-01-02.bilivideo.com/upgcxcode/00/05/5001/5001-1-64.mp4?deadline=%d", dl)
+	cnDashV := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/05/5001/5001-1-30080.m4s?deadline=%d", dl)
+	cnDashA := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/05/5001/5001-1-30280.m4s?deadline=%d", dl)
+	shUposV := fmt.Sprintf("https://upos-sz-mirrorcoso1.bilivideo.com/upgcxcode/00/05/5001/5001-1-30080.m4s?deadline=%d", dl)
+	shUposA := fmt.Sprintf("https://upos-sz-mirrorcoso1.bilivideo.com/upgcxcode/00/05/5001/5001-1-30280.m4s?deadline=%d", dl)
+	jpDURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/05/5001/5001-1-64.mp4?deadline=%d", dl)
+	jpVid80 := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/05/5001/5001-1-30080.m4s?deadline=%d", dl)
+	jpAud := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/05/5001/5001-1-30280.m4s?deadline=%d", dl)
+
+	cases := []struct {
+		name           string
+		shDashVidURLs  []string
+		shDashAudURLs  []string
+		wantDashMerged bool
+		wantHits       uint64
+		wantFallbacks  uint64
+	}{
+		{
+			name:           "cn-only-both-durl-and-dash-falls-back-to-japan",
+			shDashVidURLs:  []string{cnDashV, fmt.Sprintf("https://xy116.mcdn.bilivideo.com/v.m4s?deadline=%d", dl)},
+			shDashAudURLs:  []string{cnDashA},
+			wantDashMerged: false,
+			wantHits:       0,
+			wantFallbacks:  1,
+		},
+		{
+			name:           "cn-only-durl-with-upos-dash-keeps-japan-default-and-accelerates-dash",
+			shDashVidURLs:  []string{cnDashV, fmt.Sprintf("https://ebf529o.edge.mountaintoys.cn/v.m4s?deadline=%d", dl), shUposV},
+			shDashAudURLs:  []string{cnDashA, shUposA},
+			wantDashMerged: true,
+			wantHits:       1,
+			wantFallbacks:  0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-view":
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: makeBilibiliViewJSON(bvid, cid)}, nil
+				case "bilibili-play":
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 64,
+							"format":  "mp4720",
+							"durl":    []map[string]any{{"url": jpDURL, "size": 2097152, "length": 60000}},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				case "bilibili-play-dash":
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 80,
+							"dash": map[string]any{
+								"video": []map[string]any{
+									{"id": 80, "codecid": 7, "codecs": "avc1.640028", "width": 1920, "height": 1080, "bandwidth": 2200000, "baseUrl": jpVid80},
+								},
+								"audio": []map[string]any{
+									{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "bandwidth": 192000, "baseUrl": jpAud},
+								},
+							},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected Japan purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			shExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				switch req.Policy.Purpose {
+				case "bilibili-play":
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 64,
+							"durl":    []map[string]any{{"url": cnDURL}},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				case "bilibili-play-dash":
+					body, _ := json.Marshal(map[string]any{
+						"code": 0,
+						"data": map[string]any{
+							"quality": 80,
+							"dash": map[string]any{
+								"video": []map[string]any{
+									{"id": 80, "codecid": 7, "codecs": "avc1.640028", "baseUrl": tc.shDashVidURLs[0], "backupUrl": tc.shDashVidURLs[1:]},
+								},
+								"audio": []map[string]any{
+									{"id": 30280, "codecid": 0, "codecs": "mp4a.40.2", "baseUrl": tc.shDashAudURLs[0], "backupUrl": tc.shDashAudURLs[1:]},
+								},
+							},
+						},
+					})
+					return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+				default:
+					return fetch.Response{}, fmt.Errorf("unexpected Shanghai purpose %q", req.Policy.Purpose)
+				}
+			})
+
+			h := newBilibiliShanghaiHarnessWithSwitch(t, baseNow, jpExec, nil, true)
+			cat, err := catalog.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapters := map[string]Adapter{
+				"bilibili": bilibili.NewWithShanghai(jpExec, h.broker).WithDASH(true),
+			}
+			apiHandler, err := NewWithCacheConfig(cat, adapters, func() time.Time { return baseNow }, bilibili.PreparePublic, DefaultCacheConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			apiHandler.Stats().SetShanghaiSource(h.broker)
+			admCfg := DefaultAdmissionConfig()
+			admCfg.Parse.ClientBurst = 100
+			admCfg.Parse.ClientRPS = 100
+			ownerAuth, err := NewOwnerAuth(h.ownerToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router, err := WithAdmissionWithOwner(apiHandler, h.broker, "caddy", h.edgeKey, admCfg, ownerAuth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.router = router
+
+			noopDouyin := fetchFunc(func(_ context.Context, _ fetch.Request) (fetch.Response, error) {
+				return fetch.Response{}, fmt.Errorf("unexpected douyin call")
+			})
+			worker, err := shresolver.NewPullWorkerWithDetail(
+				"https://japan.example",
+				h.pullToken,
+				handlerControlExecutor(h.router, h.edgeKey),
+				noopDouyin,
+				probe.New(noopDouyin, douyin.AllowedMediaURL),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, err = worker.WithWorkers(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker.WithBilibili(shExec).WithBilibiliDASH(true)
+			wCtx, wCancel := context.WithCancel(context.Background())
+			wDone := make(chan struct{})
+			go func() {
+				defer close(wDone)
+				_ = worker.Run(wCtx)
+			}()
+			t.Cleanup(func() {
+				wCancel()
+				<-wDone
+			})
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && h.broker.ShanghaiStatsSnapshot().WaitingWorkers == 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			code, payload := h.doAPI("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.bilibili.com/video/"+bvid), "198.51.100.70", "")
+			if code != http.StatusOK {
+				t.Fatalf("status=%d payload=%v", code, payload)
+			}
+			if err := unified.ValidateEnvelopeAt(payload, baseNow.Unix()); err != nil {
+				t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+			}
+			encoded, _ := unified.Encode(payload)
+			if strings.Contains(string(encoded), "cn-jstz-") || strings.Contains(string(encoded), "cn-sh-") || strings.Contains(string(encoded), "mcdn.") {
+				t.Fatalf("regional cn-* or mcdn host leaked into public payload: %s", string(encoded))
+			}
+
+			data := unified.Map(payload["data"])
+			item := unified.Map(unified.Slice(data["items"])[0])
+			// item.default must ALWAYS stay Japan's DURL (never cn-*)
+			if gotDef := unified.Str(unified.Map(item["default"])["url"]); gotDef != jpDURL {
+				t.Fatalf("item.default.url = %q, want Japan DURL %q", gotDef, jpDURL)
+			}
+			variants := unified.Slice(item["variants"])
+			fileURLs := collectVariantSourceURLs(unified.Map(variants[0]))
+			if len(fileURLs) != 1 || fileURLs[0] != jpDURL {
+				t.Fatalf("DURL sources = %v, want Japan-only [%s]", fileURLs, jpDURL)
+			}
+			muxRes := unified.Slice(unified.Map(unified.Map(variants[1])["delivery"])["resources"])
+			vidSrcs := unified.Slice(unified.Map(unified.Map(muxRes[0])["delivery"])["sources"])
+			audSrcs := unified.Slice(unified.Map(unified.Map(muxRes[1])["delivery"])["sources"])
+			if tc.wantDashMerged {
+				if len(vidSrcs) != 2 || unified.Str(unified.Map(vidSrcs[0])["url"]) != shUposV || unified.Str(unified.Map(vidSrcs[1])["url"]) != jpVid80 {
+					t.Fatalf("DASH video sources = %v, want [shUposV, jpVid80]", vidSrcs)
+				}
+				if len(audSrcs) != 2 || unified.Str(unified.Map(audSrcs[0])["url"]) != shUposA || unified.Str(unified.Map(audSrcs[1])["url"]) != jpAud {
+					t.Fatalf("DASH audio sources = %v, want [shUposA, jpAud]", audSrcs)
+				}
+			} else {
+				if len(vidSrcs) != 1 || unified.Str(unified.Map(vidSrcs[0])["url"]) != jpVid80 {
+					t.Fatalf("DASH video sources = %v, want Japan-only [jpVid80]", vidSrcs)
+				}
+				if len(audSrcs) != 1 || unified.Str(unified.Map(audSrcs[0])["url"]) != jpAud {
+					t.Fatalf("DASH audio sources = %v, want Japan-only [jpAud]", audSrcs)
+				}
+			}
+
+			snap := h.stats()
+			if snap.Shanghai.ByPlatform.Bilibili.Hits != tc.wantHits || snap.Shanghai.ByPlatform.Bilibili.Fallbacks != tc.wantFallbacks {
+				t.Fatalf("shanghai bilibili stats = %+v, want hits=%d fallbacks=%d", snap.Shanghai.ByPlatform.Bilibili, tc.wantHits, tc.wantFallbacks)
 			}
 		})
 	}

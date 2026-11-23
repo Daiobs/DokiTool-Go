@@ -76,8 +76,8 @@ func TestWeiboSigningKeepsStableSourceAndDefault(t *testing.T) {
 	source := unified.Map(unified.Slice(unified.Map(first["delivery"])["sources"])[0])
 	ticket := strings.TrimPrefix(unified.Str(source["url"]), "/api/media/weibo?ticket=")
 	decoded, valid := media.Verify(ticket, key, now)
-	if !valid || decoded["u"] != raw || source["access"] != "relay" {
-		t.Fatal("invalid or unbound ticket")
+	if !valid || decoded["u"] != raw || source["access"] != "relay" || source["direct_url"] != raw {
+		t.Fatal("invalid or unbound ticket or missing direct_url")
 	}
 	oldItem := unified.Map(unified.Slice(unified.Map(snapshot["data"])["items"])[0])
 	oldVariant := unified.Map(unified.Slice(oldItem["variants"])[0])
@@ -206,5 +206,89 @@ func TestWeiboForeignOnlyFailsClosed(t *testing.T) {
 	cancel()
 	if _, err := PreparePublic(strings.Repeat("z", 64))(ctx, "weibo", payload, now); err == nil {
 		t.Fatal("canceled signing ran")
+	}
+}
+
+func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
+	const (
+		now        int64 = 1730000000
+		rawHTTP          = "http://f.video.weibocdn.com/hd.mp4?Expires=1900000000&ssig=a%2Bb+c"
+		wantHTTPS        = "https://f.video.weibocdn.com/hd.mp4?Expires=1900000000&ssig=a%2Bb+c"
+		badPort          = "http://f.video.weibocdn.com:80/bad.mp4"
+		badForeign       = "https://evil.example.com/bad.mp4"
+	)
+	key := strings.Repeat("d", 64)
+	legacy := unified.Object{"code": 200, "data": unified.Object{
+		"type": "video",
+		"url":  rawHTTP,
+		"video_backup": unified.Array{
+			unified.Object{"url": rawHTTP, "quality": "1080p", "width": 1920, "height": 1080},
+			unified.Object{"url": badPort, "quality": "720p", "width": 1280, "height": 720},
+			unified.Object{"url": badForeign, "quality": "360p", "width": 640, "height": 360},
+		},
+	}}
+	original := adaptLegacy(legacy, "https://weibo.com/1234567/AbC", now)
+	prepared, err := PreparePublic(key)(context.Background(), "weibo", original, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := unified.PublicView(prepared, false, now)
+	if err := unified.ValidateEnvelopeAt(view, now); err != nil {
+		t.Fatalf("PublicView failed validation: %v", err)
+	}
+	item := unified.Map(unified.Slice(unified.Map(view["data"])["items"])[0])
+	def := unified.Map(item["default"])
+	if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
+		t.Fatalf("item.default must remain signed relay for web compatibility: %#v", def)
+	}
+	if _, hasDirect := def["direct_url"]; hasDirect {
+		t.Fatalf("item.default must not carry direct_url: %#v", def)
+	}
+	variants := unified.Slice(item["variants"])
+	if len(variants) != 3 {
+		t.Fatalf("expected all 3 variants preserved in PublicView, got %d", len(variants))
+	}
+	src := unified.Map(unified.Slice(unified.Map(unified.Map(variants[0])["delivery"])["sources"])[0])
+	if src["availability"] == "unavailable" || src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") {
+		t.Fatalf("variants[0] source must remain ready signed relay: %#v", src)
+	}
+	if src["direct_url"] != wantHTTPS {
+		t.Fatalf("source.direct_url = %q, want lossless HTTPS %q", src["direct_url"], wantHTTPS)
+	}
+	ticket := strings.TrimPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=")
+	decoded, ok := media.Verify(ticket, key, now)
+	if !ok || decoded["u"] != wantHTTPS {
+		t.Fatalf("signed relay ticket did not verify against upgraded HTTPS URL: ok=%v decoded=%#v", ok, decoded)
+	}
+	for _, idx := range []int{1, 2} {
+		badSrc := unified.Map(unified.Slice(unified.Map(unified.Map(variants[idx])["delivery"])["sources"])[0])
+		if badSrc["availability"] != "unavailable" {
+			t.Fatalf("variants[%d] source availability = %v, want unavailable (%#v)", idx, badSrc["availability"], badSrc)
+		}
+		if _, hasDirect := badSrc["direct_url"]; hasDirect {
+			t.Fatalf("variants[%d] rejected source must not carry direct_url: %#v", idx, badSrc)
+		}
+		if badSrc["access"] == "relay" || strings.HasPrefix(unified.Str(badSrc["url"]), "/api/media/weibo?ticket=") {
+			t.Fatalf("variants[%d] rejected source must not mint relay ticket: %#v", idx, badSrc)
+		}
+	}
+
+	// Owner path also upgrades http:// -> https:// directly without minting relay or direct_url.
+	ownerOut, err := PrepareOwner(context.Background(), "weibo", original, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerView := unified.PublicView(ownerOut, false, now)
+	if err := unified.ValidateEnvelopeAt(ownerView, now); err != nil {
+		t.Fatalf("owner PublicView failed validation: %v", err)
+	}
+	ownerItem := unified.Map(unified.Slice(unified.Map(ownerView["data"])["items"])[0])
+	ownerDef := unified.Map(ownerItem["default"])
+	if ownerDef["url"] != wantHTTPS || ownerDef["access"] == "relay" {
+		t.Fatalf("owner default expected direct HTTPS %q, got %#v", wantHTTPS, ownerDef)
+	}
+	ownerSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(ownerItem["variants"])[0])["delivery"])["sources"])[0])
+	if _, hasDirect := ownerSrc["direct_url"]; hasDirect {
+		t.Fatalf("owner direct source must not emit redundant direct_url: %#v", ownerSrc)
 	}
 }

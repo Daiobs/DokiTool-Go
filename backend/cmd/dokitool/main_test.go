@@ -846,16 +846,29 @@ func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
 	ownerReq.Header.Set("Authorization", "Bearer "+ownerToken)
 	wOwner := httptest.NewRecorder()
 	entry.ServeHTTP(wOwner, ownerReq)
-	if wOwner.Code != http.StatusOK || !strings.Contains(wOwner.Body.String(), cdnURL) || strings.Contains(wOwner.Body.String(), "/api/media/weibo?ticket=") {
-		t.Fatalf("owner Weibo response did not return direct CDN URL without relay: code=%d body=%s", wOwner.Code, wOwner.Body.String())
+	if wOwner.Code != http.StatusOK || !strings.Contains(wOwner.Body.String(), cdnURL) || strings.Contains(wOwner.Body.String(), "/api/media/weibo?ticket=") || strings.Contains(wOwner.Body.String(), `"direct_url"`) {
+		t.Fatalf("owner Weibo response did not return direct CDN URL without relay/direct_url: code=%d body=%s", wOwner.Code, wOwner.Body.String())
 	}
 
 	anonReq := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
 	anonReq.RemoteAddr = "127.0.0.1:40002"
 	wAnon := httptest.NewRecorder()
 	entry.ServeHTTP(wAnon, anonReq)
-	if wAnon.Code != http.StatusOK || strings.Contains(wAnon.Body.String(), cdnURL) || !strings.Contains(wAnon.Body.String(), "/api/media/weibo?ticket=") {
-		t.Fatalf("anonymous Weibo response did not return signed relay URL: code=%d body=%s", wAnon.Code, wAnon.Body.String())
+	if wAnon.Code != http.StatusOK {
+		t.Fatalf("anonymous Weibo response status=%d body=%s", wAnon.Code, wAnon.Body.String())
+	}
+	anonPayload, err := unified.Decode(wAnon.Body.Bytes())
+	if err != nil {
+		t.Fatalf("anonymous Weibo invalid JSON: %v", err)
+	}
+	anonItem := unified.Map(unified.Slice(unified.Map(anonPayload["data"])["items"])[0])
+	anonDef := unified.Map(anonItem["default"])
+	if anonDef["access"] != "relay" || !strings.HasPrefix(unified.Str(anonDef["url"]), "/api/media/weibo?ticket=") || anonDef["direct_url"] != nil {
+		t.Fatalf("anonymous Weibo default did not stay on signed relay: %v", anonDef)
+	}
+	anonSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(anonItem["variants"])[0])["delivery"])["sources"])[0])
+	if anonSrc["access"] != "relay" || !strings.HasPrefix(unified.Str(anonSrc["url"]), "/api/media/weibo?ticket=") || anonSrc["direct_url"] != cdnURL {
+		t.Fatalf("anonymous Weibo source did not pair signed relay with direct_url: %v", anonSrc)
 	}
 }
 
@@ -1220,7 +1233,7 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 					shBiliCalls.Add(1)
 					u, _ := url.Parse(req.URL)
 					cid := u.Query().Get("cid")
-					shURL := fmt.Sprintf("https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/00/05/%s/%s-1-80.mp4?deadline=%d", cid, cid, dlUnix)
+					shURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/05/%s/%s-1-80.mp4?deadline=%d", cid, cid, dlUnix)
 					b, _ := json.Marshal(map[string]any{
 						"code": 0,
 						"data": map[string]any{"quality": 80, "durl": []map[string]any{{"url": shURL}}},
@@ -1299,9 +1312,9 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 					}
 				}
 				if tc.wantEnabled {
-					if len(group) != 2 || !strings.Contains(unified.Str(unified.Map(group[0])["url"]), "cn-sh-fx-01-01.bilivideo.com") ||
+					if len(group) != 2 || !strings.Contains(unified.Str(unified.Map(group[0])["url"]), "upos-sz-mirrorcos.bilivideo.com") ||
 						!strings.Contains(unified.Str(unified.Map(group[1])["url"]), "upos-sz-mirrorcosov.bilivideo.com") {
-						t.Fatalf("enabled mode expected [cn-sh, upos], got %v", group)
+						t.Fatalf("enabled mode expected [upos-dom, upos-ov], got %v", group)
 					}
 				} else {
 					if len(group) != 1 || !strings.Contains(unified.Str(unified.Map(group[0])["url"]), "upos-sz-mirrorcosov.bilivideo.com") {

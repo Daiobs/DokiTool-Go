@@ -50,6 +50,7 @@ import {
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import {
   PROD_API_ORIGIN,
+  isWhitelistedMediaUrl,
   validateApiBaseUrl,
   type ApiBaseUrlValidationResult,
 } from "./hostWhitelist";
@@ -504,6 +505,37 @@ export function buildExtraAllowedOrigins(apiOrigin: string): string[] | undefine
   return apiOrigin && apiOrigin !== PROD_API_ORIGIN ? [apiOrigin] : undefined;
 }
 
+/**
+ * Builds the extension's `TargetContext` with relay-direct opt-in strictly gated
+ * to built-in whitelisted HTTPS media CDN hosts (never trusting custom API origins
+ * or unwhitelisted hosts for `source.direct_url`).
+ */
+export function buildExtensionTargetContext(
+  apiOrigin?: string | null,
+  now?: number,
+): TargetContext {
+  const resolvedOrigin = resolveSafeApiOrigin(apiOrigin ?? undefined);
+  return {
+    apiOrigin: resolvedOrigin,
+    ...(now !== undefined ? { now } : {}),
+    preferRelayDirect: (directUrl: string) => {
+      try {
+        const parsed = new URL(directUrl);
+        if (parsed.protocol !== "https:") return false;
+        if (
+          parsed.origin === PROD_API_ORIGIN ||
+          parsed.origin === resolvedOrigin
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      return isWhitelistedMediaUrl(directUrl).allowed;
+    },
+  };
+}
+
 export function formatDurationMs(durationMs?: number): string {
   if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs <= 0) {
     return "";
@@ -590,6 +622,13 @@ export interface SidePanelQualityOption {
   resolvedExt: string;
   formatMime?: string;
   directUrl: string;
+  /**
+   * External/clipboard-safe URL for user-initiated "copy direct link" or
+   * browser-tab fallback: preserves signed relay URLs for `access === "relay"`
+   * sources (which would 403 outside extension DNR), while matching `directUrl`
+   * for direct/owner sources.
+   */
+  copyUrl: string;
   routes: string[];
 }
 
@@ -815,7 +854,7 @@ export function findBestStandaloneAudioForYouTube(
   attachments: Attachment[],
   apiOrigin: string,
 ): { variantId: string; url: string; ext: "m4a" | "webm" } | null {
-  const ctx = { apiOrigin: resolveSafeApiOrigin(apiOrigin) };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const candidates: ReadyVariant[] = [];
   if (readyItem(item)) {
     for (const v of item.variants) {
@@ -920,7 +959,7 @@ export function isAttachmentApplicableToItem(
 function resolveItemScopedAudioAttachments(
   media: Pick<UnifiedMedia, "platform" | "attachments">,
   item: ReadyItem,
-  ctx: TargetContext & { apiOrigin: string },
+  ctx: TargetContext,
 ): Attachment[] {
   const scoped: Attachment[] = [];
   const seenPrimaryUrls = new Set<string>();
@@ -1004,9 +1043,12 @@ export function buildSidePanelQualityOptions(
   options?: { now?: number },
 ): SidePanelQualityOption[] {
   if (!item || !readyItem(item)) return [];
-  const apiOrigin = resolveSafeApiOrigin(rawApiOrigin);
-  const ctx: TargetContext & { apiOrigin: string } =
-    options?.now !== undefined ? { apiOrigin, now: options.now } : { apiOrigin };
+  const resolvedApiOrigin = resolveSafeApiOrigin(rawApiOrigin);
+  const ctx = buildExtensionTargetContext(resolvedApiOrigin, options?.now);
+  const copyCtx: TargetContext =
+    options?.now !== undefined
+      ? { apiOrigin: resolvedApiOrigin, now: options.now }
+      : { apiOrigin: resolvedApiOrigin };
   const attachments = media.attachments ?? [];
   const isYouTube = media.platform === "youtube";
 
@@ -1061,13 +1103,19 @@ export function buildSidePanelQualityOptions(
       (item.type === "video" && meta.has_audio !== false);
 
     let directUrl = "";
+    let copyUrl = "";
     let routes: string[] = [];
     if (isDashMux && dashMux) {
       // Do NOT expose a broken video-only .m4s URL as directUrl
       directUrl = "";
+      copyUrl = "";
       routes = dashMux.videoRoutes;
     } else if (target.kind === "file") {
       directUrl = target.url;
+      copyUrl =
+        target.source.access === "relay"
+          ? sourceUrl(target.source, copyCtx)
+          : directUrl;
       const tbCandidate =
         item.type === "video" &&
         (media.platform === "pipigx" || media.platform === "zuiyou") &&
@@ -1087,10 +1135,14 @@ export function buildSidePanelQualityOptions(
     ) {
       routes = deliveryRoutes(variant.delivery.sources, ctx);
       directUrl = routes[0] ?? "";
+      copyUrl = deliveryRoutes(variant.delivery.sources, copyCtx)[0] ?? directUrl;
     } else if (variant.delivery.kind === "segments") {
       const firstPiece = variant.delivery.init ?? variant.delivery.pieces[0];
       routes = firstPiece ? deliveryRoutes(firstPiece.sources, ctx) : [];
       directUrl = routes[0] ?? "";
+      copyUrl =
+        (firstPiece ? deliveryRoutes(firstPiece.sources, copyCtx)[0] : "") ||
+        directUrl;
     } else if (variant.delivery.kind === "pair") {
       const motionRes = variant.delivery.resources.find(
         (r) => r.role === "motion" || r.role === "video",
@@ -1100,8 +1152,13 @@ export function buildSidePanelQualityOptions(
         try {
           routes = sourceRoutes(motionSrc, ctx);
           directUrl = routes[0] ?? "";
+          copyUrl =
+            motionSrc.access === "relay"
+              ? sourceUrl(motionSrc, copyCtx)
+              : directUrl;
         } catch {
           directUrl = "";
+          copyUrl = "";
         }
       }
     }
@@ -1225,6 +1282,7 @@ export function buildSidePanelQualityOptions(
       resolvedExt,
       formatMime,
       directUrl,
+      copyUrl,
       routes,
     });
   }
@@ -1352,6 +1410,10 @@ export function buildSidePanelQualityOptions(
           resolvedExt,
           formatMime,
           directUrl: attUrl,
+          copyUrl:
+            primarySrc.access === "relay"
+              ? sourceUrl(primarySrc, copyCtx)
+              : attUrl,
           routes: attRoutes,
         });
       }
@@ -1669,7 +1731,7 @@ function buildSegmentsSpecFromDelivery(
   delivery: Extract<LeafDelivery, { kind: "segments" }>,
   apiOrigin: string,
 ): OffscreenSegmentSpec[] {
-  const ctx = { apiOrigin };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const chunks: Chunk[] = [
     ...(delivery.init ? [delivery.init] : []),
     ...delivery.pieces,
@@ -1790,12 +1852,13 @@ export function buildSpecFromOption(params: {
 }): OffscreenDownloadSpec {
   const { media, option, filename, refreshContext } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
   const refreshField = refreshContext ? { refreshContext } : {};
 
   if (option.muxPair) {
-    const videoUrl = sourceUrl(option.muxPair.videoSource, { apiOrigin });
-    const audioUrl = sourceUrl(option.muxPair.audioSource, { apiOrigin });
+    const videoUrl = sourceUrl(option.muxPair.videoSource, ctx);
+    const audioUrl = sourceUrl(option.muxPair.audioSource, ctx);
     const totalSize =
       parsePositiveSafeBytes(option.muxPair.videoSource.size_bytes) +
       parsePositiveSafeBytes(option.muxPair.audioSource.size_bytes);
@@ -1842,7 +1905,7 @@ export function buildSpecFromOption(params: {
   const delivery = option.variant.delivery;
 
   if (delivery.kind === "hls") {
-    const routes = deliveryRoutes(delivery.sources, { apiOrigin });
+    const routes = deliveryRoutes(delivery.sources, ctx);
     if (!routes.length) throw new Error("HLS 清单缺少可用来源");
     return {
       kind: "hls",
@@ -1930,7 +1993,7 @@ export function buildSingleDownloadEnqueueItem(params: {
     title: stem,
     platform: media.platform,
     ...(workFingerprint ? { workFingerprint } : {}),
-    fallbackUrl: option.directUrl || media.source_url,
+    fallbackUrl: option.copyUrl || option.directUrl || media.source_url,
     ...(refreshContext ? { refreshContext } : {}),
     spec,
   };
@@ -1944,7 +2007,7 @@ function buildLeafResourceSpec(params: {
 }): { spec: OffscreenDownloadSpec; ext: string; primaryUrl: string; sizeBytes?: number } {
   const { media, resource, filename } = params;
   const apiOrigin = resolveSafeApiOrigin(params.apiOrigin);
-  const ctx = { apiOrigin };
+  const ctx = buildExtensionTargetContext(apiOrigin);
   const extraAllowedOrigins = buildExtraAllowedOrigins(apiOrigin);
   const delivery = resource.delivery;
 
@@ -2197,7 +2260,7 @@ export function buildChecklistSubfolderEnqueueItems(params: {
       title: episodeStem ? `${subfolder} - ${episodeStem}` : `${subfolder} #${ordinalIndex}`,
       platform: media.platform,
       ...(workFingerprint ? { workFingerprint } : {}),
-      fallbackUrl: chosen.directUrl || media.source_url,
+      fallbackUrl: chosen.copyUrl || chosen.directUrl || media.source_url,
       ...(refreshContext ? { refreshContext } : {}),
       spec,
     });

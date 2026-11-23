@@ -14,6 +14,14 @@ import type {
 export interface TargetContext {
   apiOrigin?: string;
   now?: number;
+  /**
+   * Optional opt-in for privileged/extension clients that can supply required
+   * Referer headers directly: when true or predicate returns true for a relay
+   * source's validated `direct_url`, `direct_url` is placed ahead of the signed
+   * relay `url` (which stays behind as fallback). Defaults falsy so Web SPA
+   * completely ignores `direct_url`.
+   */
+  preferRelayDirect?: boolean | ((directUrl: string) => boolean);
 }
 export type DownloadTarget =
   | {
@@ -57,12 +65,64 @@ export const readyVariant = (
 export const readyItem = (item?: MediaItem | null): item is ReadyItem =>
   !!item && (!item.state || item.state === "ready");
 
+const DIRECT_HTTPS_URL_RE = /^https:\/\/[^\s/?#]+\/[^\s#]*$/;
+
+function validateRelayDirectUrl(source: Source): string | undefined {
+  if (source.direct_url === undefined) return undefined;
+  if (source.access !== "relay") fail("直连备用地址仅允许用于中转来源");
+  const raw = source.direct_url;
+  if (
+    !nonempty(raw) ||
+    /[\s\\\x00-\x1f\x7f]/.test(raw) ||
+    !DIRECT_HTTPS_URL_RE.test(raw)
+  ) {
+    fail("直连备用地址必须为合法的 HTTPS 地址");
+  }
+  const slashIdx = raw.indexOf("/", "https://".length);
+  const authority = slashIdx >= 0 ? raw.slice("https://".length, slashIdx) : "";
+  if (!authority || authority.includes("@") || authority.endsWith(":")) {
+    fail("直连备用地址不安全");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return fail("直连备用地址必须为合法的 HTTPS 地址");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash
+  ) {
+    fail("直连备用地址不安全");
+  }
+  return raw;
+}
+
+function acceptsRelayDirect(
+  directUrl: string | undefined,
+  context: TargetContext,
+): directUrl is string {
+  if (!directUrl) return false;
+  const pref = context.preferRelayDirect;
+  if (pref === true) return true;
+  if (typeof pref === "function") {
+    try {
+      return Boolean(pref(directUrl));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 /** Preserve signed query bytes. Only relay paths are decoded for traversal checks. */
-export function sourceUrl(
-  source?: Source,
+function resolvePrimarySourceUrl(
+  source: Source,
   context: TargetContext = {},
 ): string {
-  if (!source) return "";
   const raw = source.url;
   if (!nonempty(raw) || /[\s\\\x00-\x1f\x7f]/.test(raw)) fail("资源地址不安全");
   if (source.access === "relay") {
@@ -123,6 +183,19 @@ export function sourceUrl(
     fail("资源地址不安全");
   return raw;
 }
+
+export function sourceUrl(
+  source?: Source,
+  context: TargetContext = {},
+): string {
+  if (!source) return "";
+  const primary = resolvePrimarySourceUrl(source, context);
+  const direct = validateRelayDirectUrl(source);
+  if (acceptsRelayDirect(direct, context)) {
+    return direct;
+  }
+  return primary;
+}
 export function sourceAvailable(source: Source, now = Date.now()): boolean {
   return (
     source.availability !== "unavailable" &&
@@ -165,14 +238,24 @@ export function sourcesOf(delivery: Delivery): Source[] {
 }
 /** Server-attested alternatives retain selection and are tried only on transport failure. */
 export function sourceRoutes(source: Source, context: TargetContext = {}): string[] {
-  const primary = sourceUrl(source, context);
+  const primary = resolvePrimarySourceUrl(source, context);
+  const direct = validateRelayDirectUrl(source);
+  if (source.access === "relay") {
+    if (source.fallback_urls !== undefined) fail("来源凭据候选无效");
+    if (acceptsRelayDirect(direct, context) && direct !== primary) {
+      return [direct, primary];
+    }
+    return [primary];
+  }
   if (source.fallback_urls === undefined) return [primary];
-  if (!Array.isArray(source.fallback_urls) || source.fallback_urls.length < 1 || source.fallback_urls.length > 2 || source.access === "relay") fail("来源凭据候选无效");
+  if (!Array.isArray(source.fallback_urls) || source.fallback_urls.length < 1 || source.fallback_urls.length > 2) {
+    fail("来源凭据候选无效");
+  }
   const base = new URL(primary);
   if (base.protocol !== "https:") fail("来源凭据候选必须使用 HTTPS");
   const routes = [primary];
   for (const raw of source.fallback_urls) {
-    const route = sourceUrl({url: raw}, context);
+    const route = resolvePrimarySourceUrl({ url: raw }, context);
     if (new URL(route).origin !== base.origin || routes.includes(route)) fail("来源凭据候选跨主机或重复");
     routes.push(route);
   }
@@ -203,6 +286,7 @@ function validateSources(
   const sources = value as Source[];
   sources.forEach((source) => {
     if (!object(source) || !identity(source.url)) fail("来源无效");
+    validateRelayDirectUrl(source);
     sourceRoutes(source, context);
     if (source.id !== undefined && !identity(source.id)) fail("来源 ID 无效");
     if (sources.length > 1 && !source.id) fail("多来源必须有 ID");
@@ -457,20 +541,30 @@ function readFile(
   if (!sourceAvailable(source, context.now))
     return { kind: "needs_refresh", message: "已选来源已过期，请刷新此条目" };
   try {
-    const url = sourceUrl(source, context);
-    const routes =
-      variant.delivery.kind === "file"
-        ? variant.delivery.sources
-            .filter((candidate) => sourceAvailable(candidate, context.now))
-            .map((candidate) => sourceUrl(candidate, context))
-        : [];
+    const primaryRoutes = sourceRoutes(source, context);
+    const url = primaryRoutes[0];
+    const seen = new Set<string>(primaryRoutes);
+    const routes = [...primaryRoutes];
+    if (variant.delivery.kind === "file") {
+      for (const candidate of availableSources(
+        variant.delivery.sources,
+        context.now,
+      )) {
+        for (const route of sourceRoutes(candidate, context)) {
+          if (!seen.has(route)) {
+            seen.add(route);
+            routes.push(route);
+          }
+        }
+      }
+    }
     return {
       kind: "file",
       item,
       variant,
       source,
       url,
-      routes: [...sourceRoutes(source, context), ...routes.filter((route) => route !== url)],
+      routes,
     };
   } catch (error) {
     return {
@@ -574,6 +668,10 @@ export function validateMediaEnvelope(
   value: unknown,
   context: TargetContext = {},
 ): UnifiedMedia {
+  const validationContext: TargetContext = {
+    ...context,
+    preferRelayDirect: false,
+  };
   if (!object(value) || value.schema_version !== "1.0")
     return fail("接口已更新，请刷新页面");
   if (value.code !== "OK")
@@ -625,7 +723,7 @@ export function validateMediaEnvelope(
       !("default" in item)
     )
       fail("条目结构无效");
-    if (item.cover) validateSources([item.cover], context);
+    if (item.cover) validateSources([item.cover], validationContext);
     if (item.state === "deferred") {
       if (
         item.default !== null ||
@@ -666,7 +764,7 @@ export function validateMediaEnvelope(
           fail("待解析版本无效");
         return;
       }
-      validateDelivery(variant.delivery, context);
+      validateDelivery(variant.delivery, validationContext);
       validateCapabilityMetadata(variant.metadata, item.type === "audio" ? "audio" : item.type === "image" ? "image" : undefined);
       if (
         sourcesOf(variant.delivery).some((source) => source.expires_at) &&
@@ -687,7 +785,7 @@ export function validateMediaEnvelope(
     } else {
       if (item.default_unavailable_reason) fail("非空默认不能附失败原因");
       const target = getDefaultDownloadTarget(item, {
-        ...context,
+        ...validationContext,
         now: generated,
       });
       if (target.kind !== "file") fail("默认引用或来源无效");
@@ -716,10 +814,10 @@ export function validateMediaEnvelope(
     )
       fail("分组引用无效");
   for (const attachment of media.attachments || []) {
-    validateDelivery(attachment.resource.delivery, context);
+    validateDelivery(attachment.resource.delivery, validationContext);
     validateCapabilityMetadata(attachment.resource.metadata, attachment.resource.role);
   }
-  if (media.cover) validateSources([media.cover], context);
-  if (media.author?.avatar) validateSources([media.author.avatar], context);
+  if (media.cover) validateSources([media.cover], validationContext);
+  if (media.author?.avatar) validateSources([media.author.avatar], validationContext);
   return media;
 }

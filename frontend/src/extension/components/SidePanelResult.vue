@@ -12,12 +12,14 @@ import {
   readyItem,
   readyVariant,
   resourceSource,
+  sourceRoutes,
   sourceUrl,
 } from "../../utils/mediaContract";
 import type { EnqueueDownloadItem, ExtensionSettings } from "../protocol";
 import {
   buildChecklistSubfolderEnqueueItems,
   buildChecklistZipEnqueueItem,
+  buildExtensionTargetContext,
   buildPrimarySingleCtaLabel,
   buildSidePanelQualityOptions,
   buildSingleDownloadEnqueueItem,
@@ -59,12 +61,14 @@ const emit = defineEmits<{
 }>();
 
 const apiOrigin = computed(() => resolveSafeApiOrigin(props.settings.apiBaseUrl));
-const targetContext = computed(() => ({ apiOrigin: apiOrigin.value }));
+const targetContext = computed(() => buildExtensionTargetContext(apiOrigin.value));
+const copyTargetContext = computed(() => ({ apiOrigin: apiOrigin.value }));
 
 const layoutKind = computed(() => classifyMediaLayout(props.media));
 
 // Track broken image/video preview URLs so UI gracefully falls back without ugly broken icons
 const brokenUrls = ref<Record<string, boolean>>({});
+const previewVideoRouteIndex = ref(0);
 function markUrlBroken(url: string) {
   if (url && !brokenUrls.value[url]) {
     brokenUrls.value = { ...brokenUrls.value, [url]: true };
@@ -76,6 +80,11 @@ function safeAssetUrl(raw: string): string {
 function safeSourceUrl(src?: Source | null): string {
   if (!src) return "";
   try {
+    const routes = sourceRoutes(src, targetContext.value);
+    for (const candidate of routes) {
+      const safe = safeAssetUrl(candidate);
+      if (safe) return safe;
+    }
     return safeAssetUrl(sourceUrl(src, targetContext.value));
   } catch {
     return "";
@@ -145,6 +154,7 @@ const checklistPool = computed<MediaItem[]>(() => {
 
 function initSelectionForMedia() {
   brokenUrls.value = {};
+  previewVideoRouteIndex.value = 0;
   activeCollectionIdx.value = 0;
   previewModalItem.value = null;
   livePhotoFilter.value = "both";
@@ -287,28 +297,47 @@ const previewCoverUrl = computed<string>(() => {
   const itemCover = safeSourceUrl(activeItem.value?.cover);
   if (itemCover) return itemCover;
   if (activeItem.value?.type === "image") {
+    const optRoutes = activeSelectedOption.value?.routes ?? [];
+    for (const candidate of optRoutes) {
+      const safe = safeAssetUrl(candidate);
+      if (safe) return safe;
+    }
     const directImg = safeAssetUrl(activeSelectedOption.value?.directUrl || "");
     if (directImg) return directImg;
   }
   if (activeItem.value?.type === "live_photo") {
-    const liveImg = safeAssetUrl(resolveLiveResourceUrl(activeItem.value, "image"));
-    if (liveImg) return liveImg;
+    for (const candidate of resolveLiveResourceRoutes(activeItem.value, "image")) {
+      const safe = safeAssetUrl(candidate);
+      if (safe) return safe;
+    }
   }
   const mediaCover = safeSourceUrl(props.media.cover);
   if (mediaCover) return mediaCover;
   return "";
 });
 
-const previewVideoUrl = computed<string>(() => {
+const previewVideoCandidates = computed<string[]>(() => {
   const item = activeItem.value;
-  if (!item) return "";
+  if (!item) return [];
+  const collectUnique = (urls: string[]): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of urls) {
+      if (raw && !seen.has(raw)) {
+        seen.add(raw);
+        out.push(raw);
+      }
+    }
+    return out;
+  };
+
   if (item.type === "live_photo") {
-    return safeAssetUrl(resolveLiveResourceUrl(item, "motion"));
+    return collectUnique(resolveLiveResourceRoutes(item, "motion"));
   }
-  if (item.type !== "video" && item.type !== "audio") return "";
+  if (item.type !== "video" && item.type !== "audio") return [];
 
   const chosen = activeSelectedOption.value;
-  if (!chosen) return "";
+  if (!chosen) return [];
 
   // If the user selected a split adaptive/DASH mux option (YouTube muxPair or generic DASH dashMux),
   // keep the top <video> stage bound to the best inline-playable `kind: "file"` stream (e.g. Bilibili durl or YouTube muxed)
@@ -323,22 +352,76 @@ const previewVideoUrl = computed<string>(() => {
           ? o.variant.metadata?.has_audio === true
           : o.variant.metadata?.has_audio !== false) &&
         o.downloadTarget.kind === "file" &&
-        Boolean(safeAssetUrl(o.directUrl)),
+        (o.routes.length > 0 || Boolean(o.directUrl)),
     );
     const preferredDefault = defaultVarId
       ? playableFileCandidates.find((o) => o.variant.id === defaultVarId)
       : undefined;
     const muxedPlayable = preferredDefault ?? playableFileCandidates[0];
     if (muxedPlayable) {
-      return safeAssetUrl(muxedPlayable.directUrl);
+      return collectUnique(
+        muxedPlayable.routes.length > 0
+          ? muxedPlayable.routes
+          : muxedPlayable.directUrl
+            ? [muxedPlayable.directUrl]
+            : [],
+      );
     }
+    return [];
   }
 
   if (chosen.downloadTarget.kind === "file") {
-    return safeAssetUrl(chosen.directUrl);
+    return collectUnique(
+      chosen.routes.length > 0
+        ? chosen.routes
+        : chosen.directUrl
+          ? [chosen.directUrl]
+          : [],
+    );
+  }
+  return [];
+});
+
+watch(
+  [
+    () => activeItem.value?.id ?? "",
+    () => activeSelectedOption.value?.key ?? "",
+    () => previewVideoCandidates.value.join("\n"),
+  ],
+  () => {
+    previewVideoRouteIndex.value = 0;
+  },
+);
+
+const previewVideoUrl = computed<string>(() => {
+  const candidates = previewVideoCandidates.value;
+  for (let i = previewVideoRouteIndex.value; i < candidates.length; i++) {
+    const candidate = safeAssetUrl(candidates[i]);
+    if (candidate) return candidate;
   }
   return "";
 });
+
+function handlePreviewVideoError(event?: Event) {
+  const target = event?.currentTarget as
+    | (HTMLVideoElement & { getAttribute?: (name: string) => string | null })
+    | null
+    | undefined;
+  const failedUrl =
+    target?.getAttribute?.("src") || target?.src || previewVideoUrl.value;
+  if (!failedUrl) return;
+  markUrlBroken(failedUrl);
+  const candidates = previewVideoCandidates.value;
+  const currentIdx = candidates.indexOf(failedUrl);
+  if (currentIdx >= 0) {
+    previewVideoRouteIndex.value = Math.max(
+      previewVideoRouteIndex.value,
+      currentIdx + 1,
+    );
+  } else if (failedUrl === previewVideoUrl.value) {
+    previewVideoRouteIndex.value += 1;
+  }
+}
 
 const durationLabel = computed(() =>
   formatDurationMs(
@@ -366,13 +449,17 @@ const directCopyCandidateUrl = computed<string>(() => {
   if (isDashMuxSelected.value) {
     return "";
   }
-  if (activeSelectedOption.value?.directUrl) {
-    return activeSelectedOption.value.directUrl;
+  const opt = activeSelectedOption.value;
+  if (opt?.copyUrl) {
+    return opt.copyUrl;
+  }
+  if (opt?.directUrl) {
+    return opt.directUrl;
   }
   if (activeItem.value?.type === "live_photo") {
     return (
-      resolveLiveResourceUrl(activeItem.value, "motion") ||
-      resolveLiveResourceUrl(activeItem.value, "image")
+      resolveLiveResourceUrl(activeItem.value, "motion", copyTargetContext.value) ||
+      resolveLiveResourceUrl(activeItem.value, "image", copyTargetContext.value)
     );
   }
   return props.media.source_url || "";
@@ -448,25 +535,47 @@ function handleSinglePrimaryDownload() {
 // Album / LivePhoto / Multi-P / Mixed Helpers
 // ============================================================================
 
-function resolveLiveResourceUrl(
+function resolveLiveResourceRoutes(
   item: MediaItem,
   role: "image" | "motion",
-): string {
-  if (!readyItem(item)) return "";
+  ctx = targetContext.value,
+): string[] {
+  if (!readyItem(item)) return [];
   const pairVar = item.variants.find(
     (v): v is ReadyVariant => readyVariant(v) && v.delivery.kind === "pair",
   );
-  if (!pairVar || pairVar.delivery.kind !== "pair") return "";
+  if (!pairVar || pairVar.delivery.kind !== "pair") return [];
   const res = pairVar.delivery.resources.find((r) =>
     role === "motion" ? r.role === "motion" || r.role === "video" : r.role === "image",
   );
-  const src = res ? resourceSource(res, targetContext.value) : undefined;
-  if (!src) return "";
+  const src = res ? resourceSource(res, ctx) : undefined;
+  if (!src) return [];
   try {
-    return sourceUrl(src, targetContext.value);
+    return sourceRoutes(src, ctx);
   } catch {
-    return "";
+    return [];
   }
+}
+
+function resolveLiveResourceUrl(
+  item: MediaItem,
+  role: "image" | "motion",
+  ctx = targetContext.value,
+): string {
+  const routes = resolveLiveResourceRoutes(item, role, ctx);
+  if (routes.length > 0) return routes[0];
+  return "";
+}
+
+function resolveSafeLiveResourceUrl(
+  item: MediaItem,
+  role: "image" | "motion",
+): string {
+  for (const candidate of resolveLiveResourceRoutes(item, role)) {
+    const safe = safeAssetUrl(candidate);
+    if (safe) return safe;
+  }
+  return "";
 }
 
 function mixedItemTypeBadge(item: MediaItem): {
@@ -500,11 +609,15 @@ function resolveAlbumThumbUrl(item: MediaItem): string {
   const cover = safeSourceUrl(item.cover);
   if (cover) return cover;
   if (item.type === "live_photo") {
-    return safeAssetUrl(resolveLiveResourceUrl(item, "image"));
+    return resolveSafeLiveResourceUrl(item, "image");
   }
   if (readyItem(item)) {
     const target = getDownloadTarget(item, null, targetContext.value);
     if (target.kind === "file") {
+      for (const candidate of target.routes) {
+        const safe = safeAssetUrl(candidate);
+        if (safe) return safe;
+      }
       return safeAssetUrl(target.url);
     }
   }
@@ -780,7 +893,7 @@ async function handleBatchZipSave() {
           playsinline
           referrerpolicy="no-referrer"
           class="sp-stage__video"
-          @error="markUrlBroken(previewVideoUrl)"
+          @error="handlePreviewVideoError($event)"
         />
         <img
           v-else-if="previewCoverUrl"
@@ -1557,16 +1670,18 @@ async function handleBatchZipSave() {
             v-if="
               previewModalItem.type === 'live_photo' &&
               previewLiveMode === 'motion' &&
-              resolveLiveResourceUrl(previewModalItem, 'motion')
+              resolveSafeLiveResourceUrl(previewModalItem, 'motion')
             "
-            :src="resolveLiveResourceUrl(previewModalItem, 'motion')"
-            :poster="resolveLiveResourceUrl(previewModalItem, 'image') || undefined"
+            :key="resolveSafeLiveResourceUrl(previewModalItem, 'motion')"
+            :src="resolveSafeLiveResourceUrl(previewModalItem, 'motion')"
+            :poster="resolveSafeLiveResourceUrl(previewModalItem, 'image') || undefined"
             controls
             autoplay
             loop
             playsinline
             referrerpolicy="no-referrer"
             class="sp-lightbox__media"
+            @error="markUrlBroken(resolveSafeLiveResourceUrl(previewModalItem, 'motion'))"
           />
           <img
             v-else-if="resolveAlbumThumbUrl(previewModalItem)"
@@ -1574,6 +1689,7 @@ async function handleBatchZipSave() {
             alt="预览图"
             referrerpolicy="no-referrer"
             class="sp-lightbox__media"
+            @error="markUrlBroken(resolveAlbumThumbUrl(previewModalItem))"
           />
         </div>
       </div>

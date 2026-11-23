@@ -5,6 +5,8 @@ export interface Source {
   url: string;
   /** At most two alternate credentials within this same logical source. */
   fallback_urls?: string[];
+  /** Optional verified direct HTTPS upstream media URL alongside access="relay". */
+  direct_url?: string;
   access?: "direct" | "relay";
   expires_at?: string;
   size_bytes?: number;
