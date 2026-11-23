@@ -194,7 +194,7 @@ func TestXHTTPParseResolveAndDegradation(t *testing.T) {
 
 	// 4. Degrade X engine (e.g. missing or mismatched yt-dlp binary):
 	// After cache TTL expires, X returns 503 SERVICE_NOT_CONFIGURED cleanly while existing platforms (douyin) remain 200 OK.
-	clockNow.Add(61)
+	clockNow.Add(int64(defaultCacheTTL/time.Second) + 1)
 	xExtractor.enabled = false
 	xExtractor.extract = nil
 
@@ -426,8 +426,8 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 		t.Fatalf("expected queued SlowParse X request to wake and return 200 OK, got %d: %s", wQueued.Code, wQueued.Body.String())
 	}
 
-	// 5. Subsequent X request after slots are freed (and short cache TTL expires) succeeds with 200 OK.
-	clockNow.Add(61)
+	// 5. Subsequent X request after slots are freed (and cache TTL expires) succeeds with 200 OK.
+	clockNow.Add(int64(defaultCacheTTL/time.Second) + 1)
 	reqAfter := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://x.com/UltimaShadowX/status/1577719286659006464"), "198.51.100.50")
 	wAfter := call(entry, reqAfter)
 	if wAfter.Code != http.StatusOK {

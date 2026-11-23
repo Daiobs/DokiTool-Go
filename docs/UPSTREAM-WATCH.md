@@ -37,7 +37,7 @@ GitHub Actions 的 **Watch upstream updates**（[`.github/workflows/upstream-wat
 
 - **最小权限**：工作流仅授予 `contents: read` 与 `issues: write`，`actions/checkout` 显式设置 `persist-credentials: false`，且仅在 `Daiobs/DokiTool-Go` 的 `refs/heads/main` 分支运行。
 - **零外部依赖与防注入**：脚本仅使用 Python 3 标准库，禁用 HTTP 重定向（`NoRedirect`）防止转发 `GITHUB_TOKEN`，严格限制 API 域名为 `https://api.github.com` 且仅允许向 `Daiobs/DokiTool-Go` 的 Issues 端点发起受控写入；所有上游字符串（`tag_name`、Release 标题、时间戳）均经过 `safe_text` 转义，阻断 `@mention`、Markdown 链接/表格注入与 HTML 标签。
-- **不下载、不自动升级**：此检查绝对不会下载或执行任何上游二进制、压缩包或源码，也不会自动创建 PR、修改仓库文件或触发部署。升级 `yt-dlp` 或 `Deno` 时，维护者可使用本地辅助脚本 [`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 同步更新全部 5 处锁定文件中的版本号与官方 SHA-256 摘要（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`），并在经人工审查的 PR 中通过全部离线与集成门禁后合并。
+- **不下载、不自动升级**：此检查绝对不会下载或执行任何上游二进制、压缩包或源码，也不会自动创建 PR、修改仓库文件或触发部署。升级 `yt-dlp` 或 `Deno` 时，维护者可使用本地辅助脚本 [`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 同步更新全部 5 处锁定文件中的版本号与官方 SHA-256 摘要（`backend/internal/ytengine/engine.go` 同步锁定含零解压 Python zipapp `yt-dlp` 在内的全套官方产物、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`），并在经人工审查的 PR 中通过全部离线与集成门禁后合并。
 
 ## 使用 `scripts/bump-runtime-pins.py` 同步更新本地锁定
 

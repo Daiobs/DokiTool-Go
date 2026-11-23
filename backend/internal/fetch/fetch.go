@@ -77,8 +77,11 @@ type Resolver interface {
 type roundTrip func(*http.Request, []netip.Addr, Policy) (*http.Response, error)
 
 const (
-	maxPooledTransports  = 64
-	maxPolicyHeaderBytes = 64 << 10
+	maxPooledTransports   = 64
+	maxPolicyHeaderBytes  = 64 << 10
+	defaultDNSCacheTTL    = 30 * time.Second
+	maxDNSCacheEntries    = 512
+	pooledIdleConnTimeout = 120 * time.Second
 )
 
 type transportKey struct {
@@ -92,6 +95,12 @@ type pooledTransportEntry struct {
 	transport *http.Transport
 }
 
+type dnsCacheEntry struct {
+	host      string
+	ips       []netip.Addr
+	expiresAt time.Time
+}
+
 type Client struct {
 	resolver  Resolver
 	transport roundTrip
@@ -99,13 +108,22 @@ type Client struct {
 	dial           func(context.Context, string, string) (net.Conn, error)
 	tlsRootCAs     *x509.CertPool
 	maxPoolEntries int
+	now            func() time.Time
+	dnsCacheTTL    time.Duration
+	maxDNSEntries  int
 
 	poolMu  sync.Mutex
 	pool    map[transportKey]*list.Element
 	poolLRU *list.List
+
+	dnsMu    sync.Mutex
+	dnsCache map[string]*list.Element
+	dnsLRU   *list.List
 }
 
-func New() *Client { return NewWithResolver(net.DefaultResolver) }
+func New() *Client {
+	return NewWithResolver(net.DefaultResolver).WithDNSCache(defaultDNSCacheTTL)
+}
 
 // NewWithResolver creates a Client using r for hop-by-hop DNS resolution while
 // retaining all URL, PublicIP, pinned-IP dialing, and response-size boundaries.
@@ -114,12 +132,133 @@ func NewWithResolver(r Resolver) *Client {
 		r = net.DefaultResolver
 	}
 	c := &Client{
-		resolver: r,
-		pool:     make(map[transportKey]*list.Element),
-		poolLRU:  list.New(),
+		resolver:      r,
+		now:           time.Now,
+		maxDNSEntries: maxDNSCacheEntries,
+		pool:          make(map[transportKey]*list.Element),
+		poolLRU:       list.New(),
+		dnsCache:      make(map[string]*list.Element),
+		dnsLRU:        list.New(),
 	}
 	c.transport = c.pooledRoundTrip
 	return c
+}
+
+// WithDNSCache enables or disables the bounded short-lived public-IP DNS cache.
+// Only validated all-public lookups are cached; errors, empty results, and any
+// private/reserved IP results are never cached, and every cached IP is still
+// re-checked with PublicIP before dialing.
+func (c *Client) WithDNSCache(ttl time.Duration) *Client {
+	if c == nil {
+		return nil
+	}
+	c.dnsMu.Lock()
+	if ttl <= 0 {
+		c.dnsCacheTTL = 0
+		c.dnsCache = make(map[string]*list.Element)
+		c.dnsLRU = list.New()
+	} else {
+		c.dnsCacheTTL = ttl
+		if c.maxDNSEntries <= 0 {
+			c.maxDNSEntries = maxDNSCacheEntries
+		}
+		if c.dnsCache == nil {
+			c.dnsCache = make(map[string]*list.Element)
+			c.dnsLRU = list.New()
+		}
+	}
+	c.dnsMu.Unlock()
+	return c
+}
+
+func (c *Client) currentTime() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *Client) lookupPublicIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	c.dnsMu.Lock()
+	ttl := c.dnsCacheTTL
+	if ttl > 0 && c.dnsCache != nil {
+		if elem, ok := c.dnsCache[key]; ok {
+			entry := elem.Value.(*dnsCacheEntry)
+			if c.currentTime().Before(entry.expiresAt) {
+				c.dnsLRU.MoveToFront(elem)
+				cached := append([]netip.Addr(nil), entry.ips...)
+				c.dnsMu.Unlock()
+				if len(cached) == 0 {
+					return nil, ErrPolicy
+				}
+				for _, ip := range cached {
+					if !PublicIP(ip) {
+						return nil, ErrPolicy
+					}
+				}
+				return cached, nil
+			}
+			c.dnsLRU.Remove(elem)
+			delete(c.dnsCache, key)
+		}
+	}
+	c.dnsMu.Unlock()
+
+	ips, err := c.resolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, ErrPolicy
+	}
+	for _, ip := range ips {
+		if !PublicIP(ip) {
+			if ttl > 0 {
+				c.dnsMu.Lock()
+				if elem, ok := c.dnsCache[key]; ok {
+					c.dnsLRU.Remove(elem)
+					delete(c.dnsCache, key)
+				}
+				c.dnsMu.Unlock()
+			}
+			return nil, ErrPolicy
+		}
+	}
+	if ttl > 0 {
+		c.dnsMu.Lock()
+		if c.dnsCacheTTL > 0 {
+			if c.dnsCache == nil {
+				c.dnsCache = make(map[string]*list.Element)
+				c.dnsLRU = list.New()
+			}
+			if old, ok := c.dnsCache[key]; ok {
+				c.dnsLRU.Remove(old)
+				delete(c.dnsCache, key)
+			}
+			limit := c.maxDNSEntries
+			if limit <= 0 {
+				limit = maxDNSCacheEntries
+			}
+			for c.dnsLRU.Len() >= limit {
+				oldest := c.dnsLRU.Back()
+				if oldest == nil {
+					break
+				}
+				c.dnsLRU.Remove(oldest)
+				delete(c.dnsCache, oldest.Value.(*dnsCacheEntry).host)
+			}
+			stored := append([]netip.Addr(nil), ips...)
+			elem := c.dnsLRU.PushFront(&dnsCacheEntry{
+				host:      key,
+				ips:       stored,
+				expiresAt: c.currentTime().Add(c.dnsCacheTTL),
+			})
+			c.dnsCache[key] = elem
+		}
+		c.dnsMu.Unlock()
+	}
+	return ips, nil
 }
 
 // CloseIdleConnections closes all idle Keep-Alive connections in the client's
@@ -256,17 +395,9 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 		if err != nil || !p.AllowedURL(current) {
 			return Response{}, ErrPolicy
 		}
-		ips, err := c.resolver.LookupNetIP(ctx, "ip", u.Hostname())
+		ips, err := c.lookupPublicIPs(ctx, u.Hostname())
 		if err != nil {
 			return Response{}, err
-		}
-		if len(ips) == 0 {
-			return Response{}, ErrPolicy
-		}
-		for _, ip := range ips {
-			if !PublicIP(ip) {
-				return Response{}, ErrPolicy
-			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, current, bytes.NewReader(body))
 		if err != nil {
@@ -407,8 +538,9 @@ func (c *Client) pooledRoundTrip(req *http.Request, ips []netip.Addr, policy Pol
 		cloned.Host = strings.ToLower(req.Host)
 		req = cloned
 	}
+	orderedIPs := c.preferPooledIP(lowerHost, port, ips)
 	var lastErr error
-	for i, ip := range ips {
+	for i, ip := range orderedIPs {
 		if err := req.Context().Err(); err != nil {
 			return nil, err
 		}
@@ -438,6 +570,33 @@ func (c *Client) pooledRoundTrip(req *http.Request, ips []netip.Addr, policy Pol
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+func (c *Client) preferPooledIP(lowerHost, port string, ips []netip.Addr) []netip.Addr {
+	if len(ips) <= 1 {
+		return ips
+	}
+	c.poolMu.Lock()
+	hitIdx := -1
+	if c.pool != nil {
+		for i, ip := range ips {
+			key := transportKey{host: lowerHost, port: port, ip: ip.String()}
+			if elem, ok := c.pool[key]; ok {
+				c.poolLRU.MoveToFront(elem)
+				hitIdx = i
+				break
+			}
+		}
+	}
+	c.poolMu.Unlock()
+	if hitIdx <= 0 {
+		return ips
+	}
+	ordered := make([]netip.Addr, 0, len(ips))
+	ordered = append(ordered, ips[hitIdx])
+	ordered = append(ordered, ips[:hitIdx]...)
+	ordered = append(ordered, ips[hitIdx+1:]...)
+	return ordered
 }
 
 func (c *Client) pooledTransport(lowerHost, port string, ip netip.Addr) *http.Transport {
@@ -507,9 +666,9 @@ func (c *Client) newPooledTransport(lowerHost, port string, verifiedIP netip.Add
 		// DialContext/TLSClientConfig would otherwise silently downgrade every
 		// non-strict request to HTTP/1.1 and change the upstream fingerprint.
 		ForceAttemptHTTP2:      true,
-		MaxIdleConns:           2,
-		MaxIdleConnsPerHost:    2,
-		IdleConnTimeout:        25 * time.Second,
+		MaxIdleConns:           4,
+		MaxIdleConnsPerHost:    4,
+		IdleConnTimeout:        pooledIdleConnTimeout,
 		TLSHandshakeTimeout:    10 * time.Second,
 		ResponseHeaderTimeout:  20 * time.Second,
 		MaxResponseHeaderBytes: maxPolicyHeaderBytes,

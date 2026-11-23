@@ -294,45 +294,45 @@ type shanghaiValidated struct {
 // The official dispatcher and validated service response establish provenance.
 // Compare against this work's own duration and declared renditions before
 // allowing an optional resolver to replace or supplement the Japan route.
-func (p *Parser) probeOriginalWithShanghai(ctx context.Context, vid, entry string, detail object, known qualityVideo, shState shanghaiState) (object, *shanghaiSameObject, error) {
+func (p *Parser) probeOriginalWithShanghai(ctx context.Context, vid, entry string, detail object, known qualityVideo, shState shanghaiState) (object, *shanghaiSameObject, bool, error) {
 	video := unified.Map(detail["video"])
 	if shState.work != nil {
 		if len(shState.work.Candidates) > 0 {
 			if shState.work.VideoID == vid {
 				if validated := validateShanghai(vid, shState.work.Candidates, video); validated != nil {
 					if higherThanDeclared(validated.metadata, known, video, validated.objectKey) {
-						return object{"url": validated.url, "metadata": validated.metadata}, nil, nil
+						return object{"url": validated.url, "metadata": validated.metadata}, nil, true, nil
 					}
-					return nil, &shanghaiSameObject{objectKey: validated.objectKey, sources: validated.sources}, nil
+					return nil, &shanghaiSameObject{objectKey: validated.objectKey, sources: validated.sources}, true, nil
 				}
 			}
 		} else if shState.work.VideoID != "" && shState.work.VideoID == vid {
 			// Shanghai completed original probing for this video_id and confirmed no higher-quality original exists.
-			return nil, nil, nil
+			return nil, nil, true, nil
 		}
 	} else if p.resolver != nil && (!shState.resolved || shState.useV1Fallback) {
 		candidates, err := p.resolver.ResolveOriginal(ctx, vid)
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return nil, nil, false, ctx.Err()
 		}
 		if err == nil {
 			if validated := validateShanghai(vid, candidates, video); validated != nil {
 				if higherThanDeclared(validated.metadata, known, video, validated.objectKey) {
-					return object{"url": validated.url, "metadata": validated.metadata}, nil, nil
+					return object{"url": validated.url, "metadata": validated.metadata}, nil, true, nil
 				}
-				return nil, &shanghaiSameObject{objectKey: validated.objectKey, sources: validated.sources}, nil
+				return nil, &shanghaiSameObject{objectKey: validated.objectKey, sources: validated.sources}, true, nil
 			}
 		}
 	}
 	if p.prober == nil {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	probed, err := p.prober.Probe(ctx, entry)
 	if ctx.Err() != nil {
-		return nil, nil, ctx.Err()
+		return nil, nil, false, ctx.Err()
 	}
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	// With the feature enabled the same confirmed CDN object keeps its version
 	// identity even when its credentials came from the Japan fallback.
@@ -341,7 +341,7 @@ func (p *Parser) probeOriginalWithShanghai(ctx context.Context, vid, entry strin
 		key := unified.DouyinStoragePath(raw)
 		meta := unified.Map(probed["metadata"])
 		if len(meta) > 0 && !higherThanDeclared(meta, known, video, key) {
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
 		if key != "" && len(meta) > 0 {
 			// DouyinStoragePath has already parsed and validated this URL.
@@ -351,10 +351,10 @@ func (p *Parser) probeOriginalWithShanghai(ctx context.Context, vid, entry strin
 			src := object{"url": raw, "size": meta["size"], "private_source_identity": id + "@" + strings.ToLower(u.Hostname())}
 			meta["sources"] = array{src}
 			meta["private_media_identity"] = id
-			return object{"url": raw, "metadata": meta}, nil, nil
+			return object{"url": raw, "metadata": meta}, nil, false, nil
 		}
 	}
-	return probed, nil, nil
+	return probed, nil, false, nil
 }
 
 func validateShanghai(vid string, candidates []object, video object) *shanghaiValidated {
@@ -427,10 +427,10 @@ func declaredCandidateSource(candidate object) object {
 	return src
 }
 
-func prependShanghaiSources(mainCandidate object, backups array, same *shanghaiSameObject, renditions map[string]array) {
+func prependShanghaiSources(mainCandidate object, backups array, same *shanghaiSameObject, renditions map[string]array) bool {
 	hasSame := same != nil && same.objectKey != "" && len(same.sources) > 0
 	if !hasSame && len(renditions) == 0 {
-		return
+		return false
 	}
 	all := make([]object, 0, 1+len(backups))
 	if truthy(mainCandidate["url"]) {
@@ -455,7 +455,7 @@ func prependShanghaiSources(mainCandidate object, backups array, same *shanghaiS
 		}
 	}
 	if len(groupObjectKey) == 0 {
-		return
+		return false
 	}
 	prepended := map[string]bool{}
 	for _, candidate := range all {
@@ -514,6 +514,7 @@ func prependShanghaiSources(mainCandidate object, backups array, same *shanghaiS
 		candidate["sources"] = merged
 		prepended[groupKey] = true
 	}
+	return len(prepended) > 0
 }
 
 // Both routes identify the storage object and fingerprint the same initial bytes.

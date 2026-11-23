@@ -4347,6 +4347,7 @@ test("Background Controller lifecycle: dynamic setBadgeText & setTitle across pa
     storage: extStorage,
     fetchImpl: mockFetch,
     badgeSuccessDurationMs: 45,
+    badgeProgressThrottleMs: 0,
   });
 
   try {
@@ -9297,8 +9298,8 @@ test("[PR-A Item 4e & 4f] All-routes 403/410 expiry (probe & mid-transfer chunk)
   }
 });
 
-test("[PR-A Item 4g & 4h] dash_mux concurrent video (<=3) + audio (<=1) with total <=4 and valid mediabunny MP4, plus same-origin /api/ relay strictly capped at 1x even >= 8 MiB", async () => {
-  // 1) dash_mux: 16 MiB video (Chunk 0 + 3 parallel chunks -> max 3) + 9 MiB audio (strictly capped at 1) -> combined <= 4, valid MP4!
+test("[PR-A Item 4g & 4h] dash_mux concurrent video (<=3) + audio (<=2) with total <=5 and valid mediabunny MP4, plus same-origin /api/ relay strictly capped at 1x even >= 8 MiB", async () => {
+  // 1) dash_mux: 16 MiB video (Chunk 0 + 3 parallel chunks -> max 3) + 9 MiB audio (Chunk 0 + 2 parallel chunks -> max 2) -> combined <= 5, valid MP4!
   {
     const { videoBytes: rawVideo, audioBytes: rawAudio } =
       await createSyntheticDashTrackBuffers("avc");
@@ -9408,11 +9409,11 @@ test("[PR-A Item 4g & 4h] dash_mux concurrent video (<=3) + audio (<=1) with tot
       await executor.waitForIdle();
       assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
       assert.equal(videoMaxInFlight, 3, "DASH video track must use up to 3 concurrent Range workers");
-      assert.equal(audioMaxInFlight, 1, "DASH audio track must stay strictly at 1 connection even >= 8 MiB");
-      assert.equal(audioRangeHeaders.length, 0, "DASH audio track (maxConcurrency=1) must not send initial Range probe");
+      assert.equal(audioMaxInFlight, 2, "DASH audio track must use up to 2 concurrent Range workers when >= 3 MiB");
+      assert.ok(audioRangeHeaders.length >= 2, "DASH audio track (maxConcurrency=2) must use Range requests for >= 3 MiB");
       assert.ok(
-        totalMaxInFlight <= 4,
-        `combined DASH in-flight connections must be <= 4 (got ${totalMaxInFlight})`,
+        totalMaxInFlight <= 5,
+        `combined DASH in-flight connections must be <= 5 (got ${totalMaxInFlight})`,
       );
       assert.ok(muxedMp4Bytes && muxedMp4Bytes.byteLength > 0);
 
@@ -11971,5 +11972,322 @@ test("PR 1 UX: single-P Bilibili stays single-video with clean media.title filen
     assert.equal(albumEnqueues[0].items[0].spec.kind, "batch_zip");
   } finally {
     albumView.unmount();
+  }
+});
+
+test("[PR3] opfsStreamTransfer defaults: 3 MiB parallel Range threshold and DASH audio maxConcurrency=2", async () => {
+  assert.equal(
+    opfsStreamTransferMod.DEFAULT_RANGE_CONCURRENCY_THRESHOLD_BYTES,
+    3 * 1024 * 1024,
+  );
+  assert.equal(opfsStreamTransferMod.DEFAULT_DASH_AUDIO_MAX_CONCURRENCY, 2);
+
+  // 3.5 MiB file with 1 MiB chunks activates parallel Range under default minParallelRangeBytes (3 MiB).
+  const runSize = async (byteLength) => {
+    const payload = makeDeterministicPayload(byteLength, 73);
+    const opfs = createMockOpfs();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const res = await opfsStreamTransferMod.streamResumableRouteToOpfs({
+      taskId: `thresh-${byteLength}`,
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/thresh.mp4"],
+      spec: {
+        kind: "direct_file",
+        apiOrigin: "https://snap.dokitool.com",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/thresh.mp4"],
+        filename: "thresh.mp4",
+      },
+      fetchFn: async (_url, init) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          const parsed = parseTestRangeHeader(init?.headers?.Range);
+          if (parsed) {
+            const start = parsed.start;
+            const end = Math.min(payload.byteLength - 1, parsed.end ?? payload.byteLength - 1);
+            await new Promise((r) => setTimeout(r, start === 0 ? 1 : 20));
+            const slice = payload.subarray(start, end + 1);
+            return new Response(slice, {
+              status: 206,
+              headers: {
+                "Content-Type": "video/mp4",
+                "Content-Range": `bytes ${start}-${end}/${payload.byteLength}`,
+                "Content-Length": String(slice.byteLength),
+              },
+            });
+          }
+          return new Response(payload, {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Length": String(payload.byteLength),
+            },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+      openOpfsSink: makeTestOpfsSink(opfs),
+      signal: new AbortController().signal,
+      estimatedSize: byteLength,
+      maxConcurrency: 4,
+      rangeChunkSizeBytes: 1024 * 1024,
+    });
+    const blob = await res.sink.closeAndGetBlob();
+    assert.equal(sha256Hex(new Uint8Array(await blob.arrayBuffer())), sha256Hex(payload));
+    await res.sink.cleanup();
+    return { parallelUsed: res.parallelUsed, maxInFlight };
+  };
+
+  const over3MiB = await runSize(Math.floor(3.5 * 1024 * 1024));
+  assert.equal(over3MiB.parallelUsed, true, "3.5 MiB must activate parallel Range with 3 MiB threshold");
+  assert.ok(over3MiB.maxInFlight >= 2, `expected parallel workers on 3.5 MiB, got ${over3MiB.maxInFlight}`);
+
+  const under3MiB = await runSize(Math.floor(2.5 * 1024 * 1024));
+  assert.equal(under3MiB.parallelUsed, false, "2.5 MiB (< 3 MiB) must stay single-stream");
+  assert.equal(under3MiB.maxInFlight, 1);
+});
+
+test("[PR3] Background Controller throttles badge/tooltip progress updates when SidePanel is closed while flushing state transitions immediately", async () => {
+  assert.equal(backgroundMod.DEFAULT_BADGE_PROGRESS_THROTTLE_MS, 1_000);
+
+  const env = createMockMv3Environment({ autoCompleteDownloads: false });
+  let startedTaskId = "";
+  let fakeNow = 10_000;
+
+  env.chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "OFFSCREEN_START_TASK") {
+      startedTaskId = msg.taskId;
+      sendResponse({ ok: true, data: { accepted: true } });
+      return true;
+    }
+    if (msg?.type === "RELEASE_BLOB") {
+      sendResponse({ ok: true, data: { released: true } });
+      return true;
+    }
+    return false;
+  });
+
+  const extStorage = storage.createExtensionStorage();
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    now: () => fakeNow,
+    badgeSuccessDurationMs: 40,
+    badgeProgressThrottleMs: 80,
+  });
+
+  try {
+    await bg.init();
+    env.badgeHistory.length = 0;
+
+    // Enqueue single direct_file task with SidePanel CLOSED (0 connected ports).
+    const enq = await env.chrome.runtime.sendMessage({
+      type: "ENQUEUE_DOWNLOADS",
+      items: [
+        {
+          title: "节流测试视频",
+          platform: "bilibili",
+          spec: {
+            kind: "direct_file",
+            apiOrigin: "https://snap.dokitool.com",
+            routes: ["https://upos-sz-mirrorcos.bilivideo.com/throttle.mp4"],
+            filename: "throttle.mp4",
+            sizeBytes: 100_000_000,
+          },
+        },
+      ],
+    });
+    const taskId = enq.data.taskIds[0];
+    for (let i = 0; i < 30 && !startedTaskId; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(startedTaskId, taskId);
+    env.badgeHistory.length = 0;
+
+    // 1) Leading-edge progress tick flushes immediately (10%).
+    fakeNow = 10_100;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 10,
+      loaded: 10_000_000,
+      total: 100_000_000,
+      speed: 2_000_000,
+    });
+    assert.deepEqual(
+      env.badgeHistory.filter((e) => e.kind === "text").map((e) => e.text),
+      ["10%"],
+    );
+
+    // 2) Rapid ticks within throttle window (<80ms) MUST coalesce with ZERO immediate Chrome IPC!
+    env.badgeHistory.length = 0;
+    for (const [dt, pct, speed] of [
+      [10, 20, 2_500_000],
+      [20, 30, 3_000_000],
+      [30, 45, 3_500_000],
+    ]) {
+      fakeNow = 10_100 + dt;
+      await env.chrome.runtime.sendMessage({
+        type: "OFFSCREEN_TASK_PROGRESS",
+        taskId,
+        status: "downloading",
+        statusText: "正在下载...",
+        percent: pct,
+        loaded: pct * 1_000_000,
+        total: 100_000_000,
+        speed,
+      });
+    }
+    assert.equal(
+      env.badgeHistory.length,
+      0,
+      "Rapid closed-SidePanel progress ticks within throttle window must coalesce",
+    );
+
+    // 3) After throttle window elapses, trailing flush emits ONLY the latest coalesced state (45%)!
+    fakeNow = 10_200;
+    await new Promise((r) => setTimeout(r, 110));
+    assert.deepEqual(
+      env.badgeHistory.filter((e) => e.kind === "text").map((e) => e.text),
+      ["45%"],
+    );
+    assert.match(
+      env.badgeHistory.filter((e) => e.kind === "title").at(-1)?.title ?? "",
+      /45% \(3\.5 MB\/s\)/,
+    );
+
+    // 4) Queue another throttled progress tick (55%), then trigger a state transition (downloading -> muxing 80%) -> MUST flush immediately!
+    env.badgeHistory.length = 0;
+    fakeNow = 10_210;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "downloading",
+      statusText: "正在下载...",
+      percent: 55,
+      loaded: 55_000_000,
+      total: 100_000_000,
+      speed: 4_000_000,
+    });
+    assert.equal(env.badgeHistory.length, 0, "55% tick throttled inside window");
+
+    fakeNow = 10_220;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 80,
+      loaded: 80_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    assert.deepEqual(
+      env.badgeHistory.filter((e) => e.kind === "text").map((e) => e.text),
+      ["80%"],
+      "Stage transition downloading -> muxing must flush immediately without waiting for throttle timer",
+    );
+
+    // 5) Opening SidePanel flushes any pending throttled tick and disables throttling while open!
+    env.badgeHistory.length = 0;
+    fakeNow = 10_225;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 84,
+      loaded: 84_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    // First muxing progress-only tick (84%) flushes leading edge; next tick (88%) is throttled.
+    fakeNow = 10_235;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 88,
+      loaded: 88_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    assert.deepEqual(
+      env.badgeHistory.filter((e) => e.kind === "text").map((e) => e.text),
+      ["84%"],
+    );
+
+    const spPort = env.chrome.runtime.connect({
+      name: protocol.SIDEPANEL_PORT_NAME,
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "88%",
+      "Connecting SidePanel must immediately flush pending throttled badge update",
+    );
+
+    // While SidePanel is open, rapid progress ticks flush immediately.
+    env.badgeHistory.length = 0;
+    fakeNow = 10_240;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 91,
+      loaded: 91_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    fakeNow = 10_245;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 94,
+      loaded: 94_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    assert.deepEqual(
+      env.badgeHistory.filter((e) => e.kind === "text").map((e) => e.text),
+      ["91%", "94%"],
+      "Progress ticks must not throttle while SidePanel is connected",
+    );
+
+    // Close SidePanel, queue a throttled tick, then fail -> terminal "!" flushes IMMEDIATELY!
+    spPort.disconnect();
+    env.badgeHistory.length = 0;
+    fakeNow = 10_250;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_PROGRESS",
+      taskId,
+      status: "muxing",
+      statusText: "正在合流...",
+      percent: 96,
+      loaded: 96_000_000,
+      total: 100_000_000,
+      speed: 0,
+    });
+    assert.equal(env.badgeHistory.length, 0, "Closed SidePanel re-enables throttling");
+
+    fakeNow = 10_255;
+    await env.chrome.runtime.sendMessage({
+      type: "OFFSCREEN_TASK_ERROR",
+      taskId,
+      error: "synthetic failure",
+    });
+    assert.equal(
+      env.badgeHistory.filter((e) => e.kind === "text").at(-1)?.text,
+      "!",
+      "Terminal failure must flush immediately even during throttle window",
+    );
+  } finally {
+    bg.dispose();
   }
 });

@@ -59,19 +59,40 @@ func viewRequest(bvid string, timeout time.Duration) fetch.Request {
 	return apiRequest("bilibili-view", "https://api.bilibili.com/x/web-interface/view?bvid="+bvid, timeout)
 }
 
+func browserAPIHeaders() http.Header {
+	return http.Header{
+		"User-Agent":      {desktopUA},
+		"Referer":         {"https://www.bilibili.com/"},
+		"Origin":          {"https://www.bilibili.com"},
+		"Accept":          {"application/json, text/plain, */*"},
+		"Accept-Language": {"zh-CN,zh;q=0.9"},
+		"Accept-Encoding": {"gzip,deflate"},
+	}
+}
+
 func playRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
 	return apiRequest("bilibili-play", "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=3&player=3&qn=112&bvid="+bvid+"&cid="+url.QueryEscape(stringValue(cid))+"&platform=html5&high_quality=1", timeout)
+}
+
+func shanghaiPlayRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
+	return fetch.Request{
+		URL:    "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=3&player=3&qn=112&bvid=" + bvid + "&cid=" + url.QueryEscape(stringValue(cid)) + "&platform=html5&high_quality=1",
+		Method: http.MethodGet,
+		Header: browserAPIHeaders(),
+		Policy: fetch.Policy{
+			Purpose:    "bilibili-play",
+			AllowedURL: AllowedAPIURL,
+			Timeout:    timeout,
+			MaxBytes:   8 << 20,
+		},
+	}
 }
 
 func dashPlayRequest(bvid string, cid any, timeout time.Duration) fetch.Request {
 	return fetch.Request{
 		URL:    "https://api.bilibili.com/x/player/playurl?otype=json&fnver=0&fnval=4048&qn=120&fourk=1&try_look=1&bvid=" + bvid + "&cid=" + url.QueryEscape(stringValue(cid)),
 		Method: http.MethodGet,
-		Header: http.Header{
-			"User-Agent":      {desktopUA},
-			"Referer":         {"https://www.bilibili.com/"},
-			"Accept-Encoding": {"gzip,deflate"},
-		},
+		Header: browserAPIHeaders(),
 		Policy: fetch.Policy{
 			Purpose:    "bilibili-play-dash",
 			AllowedURL: AllowedAPIURL,

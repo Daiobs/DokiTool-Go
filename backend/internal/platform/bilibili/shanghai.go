@@ -644,7 +644,7 @@ func fetchShanghaiPlayStreams(
 		}()
 	}
 
-	durlData, durlErr := fetchShanghaiPlayData(ctx, executor, playRequest(bvid, cid, timeout))
+	durlData, durlErr := fetchShanghaiPlayData(ctx, executor, shanghaiPlayRequest(bvid, cid, timeout))
 	if err := ctx.Err(); err != nil {
 		return shanghaiPlayFetchResult{}, shanghaiPlayFetchResult{}, 0, nil, err
 	}

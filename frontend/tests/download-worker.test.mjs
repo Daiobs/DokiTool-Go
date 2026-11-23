@@ -1139,3 +1139,331 @@ test('tbvideo preparation deadline cancels a pending read, returns no attachment
   assert.equal((await (await h.download(2)).arrayBuffer()).byteLength, 8);
   assert.equal((await h.query(2)).status, 'completed');
 });
+
+function makeRangePayload(size) {
+  const buf = Buffer.allocUnsafe(size);
+  // Start with a valid MP4 ftyp header so prefix sniffing passes.
+  buf.set([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d], 0);
+  for (let i = 12; i < size; i++) buf[i] = (i * 31 + (i >>> 8) * 17 + 7) & 0xff;
+  return buf;
+}
+
+function sha256(buf) {
+  return createHash('sha256').update(buf).digest('hex');
+}
+
+function makeChunkedStream(buf, chunkSize, hooks = {}) {
+  let offset = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (offset >= buf.length) {
+        controller.close();
+        return;
+      }
+      if (hooks.onPull) await hooks.onPull(offset);
+      const end = Math.min(buf.length, offset + chunkSize);
+      const slice = buf.subarray(offset, end);
+      offset = end;
+      controller.enqueue(slice);
+    },
+    cancel(reason) {
+      hooks.onCancel?.(offset, reason);
+    },
+  }, { highWaterMark: 0 });
+}
+
+test('multi-range sliding window delivers exact bytes out-of-order with bounded concurrency and window', async t => {
+  const payload = makeRangePayload(12 * 1024 * 1024 + 137);
+  const expectedDigest = sha256(payload);
+  const etag = '"range-etag-v1"';
+  const rangeCalls = [];
+  let initialCancelledAt = -1;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const pendingResolvers = new Map();
+
+  const h = harness(async (url, options) => {
+    assert.equal(url, 'https://cdn.test/primary.mp4');
+    assert.equal(options.mode, 'cors');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      // Deliver chunk 0 in 256 KiB slices (with one straddling offset to verify exact boundary slicing).
+      return new Response(makeChunkedStream(payload, 300 * 1024, {
+        onCancel(at) { initialCancelledAt = at; },
+      }), {
+        status: 200,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(payload.length),
+          'accept-ranges': 'Bytes',
+          etag,
+        },
+      });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    assert.ok(m, `unexpected Range header: ${rangeHeader}`);
+    const start = Number(m[1]), end = Number(m[2]);
+    rangeCalls.push({ start, end, signal: options.signal });
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    const slice = payload.subarray(start, end + 1);
+    const body = new ReadableStream({
+      async start(controller) {
+        // Hold chunk 1 (starts at 2 MiB) until chunk 2 (4 MiB) is also in-flight to verify out-of-order completion.
+        if (start === 2 * 1024 * 1024) {
+          await new Promise(resolve => { pendingResolvers.set(start, resolve); });
+        } else if (start === 4 * 1024 * 1024) {
+          pendingResolvers.get(2 * 1024 * 1024)?.();
+        }
+        for (let at = 0; at < slice.length; at += 512 * 1024) {
+          controller.enqueue(slice.subarray(at, Math.min(slice.length, at + 512 * 1024)));
+        }
+        controller.close();
+        inFlight--;
+      },
+      cancel() { inFlight--; },
+    });
+    return new Response(body, {
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(slice.length),
+        'content-range': `bytes ${start}-${end}/${payload.length}`,
+        etag,
+      },
+    });
+  });
+  t.after(() => h.close());
+
+  await h.admit(1);
+  const response = await h.download(1);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-length'), String(payload.length));
+  assert.equal(rangeCalls.length, 0, 'no Range probe before consumer pulls');
+
+  const reader = response.body.getReader();
+  // Pull first chunk -> starts probe and fills bounded window (max 4 chunks: 2M, 4M, 6M, 8M; must NOT schedule 10M or 12M yet!)
+  const firstRead = await reader.read();
+  assert.ok(!firstRead.done);
+  // Wait a few microtasks/ticks so probe + initial bounded window dispatch.
+  for (let i = 0; i < 15; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(rangeCalls.length >= 2 && rangeCalls.length <= 4,
+    `bounded window must schedule at most 4 chunks before chunk 1 is delivered, saw ${rangeCalls.length}`);
+  assert.ok(!rangeCalls.some(c => c.start >= 10 * 1024 * 1024),
+    'chunks beyond MAX_WINDOW_CHUNKS=4 must not be scheduled while paused on chunk 0');
+
+  // Drain the rest of the stream and verify byte-for-byte SHA-256 identity.
+  const chunks = [Buffer.from(firstRead.value)];
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    chunks.push(Buffer.from(next.value));
+  }
+  const actual = Buffer.concat(chunks);
+  assert.equal(actual.length, payload.length);
+  assert.equal(sha256(actual), expectedDigest);
+  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 2 * 1024 * 1024 + 300 * 1024,
+    `initial 200 stream should cancel at 2 MiB boundary, cancelled at ${initialCancelledAt}`);
+  assert.ok(maxInFlight >= 2 && maxInFlight <= 4, `expected bounded concurrency 2..4, got ${maxInFlight}`);
+  assert.equal(rangeCalls.length, 6, '12 MiB + 137 B after 2 MiB chunk 0 = 6 Range chunks');
+  const finished = await h.query(1);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.loaded, payload.length);
+  assert.equal(h.transferTimers.length, 0);
+});
+
+test('multi-range falls back silently to initial 200 stream when 206 is unsupported, mismatched, CORS-rejected or ETag changes', async t => {
+  const payload = makeRangePayload(5 * 1024 * 1024 + 19);
+  const expectedDigest = sha256(payload);
+  const cases = [
+    ['non-206', () => new Response(payload.subarray(2 * 1024 * 1024), { status: 200, headers: { 'content-type': 'video/mp4' } })],
+    ['cors-error', () => { throw new TypeError('Failed to fetch'); }],
+    ['missing-content-range', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), { status: 206, headers: { 'content-type': 'video/mp4' } })],
+    ['mismatched-total', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), {
+      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${2 * 1024 * 1024}-${4 * 1024 * 1024 - 1}/${payload.length + 1}` },
+    })],
+    ['changed-etag', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), {
+      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${2 * 1024 * 1024}-${4 * 1024 * 1024 - 1}/${payload.length}`, etag: '"v2"' },
+    })],
+  ];
+
+  for (const [name, makeRangeResponse] of cases) {
+    let rangeCount = 0;
+    const h = harness(async (_url, options) => {
+      if (options.headers?.Range) {
+        rangeCount++;
+        return makeRangeResponse();
+      }
+      return new Response(makeChunkedStream(payload, 512 * 1024), {
+        status: 200,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(payload.length),
+          'accept-ranges': 'bytes',
+          etag: '"v1"',
+        },
+      });
+    });
+    t.after(() => h.close());
+    await h.admit(1);
+    const res = await h.download(1);
+    const actual = Buffer.from(await res.arrayBuffer());
+    assert.equal(actual.length, payload.length, `${name}: full length preserved`);
+    assert.equal(sha256(actual), expectedDigest, `${name}: exact bytes from fallback 200 stream`);
+    assert.equal(rangeCount, 1, `${name}: only single probe issued before fallback`);
+    assert.equal((await h.query(1)).status, 'completed', `${name}: completed cleanly`);
+  }
+
+  // Same-origin relay URLs (credentials: same-origin) and missing Accept-Ranges must never issue Range probes.
+  for (const [name, url, headers] of [
+    ['same-origin', `${origin}/api/media/weibo?ticket=abc`, { 'accept-ranges': 'bytes' }],
+    ['no-accept-ranges', 'https://cdn.test/no-range.mp4', {}],
+  ]) {
+    let rangeCount = 0;
+    const h = harness(async (_url, options) => {
+      if (options.headers?.Range) rangeCount++;
+      return new Response(makeChunkedStream(payload, 1024 * 1024), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), ...headers },
+      });
+    });
+    t.after(() => h.close());
+    await h.start(1, [], { url });
+    const actual = Buffer.from(await (await h.download(1)).arrayBuffer());
+    assert.equal(sha256(actual), expectedDigest, `${name}: exact bytes`);
+    assert.equal(rangeCount, 0, `${name}: zero Range probes`);
+  }
+});
+
+test('multi-range aborts all in-flight range fetches and releases slot cleanly on cancel', async t => {
+  const payload = makeRangePayload(10 * 1024 * 1024);
+  const rangeSignals = [];
+  let initialAborted = false;
+  let readersCancelled = 0;
+
+  const h = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      options.signal.addEventListener('abort', () => { initialAborted = true; }, { once: true });
+      return new Response(makeChunkedStream(payload, 512 * 1024), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), 'accept-ranges': 'bytes' },
+      });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const start = Number(m[1]), end = Number(m[2]);
+    rangeSignals.push(options.signal);
+    return new Response(new ReadableStream({
+      pull() { return new Promise(() => {}); },
+      cancel() { readersCancelled++; },
+    }, { highWaterMark: 0 }), {
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(end - start + 1),
+        'content-range': `bytes ${start}-${end}/${payload.length}`,
+      },
+    });
+  });
+  t.after(() => h.close());
+
+  await h.admit(1);
+  const reader = (await h.download(1)).body.getReader();
+  await reader.read();
+  for (let i = 0; i < 15; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(rangeSignals.length >= 2, `expected concurrent Range workers in flight, saw ${rangeSignals.length}`);
+  assert.ok(rangeSignals.every(s => !s.aborted));
+
+  await h.cancel(1);
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await h.query(1)).status, 'cancelled');
+  assert.equal(initialAborted, true, 'initial stream controller must abort');
+  assert.ok(rangeSignals.every(s => s.aborted), 'every in-flight Range AbortSignal must abort immediately');
+  assert.equal(readersCancelled, rangeSignals.length, 'every Range body reader must cancel');
+  assert.equal(h.transferTimers.length, 0, 'no dangling transfer timers after cancel');
+});
+
+test('multi-range retries transient post-switch chunk error and fails closed on post-switch ETag mismatch', async t => {
+  const payload = makeRangePayload(6 * 1024 * 1024);
+  const expectedDigest = sha256(payload);
+  let chunk2Attempts = 0;
+  let releaseRetryChunk2;
+  const retryChunk2Gate = new Promise(resolve => { releaseRetryChunk2 = resolve; });
+
+  const hRetry = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      return new Response(makeChunkedStream(payload, 512 * 1024, {
+        onCancel() { releaseRetryChunk2(); },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), 'accept-ranges': 'bytes', etag: '"stable"' },
+      });
+    }
+    const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const start = Number(a), end = Number(b);
+    const slice = payload.subarray(start, end + 1);
+    if (start === 4 * 1024 * 1024) {
+      await retryChunk2Gate;
+      if (++chunk2Attempts === 1) {
+        // Simulate truncated transient drop after initial switch.
+        return new Response(new ReadableStream({
+          pull(controller) {
+            controller.enqueue(slice.subarray(0, 1024));
+            controller.close();
+          },
+        }), {
+          status: 206,
+          headers: { 'content-type': 'video/mp4', 'content-length': String(slice.length), 'content-range': `bytes ${start}-${end}/${payload.length}`, etag: '"stable"' },
+        });
+      }
+    }
+    return new Response(slice, {
+      status: 206,
+      headers: { 'content-type': 'video/mp4', 'content-length': String(slice.length), 'content-range': `bytes ${start}-${end}/${payload.length}`, etag: '"stable"' },
+    });
+  });
+  t.after(() => hRetry.close());
+  await hRetry.admit(1);
+  const res = await hRetry.download(1);
+  const actual = Buffer.from(await res.arrayBuffer());
+  assert.equal(sha256(actual), expectedDigest);
+  assert.equal((await hRetry.query(1)).status, 'completed');
+  assert.equal(chunk2Attempts, 2, 'post-switch transient chunk drop must retry and succeed');
+
+  // Post-switch ETag drift on chunk 2 (held until switch completes) must fail cleanly.
+  let releaseChunk2;
+  const chunk2Gate = new Promise(resolve => { releaseChunk2 = resolve; });
+  const hDrift = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      return new Response(makeChunkedStream(payload, 512 * 1024, {
+        onCancel() { releaseChunk2(); },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), 'accept-ranges': 'bytes', etag: '"v1"' },
+      });
+    }
+    const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const start = Number(a), end = Number(b);
+    const slice = payload.subarray(start, end + 1);
+    if (start === 4 * 1024 * 1024) await chunk2Gate;
+    return new Response(slice, {
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-length': String(slice.length),
+        'content-range': `bytes ${start}-${end}/${payload.length}`,
+        etag: start === 4 * 1024 * 1024 ? '"v2"' : '"v1"',
+      },
+    });
+  });
+  t.after(() => hDrift.close());
+  await hDrift.admit(1);
+  const driftRes = await hDrift.download(1);
+  await assert.rejects(driftRes.arrayBuffer(), /ETag/);
+  assert.equal((await hDrift.query(1)).status, 'failed');
+});

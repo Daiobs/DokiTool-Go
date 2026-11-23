@@ -279,6 +279,14 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 			if req.URL != wantPlay {
 				return fetch.Response{}, errors.New("unexpected durl URL: " + req.URL)
 			}
+			if req.Header.Get("User-Agent") != desktopUA ||
+				req.Header.Get("Referer") != "https://www.bilibili.com/" ||
+				req.Header.Get("Origin") != "https://www.bilibili.com" ||
+				req.Header.Get("Accept") != "application/json, text/plain, */*" ||
+				req.Header.Get("Accept-Language") != "zh-CN,zh;q=0.9" ||
+				req.Header.Get("Accept-Encoding") != "gzip,deflate" {
+				return fetch.Response{}, errors.New("unexpected Shanghai durl browser headers")
+			}
 			playCalls.Add(1)
 			close(durlEntered)
 			select {
@@ -290,7 +298,13 @@ func TestFetchShanghaiPlayOutboundPolicyAndCandidateFiltering(t *testing.T) {
 			}
 			return fetch.Response{StatusCode: http.StatusOK, Body: []byte(durlBody)}, nil
 		case "bilibili-play-dash":
-			if req.URL != wantDash || req.Header.Get("Referer") != "https://www.bilibili.com/" || req.Header.Get("User-Agent") != desktopUA {
+			if req.URL != wantDash ||
+				req.Header.Get("Referer") != "https://www.bilibili.com/" ||
+				req.Header.Get("Origin") != "https://www.bilibili.com" ||
+				req.Header.Get("User-Agent") != desktopUA ||
+				req.Header.Get("Accept") != "application/json, text/plain, */*" ||
+				req.Header.Get("Accept-Language") != "zh-CN,zh;q=0.9" ||
+				req.Header.Get("Accept-Encoding") != "gzip,deflate" {
 				return fetch.Response{}, errors.New("unexpected dash request: " + req.URL)
 			}
 			dashCalls.Add(1)
@@ -761,5 +775,54 @@ func TestShanghaiCallAndParsePanicRecovery(t *testing.T) {
 		if strings.Contains(logged, forbidden) {
 			t.Fatalf("panic recovery log leaked sensitive value %q: %q", forbidden, logged)
 		}
+	}
+}
+
+func TestShanghaiPlayRequestHeadersAndZeroCookie(t *testing.T) {
+	shReq := shanghaiPlayRequest("BV1234567890", int64(101), 2500*time.Millisecond)
+	dashReq := dashPlayRequest("BV1234567890", int64(101), 2500*time.Millisecond)
+	jpReq := playRequest("BV1234567890", int64(101), 20*time.Second)
+
+	for _, tc := range []struct {
+		name string
+		req  fetch.Request
+	}{
+		{"shanghaiPlayRequest", shReq},
+		{"dashPlayRequest", dashReq},
+	} {
+		if tc.req.Header.Get("User-Agent") != desktopUA || tc.req.Header.Get("User-Agent") == "" {
+			t.Fatalf("%s User-Agent = %q, want desktopUA", tc.name, tc.req.Header.Get("User-Agent"))
+		}
+		if tc.req.Header.Get("Referer") != "https://www.bilibili.com/" {
+			t.Fatalf("%s Referer = %q, want https://www.bilibili.com/", tc.name, tc.req.Header.Get("Referer"))
+		}
+		if tc.req.Header.Get("Origin") != "https://www.bilibili.com" {
+			t.Fatalf("%s Origin = %q, want https://www.bilibili.com", tc.name, tc.req.Header.Get("Origin"))
+		}
+		if tc.req.Header.Get("Accept") != "application/json, text/plain, */*" {
+			t.Fatalf("%s Accept = %q", tc.name, tc.req.Header.Get("Accept"))
+		}
+		if tc.req.Header.Get("Accept-Language") != "zh-CN,zh;q=0.9" {
+			t.Fatalf("%s Accept-Language = %q", tc.name, tc.req.Header.Get("Accept-Language"))
+		}
+		if tc.req.Header.Get("Accept-Encoding") != "gzip,deflate" {
+			t.Fatalf("%s Accept-Encoding = %q", tc.name, tc.req.Header.Get("Accept-Encoding"))
+		}
+		for k := range tc.req.Header {
+			if strings.EqualFold(k, "Cookie") || strings.EqualFold(k, "Authorization") {
+				t.Fatalf("%s must not send %s header", tc.name, k)
+			}
+		}
+		if tc.req.Policy.FollowRedirects {
+			t.Fatalf("%s must not follow redirects", tc.name)
+		}
+		if tc.req.Policy.AllowedURL == nil || !tc.req.Policy.AllowedURL(tc.req.URL) {
+			t.Fatalf("%s URL rejected by AllowedAPIURL: %q", tc.name, tc.req.URL)
+		}
+	}
+
+	// Verify Japan PHP-baseline playRequest remains completely untouched.
+	if jpReq.Header.Get("User-Agent") != "" || jpReq.Header.Get("Referer") != "" || jpReq.Header.Get("Origin") != "" {
+		t.Fatalf("Japan playRequest headers unexpectedly modified: %+v", jpReq.Header)
 	}
 }

@@ -1,9 +1,11 @@
 package unified
 
 import (
+	"context"
 	"math"
 	"net/url"
 	"strings"
+	"sync/atomic"
 )
 
 func SameFrameRate(a, b float64) bool {
@@ -258,4 +260,29 @@ func PublicView(payload Object, debug bool, now int64) Object {
 	}
 	data["items"] = items
 	return FinalizeData(data, now)
+}
+
+type shanghaiFallbackKey struct{}
+
+type shanghaiFallbackTracker struct {
+	degraded atomic.Bool
+}
+
+// WithShanghaiFallbackTracker attaches a per-request atomic flag to ctx so
+// Shanghai-enabled platform parsers can report when a parse fell back to
+// overseas routes without altering any response envelope.
+func WithShanghaiFallbackTracker(ctx context.Context) (context.Context, func() bool) {
+	tracker := &shanghaiFallbackTracker{}
+	return context.WithValue(ctx, shanghaiFallbackKey{}, tracker), tracker.degraded.Load
+}
+
+// MarkShanghaiFallback records that the current parse fell back from an enabled
+// Shanghai route to overseas resolution.
+func MarkShanghaiFallback(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if tracker, ok := ctx.Value(shanghaiFallbackKey{}).(*shanghaiFallbackTracker); ok && tracker != nil {
+		tracker.degraded.Store(true)
+	}
 }

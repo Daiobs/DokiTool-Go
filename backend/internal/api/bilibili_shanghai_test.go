@@ -1650,3 +1650,119 @@ func TestBilibiliShanghaiCNNodesFilteredAndFallbackToJapan(t *testing.T) {
 		})
 	}
 }
+
+func TestBilibiliShanghaiDegradedFallbackCaches15sThenRecoversTo600s(t *testing.T) {
+	const bvid = "BV1234567888"
+	const cid int64 = 888
+	baseNow := time.Date(2026, 11, 15, 2, 0, 0, 0, time.UTC)
+
+	var (
+		jpPlayCalls atomic.Int32
+		shPlayCalls atomic.Int32
+		h           *bilibiliShanghaiHarness
+	)
+
+	jpExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if strings.Contains(req.URL, "/x/web-interface/view") {
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: makeBilibiliViewJSON(bvid, cid)}, nil
+		}
+		jpPlayCalls.Add(1)
+		dl := h.nowUnix() + 7200
+		jpURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/08/888/888-1-64.mp4?deadline=%d", dl)
+		body, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"quality": 64,
+				"format":  "mp4720",
+				"durl":    []map[string]any{{"url": jpURL, "size": 1048576, "length": 30000}},
+			},
+		})
+		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+	})
+	shExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		shPlayCalls.Add(1)
+		dl := h.nowUnix() + 7200
+		shURL := fmt.Sprintf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/00/08/888/888-1-64.mp4?deadline=%d", dl)
+		body, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"quality": 64,
+				"durl":    []map[string]any{{"url": shURL}},
+			},
+		})
+		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+	})
+
+	// 1. Shanghai Bilibili enabled, but NO Shanghai worker connected yet -> falls back to Japan overseas -> 15s cache TTL!
+	h = newBilibiliShanghaiHarness(t, baseNow, jpExec, nil)
+	target := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.bilibili.com/video/"+bvid)
+
+	code, payload1 := h.doAPI(target, "198.51.100.88", "")
+	if code != http.StatusOK || jpPlayCalls.Load() != 1 || shPlayCalls.Load() != 0 {
+		t.Fatalf("degraded parse failed: code=%d jp=%d sh=%d", code, jpPlayCalls.Load(), shPlayCalls.Load())
+	}
+	item1 := unified.Map(unified.Slice(unified.Map(payload1["data"])["items"])[0])
+	if defURL := unified.Str(unified.Map(item1["default"])["url"]); !strings.Contains(defURL, "mirrorcosov.bilivideo.com") {
+		t.Fatalf("expected overseas fallback default URL, got %q", defURL)
+	}
+
+	// Connect Shanghai worker now; at +14s, degraded 15s cache entry is still served.
+	h.startPullWorker(shExec, nil)
+	h.advanceClock(14 * time.Second)
+	code, _ = h.doAPI(target, "198.51.100.88", "")
+	if code != http.StatusOK || jpPlayCalls.Load() != 1 || shPlayCalls.Load() != 0 {
+		t.Fatalf("expected degraded cache hit at +14s: code=%d jp=%d sh=%d", code, jpPlayCalls.Load(), shPlayCalls.Load())
+	}
+
+	// At +15s, degraded cache expires -> immediately re-parses and upgrades to Shanghai domestic UPOS!
+	h.advanceClock(1 * time.Second)
+	code, payload2 := h.doAPI(target, "198.51.100.88", "")
+	if code != http.StatusOK || jpPlayCalls.Load() != 2 || shPlayCalls.Load() != 1 {
+		t.Fatalf("expected Shanghai recovery at +15s: code=%d jp=%d sh=%d", code, jpPlayCalls.Load(), shPlayCalls.Load())
+	}
+	item2 := unified.Map(unified.Slice(unified.Map(payload2["data"])["items"])[0])
+	if defURL := unified.Str(unified.Map(item2["default"])["url"]); !strings.Contains(defURL, "upos-sz-mirrorcos.bilivideo.com") {
+		t.Fatalf("expected recovered Shanghai domestic URL, got %q", defURL)
+	}
+
+	// Healthy Shanghai result (with +7200s deadline) caches for full 600s cap (+599s hit, +600s expire).
+	h.advanceClock(599 * time.Second)
+	code, _ = h.doAPI(target, "198.51.100.88", "")
+	if code != http.StatusOK || jpPlayCalls.Load() != 2 || shPlayCalls.Load() != 1 {
+		t.Fatalf("expected healthy Shanghai cache hit at +599s: code=%d jp=%d sh=%d", code, jpPlayCalls.Load(), shPlayCalls.Load())
+	}
+	h.advanceClock(1 * time.Second)
+	code, _ = h.doAPI(target, "198.51.100.88", "")
+	if code != http.StatusOK || jpPlayCalls.Load() != 3 || shPlayCalls.Load() != 2 {
+		t.Fatalf("expected healthy Shanghai cache expiry at +600s: code=%d jp=%d sh=%d", code, jpPlayCalls.Load(), shPlayCalls.Load())
+	}
+
+	// 2. When Shanghai Bilibili is explicitly DISABLED, Japan-only result is NOT degraded -> caches for full 600s!
+	var disabledJPCalls atomic.Int32
+	var hDisabled *bilibiliShanghaiHarness
+	jpDisabledExec := fetchFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		if strings.Contains(req.URL, "/x/web-interface/view") {
+			return fetch.Response{StatusCode: 200, URL: req.URL, Body: makeBilibiliViewJSON(bvid, cid)}, nil
+		}
+		disabledJPCalls.Add(1)
+		dl := hDisabled.nowUnix() + 7200
+		jpURL := fmt.Sprintf("https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/00/08/888/888-1-64.mp4?deadline=%d", dl)
+		body, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"quality": 64,
+				"format":  "mp4720",
+				"durl":    []map[string]any{{"url": jpURL, "size": 1048576, "length": 30000}},
+			},
+		})
+		return fetch.Response{StatusCode: 200, URL: req.URL, Body: body}, nil
+	})
+	hDisabled = newBilibiliShanghaiHarnessWithSwitch(t, baseNow, jpDisabledExec, nil, false)
+	if code, _ := hDisabled.doAPI(target, "198.51.100.89", ""); code != http.StatusOK || disabledJPCalls.Load() != 1 {
+		t.Fatalf("disabled-Shanghai parse failed: code=%d calls=%d", code, disabledJPCalls.Load())
+	}
+	hDisabled.advanceClock(300 * time.Second)
+	if code, _ := hDisabled.doAPI(target, "198.51.100.89", ""); code != http.StatusOK || disabledJPCalls.Load() != 1 {
+		t.Fatalf("disabled-Shanghai result must NOT use 15s degraded cap: code=%d calls=%d", code, disabledJPCalls.Load())
+	}
+}

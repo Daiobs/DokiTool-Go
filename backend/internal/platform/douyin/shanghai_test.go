@@ -341,3 +341,88 @@ func TestShanghaiSameObjectPrependsDomesticSourcesAndSkipsJapanProbe(t *testing.
 		t.Fatalf("nil resolver diverged: calls=%d", nilCalls)
 	}
 }
+
+func TestShanghaiFallbackTrackerMarksDegradedFallbacksOnly(t *testing.T) {
+	const (
+		vid     = "v0200fg10000tracker"
+		sameKey = "/video/tos/cn/tos-cn-v-0015/tracker4K"
+		ov1     = "https://v3-web-ov.douyinvod.com/11111111111111111111111111111111/6a000001" + sameKey + "/?a=6383"
+	)
+	detail := object{
+		"video": object{
+			"duration":        13667,
+			"cdn_url_expired": 1800003600,
+			"play_addr":       object{"uri": vid},
+			"bit_rate": array{
+				object{
+					"gear_name": "2160p",
+					"bit_rate":  54730256,
+					"is_h265":   1,
+					"play_addr": object{
+						"uri":       vid,
+						"file_hash": "hash4k",
+						"width":     2160,
+						"height":    3840,
+						"data_size": 93733891,
+						"url_list":  array{ov1},
+					},
+				},
+			},
+		},
+	}
+	shOK := object{
+		"url":           "https://v3-dy-o.zjcdn.com/" + strings.Repeat("a", 32) + "/6a000001" + sameKey + "/?ver=1",
+		"metadata":      object{"metadata_source": "mp4", "width": json.Number("2160"), "height": json.Number("3840"), "size": json.Number("93733891"), "bit_rate": json.Number("54730256"), "duration": json.Number("13.667"), "codec": "hevc", "has_audio": true},
+		"object_key":    sameKey,
+		"source_key":    "v3-dy-o.zjcdn.com",
+		"prefix_sha256": strings.Repeat("c", 64),
+		"expires_at":    "2099-01-01T00:00:00Z",
+	}
+	japan := proberFunc(func(context.Context, string) (object, error) { return nil, nil })
+
+	// 1. Shanghai succeeds -> fellBack must be false.
+	pHit := NewWithOriginalResolver(nil, japan, originalResolverFunc(func(context.Context, string) ([]unified.Object, error) {
+		return []unified.Object{shOK}, nil
+	}))
+	ctxHit, fellBackHit := unified.WithShanghaiFallbackTracker(context.Background())
+	if _, err := pHit.formatData(ctxHit, detail, "7673404708262453110"); err != nil {
+		t.Fatal(err)
+	}
+	if fellBackHit() {
+		t.Fatal("expected fellBack=false when Shanghai returned valid candidate")
+	}
+
+	// 2. Shanghai fails -> fellBack must be true.
+	pErr := NewWithOriginalResolver(nil, japan, originalResolverFunc(func(context.Context, string) ([]unified.Object, error) {
+		return nil, errors.New("shanghai 503")
+	}))
+	ctxErr, fellBackErr := unified.WithShanghaiFallbackTracker(context.Background())
+	if _, err := pErr.formatData(ctxErr, detail, "7673404708262453110"); err != nil {
+		t.Fatal(err)
+	}
+	if !fellBackErr() {
+		t.Fatal("expected fellBack=true when Shanghai errored and fell back to Japan")
+	}
+
+	// 3. Shanghai empty -> fellBack must be true.
+	pEmpty := NewWithOriginalResolver(nil, japan, originalResolverFunc(func(context.Context, string) ([]unified.Object, error) {
+		return nil, nil
+	}))
+	ctxEmpty, fellBackEmpty := unified.WithShanghaiFallbackTracker(context.Background())
+	if _, err := pEmpty.formatData(ctxEmpty, detail, "7673404708262453110"); err != nil {
+		t.Fatal(err)
+	}
+	if !fellBackEmpty() {
+		t.Fatal("expected fellBack=true when Shanghai returned empty candidates")
+	}
+
+	// 4. Shanghai disabled (resolver == nil) -> fellBack must be false.
+	pNil := New(nil, japan)
+	ctxNil, fellBackNil := unified.WithShanghaiFallbackTracker(context.Background())
+	if _, err := pNil.formatData(ctxNil, detail, "7673404708262453110"); err != nil {
+		t.Fatal(err)
+	}
+	if fellBackNil() {
+		t.Fatal("expected fellBack=false when Shanghai resolver is disabled")
+	}
+}

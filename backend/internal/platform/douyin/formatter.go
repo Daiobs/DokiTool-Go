@@ -113,11 +113,16 @@ func (p *Parser) formatDataWithShanghai(ctx context.Context, detail object, fall
 			}
 		}
 		var sameObject *shanghaiSameObject
+		shanghaiHit := false
 		if fallback := OriginalPlayURL(playURI); fallback != "" {
 			var probed object
-			probed, sameObject, err = p.probeOriginalWithShanghai(ctx, playURI, fallback, detail, videoInfo, shState)
+			var origHit bool
+			probed, sameObject, origHit, err = p.probeOriginalWithShanghai(ctx, playURI, fallback, detail, videoInfo, shState)
 			if err != nil {
 				return nil, err
+			}
+			if origHit {
+				shanghaiHit = true
 			}
 			originalURL := stringValue(pick(probed["url"], fallback))
 			originalMetadata := unified.Clone(unified.Map(probed["metadata"]))
@@ -188,7 +193,12 @@ func (p *Parser) formatDataWithShanghai(ctx context.Context, detail object, fall
 		if shState.work != nil {
 			shRenditions = shState.work.Renditions
 		}
-		prependShanghaiSources(result, backups, sameObject, shRenditions)
+		if prependShanghaiSources(result, backups, sameObject, shRenditions) {
+			shanghaiHit = true
+		}
+		if p.resolver != nil && !shanghaiHit {
+			unified.MarkShanghaiFallback(ctx)
+		}
 		result["private_audio_candidates"] = audioCandidates(unified.Slice(child(detail, "video", "bit_rate_audio")), child(detail, "video", "cdn_url_expired"))
 		result["video_id"] = fallbackVideoID
 		if truthy(playURI) {

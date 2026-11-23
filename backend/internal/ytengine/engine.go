@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ const (
 	defaultMaxStdoutBytes      = 16 << 20 // 16 MiB
 	defaultMaxStderrBytes      = 64 << 10 // 64 KiB
 	maxBinaryFileBytes         = 128 << 20
+	defaultSafeEnvPath         = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 )
 
 var staleTempCleanupOnce sync.Once
@@ -178,12 +180,57 @@ func detectPythonZipapp(absPath string) bool {
 	return stat.Mode()&0o111 == 0
 }
 
-func lookupPython3InPath(envPath string) string {
-	searchPath := envPath
-	if strings.TrimSpace(searchPath) == "" {
-		searchPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+func sanitizePathDirs(envPath string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, dir := range filepath.SplitList(envPath) {
+		trimmed := strings.TrimSpace(dir)
+		if trimmed == "" || !filepath.IsAbs(trimmed) {
+			continue
+		}
+		cleaned := filepath.Clean(trimmed)
+		if seen[cleaned] {
+			continue
+		}
+		info, err := os.Stat(cleaned)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o002 != 0 {
+			continue
+		}
+		seen[cleaned] = true
+		out = append(out, cleaned)
 	}
-	for _, dir := range filepath.SplitList(searchPath) {
+	return out
+}
+
+func safeEnvPath(envPath string) string {
+	dirs := sanitizePathDirs(envPath)
+	if len(dirs) > 0 {
+		return strings.Join(dirs, string(os.PathListSeparator))
+	}
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	return defaultSafeEnvPath
+}
+
+func isSafeExecutableFile(stat os.FileInfo) bool {
+	if stat == nil || !stat.Mode().IsRegular() {
+		return false
+	}
+	if runtime.GOOS != "windows" {
+		perm := stat.Mode().Perm()
+		if perm&0o111 == 0 || perm&0o002 != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func lookupPython3InPath(envPath string) string {
+	for _, dir := range filepath.SplitList(safeEnvPath(envPath)) {
 		trimmedDir := strings.TrimSpace(dir)
 		if trimmedDir == "" {
 			continue
@@ -191,7 +238,7 @@ func lookupPython3InPath(envPath string) string {
 		for _, candidateName := range []string{"python3", "python3.exe"} {
 			candidate := filepath.Join(trimmedDir, candidateName)
 			stat, err := os.Stat(candidate)
-			if err != nil || !stat.Mode().IsRegular() {
+			if err != nil || !isSafeExecutableFile(stat) {
 				continue
 			}
 			return candidate
@@ -311,13 +358,13 @@ func VerifyBinary(binaryPath string, allowedHashes map[string]string) (string, s
 }
 
 func lookupBinaryInPath(envPath string) (string, error) {
-	for _, dir := range filepath.SplitList(envPath) {
-		trimmedDir := strings.TrimSpace(dir)
-		if trimmedDir == "" {
-			continue
-		}
+	dirs := sanitizePathDirs(envPath)
+	if strings.TrimSpace(envPath) == "" && len(dirs) == 0 && runtime.GOOS != "windows" {
+		dirs = sanitizePathDirs(defaultSafeEnvPath)
+	}
+	for _, dir := range dirs {
 		for _, candidateName := range []string{"yt-dlp", "yt-dlp.exe"} {
-			candidate := filepath.Join(trimmedDir, candidateName)
+			candidate := filepath.Join(dir, candidateName)
 			stat, err := os.Stat(candidate)
 			if err != nil || !stat.Mode().IsRegular() {
 				continue

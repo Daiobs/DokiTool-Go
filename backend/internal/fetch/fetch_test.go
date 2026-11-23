@@ -833,3 +833,217 @@ func TestCloseIdleConnectionsAndConcurrentPoolEviction(t *testing.T) {
 		t.Fatalf("concurrent pool race error: %v", err)
 	}
 }
+
+func TestShortLivedPublicDNSCacheHitExpiryAndSafetyInvariants(t *testing.T) {
+	// Default New() enables the 30s public DNS cache.
+	if def := New(); def.dnsCacheTTL != defaultDNSCacheTTL || def.maxDNSEntries != maxDNSCacheEntries {
+		t.Fatalf("New() DNS cache defaults = (ttl=%v, max=%d), want (%v, %d)",
+			def.dnsCacheTTL, def.maxDNSEntries, defaultDNSCacheTTL, maxDNSCacheEntries)
+	}
+
+	var (
+		mu       sync.Mutex
+		nowTime  = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+		mode     = "public"
+		lookups  atomic.Int32
+		resolved = netip.MustParseAddr("93.184.216.34")
+	)
+
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		mu.Lock()
+		m := mode
+		ip := resolved
+		mu.Unlock()
+		switch m {
+		case "error":
+			return nil, errors.New("dns transient failure")
+		case "empty":
+			return nil, nil
+		case "private":
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		case "mixed":
+			return []netip.Addr{netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr("10.0.0.1")}, nil
+		default:
+			if strings.HasPrefix(host, "host") {
+				return []netip.Addr{ip}, nil
+			}
+			return []netip.Addr{ip}, nil
+		}
+	})).WithDNSCache(30 * time.Second)
+	c.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return nowTime
+	}
+	c.maxDNSEntries = 2
+	c.transport = func(_ *http.Request, ips []netip.Addr, _ Policy) (*http.Response, error) {
+		return reply(http.StatusOK, nil, ips[0].String()), nil
+	}
+
+	policy := Policy{
+		Purpose:    "test-dns-cache",
+		AllowedURL: AllowHosts("api.example.test", "cdn.example.test", "host1.example.test", "host2.example.test", "host3.example.test"),
+		Timeout:    time.Second,
+		MaxBytes:   128,
+	}
+
+	// 1. Cache miss -> caches validated public IP; subsequent case-variant calls within 30s hit cache.
+	res1, err := c.Do(context.Background(), Request{URL: "https://api.example.test/1", Policy: policy})
+	if err != nil || string(res1.Body) != "93.184.216.34" || lookups.Load() != 1 {
+		t.Fatalf("initial DNS lookup failed: body=%q lookups=%d err=%v", string(res1.Body), lookups.Load(), err)
+	}
+	mu.Lock()
+	nowTime = nowTime.Add(29 * time.Second)
+	mu.Unlock()
+	res2, err := c.Do(context.Background(), Request{URL: "https://API.Example.Test/2", Policy: policy})
+	if err != nil || string(res2.Body) != "93.184.216.34" || lookups.Load() != 1 {
+		t.Fatalf("expected DNS cache hit at +29s: body=%q lookups=%d err=%v", string(res2.Body), lookups.Load(), err)
+	}
+
+	// 2. TTL expiry at +30s triggers a fresh lookup and picks up new public IP.
+	mu.Lock()
+	nowTime = nowTime.Add(time.Second)
+	resolved = netip.MustParseAddr("1.1.1.1")
+	mu.Unlock()
+	res3, err := c.Do(context.Background(), Request{URL: "https://api.example.test/3", Policy: policy})
+	if err != nil || string(res3.Body) != "1.1.1.1" || lookups.Load() != 2 {
+		t.Fatalf("expected DNS cache expiry at +30s: body=%q lookups=%d err=%v", string(res3.Body), lookups.Load(), err)
+	}
+
+	// 3. Errors, empty results, private IPs, and mixed public+private IPs are NEVER cached.
+	for _, badMode := range []string{"error", "empty", "private", "mixed"} {
+		mu.Lock()
+		mode = badMode
+		mu.Unlock()
+		before := lookups.Load()
+		if _, err := c.Do(context.Background(), Request{URL: "https://cdn.example.test/bad", Policy: policy}); err == nil {
+			t.Fatalf("mode %q unexpectedly succeeded", badMode)
+		}
+		if _, err := c.Do(context.Background(), Request{URL: "https://cdn.example.test/bad", Policy: policy}); err == nil {
+			t.Fatalf("mode %q second call unexpectedly succeeded", badMode)
+		}
+		if got := lookups.Load() - before; got != 2 {
+			t.Fatalf("mode %q must never cache failures/private IPs: lookups delta=%d, want 2", badMode, got)
+		}
+	}
+
+	// 4. Re-check PublicIP on cached entry before dialing (defense-in-depth).
+	c.dnsMu.Lock()
+	if elem, ok := c.dnsCache["api.example.test"]; ok {
+		elem.Value.(*dnsCacheEntry).ips = []netip.Addr{netip.MustParseAddr("127.0.0.1")}
+	}
+	c.dnsMu.Unlock()
+	if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/recheck", Policy: policy}); !errors.Is(err, ErrPolicy) {
+		t.Fatalf("expected ErrPolicy on tampered cached non-public IP, got %v", err)
+	}
+
+	// 5. Bounded LRU eviction (maxDNSEntries = 2): inserting 3 distinct hosts evicts oldest.
+	mu.Lock()
+	mode = "public"
+	resolved = netip.MustParseAddr("8.8.8.8")
+	mu.Unlock()
+	for _, h := range []string{"host1.example.test", "host2.example.test", "host3.example.test"} {
+		if _, err := c.Do(context.Background(), Request{URL: "https://" + h + "/ok", Policy: policy}); err != nil {
+			t.Fatalf("host %s failed: %v", h, err)
+		}
+	}
+	c.dnsMu.Lock()
+	cacheLen := len(c.dnsCache)
+	_, hasHost1 := c.dnsCache["host1.example.test"]
+	c.dnsMu.Unlock()
+	if cacheLen != 2 || hasHost1 {
+		t.Fatalf("expected DNS cache bounded to 2 with host1 evicted, got len=%d hasHost1=%v", cacheLen, hasHost1)
+	}
+}
+
+func TestWarmConnectionPoolAffinityAndIdleConnTimeout(t *testing.T) {
+	srvA, rootsA, statsA := newPoolTestServer(t, true, []string{"cdn.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "from-A")
+	}))
+	srvB, rootsB, statsB := newPoolTestServer(t, true, []string{"cdn.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "from-B")
+	}))
+	roots := x509.NewCertPool()
+	roots.AddCert(srvA.Certificate())
+	roots.AddCert(srvB.Certificate())
+	_ = rootsA
+	_ = rootsB
+
+	ipA := netip.MustParseAddr("93.184.216.34")
+	ipB := netip.MustParseAddr("1.1.1.1")
+	ipUnreachable := netip.MustParseAddr("93.184.216.99")
+
+	var (
+		mu      sync.Mutex
+		dnsIPs  = []netip.Addr{ipB}
+		dialsA  atomic.Int32
+		dialsB  atomic.Int32
+		dialsUn atomic.Int32
+	)
+
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]netip.Addr(nil), dnsIPs...), nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = roots
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		switch addr {
+		case ipA.String() + ":443":
+			dialsA.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, srvA.Listener.Addr().String())
+		case ipB.String() + ":443":
+			dialsB.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, srvB.Listener.Addr().String())
+		case ipUnreachable.String() + ":443":
+			dialsUn.Add(1)
+			return nil, errors.New("unreachable")
+		default:
+			return nil, fmt.Errorf("unexpected dial %s", addr)
+		}
+	}
+
+	policy := testPolicy()
+
+	// 1. Warm pool with ipB and verify pooled IdleConnTimeout == 120s.
+	res1, err := c.Do(context.Background(), Request{URL: "https://cdn.example.test/1", Policy: policy})
+	if err != nil || string(res1.Body) != "from-B" || dialsB.Load() != 1 {
+		t.Fatalf("warm ipB failed: body=%q dialsB=%d err=%v", string(res1.Body), dialsB.Load(), err)
+	}
+	c.poolMu.Lock()
+	elemB := c.pool[transportKey{host: "cdn.example.test", port: "443", ip: ipB.String()}]
+	c.poolMu.Unlock()
+	if elemB == nil {
+		t.Fatal("expected ipB in transport pool")
+	}
+	if gotTimeout := elemB.Value.(*pooledTransportEntry).transport.IdleConnTimeout; gotTimeout != 120*time.Second {
+		t.Fatalf("pooled IdleConnTimeout = %v, want 120s", gotTimeout)
+	}
+
+	// 2. Round-robin DNS returns [ipA, ipB]: affinity must prefer warm ipB (ips[1]) without dialing unpooled ipA (ips[0])!
+	mu.Lock()
+	dnsIPs = []netip.Addr{ipA, ipB}
+	mu.Unlock()
+	for i := range 3 {
+		res, err := c.Do(context.Background(), Request{URL: "https://cdn.example.test/warm", Policy: policy})
+		if err != nil || string(res.Body) != "from-B" {
+			t.Fatalf("affinity call %d failed: body=%q err=%v", i+1, string(res.Body), err)
+		}
+	}
+	if dialsA.Load() != 0 || statsA.stateNew.Load() != 0 || dialsB.Load() != 1 || statsB.stateNew.Load() != 1 {
+		t.Fatalf("warm pool affinity failed: dialsA=%d stateNewA=%d dialsB=%d stateNewB=%d",
+			dialsA.Load(), statsA.stateNew.Load(), dialsB.Load(), statsB.stateNew.Load())
+	}
+
+	// 3. When NO returned IP is pooled ([unreachable, ipA]), normal dial fallback still succeeds via ipA.
+	mu.Lock()
+	dnsIPs = []netip.Addr{ipUnreachable, ipA}
+	mu.Unlock()
+	resFallback, err := c.Do(context.Background(), Request{URL: "https://cdn.example.test/fallback", Policy: policy})
+	if err != nil || string(resFallback.Body) != "from-A" || dialsUn.Load() != 1 || dialsA.Load() != 1 {
+		t.Fatalf("unpooled multi-IP fallback failed: body=%q dialsUn=%d dialsA=%d err=%v",
+			string(resFallback.Body), dialsUn.Load(), dialsA.Load(), err)
+	}
+}

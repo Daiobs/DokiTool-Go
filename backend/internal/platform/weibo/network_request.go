@@ -7,24 +7,273 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
+const defaultVisitorCacheTTL = 10 * time.Minute
+
+var weiboCookieURL = &url.URL{Scheme: "https", Host: "weibo.com", Path: "/"}
+
+// visitorCookieCache caches ONLY server-generated anonymous Weibo visitor
+// cookies (SUB / SUBP) obtained from official passport.weibo.com/visitor/*
+// responses. It is strictly in-memory, never persisted to disk, never logged,
+// and never stores user-supplied cookies.
+type visitorCookieCache struct {
+	mu         sync.Mutex
+	ttl        time.Duration
+	now        func() time.Time
+	gen        uint64
+	cookies    []*http.Cookie
+	expiresAt  time.Time
+	refreshing chan struct{}
+}
+
+func newVisitorCookieCache(ttl time.Duration, now func() time.Time) *visitorCookieCache {
+	if ttl <= 0 {
+		ttl = defaultVisitorCacheTTL
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &visitorCookieCache{ttl: ttl, now: now}
+}
+
+func (c *visitorCookieCache) String() string   { return "visitorCookieCache{redacted}" }
+func (c *visitorCookieCache) GoString() string { return c.String() }
+
+func (c *visitorCookieCache) currentTime() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func cloneVisitorCookies(src []*http.Cookie) []*http.Cookie {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]*http.Cookie, len(src))
+	for i, ck := range src {
+		cp := *ck
+		out[i] = &cp
+	}
+	return out
+}
+
+func (c *visitorCookieCache) get() ([]*http.Cookie, uint64, bool) {
+	if c == nil {
+		return nil, 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cookies) == 0 || !c.currentTime().Before(c.expiresAt) {
+		return nil, 0, false
+	}
+	return cloneVisitorCookies(c.cookies), c.gen, true
+}
+
+func (c *visitorCookieCache) refresh(
+	ctx context.Context,
+	staleGen uint64,
+	runStartGuest func(context.Context) (visitorCookies []*http.Cookie, expiry time.Time, ok bool),
+) (cookies []*http.Cookie, gen uint64, ok bool, ran bool) {
+	if c == nil {
+		visitorCookies, _, guestOK := runStartGuest(ctx)
+		return visitorCookies, 0, guestOK, true
+	}
+	for {
+		if ctx.Err() != nil {
+			return nil, 0, false, false
+		}
+		c.mu.Lock()
+		if staleGen != 0 && c.gen == staleGen {
+			c.cookies = nil
+			c.expiresAt = time.Time{}
+		}
+		if len(c.cookies) > 0 && c.currentTime().Before(c.expiresAt) && (staleGen == 0 || c.gen != staleGen) {
+			got := cloneVisitorCookies(c.cookies)
+			gotGen := c.gen
+			c.mu.Unlock()
+			return got, gotGen, true, false
+		}
+		if c.refreshing != nil {
+			waitCh := c.refreshing
+			c.mu.Unlock()
+			select {
+			case <-waitCh:
+				continue
+			case <-ctx.Done():
+				return nil, 0, false, false
+			}
+		}
+		ch := make(chan struct{})
+		c.refreshing = ch
+		c.mu.Unlock()
+
+		var (
+			freshCookies []*http.Cookie
+			cookieExpiry time.Time
+			guestOK      bool
+		)
+		func() {
+			defer func() {
+				c.mu.Lock()
+				if guestOK && len(freshCookies) > 0 {
+					now := c.currentTime()
+					exp := now.Add(c.ttl)
+					if !cookieExpiry.IsZero() && cookieExpiry.Before(exp) {
+						exp = cookieExpiry
+					}
+					if now.Before(exp) {
+						c.gen++
+						c.cookies = cloneVisitorCookies(freshCookies)
+						c.expiresAt = exp
+						gen = c.gen
+					}
+				}
+				c.refreshing = nil
+				close(ch)
+				c.mu.Unlock()
+			}()
+			freshCookies, cookieExpiry, guestOK = runStartGuest(ctx)
+		}()
+		return cloneVisitorCookies(freshCookies), gen, guestOK, true
+	}
+}
+
+func validAnonymousCookieValue(v string) bool {
+	if len(v) == 0 || len(v) > 512 {
+		return false
+	}
+	for _, r := range v {
+		if r <= 0x20 || r >= 0x7f || r == ';' {
+			return false
+		}
+	}
+	return true
+}
+
+func extractAnonymousVisitorCookies(raw []*http.Cookie, now time.Time) ([]*http.Cookie, time.Time) {
+	var (
+		sub        *http.Cookie
+		subp       *http.Cookie
+		earliest   time.Time
+		hasEarliest bool
+	)
+	for _, ck := range raw {
+		if ck == nil || (ck.Name != "SUB" && ck.Name != "SUBP") {
+			continue
+		}
+		if ck.MaxAge < 0 || (!ck.Expires.IsZero() && !now.Before(ck.Expires)) {
+			continue
+		}
+		if !validAnonymousCookieValue(ck.Value) {
+			continue
+		}
+		var exp time.Time
+		if ck.MaxAge > 0 {
+			exp = now.Add(time.Duration(ck.MaxAge) * time.Second)
+		} else if !ck.Expires.IsZero() {
+			exp = ck.Expires
+		}
+		if !exp.IsZero() && (!hasEarliest || exp.Before(earliest)) {
+			earliest = exp
+			hasEarliest = true
+		}
+		normalized := &http.Cookie{
+			Name:     ck.Name,
+			Value:    ck.Value,
+			Domain:   ".weibo.com",
+			Path:     "/",
+			Secure:   true,
+			HttpOnly: true,
+		}
+		if ck.Name == "SUB" {
+			sub = normalized
+		} else {
+			subp = normalized
+		}
+	}
+	if sub == nil {
+		return nil, time.Time{}
+	}
+	if subp != nil {
+		return []*http.Cookie{sub, subp}, earliest
+	}
+	return []*http.Cookie{sub}, earliest
+}
+
 // Network requests are one parsing operation's ephemeral guest session. The
 // caller supplies the 35-second total parse context; metadata requests retain
 // the 20-second per-hop cap and the existing bound DNS/socket/TLS fetch layer.
 // No request-scoped cookies or user-supplied URLs escape this session.
 type guestHTTP struct {
-	executor fetch.Executor
-	jar      *cookiejar.Jar
+	executor  fetch.Executor
+	jar       *cookiejar.Jar
+	onCookies func([]*http.Cookie)
 }
 
 func newNetworkGuestSession(executor fetch.Executor) *guestSession {
 	jar, _ := cookiejar.New(nil)
 	return newGuestSession((&guestHTTP{executor: executor, jar: jar}).exchange)
+}
+
+func newCachedNetworkGuestSession(executor fetch.Executor, cache *visitorCookieCache) *guestSession {
+	jar, _ := cookiejar.New(nil)
+	httpClient := &guestHTTP{executor: executor, jar: jar}
+	session := newGuestSession(httpClient.exchange)
+	if cache == nil {
+		return session
+	}
+	var seededGen uint64
+	if cached, gen, ok := cache.get(); ok {
+		jar.SetCookies(weiboCookieURL, cached)
+		seededGen = gen
+		session.seededFromCache = true
+	}
+	session.refreshGuest = func(ctx context.Context, guestReferer string) bool {
+		var leaderJar *cookiejar.Jar
+		cookies, newGen, ok, ran := cache.refresh(ctx, seededGen, func(refreshCtx context.Context) ([]*http.Cookie, time.Time, bool) {
+			freshJar, _ := cookiejar.New(nil)
+			var seen []*http.Cookie
+			refreshHTTP := &guestHTTP{
+				executor: executor,
+				jar:      freshJar,
+				onCookies: func(batch []*http.Cookie) {
+					seen = append(seen, batch...)
+				},
+			}
+			refreshSession := newGuestSession(refreshHTTP.exchange)
+			if session.nonce != nil {
+				refreshSession.nonce = session.nonce
+			}
+			if !refreshSession.startGuest(refreshCtx, guestReferer) {
+				return nil, time.Time{}, false
+			}
+			leaderJar = freshJar
+			visitorCookies, exp := extractAnonymousVisitorCookies(seen, cache.currentTime())
+			return visitorCookies, exp, true
+		})
+		if !ok {
+			return false
+		}
+		if ran && leaderJar != nil {
+			httpClient.jar = leaderJar
+		} else {
+			freshJar, _ := cookiejar.New(nil)
+			if len(cookies) > 0 {
+				freshJar.SetCookies(weiboCookieURL, cookies)
+			}
+			httpClient.jar = freshJar
+		}
+		seededGen = newGen
+		return true
+	}
+	return session
 }
 
 const weiboUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -137,7 +386,11 @@ func (g *guestHTTP) exchange(ctx context.Context, address string, post *string, 
 		if err != nil {
 			return nil, err
 		}
-		g.jar.SetCookies(target, safeWeiboCookies(reply.Header))
+		accepted := safeWeiboCookies(reply.Header)
+		g.jar.SetCookies(target, accepted)
+		if g.onCookies != nil && len(accepted) > 0 {
+			g.onCookies(accepted)
+		}
 		if reply.StatusCode == http.StatusMovedPermanently || reply.StatusCode == http.StatusFound || reply.StatusCode == http.StatusSeeOther || reply.StatusCode == http.StatusTemporaryRedirect || reply.StatusCode == http.StatusPermanentRedirect {
 			if hop == 3 {
 				return nil, fetch.ErrRedirect

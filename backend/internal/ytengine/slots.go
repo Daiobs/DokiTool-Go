@@ -263,10 +263,8 @@ func buildIsolatedEnv(tempDir, envPath string) []string {
 		"https_proxy=",
 		"all_proxy=",
 	}
-	if envPath != "" {
-		env = append(env, "PATH="+envPath)
-	} else {
-		env = append(env, "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+	if pathVal := safeEnvPath(envPath); pathVal != "" {
+		env = append(env, "PATH="+pathVal)
 	}
 	if sysRoot := os.Getenv("SYSTEMROOT"); sysRoot != "" {
 		env = append(env, "SYSTEMROOT="+sysRoot)
