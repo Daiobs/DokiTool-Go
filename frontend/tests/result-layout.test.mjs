@@ -1674,3 +1674,161 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
     globalThis.requestAnimationFrame = prevRaf;
   }
 });
+
+test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return upgrade probe dismissing update badge, and auto in-place extension-youtube-ready emit', async () => {
+  const prevChrome = globalThis.chrome;
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  let mockState = {
+    connected: true,
+    version: '4.1.0',
+    extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+    capabilities: ['dash_mux', 'direct_download'],
+  };
+  let pingCalls = 0;
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg?.type === 'WEB_EXT_PING') {
+          pingCalls++;
+          if (!mockState.connected) {
+            cb({ ok: false, code: 'EXTENSION_UNAVAILABLE', error: 'not connected' });
+            return;
+          }
+          cb({ ok: true, data: { ...mockState } });
+        }
+      },
+    },
+  };
+
+  const ytOutdatedExtData = {
+    platform: 'youtube',
+    title: 'YouTube Outdated Extension Upgrade Flow',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-out-1',
+    items: [fileItem('yt-out-1', 'video', 'https://www.youtube.com/watch?v=I9JvDaciaFk&helper_required=1')],
+    extra: {
+      youtube_helper: {
+        status: 'outdated',
+        provider: 'extension',
+        version: '4.1.0',
+        extensionVersion: '4.1.0',
+        min_version: '4.2.0',
+        message: '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.2.0+ 即可免油猴解析下载 YouTube',
+      },
+    },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: ytOutdatedExtData });
+
+  let readyEmits = 0;
+  const view = await mount(ytOutdatedExtData);
+  view.state.value = {
+    ...view.state.value,
+    onExtensionYoutubeReady() { readyEmits++; },
+  };
+  await view.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await view.flush();
+
+  try {
+    // 1. Outdated v4.1.0 connected state: update badge visible + CapabilityUpgradeNotice shows extension upgrade wording (NOT userscript!)
+    assert.equal(view.findAll(n => n.props['data-testid'] === 'extension-connected-badge').length, 1);
+    assert.equal(view.findAll(n => n.props['data-testid'] === 'extension-update-badge').length, 1);
+    const notice = () => view.portalFindAll(n => n.props['data-capability-upgrade-notice'] !== undefined)[0];
+    assert.ok(notice(), 'expected CapabilityUpgradeNotice visible for outdated connected extension');
+    assert.equal(notice().props['data-upgrade-reason'], 'outdated_extension');
+    const zhNoticeText = textOf(notice());
+    assert.match(zhNoticeText, /v4\.1\.0/);
+    assert.match(zhNoticeText, /v4\.2\.0\+/);
+    assert.doesNotMatch(zhNoticeText, /检测到旧版 YouTube 下载助手脚本需要更新/);
+    assert.equal(readyEmits, 0);
+
+    // EN copy check
+    view.state.value = { ...view.state.value, locale: 'en' };
+    await view.flush();
+    const enNoticeText = textOf(notice());
+    assert.match(enNoticeText, /v4\.1\.0/);
+    assert.match(enNoticeText, /v4\.2\.0\+/);
+    assert.doesNotMatch(enNoticeText, /Your legacy userscript needs an update/);
+    view.state.value = { ...view.state.value, locale: 'zh-CN' };
+    await view.flush();
+
+    // 2. User upgrades extension to v4.2.0 and returns to tab -> handleWindowReturnForBridge re-probes even though already connected!
+    const callsBeforeFocus = pingCalls;
+    mockState = {
+      connected: true,
+      version: '4.2.0',
+      extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+      capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+    };
+    for (const fn of view.listeners.get('focus') || []) fn();
+    await new Promise(r => setTimeout(r, 20));
+    await view.flush();
+
+    assert.ok(pingCalls > callsBeforeFocus, 'window focus must re-probe when extension was outdated');
+    assert.equal(
+      view.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
+      0,
+      '有新版 v4.2.0 pill must disappear immediately after upgrading to 4.2.0',
+    );
+    assert.equal(notice(), undefined, 'CapabilityUpgradeNotice must auto-dismiss once youtube_parse becomes available');
+    assert.equal(readyEmits, 1, 'must emit extension-youtube-ready once to trigger in-place parseVideo()');
+
+    // Subsequent focus must not loop emits
+    for (const fn of view.listeners.get('focus') || []) fn();
+    await new Promise(r => setTimeout(r, 15));
+    await view.flush();
+    assert.equal(readyEmits, 1);
+  } finally {
+    view.app.unmount();
+  }
+
+  // 3. Disconnected YouTube missing state -> user installs v4.2.0 extension & returns to tab -> closes notice & emits extension-youtube-ready
+  mockState = { connected: false, version: '', extensionId: '', capabilities: [] };
+  const ytMissingData = {
+    platform: 'youtube',
+    title: 'YouTube Fresh Extension Install Flow',
+    source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
+    default_item_id: 'yt-miss-1',
+    items: [fileItem('yt-miss-1', 'video', 'https://www.youtube.com/watch?v=I9JvDaciaFk&helper_required=1')],
+    extra: {
+      youtube_helper: {
+        status: 'missing',
+        message: '当前未检测到 DokiTool 扩展或 YouTube 助手脚本，请按说明安装并启用后重试',
+      },
+    },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: ytMissingData });
+
+  let freshReadyEmits = 0;
+  const freshView = await mount(ytMissingData);
+  freshView.state.value = {
+    ...freshView.state.value,
+    onExtensionYoutubeReady() { freshReadyEmits++; },
+  };
+  await freshView.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await freshView.flush();
+
+  try {
+    assert.equal(freshView.portalFindAll(n => n.props['data-capability-upgrade-notice'] !== undefined).length, 1);
+    mockState = {
+      connected: true,
+      version: '4.2.0',
+      extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+      capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+    };
+    for (const fn of freshView.listeners.get('focus') || []) fn();
+    await new Promise(r => setTimeout(r, 20));
+    await freshView.flush();
+
+    assert.equal(freshView.findAll(n => n.props['data-testid'] === 'extension-connected-badge').length, 1);
+    assert.equal(freshView.portalFindAll(n => n.props['data-capability-upgrade-notice'] !== undefined).length, 0);
+    assert.equal(freshReadyEmits, 1);
+  } finally {
+    freshView.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

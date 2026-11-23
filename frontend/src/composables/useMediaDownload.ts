@@ -9,9 +9,11 @@ import {
 } from "../utils/mediaContract";
 import {
   isTbvideoVideoItem,
+  resolveAcceleratedExtensionDirectRoutes,
   resolveProtectedExtensionAudioRoutes,
   resolveWhitelistedExtensionMuxSpec,
 } from "../core/media";
+import { resolveExecutionPlan } from "../core/capabilityHub";
 import type {
   WebExtEnqueuePayload,
   WebExtTaskPhase,
@@ -48,6 +50,16 @@ export { MAX_ARCHIVE_BYTES };
 const loadStreaming = () => import("../downloads/streaming");
 const loadDownloadManager = () => import("../downloads/manager");
 const loadExtensionBridge = () => import("../services/extensionBridge");
+
+const EXTENSION_DIRECT_FALLBACK_CODES = new Set<string>([
+  "NO_CHROME_RUNTIME",
+  "BRIDGE_TIMEOUT",
+  "EXTENSION_UNAVAILABLE",
+  "EMPTY_RESPONSE",
+  "BRIDGE_ERROR",
+  "UNSUPPORTED_ACTION",
+  "FORBIDDEN_ORIGIN",
+]);
 
 function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) {
@@ -637,6 +649,7 @@ export function useMediaDownload({
     savePathLabel: string;
     startStatusText: string;
     selectionKey: string;
+    onBridgeUnavailable?: () => Promise<boolean> | boolean;
   }): Promise<boolean> {
     const {
       snapshot,
@@ -716,6 +729,13 @@ export function useMediaDownload({
         if (!enq.ok) {
           checkAbort(controller.signal);
           if (!ownsTask(id, controller)) return false;
+          if (
+            params.onBridgeUnavailable &&
+            enq.code &&
+            EXTENSION_DIRECT_FALLBACK_CODES.has(enq.code)
+          ) {
+            return await params.onBridgeUnavailable();
+          }
           const errMsg = enq.error || "连接 Chrome 扩展失败，请确认扩展已启用";
           videoStore.updateDownload(id, {
             status: "failed",
@@ -1046,6 +1066,109 @@ export function useMediaDownload({
         );
         if (!ownsTask(id, controller)) return false;
         const delivery = target.variant.delivery;
+        if (
+          target.kind === "file" &&
+          delivery.kind === "file" &&
+          !isTbvideoVideoItem(item)
+        ) {
+          const acceleratedRoutes = resolveAcceleratedExtensionDirectRoutes(
+            { delivery },
+            apiContext,
+          );
+          if (acceleratedRoutes && acceleratedRoutes.length > 0) {
+            const bridge = await loadExtensionBridge();
+            checkAbort(controller.signal);
+            if (!ownsTask(id, controller)) return false;
+            const extState = await bridge.pingInstalledExtension();
+            checkAbort(controller.signal);
+            if (!ownsTask(id, controller)) return false;
+            const plan = resolveExecutionPlan(
+              {
+                deliveryKind: "file",
+                whitelistedForExtension: true,
+                preferExtensionDirectAcceleration: true,
+                hasTbvideo: false,
+              },
+              {
+                extensionConnected: extState.connected,
+                extensionVersion: extState.version,
+                extensionCapabilities: extState.capabilities,
+                userscriptReady: false,
+              },
+            );
+            if (plan.channel === "extension_direct") {
+              const prepared = preparedSnapshot(snapshot, item, target);
+              videoRetries.set(id, (forceRefresh = false) =>
+                enqueueItem(prepared, id, forceRefresh),
+              );
+              videoStore.updateDownload(id, {
+                refreshAvailable: refreshable(prepared),
+              });
+              const { resolvedExt, formatMime } = resolveFinalMediaExtension(
+                target,
+                item,
+                snapshot.platform,
+              );
+              const filename = filenameFor(
+                snapshot,
+                resolvedExt,
+                target.variant,
+              );
+              videoStore.updateDownload(id, { filename });
+              const primaryUrl = target.url;
+              const orderedRoutes = acceleratedRoutes.includes(primaryUrl)
+                ? [
+                    primaryUrl,
+                    ...acceleratedRoutes.filter((r) => r !== primaryUrl),
+                  ]
+                : acceleratedRoutes;
+              const knownSize =
+                target.source.size_bytes ??
+                delivery.sources.find((s) =>
+                  sourceRoutes(s, apiContext).includes(orderedRoutes[0]),
+                )?.size_bytes;
+              const selectionKey =
+                selected ||
+                JSON.stringify([
+                  snapshot.version,
+                  item.id,
+                  target.variant.id,
+                  "ext-direct-accel",
+                ]);
+              let fellBackToWeb = false;
+              const bridgeOk = await runExtensionBridgeDownload({
+                snapshot: prepared,
+                retryId: id,
+                controller,
+                filename,
+                payload: {
+                  kind: "direct_download",
+                  platform: snapshot.platform || "media",
+                  title: snapshot.title || item.title || filename,
+                  filename,
+                  routes: orderedRoutes,
+                  ...(knownSize ? { sizeBytes: knownSize } : {}),
+                  ...(formatMime ? { mimeType: formatMime } : {}),
+                },
+                savePathLabel: "保存路径：Chrome 扩展后台加速下载",
+                startStatusText: "扩展 4 路并发高速下载中...",
+                selectionKey,
+                onBridgeUnavailable: () => {
+                  fellBackToWeb = true;
+                  return false;
+                },
+              });
+              if (!fellBackToWeb) {
+                return bridgeOk;
+              }
+              if (!ownsTask(id, controller)) return false;
+              videoStore.updateDownload(id, {
+                savePath: undefined,
+                savePathLabel: undefined,
+              });
+            }
+          }
+        }
         if (
           !refresh &&
           !snapshot.pinned &&

@@ -1197,3 +1197,94 @@ test("Round 2 regressions: loopback apiOrigin mux whitelist, mixed-route strippi
     "v-1080-60",
   );
 });
+
+test("P2: prefersExtensionDirectAcceleration and resolveAcceleratedExtensionDirectRoutes identify whitelisted slow progressive CDNs cleanly", () => {
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/720p.mp4",
+    ),
+    true,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://cn-sh-fx-01.bilivideo.cn/upgcxcode/720p.mp4",
+    ),
+    true,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/720p.mp4",
+    ),
+    true,
+  );
+  // Reject non-slow hosts, http:, credentials, and relay sources
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://sns-video-bd.xhscdn.com/stream/720p.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "http://upos-sz-mirrorcos.bilivideo.com/720p.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://user:pass@upos-sz-mirrorcos.bilivideo.com/720p.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://upos-sz-mirrorcos.bilivideo.com/720p.mp4",
+      { access: "relay" },
+    ),
+    false,
+  );
+
+  // resolveAcceleratedExtensionDirectRoutes keeps only whitelisted routes and filters out unwhitelisted sources
+  const routes = mediaKernel.resolveAcceleratedExtensionDirectRoutes(
+    {
+      delivery: {
+        kind: "file",
+        sources: [
+          {
+            id: "s1",
+            url: "https://upos-sz-mirrorcos.bilivideo.com/720p.mp4",
+          },
+          {
+            id: "s2",
+            url: "https://upos-hz-mirrorakam.akamaized.net/720p.mp4",
+          },
+          {
+            id: "s3",
+            url: "https://evil-unwhitelisted.example/720p.mp4",
+          },
+        ],
+      },
+    },
+    { apiOrigin: PROD_API_ORIGIN },
+  );
+  assert.deepEqual(routes, [
+    "https://upos-sz-mirrorcos.bilivideo.com/720p.mp4",
+    "https://upos-hz-mirrorakam.akamaized.net/720p.mp4",
+  ]);
+
+  // Normal fast CDN returns null (no extension hijack)
+  assert.equal(
+    mediaKernel.resolveAcceleratedExtensionDirectRoutes(
+      {
+        delivery: {
+          kind: "file",
+          sources: [
+            { id: "s1", url: "https://sns-video-bd.xhscdn.com/stream/1080p.mp4" },
+          ],
+        },
+      },
+      { apiOrigin: PROD_API_ORIGIN },
+    ),
+    null,
+  );
+});

@@ -24,6 +24,12 @@ const REFERER_PROTECTED_AUDIO_HOST_SUFFIXES = [
   ".akamaized.net",
 ] as const;
 
+const SLOW_PROGRESSIVE_DIRECT_HOST_SUFFIXES = [
+  ".bilivideo.com",
+  ".bilivideo.cn",
+  ".akamaized.net",
+] as const;
+
 const TBVIDEO_FALLBACK_EXACT_HOSTS = new Set([
   "web-v01.izuiyou.com",
   "tbvideo.ixiaochuan.cn",
@@ -214,6 +220,30 @@ export function isRefererProtectedMediaRoute(
     const parsed = new URL(rawUrl);
     const host = normalizeHost(parsed);
     return matchesHostSuffix(host, REFERER_PROTECTED_AUDIO_HOST_SUFFIXES);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Identifies progressive direct media routes hosted on CDNs known to throttle
+ * single-connection browser downloads (e.g. ~800 KB/s), where routing through
+ * a connected extension's 4-way OPFS Range engine accelerates transfer.
+ */
+export function prefersExtensionDirectAcceleration(
+  rawUrl: string,
+  source?: Pick<Source, "access" | "browser_fetch"> | null,
+): boolean {
+  if (source?.access === "relay") {
+    return false;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      return false;
+    }
+    const host = normalizeHost(parsed);
+    return matchesHostSuffix(host, SLOW_PROGRESSIVE_DIRECT_HOST_SUFFIXES);
   } catch {
     return false;
   }

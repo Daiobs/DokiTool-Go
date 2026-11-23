@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -90,19 +89,10 @@ func (c CacheConfig) Validate() error {
 	return nil
 }
 
-// cacheablePlatform excludes platforms whose responses carry requester-bound,
-// channel-dependent, or server-egress-IP-bound artifacts:
-//   - weibo: mints HMAC-signed /api/media/weibo?ticket=... relay tickets (and
-//     differs between anonymous visitors and owner-token callers in PR 5).
-//   - youtube: helper sessions use /api/youtube/context + /api/youtube/finalize,
-//     and /api/parse yields egress-IP-bound googlevideo.com stream URLs.
+// cacheablePlatform reports whether platform responses may enter parseCache
+// according to the declarative platformTraits table in platform_traits.go.
 func cacheablePlatform(platform string) bool {
-	switch platform {
-	case "", "weibo", "youtube":
-		return false
-	default:
-		return true
-	}
+	return platform != "" && !traitsForPlatform(platform).disableParseCache
 }
 
 func cacheableRequest(platform, source string) bool {
@@ -386,42 +376,7 @@ func normalizeCacheURL(platform, source string) string {
 	isStandardHTTP := (scheme == "http" || scheme == "https") && port == ""
 
 	if isStandardHTTP {
-		switch platform {
-		case "x":
-			switch host {
-			case "x.com", "www.x.com", "mobile.x.com", "m.x.com",
-				"twitter.com", "www.twitter.com", "mobile.twitter.com", "m.twitter.com":
-				host = "x.com"
-				scheme = "https"
-			case "t.co":
-				host = "t.co"
-				scheme = "https"
-			}
-		case "instagram":
-			if _, canonical, ok := instagram.ExtractPostTarget(source); ok {
-				if cu, parseErr := url.Parse(canonical); parseErr == nil {
-					scheme = "https"
-					host = "www.instagram.com"
-					escapedPath = cu.EscapedPath()
-				}
-			} else {
-				switch host {
-				case "www.instagram.com", "instagram.com", "m.instagram.com":
-					host = "www.instagram.com"
-					scheme = "https"
-				}
-			}
-		case "facebook":
-			if host == "facebook.com" || host == "m.facebook.com" {
-				host = "www.facebook.com"
-				scheme = "https"
-			}
-		case "tumblr":
-			if host == "tumblr.com" {
-				host = "www.tumblr.com"
-				scheme = "https"
-			}
-		}
+		scheme, host, escapedPath = normalizePlatformCacheURL(platform, source, scheme, host, escapedPath)
 	}
 
 	if strings.Contains(host, ":") {
@@ -466,10 +421,11 @@ func computeCacheTTLForResult(platform string, payload unified.Object, now time.
 		return 0, false
 	}
 	if unified.Str(payload["code"]) == "OK" {
-		if platform == PlatformGeneric && ttl > genericCacheTTL {
-			ttl = genericCacheTTL
+		traits := traitsForPlatform(platform)
+		if traits.maxOKCacheTTL > 0 && ttl > traits.maxOKCacheTTL {
+			ttl = traits.maxOKCacheTTL
 		}
-		if shanghaiFallback && (platform == "douyin" || platform == "bilibili") && ttl > shanghaiFallbackCacheTTL {
+		if shanghaiFallback && traits.shanghaiFallbackShortTTL && ttl > shanghaiFallbackCacheTTL {
 			ttl = shanghaiFallbackCacheTTL
 		}
 	}

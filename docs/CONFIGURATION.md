@@ -107,8 +107,19 @@
 
 > **`yt-dlp` 零解压 Python Zipapp 运维切换说明（推荐用于海外解析加速）**：
 > - **消除每次冷启动约 35 MiB PyInstaller 解压开销**：官方 Release 同批次提供的 `yt-dlp`（Python zipapp，含 `#!/usr/bin/env python3` 与 ZIP 头）的 SHA-256 已同步锁定于 `backend/internal/ytengine/engine.go` 的 `OfficialSHA256Sums` 中（随 `scripts/bump-runtime-pins.py` 自动同步更新）。
-> - **宿主机前置条件**：宿主机具备符合该 `yt-dlp` 版本要求的系统 `python3`（通常 Python 3.10+）且位于安全 `PATH`（绝对路径、非全局可写目录、可执行权限）中。
-> - **切换与回滚步骤**：将与当前 `PinnedVersion` 匹配的官方 `yt-dlp` zipapp 放至受控目录（如 `0644` 或 `0755` 权限）并核对 `sha256sum`，通过 systemd drop-in 将 `DOKITOOL_YTDLP_BINARY` 指向该 zipapp 路径并重启 `dokitool-go.service`。启动时 `ytengine` 会自动校验 SHA-256、使用安全 `PATH` 中的 `python3` 执行 `--version` 自检，并在子进程环境中固定开启 `PYTHONDONTWRITEBYTECODE=1` 与 `PYTHONNOUSERSITE=1`（零 `_MEI*` 临时解压、零 `.pyc` 写入）；如需回滚，只需将 `DOKITOOL_YTDLP_BINARY` 改回 `yt-dlp_linux` 并重启即可。
+> - **宿主机前置条件与 Python 运行时依赖**：
+>   - 宿主机须具备符合该 `yt-dlp` 版本要求的系统 `python3`（通常 Python 3.10+）且位于安全 `PATH`（绝对路径、非全局可写目录、可执行权限）中；
+>   - 因为 `ytengine` 在子进程中强制注入 `PYTHONNOUSERSITE=1`（隔离 `~/.local` 用户目录），单文件 `yt-dlp_linux` 内置的可选运行库在切换为 zipapp 后需预装于**宿主机系统级 Python `site-packages` / `dist-packages`** 中，推荐齐备以下 4 项依赖以保持与官方 PyInstaller 二进制一致的解析能力：
+>     - `curl_cffi`（TLS 指纹模拟 / `--impersonate`，覆盖反爬较严的海外站点）
+>     - `brotli`（Brotli `br` 响应体解压）
+>     - `websockets`（部分长尾提取器的 WebSocket 通信支持）
+>     - `pycryptodomex`（加密 HLS / AES-128 解密与签名运算，导入名 `Cryptodome`）
+>   - 切换前建议以相同隔离环境变量执行一次依赖自检：
+>     ```sh
+>     PYTHONNOUSERSITE=1 python3 -c "import curl_cffi, brotli, websockets, Cryptodome; print('OK')"
+>     ```
+>     （缺失可选依赖不会导致启动期 `--version` 预检报错，但可能导致个别需要 TLS 指纹模拟或加密流解密的站点在运行期降级或解析失败。）
+> - **切换与回滚步骤**：将与当前 `PinnedVersion` 匹配的官方 `yt-dlp` zipapp 放至受控目录（如 `0644` 或 `0755` 权限）并核对 `sha256sum`，确认上述系统级 Python 依赖可用后，通过 systemd drop-in 将 `DOKITOOL_YTDLP_BINARY` 指向该 zipapp 路径并重启 `dokitool-go.service`。启动时 `ytengine` 会自动校验 SHA-256、使用安全 `PATH` 中的 `python3` 执行 `--version` 自检，并在子进程环境中固定开启 `PYTHONDONTWRITEBYTECODE=1` 与 `PYTHONNOUSERSITE=1`（零 `_MEI*` 临时解压、零 `.pyc` 写入）；如需回滚，只需将 `DOKITOOL_YTDLP_BINARY` 改回 `yt-dlp_linux` 并重启即可。
 
 ### 4. 准入控制限流与并发池
 

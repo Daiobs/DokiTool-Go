@@ -2624,3 +2624,51 @@ func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
 		t.Fatalf("expected recovered cache expiry at +600s, calls=%d", calls.Load())
 	}
 }
+
+func TestPlatformTraitsTableConsolidation(t *testing.T) {
+	// 1. Cacheability driven by platformTraits.disableParseCache
+	for _, uncacheable := range []string{"", "weibo", "youtube"} {
+		if cacheablePlatform(uncacheable) {
+			t.Fatalf("cacheablePlatform(%q) = true, want false", uncacheable)
+		}
+	}
+	for _, cacheable := range []string{"douyin", "bilibili", "xiaohongshu", "x", "instagram", "facebook", "tumblr", PlatformGeneric} {
+		if !cacheablePlatform(cacheable) {
+			t.Fatalf("cacheablePlatform(%q) = false, want true", cacheable)
+		}
+	}
+
+	// 2. Slow-engine & strictInput2048 invariants preserved
+	for _, p := range []string{"x", "instagram", "facebook", "tumblr", PlatformGeneric} {
+		tr := traitsForPlatform(p)
+		if !tr.slowEngine || !tr.strictInput2048 {
+			t.Fatalf("platform %q traits = %+v, want slowEngine=true strictInput2048=true", p, tr)
+		}
+	}
+	if yt := traitsForPlatform("youtube"); !yt.slowEngine || yt.strictInput2048 || !yt.disableParseCache {
+		t.Fatalf("youtube traits = %+v, want slowEngine=true strictInput2048=false disableParseCache=true", yt)
+	}
+
+	// 3. Shanghai fallback 15s TTL cap applies only to Shanghai-enabled platforms (douyin, bilibili)
+	const startUnix int64 = 1793448000
+	baseNow := time.Unix(startUnix, 0).UTC()
+	distantExp := baseNow.Add(2 * time.Hour).Format(time.RFC3339)
+
+	for _, p := range []string{"douyin", "bilibili"} {
+		if !traitsForPlatform(p).shanghaiFallbackShortTTL {
+			t.Fatalf("expected shanghaiFallbackShortTTL=true for %q", p)
+		}
+		ttl, ok := computeCacheTTLForResult(p, makeSyntheticEnvelope(p, "https://example.com/1", startUnix, distantExp), baseNow, true)
+		if !ok || ttl != shanghaiFallbackCacheTTL {
+			t.Fatalf("computeCacheTTLForResult(%q, shanghaiFallback=true) = (%v, %v), want (%v, true)", p, ttl, ok, shanghaiFallbackCacheTTL)
+		}
+	}
+	// Non-Shanghai platform ignores shanghaiFallback=true and keeps normal maxCacheTTL (600s).
+	if ttl, ok := computeCacheTTLForResult("xiaohongshu", makeSyntheticEnvelope("xiaohongshu", "https://www.xiaohongshu.com/explore/1", startUnix, distantExp), baseNow, true); !ok || ttl != maxCacheTTL {
+		t.Fatalf("xiaohongshu with shanghaiFallback=true = (%v, %v), want (%v, true)", ttl, ok, maxCacheTTL)
+	}
+	// PlatformGeneric uses maxOKCacheTTL = genericCacheTTL (60s).
+	if ttl, ok := computeCacheTTLForResult(PlatformGeneric, makeSyntheticEnvelope("vimeo", "https://vimeo.com/123", startUnix, distantExp), baseNow, false); !ok || ttl != genericCacheTTL {
+		t.Fatalf("PlatformGeneric OK TTL = (%v, %v), want (%v, true)", ttl, ok, genericCacheTTL)
+	}
+}

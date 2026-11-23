@@ -4752,3 +4752,183 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript downloads: 4K60/1080p 
     else globalThis.chrome = prevChrome;
   }
 });
+
+test('P2: connected extension accelerates whitelisted slow progressive direct files via direct_download and falls back cleanly to Web SW when disconnected or unavailable', async () => {
+  const prevChrome = globalThis.chrome;
+  const bili720Primary = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/720p-slow.mp4';
+  const bili720Mirror = 'https://upos-hz-mirrorakam.akamaized.net/upgcxcode/720p-slow.mp4';
+  const biliData = {
+    platform: 'bilibili',
+    content_id: 'BV1P2AccelTest',
+    title: 'B站720P慢速直链提速测试',
+    source_url: 'https://www.bilibili.com/video/BV1P2AccelTest',
+    default_item_id: 'p1',
+    items: [
+      {
+        id: 'p1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'v-720', source_id: 's-720', url: bili720Primary },
+        variants: [
+          {
+            id: 'v-720',
+            label: '720p',
+            metadata: { width: 1280, height: 720, has_audio: true, video_codec: 'avc1.64001f', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+            delivery: {
+              kind: 'file',
+              sources: [
+                {
+                  id: 's-720',
+                  url: bili720Primary,
+                  size_bytes: 18_500_000,
+                },
+                {
+                  id: 's-720-mirror',
+                  url: bili720Mirror,
+                  size_bytes: 18_500_000,
+                },
+                {
+                  id: 's-720-skip',
+                  url: 'https://unwhitelisted.example/skip.mp4',
+                  size_bytes: 18_500_000,
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+
+  // Case 1: Connected extension with `direct_download` accelerates via WEB_EXT_ENQUEUE_MEDIA { kind: "direct_download" }
+  const enqueued = [];
+  const cancelled = [];
+  let seq = 1;
+  let holdNext = false;
+  let heldTaskId = null;
+  const taskMap = new Map();
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '4.2.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+            },
+          });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+          const taskId = `p2-direct-${seq++}`;
+          enqueued.push({ taskId, payload: msg.payload });
+          taskMap.set(taskId, { filename: msg.payload.filename, totalBytes: msg.payload.sizeBytes || 18_500_000, polls: 0, cancelled: false, hold: holdNext });
+          if (holdNext) heldTaskId = taskId;
+          cb({ ok: true, data: { taskId, status: 'queued' } });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+          const st = taskMap.get(msg.taskId);
+          st.polls++;
+          if (st.cancelled) {
+            cb({ ok: true, data: { taskId: msg.taskId, status: 'cancelled', phase: 'cancelled', progress: 20, loadedBytes: 2_000_000, totalBytes: st.totalBytes, speedBytesPerSec: 0, filename: st.filename } });
+            return;
+          }
+          if (st.hold || st.polls === 1) {
+            cb({ ok: true, data: { taskId: msg.taskId, status: 'downloading', phase: 'downloading', progress: 50, loadedBytes: Math.round(st.totalBytes * 0.5), totalBytes: st.totalBytes, speedBytesPerSec: 4_200_000, filename: st.filename } });
+            return;
+          }
+          cb({ ok: true, data: { taskId: msg.taskId, status: 'completed', phase: 'completed', progress: 100, loadedBytes: st.totalBytes, totalBytes: st.totalBytes, speedBytesPerSec: 0, filename: st.filename } });
+          return;
+        }
+        if (msg.type === 'WEB_EXT_CANCEL_TASK') {
+          cancelled.push(msg.taskId);
+          const st = taskMap.get(msg.taskId);
+          if (st) st.cancelled = true;
+          cb({ ok: true, data: { taskId: msg.taskId, cancelled: true } });
+        }
+      },
+    },
+  };
+
+  const prevManager = globalThis.__uiDownloadManager;
+  try {
+    let webManagerCalls = 0;
+    globalThis.__uiDownloadManager = {
+      async run(req, _signal, onUpdate) {
+        webManagerCalls++;
+        const snap = { id: req.id, transport: 'browser_streaming', status: 'completed', filename: req.filename, url: req.url, loaded: 18_500_000, total: 18_500_000, speed: 0, elapsed: 1, averageSpeed: 18_500_000 };
+        onUpdate(snap);
+        return snap;
+      },
+    };
+
+    const h1 = harness(biliData);
+    await h1.instance.downloadMainVideo();
+    await settled(h1.store.downloads[0]);
+    assert.equal(webManagerCalls, 0, 'connected extension must handle slow progressive bilivideo MP4 without Web SW');
+    assert.equal(h1.store.downloads[0].status, 'completed');
+    assert.equal(h1.store.downloads[0].savePath, 'extension');
+    assert.equal(h1.store.downloads[0].savePathLabel, '保存路径：Chrome 扩展后台加速下载');
+    assert.equal(enqueued.length, 1);
+    assert.equal(enqueued[0].payload.kind, 'direct_download');
+    assert.deepEqual(enqueued[0].payload.routes, [bili720Primary, bili720Mirror]);
+    assert.equal(enqueued[0].payload.sizeBytes, 18_500_000);
+    assert.equal(enqueued[0].payload.mimeType, 'video/mp4');
+
+    // Cancel active accelerated direct_download -> forwards WEB_EXT_CANCEL_TASK
+    holdNext = true;
+    const hCancel = harness(biliData);
+    const pending = hCancel.instance.downloadMainVideo();
+    await waitUntil(() => hCancel.store.downloads.length === 1 && hCancel.store.downloads[0].status === 'downloading' && heldTaskId !== null);
+    await hCancel.instance.handleCancelDownload(hCancel.store.downloads[0].id);
+    await pending;
+    assert.equal(hCancel.store.downloads[0].status, 'cancelled');
+    assert.deepEqual(cancelled, [heldTaskId]);
+    holdNext = false;
+
+    // Case 2: Extension disconnects between WEB_EXT_PING and WEB_EXT_ENQUEUE_MEDIA -> falls back smoothly to Web SW!
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version: '4.2.0',
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download'],
+              },
+            });
+            return;
+          }
+          cb({ ok: false, code: 'EXTENSION_UNAVAILABLE', error: 'Extension context invalidated' });
+        },
+      },
+    };
+    webManagerCalls = 0;
+    const hFallback = harness(biliData);
+    await hFallback.instance.downloadMainVideo();
+    await waitUntil(() => hFallback.store.downloads[0]?.status === 'completed');
+    assert.equal(webManagerCalls, 1, 'must seamlessly fall back to Web SW when extension disappears on enqueue');
+    assert.equal(hFallback.store.downloads[0].savePath, undefined, 'savePath must be cleared on fallback to Web SW');
+    assert.equal(hFallback.toasts.some((t) => t[1] === 'error'), false, 'seamless fallback must not show an error toast');
+
+    // Case 3: No extension installed -> straight to Web SW with zero error
+    delete globalThis.chrome;
+    webManagerCalls = 0;
+    const hNoExt = harness(biliData);
+    await hNoExt.instance.downloadMainVideo();
+    await waitUntil(() => hNoExt.store.downloads[0]?.status === 'completed');
+    assert.equal(webManagerCalls, 1);
+    assert.equal(hNoExt.toasts.some((t) => t[1] === 'error'), false);
+  } finally {
+    if (prevManager === undefined) delete globalThis.__uiDownloadManager;
+    else globalThis.__uiDownloadManager = prevManager;
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

@@ -591,7 +591,7 @@ test('finished elapsed time and average speed remain stable across later queries
 test('worker reports its build and separates total elapsed time from transfer speed', async t => {
   const h = harness(async () => media()); t.after(() => h.close());
   const ping = await h.send({ action: 'ping' });
-  assert.equal(ping.workerBuild, 'downloads-20261104.1');
+  assert.equal(ping.workerBuild, 'downloads-20261123.1');
   assert.equal(ping.capabilities.admission, true);
   await h.start(1, [], { startedAt: 995_000 });
   assert.equal((await h.query(1)).elapsed, 5);
@@ -1212,11 +1212,11 @@ test('multi-range sliding window delivers exact bytes out-of-order with bounded 
     const slice = payload.subarray(start, end + 1);
     const body = new ReadableStream({
       async start(controller) {
-        // Hold chunk 1 (starts at 2 MiB) until chunk 2 (4 MiB) is also in-flight to verify out-of-order completion.
-        if (start === 2 * 1024 * 1024) {
+        // Hold chunk 0 (starts at 512 KiB) until chunk 1 (1.5 MiB) is also in-flight to verify out-of-order completion.
+        if (start === 512 * 1024) {
           await new Promise(resolve => { pendingResolvers.set(start, resolve); });
-        } else if (start === 4 * 1024 * 1024) {
-          pendingResolvers.get(2 * 1024 * 1024)?.();
+        } else if (start === 1536 * 1024) {
+          pendingResolvers.get(512 * 1024)?.();
         }
         for (let at = 0; at < slice.length; at += 512 * 1024) {
           controller.enqueue(slice.subarray(at, Math.min(slice.length, at + 512 * 1024)));
@@ -1245,14 +1245,14 @@ test('multi-range sliding window delivers exact bytes out-of-order with bounded 
   assert.equal(rangeCalls.length, 0, 'no Range probe before consumer pulls');
 
   const reader = response.body.getReader();
-  // Pull first chunk -> starts probe and fills bounded window (max 4 chunks: 2M, 4M, 6M, 8M; must NOT schedule 10M or 12M yet!)
+  // Pull first chunk -> starts probe and fills bounded window (max 4 chunks: 0.5M, 1.5M, 2.5M, 3.5M; must NOT schedule >= 4.5M yet!)
   const firstRead = await reader.read();
   assert.ok(!firstRead.done);
   // Wait a few microtasks/ticks so probe + initial bounded window dispatch.
   for (let i = 0; i < 15; i++) await new Promise(resolve => setImmediate(resolve));
   assert.ok(rangeCalls.length >= 2 && rangeCalls.length <= 4,
     `bounded window must schedule at most 4 chunks before chunk 1 is delivered, saw ${rangeCalls.length}`);
-  assert.ok(!rangeCalls.some(c => c.start >= 10 * 1024 * 1024),
+  assert.ok(!rangeCalls.some(c => c.start >= 4608 * 1024),
     'chunks beyond MAX_WINDOW_CHUNKS=4 must not be scheduled while paused on chunk 0');
 
   // Drain the rest of the stream and verify byte-for-byte SHA-256 identity.
@@ -1265,10 +1265,10 @@ test('multi-range sliding window delivers exact bytes out-of-order with bounded 
   const actual = Buffer.concat(chunks);
   assert.equal(actual.length, payload.length);
   assert.equal(sha256(actual), expectedDigest);
-  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 2 * 1024 * 1024 + 300 * 1024,
-    `initial 200 stream should cancel at 2 MiB boundary, cancelled at ${initialCancelledAt}`);
+  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 512 * 1024 + 300 * 1024,
+    `initial 200 stream should cancel at 512 KiB boundary, cancelled at ${initialCancelledAt}`);
   assert.ok(maxInFlight >= 2 && maxInFlight <= 4, `expected bounded concurrency 2..4, got ${maxInFlight}`);
-  assert.equal(rangeCalls.length, 6, '12 MiB + 137 B after 2 MiB chunk 0 = 6 Range chunks');
+  assert.equal(rangeCalls.length, 12, '12 MiB + 137 B after 512 KiB chunk 0 = 12 Range chunks (1 MiB each)');
   const finished = await h.query(1);
   assert.equal(finished.status, 'completed');
   assert.equal(finished.loaded, payload.length);
@@ -1279,14 +1279,14 @@ test('multi-range falls back silently to initial 200 stream when 206 is unsuppor
   const payload = makeRangePayload(5 * 1024 * 1024 + 19);
   const expectedDigest = sha256(payload);
   const cases = [
-    ['non-206', () => new Response(payload.subarray(2 * 1024 * 1024), { status: 200, headers: { 'content-type': 'video/mp4' } })],
+    ['non-206', () => new Response(payload.subarray(512 * 1024), { status: 200, headers: { 'content-type': 'video/mp4' } })],
     ['cors-error', () => { throw new TypeError('Failed to fetch'); }],
-    ['missing-content-range', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), { status: 206, headers: { 'content-type': 'video/mp4' } })],
-    ['mismatched-total', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), {
-      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${2 * 1024 * 1024}-${4 * 1024 * 1024 - 1}/${payload.length + 1}` },
+    ['missing-content-range', () => new Response(payload.subarray(512 * 1024, 1536 * 1024), { status: 206, headers: { 'content-type': 'video/mp4' } })],
+    ['mismatched-total', () => new Response(payload.subarray(512 * 1024, 1536 * 1024), {
+      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${512 * 1024}-${1536 * 1024 - 1}/${payload.length + 1}` },
     })],
-    ['changed-etag', () => new Response(payload.subarray(2 * 1024 * 1024, 4 * 1024 * 1024), {
-      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${2 * 1024 * 1024}-${4 * 1024 * 1024 - 1}/${payload.length}`, etag: '"v2"' },
+    ['changed-etag', () => new Response(payload.subarray(512 * 1024, 1536 * 1024), {
+      status: 206, headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${512 * 1024}-${1536 * 1024 - 1}/${payload.length}`, etag: '"v2"' },
     })],
   ];
 
@@ -1406,7 +1406,7 @@ test('multi-range retries transient post-switch chunk error and fails closed on 
     const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
     const start = Number(a), end = Number(b);
     const slice = payload.subarray(start, end + 1);
-    if (start === 4 * 1024 * 1024) {
+    if (start === 1536 * 1024) {
       await retryChunk2Gate;
       if (++chunk2Attempts === 1) {
         // Simulate truncated transient drop after initial switch.
@@ -1434,7 +1434,7 @@ test('multi-range retries transient post-switch chunk error and fails closed on 
   assert.equal((await hRetry.query(1)).status, 'completed');
   assert.equal(chunk2Attempts, 2, 'post-switch transient chunk drop must retry and succeed');
 
-  // Post-switch ETag drift on chunk 2 (held until switch completes) must fail cleanly.
+  // Post-switch ETag drift on chunk 1 (held until switch completes) must fail cleanly.
   let releaseChunk2;
   const chunk2Gate = new Promise(resolve => { releaseChunk2 = resolve; });
   const hDrift = harness(async (_url, options) => {
@@ -1450,14 +1450,14 @@ test('multi-range retries transient post-switch chunk error and fails closed on 
     const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
     const start = Number(a), end = Number(b);
     const slice = payload.subarray(start, end + 1);
-    if (start === 4 * 1024 * 1024) await chunk2Gate;
+    if (start === 1536 * 1024) await chunk2Gate;
     return new Response(slice, {
       status: 206,
       headers: {
         'content-type': 'video/mp4',
         'content-length': String(slice.length),
         'content-range': `bytes ${start}-${end}/${payload.length}`,
-        etag: start === 4 * 1024 * 1024 ? '"v2"' : '"v1"',
+        etag: start === 1536 * 1024 ? '"v2"' : '"v1"',
       },
     });
   });
@@ -1516,9 +1516,9 @@ test('multi-range activates on real-browser CORS responses without Content-Encod
   const corsBuf = Buffer.from(await corsRes.arrayBuffer());
   assert.equal(corsBuf.length, payload.length);
   assert.equal(sha256(corsBuf), expectedDigest);
-  assert.equal(rangeCalls.length, 3, '6 MiB + 55 B after 2 MiB chunk 0 = 3 Range chunks');
-  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 2 * 1024 * 1024 + 512 * 1024,
-    `initial CORS 200 stream should cancel at 2 MiB boundary, cancelled at ${initialCancelledAt}`);
+  assert.equal(rangeCalls.length, 6, '6 MiB + 55 B after 512 KiB chunk 0 = 6 Range chunks (1 MiB each)');
+  assert.ok(initialCancelledAt > 0 && initialCancelledAt <= 512 * 1024 + 512 * 1024,
+    `initial CORS 200 stream should cancel at 512 KiB boundary, cancelled at ${initialCancelledAt}`);
   const corsSnap = await hCors.query(1);
   assert.equal(corsSnap.status, 'completed');
   assert.equal(corsSnap.loaded, payload.length);
@@ -1530,7 +1530,7 @@ test('multi-range activates on real-browser CORS responses without Content-Encod
   const hMismatch = harness(async (_url, options) => {
     if (options.headers?.Range) {
       mismatchProbes++;
-      const start = 2 * 1024 * 1024, end = 4 * 1024 * 1024 - 1;
+      const start = 512 * 1024, end = 1536 * 1024 - 1;
       return makeCorsResponse(payload.subarray(start, end + 1), {
         status: 206,
         headers: {
@@ -1584,4 +1584,224 @@ test('multi-range activates on real-browser CORS responses without Content-Encod
   const noneSnap = await hNone.query(1);
   assert.equal(noneSnap.status, 'completed');
   assert.equal(noneSnap.total, 0);
+});
+
+test('P2: 2 MiB threshold activates multi-range on 2.5 MiB files, skips 1.5 MiB files, and ramps window immediately on 206 headers before probe body completes', async t => {
+  // 1. 1.5 MiB (< 2 MiB threshold) stays pure single-stream with zero Range requests.
+  const smallPayload = makeRangePayload(1536 * 1024);
+  let smallRanges = 0;
+  const hSmall = harness(async (_url, options) => {
+    if (options.headers?.Range) smallRanges++;
+    return new Response(makeChunkedStream(smallPayload, 256 * 1024), {
+      status: 200,
+      headers: { 'content-type': 'video/mp4', 'content-length': String(smallPayload.length), 'accept-ranges': 'bytes' },
+    });
+  });
+  t.after(() => hSmall.close());
+  await hSmall.admit(1);
+  const smallBuf = Buffer.from(await (await hSmall.download(1)).arrayBuffer());
+  assert.equal(sha256(smallBuf), sha256(smallPayload));
+  assert.equal(smallRanges, 0, '1.5 MiB file below 2 MiB threshold must not issue Range requests');
+
+  // 2. 2.5 MiB (>= 2 MiB threshold) activates multi-Range with 512 KiB warmup + 2 x 1 MiB Range chunks.
+  const midPayload = makeRangePayload(2560 * 1024);
+  const midRanges = [];
+  const hMid = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      return new Response(makeChunkedStream(midPayload, 256 * 1024), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(midPayload.length), 'accept-ranges': 'bytes' },
+      });
+    }
+    const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const start = Number(a), end = Number(b);
+    midRanges.push({ start, end });
+    const slice = midPayload.subarray(start, end + 1);
+    return new Response(slice, {
+      status: 206,
+      headers: { 'content-type': 'video/mp4', 'content-length': String(slice.length), 'content-range': `bytes ${start}-${end}/${midPayload.length}` },
+    });
+  });
+  t.after(() => hMid.close());
+  await hMid.admit(1);
+  const midBuf = Buffer.from(await (await hMid.download(1)).arrayBuffer());
+  assert.equal(sha256(midBuf), sha256(midPayload));
+  assert.deepEqual(midRanges, [
+    { start: 512 * 1024, end: 1536 * 1024 - 1 },
+    { start: 1536 * 1024, end: 2560 * 1024 - 1 },
+  ]);
+
+  // 3. Probe 206 header validation ramps chunks 1..3 immediately while probe chunk 0 body is still blocked!
+  const rampPayload = makeRangePayload(6 * 1024 * 1024);
+  const dispatchedStarts = [];
+  let releaseProbeBody;
+  const probeBodyGate = new Promise(resolve => { releaseProbeBody = resolve; });
+  const hRamp = harness(async (_url, options) => {
+    const rangeHeader = options.headers?.Range;
+    if (!rangeHeader) {
+      return new Response(makeChunkedStream(rampPayload, 128 * 1024), {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(rampPayload.length), 'accept-ranges': 'bytes' },
+      });
+    }
+    const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    const start = Number(a), end = Number(b);
+    dispatchedStarts.push(start);
+    const slice = rampPayload.subarray(start, end + 1);
+    if (start === 512 * 1024) {
+      return new Response(new ReadableStream({
+        async start(controller) {
+          await probeBodyGate;
+          controller.enqueue(slice);
+          controller.close();
+        },
+      }), {
+        status: 206,
+        headers: { 'content-type': 'video/mp4', 'content-length': String(slice.length), 'content-range': `bytes ${start}-${end}/${rampPayload.length}` },
+      });
+    }
+    return new Response(slice, {
+      status: 206,
+      headers: { 'content-type': 'video/mp4', 'content-length': String(slice.length), 'content-range': `bytes ${start}-${end}/${rampPayload.length}` },
+    });
+  });
+  t.after(() => hRamp.close());
+  await hRamp.admit(1);
+  const res = await hRamp.download(1);
+  const reader = res.body.getReader();
+  const firstRead = await reader.read();
+  for (let i = 0; i < 15; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(
+    dispatchedStarts,
+    [512 * 1024, 1536 * 1024, 2560 * 1024, 3584 * 1024],
+    'all 4 concurrent Range chunks must ramp immediately once probe 206 headers validate, before probe body delivers a single byte',
+  );
+  releaseProbeBody();
+  const chunks = [Buffer.from(firstRead.value)];
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    chunks.push(Buffer.from(next.value));
+  }
+  assert.equal(sha256(Buffer.concat(chunks)), sha256(rampPayload));
+});
+
+test('P2: safe idle hot-swap skips waiting & claims when idle, defers during active tasks until worker-idle, and fails safe for legacy workers', async t => {
+  function createChannelBus() {
+    const channels = new Set();
+    return class FakeBroadcastChannel {
+      constructor(name) {
+        this.name = name;
+        this.listeners = new Set();
+        channels.add(this);
+      }
+      addEventListener(type, fn) { if (type === 'message') this.listeners.add(fn); }
+      removeEventListener(type, fn) { if (type === 'message') this.listeners.delete(fn); }
+      postMessage(data) {
+        for (const ch of [...channels]) {
+          if (ch !== this && ch.name === this.name) {
+            queueMicrotask(() => {
+              for (const fn of [...ch.listeners]) fn({ data });
+            });
+          }
+        }
+      }
+      close() { channels.delete(this); }
+    };
+  }
+
+  function lifecycleHarness({ fetcher = async () => media(), bus, controlledClients = [], swState = 'installing' } = {}) {
+    const events = new Map(), timers = new Map(), lifetime = [];
+    let nextTimer = 0, now = 1_000_000;
+    let skipWaitingCalls = 0, claimCalls = 0;
+    const sw = { state: swState };
+    const clientsMap = new Map([
+      ['page', { id: 'page', url: origin + '/', postMessage() {} }],
+    ]);
+    const context = vm.createContext({
+      self: {
+        location: new URL(origin),
+        serviceWorker: sw,
+        skipWaiting: async () => { skipWaitingCalls++; },
+        clients: {
+          get: async key => clientsMap.get(key),
+          matchAll: async () => controlledClients,
+          claim: async () => { claimCalls++; },
+        },
+        addEventListener: (key, handler) => events.set(key, handler),
+      },
+      ...(bus ? { BroadcastChannel: bus } : {}),
+      fetch: fetcher, URL, Response, Blob, ReadableStream, AbortController, DOMException, TextDecoder,
+      crypto: { randomUUID },
+      Date: class extends Date { static now() { return now; } },
+      performance: { now: () => now },
+      setTimeout(callback, delay) { const handle = ++nextTimer; timers.set(handle, { callback, delay }); return handle; },
+      clearTimeout: handle => timers.delete(handle),
+    });
+    vm.runInContext(source, context);
+    const dispatchLifecycle = async (type) => {
+      const promises = [];
+      events.get(type)?.({ waitUntil: p => promises.push(p) });
+      await Promise.all(promises);
+    };
+    const send = (message, client = 'page') => new Promise(resolve => {
+      events.get('message')({ data: { protocol: 1, ...message }, source: { id: client }, ports: [{ postMessage: resolve }], waitUntil: p => lifetime.push(p) });
+    });
+    const tickAll = delay => { for (const [k, tm] of [...timers]) if (tm.delay === delay) { timers.delete(k); tm.callback(); } };
+    return {
+      sw, dispatchLifecycle, send, tickAll,
+      get skipWaitingCalls() { return skipWaitingCalls; },
+      get claimCalls() { return claimCalls; },
+      async close() { await Promise.all(lifetime); },
+    };
+  }
+
+  // Case 1: No controlled /downloads/* clients -> immediately skipWaiting on install + clients.claim on activate.
+  const idle = lifecycleHarness({ bus: createChannelBus(), controlledClients: [{ url: origin + '/' }] });
+  t.after(() => idle.close());
+  await idle.dispatchLifecycle('install');
+  assert.equal(idle.skipWaitingCalls, 1);
+  idle.sw.state = 'activating';
+  await idle.dispatchLifecycle('activate');
+  assert.equal(idle.claimCalls, 1);
+
+  // Case 2: Active new-gen worker owns open /downloads/bridge.html with tasks.size === 0 -> idle-probe confirms idle -> skipWaiting!
+  const busIdlePeer = createChannelBus();
+  const bridgeClient = [{ url: origin + '/downloads/bridge.html' }];
+  const activeIdlePeer = lifecycleHarness({ bus: busIdlePeer, controlledClients: bridgeClient, swState: 'activated' });
+  t.after(() => activeIdlePeer.close());
+  const installingOverIdle = lifecycleHarness({ bus: busIdlePeer, controlledClients: bridgeClient, swState: 'installing' });
+  t.after(() => installingOverIdle.close());
+  const installIdlePromise = installingOverIdle.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  installingOverIdle.tickAll(120);
+  await installIdlePromise;
+  assert.equal(installingOverIdle.skipWaitingCalls, 1);
+
+  // Case 3: Active new-gen worker has active task (tasks.size === 1) -> defers skipWaiting until task completes & broadcasts worker-idle!
+  const busBusyPeer = createChannelBus();
+  const activeBusyPeer = lifecycleHarness({ bus: busBusyPeer, controlledClients: bridgeClient, swState: 'activated' });
+  t.after(() => activeBusyPeer.close());
+  await activeBusyPeer.send({ action: 'start', token, request: { id: id(1), filename: 'active.mp4', url: 'https://cdn.test/a.mp4' } });
+  const waitingWorker = lifecycleHarness({ bus: busBusyPeer, controlledClients: bridgeClient, swState: 'installing' });
+  t.after(() => waitingWorker.close());
+  const installBusyPromise = waitingWorker.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  await installBusyPromise;
+  waitingWorker.sw.state = 'installed';
+  assert.equal(waitingWorker.skipWaitingCalls, 0, 'must NOT skipWaiting while active worker owns an in-flight download');
+  // Cancel / settle active task -> tasks.size drops to 0 -> broadcasts worker-idle -> waiting worker immediately calls skipWaiting!
+  await activeBusyPeer.send({ action: 'cancel', id: id(1), token });
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(waitingWorker.skipWaitingCalls, 1, 'waiting worker must immediately skipWaiting once active worker drains to tasks.size === 0');
+
+  // Case 4: Legacy worker (no BroadcastChannel peer) holds open /downloads/bridge.html -> fails safe (0 skipWaiting).
+  const installingOverLegacy = lifecycleHarness({ bus: createChannelBus(), controlledClients: bridgeClient, swState: 'installing' });
+  t.after(() => installingOverLegacy.close());
+  const legacyPromise = installingOverLegacy.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  installingOverLegacy.tickAll(120);
+  await legacyPromise;
+  assert.equal(installingOverLegacy.skipWaitingCalls, 0, 'must fail safe and wait when legacy worker with open bridge does not answer idle-probe');
 });

@@ -4,7 +4,7 @@ import { attachmentFormat, cleanFilename } from "./media-format.js";
 import { decodedLength } from "./decoded-length.js";
 import { readCandidate, validCandidate, reportTbvideo } from "./tbvideo.js";
 const PROTOCOL = 1;
-const BUILD = "downloads-20261104.1";
+const BUILD = "downloads-20261123.1";
 const INSTANCE = crypto.randomUUID();
 const store = createTaskStore();
 const MAX_ACTIVE = 2;
@@ -16,17 +16,135 @@ const STALLED_MS = 15_000;
 const SPEED_WINDOW_MS = 2000;
 const CLAIM_MS = 60_000;
 const RETAIN_MS = HISTORY_MS;
-const RANGE_THRESHOLD_BYTES = 4 * 1024 * 1024;
-const RANGE_CHUNK_SIZE = 2 * 1024 * 1024;
+const RANGE_THRESHOLD_BYTES = 2 * 1024 * 1024;
+const RANGE_INITIAL_CHUNK_BYTES = 512 * 1024;
+const RANGE_CHUNK_SIZE = 1 * 1024 * 1024;
 const MAX_RANGE_CONCURRENCY = 4;
 const MAX_WINDOW_CHUNKS = 4;
 const RANGE_DELIVER_SLICE_BYTES = 256 * 1024;
 const MAX_RANGE_CHUNK_RETRIES = 2;
+const RANGE_PROBE_WAIT_MS = 1500;
+const WORKER_CONTROL_CHANNEL = "dokitool-download-worker-control";
+const WORKER_IDLE_PROBE_MS = 120;
 const tasks = new Map();
 const history = new Map();
 const queue = [];
 let active = 0;
 let historyTimer;
+let isActivated = false;
+let waitingToActivate = false;
+const controlChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel(WORKER_CONTROL_CHANNEL) : null;
+
+function isCurrentActiveWorker() {
+  if (self.serviceWorker && typeof self.serviceWorker.state === "string") {
+    return self.serviceWorker.state === "activated" || self.serviceWorker.state === "activating";
+  }
+  return isActivated;
+}
+
+async function hasControlledDownloadClients() {
+  if (typeof self.clients?.matchAll !== "function") return false;
+  try {
+    const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    return list.some(client => {
+      try {
+        const u = new URL(client.url);
+        return u.origin === self.location.origin && u.pathname.startsWith("/downloads/");
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return true;
+  }
+}
+
+async function canSafelySkipWaiting() {
+  if (tasks.size > 0 || queue.length > 0) return false;
+  const hasDownloadClient = await hasControlledDownloadClients();
+  if (!hasDownloadClient) return true;
+  if (!controlChannel) return false;
+  // A `/downloads/` bridge document exists; ask the active worker whether it has
+  // zero active tasks. If no peer replies (legacy build), fail safe and wait.
+  return new Promise(resolve => {
+    const probeId = crypto.randomUUID();
+    let sawPeer = false;
+    let busy = false;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      controlChannel.removeEventListener("message", onReply);
+      resolve(sawPeer && !busy && tasks.size === 0 && queue.length === 0);
+    };
+    const onReply = event => {
+      const data = event.data;
+      if (!data || data.type !== "idle-reply" || data.probeId !== probeId || data.from === INSTANCE) return;
+      sawPeer = true;
+      if (Number(data.activeTasks) > 0) {
+        busy = true;
+        finish();
+      }
+    };
+    controlChannel.addEventListener("message", onReply);
+    const timer = setTimeout(finish, WORKER_IDLE_PROBE_MS);
+    try {
+      controlChannel.postMessage({ type: "idle-probe", probeId, from: INSTANCE });
+    } catch {
+      finish();
+    }
+  });
+}
+
+function notifyIdleIfEmpty() {
+  if (!controlChannel || tasks.size > 0 || queue.length > 0) return;
+  try {
+    controlChannel.postMessage({ type: "worker-idle", from: INSTANCE });
+  } catch {}
+}
+
+controlChannel?.addEventListener("message", event => {
+  const data = event.data;
+  if (!data || data.from === INSTANCE) return;
+  if (data.type === "idle-probe" && typeof data.probeId === "string") {
+    if (isCurrentActiveWorker() || tasks.size > 0 || queue.length > 0) {
+      try {
+        controlChannel.postMessage({
+          type: "idle-reply",
+          probeId: data.probeId,
+          from: INSTANCE,
+          activeTasks: tasks.size + queue.length,
+        });
+      } catch {}
+    }
+    return;
+  }
+  if (data.type === "worker-idle" && waitingToActivate && !isCurrentActiveWorker() && tasks.size === 0 && queue.length === 0) {
+    if (typeof self.skipWaiting === "function") {
+      void self.skipWaiting().catch(() => {});
+    }
+  }
+});
+
+self.addEventListener("install", event => {
+  waitingToActivate = true;
+  event.waitUntil((async () => {
+    if (await canSafelySkipWaiting()) {
+      if (typeof self.skipWaiting === "function") {
+        await self.skipWaiting();
+      }
+    }
+  })());
+});
+
+self.addEventListener("activate", event => {
+  isActivated = true;
+  waitingToActivate = false;
+  if (typeof self.clients?.claim === "function") {
+    event.waitUntil(self.clients.claim());
+  }
+});
 const terminal = status => ["completed", "failed", "cancelled", "manual"].includes(status);
 const abortError = () => new DOMException("下载已取消", "AbortError");
 const validKey = value => typeof value === "string" && /^[a-zA-Z0-9_-]{16,100}$/.test(value);
@@ -198,6 +316,7 @@ function settle(task, status, error) {
     history.set(task.state.id, { token: task.token, finishedAt: task.finishedAt, result: task.result });
     tasks.delete(task.state.id);
     prune();
+    notifyIdleIfEmpty();
   });
   // A fetch event may already be inactive at EOF. This protects only the short
   // result write where the browser permits it, never the whole transfer.
@@ -289,6 +408,14 @@ function createRangeScheduler(task, config) {
   let deliverOffset = 0;
   let fatalError = null;
   let waiter = null;
+  let probeWaiter = null;
+
+  function resolveProbeWaiter() {
+    if (!probeWaiter) return;
+    const current = probeWaiter;
+    probeWaiter = null;
+    current();
+  }
 
   function clearWaiter(err) {
     if (!waiter) return;
@@ -311,6 +438,7 @@ function createRangeScheduler(task, config) {
   function fallback() {
     if (state === "fallback" || state === "failed" || state === "aborted") return;
     state = "fallback";
+    resolveProbeWaiter();
     cancelAllWorkers();
     clearWaiter();
   }
@@ -319,6 +447,7 @@ function createRangeScheduler(task, config) {
     if (state === "failed" || state === "aborted") return;
     state = "failed";
     fatalError = error instanceof Error ? error : new Error(String(error || "分片下载失败"));
+    resolveProbeWaiter();
     cancelAllWorkers();
     clearWaiter(fatalError);
   }
@@ -326,6 +455,7 @@ function createRangeScheduler(task, config) {
   function abort() {
     if (state === "aborted") return;
     state = "aborted";
+    resolveProbeWaiter();
     cancelAllWorkers();
     clearWaiter(abortError());
   }
@@ -403,6 +533,7 @@ function createRangeScheduler(task, config) {
 
           if (isProbe && state === "probing") {
             state = "active";
+            resolveProbeWaiter();
             pump();
           }
 
@@ -482,6 +613,33 @@ function createRangeScheduler(task, config) {
     },
     fallback,
     abort,
+    waitProbeSettled() {
+      if (state !== "probing") return Promise.resolve();
+      if (task.controller.signal.aborted || rangeController.signal.aborted) {
+        return Promise.reject(abortError());
+      }
+      return new Promise((resolve, reject) => {
+        let done = false;
+        let timer;
+        const finish = err => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          task.controller.signal.removeEventListener("abort", onAbort);
+          if (probeWaiter === onSettled) probeWaiter = null;
+          if (err) reject(err);
+          else resolve();
+        };
+        const onSettled = () => finish();
+        const onAbort = () => finish(abortError());
+        probeWaiter = onSettled;
+        task.controller.signal.addEventListener("abort", onAbort, { once: true });
+        timer = setTimeout(() => {
+          if (state === "probing") fallback();
+          finish();
+        }, RANGE_PROBE_WAIT_MS);
+      });
+    },
     waitReady() {
       if (task.controller.signal.aborted || state === "aborted") return Promise.reject(abortError());
       if (fatalError) return Promise.reject(fatalError);
@@ -554,7 +712,7 @@ async function prepare(task) {
         rangeCandidateTotal >= RANGE_THRESHOLD_BYTES &&
         first.value.length < rangeCandidateTotal;
       const chunk0End = rangeEligible
-        ? Math.min(rangeCandidateTotal, Math.max(RANGE_CHUNK_SIZE, first.value.length))
+        ? Math.min(rangeCandidateTotal, Math.max(RANGE_INITIAL_CHUNK_BYTES, first.value.length))
         : 0;
       const rangeConfig = rangeEligible && chunk0End < rangeCandidateTotal ? {
         url,
@@ -610,6 +768,10 @@ async function attachment(task) {
         if (task.controller.signal.aborted) throw abortError();
         task.lastPullAt = Date.now();
         if (deliveryMode === "initial" && range && !first && task.state.loaded === range.chunk0End) {
+          if (range.isProbing()) {
+            await range.waitProbeSettled();
+            if (task.controller.signal.aborted) throw abortError();
+          }
           if (range.isActive()) {
             range.commitSwitch();
             deliveryMode = "range";
@@ -632,6 +794,10 @@ async function attachment(task) {
           task.timing?.received();
           first = undefined;
           if (!item.done && range && task.state.loaded + item.value.length >= range.chunk0End) {
+            if (range.isProbing() && task.state.loaded + item.value.length > range.chunk0End) {
+              await range.waitProbeSettled();
+              if (task.controller.signal.aborted) throw abortError();
+            }
             if (range.isActive()) {
               const keep = range.chunk0End - task.state.loaded;
               if (keep < item.value.length) item = { value: item.value.subarray(0, keep), done: false };
