@@ -32,6 +32,8 @@ const props = defineProps({
   unavailableQualityReason: String,
   higherQualityNotice: Boolean,
   isBilibili: Boolean,
+  isMulti: Boolean,
+  isExtensionConnected: Boolean,
   bilibiliDashSummary: { type: Object, default: null },
 });
 
@@ -148,8 +150,9 @@ const infoCards = computed(() => [
     icon: "fa-pen",
     label: t(props.locale, "infoTitle"),
     value:
-      props.currentItem?.title ||
-      props.resultData?.title ||
+      (props.isMulti
+        ? props.currentItem?.title || props.resultData?.title
+        : props.resultData?.title || props.currentItem?.title) ||
       t(props.locale, "unknownTitle"),
   },
   {
@@ -494,12 +497,12 @@ onUnmounted(() => {
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
         :is-bilibili="isBilibili"
+        :is-extension-connected="isExtensionConnected"
         :bilibili-dash-summary="bilibiliDashSummary"
         :display-variant-label="displayVariantLabel"
         :format-option-size="formatOptionSize"
         @select-quality="emit('select-quality', $event)"
         @toggle-show-all="emit('toggle-show-all-qualities')"
-        @open-extension="emit('open-extension')"
       />
 
       <div v-if="activeTab === 'tags'" class="rs-tab-panel">
@@ -527,7 +530,25 @@ onUnmounted(() => {
             {{ attachment.author.name }}
           </div>
           <div
-            v-if="isBilibiliDashAudio(attachment)"
+            v-if="isBilibiliDashAudio(attachment) && isExtensionConnected"
+            class="rs-bili-audio-connected"
+            data-bilibili-dash-audio-connected
+          >
+            <p class="rs-stat-note">
+              {{ t(locale, "extAudioConnectedExplain") }}
+            </p>
+            <button
+              type="button"
+              class="rs-btn rs-btn--primary rs-btn--sm rs-btn--block"
+              data-bilibili-dash-audio-ext-download
+              @click="emit('download-music', attachment)"
+            >
+              <AppIcon class="fas fa-download" />
+              <span>{{ t(locale, "extAudioDownloadCta") }}</span>
+            </button>
+          </div>
+          <div
+            v-else-if="isBilibiliDashAudio(attachment)"
             class="rs-bili-audio-guide"
             data-bilibili-dash-audio-guide
             role="status"

@@ -470,7 +470,12 @@ export function createPublicDownloadActions(deps: {
       default: null,
       default_unavailable_reason: "processing_required",
     };
-    await enqueueItem(snapshotItem(item, { variant_id: "resource" }));
+    await enqueueItem(
+      freeze({
+        ...snapshotItem(item, { variant_id: "resource" }),
+        isAttachment: true,
+      }),
+    );
   }
   function downloadMusic(attachment: Attachment) {
     void enqueueResource(freeze(attachment.resource), attachment.title);

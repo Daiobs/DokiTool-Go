@@ -73,7 +73,14 @@ export function buildMediaFilename(input: {
 }): string {
   const extension =
     (input.extension || "mp4").replace(/[^a-z0-9]/gi, "").slice(0, 12) || "bin";
-  const rawTitle = (input.title ?? "").trim();
+  let rawTitle = (input.title ?? "").trim();
+  const extSuffix = `.${extension.toLowerCase()}`;
+  if (
+    rawTitle.toLowerCase().endsWith(extSuffix) &&
+    rawTitle.length > extSuffix.length
+  ) {
+    rawTitle = rawTitle.slice(0, -extSuffix.length).trim();
+  }
   const page = typeof input.index === "number" ? input.index : undefined;
   const isMultiItem =
     typeof input.total === "number"

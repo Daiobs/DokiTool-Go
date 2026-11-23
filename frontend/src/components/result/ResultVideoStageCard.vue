@@ -1,7 +1,7 @@
 <script setup>
 import AppIcon from "../AppIcon.vue";
 import VideoPlaylist from "../VideoPlaylist.vue";
-import { t, formatBilibiliDashTitle } from "./resultI18n";
+import { t } from "./resultI18n";
 
 defineProps({
   hasVideo: Boolean,
@@ -12,6 +12,7 @@ defineProps({
   currentItem: Object,
   activeVariant: Object,
   activeVideoUrl: String,
+  copyVideoUrl: { type: String, default: undefined },
   playerKey: String,
   mainPosterUrl: String,
   playerQualityTagText: String,
@@ -24,6 +25,7 @@ defineProps({
   needsQualitySelection: Boolean,
   isActiveYouTubeSplitVideo: Boolean,
   isActiveYouTubeAudioOnly: Boolean,
+  isActiveExtensionDashMux: Boolean,
   isYouTubeHelperBlocked: Boolean,
   isTargetBlocked: Boolean,
   selectedCount: { type: Number, default: 0 },
@@ -36,7 +38,6 @@ defineProps({
   activeCollection: { type: Number, default: 0 },
   resolvingIds: Object,
   selection: Object,
-  bilibiliDashSummary: { type: Object, default: null },
 });
 
 const emit = defineEmits([
@@ -45,7 +46,6 @@ const emit = defineEmits([
   "mark-image-broken",
   "open-quality-picker",
   "open-yt-helper-modal",
-  "open-extension",
   "refresh-item",
   "primary-download",
   "download-selected",
@@ -58,9 +58,6 @@ const emit = defineEmits([
   "clear-selection",
   "select-collection",
 ]);
-
-const EXT_ICON_PATH =
-  "M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z";
 </script>
 
 <template>
@@ -152,6 +149,7 @@ const EXT_ICON_PATH =
         :data-select-quality-first="needsQualitySelection || undefined"
         :data-youtube-mux-save="isActiveYouTubeSplitVideo || undefined"
         :data-youtube-audio-only-save="isActiveYouTubeAudioOnly || undefined"
+        :data-extension-dash-mux-save="isActiveExtensionDashMux || undefined"
         :disabled="
           isYouTubeHelperBlocked ||
           isResolving ||
@@ -195,77 +193,13 @@ const EXT_ICON_PATH =
         }}
       </button>
       <button
-        @click="emit('copy-url', activeVideoUrl)"
+        @click="emit('copy-url', copyVideoUrl !== undefined ? copyVideoUrl : activeVideoUrl)"
         class="rs-btn rs-btn--ghost-light"
-        :disabled="!activeVideoUrl"
+        :disabled="!(copyVideoUrl !== undefined ? copyVideoUrl : activeVideoUrl)"
       >
         <AppIcon class="fas fa-copy" /><span>{{
           t(locale, "copyVideo")
         }}</span>
-      </button>
-    </div>
-    <div
-      v-if="bilibiliDashSummary"
-      class="rs-bili-dash-callout"
-      data-bilibili-dash-callout
-      role="region"
-      :aria-label="formatBilibiliDashTitle(bilibiliDashSummary, locale)"
-    >
-      <div class="rs-bili-dash-body">
-        <div class="rs-bili-dash-head">
-          <span class="rs-bili-dash-title">
-            <AppIcon class="fas fa-bolt rs-bili-dash-bolt" />
-            <span>{{
-              formatBilibiliDashTitle(bilibiliDashSummary, locale)
-            }}</span>
-          </span>
-          <div class="rs-bili-dash-specs">
-            <span
-              v-if="bilibiliDashSummary.maxResolution"
-              class="rs-bili-dash-pill rs-bili-dash-pill--res"
-            >
-              {{
-                t(locale, "biliDashUpTo").replace(
-                  "{res}",
-                  bilibiliDashSummary.maxResolution,
-                )
-              }}
-            </span>
-            <span
-              v-if="bilibiliDashSummary.videoCodecs.length"
-              class="rs-bili-dash-pill"
-            >
-              {{ bilibiliDashSummary.videoCodecs.join(" / ") }}
-            </span>
-            <span
-              v-if="bilibiliDashSummary.audioCodec"
-              class="rs-bili-dash-pill"
-            >
-              + {{ bilibiliDashSummary.audioCodec }}
-            </span>
-          </div>
-        </div>
-        <p class="rs-bili-dash-desc">{{ t(locale, "biliDashHint") }}</p>
-      </div>
-      <button
-        type="button"
-        class="rs-btn rs-bili-dash-cta"
-        data-bilibili-dash-extension-cta
-        @click="emit('open-extension')"
-      >
-        <svg
-          class="rs-bili-dash-ext-icon"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <path :d="EXT_ICON_PATH" />
-        </svg>
-        <span>{{ t(locale, "biliDashCta") }}</span>
       </button>
     </div>
   </div>
@@ -541,127 +475,6 @@ const EXT_ICON_PATH =
   border-color: var(--c-accent);
   color: var(--c-fg);
   transform: translateY(-1px);
-}
-
-.rs-bili-dash-callout {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem 1rem;
-  padding: 0.8rem 1.125rem;
-  flex-shrink: 0;
-  border-top: 1px solid rgba(99, 102, 241, 0.2);
-  background: linear-gradient(
-    135deg,
-    rgba(99, 102, 241, 0.08) 0%,
-    rgba(168, 85, 247, 0.06) 100%
-  );
-}
-:global(.dark) .rs-bili-dash-callout {
-  border-top-color: rgba(129, 140, 248, 0.28);
-  background: linear-gradient(
-    135deg,
-    rgba(99, 102, 241, 0.16) 0%,
-    rgba(168, 85, 247, 0.12) 100%
-  );
-}
-.rs-bili-dash-body {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-}
-.rs-bili-dash-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.4rem 0.55rem;
-}
-.rs-bili-dash-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  font-size: 0.8rem;
-  font-weight: 700;
-  color: var(--c-fg);
-}
-.rs-bili-dash-bolt {
-  font-size: 0.75rem;
-  color: var(--c-accent);
-}
-.rs-bili-dash-specs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.3rem;
-}
-.rs-bili-dash-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.12rem 0.45rem;
-  border-radius: 999px;
-  font-size: 0.65rem;
-  font-weight: 600;
-  line-height: 1.35;
-  color: #4338ca;
-  background: rgba(99, 102, 241, 0.1);
-  border: 1px solid rgba(99, 102, 241, 0.22);
-}
-.rs-bili-dash-pill--res {
-  font-weight: 700;
-  color: #3730a3;
-  background: rgba(99, 102, 241, 0.16);
-  border-color: rgba(99, 102, 241, 0.32);
-}
-:global(.dark) .rs-bili-dash-pill {
-  color: #c7d2fe;
-  background: rgba(129, 140, 248, 0.16);
-  border-color: rgba(129, 140, 248, 0.3);
-}
-:global(.dark) .rs-bili-dash-pill--res {
-  color: #e0e7ff;
-  background: rgba(129, 140, 248, 0.24);
-  border-color: rgba(165, 180, 252, 0.38);
-}
-.rs-bili-dash-desc {
-  margin: 0;
-  font-size: 0.72rem;
-  line-height: 1.45;
-  color: var(--c-fg-2);
-}
-.rs-bili-dash-cta {
-  flex-shrink: 0;
-  padding: 0.55rem 0.95rem;
-  font-size: 0.75rem;
-  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-  color: #fff;
-  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
-}
-.rs-bili-dash-cta:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 20px rgba(79, 70, 229, 0.42);
-}
-.rs-bili-dash-cta:focus-visible {
-  outline: 2px solid var(--c-accent);
-  outline-offset: 2px;
-}
-.rs-bili-dash-ext-icon {
-  width: 0.9rem;
-  height: 0.9rem;
-  flex-shrink: 0;
-}
-@media (max-width: 768px) {
-  .rs-bili-dash-callout {
-    flex-direction: column;
-    align-items: stretch;
-    padding: 0.75rem 0.875rem;
-  }
-  .rs-bili-dash-cta {
-    width: 100%;
-    white-space: normal;
-    text-align: center;
-  }
 }
 
 @keyframes rsFadeIn {

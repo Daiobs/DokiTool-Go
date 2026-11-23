@@ -24,9 +24,18 @@ export function useVideoSelection({
       (group) => group.kind !== "album",
     ),
   );
-  const hasCollections = computed(() => collections.value.length > 0);
+  const hasCollections = computed(
+    () =>
+      collections.value.length > 1 ||
+      collections.value.some(
+        (group) =>
+          (group.total_count ?? 0) > 1 || (group.item_ids?.length ?? 0) > 1,
+      ),
+  );
   const visibleList = computed(() => {
-    const group = collections.value[sectionIndex.value];
+    const group = hasCollections.value
+      ? collections.value[sectionIndex.value]
+      : undefined;
     return group
       ? group.item_ids
           .map((id) => list.value.find((item) => item.id === id))

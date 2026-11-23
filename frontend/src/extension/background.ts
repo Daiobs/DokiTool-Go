@@ -36,10 +36,12 @@ import {
 import { buildEnqueueItemsForMedia } from "./extensionDownload";
 import {
   buildSafeDownloadPath,
+  sanitizeFilenameSegment,
   sanitizeSubfolderPrefix,
 } from "./filenameSanitizer";
 import {
   LOOPBACK_HOST_PERMISSIONS,
+  PROD_API_ORIGIN,
   isSafeNativeBrowserDownloadUrl,
   isWhitelistedMediaUrl,
   validateApiBaseUrl,
@@ -52,6 +54,7 @@ import {
   COMMAND_OPEN_SIDEPANEL,
   CONTEXT_MENU_INSPECT_ID,
   CONTEXT_MENU_QUICK_DOWNLOAD_ID,
+  DOKITOOL_EXTENSION_ID,
   OFFSCREEN_IDLE_CLOSE_MS,
   OFFSCREEN_PORT_NAME,
   SIDEPANEL_PORT_NAME,
@@ -60,6 +63,7 @@ import {
   errRpc,
   isOffscreenToBackgroundMessage,
   isSidePanelRequest,
+  isWebToExtensionRequest,
   okRpc,
   type AuthMode,
   type BackgroundToOffscreenRequest,
@@ -83,6 +87,8 @@ import {
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
   type TabSyncState,
+  type WebExtTaskPhase,
+  type WebToExtensionRequest,
 } from "./protocol";
 import { isValidStatsSnapshot } from "../monitor/statsTypes";
 import {
@@ -157,8 +163,12 @@ export interface ChromeBackgroundApi {
   runtime: {
     id?: string;
     getManifest?(): {
+      version?: string;
       host_permissions?: string[];
       optional_host_permissions?: string[];
+      externally_connectable?: {
+        matches?: string[];
+      };
     };
     getContexts?(filter: {
       contextTypes?: string[];
@@ -166,6 +176,10 @@ export interface ChromeBackgroundApi {
     }): Promise<Array<{ contextType: string; documentUrl?: string }>>;
     sendMessage(message: unknown): Promise<unknown>;
     onMessage: {
+      addListener(listener: ChromeRuntimeMessageListener): void;
+      removeListener?(listener: ChromeRuntimeMessageListener): void;
+    };
+    onMessageExternal?: {
       addListener(listener: ChromeRuntimeMessageListener): void;
       removeListener?(listener: ChromeRuntimeMessageListener): void;
     };
@@ -289,6 +303,7 @@ export interface BackgroundController {
   ensureOffscreenDocument(): Promise<void>;
   getSnapshot(): Promise<ExtensionStateSnapshot>;
   handleRuntimeMessage: ChromeRuntimeMessageListener;
+  handleExternalRuntimeMessage: ChromeRuntimeMessageListener;
   waitForIdle(): Promise<void>;
   dispose(): void;
 }
@@ -472,6 +487,208 @@ const FINISHED_TASK_STATUSES = new Set<ExtensionDownloadTask["status"]>([
   "failed",
   "cancelled",
 ]);
+
+export interface ExternalWebSenderCheckResult {
+  allowed: boolean;
+  origin: string;
+  isLoopback: boolean;
+  reason?: string;
+}
+
+/**
+ * Strictly validates an external `onMessageExternal` sender origin.
+ * Production builds ONLY accept exact `https://snap.dokitool.com`.
+ * Dev loopback builds additionally accept `http://127.0.0.1` / `http://localhost`
+ * ONLY when the runtime manifest's own `externally_connectable.matches` declares them.
+ */
+export function validateExternalWebSender(
+  sender: unknown,
+  manifest?: {
+    externally_connectable?: { matches?: string[] };
+  } | null,
+): ExternalWebSenderCheckResult {
+  if (!sender || typeof sender !== "object") {
+    return {
+      allowed: false,
+      origin: "",
+      isLoopback: false,
+      reason: "缺少外部消息发送方信息",
+    };
+  }
+  const rec = sender as {
+    origin?: unknown;
+    url?: unknown;
+    tab?: { url?: unknown };
+    id?: unknown;
+  };
+  if (typeof rec.id === "string" && rec.id.trim().length > 0) {
+    return {
+      allowed: false,
+      origin: "",
+      isLoopback: false,
+      reason: "不允许其他扩展调用外部 Web 桥接接口",
+    };
+  }
+
+  const rawOrigin = typeof rec.origin === "string" ? rec.origin.trim() : "";
+  const rawUrl =
+    typeof rec.url === "string" && rec.url.trim()
+      ? rec.url.trim()
+      : typeof rec.tab?.url === "string" && rec.tab.url.trim()
+        ? rec.tab.url.trim()
+        : "";
+  const candidate = rawOrigin || rawUrl;
+  if (!candidate) {
+    return {
+      allowed: false,
+      origin: "",
+      isLoopback: false,
+      reason: "外部消息缺少发送方来源",
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return {
+      allowed: false,
+      origin: "",
+      isLoopback: false,
+      reason: "外部消息发送方来源格式无效",
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      allowed: false,
+      origin: "",
+      isLoopback: false,
+      reason: "外部消息发送方不允许包含凭据",
+    };
+  }
+
+  if (rawOrigin && rawUrl) {
+    try {
+      const parsedUrl = new URL(rawUrl);
+      if (parsedUrl.origin !== parsed.origin) {
+        return {
+          allowed: false,
+          origin: "",
+          isLoopback: false,
+          reason: "外部消息发送方 origin 与 url 不一致",
+        };
+      }
+    } catch {
+      return {
+        allowed: false,
+        origin: "",
+        isLoopback: false,
+        reason: "外部消息发送方 url 格式无效",
+      };
+    }
+  }
+
+  if (parsed.origin === PROD_API_ORIGIN) {
+    return { allowed: true, origin: PROD_API_ORIGIN, isLoopback: false };
+  }
+
+  const matches = Array.isArray(manifest?.externally_connectable?.matches)
+    ? manifest.externally_connectable.matches
+    : [];
+  const host = parsed.hostname.toLowerCase();
+  if (parsed.protocol === "http:") {
+    if (host === "127.0.0.1" && matches.includes("http://127.0.0.1/*")) {
+      return { allowed: true, origin: parsed.origin, isLoopback: true };
+    }
+    if (host === "localhost" && matches.includes("http://localhost/*")) {
+      return { allowed: true, origin: parsed.origin, isLoopback: true };
+    }
+  }
+
+  return {
+    allowed: false,
+    origin: parsed.origin,
+    isLoopback: false,
+    reason: `未授权的外部调用来源：${parsed.origin}`,
+  };
+}
+
+function mapTaskStatusToWebPhase(
+  status: ExtensionDownloadTask["status"],
+): WebExtTaskPhase {
+  switch (status) {
+    case "queued":
+    case "parsing":
+      return "queued";
+    case "downloading":
+      return "downloading";
+    case "muxing":
+      return "muxing";
+    case "saving":
+      return "saving";
+    case "completed":
+      return "completed";
+    case "cancelled":
+      return "cancelled";
+    default:
+      return "failed";
+  }
+}
+
+const ALLOWED_WEB_BRIDGE_EXTENSIONS = new Set([
+  "mp4",
+  "m4v",
+  "webm",
+  "mov",
+  "mkv",
+  "m4a",
+  "mp3",
+  "aac",
+  "ogg",
+  "opus",
+  "wav",
+  "flac",
+  "jpg",
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+  "avif",
+  "ts",
+  "bin",
+]);
+
+function sanitizeWebBridgeFilename(
+  rawFilename: unknown,
+  defaultExt: string,
+  subfolderPrefix: string,
+  forceExt?: string,
+): string {
+  const trimmed = typeof rawFilename === "string" ? rawFilename.trim() : "";
+  const flatLeaf = sanitizeFilenameSegment(trimmed, {
+    fallback: "download",
+  });
+  const dotIdx = flatLeaf.lastIndexOf(".");
+  const rawSuffix =
+    dotIdx > 0 && dotIdx < flatLeaf.length - 1
+      ? flatLeaf.slice(dotIdx + 1).toLowerCase()
+      : "";
+  const hasKnownExt = ALLOWED_WEB_BRIDGE_EXTENSIONS.has(rawSuffix);
+  const stem = hasKnownExt ? flatLeaf.slice(0, dotIdx) : flatLeaf;
+  const ext = forceExt || (hasKnownExt ? rawSuffix : defaultExt);
+  return buildSafeDownloadPath({
+    prefix: subfolderPrefix,
+    stem,
+    ext: ext || defaultExt,
+  });
+}
+
+function parseOptionalPositiveSafeInt(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0
+    ? raw
+    : undefined;
+}
 
 function sanitizeRelativeDownloadPath(rawPath: string): string {
   const trimmed = typeof rawPath === "string" ? rawPath.trim() : "";
@@ -671,6 +888,7 @@ export function createBackgroundController(
 
   const tasks = new Map<string, ExtensionDownloadTask>();
   const taskOrder: string[] = [];
+  const webBridgeTaskIds = new Set<string>();
   const parseAbortControllers = new Map<string, AbortController>();
   const pendingBlobDownloads = new Map<number, PendingBlobDownloadRecord>();
   const earlyDownloadDeltas = new Map<number, ChromeDownloadDelta>();
@@ -3441,6 +3659,7 @@ export function createBackgroundController(
         for (const [id, task] of Array.from(tasks.entries())) {
           if (FINISHED_TASK_STATUSES.has(task.status)) {
             tasks.delete(id);
+            webBridgeTaskIds.delete(id);
             const idx = taskOrder.indexOf(id);
             if (idx >= 0) taskOrder.splice(idx, 1);
           }
@@ -3634,11 +3853,275 @@ export function createBackgroundController(
     return false;
   };
 
+  const validateWebBridgeRoutes = (
+    rawRoutes: unknown,
+    fieldLabel: string,
+    allowedExtraOrigins?: string[],
+  ): { ok: true; routes: string[] } | { ok: false; error: string; code: string } => {
+    if (!Array.isArray(rawRoutes) || rawRoutes.length === 0) {
+      return {
+        ok: false,
+        error: `${fieldLabel}不能为空`,
+        code: "INVALID_PAYLOAD",
+      };
+    }
+    if (rawRoutes.length > 8) {
+      return {
+        ok: false,
+        error: `${fieldLabel}数量超出限制`,
+        code: "INVALID_PAYLOAD",
+      };
+    }
+    const routes: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of rawRoutes) {
+      if (typeof raw !== "string" || !raw.trim()) {
+        return {
+          ok: false,
+          error: `${fieldLabel}包含无效链接`,
+          code: "INVALID_PAYLOAD",
+        };
+      }
+      const trimmed = raw.trim();
+      const check = isWhitelistedMediaUrl(trimmed, allowedExtraOrigins);
+      if (!check.allowed) {
+        return {
+          ok: false,
+          error: check.reason || `域名 ${check.hostname} 不在扩展安全白名单内`,
+          code: "UNWHITELISTED_CDN",
+        };
+      }
+      if (!seen.has(trimmed)) {
+        seen.add(trimmed);
+        routes.push(trimmed);
+      }
+    }
+    return { ok: true, routes };
+  };
+
+  const handleWebExternalRequest = async (
+    req: WebToExtensionRequest,
+    senderCheck: ExternalWebSenderCheckResult,
+  ): Promise<ExtensionRpcResponse<unknown>> => {
+    const manifest = chromeApi.runtime.getManifest?.();
+    switch (req.type) {
+      case "WEB_EXT_PING": {
+        return okRpc({
+          version: String(manifest?.version || "0.0.0"),
+          extensionId: chromeApi.runtime.id || DOKITOOL_EXTENSION_ID,
+          capabilities: ["dash_mux", "direct_download"],
+        });
+      }
+
+      case "WEB_EXT_ENQUEUE_MEDIA": {
+        const payload = req.payload as unknown;
+        if (!payload || typeof payload !== "object") {
+          return errRpc("缺少下载任务参数", { code: "INVALID_PAYLOAD" });
+        }
+        const rec = payload as Record<string, unknown>;
+        const kind = rec.kind;
+        if (kind !== "dash_mux" && kind !== "direct_download") {
+          return errRpc("不支持的外部下载任务类型", { code: "INVALID_PAYLOAD" });
+        }
+        const platform =
+          typeof rec.platform === "string" ? rec.platform.trim().slice(0, 64) : "";
+        if (!platform) {
+          return errRpc("缺少平台标识", { code: "INVALID_PAYLOAD" });
+        }
+
+        const settings = await storage.getSettings();
+        const webBridgeExtraOrigins = senderCheck.isLoopback
+          ? [senderCheck.origin]
+          : undefined;
+        const apiOrigin = senderCheck.isLoopback
+          ? senderCheck.origin
+          : PROD_API_ORIGIN;
+        const rawTitle =
+          typeof rec.title === "string" && rec.title.trim()
+            ? rec.title.trim().slice(0, 120)
+            : typeof rec.filename === "string" && rec.filename.trim()
+              ? rec.filename.trim().slice(0, 120)
+              : "媒体下载";
+        const safeMimeType =
+          typeof rec.mimeType === "string" &&
+          /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(rec.mimeType.trim())
+            ? rec.mimeType.trim().toLowerCase()
+            : undefined;
+
+        let spec: OffscreenDownloadSpec;
+        if (kind === "dash_mux") {
+          const dashMuxRaw = rec.dashMux as Record<string, unknown> | undefined;
+          if (!dashMuxRaw || typeof dashMuxRaw !== "object") {
+            return errRpc("缺少 DASH 合流轨参数", { code: "INVALID_PAYLOAD" });
+          }
+          const outputContainer =
+            dashMuxRaw.outputContainer === undefined
+              ? "mp4"
+              : dashMuxRaw.outputContainer;
+          if (outputContainer !== "mp4") {
+            return errRpc("仅支持 MP4 无损合流输出", { code: "INVALID_PAYLOAD" });
+          }
+          const vRoutesCheck = validateWebBridgeRoutes(
+            dashMuxRaw.videoRoutes,
+            "视频轨线路",
+            webBridgeExtraOrigins,
+          );
+          if (!vRoutesCheck.ok) {
+            return errRpc(vRoutesCheck.error, { code: vRoutesCheck.code });
+          }
+          const aRoutesCheck = validateWebBridgeRoutes(
+            dashMuxRaw.audioRoutes,
+            "音频轨线路",
+            webBridgeExtraOrigins,
+          );
+          if (!aRoutesCheck.ok) {
+            return errRpc(aRoutesCheck.error, { code: aRoutesCheck.code });
+          }
+          const videoSize = parseOptionalPositiveSafeInt(dashMuxRaw.videoSize);
+          const audioSize = parseOptionalPositiveSafeInt(dashMuxRaw.audioSize);
+          const declaredTotal =
+            parseOptionalPositiveSafeInt(rec.sizeBytes) ??
+            (videoSize && audioSize ? videoSize + audioSize : undefined);
+          const safeFilename = sanitizeWebBridgeFilename(
+            rec.filename,
+            "mp4",
+            settings.subfolderPrefix,
+            "mp4",
+          );
+          spec = {
+            kind: "dash_mux",
+            apiOrigin,
+            routes: vRoutesCheck.routes,
+            filename: safeFilename,
+            mimeType: "video/mp4",
+            ...(declaredTotal ? { sizeBytes: declaredTotal } : {}),
+            ...(webBridgeExtraOrigins
+              ? { extraAllowedOrigins: webBridgeExtraOrigins }
+              : {}),
+            dashMux: {
+              videoRoutes: vRoutesCheck.routes,
+              audioRoutes: aRoutesCheck.routes,
+              ...(videoSize ? { videoSize } : {}),
+              ...(audioSize ? { audioSize } : {}),
+              outputContainer: "mp4",
+            },
+          };
+        } else {
+          const routesCheck = validateWebBridgeRoutes(
+            rec.routes,
+            "下载线路",
+            webBridgeExtraOrigins,
+          );
+          if (!routesCheck.ok) {
+            return errRpc(routesCheck.error, { code: routesCheck.code });
+          }
+          const sizeBytes = parseOptionalPositiveSafeInt(rec.sizeBytes);
+          const safeFilename = sanitizeWebBridgeFilename(
+            rec.filename,
+            "mp4",
+            settings.subfolderPrefix,
+          );
+          spec = {
+            kind: "direct_file",
+            apiOrigin,
+            routes: routesCheck.routes,
+            filename: safeFilename,
+            ...(safeMimeType ? { mimeType: safeMimeType } : {}),
+            ...(sizeBytes ? { sizeBytes } : {}),
+            ...(webBridgeExtraOrigins
+              ? { extraAllowedOrigins: webBridgeExtraOrigins }
+              : {}),
+          };
+        }
+
+        const enqueued = await enqueueDownloadItems([
+          {
+            title: rawTitle,
+            platform,
+            spec,
+          },
+        ]);
+        const createdTask = enqueued.tasks[0];
+        if (!createdTask) {
+          return errRpc("创建下载任务失败", { code: "ENQUEUE_FAILED" });
+        }
+        webBridgeTaskIds.add(createdTask.taskId);
+        return okRpc({
+          taskId: createdTask.taskId,
+          status: createdTask.status,
+        });
+      }
+
+      case "WEB_EXT_GET_TASK_STATUS": {
+        const taskId = typeof req.taskId === "string" ? req.taskId.trim() : "";
+        if (!taskId || !webBridgeTaskIds.has(taskId)) {
+          return errRpc("未找到该桥接下载任务", { code: "TASK_NOT_FOUND" });
+        }
+        const task = tasks.get(taskId);
+        if (!task) {
+          webBridgeTaskIds.delete(taskId);
+          return errRpc("未找到该桥接下载任务", { code: "TASK_NOT_FOUND" });
+        }
+        return okRpc({
+          taskId: task.taskId,
+          status: task.status,
+          phase: mapTaskStatusToWebPhase(task.status),
+          progress: task.percent,
+          loadedBytes: task.loaded,
+          totalBytes: task.total,
+          speedBytesPerSec: task.speed,
+          filename: task.filename,
+          ...(task.error ? { error: task.error } : {}),
+        });
+      }
+    }
+  };
+
+  const handleExternalRuntimeMessage: ChromeRuntimeMessageListener = (
+    msg: unknown,
+    sender: unknown,
+    sendResponse: (response?: unknown) => void,
+  ): boolean => {
+    const senderCheck = validateExternalWebSender(
+      sender,
+      chromeApi.runtime.getManifest?.(),
+    );
+    if (!senderCheck.allowed) {
+      sendResponse(
+        errRpc(senderCheck.reason || "未授权的外部调用来源", {
+          code: "FORBIDDEN_ORIGIN",
+        }),
+      );
+      return false;
+    }
+    if (!isWebToExtensionRequest(msg)) {
+      sendResponse(
+        errRpc("不支持的外部消息类型", { code: "UNSUPPORTED_ACTION" }),
+      );
+      return false;
+    }
+    void handleWebExternalRequest(msg, senderCheck)
+      .then((resp) => {
+        sendResponse(resp);
+      })
+      .catch((err: unknown) => {
+        const code =
+          typeof (err as { code?: unknown })?.code === "string"
+            ? (err as { code: string }).code
+            : undefined;
+        const message =
+          err instanceof Error && err.message ? err.message : "外部桥接处理失败";
+        sendResponse(errRpc(message, { code }));
+      });
+    return true;
+  };
+
   // ==========================================================================
   // 9. Listener Registration & Boot
   // ==========================================================================
 
   chromeApi.runtime.onMessage.addListener(handleRuntimeMessage);
+  chromeApi.runtime.onMessageExternal?.addListener(handleExternalRuntimeMessage);
 
   chromeApi.runtime.onConnect?.addListener((port) => {
     if (port.name === SIDEPANEL_PORT_NAME) {
@@ -3734,6 +4217,7 @@ export function createBackgroundController(
     ensureOffscreenDocument,
     getSnapshot,
     handleRuntimeMessage,
+    handleExternalRuntimeMessage,
     waitForIdle(): Promise<void> {
       const hasActiveTask = Array.from(tasks.values()).some((t) =>
         ACTIVE_TASK_STATUSES.has(t.status),
@@ -3766,6 +4250,10 @@ export function createBackgroundController(
       }
       parseAbortControllers.clear();
       chromeApi.runtime.onMessage.removeListener?.(handleRuntimeMessage);
+      chromeApi.runtime.onMessageExternal?.removeListener?.(
+        handleExternalRuntimeMessage,
+      );
+      webBridgeTaskIds.clear();
       for (const port of Array.from(sidePanelPorts)) {
         try {
           port.disconnect();

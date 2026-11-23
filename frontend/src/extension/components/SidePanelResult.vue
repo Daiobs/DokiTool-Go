@@ -15,8 +15,13 @@ import {
   sourceRoutes,
   sourceUrl,
 } from "../../utils/mediaContract";
-import type { EnqueueDownloadItem, ExtensionSettings } from "../protocol";
+import type {
+  BatchSaveMode,
+  EnqueueDownloadItem,
+  ExtensionSettings,
+} from "../protocol";
 import {
+  buildBatchPrimaryCtaLabel,
   buildChecklistSubfolderEnqueueItems,
   buildChecklistZipEnqueueItem,
   buildExtensionTargetContext,
@@ -123,6 +128,7 @@ const hasLivePhotos = computed(() =>
 );
 
 const livePhotoFilter = ref<LivePhotoSaveFilter>("both");
+const saveMode = ref<BatchSaveMode>(props.settings.batchSaveMode || "subfolder");
 
 // Active item for single view or multi_video active player
 const activeItemId = ref<string>("");
@@ -160,6 +166,7 @@ function initSelectionForMedia() {
   activeCollectionIdx.value = 0;
   previewModalItem.value = null;
   livePhotoFilter.value = "both";
+  saveMode.value = props.settings.batchSaveMode || "subfolder";
   batchPreparingProgress.value = null;
 
   const defaultId =
@@ -246,6 +253,13 @@ watch(
       }
     }
     selectedOptionKeyByItem.value = nextMap;
+  },
+);
+
+watch(
+  () => props.settings.batchSaveMode,
+  (nextMode) => {
+    saveMode.value = nextMode || "subfolder";
   },
 );
 
@@ -747,23 +761,13 @@ const selectedChecklistEntries = computed<ChecklistItemSelectionEntry[]>(() => {
   return out;
 });
 
-const subfolderBatchLabel = computed(() => {
-  if (batchPreparingProgress.value) {
-    return `正在解析分P (${batchPreparingProgress.value.current}/${batchPreparingProgress.value.total})...`;
-  }
-  const sel = checkedCount.value;
-  const tot = checklistPool.value.length;
-  if (layoutKind.value === "mixed") {
-    return `按标题存子文件夹 · 已选条目 (${sel}/${tot})`;
-  }
-  if (layoutKind.value === "multi_video") {
-    return `按标题存子文件夹 · 已选分P (${sel}/${tot})`;
-  }
-  if (hasLivePhotos.value && albumItems.value.every((i) => i.type === "live_photo")) {
-    return `按标题存子文件夹 · 实况 (${sel}/${tot})`;
-  }
-  return `按标题存子文件夹 · 已选图片 (${sel}/${tot})`;
-});
+const batchPrimaryCtaLabel = computed(() =>
+  buildBatchPrimaryCtaLabel({
+    checkedCount: checkedCount.value,
+    checkableTotalCount: checkableTotalCount.value,
+    preparing: batchPreparingProgress.value,
+  }),
+);
 
 const zipPreviewDecision = computed(() => {
   const readyEntries = selectedChecklistEntries.value.filter((e) =>
@@ -782,6 +786,18 @@ const zipPreviewDecision = computed(() => {
   });
   return res.ok ? { ok: true as const, reason: "" } : { ok: false as const, reason: res.reason };
 });
+
+const effectiveSaveMode = computed<BatchSaveMode>(() =>
+  saveMode.value === "zip" && zipPreviewDecision.value.ok ? "zip" : "subfolder",
+);
+
+async function handleBatchPrimaryDownload() {
+  if (effectiveSaveMode.value === "zip") {
+    await handleBatchZipSave();
+  } else {
+    await handleBatchSubfolderSave();
+  }
+}
 
 async function prepareResolvedChecklistEntries(): Promise<
   ChecklistItemSelectionEntry[] | null
@@ -1031,7 +1047,7 @@ async function handleBatchZipSave() {
         </div>
       </div>
 
-      <!-- Primary Single-Work CTA Bar (shown for Single layout OR as quick current-episode download in Multi-Video) -->
+      <!-- Primary Single-Work CTA Bar (shown exclusively in Single layout) -->
       <div v-if="layoutKind === 'single'" class="sp-cta-row">
         <button
           type="button"
@@ -1055,39 +1071,6 @@ async function handleBatchZipSave() {
           @click="handleCopyDirectLink"
         >
           <span>{{ copiedDirectLink ? "已复制" : "复制直链" }}</span>
-        </button>
-      </div>
-
-      <!-- Compact current-episode / current-item quick save strip in multi-video or mixed mode -->
-      <div
-        v-else-if="(layoutKind === 'multi_video' || layoutKind === 'mixed') && activeItem && readyItem(activeItem)"
-        class="sp-cta-row sp-cta-row--compact"
-      >
-        <button
-          type="button"
-          class="sp-btn sp-btn--ghost sp-btn--sm sp-cta-row__main"
-          :disabled="
-            activeItem.type !== 'live_photo' &&
-            (!activeSelectedOption || !activeSelectedOption.downloadable)
-          "
-          @click="handleSinglePrimaryDownload"
-        >
-          <span class="sp-truncate-1">
-            {{
-              layoutKind === "mixed"
-                ? `仅下当前项：${singlePrimaryCtaText}`
-                : `仅下当前集：${singlePrimaryCtaText}`
-            }}
-          </span>
-        </button>
-        <button
-          type="button"
-          class="sp-btn sp-btn--ghost sp-btn--sm"
-          :disabled="!directCopyCandidateUrl"
-          :title="directCopyButtonTitle"
-          @click="handleCopyDirectLink"
-        >
-          {{ copiedDirectLink ? "已复制" : "复制直链" }}
         </button>
       </div>
     </div>
@@ -1215,59 +1198,69 @@ async function handleBatchZipSave() {
         </div>
       </div>
 
-      <!-- Dual Batch Action Buttons (honoring settings.batchSaveMode) -->
+      <!-- Compact Save-Mode Toggle + Unified Primary Download Action -->
       <div class="sp-batch-actions">
-        <button
-          type="button"
-          class="sp-btn sp-batch-actions__subfolder"
-          :class="
-            settings.batchSaveMode === 'subfolder' || !zipPreviewDecision.ok
-              ? 'sp-btn--primary'
-              : 'sp-btn--secondary'
-          "
-          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
-          title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
-          @click="handleBatchSubfolderSave"
-        >
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-          </svg>
-          <span class="sp-truncate-1">{{ subfolderBatchLabel }}</span>
-        </button>
-
-        <div class="sp-batch-actions__subrow">
-          <button
-            type="button"
-            class="sp-btn sp-btn--sm sp-batch-actions__zip"
-            :class="
-              settings.batchSaveMode === 'zip' && zipPreviewDecision.ok
-                ? 'sp-btn--primary'
-                : 'sp-btn--ghost'
-            "
-            :disabled="
-              checkedCount === 0 ||
-              Boolean(batchPreparingProgress) ||
-              !zipPreviewDecision.ok
-            "
-            :title="
-              zipPreviewDecision.ok
-                ? '将已选条目无压缩打包为单个 ZIP 文件保存'
-                : zipPreviewDecision.reason
-            "
-            @click="handleBatchZipSave"
+        <div class="sp-save-mode-row">
+          <div
+            class="sp-save-mode-pills"
+            role="radiogroup"
+            aria-label="批量保存方式"
           >
-            <span>打包 ZIP ({{ checkedCount }})</span>
-          </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'subfolder'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'subfolder' }"
+              data-save-mode="subfolder"
+              title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
+              @click="saveMode = 'subfolder'"
+            >
+              存子文件夹
+            </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'zip'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
+              data-save-mode="zip"
+              :disabled="!zipPreviewDecision.ok"
+              :title="
+                zipPreviewDecision.ok
+                  ? '将已选条目无压缩打包为单个 ZIP 文件保存'
+                  : zipPreviewDecision.reason
+              "
+              @click="saveMode = 'zip'"
+            >
+              打包 ZIP
+            </button>
+          </div>
 
           <button
             type="button"
-            class="sp-btn sp-btn--ghost sp-btn--sm"
+            class="sp-btn sp-btn--ghost sp-btn--xs sp-save-mode-row__copy"
             :disabled="!directCopyCandidateUrl"
+            :title="directCopyButtonTitle"
             @click="handleCopyDirectLink"
           >
             {{ copiedDirectLink ? "已复制" : "复制直链" }}
           </button>
         </div>
+
+        <button
+          type="button"
+          class="sp-btn sp-btn--primary sp-batch-actions__primary"
+          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
+          @click="handleBatchPrimaryDownload"
+        >
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          <span class="sp-truncate-1">{{ batchPrimaryCtaLabel }}</span>
+        </button>
       </div>
     </div>
 
@@ -1371,46 +1364,68 @@ async function handleBatchZipSave() {
         </div>
       </div>
 
-      <!-- Dual Batch Action Buttons for Multi-Video -->
+      <!-- Compact Save-Mode Toggle + Unified Primary Download Action for Multi-Video -->
       <div class="sp-batch-actions">
-        <button
-          type="button"
-          class="sp-btn sp-batch-actions__subfolder"
-          :class="
-            settings.batchSaveMode === 'subfolder' || !zipPreviewDecision.ok
-              ? 'sp-btn--primary'
-              : 'sp-btn--secondary'
-          "
-          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
-          @click="handleBatchSubfolderSave"
-        >
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-          </svg>
-          <span class="sp-truncate-1">{{ subfolderBatchLabel }}</span>
-        </button>
+        <div class="sp-save-mode-row">
+          <div
+            class="sp-save-mode-pills"
+            role="radiogroup"
+            aria-label="批量保存方式"
+          >
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'subfolder'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'subfolder' }"
+              data-save-mode="subfolder"
+              title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
+              @click="saveMode = 'subfolder'"
+            >
+              存子文件夹
+            </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'zip'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
+              data-save-mode="zip"
+              :disabled="!zipPreviewDecision.ok"
+              :title="
+                zipPreviewDecision.ok
+                  ? '将已选分P打包为单个 ZIP 文件（500 MB 以内）'
+                  : zipPreviewDecision.reason
+              "
+              @click="saveMode = 'zip'"
+            >
+              打包 ZIP
+            </button>
+          </div>
+
+          <button
+            type="button"
+            class="sp-btn sp-btn--ghost sp-btn--xs sp-save-mode-row__copy"
+            :disabled="!directCopyCandidateUrl"
+            :title="directCopyButtonTitle"
+            @click="handleCopyDirectLink"
+          >
+            {{ copiedDirectLink ? "已复制" : "复制直链" }}
+          </button>
+        </div>
 
         <button
           type="button"
-          class="sp-btn sp-btn--sm sp-batch-actions__zip"
-          :class="
-            settings.batchSaveMode === 'zip' && zipPreviewDecision.ok
-              ? 'sp-btn--primary'
-              : 'sp-btn--ghost'
-          "
-          :disabled="
-            checkedCount === 0 ||
-            Boolean(batchPreparingProgress) ||
-            !zipPreviewDecision.ok
-          "
-          :title="
-            zipPreviewDecision.ok
-              ? '将已选分P打包为单个 ZIP 文件（500 MB 以内）'
-              : zipPreviewDecision.reason
-          "
-          @click="handleBatchZipSave"
+          class="sp-btn sp-btn--primary sp-batch-actions__primary"
+          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
+          @click="handleBatchPrimaryDownload"
         >
-          打包 ZIP ({{ checkedCount }})
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          <span class="sp-truncate-1">{{ batchPrimaryCtaLabel }}</span>
         </button>
       </div>
     </div>
@@ -1557,57 +1572,67 @@ async function handleBatchZipSave() {
       </div>
 
       <div class="sp-batch-actions">
-        <button
-          type="button"
-          class="sp-btn sp-batch-actions__subfolder"
-          :class="
-            settings.batchSaveMode === 'subfolder' || !zipPreviewDecision.ok
-              ? 'sp-btn--primary'
-              : 'sp-btn--secondary'
-          "
-          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
-          title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
-          @click="handleBatchSubfolderSave"
-        >
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-          </svg>
-          <span class="sp-truncate-1">{{ subfolderBatchLabel }}</span>
-        </button>
-
-        <div class="sp-batch-actions__subrow">
-          <button
-            type="button"
-            class="sp-btn sp-btn--sm sp-batch-actions__zip"
-            :class="
-              settings.batchSaveMode === 'zip' && zipPreviewDecision.ok
-                ? 'sp-btn--primary'
-                : 'sp-btn--ghost'
-            "
-            :disabled="
-              checkedCount === 0 ||
-              Boolean(batchPreparingProgress) ||
-              !zipPreviewDecision.ok
-            "
-            :title="
-              zipPreviewDecision.ok
-                ? '将已选混排条目无压缩打包为单个 ZIP 文件保存'
-                : zipPreviewDecision.reason
-            "
-            @click="handleBatchZipSave"
+        <div class="sp-save-mode-row">
+          <div
+            class="sp-save-mode-pills"
+            role="radiogroup"
+            aria-label="批量保存方式"
           >
-            <span>打包 ZIP ({{ checkedCount }})</span>
-          </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'subfolder'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'subfolder' }"
+              data-save-mode="subfolder"
+              title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
+              @click="saveMode = 'subfolder'"
+            >
+              存子文件夹
+            </button>
+            <button
+              type="button"
+              role="radio"
+              :aria-checked="effectiveSaveMode === 'zip'"
+              class="sp-save-mode-pill"
+              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
+              data-save-mode="zip"
+              :disabled="!zipPreviewDecision.ok"
+              :title="
+                zipPreviewDecision.ok
+                  ? '将已选混排条目无压缩打包为单个 ZIP 文件保存'
+                  : zipPreviewDecision.reason
+              "
+              @click="saveMode = 'zip'"
+            >
+              打包 ZIP
+            </button>
+          </div>
 
           <button
             type="button"
-            class="sp-btn sp-btn--ghost sp-btn--sm"
+            class="sp-btn sp-btn--ghost sp-btn--xs sp-save-mode-row__copy"
             :disabled="!directCopyCandidateUrl"
+            :title="directCopyButtonTitle"
             @click="handleCopyDirectLink"
           >
             {{ copiedDirectLink ? "已复制" : "复制直链" }}
           </button>
         </div>
+
+        <button
+          type="button"
+          class="sp-btn sp-btn--primary sp-batch-actions__primary"
+          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
+          @click="handleBatchPrimaryDownload"
+        >
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          <span class="sp-truncate-1">{{ batchPrimaryCtaLabel }}</span>
+        </button>
       </div>
     </div>
 
@@ -2236,25 +2261,72 @@ async function handleBatchZipSave() {
   background: rgba(99, 102, 241, 0.85);
 }
 
-/* Batch Action Buttons */
+/* Batch Action Buttons & Compact Save-Mode Segmented Control */
 .sp-batch-actions {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
   padding-top: 2px;
 }
 
-.sp-batch-actions__subfolder {
-  width: 100%;
-}
-
-.sp-batch-actions__subrow {
+.sp-save-mode-row {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 6px;
+  min-width: 0;
 }
 
-.sp-batch-actions__zip {
+.sp-save-mode-pills {
   flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  background: var(--sp-seg-bg);
+  padding: 2px;
+  border-radius: var(--sp-radius-sm);
+  border: 1px solid var(--sp-border);
+}
+
+.sp-save-mode-pill {
+  border: none;
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: transparent;
+  color: var(--sp-text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: all 140ms ease;
+}
+
+.sp-save-mode-pill:hover:not(:disabled):not(.sp-save-mode-pill--on) {
+  color: var(--sp-text-primary);
+}
+
+.sp-save-mode-pill--on {
+  background: var(--sp-seg-active-bg);
+  color: var(--sp-accent-text-strong);
+  box-shadow: var(--sp-shadow-xs), inset 0 0 0 1px var(--sp-border-accent);
+}
+
+.sp-save-mode-pill:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.sp-save-mode-row__copy {
+  flex-shrink: 0;
+  padding: 4px 8px;
+}
+
+.sp-batch-actions__primary {
+  width: 100%;
 }
 
 /* Multi-video Episodes */

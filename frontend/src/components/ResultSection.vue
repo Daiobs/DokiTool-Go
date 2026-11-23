@@ -8,9 +8,11 @@ import ResultDetailsSidebar from "./result/ResultDetailsSidebar.vue";
 import ResultYouTubeHelperModal from "./result/ResultYouTubeHelperModal.vue";
 import {
   readyItem,
+  readyVariant,
   getDownloadTarget,
   sourceUrl,
 } from "../utils/mediaContract";
+import { extractDashMuxSpec } from "../extension/dashMuxSpec";
 import {
   variantLabel,
   groupVariantsForDisplay,
@@ -123,13 +125,21 @@ const ytHelperModalOpen = computed(
   () => isYouTubeHelperInstallRequired.value && !ytHelperModalDismissed.value,
 );
 
-const activeVideoUrl = computed(() =>
-  isYouTubeHelperBlocked.value
-    ? ""
-    : target.value?.kind === "file"
-      ? target.value.url
-      : "",
+const extensionBridgeState = ref({
+  connected: false,
+  version: "",
+  extensionId: "",
+  capabilities: [],
+});
+const isExtensionConnected = computed(() =>
+  Boolean(extensionBridgeState.value.connected),
 );
+const canExtensionDashMux = computed(
+  () =>
+    isExtensionConnected.value &&
+    extensionBridgeState.value.capabilities.includes("dash_mux"),
+);
+
 const activeVariant = computed(() =>
   target.value && "variant" in target.value
     ? target.value.variant
@@ -138,6 +148,41 @@ const activeVariant = computed(() =>
           (v) => v.id === props.selection?.currentSelection.value?.variant_id,
         )
       : null,
+);
+const isActiveExtensionDashMux = computed(() =>
+  Boolean(
+    canExtensionDashMux.value &&
+      activeVariant.value &&
+      readyVariant(activeVariant.value) &&
+      extractDashMuxSpec(activeVariant.value, context),
+  ),
+);
+const playableFallbackVideoUrl = computed(() => {
+  if (!readyItem(currentItem.value)) return "";
+  const defaultDecision = getDownloadTarget(currentItem.value, null, context);
+  if (defaultDecision.kind === "file") return defaultDecision.url;
+  const fileVariant = currentItem.value.variants.find(
+    (v) => readyVariant(v) && v.delivery.kind === "file",
+  );
+  if (!fileVariant) return "";
+  const decision = getDownloadTarget(
+    currentItem.value,
+    { variant_id: fileVariant.id },
+    context,
+  );
+  return decision.kind === "file" ? decision.url : "";
+});
+const activeVideoUrl = computed(() =>
+  isYouTubeHelperBlocked.value
+    ? ""
+    : target.value?.kind === "file"
+      ? target.value.url
+      : isActiveExtensionDashMux.value
+        ? playableFallbackVideoUrl.value
+        : "",
+);
+const copyVideoUrl = computed(() =>
+  isActiveExtensionDashMux.value ? "" : activeVideoUrl.value,
 );
 const metadata = computed(() => activeVariant.value?.metadata || {});
 const attachments = computed(() => props.resultData?.attachments || []);
@@ -202,6 +247,7 @@ const formatOptionSize = (option) =>
     option,
     youtubeMuxPairsByVariantId.value,
     props.locale,
+    currentItem.value?.duration_ms,
   );
 
 const hasVideo = computed(
@@ -242,6 +288,7 @@ const allQualityOptions = computed(() =>
     props.selection?.currentSelection.value,
     target.value,
     context,
+    { allowExtensionDashMux: canExtensionDashMux.value },
   ),
 );
 const showAllQualityVariants = ref(false);
@@ -291,10 +338,11 @@ const qualityOptions = computed(() => {
 const hasBackup = computed(() => allQualityOptions.value.length > 0);
 const isTargetBlocked = computed(
   () =>
-    !target.value ||
-    target.value.kind === "unsupported" ||
-    target.value.kind === "unavailable" ||
-    target.value.kind === "invalid",
+    !isActiveExtensionDashMux.value &&
+    (!target.value ||
+      target.value.kind === "unsupported" ||
+      target.value.kind === "unavailable" ||
+      target.value.kind === "invalid"),
 );
 const needsQualitySelection = computed(
   () =>
@@ -526,13 +574,82 @@ watch(
 );
 watch(ytHelperModalOpen, syncBodyScrollLock);
 
+const extConnectedTitleText = computed(() => {
+  const ver = extensionBridgeState.value.version
+    ? ` (v${extensionBridgeState.value.version})`
+    : "";
+  return `${t(props.locale, "extConnectedTitle")}${ver}`;
+});
+const extInstallHintText = computed(() => {
+  const maxRes = bilibiliDashSummary.value?.maxResolution;
+  if (maxRes) {
+    return t(props.locale, "extInstallHintWithRes").replace("{res}", maxRes);
+  }
+  return t(props.locale, "extInstallHintGeneric");
+});
+
+let bridgeDisposed = false;
+let bridgeProbeInFlight = false;
+const probeExtensionBridge = async () => {
+  if (bridgeDisposed || bridgeProbeInFlight) return;
+  bridgeProbeInFlight = true;
+  try {
+    const { pingInstalledExtension } = await import(
+      "../services/extensionBridge"
+    );
+    const state = await pingInstalledExtension();
+    if (!bridgeDisposed) {
+      extensionBridgeState.value = state;
+    }
+  } catch {
+    if (!bridgeDisposed) {
+      extensionBridgeState.value = {
+        connected: false,
+        version: "",
+        extensionId: "",
+        capabilities: [],
+      };
+    }
+  } finally {
+    bridgeProbeInFlight = false;
+  }
+};
+const handleWindowReturnForBridge = () => {
+  if (
+    typeof document !== "undefined" &&
+    document.visibilityState === "hidden"
+  ) {
+    return;
+  }
+  if (!isExtensionConnected.value) {
+    void probeExtensionBridge();
+  }
+};
+
 onMounted(() => {
   isClientMounted.value = true;
   syncBodyScrollLock();
+  void probeExtensionBridge();
+  if (typeof document !== "undefined") {
+    document.addEventListener?.("visibilitychange", handleWindowReturnForBridge);
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener?.("focus", handleWindowReturnForBridge);
+  }
 });
 onUnmounted(() => {
-  if (typeof document !== "undefined" && document.body) {
-    document.body.style.overflow = "";
+  bridgeDisposed = true;
+  if (typeof document !== "undefined") {
+    document.removeEventListener?.(
+      "visibilitychange",
+      handleWindowReturnForBridge,
+    );
+    if (document.body) {
+      document.body.style.overflow = "";
+    }
+  }
+  if (typeof window !== "undefined") {
+    window.removeEventListener?.("focus", handleWindowReturnForBridge);
   }
   clearTimeout(copyTimer);
 });
@@ -623,6 +740,18 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         </div>
         <div class="rs-header-right">
           <span
+            v-if="isExtensionConnected"
+            data-testid="extension-connected-badge"
+            class="rs-header-hint rs-header-hint--ready rs-header-hint--ext"
+            :title="extConnectedTitleText"
+            role="status"
+            ><AppIcon
+              class="fas fa-circle-check rs-header-hint-icon"
+            /><span class="rs-header-hint-text">{{
+              t(locale, "extConnected")
+            }}</span></span
+          ><span
+            v-if="isYouTubeHelperReady || !isExtensionConnected"
             class="rs-header-hint"
             :class="{ 'rs-header-hint--ready': isYouTubeHelperReady }"
             :title="headerStatusTitle"
@@ -678,6 +807,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :current-item="currentItem"
           :active-variant="activeVariant"
           :active-video-url="activeVideoUrl"
+          :copy-video-url="copyVideoUrl"
           :player-key="playerKey"
           :main-poster-url="mainPosterUrl"
           :player-quality-tag-text="playerQualityTagText"
@@ -690,6 +820,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :needs-quality-selection="needsQualitySelection"
           :is-active-you-tube-split-video="isActiveYouTubeSplitVideo"
           :is-active-you-tube-audio-only="isActiveYouTubeAudioOnly"
+          :is-active-extension-dash-mux="isActiveExtensionDashMux"
           :is-you-tube-helper-blocked="isYouTubeHelperBlocked"
           :is-target-blocked="isTargetBlocked"
           :selected-count="selectedCount"
@@ -702,13 +833,11 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :active-collection="activeCollection"
           :resolving-ids="resolvingIds"
           :selection="selection"
-          :bilibili-dash-summary="bilibiliDashSummary"
           @playback-error="updatePlaybackStatus($event, true)"
           @playback-loaded="updatePlaybackStatus($event, false)"
           @mark-image-broken="markImageBroken"
           @open-quality-picker="openQualityPicker(false)"
           @open-yt-helper-modal="openYtHelperModal"
-          @open-extension="emit('open-extension')"
           @refresh-item="emit('refresh-item', $event)"
           @primary-download="handlePrimaryDownloadClick"
           @download-selected="emit('download-selected')"
@@ -779,6 +908,8 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         :unavailable-quality-reason="unavailableQualityReason"
         :higher-quality-notice="higherQualityNotice"
         :is-bilibili="isBilibili"
+        :is-multi="Boolean(isMulti)"
+        :is-extension-connected="isExtensionConnected"
         :bilibili-dash-summary="bilibiliDashSummary"
         @toggle-show-all-qualities="
           showAllQualityVariants = !showAllQualityVariants
@@ -790,6 +921,22 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         @mark-image-broken="markImageBroken"
         @baseline-change="onBaselineChange"
       />
+    </div>
+
+    <div
+      v-if="!isExtensionConnected && bilibiliDashSummary"
+      class="rs-ext-hint"
+      data-testid="extension-install-hint"
+    >
+      <span class="rs-ext-hint-text">{{ extInstallHintText }}</span>
+      <button
+        type="button"
+        class="rs-ext-hint-link"
+        data-extension-install-cta
+        @click="emit('open-extension')"
+      >
+        {{ t(locale, "extInstallHintCta") }}
+      </button>
     </div>
 
     <Teleport to="body"
@@ -1186,6 +1333,37 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   display: flex;
   flex-direction: column;
   gap: var(--gap);
+}
+
+.rs-ext-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.9rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--c-fg-3);
+}
+.rs-ext-hint-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--c-accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.rs-ext-hint-link:hover {
+  color: var(--c-accent-dark);
+}
+.rs-ext-hint-link:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
 @media (max-width: 480px) {
