@@ -2375,3 +2375,231 @@ func TestYTDLPGenericConfigurationAndStartupValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestYTDLPThreeCompartmentsAndRuntimeHotReloadSIGHUP(t *testing.T) {
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "yt-dlp")
+	payload := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(fakeBin, payload, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	hexSum := hex.EncodeToString(sum[:])
+	origAsset, hadOrig := ytengine.OfficialSHA256Sums[hexSum]
+	ytengine.OfficialSHA256Sums[hexSum] = "yt-dlp-p37-compartments-test"
+	defer func() {
+		if hadOrig {
+			ytengine.OfficialSHA256Sums[hexSum] = origAsset
+		} else {
+			delete(ytengine.OfficialSHA256Sums, hexSum)
+		}
+	}()
+
+	runtimePath := filepath.Join(dir, "runtime.json")
+	initialJSON := `{
+  "schema_version": "1.0",
+  "ytdlp": {
+    "youtube_slots": 5,
+    "youtube_queue_size": 40,
+    "youtube_queue_wait": "18s",
+    "social_slots": 6,
+    "social_queue_size": 44,
+    "social_queue_wait": "19s",
+    "generic_slots": 3,
+    "generic_queue_size": 20,
+    "generic_queue_wait": "14s",
+    "youtube_ejs_concurrency": 7,
+    "youtube_ejs_queue_size": 70,
+    "youtube_ejs_queue_wait": "9s"
+  },
+  "fast_pool": {
+    "per_platform_max_concurrency": 20
+  },
+  "circuit_breaker": {
+    "enabled": true,
+    "consecutive_failures": 5,
+    "window_size": 10,
+    "failure_rate_threshold": 0.6,
+    "open_duration": "30s",
+    "half_open_max_probes": 2,
+    "disabled_platforms": []
+  },
+  "cache": {
+    "youtube_parse_ttl": "90s",
+    "stale_if_error_ttl": "480s",
+    "upstream_blocked_neg_ttl": "4s"
+  }
+}`
+	if err := os.WriteFile(runtimePath, []byte(initialJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	envMap := map[string]string{
+		"DOKITOOL_YTDLP_BINARY":          fakeBin,
+		"DOKITOOL_YTDLP_GATE_PORTS":      "23101", // Single fixed port shared across all 3 compartments (5+6+3=14 slots)
+		"DOKITOOL_YTDLP_YOUTUBE_ENABLED": "true",
+		"DOKITOOL_YTDLP_X_ENABLED":       "true",
+		"DOKITOOL_YTDLP_GENERIC_ENABLED": "true",
+		api.EnvRuntimeConfigFile:         runtimePath,
+	}
+	getenv := func(k string) string { return envMap[k] }
+
+	rtCfg, fromFile, err := api.LoadRuntimeConfig(getenv)
+	if err != nil || !fromFile {
+		t.Fatalf("LoadRuntimeConfig failed: fromFile=%v err=%v", fromFile, err)
+	}
+	limits, err := api.LoadAdmissionConfig(getenv)
+	if err != nil {
+		t.Fatalf("LoadAdmissionConfig failed: %v", err)
+	}
+	api.ApplyRuntimeConfigToAdmissionConfig(&limits, rtCfg)
+
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapters := map[string]api.Adapter{}
+	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, fetch.New(), x.TombstoneFallbackOff, getenv, rtCfg, fromFile)
+	if err != nil {
+		t.Fatalf("configureYTDLPFullWithRuntime failed: %v", err)
+	}
+	defer func() { _ = ytCfg.Close() }()
+
+	if ytCfg.youtubeEngine == nil || ytCfg.socialEngine == nil || ytCfg.genericEngine == nil {
+		t.Fatalf("expected all 3 compartment engines to be initialized: %+v", ytCfg)
+	}
+	if ytCfg.youtubeEngine.ConcurrencyLimit() != 5 || ytCfg.socialEngine.ConcurrencyLimit() != 6 || ytCfg.genericEngine.ConcurrencyLimit() != 3 {
+		t.Fatalf("unexpected initial compartment limits: yt=%d social=%d generic=%d, want 5/6/3",
+			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.socialEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
+	}
+
+	h, err := api.New(c, adapters, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetGenericAdapter(ytCfg.genericAdapter)
+	h.Stats().SetYTDLPEngine(ytCfg.socialEngine)
+	h.Stats().SetGenericYTDLPEngine(ytCfg.genericEngine)
+	h.Stats().SetYTDLPCompartmentSources(ytCfg.youtubeEngine, ytCfg.socialEngine, ytCfg.genericEngine)
+	h.Stats().SetRuntimeConfig(api.RuntimeConfigSnapshot{
+		Version:             version,
+		YTDLPEnabled:        true,
+		YTDLPGenericEnabled: true,
+	})
+
+	ownerTok := randomHexToken(t, 24)
+	auth, err := api.NewOwnerAuth(ownerTok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := api.WithAdmissionWithOwner(h, nil, "direct", "", limits, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.ApplyRuntimeConfig(entry, h, rtCfg, true, false)
+
+	// Trigger SIGHUP with valid updated runtime.json.
+	updatedJSON := `{
+  "schema_version": "1.0",
+  "ytdlp": {
+    "youtube_slots": 8,
+    "youtube_queue_size": 48,
+    "youtube_queue_wait": "22s",
+    "social_slots": 7,
+    "social_queue_size": 40,
+    "social_queue_wait": "21s",
+    "generic_slots": 4,
+    "generic_queue_size": 24,
+    "generic_queue_wait": "12s",
+    "youtube_ejs_concurrency": 9,
+    "youtube_ejs_queue_size": 80,
+    "youtube_ejs_queue_wait": "11s"
+  },
+  "fast_pool": {
+    "per_platform_max_concurrency": 32
+  },
+  "circuit_breaker": {
+    "enabled": true,
+    "consecutive_failures": 4,
+    "window_size": 12,
+    "failure_rate_threshold": 0.5,
+    "open_duration": "45s",
+    "half_open_max_probes": 3,
+    "disabled_platforms": ["tumblr"]
+  },
+  "cache": {
+    "youtube_parse_ttl": "0s",
+    "stale_if_error_ttl": "300s",
+    "upstream_blocked_neg_ttl": "8s"
+  }
+}`
+	if err := os.WriteFile(runtimePath, []byte(updatedJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 2)
+	var logsMu sync.Mutex
+	var logs []string
+	logf := func(format string, args ...any) {
+		logsMu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		logsMu.Unlock()
+	}
+	stopReload := startSignalReloader(ctx, sigCh, entry, h, &ytCfg, getenv, limits, logf)
+	defer stopReload()
+
+	sigCh <- syscall.SIGHUP
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.Stats().Snapshot().RuntimePolicy.ReloadCount == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	snap := h.Stats().Snapshot()
+	if snap.RuntimePolicy.ReloadCount != 1 || !snap.RuntimePolicy.ConfigFileActive || snap.RuntimePolicy.LastReloadedAt == "" {
+		t.Fatalf("runtime hot-reload did not update stats policy: %+v", snap.RuntimePolicy)
+	}
+	if ytCfg.youtubeEngine.ConcurrencyLimit() != 8 || ytCfg.socialEngine.ConcurrencyLimit() != 7 || ytCfg.genericEngine.ConcurrencyLimit() != 4 {
+		t.Fatalf("ytengine compartment limits not resized on SIGHUP: yt=%d social=%d generic=%d, want 8/7/4",
+			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.socialEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
+	}
+	if snap.YTDLPPools.YouTube.ConcurrencyLimit != 8 || snap.YTDLPPools.Social.ConcurrencyLimit != 7 || snap.YTDLPPools.Generic.ConcurrencyLimit != 4 || snap.YTDLPPools.YouTubeEJS.ConcurrencyLimit != 9 {
+		t.Fatalf("stats ytdlp_pools not updated on SIGHUP: %+v", snap.YTDLPPools)
+	}
+	if snap.RuntimePolicy.FastPerPlatformMaxConcurrency != 32 || snap.RuntimePolicy.YouTubeParseTTLSeconds != 0 || len(snap.RuntimePolicy.DisabledPlatforms) != 1 || snap.RuntimePolicy.DisabledPlatforms[0] != "tumblr" {
+		t.Fatalf("unexpected reloaded runtime policy fields: %+v", snap.RuntimePolicy)
+	}
+
+	// Trigger SIGHUP with invalid JSON (unknown field) -> must fail safe and retain previous limits.
+	if err := os.WriteFile(runtimePath, []byte(`{"schema_version":"1.0","unknown_key":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sigCh <- syscall.SIGHUP
+	deadline = time.Now().Add(2 * time.Second)
+	rejectedLogged := false
+	for time.Now().Before(deadline) {
+		logsMu.Lock()
+		for _, line := range logs {
+			if strings.Contains(line, "runtime config reload rejected") {
+				rejectedLogged = true
+				break
+			}
+		}
+		logsMu.Unlock()
+		if rejectedLogged {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rejectedLogged {
+		t.Fatal("expected fail-safe rejection log for invalid runtime.json reload")
+	}
+	snapAfterBad := h.Stats().Snapshot()
+	if snapAfterBad.RuntimePolicy.ReloadCount != 1 || snapAfterBad.RuntimePolicy.YouTubeSlots != 8 || ytCfg.youtubeEngine.ConcurrencyLimit() != 8 {
+		t.Fatalf("invalid reload mutated active config: policy=%+v ytLimit=%d", snapAfterBad.RuntimePolicy, ytCfg.youtubeEngine.ConcurrencyLimit())
+	}
+}

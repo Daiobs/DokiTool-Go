@@ -218,6 +218,7 @@
 !/frontend/public/favicon.ico
 !/frontend/public/helper/
 !/frontend/public/licenses/
+!/frontend/public/llms.txt
 !/frontend/public/robots.txt
 !/frontend/public/sitemap.xml
 !/frontend/public/social/
@@ -229,6 +230,7 @@
 !/frontend/scripts/generate-brand-assets.mjs
 !/frontend/scripts/generate-platform-catalog.mjs
 !/frontend/scripts/generate-social-image.mjs
+!/frontend/scripts/precompress-assets.mjs
 !/frontend/scripts/prerender.mjs
 !/frontend/scripts/test-go-media-integration.mjs
 !/frontend/scripts/test-media-integration.mjs
@@ -281,7 +283,9 @@
 !/frontend/tests/youtube-helper.test.mjs
 /ops/examples/*
 !/ops/examples/api-keys.example.json
+!/ops/examples/dokitool-sandbox.conf.example
 !/ops/examples/release.conf.example
+!/ops/examples/runtime.example.json
 !/ops/examples/snap-access.caddy.example
 !/ops/examples/snap-fpm.conf
 !/ops/examples/snap.caddy
@@ -381,6 +385,8 @@
 !/backend/internal/api/cache.go
 !/backend/internal/api/cache_test.go
 !/backend/internal/api/capacity_test.go
+!/backend/internal/api/circuit_breaker.go
+!/backend/internal/api/circuit_breaker_test.go
 !/backend/internal/api/douyin_test.go
 !/backend/internal/api/generic_named_test.go
 !/backend/internal/api/handler.go
@@ -390,6 +396,8 @@
 !/backend/internal/api/pipigx_http_test.go
 !/backend/internal/api/pipixia_http_test.go
 !/backend/internal/api/platform_traits.go
+!/backend/internal/api/runtime_config.go
+!/backend/internal/api/runtime_config_test.go
 !/backend/internal/api/stats.go
 !/backend/internal/api/stats_persistence.go
 !/backend/internal/api/stats_test.go
@@ -504,6 +512,7 @@
 !/backend/internal/ytengine/gate_ports.go
 !/backend/internal/ytengine/gate_ports_test.go
 !/backend/internal/ytengine/hls.go
+!/backend/internal/ytengine/p37_upgrade_test.go
 !/backend/internal/ytengine/proc_other.go
 !/backend/internal/ytengine/proc_unix.go
 !/backend/internal/ytengine/sizeprobe.go

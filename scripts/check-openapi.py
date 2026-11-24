@@ -1215,14 +1215,95 @@ def check_caddy_whitelist() -> int:
         "ops/examples/snap.caddy must preserve the Caddy route ordering comment",
     )
 
+    require(
+        "try_files {path} /index.html" not in caddy,
+        "ops/examples/snap.caddy must not use site-wide SPA soft-404 'try_files {path} /index.html'",
+    )
+    require(
+        'header Strict-Transport-Security "max-age=31536000"' in caddy,
+        "ops/examples/snap.caddy must declare Strict-Transport-Security header",
+    )
+    require(
+        'header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"' in caddy,
+        "ops/examples/snap.caddy must declare Permissions-Policy header",
+    )
+    require(
+        '@download_bridge path /downloads/bridge.html' in caddy
+        and '@default_csp not path /monitor /monitor.html /downloads/bridge.html' in caddy,
+        "ops/examples/snap.caddy must declare mutually exclusive @download_bridge and @default_csp matchers",
+    )
+    bridge_csp_match = re.search(r'header\s+@download_bridge\s+Content-Security-Policy\s+"([^"]+)"', caddy)
+    require(bridge_csp_match is not None, "ops/examples/snap.caddy must declare @download_bridge Content-Security-Policy")
+    bridge_csp_val = bridge_csp_match.group(1)
+    bridge_csp_dirs = [part.strip() for part in bridge_csp_val.split(";") if part.strip()]
+    for required_dir in (
+        "default-src 'none'",
+        "script-src 'self'",
+        "connect-src 'self'",
+        "worker-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'self'",
+    ):
+        require(
+            required_dir in bridge_csp_dirs,
+            f"ops/examples/snap.caddy @download_bridge CSP missing directive: {required_dir}",
+        )
+    require(
+        "unsafe-inline" not in bridge_csp_val and "unsafe-eval" not in bridge_csp_val,
+        "ops/examples/snap.caddy @download_bridge CSP must forbid unsafe-inline and unsafe-eval",
+    )
+    default_csp_match = re.search(r'header\s+@default_csp\s+Content-Security-Policy\s+"([^"]+)"', caddy)
+    require(default_csp_match is not None, "ops/examples/snap.caddy must declare @default_csp Content-Security-Policy")
+    default_csp_val = default_csp_match.group(1)
+    default_csp_dirs = [part.strip() for part in default_csp_val.split(";") if part.strip()]
+    for required_dir in (
+        "default-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' https: http: data: blob:",
+        "media-src 'self' https: http: blob:",
+        "connect-src 'self' https: http:",
+        "worker-src 'self'",
+        "frame-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ):
+        require(
+            required_dir in default_csp_dirs,
+            f"ops/examples/snap.caddy @default_csp CSP missing directive: {required_dir}",
+        )
+    require(
+        re.search(r"script-src 'self' 'sha256-[A-Za-z0-9+/=]+'", default_csp_val) is not None,
+        "ops/examples/snap.caddy @default_csp script-src must pin 'self' and theme bootstrap sha256 hash",
+    )
+    require(
+        "unsafe-eval" not in default_csp_val
+        and not any(d.startswith("script-src ") and "unsafe-inline" in d for d in default_csp_dirs),
+        "ops/examples/snap.caddy @default_csp script-src must forbid unsafe-inline and unsafe-eval",
+    )
+
     idx_weibo = caddy.find("handle /api/media/weibo {")
     idx_api = caddy.find("handle @api {")
     idx_catchall = caddy.find("handle /api/* {")
     idx_source = caddy.find("handle @source {")
-    idx_spa = caddy.find("try_files {path} /index.html")
+    idx_llms = caddy.find("handle /llms.txt {")
+    idx_share = caddy.find("handle /social/dokitool-share-v1.png {")
+    idx_monitor = caddy.find("handle @monitor {")
+    idx_static_handle = caddy.find("\n    handle {", idx_monitor)
+    idx_real_404 = caddy.find("respond 404", idx_static_handle) if idx_static_handle > 0 else -1
     require(
-        0 < idx_weibo < idx_api < idx_catchall < idx_source < idx_spa,
-        "ops/examples/snap.caddy handle blocks must order /api/media/weibo -> @api -> /api/* 404 -> @source -> SPA",
+        0 < idx_weibo < idx_api < idx_catchall < idx_source < idx_llms < idx_share < idx_monitor < idx_static_handle < idx_real_404,
+        "ops/examples/snap.caddy handle blocks must order /api/media/weibo -> @api -> /api/* 404 -> @source -> /llms.txt -> share -> @monitor -> static real-404",
+    )
+    static_block = caddy[idx_static_handle:]
+    require(
+        "precompressed br gzip" in static_block
+        and r"(?:\.(?:br|gz))?$" in static_block
+        and "@existing_static" in static_block
+        and "file {path} {path}/index.html" in static_block,
+        "ops/examples/snap.caddy static fallback must enable precompressed br gzip, extended @versioned regex, and real-file-only @existing_static + 404",
     )
 
     catchall_block = caddy[idx_catchall:idx_source]
@@ -1243,14 +1324,7 @@ def check_caddy_whitelist() -> int:
         monitor_matcher.group(1).split() == ["/monitor", "/monitor.html"],
         f"ops/examples/snap.caddy @monitor paths mismatch: got {monitor_matcher.group(1).split()}",
     )
-    idx_share = caddy.find("handle /social/dokitool-share-v1.png {")
-    idx_monitor = caddy.find("handle @monitor {")
-    idx_spa_handle = caddy.find("\n    handle {", idx_monitor)
-    require(
-        0 < idx_source < idx_share < idx_monitor < idx_spa_handle < idx_spa,
-        "ops/examples/snap.caddy must place handle @monitor after /social/dokitool-share-v1.png and before SPA fallback",
-    )
-    monitor_block = caddy[idx_monitor:idx_spa_handle]
+    monitor_block = caddy[idx_monitor:idx_static_handle]
     require(
         'header Content-Type "text/html; charset=utf-8"' in monitor_block
         and 'header Cache-Control "no-store"' in monitor_block
