@@ -1,0 +1,39 @@
+# /etc/systemd/system/dokitool-go.service.d/20-sandbox.conf
+# Owner: root:root, mode: 0644. Contains NO secrets or tokens.
+#
+# Redacted systemd service-level least-privilege hardening drop-in for
+# dokitool-go.service. Review paths against your host layout before enabling,
+# then apply with:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart dokitool-go.service
+#
+# Filesystem access model under ProtectSystem=strict:
+#   - Entire filesystem is mounted read-only except /dev, /proc, /sys, and
+#     explicitly allowlisted ReadWritePaths below.
+#   - /etc/dokitool (secrets/env, runtime.json, api-keys.json): read-only
+#   - /opt/dokitool (pinned yt-dlp zipapp, deno, read-only ytdlp-venv): read-only
+#   - /srv/dokitool (or /srv/dokitool-go releases & static dist): read-only
+#   - /var/lib/dokitool (optional service state dir): read-write via ReadWritePaths
+#   - Per-task yt-dlp isolation dirs live inside the private /tmp namespace
+#     provided by PrivateTmp=yes (and cleaned automatically on exit).
+
+[Service]
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Keep /etc/dokitool, /opt/dokitool, and /srv/dokitool strictly read-only.
+# Prefix with "-" if /var/lib/dokitool is not pre-created on your host, or
+# pre-create it owned by the unprivileged service user before restarting.
+ReadWritePaths=/var/lib/dokitool
+
+# Do NOT enable MemoryDenyWriteExecute=yes:
+# Go runtime, Deno V8 JIT (yt-dlp/ejs), and Python C extensions (e.g. curl_cffi
+# / libffi) require writable+executable memory mappings for JIT/trampolines.
+MemoryDenyWriteExecute=no

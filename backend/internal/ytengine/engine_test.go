@@ -356,8 +356,8 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 	ytEng.resolver = pubResolver
 	igEng.resolver = pubResolver
 
-	if cap(xEng.sem) != 2 || xEng.sem != ytEng.sem || ytEng.sem != igEng.sem {
-		t.Fatalf("expected all 3 platform engines to share a single capacity-2 semaphore")
+	if xEng.ConcurrencyLimit() != 2 || xEng.slotPool != ytEng.slotPool || ytEng.slotPool != igEng.slotPool {
+		t.Fatalf("expected all 3 platform engines to share a single capacity-2 slot pool")
 	}
 
 	var wg sync.WaitGroup
@@ -376,31 +376,31 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 	for time.Now().Before(deadline) {
 		_, err1 := os.Stat(filepath.Join(coordDir, "started_1"))
 		_, err2 := os.Stat(filepath.Join(coordDir, "started_2"))
-		if err1 == nil && err2 == nil && len(baseEng.sem) == 2 {
+		if err1 == nil && err2 == nil && baseEng.slotPool.Active() == 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(baseEng.sem) != 2 {
-		t.Fatalf("expected both semaphore slots to be occupied, got %d", len(baseEng.sem))
+	if baseEng.slotPool.Active() != 2 {
+		t.Fatalf("expected both slot pool slots to be occupied, got %d", baseEng.slotPool.Active())
 	}
 
 	// 3a. A 3rd concurrent request with a short deadline waits on the full 2-slot
-	// semaphore without spawning a 3rd yt-dlp subprocess, then exits on ctx.Done().
+	// pool without spawning a 3rd yt-dlp subprocess, then exits on ctx.Done().
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancelWait()
 	startWait := time.Now()
 	_, waitErr := igEng.Extract(waitCtx, "https://www.instagram.com/reel/C123456/")
 	waitElapsed := time.Since(startWait)
 	if waitElapsed < 60*time.Millisecond || waitElapsed > time.Second {
-		t.Fatalf("expected semaphore wait to respect 80ms ctx deadline, took %s", waitElapsed)
+		t.Fatalf("expected slot pool wait to respect 80ms ctx deadline, took %s", waitElapsed)
 	}
 	var engineErr *Error
 	if !errors.As(waitErr, &engineErr) || engineErr.Code != CodeUpstreamTimeout || !engineErr.Retryable {
-		t.Fatalf("expected UPSTREAM_TIMEOUT after semaphore wait deadline, got %#v (%v)", engineErr, waitErr)
+		t.Fatalf("expected UPSTREAM_TIMEOUT after slot pool wait deadline, got %#v (%v)", engineErr, waitErr)
 	}
 
-	// 3b. A queued 3rd concurrent request with a live context waits on e.sem without
+	// 3b. A queued 3rd concurrent request with a live context waits on e.slotPool without
 	// spawning a 3rd subprocess until one of the 2 active extractions finishes.
 	queuedDone := make(chan error, 1)
 	go func() {
@@ -430,8 +430,8 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 	if queuedErr := <-queuedDone; queuedErr != nil {
 		t.Fatalf("queued 3rd call failed after slot release: %v", queuedErr)
 	}
-	if len(baseEng.sem) != 0 {
-		t.Fatalf("expected semaphore to be empty after completion, got %d", len(baseEng.sem))
+	if baseEng.slotPool.Active() != 0 {
+		t.Fatalf("expected slot pool to be empty after completion, got %d", baseEng.slotPool.Active())
 	}
 	countBytes, err = os.ReadFile(countFile)
 	if err != nil {
@@ -445,8 +445,8 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 	if _, err := igEng.Extract(context.Background(), "https://www.instagram.com/reel/C123456/"); err != nil {
 		t.Fatalf("expected subsequent request after slot release to succeed, got %v", err)
 	}
-	if len(baseEng.sem) != 0 {
-		t.Fatalf("expected semaphore to be empty after subsequent call, got %d", len(baseEng.sem))
+	if baseEng.slotPool.Active() != 0 {
+		t.Fatalf("expected slot pool to be empty after subsequent call, got %d", baseEng.slotPool.Active())
 	}
 
 	// Verify relaxed concurrency bounds (1..MaxConcurrency=24) for 6C / 13G host.
@@ -456,8 +456,8 @@ echo '{"id":"ok","formats":[{"format_id":"18","url":"https://video.twimg.com/ext
 			AllowedHashes:  hashes,
 			MaxConcurrency: validN,
 		})
-		if okErr != nil || !okEng.Enabled() || cap(okEng.sem) != validN {
-			t.Fatalf("expected MaxConcurrency=%d to succeed, got enabled=%v cap=%d err=%v", validN, okEng != nil && okEng.Enabled(), cap(okEng.sem), okErr)
+		if okErr != nil || !okEng.Enabled() || okEng.ConcurrencyLimit() != validN {
+			t.Fatalf("expected MaxConcurrency=%d to succeed, got enabled=%v limit=%d err=%v", validN, okEng != nil && okEng.Enabled(), okEng.ConcurrencyLimit(), okErr)
 		}
 	}
 	if badEng, badErr := New(Config{
@@ -536,24 +536,24 @@ esac
 	if _, statErr := os.Stat(countFile); !os.IsNotExist(statErr) {
 		t.Fatalf("expected pre-canceled Extract not to spawn subprocess, statErr=%v", statErr)
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots after pre-canceled call, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots after pre-canceled call, got %d", eng.slotPool.Active())
 	}
 
 	// 2. Success releases slot once.
 	if _, err := eng.Extract(context.Background(), "https://x.com/i/status/1"); err != nil {
 		t.Fatalf("expected success path to pass, got %v", err)
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots after success, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots after success, got %d", eng.slotPool.Active())
 	}
 
 	// 3. Subprocess failure releases slot once.
 	if _, err := eng.Extract(context.Background(), "https://x.com/i/status/fail"); err == nil {
 		t.Fatal("expected failure path to return error")
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots after failure, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots after failure, got %d", eng.slotPool.Active())
 	}
 
 	// 4. In-flight context cancellation releases slot once.
@@ -571,24 +571,24 @@ esac
 	if _, err := eng.Extract(cancelCtx, "https://x.com/i/status/cancel"); err == nil {
 		t.Fatal("expected canceled in-flight path to return error")
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots after in-flight cancel, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots after in-flight cancel, got %d", eng.slotPool.Active())
 	}
 
 	// 5. Timeout releases slot once.
 	if _, err := eng.Extract(context.Background(), "https://x.com/i/status/timeout"); err == nil {
 		t.Fatal("expected timeout path to return error")
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots after timeout, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots after timeout, got %d", eng.slotPool.Active())
 	}
 
 	// 6. Subsequent normal request still acquires the single slot and succeeds.
 	if _, err := eng.Extract(context.Background(), "https://x.com/i/status/2"); err != nil {
 		t.Fatalf("expected subsequent request after all 4 paths to succeed, got %v", err)
 	}
-	if len(eng.sem) != 0 {
-		t.Fatalf("expected 0 occupied slots at end, got %d", len(eng.sem))
+	if eng.slotPool.Active() != 0 {
+		t.Fatalf("expected 0 occupied slots at end, got %d", eng.slotPool.Active())
 	}
 }
 
@@ -657,9 +657,11 @@ func TestOutboundSecurityGateAndDNSProtection(t *testing.T) {
 	defer upstreamSrv.Close()
 
 	srvURL, _ := url.Parse(upstreamSrv.URL)
-	eng.dialAddr = func(_ netip.Addr, _ string) string {
-		return srvURL.Host
-	}
+	eng = eng.withGateTestHooks(gateTestHooks{
+		dialAddr: func(_ netip.Addr, _ string) string {
+			return srvURL.Host
+		},
+	})
 
 	gateURL, closeGate, err := eng.startOutboundGate(context.Background())
 	if err != nil {
@@ -1055,9 +1057,9 @@ func TestPR36Review5785629879Counterexamples(t *testing.T) {
 		t.Fatalf("R2-A failed: expected NewHTTPSizeProber with external proxy to fail closed, got (%d, %v)", sz, ok)
 	}
 
-	// Counterexamples 2, 3, 4 (R2-B): Gate POST body preservation, HTTP->HTTPS redirect, and CONNECT cancellation cleanup
+	// Counterexamples 2, 3, 4 (R2-B): Gate POST body preservation, HTTP->HTTPS redirect (with real TLS RootCAs), and CONNECT cancellation cleanup
 	var gotPostBody string
-	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstreamHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/post":
 			b, _ := io.ReadAll(r.Body)
@@ -1074,22 +1076,32 @@ func TestPR36Review5785629879Counterexamples(t *testing.T) {
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
-	}))
+	})
+	upstreamSrv := httptest.NewServer(upstreamHandler)
 	defer upstreamSrv.Close()
+	upstreamTLS, upstreamCA := newTLSServerForHosts(t, upstreamHandler, "public.x.com")
+	defer upstreamTLS.Close()
 
 	srvURL, _ := url.Parse(upstreamSrv.URL)
+	tlsURL, _ := url.Parse(upstreamTLS.URL)
 	gateEng, err := New(Config{
 		BinaryPath:          binPath,
 		AllowedHashes:       hashes,
 		AllowedOutboundHost: func(h string) bool { return h == "x.com" || strings.HasSuffix(h, ".x.com") },
 		Resolver:            privateResolver,
-		DialAddr: func(_ netip.Addr, _ string) string {
-			return srvURL.Host
-		},
 	})
 	if err != nil {
 		t.Fatalf("New gateEng failed: %v", err)
 	}
+	gateEng = gateEng.withGateTestHooks(gateTestHooks{
+		dialAddr: func(_ netip.Addr, port string) string {
+			if port == "443" {
+				return tlsURL.Host
+			}
+			return srvURL.Host
+		},
+		rootCAs: upstreamCA,
+	})
 
 	gateCtx, gateCancel := context.WithCancel(context.Background())
 	defer gateCancel()
@@ -1157,10 +1169,11 @@ func TestPR36Review5785629879Counterexamples(t *testing.T) {
 		}
 	}()
 
-	connEng := *gateEng
-	connEng.dialAddr = func(_ netip.Addr, _ string) string {
-		return holdLn.Addr().String()
-	}
+	connEng := gateEng.withGateTestHooks(gateTestHooks{
+		dialAddr: func(_ netip.Addr, _ string) string {
+			return holdLn.Addr().String()
+		},
+	})
 	tunCtx, tunCancel := context.WithCancel(context.Background())
 	tunGateURL, closeTunGate, err := connEng.startOutboundGate(tunCtx)
 	if err != nil {
@@ -2360,28 +2373,25 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 	}
 
 	// Clamping & defaults.
-	if got := cap(baseEng.WithGenericConcurrency(0).sem); got != DefaultConcurrency {
-		t.Fatalf("WithGenericConcurrency(0) cap = %d, want %d", got, DefaultConcurrency)
+	if got := baseEng.WithGenericConcurrency(0).ConcurrencyLimit(); got != DefaultGenericSlots {
+		t.Fatalf("WithGenericConcurrency(0) limit = %d, want %d", got, DefaultGenericSlots)
 	}
-	if got := cap(baseEng.WithGenericConcurrency(-3).sem); got != DefaultConcurrency {
-		t.Fatalf("WithGenericConcurrency(-3) cap = %d, want %d", got, DefaultConcurrency)
+	if got := baseEng.WithGenericConcurrency(-3).ConcurrencyLimit(); got != DefaultGenericSlots {
+		t.Fatalf("WithGenericConcurrency(-3) limit = %d, want %d", got, DefaultGenericSlots)
 	}
-	if got := cap(baseEng.WithGenericConcurrency(1).sem); got != 1 {
-		t.Fatalf("WithGenericConcurrency(1) cap = %d, want 1", got)
+	if got := baseEng.WithGenericConcurrency(1).ConcurrencyLimit(); got != 1 {
+		t.Fatalf("WithGenericConcurrency(1) limit = %d, want 1", got)
 	}
-	if got := cap(baseEng.WithGenericConcurrency(999).sem); got != MaxConcurrency {
-		t.Fatalf("WithGenericConcurrency(999) cap = %d, want %d", got, MaxConcurrency)
+	if got := baseEng.WithGenericConcurrency(999).ConcurrencyLimit(); got != MaxConcurrency {
+		t.Fatalf("WithGenericConcurrency(999) limit = %d, want %d", got, MaxConcurrency)
 	}
 
 	genericEng := baseEng.WithGenericConcurrency(2)
-	if genericEng.sem == baseEng.sem {
-		t.Fatal("dynamic-port WithGenericConcurrency must allocate an independent semaphore")
-	}
-	if genericEng.subSem != nil {
-		t.Fatal("dynamic-port WithGenericConcurrency must not attach subSem")
+	if genericEng.slotPool == baseEng.slotPool {
+		t.Fatal("WithGenericConcurrency must allocate an independent DynamicSlotPool")
 	}
 	if genericEng.slotStats == baseEng.slotStats {
-		t.Fatal("dynamic-port WithGenericConcurrency must allocate fresh slotStats")
+		t.Fatal("WithGenericConcurrency must allocate fresh slotStats")
 	}
 
 	// Saturate all 2 generic slots.
@@ -2474,7 +2484,7 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 `, startedDir, releaseFile)
 
 	binPath, hashes := writeFakeYTDLP(t, script)
-	ports := testGatePorts(t, 3)
+	ports := testGatePorts(t, 1)
 	baseEng, err := New(Config{
 		BinaryPath:     binPath,
 		AllowedHashes:  hashes,
@@ -2485,28 +2495,33 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 	if err != nil || !baseEng.Enabled() {
 		t.Fatalf("New fixed-port baseEng failed: %v", err)
 	}
+	t.Cleanup(func() { _ = baseEng.Close() })
 
-	// Capping subSem to min(limit, cap(e.sem)).
-	capped := baseEng.WithGenericConcurrency(10)
-	if capped.sem != baseEng.sem || capped.gatePorts != baseEng.gatePorts {
-		t.Fatal("fixed-port WithGenericConcurrency must share sem and gatePorts")
+	// With multiplexed fixed gate ports, WithGenericConcurrency always gets an independent
+	// DynamicSlotPool (not capped by baseEng concurrency) while sharing the multiplexed gateway.
+	independent := baseEng.WithGenericConcurrency(10)
+	if independent.gatePorts != baseEng.gatePorts {
+		t.Fatal("fixed-port WithGenericConcurrency must share multiplexed gatePorts")
 	}
-	if capped.subSem == nil || cap(capped.subSem) != 3 {
-		t.Fatalf("expected subSem cap = min(10, 3) = 3, got %v", capped.subSem)
+	if independent.slotPool == baseEng.slotPool {
+		t.Fatal("fixed-port WithGenericConcurrency must use an independent DynamicSlotPool")
+	}
+	if independent.ConcurrencyLimit() != 10 {
+		t.Fatalf("expected independent generic limit = 10, got %d", independent.ConcurrencyLimit())
 	}
 
-	// Limit generic to 1 while baseEng has 3 fixed ports, and verify chaining preserves subSem.
+	// Limit generic to 1 while baseEng has 3 slots sharing 1 fixed port, and verify chaining preserves isolation.
 	genericEng := baseEng.
 		WithGenericConcurrency(1).
 		WithExtractors("default", "-generic")
-	if genericEng.sem != baseEng.sem || genericEng.gatePorts != baseEng.gatePorts {
-		t.Fatal("chained fixed-port generic engine must share sem and gatePorts")
+	if genericEng.gatePorts != baseEng.gatePorts || genericEng.slotPool == baseEng.slotPool {
+		t.Fatal("chained fixed-port generic engine must share gatePorts with independent slotPool")
 	}
-	if genericEng.subSem == nil || cap(genericEng.subSem) != 1 {
-		t.Fatalf("expected chained subSem cap = 1, got %v", genericEng.subSem)
+	if genericEng.ConcurrencyLimit() != 1 {
+		t.Fatalf("expected chained generic limit = 1, got %d", genericEng.ConcurrencyLimit())
 	}
 
-	// Occupy the single generic subSem slot (and 1 of 3 shared sem slots).
+	// Occupy the single generic slot; Tier-1 baseEng still keeps ALL 3 of its slots free.
 	doneCh := make(chan error, 1)
 	go func() {
 		_, exErr := genericEng.Extract(context.Background(), "https://vimeo.com/slow/g1")
@@ -2525,19 +2540,19 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 		time.Sleep(15 * time.Millisecond)
 	}
 
-	// A 2nd generic request must block on subSem and time out even though 2 shared sem slots are free.
+	// A 2nd generic request must block on genericEng's independent slotPool and time out.
 	g2Ctx, g2Cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
 	defer g2Cancel()
 	_, g2Err := genericEng.Extract(g2Ctx, "https://vimeo.com/fast/g2")
 	var g2EErr *Error
 	if !errors.As(g2Err, &g2EErr) || g2EErr.Code != CodeUpstreamTimeout {
-		t.Fatalf("expected 2nd generic call to block on subSem and time out, got %v", g2Err)
+		t.Fatalf("expected 2nd generic call to block on generic pool and time out, got %v", g2Err)
 	}
 
-	// Meanwhile Tier-1 baseEng can still run 2 concurrent extractions using the remaining 2 shared slots.
+	// Meanwhile Tier-1 baseEng can run ALL 3 concurrent extractions without generic consuming any Tier-1 slot.
 	var tier1WG sync.WaitGroup
-	tier1Errs := make(chan error, 2)
-	for i := 0; i < 2; i++ {
+	tier1Errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
 		tier1WG.Add(1)
 		go func(idx int) {
 			defer tier1WG.Done()
@@ -2549,19 +2564,19 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 	close(tier1Errs)
 	for tErr := range tier1Errs {
 		if tErr != nil {
-			t.Fatalf("Tier-1 Extract failed while generic subSem saturated: %v", tErr)
+			t.Fatalf("Tier-1 Extract failed while generic pool saturated: %v", tErr)
 		}
 	}
 
-	// Release first generic call and verify subSem is freed cleanly.
+	// Release first generic call and verify slots are freed cleanly.
 	if err := os.WriteFile(releaseFile, []byte("go"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if exErr := <-doneCh; exErr != nil {
 		t.Fatalf("first generic Extract failed after release: %v", exErr)
 	}
-	if len(genericEng.subSem) != 0 || len(baseEng.sem) != 0 {
-		t.Fatalf("expected all slots released, got subSem=%d sem=%d", len(genericEng.subSem), len(baseEng.sem))
+	if genericEng.slotPool.Active() != 0 || baseEng.slotPool.Active() != 0 {
+		t.Fatalf("expected all slots released, got generic=%d base=%d", genericEng.slotPool.Active(), baseEng.slotPool.Active())
 	}
 }
 
@@ -2625,12 +2640,13 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 				Timeout:        5 * time.Second,
 			}
 			if tc.fixedGatePorts {
-				cfg.GatePorts = testGatePorts(t, tc.baseConc)
+				cfg.GatePorts = testGatePorts(t, 1)
 			}
 			baseEng, err := New(cfg)
 			if err != nil || !baseEng.Enabled() {
 				t.Fatalf("New baseEng failed: %v", err)
 			}
+			t.Cleanup(func() { _ = baseEng.Close() })
 
 			genericEng := baseEng.
 				WithGenericConcurrency(tc.genericLimit).
@@ -2731,14 +2747,10 @@ echo '{"id":"ok","title":"ok","formats":[{"format_id":"1","url":"https://cdn.exa
 			if finalBase.ConcurrencyLimit != tc.baseConc || finalBase.Active != 0 || finalBase.Waiting != 0 {
 				t.Fatalf("final base gauges mismatch: %+v", finalBase)
 			}
-			// In fixed-port mode, baseEng shares sem so baseEng saw g1 + g-wait + Tier-1 (3 uncontended acquires, 0 waits/cancels).
-			// In dynamic-port mode, baseEng only saw Tier-1 (1 acquire, 0 waits/cancels).
-			wantBaseAcquired := uint64(1)
-			if tc.fixedGatePorts {
-				wantBaseAcquired = 3
-			}
-			if finalBase.Total.AcquiredCount != wantBaseAcquired || finalBase.Total.WaitCount != 0 || finalBase.Total.CanceledCount != 0 {
-				t.Fatalf("final base totals = %+v, want acquired=%d wait=0 canceled=0", finalBase.Total, wantBaseAcquired)
+			// In both dynamic and fixed-port modes, genericEng has an independent DynamicSlotPool,
+			// so baseEng only saw Tier-1 (1 acquire, 0 waits/cancels).
+			if finalBase.Total.AcquiredCount != 1 || finalBase.Total.WaitCount != 0 || finalBase.Total.CanceledCount != 0 {
+				t.Fatalf("final base totals = %+v, want acquired=1 wait=0 canceled=0", finalBase.Total)
 			}
 		})
 	}

@@ -57,12 +57,13 @@ var OfficialSHA256Sums = map[string]string{
 // Config configures a verified yt-dlp metadata extraction engine.
 type Config struct {
 	BinaryPath          string
+	PythonPath          string
 	AllowedHashes       map[string]string
 	AllowedURL          func(string) bool
 	AllowedOutboundHost func(string) bool
 	Resolver            Resolver
+	SlotPool            *DynamicSlotPool
 	SharedSemaphore     chan struct{}
-	DialAddr            func(netip.Addr, string) string
 	MaxConcurrency      int
 	Timeout             time.Duration
 	SocketTimeoutSec    int
@@ -84,9 +85,9 @@ type Engine struct {
 	allowedURL          func(string) bool
 	allowedOutboundHost func(string) bool
 	resolver            Resolver
-	dialAddr            func(netip.Addr, string) string
+	testHooks           *gateTestHooks
+	slotPool            *DynamicSlotPool
 	sem                 chan struct{}
-	subSem              chan struct{}
 	timeout             time.Duration
 	socketTimeoutSec    int
 	maxStdoutBytes      int64
@@ -94,7 +95,6 @@ type Engine struct {
 	envPath             string
 	gatePorts           *gatePortPool
 	slotStats           *slotStats
-	subSlotStats        *slotStats
 	extractors          []string
 }
 
@@ -227,6 +227,47 @@ func isSafeExecutableFile(stat os.FileInfo) bool {
 		}
 	}
 	return true
+}
+
+func validatePythonPath(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, r := range trimmed {
+		if r < 0x20 || r == 0x7f {
+			return "", errors.New("DOKITOOL_YTDLP_PYTHON contains invalid characters")
+		}
+	}
+	if !filepath.IsAbs(trimmed) {
+		return "", errors.New("DOKITOOL_YTDLP_PYTHON must be an absolute path")
+	}
+	cleaned := filepath.Clean(trimmed)
+	stat, err := os.Stat(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("DOKITOOL_YTDLP_PYTHON is not accessible: %w", err)
+	}
+	if !isSafeExecutableFile(stat) {
+		return "", errors.New("DOKITOOL_YTDLP_PYTHON must be a regular executable file that is not world-writable")
+	}
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("resolve DOKITOOL_YTDLP_PYTHON symlink: %w", err)
+	}
+	if !filepath.IsAbs(resolved) {
+		return "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be an absolute path")
+	}
+	resolvedStat, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat DOKITOOL_YTDLP_PYTHON symlink target: %w", err)
+	}
+	if !isSafeExecutableFile(resolvedStat) {
+		return "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be a regular executable file that is not world-writable")
+	}
+	// Preserve cleaned path (rather than resolved symlink target) so Python
+	// virtualenv launchers (e.g. /opt/dokitool/ytdlp-venv/bin/python3) locate
+	// their adjacent pyvenv.cfg and site-packages.
+	return cleaned, nil
 }
 
 func lookupPython3InPath(envPath string) string {
@@ -433,33 +474,53 @@ func New(cfg Config) (*Engine, error) {
 			return NewDisabled(err.Error()), err
 		}
 	}
-	sem := cfg.SharedSemaphore
-	if sem == nil {
-		sem = make(chan struct{}, concurrency)
+	explicitPythonPath, err := validatePythonPath(cfg.PythonPath)
+	if err != nil {
+		return NewDisabled(err.Error()), err
 	}
-	gatePorts, err := newGatePortPool(cfg.GatePorts, cap(sem))
+	var (
+		slotPool *DynamicSlotPool
+		sem      chan struct{}
+	)
+	if cfg.SlotPool != nil {
+		slotPool = cfg.SlotPool
+	} else if cfg.SharedSemaphore != nil {
+		sem = cfg.SharedSemaphore
+	} else {
+		slotPool = NewDynamicSlotPool(concurrency)
+	}
+	gatePorts, err := newGatePortPool(cfg.GatePorts)
 	if err != nil {
 		return NewDisabled(err.Error()), err
 	}
 	var pythonPath string
 	if detectPythonZipapp(absPath) {
-		pythonPath = lookupPython3InPath(envPath)
-		if pythonPath != "" {
+		if explicitPythonPath != "" {
+			pythonPath = explicitPythonPath
 			if err := verifyStartupVersion(pythonPath, absPath, envPath); err != nil {
-				log.Printf("dokitool: yt-dlp python3 zipapp self-check failed (%v); attempting direct binary execution fallback", err)
-				pythonPath = ""
+				reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed with DOKITOOL_YTDLP_PYTHON: %v", err)
+				log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
+				return NewDisabled(reason), errors.New(reason)
+			}
+		} else {
+			pythonPath = lookupPython3InPath(envPath)
+			if pythonPath != "" {
+				if err := verifyStartupVersion(pythonPath, absPath, envPath); err != nil {
+					log.Printf("dokitool: yt-dlp python3 zipapp self-check failed (%v); attempting direct binary execution fallback", err)
+					pythonPath = ""
+					if directErr := verifyStartupVersion("", absPath, envPath); directErr != nil {
+						reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed (python3: %v; direct: %v)", err, directErr)
+						log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
+						return NewDisabled(reason), errors.New(reason)
+					}
+					log.Printf("dokitool: yt-dlp zipapp direct binary execution fallback succeeded (version %s)", PinnedVersion)
+				}
+			} else {
 				if directErr := verifyStartupVersion("", absPath, envPath); directErr != nil {
-					reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed (python3: %v; direct: %v)", err, directErr)
+					reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed without python3 in PATH: %v", directErr)
 					log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
 					return NewDisabled(reason), errors.New(reason)
 				}
-				log.Printf("dokitool: yt-dlp zipapp direct binary execution fallback succeeded (version %s)", PinnedVersion)
-			}
-		} else {
-			if directErr := verifyStartupVersion("", absPath, envPath); directErr != nil {
-				reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed without python3 in PATH: %v", directErr)
-				log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
-				return NewDisabled(reason), errors.New(reason)
 			}
 		}
 	}
@@ -474,7 +535,7 @@ func New(cfg Config) (*Engine, error) {
 		allowedURL:          cfg.AllowedURL,
 		allowedOutboundHost: cfg.AllowedOutboundHost,
 		resolver:            cfg.Resolver,
-		dialAddr:            cfg.DialAddr,
+		slotPool:            slotPool,
 		sem:                 sem,
 		timeout:             timeout,
 		socketTimeoutSec:    socketTimeout,
@@ -505,41 +566,83 @@ func normalizeExtractors(raw []string) []string {
 	return out
 }
 
+// WithSlotPool returns a shallow copy of the Engine bound to pool with a fresh
+// slotStats block while sharing the persistent multiplexed outbound gateway.
+func (e *Engine) WithSlotPool(pool *DynamicSlotPool) *Engine {
+	if e == nil {
+		return NewDisabled("yt-dlp engine is nil")
+	}
+	if pool == nil {
+		pool = NewDynamicSlotPool(DefaultConcurrency)
+	}
+	cp := *e
+	cp.slotPool = pool
+	cp.sem = nil
+	cp.slotStats = newSlotStats()
+	return &cp
+}
+
+// WithCompartment returns a shallow copy of the Engine backed by a new independent
+// DynamicSlotPool sized to limit (clamped 1..MaxConcurrency, defaulting to
+// DefaultConcurrency when <= 0) while sharing the multiplexed outbound gateway.
+func (e *Engine) WithCompartment(limit int) *Engine {
+	if e == nil {
+		return NewDisabled("yt-dlp engine is nil")
+	}
+	return e.WithSlotPool(NewDynamicSlotPool(limit))
+}
+
 // WithGenericConcurrency returns a shallow copy of the Engine configured for
-// isolated Tier-2 generic concurrency (limit clamped to 1..MaxConcurrency,
-// defaulting to DefaultConcurrency when <= 0).
-//
-// When gatePorts is nil (dynamic loopback ports), the copy gets an independent
-// semaphore and fresh slotStats so generic traffic never contends with Tier-1.
-// When gatePorts is non-nil (fixed DOKITOOL_YTDLP_GATE_PORTS), the copy retains
-// the shared semaphore and port pool so total listeners never exceed configured
-// fixed ports, and attaches a dedicated subSem with fresh subSlotStats capped
-// at min(limit, cap(e.sem)).
+// isolated Tier-2 generic concurrency (clamped 1..MaxConcurrency, defaulting to
+// DefaultGenericSlots when <= 0) with an independent DynamicSlotPool and fresh
+// slotStats, sharing the multiplexed outbound gateway even when fixed
+// DOKITOOL_YTDLP_GATE_PORTS is configured.
 func (e *Engine) WithGenericConcurrency(limit int) *Engine {
 	if e == nil {
 		return NewDisabled("yt-dlp engine is nil")
 	}
 	if limit <= 0 {
-		limit = DefaultConcurrency
+		limit = DefaultGenericSlots
 	}
 	if limit > MaxConcurrency {
 		limit = MaxConcurrency
 	}
-	cp := *e
-	if e.gatePorts == nil {
-		cp.sem = make(chan struct{}, limit)
-		cp.subSem = nil
-		cp.slotStats = newSlotStats()
-		cp.subSlotStats = nil
-		return &cp
+	return e.WithSlotPool(NewDynamicSlotPool(limit))
+}
+
+// SetConcurrencyLimit resizes this engine's DynamicSlotPool in-place without
+// dropping active leases or losing queued waiters.
+func (e *Engine) SetConcurrencyLimit(limit int) error {
+	if e == nil || !e.enabled {
+		return errors.New("yt-dlp engine is disabled")
 	}
-	subLimit := limit
-	if e.sem != nil && cap(e.sem) > 0 && subLimit > cap(e.sem) {
-		subLimit = cap(e.sem)
+	if e.slotPool == nil {
+		return errors.New("yt-dlp engine does not use a dynamic slot pool")
 	}
-	cp.subSem = make(chan struct{}, subLimit)
-	cp.subSlotStats = newSlotStats()
-	return &cp
+	return e.slotPool.SetLimit(limit)
+}
+
+// ConcurrencyLimit returns the engine's current concurrency limit.
+func (e *Engine) ConcurrencyLimit() int {
+	if e == nil {
+		return 0
+	}
+	if e.slotPool != nil {
+		return e.slotPool.Limit()
+	}
+	if e.sem != nil {
+		return cap(e.sem)
+	}
+	return 0
+}
+
+// Close cleanly shuts down any persistent multiplexed outbound gateway listeners
+// owned by this engine. It is idempotent and nil-safe.
+func (e *Engine) Close() error {
+	if e == nil || e.gatePorts == nil {
+		return nil
+	}
+	return e.gatePorts.Close()
 }
 
 // WithExtractors returns a shallow copy of the Engine pinned to the given yt-dlp
@@ -608,6 +711,7 @@ func NewFromEnv(getenv func(string) string, allowedURL func(string) bool) (*Engi
 	return New(Config{
 		GatePorts:      gatePorts,
 		BinaryPath:     getenv("DOKITOOL_YTDLP_BINARY"),
+		PythonPath:     getenv("DOKITOOL_YTDLP_PYTHON"),
 		AllowedHashes:  OfficialSHA256Sums,
 		AllowedURL:     allowedURL,
 		Resolver:       net.DefaultResolver,
@@ -647,6 +751,15 @@ func (e *Engine) BinaryAsset() string {
 // via python3 as a zero-unpack zipapp rather than a PyInstaller self-extracting binary.
 func (e *Engine) UsingPythonZipapp() bool {
 	return e != nil && e.pythonPath != ""
+}
+
+// PythonPath returns the active python interpreter path used to execute a verified
+// yt-dlp zipapp, or the empty string when running a native binary directly.
+func (e *Engine) PythonPath() string {
+	if e == nil {
+		return ""
+	}
+	return e.pythonPath
 }
 
 // CommandArgs returns the hardened CLI argument slice for a single URL extraction.

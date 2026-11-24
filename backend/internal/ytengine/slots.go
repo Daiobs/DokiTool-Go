@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,11 +17,225 @@ import (
 const (
 	// DefaultConcurrency is the default shared yt-dlp subprocess limit.
 	DefaultConcurrency = 2
-	// MaxConcurrency caps DOKITOOL_YTDLP_CONCURRENCY on a 6C / 13G host.
-	MaxConcurrency        = 24
+	// MaxConcurrency caps per-compartment yt-dlp concurrency on a 6C / 13G host.
+	MaxConcurrency = 24
+	// MaxTotalActiveSlots bounds total active yt-dlp slots across compartments.
+	MaxTotalActiveSlots = 32
+
+	DefaultYouTubeSlots = 4
+	MinYouTubeSlots     = 1
+	MaxYouTubeSlots     = 16
+
+	DefaultSocialSlots = 4
+	MinSocialSlots     = 1
+	MaxSocialSlots     = 16
+
+	DefaultGenericSlots = 2
+	MinGenericSlots     = 1
+	MaxGenericSlots     = 12
+
 	defaultMaxConcurrency = DefaultConcurrency
 	maxAllowedConcurrency = MaxConcurrency
 )
+
+type slotWaiter struct {
+	granted chan struct{}
+	done    bool
+}
+
+// DynamicSlotPool is a dynamically resizable FIFO semaphore for yt-dlp subprocess
+// compartments. Increasing the limit wakes queued waiters immediately in FIFO order;
+// decreasing the limit lets in-flight leases drain naturally without killing tasks.
+type DynamicSlotPool struct {
+	mu      sync.Mutex
+	limit   int
+	active  int
+	waiters []*slotWaiter
+}
+
+// NewDynamicSlotPool constructs a DynamicSlotPool clamped to 1..MaxConcurrency,
+// defaulting to DefaultConcurrency when limit <= 0.
+func NewDynamicSlotPool(limit int) *DynamicSlotPool {
+	if limit <= 0 {
+		limit = DefaultConcurrency
+	}
+	if limit > MaxConcurrency {
+		limit = MaxConcurrency
+	}
+	return &DynamicSlotPool{limit: limit}
+}
+
+// Limit returns the current concurrency cap of the pool.
+func (p *DynamicSlotPool) Limit() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	limit := p.limit
+	p.mu.Unlock()
+	return limit
+}
+
+// Active returns the number of currently held slot leases.
+func (p *DynamicSlotPool) Active() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	active := p.active
+	p.mu.Unlock()
+	return active
+}
+
+// Waiting returns the number of goroutines currently queued for a slot.
+func (p *DynamicSlotPool) Waiting() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	waiting := len(p.waiters)
+	p.mu.Unlock()
+	return waiting
+}
+
+func (p *DynamicSlotPool) snapshot() (active, waiting, limit int) {
+	if p == nil {
+		return 0, 0, 0
+	}
+	p.mu.Lock()
+	active = p.active
+	waiting = len(p.waiters)
+	limit = p.limit
+	p.mu.Unlock()
+	return active, waiting, limit
+}
+
+// SetLimit resizes the pool limit in-place without dropping active leases or queued
+// waiters. Rejects values outside 1..MaxConcurrency.
+func (p *DynamicSlotPool) SetLimit(limit int) error {
+	if p == nil {
+		return errors.New("yt-dlp slot pool is nil")
+	}
+	if limit < 1 || limit > MaxConcurrency {
+		return fmt.Errorf("yt-dlp concurrency limit %d must be between 1 and %d", limit, MaxConcurrency)
+	}
+	p.mu.Lock()
+	p.limit = limit
+	p.wakeWaitersLocked()
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *DynamicSlotPool) wakeWaitersLocked() {
+	for p.active < p.limit && len(p.waiters) > 0 {
+		w := p.waiters[0]
+		p.waiters[0] = nil
+		p.waiters = p.waiters[1:]
+		if w.done {
+			continue
+		}
+		w.done = true
+		p.active++
+		close(w.granted)
+	}
+	if len(p.waiters) == 0 {
+		p.waiters = nil
+	}
+}
+
+func (p *DynamicSlotPool) removeWaiterLocked(target *slotWaiter) {
+	for i, w := range p.waiters {
+		if w == target {
+			copy(p.waiters[i:], p.waiters[i+1:])
+			p.waiters[len(p.waiters)-1] = nil
+			p.waiters = p.waiters[:len(p.waiters)-1]
+			if len(p.waiters) == 0 {
+				p.waiters = nil
+			}
+			return
+		}
+	}
+}
+
+func (p *DynamicSlotPool) release() {
+	p.mu.Lock()
+	if p.active > 0 {
+		p.active--
+	}
+	p.wakeWaitersLocked()
+	p.mu.Unlock()
+}
+
+func (p *DynamicSlotPool) makeRelease() func() {
+	var once sync.Once
+	return func() {
+		once.Do(p.release)
+	}
+}
+
+func (p *DynamicSlotPool) acquire(ctx context.Context, stats *slotStats, chIdx int) (func(), *Error) {
+	if err := ctx.Err(); err != nil {
+		return nil, classifyContextErr(err)
+	}
+
+	p.mu.Lock()
+	if len(p.waiters) == 0 && p.active < p.limit {
+		p.active++
+		p.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			p.release()
+			return nil, classifyContextErr(err)
+		}
+		if stats != nil {
+			stats.recordUncontendedAcquire(chIdx)
+		}
+		return p.makeRelease(), nil
+	}
+
+	waiter := &slotWaiter{granted: make(chan struct{})}
+	p.waiters = append(p.waiters, waiter)
+	waitStart := time.Now()
+	if stats != nil {
+		stats.incWaiting(chIdx)
+	}
+	p.mu.Unlock()
+
+	select {
+	case <-waiter.granted:
+		waitDur := time.Since(waitStart)
+		if stats != nil {
+			stats.decWaiting(chIdx)
+		}
+		if err := ctx.Err(); err != nil {
+			p.release()
+			if stats != nil {
+				stats.recordContendedWait(chIdx, waitDur, true)
+			}
+			return nil, classifyContextErr(err)
+		}
+		if stats != nil {
+			stats.recordContendedWait(chIdx, waitDur, false)
+		}
+		return p.makeRelease(), nil
+	case <-ctx.Done():
+		waitDur := time.Since(waitStart)
+		p.mu.Lock()
+		wasGranted := waiter.done
+		if !wasGranted {
+			waiter.done = true
+			p.removeWaiterLocked(waiter)
+		}
+		p.mu.Unlock()
+		if wasGranted {
+			p.release()
+		}
+		if stats != nil {
+			stats.decWaiting(chIdx)
+			stats.recordContendedWait(chIdx, waitDur, true)
+		}
+		return nil, classifyContextErr(ctx.Err())
+	}
+}
 
 // Extract invokes yt-dlp -J in an isolated temporary directory and parses the subset Info.
 func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
@@ -39,19 +254,19 @@ func (e *Engine) Extract(ctx context.Context, rawURL string) (*Info, error) {
 	}
 
 	chIdx := channelIndex(ChannelFromContext(ctx))
-	if e.subSem != nil {
-		releaseSub, subErr := acquireSlot(ctx, e.subSem, e.subSlotStats, chIdx)
-		if subErr != nil {
-			return nil, subErr
+	if e.slotPool != nil {
+		release, slotErr := e.slotPool.acquire(ctx, e.slotStats, chIdx)
+		if slotErr != nil {
+			return nil, slotErr
 		}
-		defer releaseSub()
+		defer release()
+	} else if e.sem != nil {
+		release, slotErr := acquireSlot(ctx, e.sem, e.slotStats, chIdx)
+		if slotErr != nil {
+			return nil, slotErr
+		}
+		defer release()
 	}
-
-	release, slotErr := acquireSlot(ctx, e.sem, e.slotStats, chIdx)
-	if slotErr != nil {
-		return nil, slotErr
-	}
-	defer release()
 
 	callCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
