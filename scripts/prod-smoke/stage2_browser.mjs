@@ -814,11 +814,14 @@ export class OriginHttpClient {
         connectReq.destroy(new Error("Proxy CONNECT timed out"));
       });
       connectReq.on("error", fail);
-      connectReq.on("connect", (proxyRes, socket) => {
+      connectReq.on("connect", (proxyRes, socket, head) => {
         if (proxyRes.statusCode !== 200) {
           socket.destroy();
           fail(new Error(`Proxy CONNECT rejected with HTTP ${proxyRes.statusCode}`));
           return;
+        }
+        if (head && head.length > 0) {
+          socket.unshift(head);
         }
         const tlsSocket = tls.connect({
           socket,
@@ -987,6 +990,11 @@ export function parseZipBuffer(zipBuffer) {
     const extAttrs = buf.readUInt32LE(cursor + 38);
     const localOffset = buf.readUInt32LE(cursor + 42);
 
+    const entryEnd = cursor + 46 + nameLen + extraLen + commentLen;
+    if (entryEnd > cdOffset + cdSize) {
+      throw new Stage2Error("truncated ZIP central directory entry");
+    }
+
     const unixMode = (extAttrs >>> 16) & 0o170000;
     if (unixMode === 0o120000) {
       throw new Stage2Error("symlink entries are forbidden in extension ZIP");
@@ -1043,7 +1051,7 @@ export function parseZipBuffer(zipBuffer) {
     }
 
     entries.set(entryName, data);
-    cursor += 46 + nameLen + extraLen + commentLen;
+    cursor = entryEnd;
   }
 
   return {
@@ -1459,6 +1467,23 @@ function listResidualPidsByRunTag(runTag) {
   }
 }
 
+function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([
+    promise.then(
+      () => {},
+      () => {},
+    ),
+    timeoutPromise,
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 export class ChromeProcessPool {
   constructor(chromeBin, proxyConfig) {
     this.chromeBin = chromeBin;
@@ -1466,16 +1491,55 @@ export class ChromeProcessPool {
     this.runTag = `dokitool-stage2-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
     this.tmpRoot = null;
     this.instances = [];
+    this.closing = false;
     this.cleanedUp = false;
+    this._initPromise = null;
+    this._cleanupPromise = null;
+    this._inflightLaunches = new Set();
   }
 
   async init() {
-    this.tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), `${this.runTag}-`));
-    return this.tmpRoot;
+    if (this.closing) {
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
+    if (this.tmpRoot) return this.tmpRoot;
+    this._initPromise ??= (async () => {
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), `${this.runTag}-`));
+      if (this.closing) {
+        await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+        throw new Stage2Error("ChromeProcessPool is shutting down");
+      }
+      this.tmpRoot = root;
+      return root;
+    })();
+    return this._initPromise;
   }
 
-  async launch({ name, extensionDir = null, expectedExtensionId = DOKITOOL_EXTENSION_ID, downloadDir = null }) {
+  async launch(opts) {
+    if (this.closing) {
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
+    const launchPromise = this.#doLaunch(opts);
+    const settled = launchPromise.then(
+      () => {},
+      () => {},
+    );
+    this._inflightLaunches.add(settled);
+    try {
+      return await launchPromise;
+    } finally {
+      this._inflightLaunches.delete(settled);
+    }
+  }
+
+  async #doLaunch({ name, extensionDir = null, expectedExtensionId = DOKITOOL_EXTENSION_ID, downloadDir = null }) {
+    if (this.closing) {
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
     if (!this.tmpRoot) await this.init();
+    if (this.closing) {
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
     const profileDir = path.join(this.tmpRoot, `profile-${name}`);
     await fsp.mkdir(path.join(profileDir, "Default"), { recursive: true });
 
@@ -1537,6 +1601,13 @@ export class ChromeProcessPool {
 
     args.push("about:blank");
 
+    if (this.closing) {
+      if (this.tmpRoot) {
+        await fsp.rm(this.tmpRoot, { recursive: true, force: true }).catch(() => {});
+      }
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
+
     const stderrChunks = [];
     let stderrBytes = 0;
     const child = spawn(this.chromeBin, args, {
@@ -1558,10 +1629,20 @@ export class ChromeProcessPool {
       browser: null,
       exited: false,
     };
+    let spawnError = null;
+    child.once("error", (err) => {
+      spawnError = err;
+      instance.exited = true;
+    });
     child.once("exit", () => {
       instance.exited = true;
     });
     this.instances.push(instance);
+
+    if (this.closing) {
+      await this.#terminateInstance(instance);
+      throw new Stage2Error("ChromeProcessPool is shutting down");
+    }
 
     const listeners = new Set();
     const onEvent = (packet) => {
@@ -1577,6 +1658,14 @@ export class ChromeProcessPool {
     try {
       const browser = await until(
         async () => {
+          if (this.closing) {
+            throw new Stage2Error("ChromeProcessPool is shutting down");
+          }
+          if (spawnError) {
+            throw new Stage2Error(
+              `Chrome (${name}) failed to spawn: ${sanitizeText(spawnError.message)}`,
+            );
+          }
           if (instance.exited) {
             const tail = Buffer.concat(stderrChunks).toString("utf8").slice(-400);
             throw new Stage2Error(
@@ -1589,6 +1678,9 @@ export class ChromeProcessPool {
         15_000,
       );
       instance.browser = browser;
+      if (this.closing) {
+        throw new Stage2Error("ChromeProcessPool is shutting down");
+      }
 
       const versionInfo = await browser.send("Browser.getVersion");
       if (downloadDir) {
@@ -1623,6 +1715,10 @@ export class ChromeProcessPool {
         }
       }
 
+      if (this.closing) {
+        throw new Stage2Error("ChromeProcessPool is shutting down");
+      }
+
       return {
         name,
         browser,
@@ -1643,10 +1739,7 @@ export class ChromeProcessPool {
   async #terminateInstance(instance) {
     try {
       if (instance.browser) {
-        await Promise.race([
-          instance.browser.send("Browser.close").catch(() => {}),
-          delay(1200),
-        ]);
+        await settleWithin(instance.browser.send("Browser.close"), 1200);
         try {
           instance.browser.close();
         } catch {
@@ -1674,10 +1767,28 @@ export class ChromeProcessPool {
     }
   }
 
-  async cleanupAll() {
-    if (this.cleanedUp) return { residualChrome: 0 };
-    this.cleanedUp = true;
+  cleanupAll() {
+    this.closing = true;
+    return (this._cleanupPromise ??= this.#doCleanupAll());
+  }
 
+  async #doCleanupAll() {
+    await Promise.all(
+      this.instances.map((inst) => this.#terminateInstance(inst)),
+    );
+
+    if (this._initPromise) {
+      await this._initPromise.catch(() => {});
+    }
+
+    if (this._inflightLaunches.size > 0) {
+      await settleWithin(
+        Promise.allSettled([...this._inflightLaunches]),
+        3000,
+      );
+    }
+
+    // Re-terminate defensively in case an in-flight launch pushed an instance before settling.
     await Promise.all(
       this.instances.map((inst) => this.#terminateInstance(inst)),
     );
@@ -1705,6 +1816,7 @@ export class ChromeProcessPool {
       await fsp.rm(this.tmpRoot, { recursive: true, force: true }).catch(() => {});
     }
 
+    this.cleanedUp = true;
     return { residualChrome: residualPids.length };
   }
 }
@@ -3115,9 +3227,9 @@ async function _executeTracks({
   pool,
   options,
 }) {
-  const onSignal = async () => {
+  const onSignal = async (signal) => {
     await pool.cleanupAll();
-    process.exit(130);
+    process.exit(signal === "SIGTERM" ? 143 : 130);
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
@@ -3192,12 +3304,22 @@ async function _executeTracks({
         return { checks: extChecks, browserVersion: "" };
       }
 
+      if (pool.closing) {
+        throw new Stage2Error("ChromeProcessPool is shutting down");
+      }
       const extDir = path.join(pool.tmpRoot, "ext-unpacked");
       await extractZipEntriesToDir(archiveInfo.entries, extDir);
+      if (pool.closing) {
+        if (pool.tmpRoot) {
+          await fsp.rm(pool.tmpRoot, { recursive: true, force: true }).catch(() => {});
+        }
+        throw new Stage2Error("ChromeProcessPool is shutting down");
+      }
 
       // Run optional atomic sync & Extension Chrome concurrently!
       const syncPromise = options.syncLocalExtension
         ? (async () => {
+            if (pool.closing) return null;
             const syncStart = Date.now();
             try {
               const res = await syncExtensionAtomic(
@@ -3235,20 +3357,37 @@ async function _executeTracks({
         parsePacingMs,
       });
 
-      const [syncCheck, chromeRes] = await Promise.all([
+      const [syncSettled, chromeSettled] = await Promise.allSettled([
         syncPromise,
         chromePromise,
       ]);
+      if (syncSettled.status === "rejected") {
+        throw syncSettled.reason;
+      }
+      if (chromeSettled.status === "rejected") {
+        throw chromeSettled.reason;
+      }
+      const syncCheck = syncSettled.value;
+      const chromeRes = chromeSettled.value;
       if (syncCheck) extChecks.push(syncCheck);
       extChecks.push(...chromeRes.checks);
       return { checks: extChecks, browserVersion: chromeRes.browserVersion };
     })();
 
-    const [httpRes, pureWebRes, extRes] = await Promise.all([
+    const [httpSettled, pureWebSettled, extSettled] = await Promise.allSettled([
       httpTrack,
       pureWebTrack,
       extTrack,
     ]);
+    const firstRejected = [httpSettled, pureWebSettled, extSettled].find(
+      (res) => res.status === "rejected",
+    );
+    if (firstRejected) {
+      throw firstRejected.reason;
+    }
+    const httpRes = httpSettled.value;
+    const pureWebRes = pureWebSettled.value;
+    const extRes = extSettled.value;
 
     // Cross-verify SW workerBuild against HTTP /downloads/worker.js BUILD when both ran.
     if (httpRes.workerBuild) {

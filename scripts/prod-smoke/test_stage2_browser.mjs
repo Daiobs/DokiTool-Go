@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 
 import {
+  ChromeProcessPool,
   DOKITOOL_EXTENSION_ID,
   EXPECTED_BRIDGE_CAPABILITIES,
   MANDATORY_HEADLESS_FLAGS,
@@ -567,7 +568,7 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
       /monitor bundle/,
     );
 
-    // Rejects corrupt CRC and zip-slip entry paths.
+    // Rejects corrupt CRC, zip-slip entry paths, and truncated CD variable fields.
     const badCrcZip = buildTestZip([
       { name: "manifest.json", data: "{}", crcOverride: 0xdeadbeef },
     ]);
@@ -575,6 +576,102 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
 
     const zipSlip = buildTestZip([{ name: "../escape.txt", data: "bad" }]);
     assert.throws(() => parseZipBuffer(zipSlip), /unsafe ZIP entry/);
+
+    const truncatedCdZip = Buffer.from(
+      buildTestZip([{ name: "manifest.json", data: "{}" }]),
+    );
+    const eocdPos = truncatedCdZip.length - 22;
+    const cdStart = truncatedCdZip.readUInt32LE(eocdPos + 16);
+    assert.equal(truncatedCdZip.readUInt32LE(cdStart), 0x02014b50);
+    // Inflate extraLen beyond central directory bounds while keeping fixed 46B header valid.
+    truncatedCdZip.writeUInt16LE(512, cdStart + 30);
+    assert.throws(
+      () => parseZipBuffer(truncatedCdZip),
+      /truncated ZIP central directory entry/,
+    );
+  });
+
+  test("ChromeProcessPool shutdown latch blocks late launch and deduplicates cleanupAll", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "stage2-pool-latch-"));
+    try {
+      const markerFile = path.join(tmpRoot, "spawned.marker");
+      let sentinelBin = path.join(tmpRoot, "nonexistent-chrome-bin");
+      if (process.platform !== "win32") {
+        sentinelBin = path.join(tmpRoot, "fake-chrome.sh");
+        await fsp.writeFile(
+          sentinelBin,
+          `#!/bin/sh\necho spawned > "${markerFile}"\nexit 0\n`,
+          { mode: 0o755 },
+        );
+      }
+
+      // 1. After cleanupAll(), concurrent calls share the same promise and launch() fails closed without spawning.
+      const pool1 = new ChromeProcessPool(sentinelBin, {
+        mode: "direct",
+        proxy: null,
+        forceNoProxy: true,
+      });
+      const pool1Tmp = await pool1.init();
+      assert.equal(fs.existsSync(pool1Tmp), true);
+
+      const cleanP1 = pool1.cleanupAll();
+      const cleanP2 = pool1.cleanupAll();
+      assert.strictEqual(cleanP1, cleanP2);
+      const cleanRes1 = await cleanP1;
+      assert.equal(cleanRes1.residualChrome, 0);
+      assert.equal(pool1.closing, true);
+      assert.equal(pool1.cleanedUp, true);
+      assert.equal(fs.existsSync(pool1Tmp), false);
+
+      await assert.rejects(
+        () => pool1.launch({ name: "late-worker" }),
+        (err) => err instanceof Stage2Error && /shutting down/.test(err.message),
+      );
+      assert.equal(pool1.instances.length, 0);
+      assert.equal(fs.existsSync(markerFile), false);
+      assert.equal(fs.existsSync(pool1Tmp), false);
+
+      // 2. Mid-flight launch() racing with cleanupAll() before init() aborts without spawning or leaking tmpRoot.
+      const pool2 = new ChromeProcessPool(sentinelBin, {
+        mode: "direct",
+        proxy: null,
+        forceNoProxy: true,
+      });
+      const launchP2 = pool2.launch({ name: "raced-before-init" });
+      const cleanP3 = pool2.cleanupAll();
+      await assert.rejects(
+        launchP2,
+        (err) => err instanceof Stage2Error && /shutting down/.test(err.message),
+      );
+      const cleanRes2 = await cleanP3;
+      assert.equal(cleanRes2.residualChrome, 0);
+      assert.equal(pool2.instances.length, 0);
+      assert.equal(fs.existsSync(markerFile), false);
+      if (pool2.tmpRoot) {
+        assert.equal(fs.existsSync(pool2.tmpRoot), false);
+      }
+
+      // 3. Mid-flight launch() racing with cleanupAll() after init() aborts before spawn() and removes tmpRoot.
+      const pool3 = new ChromeProcessPool(sentinelBin, {
+        mode: "direct",
+        proxy: null,
+        forceNoProxy: true,
+      });
+      const pool3Tmp = await pool3.init();
+      const launchP3 = pool3.launch({ name: "raced-after-init" });
+      const cleanP4 = pool3.cleanupAll();
+      await assert.rejects(
+        launchP3,
+        (err) => err instanceof Stage2Error && /shutting down/.test(err.message),
+      );
+      const cleanRes3 = await cleanP4;
+      assert.equal(cleanRes3.residualChrome, 0);
+      assert.equal(pool3.instances.length, 0);
+      assert.equal(fs.existsSync(markerFile), false);
+      assert.equal(fs.existsSync(pool3Tmp), false);
+    } finally {
+      await fsp.rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   test("--sync-local-extension refuses Git-tracked paths and atomically syncs untracked dirs", async () => {
