@@ -350,7 +350,9 @@
 !/scripts/prod-smoke/README.md
 !/scripts/prod-smoke/samples.json
 !/scripts/prod-smoke/smoke.py
+!/scripts/prod-smoke/stage2_browser.mjs
 !/scripts/prod-smoke/test_smoke.py
+!/scripts/prod-smoke/test_stage2_browser.mjs
 /scripts/tests/*
 !/scripts/tests/test_bump_runtime_pins.py
 !/scripts/tests/test_classify_ci_changes.py

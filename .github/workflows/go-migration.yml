@@ -64,12 +64,18 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/dokitool-validation"
           "$RUNNER_TEMP/dokitool-validation/bin/python" -m pip install -r scripts/requirements-validation.txt
 
+      - name: Set up Node for offline script unit tests
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+
       - name: Verify reviewed source inventory
         run: python3 -B scripts/check-public-files.py --staged
 
       - name: Verify Python scripts, smoke tests, OpenAPI contract, and locked pins
         run: |
           python3 -B -X utf8 scripts/prod-smoke/test_smoke.py
+          DOKITOOL_STAGE2_SKIP_BROWSER=1 node --test scripts/prod-smoke/test_stage2_browser.mjs
           python3 -B -X utf8 -m unittest discover -s scripts/tests -v
           python3 -B scripts/check-upstream-updates.py --check-local-pins
           python3 -B scripts/go-migration/test-public-projection.py
@@ -284,6 +290,11 @@ jobs:
           for pid in "${DOWNLOAD_CHROME_PID:-}" "${DOWNLOAD_FIXTURE_PID:-}"; do
             if test -n "$pid"; then kill "$pid" 2>/dev/null || true; fi
           done
+
+      - name: Verify Stage-2 browser smoke tool (offline unit + loopback headless Chrome)
+        env:
+          DOKITOOL_STAGE2_REQUIRE_BROWSER: '1'
+        run: node --test scripts/prod-smoke/test_stage2_browser.mjs
 
   xhs-dependency-review:
     needs: changes
