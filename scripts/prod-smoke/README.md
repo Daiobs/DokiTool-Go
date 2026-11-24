@@ -60,3 +60,75 @@ python3 -B scripts/prod-smoke/test_smoke.py
 ```
 
 退出码约定：所有实际执行的检查项无 `FAIL`（`FAIL == 0`）时退出码为 `0`；任一检查项 `FAIL` 或参数错误时退出码为 `1`。
+
+---
+
+## `stage2_browser.mjs` — 阶段二无头静默浏览器验收工具
+
+面向发布阶段二（Section D）的零第三方依赖无头 Chrome 验收工具（仅依赖 Node 22/24 标准库并复用 `scripts/download-browser-session.mjs`），用于自动化验证真实浏览器水合、Service Worker 桥接、`/monitor` 响应式布局及**零修改官方 Chrome 扩展（免油猴）**握手与解析链路。
+
+### 核心约束与安全特性
+
+1. **强制无头静默与零残留**：所有 Chrome 实例均以独立临时 `--user-data-dir` 与 `--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic` 后台启动，严禁弹窗或抢占桌面焦点；退出（含 `finally` 与 `SIGINT`/`SIGTERM`）强制回收子进程树与临时目录，并校验 `RESIDUAL_CHROME=0`。
+2. **自动环境探测（零本机硬编码）**：按 `--chrome-bin` → `DOKITOOL_CHROME_BIN` → Playwright 缓存最新 `Google Chrome for Testing` → 系统 Chrome/Chromium 依次探测；网络代理按 `--proxy` → `HTTPS_PROXY` / `HTTP_PROXY`（遵守 `NO_PROXY` 且回环地址始终直连）自动适配，拒绝 URL 或代理 URL 携带凭据。
+3. **只读默认与受控同步**：默认只读不修改 Git 跟踪文件、不执行 GitHub 写操作；可选 `--sync-local-extension <dir>` 仅在扩展 ZIP 验签通过且目标目录未被 Git 跟踪（如 gitignored 的 `frontend/dist-extension`）时原子解压同步。
+4. **并行提速与三级风险分档**（详见 [`docs/RELEASE-RECEIPT.md` §3](../../docs/RELEASE-RECEIPT.md)）：
+   - **`lite`（默认，约 10–15s）**：并行运行 ① 官方扩展 ZIP 安全边界验签 + 可选 HTTP 安全头/预压缩 `br`/`/llms.txt`/真 `404`/`/api/stats` 匿名 `401` 核验；② 纯网页无头 Chrome（`/` 水合 + 主题启动 + `/downloads/` 模块 SW 注册与 `/downloads/bridge.html` iframe `MessageChannel` `ping` + `/monitor` 桌面/`390×844` 零横向溢出 + `0` CSP/报错）；③ 零修改官方扩展无头 Chrome（`WEB_EXT_PING`、无「有新版」提示、零油猴全局、`0` CSP/报错）。
+   - **`full`**：在 `lite` 基础上复用已验签的扩展 Chrome 实例追加线上 B 站 + 间隔 `>= 8.5s` 后的 YouTube 零油猴真实解析抽测；可选 `--with-mux-save` 进一步校验 Mediabunny 双轨落盘容器头与非 36 位 UUID 文件名。
+5. **Fail-Closed 脱敏与一键出回执**：写入 `--json-out` / `--md-out` 或 stdout 前强制扫描完整 URL、IPv4/IPv6、`xsec_token`/`owner_token`/`Bearer`、`ticket=`/`sign=`/`sig=`、查询串、`/api/media/` 路径及 `/Users/`、`/home/`、`C:\Users\` 本机路径，命中即报错退出非零。
+
+### 参数表
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--base-url <url>` | `https://snap.dokitool.com` | 目标站点源（仅允许 `https://`，回环地址允许 `http://`，禁止凭据/路径/查询串） |
+| `--profile <lite\|full>` | `lite` | 验收档位（`lite` 并行轻量冒烟；`full` 追加 B 站 + YouTube 零油猴真实解析） |
+| `--manifest <path>` | 无 | `release-manifest.json` 路径，用于核对扩展 ZIP 大小与 SHA-256 及关键静态文件摘要 |
+| `--skip-http-checks` | 关闭 | 跳过阶段一已核验的 HTTP 响应头/预压缩/404 子项（仍保留扩展 ZIP 下载与验签） |
+| `--with-mux-save` | 关闭 | 仅限 `--profile full`，触发 Mediabunny 双轨落盘并验证容器头与非 36 位 UUID 文件名 |
+| `--sync-local-extension <dir>` | 无 | 验签通过后原子同步解压官方扩展至指定未跟踪目录（拒绝 Git 已跟踪路径） |
+| `--samples <path>` | `scripts/prod-smoke/samples.json` | `--profile full` 默认样本清单路径 |
+| `--bilibili-url <url>` / `--youtube-url <url>` | 取自 `samples.json` | 临时覆盖 `--profile full` 的 B 站 / YouTube 公开样本 URL |
+| `--chrome-bin <path>` | 自动探测 | 显式指定 Chrome / Chromium 可执行文件路径（优先级高于 `DOKITOOL_CHROME_BIN`） |
+| `--proxy <url>` | 读取环境代理 | 显式指定无凭据 HTTP(S) 代理（回环地址始终直连） |
+| `--expected-ext-version <ver>` | 无 | 严格校验扩展 `manifest.json` 版本号 |
+| `--expected-ext-files <int>` | 无 | 严格校验扩展 ZIP 内文件数 |
+| `--timeout <seconds>` | `30` | 单步 HTTP / 浏览器等待超时秒数 |
+| `--json-out <path>` | 无 | 输出 Fail-Closed 脱敏 JSON 报告（UTF-8） |
+| `--md-out <path>` | 无 | 输出可直接 `gh issue comment` 的阶段二脱敏 Markdown 回执（UTF-8） |
+| `--format <both\|md\|json\|none>` | `both` | 标准输出格式 |
+
+### 常用命令
+
+```bash
+# 1. 标准 lite 验收并生成可直接张贴的阶段二 Markdown 回执
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile lite \
+  --manifest /path/to/release-manifest.json \
+  --md-out stage2-receipt.md \
+  --json-out stage2-report.json
+
+# 2. 配合阶段一已通过场景，跳过重复 HTTP 响应头子项
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile lite \
+  --skip-http-checks \
+  --manifest /path/to/release-manifest.json \
+  --md-out stage2-receipt.md
+
+# 3. 高风险改动（下载/合流/扩展/解析交互）执行 full 档 + Mediabunny 双轨落盘校验
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile full \
+  --with-mux-save \
+  --manifest /path/to/release-manifest.json \
+  --sync-local-extension frontend/dist-extension \
+  --md-out stage2-receipt.md
+
+# 4. 运行离线单元测试（纯逻辑模式与含本地 loopback 无头 Chrome E2E 模式）
+DOKITOOL_STAGE2_SKIP_BROWSER=1 node --test scripts/prod-smoke/test_stage2_browser.mjs
+DOKITOOL_STAGE2_REQUIRE_BROWSER=1 node --test scripts/prod-smoke/test_stage2_browser.mjs
+```
+
+退出码约定：`report.passed == true`（`FAIL == 0` 且 `RESIDUAL_CHROME == 0` 且脱敏扫描 `0` 敏感项）时返回 `0`，否则返回 `1`。

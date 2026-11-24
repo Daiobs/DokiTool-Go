@@ -60,6 +60,8 @@ class ClassifyPathsTests(unittest.TestCase):
             ["scripts/test-download-browser.mjs"],
             ["scripts/download-browser-session.mjs"],
             ["scripts/test-download-claim.mjs"],
+            ["scripts/prod-smoke/stage2_browser.mjs"],
+            ["scripts/prod-smoke/test_stage2_browser.mjs"],
             ["scripts/browser-helper.js"],
         ]
         for paths in cases:

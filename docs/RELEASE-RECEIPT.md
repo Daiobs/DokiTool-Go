@@ -41,18 +41,20 @@
 | B4 | 停启回退与恢复抽查（按发布单要求执行或 `SKIP`） | `PASS` / `SKIP` | 停机回退无 `500`，恢复后返回 `*.douyinvod.com` |
 | B5 | 切换 5 分钟后内存观察（`VmRSS` 与 `free -m`） | `PASS` / `SKIP` | `VmRSS=<n> MiB`，`free -m available=<n> MiB` |
 
-#### D. Mac 无头浏览器复测（未涉及时标 `SKIP`，涉及时按 §3 填写）
-- **执行环境**: `macOS <ver> | Chrome <ver> (--headless=new --no-first-run --no-default-browser-check) | Tampermonkey <ver> (userscript diff: 0)`
-- **网络与下载采集**: `国内平台直连 / 海外平台代理分流（不含 IP） | CDP Browser.setDownloadBehavior | https://snap.dokitool.com/?debug=1`
+#### D. Mac 阶段二无头静默浏览器复测（按 §3 风险分档执行：`skip` / `lite` / `full`）
+- **风险分档**: `skip`（纯后端/配置/脚本且前端与 Caddy 0 diff） / `lite`（默认，约 10–15s） / `full`（含 B 站 + YouTube 零油猴实测，可选 `--with-mux-save`）
+- **执行环境**: `macOS <ver> (<arch>) | Chrome <ver> (--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic) | Official Extension v<ver> (id=ihamkldlkdibleacagiejklpfofapkpo, diff: 0, zero Tampermonkey)`
+- **工具与收口**: `node scripts/prod-smoke/stage2_browser.mjs --profile <lite|full> ... | RESIDUAL_CHROME=0 | 脱敏扫描: 0 敏感项`
 
-| 编号 | 复测场景（参见 `docs/RELEASE-RECEIPT.md` §3.2） | 结论 | 媒体域名（仅域名） | 耗时 / 速率 / 落盘校验摘要 |
-| --- | --- | --- | --- | --- |
-| D1 | 抖音 4K 多线路择优 + 20s 测速 + 取消下载 | `PASS` / `SKIP` | `*.douyinvod.com` | 选中 HTTPS 国内源，20s 均速 `<x> MiB/s`，取消立即中断 |
-| D2 | 小红书原画 `403` 自动跳过 + 非原画全量 `https://` | `PASS` / `SKIP` | `*.xhscdn.com`, `*.rednotecdn.com` | 原画 `403` 自动回退，`0` 个 `http://` 链接 |
-| D3 | 快手 & 皮皮虾线路探测与浏览器直连下载 | `PASS` / `SKIP` | `*.kwimgs.com`, `*.ppxvod.com` | 直连落盘成功，`ftyp` MP4 头有效 |
-| D4 | 9 图图集打包 ZIP 耗时与图像解码校验 | `PASS` / `SKIP` | `<cdn-host>` | ZIP 含 `9/9` 图，全部解码通过，耗时 `<x>s` |
-| D5 | X 720p 音轨完整性 + 4 图图集 ZIP | `PASS` / `SKIP` | `video.twimg.com`, `pbs.twimg.com` | 720p 含音视频双轨，4 图 ZIP 解码通过 |
-| D6 | YouTube 1080p 助手合并 + B 站多 P ZIP + 抖音实况图 | `PASS` / `SKIP` | `*.googlevideo.com`, `*.bilivideo.com`, `*.douyinvod.com` | 1080p 合并有声、多 P ZIP 与实况配对正常 |
+<!-- `skip` 时下表填一行 SKIP 并写明前端/Caddy 0 diff 依据；`lite` / `full` 直接粘贴 stage2_browser.mjs --md-out 输出 -->
+| 检查项 (`id`) | 分组 (`group`) | 结论 (`status`) | 耗时 (ms) | 媒体域名 (`media_hostnames`) | 关键核对摘要 (`note`) |
+| --- | --- | --- | ---: | --- | --- |
+| `artifact_extension_zip` | `artifact_verify` | `PASS` / `SKIP` | 0 | - | 大小、SHA-256、文件数、`manifest.json` 边界校验 |
+| `web_home_hydration` | `pure_web_chrome` | `PASS` / `SKIP` | 0 | - | `/` 首屏水合、主题启动、`0` CSP/控制台/页面报错 |
+| `web_sw_bridge` | `pure_web_chrome` | `PASS` / `SKIP` | 0 | - | `{ scope: '/downloads/', type: 'module' }` SW 与 `/downloads/bridge.html` iframe `ping` |
+| `web_monitor_responsive` | `pure_web_chrome` | `PASS` / `SKIP` | 0 | - | `/monitor` 桌面 + `390×844` 零横向溢出、`0` CSP/报错 |
+| `ext_bridge_handshake` | `official_extension_chrome` | `PASS` / `SKIP` | 0 | - | 零修改官方扩展 `WEB_EXT_PING`、无「有新版」、无油猴全局、`0` CSP/报错 |
+| `full_parse_bilibili` / `full_parse_youtube` | `full_live_parse` | `PASS` / `SKIP` | 0 | `*.bilivideo.com`, `*.googlevideo.com` | 仅 `full` 档运行（间隔 `>= 8.5s`）；可选 `full_mux_save` 核验双轨落盘 |
 
 ### 1.3 新增/变更配置 Drop-in（密钥已脱敏）与 SHA-256
 - Drop-in SHA-256 清单：
@@ -233,29 +235,77 @@ sudo sha256sum "/proc/${PID}/exe"
 
 ---
 
-## 3. Mac 无头浏览器复测清单（Section D）
+## 3. Mac 阶段二无头静默浏览器复测规范（Section D：Chrome + 零修改官方扩展，免油猴）
 
-当发布改动涉及前端交互、浏览器直连选路、打包下载或油猴脚本协议时，在 macOS 环境针对 **Chrome + Tampermonkey** 执行端到端复测。
+阶段二统一使用仓内零第三方依赖工具 [`scripts/prod-smoke/stage2_browser.mjs`](../scripts/prod-smoke/stage2_browser.mjs)，针对 **Chrome + 零修改官方 MV3 扩展（`dokitool-chrome-extension.zip`，固定 ID `ihamkldlkdibleacagiejklpfofapkpo`，零油猴脚本）** 执行隔离无头实测，并在输出前执行 Fail-Closed 脱敏扫描与零残留进程校验。
 
-### 3.1 强制运行与环境记录规范
+### 3.1 阶段一与阶段二职责边界（消除重复核验）
 
-1. **强制无头静默运行**：所有本地或自动化浏览器验证一律携带 `--headless=new --no-first-run --no-default-browser-check`（Playwright / Puppeteer 保持 `headless: true`），严禁弹出前台浏览器窗口或抢占焦点；脚本结束（含 `finally` 分支）必须彻底销毁无头浏览器子进程与临时目录。
-2. **下载与调试入口**：
-   - 通过 CDP `Browser.setDownloadBehavior` 将下载落盘定向到独立临时目录，核对文件字节数、容器魔数（如 MP4 `ftyp`、ZIP `PK\x03\x04`）及图像可解码性。
-   - 页面入口统一使用 `https://snap.dokitool.com/?debug=1` 采集选路与探测信息；若本地验证对油猴脚本临时追加了 `@match` 规则，必须在回执元信息中写明与正式 `dokitool-youtube.user.js` 的 diff（生产域名验证保持 `0 diff`）。
-3. **头部必填元信息**（脱敏）：
-   - 执行者标识、UTC 起止时间、macOS 版本与 Chrome 版本号；
-   - 启动参数确认（`--headless=new --no-first-run --no-default-browser-check`）；
-   - 国内平台直连 / 海外平台代理分流模式说明（**禁止填写任何真实出口 IP**）；
-   - CDP 下载目录策略与目标入口 `https://snap.dokitool.com/?debug=1`。
+| 阶段 | 标准工具 | 负责范围（唯一验收源） | 避免重复约定 |
+| --- | --- | --- | --- |
+| **阶段一（A4 / A5）** | `scripts/prod-smoke/smoke.py` + `scripts/check-download-headers.py` | 服务端进程/热重载、全量 `frontend_dist_files` 静态字节 SHA-256、14 核心平台 API 解析与缓存/快路径/直连标记、`/api/stats` 匿名 `401` 与未白名单 `404`、下载桥接 13 项条件请求与 `X-Frame-Options` 安全头 | 不启动浏览器；负责全部纯 HTTP 静态哈希与后端接口回归 |
+| **阶段二（Section D）** | `scripts/prod-smoke/stage2_browser.mjs` | **浏览器专属实测**：① 官方扩展 ZIP 安全边界验签（`manifest.json` 版本、`externally_connectable` 仅含线上主站、零 `content_scripts`/`cookies`/`<all_urls>`）；② 纯网页无头 Chrome 真实水合、主题防闪烁、`/downloads/` 模块 Service Worker 注册与 `/downloads/bridge.html` iframe `MessageChannel` `ping` 握手、`/monitor` 桌面 + `390×844` 移动端零横向溢出与 `0` CSP/控制台/页面报错；③ 零修改官方扩展无头 Chrome `WEB_EXT_PING`、无「有新版」误报与零油猴全局；④ `full` 档追加线上 B 站 + YouTube 零油猴真实解析与可选 Mediabunny 双轨落盘 | 阶段一已完整通过 `smoke.py` + `check-download-headers.py` 时，阶段二可追加 `--skip-http-checks` 跳过重复的纯 HTTP 响应头子项（仍强制下载并验签官方扩展 ZIP） |
 
-### 3.2 标准复测项（D1–D6）
+### 3.2 强制运行与安全红线
 
-| 编号 | 复测项 | 通过判定标准 |
+1. **强制无头静默与零残留**：工具固定携带 `--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic`，使用独立临时 `--user-data-dir`，严禁弹出前台窗口或抢占焦点；`finally` 与信号处理分支强制销毁全部拉起的 Chrome 进程树与临时目录，并在退出前核验 `RESIDUAL_CHROME=0`。
+2. **零本机硬编码与凭据禁令**：自动按 `DOKITOOL_CHROME_BIN` → Playwright 缓存最新 `Google Chrome for Testing` → 系统 Chrome/Chromium 探测浏览器，按 `--proxy` / `HTTPS_PROXY` / `HTTP_PROXY`（遵守 `NO_PROXY` 且回环直连）自动适配网络；拒绝 `--base-url` 或代理 URL 携带任何凭据；默认只读不修改 Git 跟踪文件、不执行 GitHub 写操作。
+3. **可选本地扩展原子同步**：仅当传入 `--sync-local-extension <dir>`、线上 ZIP 验签通过且目标路径**未被 Git 跟踪**（如 gitignored 的 `frontend/dist-extension`）时才原子解压同步。
+4. **Fail-Closed 输出脱敏**：写入 `--json-out` / `--md-out` 或打印 stdout 前自动拦截任何完整 `http(s)://`/`ws(s)://` URL、IPv4/IPv6、`xsec_token`/`owner_token`/`Bearer`、`ticket=`/`sign=`/`sig=`、查询串、`/api/media/` 路径及 `/Users/`、`/home/`、`C:\Users\` 等本机路径，命中即非零退出。
+
+### 3.3 三级风险分档（`skip` / `lite` / `full`）
+
+| 风险分档 | 触发条件 | 执行动作与预期耗时 |
 | --- | --- | --- |
-| **D1** | 抖音 4K 多线路择优 + 20 秒测速 + 取消下载 | 自动选中可用 `https://*.douyinvod.com` 线路，记录前 20s 实际下载均速；点击取消后请求立即中止且无损坏成品残留 |
-| **D2** | 小红书原画 `403` 自动跳过 + 非原画全量 `https://` | 当原画入口探测返回 `403`/不可用时自动跳过并交付可用规格；全部图片与视频源 `100%` 为 `https://`（`0` 个 `http://`） |
-| **D3** | 快手 & 皮皮虾线路探测与直连下载 | `browser_fetch: "allowed"` 生效，前端直连 CDN 下载完整落盘，MP4 文件头校验通过 |
-| **D4** | 9 图图集打包 ZIP 耗时与图像解码 | 9 图并发拉取生成 `.zip` 成功，ZIP 内含完整 9 个文件且逐张解码宽高 `> 0`，记录总耗时 |
-| **D5** | X 720p 音轨检查 + 4 图图集 ZIP | X 720p `video.twimg.com` MP4 同时含视频轨与音频轨（非无声视频轨）；4 图推文打包 `.zip` 全部图片解码通过 |
-| **D6** | YouTube 1080p 助手合并 + B 站多 P ZIP + 抖音实况图 | 油猴脚本完成 YouTube 1080p 音视频合并落盘（含音视频轨）；B 站多 P 选集打包 ZIP 成功；抖音 Live Photo 图+视频配对下载正常 |
+| **`skip`** | 纯后端 Go / 运行时配置 / `yt-dlp` 升级 / 运维脚本发布，且 `frontend-dist.tar.gz`、`dokitool-chrome-extension.zip` 与 `snap.caddy` 与当前线上版本 **`0 diff`（字节级一致）** | **免跑浏览器**；在发布单评论核对阶段一回执、记录前端与 Caddy `0 diff` 证据即可收口关单 |
+| **`lite`**（默认） | 日常前端页面/样式、`/monitor`、Caddy 安全头/CSP/预压缩或下载 SW 改动（未改动下载合流内核、扩展通信协议或核心解析交互） | 并行执行：① 扩展 ZIP 与安全头/预压缩/真 `404` 核验（已过阶段一时可加 `--skip-http-checks`）；② 纯网页无头 Chrome（`/` 水合 + SW iframe `ping` + `/monitor` 桌面/`390×844` 零溢出）；③ 零修改官方扩展无头 Chrome（`WEB_EXT_PING` + 无「有新版」 + 零油猴 + `0` 报错）。总耗时约 **10–15s** |
+| **`full`** | 改动下载调度、Mediabunny 合流、Chrome 扩展源码/协议、YouTube 免油猴链路或前端解析结果交互 | 在 `lite` 全部检查基础上追加真实解析抽测（国内 B 站 + 强制间隔 `>= 8.5s` 后的海外 YouTube 零油猴链路），校验扩展连接徽标、主下载按钮与 `0` CSP/报错；改动合流或文件名逻辑时追加 `--with-mux-save` 实测 Mediabunny 双轨落盘与非 36 位 UUID 文件名 |
+
+### 3.4 标准执行命令
+
+```bash
+# 1. 日常 lite 档（推荐默认，配合本次发版 release-manifest.json，约 10–15s）
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile lite \
+  --manifest "<WORK_DIR>/release-manifest.json" \
+  --md-out "<WORK_DIR>/stage2-receipt.md" \
+  --json-out "<WORK_DIR>/stage2-report.json"
+
+# 2. 阶段一已完整通过 smoke.py + check-download-headers.py 时，跳过重复 HTTP 项
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile lite \
+  --skip-http-checks \
+  --manifest "<WORK_DIR>/release-manifest.json" \
+  --md-out "<WORK_DIR>/stage2-receipt.md"
+
+# 3. 高风险 full 档（下载/合流/扩展/解析交互改动必跑；涉及合流落盘时追加 --with-mux-save）
+node scripts/prod-smoke/stage2_browser.mjs \
+  --base-url https://snap.dokitool.com \
+  --profile full \
+  --with-mux-save \
+  --manifest "<WORK_DIR>/release-manifest.json" \
+  --sync-local-extension frontend/dist-extension \
+  --md-out "<WORK_DIR>/stage2-receipt.md" \
+  --json-out "<WORK_DIR>/stage2-report.json"
+```
+
+### 3.5 最小阶段二回执模板（由 `--md-out` 自动生成，可直接 `gh issue comment`）
+
+````markdown
+## 发布回执（阶段二：无头静默浏览器复测） — `<RELEASE_TAG>` (`<SHORT_SHA>`)
+
+- **目标站点**: `snap.dokitool.com` | **风险档位**: `<lite|full>` (`--skip-http-checks=<false|true>`) | **生成时间 (UTC)**: `YYYY-MM-DDTHH:MM:SSZ` | **总耗时**: `<X.XX>s`
+- **执行环境**: `darwin/arm64 | HeadlessChrome/<ver> (--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic) | Official Extension v<ver> (id=ihamkldlkdibleacagiejklpfofapkpo, diff: 0, zero Tampermonkey)`
+- **网络与资源清理**: `proxy=<direct|env-proxy|cli-proxy> (no-credentials) | RESIDUAL_CHROME=0 | 脱敏扫描: 0 敏感项`
+- **汇总**: `PASS=<n>, FAIL=0, SKIP=<k>`
+
+| 检查项 (`id`) | 分组 (`group`) | 结论 (`status`) | 耗时 (ms) | 媒体域名 (`media_hostnames`) | 关键核对摘要 (`note`) |
+| --- | --- | --- | ---: | --- | --- |
+| `artifact_extension_zip` | `artifact_verify` | **PASS** | 320 | - | `size=<N>B, sha256[:12]=<hex>, files=13, v4.2.0, id=ihamkldlkdibleacagiejklpfofapkpo, manifestMatch=true, zeroContentScripts=true, zeroCookies=true` |
+| `web_home_hydration` | `pure_web_chrome` | **PASS** | 450 | - | `hydrated=true, themeBootstrap=true, colorScheme=light, csp=0, consoleErr=0, pageErr=0` |
+| `web_sw_bridge` | `pure_web_chrome` | **PASS** | 120 | - | `scope=/downloads/, bridgeControlled=true, workerBuild=<BUILD>, admission=true` |
+| `web_monitor_responsive` | `pure_web_chrome` | **PASS** | 280 | - | `desktop(1440x900) overflow=0px, mobile(390x844) overflow=0px, csp=0, consoleErr=0, pageErr=0` |
+| `ext_bridge_handshake` | `official_extension_chrome` | **PASS** | 680 | - | `WEB_EXT_PING ok (v4.2.0, id=ihamkldlkdibleacagiejklpfofapkpo, caps=dash_mux,direct_download,youtube_parse,youtube_mux), noUpdateNotice=true, ytHelperGlobal=false, csp=0, consoleErr=0, pageErr=0` |
+````
