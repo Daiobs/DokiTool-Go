@@ -685,7 +685,7 @@ export function useMediaDownload({
       savePathLabel,
       error: null,
       nativeAvailable: false,
-      refreshAvailable: false,
+      refreshAvailable: snapshot ? refreshable(snapshot) : false,
       loaded: 0,
       total: payload.sizeBytes ?? 0,
       transferred: 0,
@@ -699,7 +699,9 @@ export function useMediaDownload({
       transport: undefined,
     });
     if (snapshot) {
-      videoRetries.set(id, () => enqueueItem(snapshot, id, false));
+      videoRetries.set(id, (forceRefresh = false) =>
+        enqueueItem(snapshot, id, forceRefresh),
+      );
     } else if (!videoRetries.has(id)) {
       videoRetries.set(id, async () => {
         const currentTask = taskFor(id);
@@ -1116,12 +1118,14 @@ export function useMediaDownload({
               );
               videoStore.updateDownload(id, { filename });
               const primaryUrl = target.url;
-              const orderedRoutes = acceleratedRoutes.includes(primaryUrl)
-                ? [
-                    primaryUrl,
-                    ...acceleratedRoutes.filter((r) => r !== primaryUrl),
-                  ]
-                : acceleratedRoutes;
+              const orderedRoutes = (
+                acceleratedRoutes.includes(primaryUrl)
+                  ? [
+                      primaryUrl,
+                      ...acceleratedRoutes.filter((r) => r !== primaryUrl),
+                    ]
+                  : acceleratedRoutes
+              ).slice(0, 8);
               const knownSize =
                 target.source.size_bytes ??
                 delivery.sources.find((s) =>

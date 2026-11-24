@@ -25,7 +25,7 @@ const RANGE_DELIVER_SLICE_BYTES = 256 * 1024;
 const MAX_RANGE_CHUNK_RETRIES = 2;
 const RANGE_PROBE_WAIT_MS = 1500;
 const WORKER_CONTROL_CHANNEL = "dokitool-download-worker-control";
-const WORKER_IDLE_PROBE_MS = 120;
+const WORKER_IDLE_PROBE_MS = 80;
 const tasks = new Map();
 const history = new Map();
 const queue = [];
@@ -61,40 +61,39 @@ async function hasControlledDownloadClients() {
 
 async function canSafelySkipWaiting() {
   if (tasks.size > 0 || queue.length > 0) return false;
-  const hasDownloadClient = await hasControlledDownloadClients();
-  if (!hasDownloadClient) return true;
-  if (!controlChannel) return false;
-  // A `/downloads/` bridge document exists; ask the active worker whether it has
-  // zero active tasks. If no peer replies (legacy build), fail safe and wait.
-  return new Promise(resolve => {
+  if (await hasControlledDownloadClients()) return false;
+  if (!controlChannel) return true;
+  // No `/downloads/` bridge document is mounted, but an active worker may still
+  // be streaming a background attachment download after the tab closed.
+  // Probe live peers over BroadcastChannel for a short window; any awake worker
+  // still streaming a task replies immediately with activeTasks > 0.
+  const hasBusyPeer = await new Promise(resolve => {
     const probeId = crypto.randomUUID();
-    let sawPeer = false;
-    let busy = false;
     let settled = false;
-    const finish = () => {
+    const finish = busy => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       controlChannel.removeEventListener("message", onReply);
-      resolve(sawPeer && !busy && tasks.size === 0 && queue.length === 0);
+      resolve(busy);
     };
     const onReply = event => {
       const data = event.data;
       if (!data || data.type !== "idle-reply" || data.probeId !== probeId || data.from === INSTANCE) return;
-      sawPeer = true;
       if (Number(data.activeTasks) > 0) {
-        busy = true;
-        finish();
+        finish(true);
       }
     };
     controlChannel.addEventListener("message", onReply);
-    const timer = setTimeout(finish, WORKER_IDLE_PROBE_MS);
+    const timer = setTimeout(() => finish(false), WORKER_IDLE_PROBE_MS);
     try {
       controlChannel.postMessage({ type: "idle-probe", probeId, from: INSTANCE });
     } catch {
-      finish();
+      finish(true);
     }
   });
+  if (hasBusyPeer || tasks.size > 0 || queue.length > 0) return false;
+  return !(await hasControlledDownloadClients());
 }
 
 function notifyIdleIfEmpty() {
@@ -121,9 +120,13 @@ controlChannel?.addEventListener("message", event => {
     return;
   }
   if (data.type === "worker-idle" && waitingToActivate && !isCurrentActiveWorker() && tasks.size === 0 && queue.length === 0) {
-    if (typeof self.skipWaiting === "function") {
-      void self.skipWaiting().catch(() => {});
-    }
+    void (async () => {
+      if (!waitingToActivate || isCurrentActiveWorker() || tasks.size > 0 || queue.length > 0) return;
+      if (await hasControlledDownloadClients()) return;
+      if (typeof self.skipWaiting === "function") {
+        await self.skipWaiting();
+      }
+    })().catch(() => {});
   }
 });
 
@@ -141,9 +144,11 @@ self.addEventListener("install", event => {
 self.addEventListener("activate", event => {
   isActivated = true;
   waitingToActivate = false;
-  if (typeof self.clients?.claim === "function") {
-    event.waitUntil(self.clients.claim());
-  }
+  event.waitUntil((async () => {
+    if (typeof self.clients?.claim === "function" && !(await hasControlledDownloadClients())) {
+      await self.clients.claim();
+    }
+  })());
 });
 const terminal = status => ["completed", "failed", "cancelled", "manual"].includes(status);
 const abortError = () => new DOMException("下载已取消", "AbortError");

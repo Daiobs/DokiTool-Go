@@ -1217,6 +1217,71 @@ test("P2: prefersExtensionDirectAcceleration and resolveAcceleratedExtensionDire
     ),
     true,
   );
+  assert.equal(
+    mediaKernel.isRefererProtectedMediaRoute(
+      "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/720p.mp4",
+    ),
+    true,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://bili-edge.akamaized.net/media/720p.mp4",
+    ),
+    true,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://edge-mirror.akamaized.net/upgcxcode/123/720p.mp4",
+    ),
+    true,
+  );
+  // Generic non-Bilibili *.akamaized.net URLs (e.g. Vimeo / Facebook) must NEVER be misrouted
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://vod-progressive.akamaized.net/exp=123/vimeo.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.isRefererProtectedMediaRoute(
+      "https://vod-progressive.akamaized.net/exp=123/vimeo.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.prefersExtensionDirectAcceleration(
+      "https://akamaized.net/upgcxcode/720p.mp4",
+    ),
+    false,
+  );
+  assert.equal(
+    mediaKernel.resolveAcceleratedExtensionDirectRoutes(
+      {
+        delivery: {
+          kind: "file",
+          sources: [
+            { id: "v1", url: "https://vod-progressive.akamaized.net/exp=123/vimeo.mp4" },
+          ],
+        },
+      },
+      { apiOrigin: PROD_API_ORIGIN },
+    ),
+    null,
+  );
+  assert.equal(
+    mediaKernel.resolveProtectedExtensionAudioRoutes(
+      {
+        delivery: {
+          kind: "file",
+          sources: [
+            { id: "a1", url: "https://vod-progressive.akamaized.net/exp=123/audio.m4a" },
+          ],
+        },
+      },
+      { apiOrigin: PROD_API_ORIGIN },
+    ),
+    null,
+  );
   // Reject non-slow hosts, http:, credentials, and relay sources
   assert.equal(
     mediaKernel.prefersExtensionDirectAcceleration(
@@ -1287,4 +1352,52 @@ test("P2: prefersExtensionDirectAcceleration and resolveAcceleratedExtensionDire
     ),
     null,
   );
+
+  // Route capping (> 8 whitelisted routes) aligns strictly with webExternalBridge MAX=8 across all 3 resolvers
+  const tenVideoSources = Array.from({ length: 10 }, (_, idx) => ({
+    id: `v-${idx}`,
+    url: `https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/v-${idx}.m4s`,
+  }));
+  const tenAudioSources = Array.from({ length: 10 }, (_, idx) => ({
+    id: `a-${idx}`,
+    url: `https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/a-${idx}.m4s`,
+  }));
+  const cappedMux = mediaKernel.resolveWhitelistedExtensionMuxSpec(
+    {
+      id: "v-10-routes",
+      label: "1080p",
+      state: "ready",
+      metadata: { width: 1920, height: 1080, video_codec: "avc1.640028" },
+      delivery: {
+        kind: "mux",
+        output: { container: "mp4", extension: "mp4" },
+        resources: [
+          { id: "video", role: "video", delivery: { kind: "file", sources: tenVideoSources } },
+          { id: "audio", role: "audio", delivery: { kind: "file", sources: tenAudioSources } },
+        ],
+      },
+    },
+    { apiOrigin: PROD_API_ORIGIN },
+  );
+  assert.ok(cappedMux);
+  assert.equal(cappedMux.videoRoutes.length, 8);
+  assert.equal(cappedMux.audioRoutes.length, 8);
+  assert.equal(cappedMux.videoRoutes[0], tenVideoSources[0].url);
+  assert.equal(cappedMux.videoRoutes[7], tenVideoSources[7].url);
+
+  const cappedProtectedAudio = mediaKernel.resolveProtectedExtensionAudioRoutes(
+    { delivery: { kind: "file", sources: tenAudioSources } },
+    { apiOrigin: PROD_API_ORIGIN },
+  );
+  assert.ok(cappedProtectedAudio);
+  assert.equal(cappedProtectedAudio.length, 8);
+  assert.equal(cappedProtectedAudio[7], tenAudioSources[7].url);
+
+  const cappedAccelerated = mediaKernel.resolveAcceleratedExtensionDirectRoutes(
+    { delivery: { kind: "file", sources: tenVideoSources } },
+    { apiOrigin: PROD_API_ORIGIN },
+  );
+  assert.ok(cappedAccelerated);
+  assert.equal(cappedAccelerated.length, 8);
+  assert.equal(cappedAccelerated[7], tenVideoSources[7].url);
 });

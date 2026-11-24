@@ -54,6 +54,8 @@ export interface MuxTierSummary {
   specText: string;
 }
 
+const MAX_EXTENSION_BRIDGE_ROUTES = 8;
+
 function parsePositiveSafeBytes(raw: unknown): number | undefined {
   return typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0
     ? raw
@@ -163,8 +165,12 @@ export function resolveWhitelistedExtensionMuxSpec(
   );
   const allowed = (url: string) =>
     isWhitelistedMediaUrl(url, allowedOrigins).allowed;
-  const videoRoutes = spec.videoRoutes.filter(allowed);
-  const audioRoutes = spec.audioRoutes.filter(allowed);
+  const videoRoutes = spec.videoRoutes
+    .filter(allowed)
+    .slice(0, MAX_EXTENSION_BRIDGE_ROUTES);
+  const audioRoutes = spec.audioRoutes
+    .filter(allowed)
+    .slice(0, MAX_EXTENSION_BRIDGE_ROUTES);
   if (!videoRoutes.length || !audioRoutes.length) {
     return null;
   }
@@ -294,7 +300,7 @@ export function resolveProtectedExtensionAudioRoutes(
   }
 
   return needsProtection && whitelistedRoutes.length > 0
-    ? whitelistedRoutes
+    ? whitelistedRoutes.slice(0, MAX_EXTENSION_BRIDGE_ROUTES)
     : null;
 }
 
@@ -336,7 +342,7 @@ export function resolveAcceleratedExtensionDirectRoutes(
   }
 
   return wantsAcceleration && whitelistedRoutes.length > 0
-    ? whitelistedRoutes
+    ? whitelistedRoutes.slice(0, MAX_EXTENSION_BRIDGE_ROUTES)
     : null;
 }
 

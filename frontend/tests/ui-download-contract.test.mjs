@@ -4925,6 +4925,83 @@ test('P2: connected extension accelerates whitelisted slow progressive direct fi
     await waitUntil(() => hNoExt.store.downloads[0]?.status === 'completed');
     assert.equal(webManagerCalls, 1);
     assert.equal(hNoExt.toasts.some((t) => t[1] === 'error'), false);
+
+    // Case 4: Failed refreshable extension direct_download preserves refreshAvailable=true, forwards forceRefresh=true on handleRefreshDownload, and caps >8 routes to <=8
+    const tenBiliSources = Array.from({ length: 10 }, (_, idx) => ({
+      id: `s-720-${idx}`,
+      url: `https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/720p-old-${idx}.mp4`,
+      size_bytes: 18_500_000,
+    }));
+    const refreshedUrl = 'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/720p-refreshed.mp4';
+    const makeBiliRefreshItem = (sources) => ({
+      id: 'p1',
+      type: 'video',
+      state: 'ready',
+      resolve_url: '/api/resolve?schema_version=1.0&url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1P2AccelTest&item_id=p1',
+      default: { variant_id: 'v-720', source_id: sources[0].id, url: sources[0].url },
+      variants: [
+        {
+          id: 'v-720',
+          label: '720p',
+          metadata: { width: 1280, height: 720, has_audio: true, video_codec: 'avc1.64001f', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4', evidence: 'upstream' },
+          delivery: { kind: 'file', sources },
+        },
+      ],
+    });
+    const refreshEnqueued = [];
+    let failFirstTask = true;
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version: '4.2.0',
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+              },
+            });
+            return;
+          }
+          if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+            const taskId = `p2-refresh-${refreshEnqueued.length + 1}`;
+            refreshEnqueued.push({ taskId, payload: msg.payload });
+            cb({ ok: true, data: { taskId, status: 'queued' } });
+            return;
+          }
+          if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+            if (failFirstTask && msg.taskId === 'p2-refresh-1') {
+              failFirstTask = false;
+              cb({ ok: true, data: { taskId: msg.taskId, status: 'failed', phase: 'failed', progress: 0, loadedBytes: 0, totalBytes: 18_500_000, speedBytesPerSec: 0, error: '链接签名已过期', filename: 'test.mp4' } });
+              return;
+            }
+            cb({ ok: true, data: { taskId: msg.taskId, status: 'completed', phase: 'completed', progress: 100, loadedBytes: 18_500_000, totalBytes: 18_500_000, speedBytesPerSec: 0, filename: 'test.mp4' } });
+          }
+        },
+      },
+    };
+    let resolveCalls = 0;
+    const hRefresh = harness(
+      { ...biliData, items: [makeBiliRefreshItem(tenBiliSources)] },
+      async () => {
+        resolveCalls++;
+        return makeBiliRefreshItem([{ id: 's-720-0', url: refreshedUrl, size_bytes: 18_500_000 }]);
+      },
+    );
+    await hRefresh.instance.downloadMainVideo();
+    await settled(hRefresh.store.downloads[0]);
+    assert.equal(hRefresh.store.downloads[0].status, 'failed');
+    assert.equal(hRefresh.store.downloads[0].refreshAvailable, true, 'runExtensionBridgeDownload must preserve refreshAvailable from snapshot');
+    assert.equal(refreshEnqueued.length, 1);
+    assert.equal(refreshEnqueued[0].payload.routes.length, 8, 'extension bridge routes must be capped at 8');
+
+    await hRefresh.instance.handleRefreshDownload(hRefresh.store.downloads[0].id);
+    await settled(hRefresh.store.downloads[0]);
+    assert.equal(resolveCalls, 1, 'handleRefreshDownload must forward forceRefresh=true through videoRetries to resolve fresh URLs');
+    assert.equal(hRefresh.store.downloads[0].status, 'completed');
+    assert.equal(refreshEnqueued.length, 2);
+    assert.deepEqual(refreshEnqueued[1].payload.routes, [refreshedUrl]);
   } finally {
     if (prevManager === undefined) delete globalThis.__uiDownloadManager;
     else globalThis.__uiDownloadManager = prevManager;

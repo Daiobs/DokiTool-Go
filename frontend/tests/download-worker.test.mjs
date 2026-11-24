@@ -1687,7 +1687,7 @@ test('P2: 2 MiB threshold activates multi-range on 2.5 MiB files, skips 1.5 MiB 
   assert.equal(sha256(Buffer.concat(chunks)), sha256(rampPayload));
 });
 
-test('P2: safe idle hot-swap skips waiting & claims when idle, defers during active tasks until worker-idle, and fails safe for legacy workers', async t => {
+test('P2: safe idle hot-swap protects both open bridge.html lease and closed-tab background streams while hot-swapping when truly idle', async t => {
   function createChannelBus() {
     const channels = new Set();
     return class FakeBroadcastChannel {
@@ -1715,6 +1715,7 @@ test('P2: safe idle hot-swap skips waiting & claims when idle, defers during act
     const events = new Map(), timers = new Map(), lifetime = [];
     let nextTimer = 0, now = 1_000_000;
     let skipWaitingCalls = 0, claimCalls = 0;
+    let currentClients = controlledClients;
     const sw = { state: swState };
     const clientsMap = new Map([
       ['page', { id: 'page', url: origin + '/', postMessage() {} }],
@@ -1726,7 +1727,7 @@ test('P2: safe idle hot-swap skips waiting & claims when idle, defers during act
         skipWaiting: async () => { skipWaitingCalls++; },
         clients: {
           get: async key => clientsMap.get(key),
-          matchAll: async () => controlledClients,
+          matchAll: async () => currentClients,
           claim: async () => { claimCalls++; },
         },
         addEventListener: (key, handler) => events.set(key, handler),
@@ -1751,57 +1752,94 @@ test('P2: safe idle hot-swap skips waiting & claims when idle, defers during act
     const tickAll = delay => { for (const [k, tm] of [...timers]) if (tm.delay === delay) { timers.delete(k); tm.callback(); } };
     return {
       sw, dispatchLifecycle, send, tickAll,
+      setClients(next) { currentClients = next; },
       get skipWaitingCalls() { return skipWaitingCalls; },
       get claimCalls() { return claimCalls; },
       async close() { await Promise.all(lifetime); },
     };
   }
 
-  // Case 1: No controlled /downloads/* clients -> immediately skipWaiting on install + clients.claim on activate.
-  const idle = lifecycleHarness({ bus: createChannelBus(), controlledClients: [{ url: origin + '/' }] });
-  t.after(() => idle.close());
-  await idle.dispatchLifecycle('install');
-  assert.equal(idle.skipWaitingCalls, 1);
-  idle.sw.state = 'activating';
-  await idle.dispatchLifecycle('activate');
-  assert.equal(idle.claimCalls, 1);
-
-  // Case 2: Active new-gen worker owns open /downloads/bridge.html with tasks.size === 0 -> idle-probe confirms idle -> skipWaiting!
-  const busIdlePeer = createChannelBus();
+  const noBridgeClients = [{ url: origin + '/' }];
   const bridgeClient = [{ url: origin + '/downloads/bridge.html' }];
-  const activeIdlePeer = lifecycleHarness({ bus: busIdlePeer, controlledClients: bridgeClient, swState: 'activated' });
-  t.after(() => activeIdlePeer.close());
-  const installingOverIdle = lifecycleHarness({ bus: busIdlePeer, controlledClients: bridgeClient, swState: 'installing' });
-  t.after(() => installingOverIdle.close());
-  const installIdlePromise = installingOverIdle.dispatchLifecycle('install');
-  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
-  installingOverIdle.tickAll(120);
-  await installIdlePromise;
-  assert.equal(installingOverIdle.skipWaitingCalls, 1);
 
-  // Case 3: Active new-gen worker has active task (tasks.size === 1) -> defers skipWaiting until task completes & broadcasts worker-idle!
-  const busBusyPeer = createChannelBus();
-  const activeBusyPeer = lifecycleHarness({ bus: busBusyPeer, controlledClients: bridgeClient, swState: 'activated' });
-  t.after(() => activeBusyPeer.close());
-  await activeBusyPeer.send({ action: 'start', token, request: { id: id(1), filename: 'active.mp4', url: 'https://cdn.test/a.mp4' } });
-  const waitingWorker = lifecycleHarness({ bus: busBusyPeer, controlledClients: bridgeClient, swState: 'installing' });
-  t.after(() => waitingWorker.close());
-  const installBusyPromise = waitingWorker.dispatchLifecycle('install');
+  // Case (a1): No bridge.html and no awake peer (sleeping old SW / first install) -> skipWaiting + clients.claim after 80ms probe.
+  const idleNoPeer = lifecycleHarness({ bus: createChannelBus(), controlledClients: noBridgeClients });
+  t.after(() => idleNoPeer.close());
+  const installIdleNoPeer = idleNoPeer.dispatchLifecycle('install');
   for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
-  await installBusyPromise;
-  waitingWorker.sw.state = 'installed';
-  assert.equal(waitingWorker.skipWaitingCalls, 0, 'must NOT skipWaiting while active worker owns an in-flight download');
-  // Cancel / settle active task -> tasks.size drops to 0 -> broadcasts worker-idle -> waiting worker immediately calls skipWaiting!
-  await activeBusyPeer.send({ action: 'cancel', id: id(1), token });
+  idleNoPeer.tickAll(80);
+  await installIdleNoPeer;
+  assert.equal(idleNoPeer.skipWaitingCalls, 1, 'no bridge.html + sleeping peer must skipWaiting');
+  idleNoPeer.sw.state = 'activating';
+  await idleNoPeer.dispatchLifecycle('activate');
+  assert.equal(idleNoPeer.claimCalls, 1, 'activate without bridge.html must call clients.claim');
+
+  // Case (a2): No bridge.html and awake idle peer (tasks.size === 0) -> skipWaiting + clients.claim.
+  const busIdleNoBridge = createChannelBus();
+  const awakeIdlePeer = lifecycleHarness({ bus: busIdleNoBridge, controlledClients: noBridgeClients, swState: 'activated' });
+  t.after(() => awakeIdlePeer.close());
+  const installingIdleNoBridge = lifecycleHarness({ bus: busIdleNoBridge, controlledClients: noBridgeClients, swState: 'installing' });
+  t.after(() => installingIdleNoBridge.close());
+  const installIdlePeerPromise = installingIdleNoBridge.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  installingIdleNoBridge.tickAll(80);
+  await installIdlePeerPromise;
+  assert.equal(installingIdleNoBridge.skipWaitingCalls, 1, 'no bridge.html + awake idle peer (activeTasks=0) must skipWaiting');
+  installingIdleNoBridge.sw.state = 'activating';
+  await installingIdleNoBridge.dispatchLifecycle('activate');
+  assert.equal(installingIdleNoBridge.claimCalls, 1);
+
+  // Case (a3): bridge.html mounts DURING the 80ms probe window -> final re-check aborts skipWaiting and activate skips clients.claim.
+  const raceBridge = lifecycleHarness({ bus: createChannelBus(), controlledClients: noBridgeClients });
+  t.after(() => raceBridge.close());
+  const installRacePromise = raceBridge.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  raceBridge.setClients(bridgeClient);
+  raceBridge.tickAll(80);
+  await installRacePromise;
+  assert.equal(raceBridge.skipWaitingCalls, 0, 'bridge.html mounted during 80ms probe must abort skipWaiting');
+  raceBridge.sw.state = 'activating';
+  await raceBridge.dispatchLifecycle('activate');
+  assert.equal(raceBridge.claimCalls, 0, 'activate with open bridge.html must NOT call clients.claim');
+
+  // Case (b): Closed-tab background download (no bridge.html, but awake old SW has tasks.size === 1) -> waits until task drains & worker-idle!
+  const busBgBusy = createChannelBus();
+  const bgActiveWorker = lifecycleHarness({ bus: busBgBusy, controlledClients: noBridgeClients, swState: 'activated' });
+  t.after(() => bgActiveWorker.close());
+  await bgActiveWorker.send({ action: 'start', token, request: { id: id(1), filename: 'background.mp4', url: 'https://cdn.test/bg.mp4' } });
+  const waitingOverBg = lifecycleHarness({ bus: busBgBusy, controlledClients: noBridgeClients, swState: 'installing' });
+  t.after(() => waitingOverBg.close());
+  const installBgPromise = waitingOverBg.dispatchLifecycle('install');
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  await installBgPromise;
+  waitingOverBg.sw.state = 'installed';
+  assert.equal(waitingOverBg.skipWaitingCalls, 0, 'must NOT skipWaiting while old SW is streaming a closed-tab background download');
+  // Once background download settles, old SW broadcasts worker-idle -> waiting SW re-verifies no bridge.html and calls skipWaiting!
+  await bgActiveWorker.send({ action: 'cancel', id: id(1), token });
   for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(waitingWorker.skipWaitingCalls, 1, 'waiting worker must immediately skipWaiting once active worker drains to tasks.size === 0');
+  assert.equal(waitingOverBg.skipWaitingCalls, 1, 'waiting SW must skipWaiting once closed-tab background task finishes and no bridge.html is open');
 
-  // Case 4: Legacy worker (no BroadcastChannel peer) holds open /downloads/bridge.html -> fails safe (0 skipWaiting).
-  const installingOverLegacy = lifecycleHarness({ bus: createChannelBus(), controlledClients: bridgeClient, swState: 'installing' });
-  t.after(() => installingOverLegacy.close());
-  const legacyPromise = installingOverLegacy.dispatchLifecycle('install');
-  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
-  installingOverLegacy.tickAll(120);
-  await legacyPromise;
-  assert.equal(installingOverLegacy.skipWaitingCalls, 0, 'must fail safe and wait when legacy worker with open bridge does not answer idle-probe');
+  // Case (c1): Open /downloads/bridge.html with old SW tasks.size === 0 (handshake or 4000ms grace period) -> NEVER skipWaiting!
+  const busBridgeIdle = createChannelBus();
+  const activeBridgeIdle = lifecycleHarness({ bus: busBridgeIdle, controlledClients: bridgeClient, swState: 'activated' });
+  t.after(() => activeBridgeIdle.close());
+  const waitingBridgeIdle = lifecycleHarness({ bus: busBridgeIdle, controlledClients: bridgeClient, swState: 'installing' });
+  t.after(() => waitingBridgeIdle.close());
+  await waitingBridgeIdle.dispatchLifecycle('install');
+  assert.equal(waitingBridgeIdle.skipWaitingCalls, 0, 'must NOT skipWaiting while /downloads/bridge.html is mounted even when tasks.size === 0');
+
+  // Case (c2): Open /downloads/bridge.html with old SW tasks.size === 1 -> NEVER skipWaiting on install OR on worker-idle while bridge.html remains mounted!
+  const busBridgeBusy = createChannelBus();
+  const activeBridgeBusy = lifecycleHarness({ bus: busBridgeBusy, controlledClients: bridgeClient, swState: 'activated' });
+  t.after(() => activeBridgeBusy.close());
+  await activeBridgeBusy.send({ action: 'start', token, request: { id: id(2), filename: 'active-bridge.mp4', url: 'https://cdn.test/a.mp4' } });
+  const waitingBridgeBusy = lifecycleHarness({ bus: busBridgeBusy, controlledClients: bridgeClient, swState: 'installing' });
+  t.after(() => waitingBridgeBusy.close());
+  await waitingBridgeBusy.dispatchLifecycle('install');
+  waitingBridgeBusy.sw.state = 'installed';
+  assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting when bridge.html is open and tasks.size === 1');
+  // Even after task finishes and broadcasts worker-idle, bridge.html is still in its 4000ms post-completion grace lease -> STILL must NOT skipWaiting!
+  await activeBridgeBusy.send({ action: 'cancel', id: id(2), token });
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting on worker-idle while /downloads/bridge.html is still mounted in 4000ms grace period');
 });
