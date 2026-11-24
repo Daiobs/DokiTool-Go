@@ -2696,9 +2696,8 @@ async function runExtensionChromeChecks({
           throw new Stage2Error(submitted?.reason || "failed to submit parse");
         }
 
-        const outcome = await until(
-          async () =>
-            page.evaluate(`(() => {
+        const readResultSnapshot = () =>
+          page.evaluate(`(() => {
               const loading = Boolean(document.querySelector('[data-cancel-parse="true"]'));
               if (loading) return null;
               const errEl = document.querySelector('.parse-error-panel');
@@ -2733,10 +2732,29 @@ async function runExtensionChromeChecks({
                   try { return new URL(u, location.origin).hostname; } catch { return ''; }
                 }).filter(Boolean),
               };
-            })()`),
+            })()`);
+
+        let outcome = await until(
+          readResultSnapshot,
           `${expectedPlatform} live parse`,
           waitBudgetMs,
         );
+
+        // ResultSection lazy-loads extensionBridge and runs pingInstalledExtension() on mount;
+        // allow a brief settle window for the connected badge & auto-upgraded mux CTA to render.
+        if (outcome.kind === "ready" && !outcome.hasExtConnectedBadge) {
+          const settled = await until(
+            async () => {
+              const snap = await readResultSnapshot();
+              return snap && snap.kind === "ready" && snap.hasExtConnectedBadge
+                ? snap
+                : null;
+            },
+            `${expectedPlatform} extension-connected-badge settle`,
+            5000,
+          ).catch(() => null);
+          if (settled) outcome = settled;
+        }
 
         if (outcome.kind === "error") {
           fails.push(`parse error panel: ${sanitizeText(outcome.message)}`);
