@@ -2,6 +2,7 @@ package ytengine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,8 +12,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -944,5 +947,161 @@ func TestGateTLSVerificationAndPortPolicyP28(t *testing.T) {
 	// 4. Custom non-80/443 port MUST be rejected with 403 even when dialAddr hook is set (allowCustomPort == false).
 	if code := send(trustedEng, "https://a.example:8443/ok"); code != http.StatusForbidden {
 		t.Fatalf("custom port 8443 expected 403 Forbidden when allowCustomPort=false, got %d", code)
+	}
+}
+
+func TestPythonPathAncestorDirAndPreExecReverifyM3(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits test")
+	}
+	realPython3 := lookupPython3InPath(os.Getenv("PATH"))
+	if realPython3 == "" {
+		t.Skip("python3 not found in PATH")
+	}
+
+	mainPy := fmt.Sprintf(`import json, sys
+if '--version' in sys.argv:
+    print(%q)
+    sys.exit(0)
+print(json.dumps({
+    'id': 'preexec-ok',
+    'title': sys.executable,
+    'formats': [{'format_id': '18', 'url': 'https://cdn.example.com/v.mp4', 'ext': 'mp4', 'protocol': 'https', 'width': 1280, 'height': 720, 'vcodec': 'avc1', 'acodec': 'mp4a'}]
+}))
+`, PinnedVersion)
+	zipBytes := buildRealPythonZipapp(t, mainPy, "OK = True\n")
+	zipDir := t.TempDir()
+	zipPath := filepath.Join(zipDir, "yt-dlp")
+	if err := os.WriteFile(zipPath, zipBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	zipSum := sha256.Sum256(zipBytes)
+	zipHashes := map[string]string{hex.EncodeToString(zipSum[:]): "yt-dlp"}
+
+	// 1. World-writable ancestor directory without sticky bit MUST be rejected.
+	wwParent := filepath.Join(t.TempDir(), "ww-dir")
+	if err := os.MkdirAll(wwParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wwBinDir := filepath.Join(wwParent, "bin")
+	if err := os.MkdirAll(wwBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wwPy := filepath.Join(wwBinDir, "python3")
+	if err := os.Symlink(realPython3, wwPy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(wwParent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(wwParent, 0o755) })
+	if eng, err := New(Config{BinaryPath: zipPath, PythonPath: wwPy, AllowedHashes: zipHashes}); err == nil || eng.Enabled() {
+		t.Fatalf("expected world-writable ancestor directory without sticky bit to be rejected, got enabled=%v err=%v", eng.Enabled(), err)
+	}
+
+	// 2. Group-writable (0o775) AND sticky world-writable (0o1777) ancestor directories MUST be accepted.
+	safeParent := filepath.Join(t.TempDir(), "sticky-parent")
+	groupBin := filepath.Join(safeParent, "group-writable-bin")
+	if err := os.MkdirAll(groupBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(safeParent, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(groupBin, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(groupBin, 0o755)
+		_ = os.Chmod(safeParent, 0o755)
+	})
+	safePy := filepath.Join(groupBin, "python3")
+	if err := os.Symlink(realPython3, safePy); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := New(Config{
+		BinaryPath:    zipPath,
+		PythonPath:    safePy,
+		AllowedHashes: zipHashes,
+		EnvPath:       "/nonexistent",
+	})
+	if err != nil || !eng.Enabled() {
+		t.Fatalf("expected sticky + group-writable ancestor directory to succeed, got err=%v", err)
+	}
+	info, err := eng.Extract(context.Background(), "https://example.com/v/ok")
+	if err != nil || info == nil || info.ID != "preexec-ok" {
+		t.Fatalf("initial Extract failed: info=%+v err=%v", info, err)
+	}
+
+	// 3. Runtime symlink swap AFTER startup MUST be blocked before exec with non-retryable CodeUpstreamUnavailable.
+	altExec := filepath.Join(t.TempDir(), "alt-python")
+	if err := os.WriteFile(altExec, []byte("#!/bin/sh\necho '{\"id\":\"pwned\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(safePy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(altExec, safePy); err != nil {
+		t.Fatal(err)
+	}
+	_, tamperErr := eng.Extract(context.Background(), "https://example.com/v/tampered")
+	var ytErr *Error
+	if !errors.As(tamperErr, &ytErr) || ytErr.Code != CodeUpstreamUnavailable || ytErr.Retryable {
+		t.Fatalf("expected non-retryable CodeUpstreamUnavailable on runtime python symlink swap, got %v", tamperErr)
+	}
+
+	// 4. Restore original symlink, then chmod parent world-writable without sticky bit -> MUST also block before exec!
+	if err := os.Remove(safePy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPython3, safePy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(groupBin, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	_, permErr := eng.Extract(context.Background(), "https://example.com/v/ww")
+	ytErr = nil
+	if !errors.As(permErr, &ytErr) || ytErr.Code != CodeUpstreamUnavailable || ytErr.Retryable {
+		t.Fatalf("expected non-retryable CodeUpstreamUnavailable when ancestor becomes world-writable, got %v", permErr)
+	}
+}
+
+func TestGatePortPoolBusyPortLogsWarningLow5(t *testing.T) {
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	busyPort := occupied.Addr().(*net.TCPAddr).Port
+
+	freeLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freePort := freeLn.Addr().(*net.TCPAddr).Port
+	_ = freeLn.Close()
+
+	pool, err := newGatePortPool([]int{busyPort, freePort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	var logBuf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevOut)
+
+	gl, err := pool.pickListener()
+	if err != nil {
+		t.Fatalf("expected free port %d to bind while busy port %d is skipped: %v", freePort, busyPort, err)
+	}
+	if gl.port != freePort {
+		t.Fatalf("picked port = %d, want %d", gl.port, freePort)
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "skipped busy ports") || !strings.Contains(logged, fmt.Sprintf("%d", busyPort)) || !strings.Contains(logged, "1/2") {
+		t.Fatalf("expected warning log for skipped busy port %d (1/2), got %q", busyPort, logged)
 	}
 }

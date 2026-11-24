@@ -184,7 +184,7 @@ func run(args []string) error {
 	if runtimeFromFile {
 		api.ApplyRuntimeConfigToAdmissionConfig(&limits, runtimeCfg)
 	}
-	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, executor, *xTombstoneFallback, os.Getenv, runtimeCfg, runtimeFromFile)
+	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, executor, *xTombstoneFallback, os.Getenv, limits, runtimeCfg, runtimeFromFile)
 	if err != nil {
 		return err
 	}
@@ -430,13 +430,40 @@ func reloadRuntimeConfigOnce(
 		}
 		return false
 	}
-	if !api.ApplyRuntimeConfig(entry, handler, next, fromFile, true) {
-		return false
-	}
+	var prevYT, prevSocial, prevGeneric int
 	if ytCfg != nil {
-		if err := ytCfg.SetCompartmentLimits(next.YTDLP.YouTubeSlots, next.YTDLP.SocialSlots, next.YTDLP.GenericSlots); err != nil && logf != nil {
-			logf("dokitool: runtime config ytengine slot resize warning: %v", err)
+		if ytCfg.youtubeEngine != nil {
+			prevYT = ytCfg.youtubeEngine.ConcurrencyLimit()
 		}
+		if ytCfg.socialEngine != nil {
+			prevSocial = ytCfg.socialEngine.ConcurrencyLimit()
+		}
+		if ytCfg.genericEngine != nil {
+			prevGeneric = ytCfg.genericEngine.ConcurrencyLimit()
+		}
+		if err := ytCfg.SetCompartmentLimits(next.YTDLP.YouTubeSlots, next.YTDLP.SocialSlots, next.YTDLP.GenericSlots); err != nil {
+			if logf != nil {
+				logf("dokitool: runtime config reload rejected during ytengine slot resize (keeping previous configuration): %v", err)
+			}
+			return false
+		}
+	}
+	if !api.ApplyRuntimeConfig(entry, handler, next, fromFile, true) {
+		if ytCfg != nil {
+			if ytCfg.youtubeEngine != nil && prevYT >= 1 {
+				_ = ytCfg.youtubeEngine.SetConcurrencyLimit(prevYT)
+			}
+			if ytCfg.socialEngine != nil && prevSocial >= 1 {
+				_ = ytCfg.socialEngine.SetConcurrencyLimit(prevSocial)
+			}
+			if ytCfg.genericEngine != nil && prevGeneric >= 1 {
+				_ = ytCfg.genericEngine.SetConcurrencyLimit(prevGeneric)
+			}
+		}
+		if logf != nil {
+			logf("dokitool: runtime config reload rejected by admission/handler apply (keeping previous configuration)")
+		}
+		return false
 	}
 	if logf != nil {
 		logf("dokitool: runtime config reloaded (yt=%d social=%d generic=%d ejs=%d fast_per_platform=%d cb_enabled=%t disabled=%d)",
@@ -566,23 +593,32 @@ func (r *ytdlpConfigResult) SetCompartmentLimits(ytSlots, socialSlots, genericSl
 	if r == nil {
 		return nil
 	}
-	var firstErr error
+	type target struct {
+		eng  *ytengine.Engine
+		prev int
+		next int
+	}
+	var targets []target
 	if r.youtubeEngine != nil {
-		if err := r.youtubeEngine.SetConcurrencyLimit(ytSlots); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		targets = append(targets, target{eng: r.youtubeEngine, prev: r.youtubeEngine.ConcurrencyLimit(), next: ytSlots})
 	}
 	if r.socialEngine != nil {
-		if err := r.socialEngine.SetConcurrencyLimit(socialSlots); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		targets = append(targets, target{eng: r.socialEngine, prev: r.socialEngine.ConcurrencyLimit(), next: socialSlots})
 	}
 	if r.genericEngine != nil {
-		if err := r.genericEngine.SetConcurrencyLimit(genericSlots); err != nil && firstErr == nil {
-			firstErr = err
+		targets = append(targets, target{eng: r.genericEngine, prev: r.genericEngine.ConcurrencyLimit(), next: genericSlots})
+	}
+	for i, t := range targets {
+		if err := t.eng.SetConcurrencyLimit(t.next); err != nil {
+			for j := i - 1; j >= 0; j-- {
+				if targets[j].prev >= 1 {
+					_ = targets[j].eng.SetConcurrencyLimit(targets[j].prev)
+				}
+			}
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }
 
 func parseYTDLPGenericConcurrency(getenv func(string) string) (int, error) {
@@ -606,7 +642,11 @@ func configureYTDLPWithEngine(c *catalog.Catalog, adapters map[string]api.Adapte
 }
 
 func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, executor fetch.Executor, xTombstoneFallback string, getenv func(string) string) (ytdlpConfigResult, error) {
-	return configureYTDLPFullWithRuntime(c, adapters, executor, xTombstoneFallback, getenv, api.DefaultRuntimeConfig(), false)
+	limits, err := api.LoadAdmissionConfig(getenv)
+	if err != nil {
+		return ytdlpConfigResult{}, err
+	}
+	return configureYTDLPFullWithRuntime(c, adapters, executor, xTombstoneFallback, getenv, limits, api.DefaultRuntimeConfig(), false)
 }
 
 func configureYTDLPFullWithRuntime(
@@ -615,6 +655,7 @@ func configureYTDLPFullWithRuntime(
 	executor fetch.Executor,
 	xTombstoneFallback string,
 	getenv func(string) string,
+	limits api.AdmissionConfig,
 	runtimeCfg api.RuntimeConfig,
 	runtimeFromFile bool,
 ) (ytdlpConfigResult, error) {
@@ -675,10 +716,15 @@ func configureYTDLPFullWithRuntime(
 		youtubeSlots = runtimeCfg.YTDLP.YouTubeSlots
 		socialSlots = runtimeCfg.YTDLP.SocialSlots
 		genericConc = runtimeCfg.YTDLP.GenericSlots
-	} else if rawConc := strings.TrimSpace(getenv("DOKITOOL_YTDLP_CONCURRENCY")); rawConc != "" {
-		if n := baseEngine.ConcurrencyLimit(); n >= 1 {
-			youtubeSlots = n
-			socialSlots = n
+	} else {
+		if limits.YouTubeSlowParse.GlobalConcurrency >= 1 {
+			youtubeSlots = limits.YouTubeSlowParse.GlobalConcurrency
+		}
+		if limits.SlowParse.GlobalConcurrency >= 1 {
+			socialSlots = limits.SlowParse.GlobalConcurrency
+		}
+		if limits.GenericSlowParse.GlobalConcurrency >= 1 {
+			genericConc = limits.GenericSlowParse.GlobalConcurrency
 		}
 	}
 

@@ -59,10 +59,16 @@ func isCircuitBreakerFailure(code string) bool {
 	}
 }
 
+type circuitSample struct {
+	failed bool
+	at     time.Time
+}
+
 type platformCircuitState struct {
 	state               string
 	consecutiveFailures int
-	window              []bool
+	lastFailureAt       time.Time
+	window              []circuitSample
 	windowHead          int
 	windowCount         int
 	windowFailures      int
@@ -77,7 +83,7 @@ func newPlatformCircuitState(windowSize int) *platformCircuitState {
 	}
 	return &platformCircuitState{
 		state:  CircuitStateClosed,
-		window: make([]bool, windowSize),
+		window: make([]circuitSample, windowSize),
 	}
 }
 
@@ -94,13 +100,13 @@ func (s *platformCircuitState) resizeWindow(newSize int) {
 		keep = newSize
 	}
 	startOffset := s.windowCount - keep
-	next := make([]bool, newSize)
+	next := make([]circuitSample, newSize)
 	failures := 0
 	oldLen := len(s.window)
 	for i := 0; i < keep; i++ {
 		val := s.window[(s.windowHead+startOffset+i)%oldLen]
 		next[i] = val
-		if val {
+		if val.failed {
 			failures++
 		}
 	}
@@ -110,24 +116,53 @@ func (s *platformCircuitState) resizeWindow(newSize int) {
 	s.windowFailures = failures
 }
 
-func (s *platformCircuitState) pushSample(failed bool) {
+func (s *platformCircuitState) pruneExpired(now time.Time, maxAge time.Duration) {
+	if maxAge <= 0 {
+		return
+	}
+	cutoff := now.Add(-maxAge)
+	n := len(s.window)
+	for s.windowCount > 0 && n > 0 {
+		oldest := s.window[s.windowHead]
+		if !oldest.at.Before(cutoff) {
+			break
+		}
+		if oldest.failed {
+			s.windowFailures--
+		}
+		s.window[s.windowHead] = circuitSample{}
+		s.windowHead = (s.windowHead + 1) % n
+		s.windowCount--
+	}
+	if s.windowCount == 0 {
+		s.windowHead = 0
+		s.windowFailures = 0
+	}
+	if !s.lastFailureAt.IsZero() && now.Sub(s.lastFailureAt) > maxAge {
+		s.consecutiveFailures = 0
+		s.lastFailureAt = time.Time{}
+	}
+}
+
+func (s *platformCircuitState) pushSample(failed bool, at time.Time) {
 	n := len(s.window)
 	if n == 0 {
 		return
 	}
+	sample := circuitSample{failed: failed, at: at}
 	if s.windowCount < n {
 		idx := (s.windowHead + s.windowCount) % n
-		s.window[idx] = failed
+		s.window[idx] = sample
 		s.windowCount++
 		if failed {
 			s.windowFailures++
 		}
 		return
 	}
-	if s.window[s.windowHead] {
+	if s.window[s.windowHead].failed {
 		s.windowFailures--
 	}
-	s.window[s.windowHead] = failed
+	s.window[s.windowHead] = sample
 	if failed {
 		s.windowFailures++
 	}
@@ -136,7 +171,7 @@ func (s *platformCircuitState) pushSample(failed bool) {
 
 func (s *platformCircuitState) resetWindow() {
 	for i := range s.window {
-		s.window[i] = false
+		s.window[i] = circuitSample{}
 	}
 	s.windowHead = 0
 	s.windowCount = 0
@@ -192,6 +227,26 @@ func (m *circuitBreakerManager) UpdateConfig(cfg CircuitBreakerConfig) {
 	}
 }
 
+func (m *circuitBreakerManager) sampleMaxAge() time.Duration {
+	age := 5 * time.Minute
+	if tenOpen := 10 * m.cfg.OpenDuration; tenOpen > age {
+		age = tenOpen
+	}
+	return age
+}
+
+// IsDisabled reports whether platform is manually disabled via runtime config
+// circuit_breaker.disabled_platforms (distinct from automatic circuit open state).
+func (m *circuitBreakerManager) IsDisabled(platform string) bool {
+	if m == nil || platform == "" {
+		return false
+	}
+	m.mu.Lock()
+	_, disabled := m.disabled[platform]
+	m.mu.Unlock()
+	return disabled
+}
+
 // Allow checks whether an upstream call for platform is permitted at now.
 // When allowed is false, retryAfterSec is >= 1 (30s when disabled_by_config).
 // When halfOpenGen > 0, callers MUST call Finish(platform, code, halfOpenGen, finishNow)
@@ -213,6 +268,7 @@ func (m *circuitBreakerManager) Allow(platform string, now time.Time) (allowed b
 	if !ok {
 		return true, 0, 0
 	}
+	st.pruneExpired(now, m.sampleMaxAge())
 	switch st.state {
 	case CircuitStateClosed:
 		return true, 0, 0
@@ -259,9 +315,11 @@ func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64
 	if !m.cfg.Enabled {
 		return
 	}
+	st.pruneExpired(now, m.sampleMaxAge())
 
 	if code == "OK" {
 		st.consecutiveFailures = 0
+		st.lastFailureAt = time.Time{}
 		if st.state == CircuitStateHalfOpen {
 			st.state = CircuitStateClosed
 			st.openUntil = time.Time{}
@@ -269,7 +327,7 @@ func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64
 			st.halfOpenGen++
 			st.resetWindow()
 		}
-		st.pushSample(false)
+		st.pushSample(false, now)
 		return
 	}
 
@@ -281,7 +339,8 @@ func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64
 	}
 
 	st.consecutiveFailures++
-	st.pushSample(true)
+	st.lastFailureAt = now
+	st.pushSample(true, now)
 
 	if st.state == CircuitStateHalfOpen {
 		st.state = CircuitStateOpen
@@ -318,6 +377,7 @@ func (m *circuitBreakerManager) Snapshot(now time.Time) []CircuitBreakerPlatform
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	maxAge := m.sampleMaxAge()
 	for i := 0; i < numCorePlatforms; i++ {
 		plat := knownPlatforms[i]
 		st := m.states[plat]
@@ -328,6 +388,7 @@ func (m *circuitBreakerManager) Snapshot(now time.Time) []CircuitBreakerPlatform
 			DisabledByConfig: disabled,
 		}
 		if st != nil {
+			st.pruneExpired(now, maxAge)
 			snap.ConsecutiveFailures = st.consecutiveFailures
 			snap.WindowFailures = st.windowFailures
 			snap.WindowTotal = st.windowCount

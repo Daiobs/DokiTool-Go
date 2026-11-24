@@ -450,9 +450,10 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 				headers.Set("Referer", previous.String())
 			}
 			crossHost := !strings.EqualFold(originalHost, u.Host) || !strings.EqualFold(next.Host, u.Host)
-			downgraded := p.AutoReferer && u.Scheme == "https" && (originalScheme == "http" || next.Scheme == "http")
+			downgraded := strings.EqualFold(u.Scheme, "https") && (strings.EqualFold(originalScheme, "http") || strings.EqualFold(next.Scheme, "http"))
 			if crossHost || downgraded {
 				headers.Del("Authorization")
+				headers.Del("Proxy-Authorization")
 				headers.Del("Cookie")
 			}
 			if (response.StatusCode == 301 || response.StatusCode == 302 || response.StatusCode == 303) && method != http.MethodHead {

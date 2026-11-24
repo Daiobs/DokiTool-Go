@@ -1047,3 +1047,106 @@ func TestWarmConnectionPoolAffinityAndIdleConnTimeout(t *testing.T) {
 			string(resFallback.Body), dialsUn.Load(), dialsA.Load(), err)
 	}
 }
+
+func TestRedirectStripsSensitiveHeadersWithoutAutoReferer(t *testing.T) {
+	type seenHeaders struct {
+		path      string
+		auth      string
+		proxyAuth string
+		cookie    string
+	}
+	var (
+		mu   sync.Mutex
+		seen []seenHeaders
+	)
+	record := func(r *http.Request) {
+		mu.Lock()
+		seen = append(seen, seenHeaders{
+			path:      r.URL.Path,
+			auth:      r.Header.Get("Authorization"),
+			proxyAuth: r.Header.Get("Proxy-Authorization"),
+			cookie:    r.Header.Get("Cookie"),
+		})
+		mu.Unlock()
+	}
+
+	tlsSrv, roots, _ := newPoolTestServer(t, true, []string{"api.example.test", "cdn.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		switch r.URL.Path {
+		case "/downgrade":
+			http.Redirect(w, r, "http://api.example.test/plain", http.StatusFound)
+		case "/cross":
+			http.Redirect(w, r, "https://cdn.example.test/other", http.StatusFound)
+		case "/same":
+			http.Redirect(w, r, "https://api.example.test/same-final", http.StatusFound)
+		default:
+			_, _ = io.WriteString(w, "ok:"+r.URL.Path)
+		}
+	}))
+	plainSrv, _, _ := newPoolTestServer(t, false, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		_, _ = io.WriteString(w, "plain:"+r.URL.Path)
+	}))
+
+	c := NewWithResolver(resolverFunc(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = roots
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.HasSuffix(addr, ":80") {
+			return (&net.Dialer{}).DialContext(ctx, network, plainSrv.Listener.Addr().String())
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, tlsSrv.Listener.Addr().String())
+	}
+
+	policy := Policy{
+		Purpose:         "test-redirect-strip-no-autoreferer",
+		AllowedURL:      AllowHosts("api.example.test", "cdn.example.test"),
+		FollowRedirects: true,
+		AutoReferer:     false,
+		MaxRedirects:    3,
+		MaxBytes:        1024,
+		Timeout:         5 * time.Second,
+	}
+	send := func(rawURL string) {
+		t.Helper()
+		seen = nil
+		h := http.Header{
+			"Authorization":       {"Bearer secret-token"},
+			"Proxy-Authorization": {"Basic cHJveHk6c2VjcmV0"},
+			"Cookie":              {"sid=xyz"},
+		}
+		res, err := c.Do(context.Background(), Request{URL: rawURL, Header: h, Policy: policy})
+		if err != nil || res.StatusCode != http.StatusOK {
+			t.Fatalf("Do(%s) failed: status=%d err=%v", rawURL, res.StatusCode, err)
+		}
+	}
+
+	// 1. Same-host HTTPS -> HTTP downgrade with AutoReferer=false MUST strip all 3 credential headers.
+	send("https://api.example.test/downgrade")
+	if len(seen) != 2 || seen[1].path != "/plain" {
+		t.Fatalf("downgrade hops = %+v", seen)
+	}
+	if seen[0].auth == "" || seen[0].proxyAuth == "" || seen[0].cookie == "" {
+		t.Fatalf("initial hop missing headers: %+v", seen[0])
+	}
+	if seen[1].auth != "" || seen[1].proxyAuth != "" || seen[1].cookie != "" {
+		t.Fatalf("same-host HTTPS->HTTP downgrade with AutoReferer=false leaked headers: %+v", seen[1])
+	}
+
+	// 2. Cross-host HTTPS -> HTTPS MUST strip all 3 credential headers (including Proxy-Authorization).
+	send("https://api.example.test/cross")
+	if len(seen) != 2 || seen[1].path != "/other" {
+		t.Fatalf("cross-host hops = %+v", seen)
+	}
+	if seen[1].auth != "" || seen[1].proxyAuth != "" || seen[1].cookie != "" {
+		t.Fatalf("cross-host redirect leaked headers: %+v", seen[1])
+	}
+
+	// 3. Same-host HTTPS -> HTTPS preserves headers.
+	send("https://api.example.test/same")
+	if len(seen) != 2 || seen[1].auth != "Bearer secret-token" || seen[1].proxyAuth != "Basic cHJveHk6c2VjcmV0" || seen[1].cookie != "sid=xyz" {
+		t.Fatalf("same-host HTTPS redirect dropped headers unexpectedly: %+v", seen)
+	}
+}

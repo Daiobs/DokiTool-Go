@@ -980,6 +980,7 @@ type Stats struct {
 	cbSrc                  *circuitBreakerManager
 	ytdlpSrc               *ytengine.Engine
 	ytdlpGenericSrc        YTDLPStatsSource
+	ytdlpCompartmentsWired bool
 	ytdlpYoutubeSrc        YTDLPStatsSource
 	ytdlpSocialSrc         YTDLPStatsSource
 	ytdlpGenericCompSrc    YTDLPStatsSource
@@ -1059,6 +1060,7 @@ func (s *Stats) SetYTDLPCompartmentSources(youtube, social, generic YTDLPStatsSo
 		return
 	}
 	s.mu.Lock()
+	s.ytdlpCompartmentsWired = true
 	s.ytdlpYoutubeSrc = sanitizeYTDLPStatsSource(youtube)
 	s.ytdlpSocialSrc = sanitizeYTDLPStatsSource(social)
 	s.ytdlpGenericCompSrc = sanitizeYTDLPStatsSource(generic)
@@ -1477,6 +1479,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	cbSrc := s.cbSrc
 	ytdlpSrc := s.ytdlpSrc
 	ytdlpGenericSrc := s.ytdlpGenericSrc
+	ytdlpCompartmentsWired := s.ytdlpCompartmentsWired
 	ytdlpYoutubeSrc := s.ytdlpYoutubeSrc
 	ytdlpSocialSrc := s.ytdlpSocialSrc
 	ytdlpGenericCompSrc := s.ytdlpGenericCompSrc
@@ -1607,13 +1610,16 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	s.mu.Unlock()
 
 	genericSrcForComp := ytdlpGenericCompSrc
-	if genericSrcForComp == nil {
+	if !ytdlpCompartmentsWired && genericSrcForComp == nil {
 		genericSrcForComp = ytdlpGenericSrc
 	}
+	ytFallbackEnabled := !ytdlpCompartmentsWired && (runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled)
+	socialFallbackEnabled := !ytdlpCompartmentsWired && (runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled)
+	genericFallbackEnabled := !ytdlpCompartmentsWired && (runtimeCfg.YTDLPGenericEnabled || ytdlpGenericSnap.Enabled)
 	ytdlpPools := YTDLPPoolsSnapshot{
-		YouTube:    buildYTDLPCompartmentSnapshot(admYT, admSrc != nil, ytdlpYoutubeSrc, runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled),
-		Social:     buildYTDLPCompartmentSnapshot(admSocial, admSrc != nil, ytdlpSocialSrc, runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled),
-		Generic:    buildYTDLPCompartmentSnapshot(admGeneric, admSrc != nil, genericSrcForComp, runtimeCfg.YTDLPGenericEnabled || ytdlpGenericSnap.Enabled),
+		YouTube:    buildYTDLPCompartmentSnapshot(admYT, admSrc != nil, ytdlpYoutubeSrc, ytFallbackEnabled),
+		Social:     buildYTDLPCompartmentSnapshot(admSocial, admSrc != nil, ytdlpSocialSrc, socialFallbackEnabled),
+		Generic:    buildYTDLPCompartmentSnapshot(admGeneric, admSrc != nil, genericSrcForComp, genericFallbackEnabled),
 		YouTubeEJS: buildYTDLPCompartmentSnapshot(admEJS, admSrc != nil, nil, runtimeCfg.YouTubeHelper),
 	}
 

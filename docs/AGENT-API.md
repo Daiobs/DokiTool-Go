@@ -891,7 +891,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | **抖音（`douyin`）、哔哩哔哩（`bilibili`）** | 纯 Go 解析；若开启上海 `pull` 模式（哔哩哔哩需同时在主后端显式开启 `DOKITOOL_SHANGHAI_BILIBILI`），上海 `shanghai-resolver` 默认运行 `3` 个出站 worker。当全部上海 worker 忙碌时，主后端最多等待 **`300ms`**，未获认领或超时即无阻塞回退日本主后端解析结果（仍返回可用直链，但可能少国内 `*.douyinvod.com` 或 `cn-*.bilivideo.com` 候选）。 | 追求最高吞吐：**`<= 8`**；<br>追求最高上海国内线路命中率：**`<= 3`**（或配合调高 `shanghai-resolver -workers`）。 |
 | **X（`x`）常规图文与视频推文** | 默认优先走纯 Go 官方 Syndication 快路径（无需拉起 `yt-dlp` 子进程）；仅在 Syndication 未命中或需回退时才请求 `yt-dlp` 槽位。 | **`4–8`**（若大批链接含需回退的复杂推文，建议降至 **`1–2`**）。 |
 | **快手、小红书、皮皮虾等纯 Go 平台** | 纯 Go 无状态抓取与探测，无子进程开销。 | **`4–8`**（建议不超过 `DOKITOOL_OWNER_CONCURRENCY`）。 |
-| **Instagram、Facebook、Tumblr** | 每次未命中缓存的解析均需申请全局共享的 `DOKITOOL_YTDLP_CONCURRENCY` 子进程信号量（默认 `2`，可配置范围 `1..24`）。 | **`<= 1–2`**（默认配置下建议 `1`，留出余量避免长时间占满全部提取器槽位）。 |
+| **Instagram、Facebook、Tumblr** | 每次未命中缓存的解析均需申请社交慢解析舱（`PARSE_SLOW`）的 `yt-dlp` 子进程并发槽位（默认 `4`，通过 `DOKITOOL_YTDLP_CONCURRENCY` / `runtime.json` 调整，与 YouTube / 通用长尾分舱隔离）。 | **`<= 2–4`**（建议结合当前分舱并发留出余量，避免长时间占满全部社交提取器槽位）。 |
 | **第二级通用具名提取器长尾站点（`DOKITOOL_YTDLP_GENERIC_ENABLED`）** | 独立隔离的 `PARSE_GENERIC` 准入池与 `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` 并发上限（默认 `2`，与核心快/慢池隔离；认证密钥同时受自身 `slow_concurrency` 约束）；成功缓存 TTL 上限 `60s`。 | **`1`**（长尾站点响应耗时波动较大，建议低并发串行或小批量提交）。 |
 
 > **提示**：解析与 CDN 媒体文件下载可以流水线解耦——例如保持 `4` 个并发协程调用 `/api/parse`，拿到直链后立即交给 `4–8` 个独立的 CDN 下载协程流式落盘。
@@ -899,12 +899,13 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 ### 6.3 服务端短时解析缓存（`DOKITOOL_PARSE_CACHE`）与零槽位缓存快路径
 
 - **默认启用**：主后端内置上限为 `4096` 条、`64 MiB` 的并发读锁（`RWMutex`）LRU 结果缓存及同键并发请求合并（`singleflight`）。相同 `(route, platform, normalized_url, item_id, debug)` 的并发或短时重复请求只会访问一次上游平台。
-- **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：携带有效 Bearer 密钥请求 `GET /api/parse` 或 `GET /api/resolve` 时，若目标平台通过该密钥的 `platforms` 白名单校验且进程内缓存存在未过期条目，服务端仅校验该密钥的快读速率桶（`rps > 0` 时为 `max(rps*4, 20.0)` / `max(burst*4, 64)`；`rps == 0` 不限速），在纯读锁下直接返回缓存响应并累加该密钥的 `cache_hits`，**占用 `0` 个 `keyPool` 并发槽位**——即使该密钥的全部并发槽位正被慢上游解析占满，新鲜缓存命中仍能毫秒级即时返回。
-- **动态 TTL（`10s..180s`；第二级通用长尾上限 `60s`）**：
-  - 若响应内包含任何 `expires_at`，核心平台缓存寿命取 **`min(180s, earliest_expires_at - now - 60s)`**（第二级通用具名提取器响应额外封顶在 **`60s`**）；若扣除 `60s` 安全余量后不足 `10s`，则不写入缓存，确保缓存绝不返回即将过期的直链。
-  - 若响应不含 `expires_at`，成功响应缓存 **`60s`**。
-  - `404 CONTENT_UNAVAILABLE` 负缓存 **`10s`**；`429`、`5xx` 及其他错误不缓存。
-  - **`weibo` 与 `youtube` 永久不缓存且不合并**（在 `/api/stats` 中计入 `cache.by_channel.*.uncacheable`）。
+- **鉴权后零槽位缓存快路径（Post-Auth Zero-Slot Cache Fast-Path）**：携带有效 Bearer 密钥请求 `GET /api/parse` 或 `GET /api/resolve` 时，若目标平台通过该密钥的 `platforms` 白名单校验、未被 `disabled_platforms` 手动禁用且进程内缓存存在未过期条目，服务端仅校验该密钥的快读速率桶（`rps > 0` 时为 `max(rps*4, 20.0)` / `max(burst*4, 64)`；`rps == 0` 不限速），在纯读锁下直接返回缓存响应并累加该密钥的 `cache_hits`，**占用 `0` 个 `keyPool` 并发槽位**——即使该密钥的全部并发槽位正被慢上游解析占满，新鲜缓存命中仍能毫秒级即时返回。
+- **动态 TTL（核心平台 `10s..600s`、YouTube 默认 `120s`、第二级通用长尾上限 `60s`）**：
+  - 若响应内包含任何 `expires_at`，核心平台新鲜缓存寿命取 **`min(600s, earliest_expires_at - now - 60s)`**（YouTube 服务端 `/api/parse` 额外受 `cache.youtube_parse_ttl` 默认 **`120s`** 封顶，设为 `0s` 可关闭；第二级通用具名提取器额外封顶在 **`60s`**）；若扣除 `60s` 安全余量后不足 `10s`，则不写入缓存，确保缓存绝不返回即将过期的直链。
+  - 若响应不含 `expires_at`，核心平台成功响应默认缓存 **`300s`**（仍受上述平台上限约束）。
+  - **`stale-if-error` 过期兜底**：当实时回源遭遇上游/系统故障（`UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` / `INTERNAL_ERROR` 或可重试 `RATE_LIMITED`）或平台自动熔断打开时，若存在未超过 `cache.stale_if_error_ttl`（默认 `600s`）且严格早于 **`earliest_expires_at - 15s`** 硬顶的历史成功条目，服务端返回该兜底响应并附加 `X-DokiTool-Cache: stale`；人工配置的 `disabled_platforms` 紧急下线不走缓存兜底，直接返回 `503`。
+  - 负缓存：`404 CONTENT_UNAVAILABLE` 缓存 **`10s`**，`403 UPSTREAM_BLOCKED` 缓存 `cache.upstream_blocked_neg_ttl`（默认 **`5s`**，置 `0s` 关闭）；负缓存绝不作为 `stale` 兜底返回，其他 `429`/`5xx` 错误不写入缓存。
+  - **`weibo` 永久不缓存且不合并**（在 `/api/stats` 中计入 `cache.by_channel.*.uncacheable`）；`youtube` 仅在 `cache.youtube_parse_ttl = 0s` 时记为 `uncacheable`。
 - HTTP 响应头始终保持 `Cache-Control: no-store`，防止反向代理或客户端 HTTP 缓存组件在进程外把签名直链缓存过久。
 
 ### 6.4 CDN 直链有效期（`expires_at`）与即时下载原则

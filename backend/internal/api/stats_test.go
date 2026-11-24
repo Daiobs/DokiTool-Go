@@ -2250,4 +2250,21 @@ func TestStatsSnapshotExtendedPoolsCircuitBreakersAndRuntimePolicy(t *testing.T)
 		rp.YouTubeParseTTLSeconds != 90 || rp.StaleIfErrorTTLSeconds != 300 || rp.UpstreamBlockedNegTTLSeconds != 10 {
 		t.Fatalf("unexpected runtime_policy snapshot: %+v", rp)
 	}
+
+	// 3. Explicit nil compartment sources MUST report enabled=false even when YTDLPEnabled=true.
+	h.Stats().SetYTDLPCompartmentSources(
+		nil,
+		stubYTDLPStatsSource{snap: ytengine.SlotStatsSnapshot{Enabled: true, Active: 1, ConcurrencyLimit: 4}},
+		nil,
+	)
+	partialSnap := h.Stats().Snapshot()
+	if partialSnap.YTDLPPools.YouTube.Enabled {
+		t.Fatalf("expected explicitly nil youtube compartment source to report enabled=false: %+v", partialSnap.YTDLPPools.YouTube)
+	}
+	if !partialSnap.YTDLPPools.Social.Enabled {
+		t.Fatalf("expected wired social compartment source to report enabled=true: %+v", partialSnap.YTDLPPools.Social)
+	}
+	if partialSnap.YTDLPPools.Generic.Enabled {
+		t.Fatalf("expected explicitly nil generic compartment source to report enabled=false: %+v", partialSnap.YTDLPPools.Generic)
+	}
 }

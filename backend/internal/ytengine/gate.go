@@ -26,6 +26,24 @@ type Resolver interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
+// sensitiveRedirectHeaders enumerates credential headers stripped unconditionally
+// after any cross-host, cross-port, or HTTPS->HTTP downgrade redirect.
+// Proxy-Authorization is additionally never forwarded on hop 0 either.
+var sensitiveRedirectHeaders = []string{
+	"Authorization",
+	"Proxy-Authorization",
+	"Cookie",
+}
+
+func isSensitiveRedirectHeader(name string) bool {
+	for _, h := range sensitiveRedirectHeaders {
+		if strings.EqualFold(name, h) {
+			return true
+		}
+	}
+	return false
+}
+
 // gateTestHooks holds test-only transport overrides configured exclusively by
 // unexported test helpers within package ytengine. Production engines always
 // run with testHooks == nil.
@@ -580,7 +598,7 @@ func (s *gateSession) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				if strings.EqualFold(k, "Proxy-Connection") || strings.EqualFold(k, "Proxy-Authorization") {
 					continue
 				}
-				if stripCreds && (strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie")) {
+				if stripCreds && isSensitiveRedirectHeader(k) {
 					continue
 				}
 				if bodyReader == nil && (strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Type") || strings.EqualFold(k, "Transfer-Encoding")) {

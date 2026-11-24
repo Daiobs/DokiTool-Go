@@ -94,10 +94,11 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `DOKITOOL_YTDLP_BINARY` | 指定受官方发布摘要锁定校验的外部提取器路径（支持官方单文件二进制与零解压 `yt-dlp` Python zipapp，均须匹配 `OfficialSHA256Sums` 中的锁定 SHA-256） | 否 |
-| `DOKITOOL_YTDLP_CONCURRENCY` | 指定核心海外提取器平台共享的最大并发子进程数 | 否 |
-| `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` | 指定第二级通用具名提取器兜底独立隔离的最大并发子进程数（整数 `1..24`，默认 `2`；与核心慢解析池及核心 `yt-dlp` 槽位严格隔离，非法或越界值在启动阶段即拒绝运行） | 否 |
+| `DOKITOOL_YTDLP_PYTHON` | 可选，显式指定执行零解压 `yt-dlp` Python zipapp 的受控 Python 解释器绝对路径（例如 `/opt/dokitool/ytdlp-venv/bin/python3`）；启动阶段与每次子进程执行前均复验常规可执行权限、符号链接目标一致性及祖先目录链安全（禁止无 sticky 位的全局可写目录） | 否 |
+| `DOKITOOL_YTDLP_CONCURRENCY` | 指定核心海外提取器平台（`PARSE_YOUTUBE` 与 `PARSE_SLOW` 未单独覆写时）默认继承的并发槽位数（`1..24`，且 `PARSE_YOUTUBE + PARSE_SLOW + PARSE_GENERIC` 三舱总和须 `<= 32`） | 否 |
+| `DOKITOOL_YTDLP_GENERIC_CONCURRENCY` | 指定第二级通用具名提取器兜底独立隔离的最大并发子进程数（整数 `1..24`，默认 `2`；与核心慢解析池及核心 `yt-dlp` 槽位严格隔离，且三舱总和须 `<= 32`，非法或越界值在启动阶段即拒绝运行） | 否 |
 | `DOKITOOL_YTDLP_TIMEOUT` | 指定单次外部提取器子进程调用的超时时长 | 否 |
-| `DOKITOOL_YTDLP_GATE_PORTS` | 按逗号分隔指定本地回环任务网关监听端口池（端口数量须与提取器并发上限一致） | 否 |
+| `DOKITOOL_YTDLP_GATE_PORTS` | 按逗号分隔指定本地回环多路复用任务网关监听端口池（支持单端口如 `23101` 或少量固定端口，通过每任务独立随机凭据在同一持久端口上并发多路复用全部 `yt-dlp` 分舱任务，无需与并发槽位数 1:1 匹配；若个别端口已被占用则记录告警日志并跳过） | 否 |
 | `DOKITOOL_YTDLP_PROXY` | 外部提取器代理配置项（启用出站目标白名单策略时禁止设置；若携带代理凭据则属敏感信息） | 是 |
 | `DOKITOOL_DENO_BINARY` | 指定用于无权限沙箱解算 YouTube 签名挑战且受摘要校验的 Deno 可执行文件路径 | 否 |
 | `DOKITOOL_EJS_DIR` | 指定存放受摘要校验的 YouTube 签名解算脚本文件的目录路径 | 否 |
@@ -109,18 +110,18 @@
 > **`yt-dlp` 零解压 Python Zipapp 运维切换说明（推荐用于海外解析加速）**：
 > - **消除每次冷启动约 35 MiB PyInstaller 解压开销**：官方 Release 同批次提供的 `yt-dlp`（Python zipapp，含 `#!/usr/bin/env python3` 与 ZIP 头）的 SHA-256 已同步锁定于 `backend/internal/ytengine/engine.go` 的 `OfficialSHA256Sums` 中（随 `scripts/bump-runtime-pins.py` 自动同步更新）。
 > - **宿主机前置条件与 Python 运行时依赖**：
->   - 宿主机须具备符合该 `yt-dlp` 版本要求的系统 `python3`（通常 Python 3.10+）且位于安全 `PATH`（绝对路径、非全局可写目录、可执行权限）中；
->   - 因为 `ytengine` 在子进程中强制注入 `PYTHONNOUSERSITE=1`（隔离 `~/.local` 用户目录），单文件 `yt-dlp_linux` 内置的可选运行库在切换为 zipapp 后需预装于**宿主机系统级 Python `site-packages` / `dist-packages`** 中，推荐齐备以下 4 项依赖以保持与官方 PyInstaller 二进制一致的解析能力：
+>   - 宿主机须具备符合该 `yt-dlp` 版本要求的 `python3`（通常 Python 3.10+）：既可使用位于安全 `PATH` 中的系统 `python3`，也推荐通过 `DOKITOOL_YTDLP_PYTHON` 显式指向独立受控虚拟环境解释器（例如 `/opt/dokitool/ytdlp-venv/bin/python3`），并保证可执行文件及其符号链接目标与各级祖先目录均非无 sticky 位的全局可写目录；
+>   - 因为 `ytengine` 在子进程中强制注入 `PYTHONNOUSERSITE=1`（隔离 `~/.local` 用户目录），单文件 `yt-dlp_linux` 内置的可选运行库在切换为 zipapp 后需预装于对应的**系统级 `site-packages` 或 `DOKITOOL_YTDLP_PYTHON` 所指 venv** 中，推荐齐备以下 4 项依赖以保持与官方 PyInstaller 二进制一致的解析能力：
 >     - `curl_cffi`（TLS 指纹模拟 / `--impersonate`，覆盖反爬较严的海外站点）
 >     - `brotli`（Brotli `br` 响应体解压）
 >     - `websockets`（部分长尾提取器的 WebSocket 通信支持）
 >     - `pycryptodomex`（加密 HLS / AES-128 解密与签名运算，导入名 `Cryptodome`）
 >   - 切换前建议以相同隔离环境变量执行一次依赖自检：
 >     ```sh
->     PYTHONNOUSERSITE=1 python3 -c "import curl_cffi, brotli, websockets, Cryptodome; print('OK')"
+>     PYTHONNOUSERSITE=1 "${DOKITOOL_YTDLP_PYTHON:-python3}" -c "import curl_cffi, brotli, websockets, Cryptodome; print('OK')"
 >     ```
 >     （缺失可选依赖不会导致启动期 `--version` 预检报错，但可能导致个别需要 TLS 指纹模拟或加密流解密的站点在运行期降级或解析失败。）
-> - **切换与回滚步骤**：将与当前 `PinnedVersion` 匹配的官方 `yt-dlp` zipapp 放至受控目录（如 `0644` 或 `0755` 权限）并核对 `sha256sum`，确认上述系统级 Python 依赖可用后，通过 systemd drop-in 将 `DOKITOOL_YTDLP_BINARY` 指向该 zipapp 路径并重启 `dokitool-go.service`。启动时 `ytengine` 会自动校验 SHA-256、使用安全 `PATH` 中的 `python3` 执行 `--version` 自检，并在子进程环境中固定开启 `PYTHONDONTWRITEBYTECODE=1` 与 `PYTHONNOUSERSITE=1`（零 `_MEI*` 临时解压、零 `.pyc` 写入）；如需回滚，只需将 `DOKITOOL_YTDLP_BINARY` 改回 `yt-dlp_linux` 并重启即可。
+> - **切换与回滚步骤**：将与当前 `PinnedVersion` 匹配的官方 `yt-dlp` zipapp 放至受控目录（如 `0644` 或 `0755` 权限）并核对 `sha256sum`，确认上述 Python 依赖可用后，通过 systemd drop-in 将 `DOKITOOL_YTDLP_BINARY` 指向该 zipapp 路径（如使用独立 venv，同时配置 `DOKITOOL_YTDLP_PYTHON`）并重启 `dokitool-go.service`。启动时 `ytengine` 会自动校验 SHA-256、使用指定的受控 Python 解释器执行 `--version` 自检，并在每次子进程执行前复验解释器路径一致性与权限，同时固定开启 `PYTHONDONTWRITEBYTECODE=1` 与 `PYTHONNOUSERSITE=1`（零 `_MEI*` 临时解压、零 `.pyc` 写入）；如需回滚，只需将 `DOKITOOL_YTDLP_BINARY` 改回 `yt-dlp_linux`（并清空 `DOKITOOL_YTDLP_PYTHON`）后重启即可。
 
 ### 4. 准入控制限流与并发池
 
@@ -196,6 +197,9 @@
 | `VITE_API_MODE` | 前端构建期选择接口路由模式（同源兼容路由模式或独立跨域安全路由模式） | 否 |
 | `VITE_API_BASE_URL` | 前端构建期指定后端 API 基础源站地址（同源部署时留空） | 否 |
 | `DEV_API_TARGET` | 本地前端开发服务器将同源接口请求代理转发至本地后端实例的目标源站地址 | 否 |
+
+> **下载 Service Worker（`frontend/public/downloads/worker.js`）浏览器侧防护边界**：
+> 下载 Service Worker 在接收下载目标以及主下载 `prepare()` / Range 分片 `fetchChunk()` 跟随公网 CDN 正常 `302` 重定向返回后，均会调用 `sourceUrl()` 对初始 URL 与最终 `response.url` 强制复检：拒绝私网/保留/变形 IPv4、非全局单播 IPv6、非标准端口（非 80/443）、内网后缀（`localhost` / `local` / `localdomain` / `internal` / `lan` / `corp` / `home.arpa`）及单标签主机名（如 `http://router/...`）；一旦落点违例立即 `body.cancel()` 并终止下载任务。由于浏览器 Service Worker 沙箱无法主动查询 DNS 解析记录，该校验属于 URL 字面量与最终重定向落点防护层（与后端出站解析的逐跳公网 IP 校验互补）。
 
 ---
 
@@ -311,7 +315,7 @@
 | `circuit_breaker.failure_rate_threshold` | `0.6` | `(0.0, 1.0]` | 滑动窗口失败率熔断阈值 |
 | `circuit_breaker.open_duration` | `"30s"` | `5s..600s` | 熔断打开后进入 `half_open` 探活前的冷却时长 |
 | `circuit_breaker.half_open_max_probes` | `2` | `1..16` | `half_open` 状态下允许并发放行的探活请求上限 |
-| `circuit_breaker.disabled_platforms` | `[]` | 14 核心平台 ID 或 `"ytdlp_generic"` | 手动强制熔断止血列表（自动去重；即使 `enabled: false` 也生效，优先返回未超硬顶的过期缓存，否则直接 `503` 快速失败） |
+| `circuit_breaker.disabled_platforms` | `[]` | 14 核心平台 ID 或 `"ytdlp_generic"` | 手动强制紧急下线列表（自动去重；即使 `enabled: false` 也生效；热重载时立即清理该平台存量缓存，并在查缓存前直接拦截返回 `503` 快速失败，绝不返回 `fresh` 或 `stale` 缓存） |
 | `cache.youtube_parse_ttl` | `"120s"` | `0s..600s` | YouTube 服务端 `/api/parse` 缓存上限（受 `earliest_expires_at - 60s` 收缩；`"0s"` 可一键停用 YouTube 服务端缓存） |
 | `cache.stale_if_error_ttl` | `"600s"` | `0s..3600s` | `stale-if-error` 过期兜底窗口（铁律：含 `expires_at` 的响应硬顶绝不超过 `earliest_expires_at - 15s`；`"0s"` 关闭） |
 | `cache.upstream_blocked_neg_ttl` | `"5s"` | `0s..60s` | `UPSTREAM_BLOCKED` 短负缓存时长（`"0s"` 关闭；负缓存绝不作为过期兜底返回） |

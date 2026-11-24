@@ -238,6 +238,9 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 	if !h.isCacheableRequest(platform, source) {
 		return cacheKey{}, "", false
 	}
+	if h.cb.IsDisabled(platform) {
+		return cacheKey{}, "", false
+	}
 	itemID := ""
 	if path == "/api/resolve" {
 		id, ok := queryValue(rawQuery, "item_id")
@@ -436,15 +439,7 @@ func encodeResponse(status int, payload unified.Object) (cachedResponse, bool) {
 }
 
 func isStaleFallbackTrigger(res cachedResponse) bool {
-	if !res.retryable {
-		return false
-	}
-	switch res.code {
-	case "UPSTREAM_TIMEOUT", "UPSTREAM_UNAVAILABLE", "RATE_LIMITED":
-		return true
-	default:
-		return false
-	}
+	return isCircuitBreakerFailure(res.code) || (res.retryable && res.code == "RATE_LIMITED")
 }
 
 func schemaVersionConflictMessage(ctx context.Context) string {
@@ -617,6 +612,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "/api/resolve" {
 		resolveItemID = itemID
 	}
+	if h.cb.IsDisabled(platform) {
+		res := circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
+		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
+		writeResponse(w, res)
+		return
+	}
 	if h.cache == nil || h.cache.cfg.Disabled || !h.isCacheableRequest(platform, source) {
 		h.stats.recordCacheUncacheable(channel)
 		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, h.now())
@@ -688,14 +689,16 @@ func (h *Handler) serveCachedParse(
 	if !joining {
 		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, now)
 		if !allowed {
-			policy := h.getCachePolicy()
-			if staleRes, ok := h.cache.getStaleLocked(key, now, policy.StaleIfErrorTTL); ok {
-				h.cache.mu.Unlock()
-				h.stats.recordCacheStaleHit(channel)
-				h.recordParseTelemetry(platform, staleRes.platform, staleRes.code, channel, time.Since(wallStart))
-				w.Header().Set("X-DokiTool-Cache", "stale")
-				writeResponse(w, staleRes)
-				return
+			if !h.cb.IsDisabled(platform) {
+				policy := h.getCachePolicy()
+				if staleRes, ok := h.cache.getStaleLocked(key, now, policy.StaleIfErrorTTL); ok {
+					h.cache.mu.Unlock()
+					h.stats.recordCacheStaleHit(channel)
+					h.recordParseTelemetry(platform, staleRes.platform, staleRes.code, channel, time.Since(wallStart))
+					w.Header().Set("X-DokiTool-Cache", "stale")
+					writeResponse(w, staleRes)
+					return
+				}
 			}
 			h.cache.mu.Unlock()
 			res := circuitBreakerOpenResponse(platform, retryAfterSec)
@@ -811,7 +814,9 @@ func (h *Handler) runSingleflight(
 
 		servedStale := false
 		if !abandoned && ctx.Err() == nil {
-			if cacheable {
+			if h.cb.IsDisabled(platform) {
+				res = circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
+			} else if cacheable {
 				h.cache.putWithStaleLocked(key, res, freshUntil, hardExpiresAt, res.code == "OK")
 			} else if isStaleFallbackTrigger(res) {
 				if staleRes, ok := h.cache.getStaleLocked(key, finishNow, policy.StaleIfErrorTTL); ok {

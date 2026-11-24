@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -316,4 +317,207 @@ func TestCircuitBreakerDisabledPlatformAlsoCoversGenericAndConcurrentRace(t *tes
 		}
 	}()
 	wg.Wait()
+}
+
+func TestDisabledPlatformImmediateBlockAndCachePurgeM4(t *testing.T) {
+	const startUnix int64 = 1793448000
+	var nowSec atomic.Int64
+	nowSec.Store(startUnix)
+	clock := func() time.Time { return time.Unix(nowSec.Load(), 0).UTC() }
+
+	c := loadCacheTestCatalog(t)
+	var dyCalls, biliCalls atomic.Int32
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			dyCalls.Add(1)
+			exp := time.Unix(now+1200, 0).UTC().Format(time.RFC3339)
+			return makeSyntheticEnvelope("douyin", src, now, exp), nil
+		}),
+		"bilibili": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			biliCalls.Add(1)
+			exp := time.Unix(now+1200, 0).UTC().Format(time.RFC3339)
+			return makeSyntheticEnvelope("bilibili", src, now, exp), nil
+		}),
+	}, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ownerTok := randomPrintableToken(t, 48)
+	auth, err := NewOwnerAuth(ownerTok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := WithAdmissionWithOwner(h, nil, "direct", "", DefaultAdmissionConfig(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dyURL := "https://www.douyin.com/video/7400000000000000099"
+	dyReq := "/api/parse?schema_version=1.0&url=" + url.QueryEscape(dyURL)
+	biliURL := "https://www.bilibili.com/video/BV1xx411c7mD"
+	biliReq := "/api/parse?schema_version=1.0&url=" + url.QueryEscape(biliURL)
+
+	// 1. Prime both douyin and bilibili caches (freshUntil = +600s, hardExpiresAt = +1185s).
+	for _, path := range []string{dyReq, biliReq} {
+		w := httptest.NewRecorder()
+		entry.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("prime %s failed: code=%d body=%s", path, w.Code, w.Body.String())
+		}
+	}
+	if !h.HasFreshCachedParse("/api/parse", "schema_version=1.0&url="+url.QueryEscape(dyURL)) {
+		t.Fatal("expected douyin to have fresh cache before disable")
+	}
+
+	// 2. Disable douyin via ApplyRuntimeConfig -> MUST purge douyin cache immediately (leaving bilibili cached)
+	// and block BOTH anonymous and owner-authenticated requests with 503 (never serving fresh OR stale cache).
+	rt := DefaultRuntimeConfig()
+	rt.CircuitBreaker.DisabledPlatforms = []string{"douyin"}
+	if !ApplyRuntimeConfig(entry, h, rt, true, true) {
+		t.Fatal("ApplyRuntimeConfig failed")
+	}
+	if h.HasFreshCachedParse("/api/parse", "schema_version=1.0&url="+url.QueryEscape(dyURL)) {
+		t.Fatal("HasFreshCachedParse must return false for disabled platform")
+	}
+	if entries, _ := h.cache.stats(); entries != 1 {
+		t.Fatalf("expected purgePlatforms to remove douyin entry while keeping bilibili (entries=1), got %d", entries)
+	}
+
+	// Anonymous request -> immediate 503 with zero upstream calls and zero cache header.
+	wAnon := httptest.NewRecorder()
+	entry.ServeHTTP(wAnon, httptest.NewRequest(http.MethodGet, dyReq, nil))
+	if wAnon.Code != http.StatusServiceUnavailable || dyCalls.Load() != 1 || wAnon.Header().Get("X-DokiTool-Cache") != "" {
+		t.Fatalf("disabled platform leaked fresh/stale cache to anon: code=%d calls=%d hdr=%q", wAnon.Code, dyCalls.Load(), wAnon.Header().Get("X-DokiTool-Cache"))
+	}
+
+	// Owner-authenticated request (would normally hit post-auth zero-slot cache fast-path) -> MUST also get 503!
+	reqOwner := httptest.NewRequest(http.MethodGet, dyReq, nil)
+	reqOwner.Header.Set("Authorization", "Bearer "+ownerTok)
+	wOwner := httptest.NewRecorder()
+	entry.ServeHTTP(wOwner, reqOwner)
+	if wOwner.Code != http.StatusServiceUnavailable || dyCalls.Load() != 1 || wOwner.Header().Get("X-DokiTool-Cache") != "" {
+		t.Fatalf("disabled platform leaked fresh/stale cache to owner: code=%d calls=%d hdr=%q", wOwner.Code, dyCalls.Load(), wOwner.Header().Get("X-DokiTool-Cache"))
+	}
+
+	// Even if a stale entry is manually re-inserted into cache while platform is disabled, ServeHTTP MUST still block with 503.
+	ck := cacheKey{route: "/api/parse", platform: "douyin", url: normalizeCacheURL("douyin", dyURL)}
+	okRes, _ := encodeResponse(http.StatusOK, makeSyntheticEnvelope("douyin", dyURL, startUnix, time.Unix(startUnix+1200, 0).UTC().Format(time.RFC3339)))
+	h.cache.mu.Lock()
+	h.cache.putWithStaleLocked(ck, okRes, time.Unix(startUnix+50, 0).UTC(), time.Unix(startUnix+1185, 0).UTC(), true)
+	h.cache.mu.Unlock()
+	nowSec.Store(startUnix + 200) // inside stale window, past freshUntil
+	wStaleBlocked := httptest.NewRecorder()
+	entry.ServeHTTP(wStaleBlocked, httptest.NewRequest(http.MethodGet, dyReq, nil))
+	if wStaleBlocked.Code != http.StatusServiceUnavailable || wStaleBlocked.Header().Get("X-DokiTool-Cache") != "" {
+		t.Fatalf("disabled platform must never serve stale cache: code=%d hdr=%q", wStaleBlocked.Code, wStaleBlocked.Header().Get("X-DokiTool-Cache"))
+	}
+
+	// Bilibili remains completely unaffected and hits its fresh cache!
+	wBili := httptest.NewRecorder()
+	entry.ServeHTTP(wBili, httptest.NewRequest(http.MethodGet, biliReq, nil))
+	if wBili.Code != http.StatusOK || wBili.Header().Get("X-DokiTool-Cache") != "hit" || biliCalls.Load() != 1 {
+		t.Fatalf("unaffected bilibili cache should remain warm: code=%d hdr=%q calls=%d", wBili.Code, wBili.Header().Get("X-DokiTool-Cache"), biliCalls.Load())
+	}
+}
+
+func TestCircuitBreakerTimeDecayM5(t *testing.T) {
+	baseNow := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultRuntimeConfig().CircuitBreaker
+	cfg.ConsecutiveFailures = 3
+	cfg.WindowSize = 4
+	cfg.FailureRateThreshold = 0.5
+	cfg.OpenDuration = 60 * time.Second // sampleMaxAge = max(5m, 10*60s) = 10m
+
+	cb := newCircuitBreakerManager(cfg)
+
+	// Record 2 failures at t=0 -> not yet open (threshold=3, windowCount=2 < 4).
+	cb.Finish("tumblr", "UPSTREAM_TIMEOUT", 0, baseNow)
+	cb.Finish("tumblr", "UPSTREAM_UNAVAILABLE", 0, baseNow.Add(10*time.Second))
+	tbIdx := corePlatformIndex("tumblr")
+	if s := cb.Snapshot(baseNow.Add(5 * time.Minute))[tbIdx]; s.ConsecutiveFailures != 2 || s.WindowFailures != 2 || s.WindowTotal != 2 {
+		t.Fatalf("samples within 10m window should remain intact: %+v", s)
+	}
+
+	// Advance past 10m (10m + 11s): both old samples & consecutiveFailures MUST decay to 0!
+	tDecayed := baseNow.Add(10*time.Minute + 11*time.Second)
+	if s := cb.Snapshot(tDecayed)[tbIdx]; s.State != CircuitStateClosed || s.ConsecutiveFailures != 0 || s.WindowFailures != 0 || s.WindowTotal != 0 {
+		t.Fatalf("stale samples did not decay past sampleMaxAge: %+v", s)
+	}
+
+	// Another sporadic failure hours later must NOT accumulate with expired failures to trip breaker!
+	tNextDay := tDecayed.Add(24 * time.Hour)
+	cb.Finish("tumblr", "UPSTREAM_TIMEOUT", 0, tNextDay)
+	if s := cb.Snapshot(tNextDay)[tbIdx]; s.State != CircuitStateClosed || s.ConsecutiveFailures != 1 || s.WindowFailures != 1 || s.WindowTotal != 1 {
+		t.Fatalf("sporadic cross-day failure tripped or miscounted after decay: %+v", s)
+	}
+}
+
+func TestStaleFallbackCoversUpstreamInvalidResponseAndInternalErrorM6AndCeilingLow8(t *testing.T) {
+	const startUnix int64 = 1793448000
+	var nowSec atomic.Int64
+	nowSec.Store(startUnix)
+	clock := func() time.Time { return time.Unix(nowSec.Load(), 0).UTC() }
+
+	c := loadCacheTestCatalog(t)
+	var mode atomic.Int32 // 0=OK, 1=adapter Go error (-> 502 UPSTREAM_INVALID_RESPONSE), 2=INTERNAL_ERROR, 3=retryable RATE_LIMITED
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			switch mode.Load() {
+			case 1:
+				return nil, errors.New("synthetic adapter decode failure")
+			case 2:
+				return unified.ContractError("INTERNAL_ERROR", "内部异常", false), nil
+			case 3:
+				return unified.ContractError("RATE_LIMITED", "限流", true), nil
+			default:
+				exp := time.Unix(startUnix+500, 0).UTC().Format(time.RFC3339)
+				return makeSyntheticEnvelope("douyin", src, now, exp), nil
+			}
+		}),
+	}, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := DefaultRuntimeConfig()
+	rt.CircuitBreaker.ConsecutiveFailures = 10 // Keep breaker closed so we exercise live stale-if-error directly.
+	rt.Cache.StaleIfErrorTTL = 600 * time.Second
+	ApplyRuntimeConfig(nil, h, rt, true, false)
+
+	target := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.douyin.com/video/7400000000000000077")
+	w0 := httptest.NewRecorder()
+	h.ServeHTTP(w0, httptest.NewRequest(http.MethodGet, target, nil))
+	if w0.Code != http.StatusOK {
+		t.Fatalf("prime failed: %d", w0.Code)
+	}
+
+	// Move past freshUntil (+440s) and inside hardExpiresAt (+485s).
+	nowSec.Store(startUnix + 450)
+	for _, tc := range []struct {
+		name string
+		mode int32
+	}{
+		{"adapter-error-UPSTREAM_INVALID_RESPONSE", 1},
+		{"non-retryable-INTERNAL_ERROR", 2},
+		{"retryable-RATE_LIMITED", 3},
+	} {
+		mode.Store(tc.mode)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		if w.Code != http.StatusOK || w.Header().Get("X-DokiTool-Cache") != "stale" {
+			t.Fatalf("%s: expected 200 stale fallback, got code=%d hdr=%q body=%s", tc.name, w.Code, w.Header().Get("X-DokiTool-Cache"), w.Body.String())
+		}
+	}
+
+	// Verify Low-8: non-retryable RATE_LIMITED or NO_MEDIA does NOT trigger stale fallback.
+	if isStaleFallbackTrigger(cachedResponse{code: "RATE_LIMITED", retryable: false}) {
+		t.Fatal("non-retryable RATE_LIMITED must not trigger stale fallback")
+	}
+	if isStaleFallbackTrigger(cachedResponse{code: "UPSTREAM_BLOCKED", retryable: true}) {
+		t.Fatal("UPSTREAM_BLOCKED must not trigger stale fallback")
+	}
+	if !isStaleFallbackTrigger(cachedResponse{code: "UPSTREAM_INVALID_RESPONSE", retryable: false}) ||
+		!isStaleFallbackTrigger(cachedResponse{code: "INTERNAL_ERROR", retryable: false}) {
+		t.Fatal("UPSTREAM_INVALID_RESPONSE and INTERNAL_ERROR must trigger stale fallback")
+	}
 }

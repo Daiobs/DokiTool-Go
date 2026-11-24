@@ -237,9 +237,9 @@ func (c AdmissionConfig) Validate() error {
 	}{
 		{"PARSE", c.Parse, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"RESOLVE", c.Resolve, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
-		{"PARSE_YOUTUBE", c.YouTubeSlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
-		{"PARSE_SLOW", c.SlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
-		{"PARSE_GENERIC", c.GenericSlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"PARSE_YOUTUBE", c.YouTubeSlowParse, ytengine.MaxConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"PARSE_SLOW", c.SlowParse, ytengine.MaxConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"PARSE_GENERIC", c.GenericSlowParse, ytengine.MaxConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"YOUTUBE_EJS", c.YouTubeEJS, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"CATALOG", c.Catalog, 4096, 0, 0},
 		{"WEIBO", c.Relay, 4096, 0, 0},
@@ -267,6 +267,11 @@ func (c AdmissionConfig) Validate() error {
 		if p.QueueSize < 0 || p.QueueSize > entry.maxQueueSize {
 			return fmt.Errorf("DOKITOOL_%s_QUEUE_SIZE must be between 0 and %d", entry.name, entry.maxQueueSize)
 		}
+	}
+	// Keep the three yt-dlp slow compartments bounded to the shared host budget
+	// even when configured purely via environment variables without runtime.json.
+	if c.YouTubeSlowParse.GlobalConcurrency+c.SlowParse.GlobalConcurrency+c.GenericSlowParse.GlobalConcurrency > ytengine.MaxTotalActiveSlots {
+		return fmt.Errorf("combined DOKITOOL_PARSE_YOUTUBE/PARSE_SLOW/PARSE_GENERIC global concurrency cannot exceed %d", ytengine.MaxTotalActiveSlots)
 	}
 	// The existing relay also owns twelve binary-stream leases. Do not advertise
 	// a larger outer capacity while its independent stream guard remains in place.

@@ -82,6 +82,7 @@ type Engine struct {
 	binarySHA256        string
 	binaryAsset         string
 	pythonPath          string
+	resolvedPythonPath  string
 	allowedURL          func(string) bool
 	allowedOutboundHost func(string) bool
 	resolver            Resolver
@@ -229,45 +230,79 @@ func isSafeExecutableFile(stat os.FileInfo) bool {
 	return true
 }
 
-func validatePythonPath(raw string) (string, error) {
+func validateSafeParentDirs(filePath string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir := filepath.Dir(filePath)
+	for {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat DOKITOOL_YTDLP_PYTHON ancestor directory %s: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("DOKITOOL_YTDLP_PYTHON ancestor %s is not a directory", dir)
+		}
+		mode := info.Mode()
+		// Reject world-writable directories without sticky bit (never reject group-writable 0o020 or sticky /tmp).
+		if mode.Perm()&0o002 != 0 && mode&os.ModeSticky == 0 {
+			return fmt.Errorf("DOKITOOL_YTDLP_PYTHON ancestor directory %s must not be world-writable without sticky bit", dir)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return nil
+}
+
+func validatePythonPath(raw string) (string, string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return "", nil
+		return "", "", nil
 	}
 	for _, r := range trimmed {
 		if r < 0x20 || r == 0x7f {
-			return "", errors.New("DOKITOOL_YTDLP_PYTHON contains invalid characters")
+			return "", "", errors.New("DOKITOOL_YTDLP_PYTHON contains invalid characters")
 		}
 	}
 	if !filepath.IsAbs(trimmed) {
-		return "", errors.New("DOKITOOL_YTDLP_PYTHON must be an absolute path")
+		return "", "", errors.New("DOKITOOL_YTDLP_PYTHON must be an absolute path")
 	}
 	cleaned := filepath.Clean(trimmed)
+	if err := validateSafeParentDirs(cleaned); err != nil {
+		return "", "", err
+	}
 	stat, err := os.Stat(cleaned)
 	if err != nil {
-		return "", fmt.Errorf("DOKITOOL_YTDLP_PYTHON is not accessible: %w", err)
+		return "", "", fmt.Errorf("DOKITOOL_YTDLP_PYTHON is not accessible: %w", err)
 	}
 	if !isSafeExecutableFile(stat) {
-		return "", errors.New("DOKITOOL_YTDLP_PYTHON must be a regular executable file that is not world-writable")
+		return "", "", errors.New("DOKITOOL_YTDLP_PYTHON must be a regular executable file that is not world-writable")
 	}
 	resolved, err := filepath.EvalSymlinks(cleaned)
 	if err != nil {
-		return "", fmt.Errorf("resolve DOKITOOL_YTDLP_PYTHON symlink: %w", err)
+		return "", "", fmt.Errorf("resolve DOKITOOL_YTDLP_PYTHON symlink: %w", err)
 	}
 	if !filepath.IsAbs(resolved) {
-		return "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be an absolute path")
+		return "", "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be an absolute path")
+	}
+	if err := validateSafeParentDirs(resolved); err != nil {
+		return "", "", err
 	}
 	resolvedStat, err := os.Stat(resolved)
 	if err != nil {
-		return "", fmt.Errorf("stat DOKITOOL_YTDLP_PYTHON symlink target: %w", err)
+		return "", "", fmt.Errorf("stat DOKITOOL_YTDLP_PYTHON symlink target: %w", err)
 	}
 	if !isSafeExecutableFile(resolvedStat) {
-		return "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be a regular executable file that is not world-writable")
+		return "", "", errors.New("DOKITOOL_YTDLP_PYTHON symlink target must be a regular executable file that is not world-writable")
 	}
 	// Preserve cleaned path (rather than resolved symlink target) so Python
 	// virtualenv launchers (e.g. /opt/dokitool/ytdlp-venv/bin/python3) locate
-	// their adjacent pyvenv.cfg and site-packages.
-	return cleaned, nil
+	// their adjacent pyvenv.cfg and site-packages, while also returning the
+	// canonical resolved path for lightweight pre-exec tamper verification.
+	return cleaned, resolved, nil
 }
 
 func lookupPython3InPath(envPath string) string {
@@ -474,7 +509,7 @@ func New(cfg Config) (*Engine, error) {
 			return NewDisabled(err.Error()), err
 		}
 	}
-	explicitPythonPath, err := validatePythonPath(cfg.PythonPath)
+	explicitPythonPath, explicitResolvedPythonPath, err := validatePythonPath(cfg.PythonPath)
 	if err != nil {
 		return NewDisabled(err.Error()), err
 	}
@@ -493,21 +528,31 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return NewDisabled(err.Error()), err
 	}
-	var pythonPath string
+	var (
+		pythonPath         string
+		resolvedPythonPath string
+	)
 	if detectPythonZipapp(absPath) {
 		if explicitPythonPath != "" {
 			pythonPath = explicitPythonPath
+			resolvedPythonPath = explicitResolvedPythonPath
 			if err := verifyStartupVersion(pythonPath, absPath, envPath); err != nil {
 				reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed with DOKITOOL_YTDLP_PYTHON: %v", err)
 				log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
 				return NewDisabled(reason), errors.New(reason)
 			}
 		} else {
-			pythonPath = lookupPython3InPath(envPath)
+			if candidatePython := lookupPython3InPath(envPath); candidatePython != "" {
+				if cleanPy, resolvedPy, pyErr := validatePythonPath(candidatePython); pyErr == nil {
+					pythonPath = cleanPy
+					resolvedPythonPath = resolvedPy
+				}
+			}
 			if pythonPath != "" {
 				if err := verifyStartupVersion(pythonPath, absPath, envPath); err != nil {
 					log.Printf("dokitool: yt-dlp python3 zipapp self-check failed (%v); attempting direct binary execution fallback", err)
 					pythonPath = ""
+					resolvedPythonPath = ""
 					if directErr := verifyStartupVersion("", absPath, envPath); directErr != nil {
 						reason := fmt.Sprintf("yt-dlp zipapp startup self-check failed (python3: %v; direct: %v)", err, directErr)
 						log.Printf("dokitool: %s; disabling yt-dlp engine", reason)
@@ -532,6 +577,7 @@ func New(cfg Config) (*Engine, error) {
 		binarySHA256:        digest,
 		binaryAsset:         asset,
 		pythonPath:          pythonPath,
+		resolvedPythonPath:  resolvedPythonPath,
 		allowedURL:          cfg.AllowedURL,
 		allowedOutboundHost: cfg.AllowedOutboundHost,
 		resolver:            cfg.Resolver,
