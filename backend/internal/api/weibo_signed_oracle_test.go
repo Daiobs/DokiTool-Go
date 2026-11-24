@@ -1,3 +1,5 @@
+//go:build phporacle
+
 package api
 
 import (

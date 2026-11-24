@@ -238,7 +238,7 @@ def main():
         if venv_deno.is_file() and not environment.get("DOKITOOL_DENO_BINARY"):
             environment["DOKITOOL_DENO_BINARY"] = str(venv_deno)
         environment.update({f"DOKITOOL_GO_{name.upper()}_OUTPUT": str(path) for name, path in platform_outputs.items()})
-        command = [args.go, "test", "-json", "-count=1"]
+        command = [args.go, "test", "-tags=phporacle", "-json", "-count=1"]
         if args.race:
             command.append("-race")
         command.append("./...")
@@ -246,7 +246,7 @@ def main():
         failures = [event for event in events if event.get("Action") == "fail"]
         if failures:
             raise RuntimeError("Go reported a failed test/package")
-        run([args.go, "vet", "./..."], cwd=ROOT / "backend")
+        run([args.go, "vet", "-tags=phporacle", "./..."], cwd=ROOT / "backend")
         actual = json.loads(outputs.read_text())
         labels = [f"shared/{index}" for index in range(len(actual))]
         douyin = json.loads(douyin_outputs.read_text())
