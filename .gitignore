@@ -91,6 +91,7 @@
 /.github/workflows/*
 !/.github/workflows/gateway-isolation.yml
 !/.github/workflows/go-migration.yml
+!/.github/workflows/php-oracle.yml
 !/.github/workflows/release-build.yml
 !/.github/workflows/upstream-watch.yml
 /backend/api/*
@@ -108,6 +109,7 @@
 !/backend/bin/catalog.php
 /backend/cmd/*
 !/backend/cmd/dokitool/
+!/backend/cmd/genstatstypes/
 !/backend/cmd/loadtest/
 !/backend/cmd/shanghai-resolver/
 /backend/config/*
@@ -350,6 +352,7 @@
 !/scripts/prod-smoke/test_smoke.py
 /scripts/tests/*
 !/scripts/tests/test_bump_runtime_pins.py
+!/scripts/tests/test_public_files.py
 !/scripts/tests/test_upstream_updates.py
 !/scripts/tests/test_weibo_direct_url_oracle.py
 /backend/api/bilibili/*
@@ -368,6 +371,9 @@
 !/backend/cmd/dokitool/main.go
 !/backend/cmd/dokitool/main_test.go
 !/backend/cmd/dokitool/xhs_public_integration_test.go
+/backend/cmd/genstatstypes/*
+!/backend/cmd/genstatstypes/main.go
+!/backend/cmd/genstatstypes/main_test.go
 /backend/cmd/loadtest/*
 !/backend/cmd/loadtest/main.go
 !/backend/cmd/loadtest/main_test.go
@@ -652,6 +658,7 @@
 !/frontend/src/monitor/main.ts
 !/frontend/src/monitor/monitor.css
 !/frontend/src/monitor/monitorStorage.ts
+!/frontend/src/monitor/statsTypes.generated.ts
 !/frontend/src/monitor/statsTypes.ts
 /frontend/src/services/*
 !/frontend/src/services/apiConfig.ts
@@ -731,6 +738,7 @@
 !/backend/internal/platform/douyin/shanghai.go
 !/backend/internal/platform/douyin/shanghai_test.go
 !/backend/internal/platform/douyin/shanghai_work_test.go
+!/backend/internal/platform/douyin/test_helpers_test.go
 !/backend/internal/platform/douyin/testdata/
 !/backend/internal/platform/douyin/video.go
 /backend/internal/platform/instagram/*
@@ -749,6 +757,7 @@
 /backend/internal/platform/pipigx/*
 !/backend/internal/platform/pipigx/baseline_test.go
 !/backend/internal/platform/pipigx/parser.go
+!/backend/internal/platform/pipigx/parser_test.go
 !/backend/internal/platform/pipigx/php.go
 !/backend/internal/platform/pipigx/testdata/
 !/backend/internal/platform/pipigx/wire.go
