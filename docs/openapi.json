@@ -409,7 +409,7 @@
         }
       },
       "SchemaVersionConflictFailure": {
-        "description": "Missing, array-valued, or unsupported `schema_version` (`INVALID_INPUT`).",
+        "description": "Missing, array-valued, or unsupported `schema_version` (`INVALID_INPUT`). Authenticated Bearer requests receive actionable guidance copy (`请传入必需查询参数 schema_version=1.0（详见 docs/AGENT-API.md）`) while anonymous requests preserve the browser refresh notice.",
         "content": {
           "application/json": {
             "schema": {
@@ -454,7 +454,7 @@
         }
       },
       "ServiceUnavailableFailure": {
-        "description": "Platform adapter or required backend component is not configured (`SERVICE_NOT_CONFIGURED`).",
+        "description": "Platform adapter or required backend component is not configured (`SERVICE_NOT_CONFIGURED`), or per-platform circuit breaker / `disabled_platforms` fast-fail protection is open (`UPSTREAM_UNAVAILABLE`, `retryable: true`, with `Retry-After` header and `error.retry_after_seconds`).",
         "content": {
           "application/json": {
             "schema": {
@@ -2302,6 +2302,7 @@
         "additionalProperties": false,
         "required": [
           "hits",
+          "stale_hits",
           "misses",
           "singleflight_shared",
           "uncacheable"
@@ -2310,7 +2311,12 @@
           "hits": {
             "type": "integer",
             "minimum": 0,
-            "description": "Direct LRU response cache hits."
+            "description": "Direct fresh LRU response cache hits (`X-DokiTool-Cache: hit`)."
+          },
+          "stale_hits": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Stale-if-error fallback cache hits served before media hard expiry (`X-DokiTool-Cache: stale`)."
           },
           "misses": {
             "type": "integer",
@@ -2325,7 +2331,7 @@
           "uncacheable": {
             "type": "integer",
             "minimum": 0,
-            "description": "Requests bypassing cache and singleflight (e.g. weibo, youtube, oversized input)."
+            "description": "Requests bypassing cache and singleflight (e.g. weibo, oversized input, or youtube when youtube_parse_ttl is 0s)."
           }
         }
       },
@@ -3237,6 +3243,304 @@
           }
         }
       },
+      "YTDLPCompartmentPoolSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "active",
+          "queued",
+          "concurrency_limit",
+          "queue_limit",
+          "waited",
+          "granted",
+          "timeout",
+          "full",
+          "canceled",
+          "wait_ms_total",
+          "wait_ms_max"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this isolated yt-dlp or YouTube EJS compartment is enabled."
+          },
+          "active": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently holding an execution slot in this compartment."
+          },
+          "queued": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Requests currently waiting in this compartment's FIFO queue."
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Active concurrency slot limit for this compartment."
+          },
+          "queue_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Active FIFO queue capacity for this compartment."
+          },
+          "waited": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests that entered this compartment's FIFO wait queue."
+          },
+          "granted": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests granted an execution slot."
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests rejected with HTTP 429 on wait timeout."
+          },
+          "full": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative requests rejected immediately with HTTP 429 because the queue was full."
+          },
+          "canceled": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative queued requests canceled by caller disconnect."
+          },
+          "wait_ms_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative milliseconds spent waiting in this compartment's queue."
+          },
+          "wait_ms_max": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum single-request wait time in milliseconds for this compartment."
+          }
+        }
+      },
+      "YTDLPPoolsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "youtube",
+          "social",
+          "generic",
+          "youtube_ejs"
+        ],
+        "properties": {
+          "youtube": {
+            "$ref": "#/components/schemas/YTDLPCompartmentPoolSnapshot"
+          },
+          "social": {
+            "$ref": "#/components/schemas/YTDLPCompartmentPoolSnapshot"
+          },
+          "generic": {
+            "$ref": "#/components/schemas/YTDLPCompartmentPoolSnapshot"
+          },
+          "youtube_ejs": {
+            "$ref": "#/components/schemas/YTDLPCompartmentPoolSnapshot"
+          }
+        }
+      },
+      "CircuitBreakerState": {
+        "type": "string",
+        "enum": [
+          "closed",
+          "open",
+          "half_open"
+        ],
+        "description": "Per-platform circuit breaker protection state."
+      },
+      "CircuitBreakerPlatformSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "platform",
+          "state",
+          "consecutive_failures",
+          "window_failures",
+          "window_total",
+          "open_until",
+          "disabled_by_config"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string",
+            "enum": [
+              "douyin",
+              "bilibili",
+              "weibo",
+              "toutiao",
+              "kuaishou",
+              "pipixia",
+              "pipigx",
+              "zuiyou",
+              "xiaohongshu",
+              "x",
+              "youtube",
+              "instagram",
+              "facebook",
+              "tumblr"
+            ],
+            "description": "Core platform identifier."
+          },
+          "state": {
+            "$ref": "#/components/schemas/CircuitBreakerState"
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Current consecutive genuine upstream/system failures."
+          },
+          "window_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Genuine upstream/system failures inside the sliding evaluation window."
+          },
+          "window_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total eligible outcomes recorded inside the sliding evaluation window."
+          },
+          "open_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date-time"
+              }
+            ],
+            "description": "RFC 3339 UTC timestamp when an automatic open circuit expires into half_open, or empty string when closed/half_open/disabled_by_config."
+          },
+          "disabled_by_config": {
+            "type": "boolean",
+            "description": "Whether this platform is manually forced open via runtime config circuit_breaker.disabled_platforms."
+          }
+        }
+      },
+      "RuntimePolicyPlatform": {
+        "type": "string",
+        "enum": [
+          "douyin",
+          "bilibili",
+          "weibo",
+          "toutiao",
+          "kuaishou",
+          "pipixia",
+          "pipigx",
+          "zuiyou",
+          "xiaohongshu",
+          "x",
+          "youtube",
+          "instagram",
+          "facebook",
+          "tumblr",
+          "ytdlp_generic"
+        ],
+        "description": "Valid platform or internal Tier-2 generic scope identifier for runtime circuit_breaker.disabled_platforms."
+      },
+      "RuntimePolicySummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "config_file_active",
+          "reload_count",
+          "last_reloaded_at",
+          "youtube_slots",
+          "social_slots",
+          "generic_slots",
+          "youtube_ejs_concurrency",
+          "fast_per_platform_max_concurrency",
+          "circuit_breaker_enabled",
+          "disabled_platforms",
+          "youtube_parse_ttl_seconds",
+          "stale_if_error_ttl_seconds",
+          "upstream_blocked_neg_ttl_seconds"
+        ],
+        "properties": {
+          "config_file_active": {
+            "type": "boolean",
+            "description": "Whether DOKITOOL_RUNTIME_CONFIG_FILE is active (never exposes the file path)."
+          },
+          "reload_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative successful SIGHUP runtime policy reloads."
+          },
+          "last_reloaded_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date-time"
+              }
+            ],
+            "description": "RFC 3339 UTC timestamp of the most recent SIGHUP runtime policy reload, or empty string if never reloaded."
+          },
+          "youtube_slots": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Active YouTube yt-dlp compartment concurrency slots."
+          },
+          "social_slots": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Active Social yt-dlp compartment concurrency slots."
+          },
+          "generic_slots": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Active Tier-2 generic yt-dlp compartment concurrency slots."
+          },
+          "youtube_ejs_concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Active YouTube EJS helper admission pool concurrency."
+          },
+          "fast_per_platform_max_concurrency": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Active per-platform concurrency bulkhead cap in the fast parse pool."
+          },
+          "circuit_breaker_enabled": {
+            "type": "boolean",
+            "description": "Whether automatic per-platform circuit breaking is enabled."
+          },
+          "disabled_platforms": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/RuntimePolicyPlatform"
+            },
+            "description": "Platforms manually forced into circuit-open protection via runtime config."
+          },
+          "youtube_parse_ttl_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured YouTube /api/parse server cache TTL cap in seconds (0 disables YouTube caching)."
+          },
+          "stale_if_error_ttl_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured stale-if-error fallback window in seconds (clamped by earliest_expires_at - 15s; 0 disables stale fallback)."
+          },
+          "upstream_blocked_neg_ttl_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured UPSTREAM_BLOCKED short negative cache TTL in seconds (0 disables)."
+          }
+        }
+      },
       "StatsSnapshot": {
         "type": "object",
         "additionalProperties": false,
@@ -3249,6 +3553,9 @@
           "admission",
           "ytdlp",
           "ytdlp_generic",
+          "ytdlp_pools",
+          "circuit_breakers",
+          "runtime_policy",
           "shanghai",
           "parse_latency_ms",
           "api_keys",
@@ -3284,6 +3591,21 @@
           },
           "ytdlp_generic": {
             "$ref": "#/components/schemas/YTDLPStatsSnapshot"
+          },
+          "ytdlp_pools": {
+            "$ref": "#/components/schemas/YTDLPPoolsSnapshot"
+          },
+          "circuit_breakers": {
+            "type": "array",
+            "minItems": 14,
+            "maxItems": 14,
+            "description": "Current circuit breaker state for all 14 core platforms in fixed canonical order.",
+            "items": {
+              "$ref": "#/components/schemas/CircuitBreakerPlatformSnapshot"
+            }
+          },
+          "runtime_policy": {
+            "$ref": "#/components/schemas/RuntimePolicySummary"
           },
           "shanghai": {
             "$ref": "#/components/schemas/ShanghaiStatsSnapshot"

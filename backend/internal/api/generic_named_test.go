@@ -542,9 +542,14 @@ func TestGenericSlowPoolIsolationFromCorePools(t *testing.T) {
 	}()
 	<-xStarted
 
-	wX2 := doReq("198.51.100.21", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+	wX2 := doReq("198.51.100.21", "https://www.instagram.com/reel/C9999999999/")
 	if wX2.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected SlowParse 429 while X occupies sole slot, got %d", wX2.Code)
+		t.Fatalf("expected Social SlowParse 429 while X occupies sole slot, got %d", wX2.Code)
+	}
+	// YouTube routes to its own YouTubeSlow compartment and is NOT blocked by Social SlowParse!
+	wYT := doReq("198.51.100.23", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+	if wYT.Code != http.StatusOK {
+		t.Fatalf("youtubeSlow request blocked by Social SlowParse saturation: status=%d body=%s", wYT.Code, wYT.Body.String())
 	}
 	// Release generic immediately by replacing releaseGeneric with an already-closed channel (it is already closed!).
 	wVimeo := doReq("198.51.100.22", "https://vimeo.com/900003")
@@ -671,7 +676,7 @@ func TestLoadAdmissionConfigGenericSlowPool(t *testing.T) {
 		defaults.GenericSlowParse.ClientBurst != 3 ||
 		defaults.GenericSlowParse.GlobalBurst != 12 ||
 		defaults.GenericSlowParse.QueueSize != 16 ||
-		defaults.GenericSlowParse.QueueWait != DefaultSlowParseQueueWait {
+		defaults.GenericSlowParse.QueueWait != DefaultGenericSlowParseQueueWait {
 		t.Fatalf("unexpected GenericSlowParse defaults: %+v", defaults.GenericSlowParse)
 	}
 

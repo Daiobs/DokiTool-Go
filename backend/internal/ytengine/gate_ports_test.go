@@ -52,7 +52,11 @@ func inertGateBinary(t *testing.T) (string, map[string]string) {
 
 func TestGatePortConfiguration(t *testing.T) {
 	bin, hashes := inertGateBinary(t)
-	for _, ports := range [][]int{{1023, 19002}, {19001, 65536}, {19001, 19001}, {19001}, {19001, 19002, 19003}} {
+	tooMany := make([]int, MaxConcurrency+1)
+	for i := range tooMany {
+		tooMany[i] = 19200 + i
+	}
+	for _, ports := range [][]int{{1023, 19002}, {19001, 65536}, {19001, 19001}, tooMany} {
 		e, err := New(Config{BinaryPath: bin, AllowedHashes: hashes, GatePorts: ports})
 		if err == nil || e.Enabled() {
 			t.Fatalf("invalid port set accepted: %v", ports)
@@ -69,6 +73,24 @@ func TestGatePortConfiguration(t *testing.T) {
 			t.Fatalf("invalid env syntax accepted: %q", raw)
 		}
 	}
+	// Multiplexed gateway breaks the old 1:1 port==concurrency restriction:
+	// 1 port with concurrency 6, 3 ports with concurrency 2, and SharedSemaphore mismatch all succeed.
+	for _, tc := range []struct {
+		ports []int
+		conc  int
+	}{
+		{[]int{19001}, 6},
+		{[]int{19001, 19002}, 12},
+		{[]int{19001, 19002, 19003}, 2},
+	} {
+		eng, err := New(Config{BinaryPath: bin, AllowedHashes: hashes, MaxConcurrency: tc.conc, GatePorts: tc.ports})
+		if err != nil || !eng.Enabled() {
+			t.Fatalf("expected GatePorts=%v with MaxConcurrency=%d to succeed, got err=%v", tc.ports, tc.conc, err)
+		}
+	}
+	if sharedEng, err := New(Config{BinaryPath: bin, AllowedHashes: hashes, GatePorts: []int{19001, 19002}, SharedSemaphore: make(chan struct{}, 1)}); err != nil || !sharedEng.Enabled() {
+		t.Fatalf("expected GatePorts with SharedSemaphore to succeed under multiplexed gateway, got err=%v", err)
+	}
 	ports, err := parseGatePorts("19001, 19002")
 	if err != nil {
 		t.Fatal(err)
@@ -82,12 +104,8 @@ func TestGatePortConfiguration(t *testing.T) {
 		t.Fatal("configuration slice retained by reference")
 	}
 	clone := eng.WithTargetPolicy(func(string) bool { return true }, func(string) bool { return true })
-	if clone.gatePorts != eng.gatePorts || clone.sem != eng.sem {
-		t.Fatal("platform clones must share port and concurrency allocation")
-	}
-	_, err = New(Config{BinaryPath: bin, AllowedHashes: hashes, GatePorts: []int{19001, 19002}, SharedSemaphore: make(chan struct{}, 1)})
-	if err == nil {
-		t.Fatal("port pool must match actual shared semaphore capacity")
+	if clone.gatePorts != eng.gatePorts || clone.slotPool != eng.slotPool {
+		t.Fatal("platform clones must share gateway and concurrency allocation")
 	}
 	for _, n := range []int{6, MaxConcurrency} {
 		poolPorts := make([]int, n)
@@ -103,13 +121,15 @@ func TestGatePortConfiguration(t *testing.T) {
 
 func TestGateFixedPoolNoFallbackAndReclaims(t *testing.T) {
 	ports := testGatePorts(t, 2)
-	p, err := newGatePortPool(ports, 2)
+	p, err := newGatePortPool(ports)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &Engine{gatePorts: p}
+	t.Cleanup(func() { _ = e.Close() })
 	x := e.WithTargetPolicy(nil, func(s string) bool { return s == "x.example" })
 	y := e.WithTargetPolicy(nil, func(s string) bool { return s == "y.example" })
+	z := e.WithTargetPolicy(nil, func(s string) bool { return s == "z.example" })
 	xURL, xClose, err := x.startOutboundGate(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +143,7 @@ func TestGateFixedPoolNoFallbackAndReclaims(t *testing.T) {
 	xu, _ := url.Parse(xURL)
 	yu, _ := url.Parse(yURL)
 	if xu.Host == yu.Host {
-		t.Fatal("concurrent platform tasks share a listener")
+		t.Fatal("two tasks on two fixed ports should distribute across both listeners")
 	}
 	if got := gateRawRequest(t, xu, "GET", "http://y.example/", gateAuth(xu)); got != 403 {
 		t.Fatal("x task borrowed y target policy")
@@ -132,42 +152,80 @@ func TestGateFixedPoolNoFallbackAndReclaims(t *testing.T) {
 		t.Fatal("y task borrowed x target policy")
 	}
 	if got := gateRawRequest(t, yu, "GET", "http://y.example/", gateAuth(xu)); got != 407 {
-		t.Fatal("one task credential authorized another task")
+		t.Fatal("one task credential authorized another task on another port")
 	}
-	if _, _, err := e.startOutboundGate(context.Background()); err == nil {
-		t.Fatal("exhausted fixed pool must not fall back")
+	// A 3rd concurrent task multiplexes cleanly onto one of the 2 configured fixed ports with full policy isolation.
+	zURL, zClose, err := z.startOutboundGate(context.Background())
+	if err != nil {
+		t.Fatalf("3rd concurrent task failed to multiplex on 2-port gateway: %v", err)
+	}
+	defer zClose()
+	zu, _ := url.Parse(zURL)
+	if zu.Host != xu.Host {
+		t.Fatalf("expected round-robin 3rd task on %s, got %s", xu.Host, zu.Host)
+	}
+	if got := gateRawRequest(t, zu, "GET", "http://x.example/", gateAuth(zu)); got != 403 {
+		t.Fatalf("z task on shared port borrowed x policy: got %d", got)
 	}
 	xClose()
 	yClose()
-	occupied, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(ports[0])))
+	zClose()
+	_ = e.Close()
+
+	// Fresh engine where ports[0] is externally occupied must skip ports[0] and bind ports[1] without falling back to :0.
+	occupiedPorts := testGatePorts(t, 2)
+	occupied, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(occupiedPorts[0])))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer occupied.Close()
-	u, closeGate, err := e.startOutboundGate(context.Background())
+	pSkip, err := newGatePortPool(occupiedPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eSkip := &Engine{gatePorts: pSkip}
+	t.Cleanup(func() { _ = eSkip.Close() })
+	u, closeGate, err := eSkip.startOutboundGate(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	parsed, _ := url.Parse(u)
-	if parsed.Port() != fmt.Sprint(ports[1]) {
-		t.Fatal("must skip occupied port without contacting its service")
-	}
-	if _, _, err := e.startOutboundGate(context.Background()); err == nil {
-		t.Fatal("occupied ports must not cause random fallback")
+	if parsed.Port() != fmt.Sprint(occupiedPorts[1]) {
+		t.Fatalf("must skip occupied port without contacting its service: got %s want %d", parsed.Port(), occupiedPorts[1])
 	}
 	closeGate()
 	ctx, cancel := context.WithCancel(context.Background())
-	_, closeGate, err = e.startOutboundGate(ctx)
+	_, closeGate, err = eSkip.startOutboundGate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancel()
 	closeGate()
-	_, closeGate, err = e.startOutboundGate(context.Background())
-	if err != nil {
-		t.Fatal("cancel leaked port:", err)
+	if eSkip.gatePorts.activeSessionCount() != 0 {
+		t.Fatal("cancel leaked active gate session")
 	}
-	closeGate()
+
+	// Fresh engine where ALL configured ports are externally occupied must return error and never fall back to :0.
+	busyPorts := testGatePorts(t, 2)
+	busy0, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(busyPorts[0])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy0.Close()
+	busy1, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(busyPorts[1])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy1.Close()
+	pAllBusy, err := newGatePortPool(busyPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eAllBusy := &Engine{gatePorts: pAllBusy}
+	t.Cleanup(func() { _ = eAllBusy.Close() })
+	if _, _, err := eAllBusy.startOutboundGate(context.Background()); err == nil {
+		t.Fatal("all occupied ports must fail rather than falling back to random :0")
+	}
 }
 
 type countingGateResolver struct{ count atomic.Int64 }
@@ -215,8 +273,15 @@ func TestGateAuthenticationBeforePolicyAndExpiry(t *testing.T) {
 	defer up.Close()
 	upURL, _ := url.Parse(up.URL)
 	resolver := &countingGateResolver{}
-	pool, _ := newGatePortPool(testGatePorts(t, 1), 1)
-	e := &Engine{maxStdoutBytes: defaultMaxStdoutBytes, gatePorts: pool, resolver: resolver, allowedOutboundHost: func(h string) bool { return h == "public.example" }, dialAddr: func(netip.Addr, string) string { return upURL.Host }}
+	pool, _ := newGatePortPool(testGatePorts(t, 1))
+	e := &Engine{
+		maxStdoutBytes:      defaultMaxStdoutBytes,
+		gatePorts:           pool,
+		resolver:            resolver,
+		allowedOutboundHost: func(h string) bool { return h == "public.example" },
+		testHooks:           &gateTestHooks{dialAddr: func(netip.Addr, string) string { return upURL.Host }},
+	}
+	t.Cleanup(func() { _ = e.Close() })
 	u, closeGate, err := e.startOutboundGate(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -296,8 +361,14 @@ func TestGateCancelActiveTunnelBeforePortReuse(t *testing.T) {
 		defer c.Close()
 		_, _ = io.Copy(c, c)
 	}()
-	pool, _ := newGatePortPool(testGatePorts(t, 1), 1)
-	e := &Engine{gatePorts: pool, resolver: &countingGateResolver{}, allowedOutboundHost: func(h string) bool { return h == "public.example" }, dialAddr: func(netip.Addr, string) string { return up.Addr().String() }}
+	pool, _ := newGatePortPool(testGatePorts(t, 1))
+	e := &Engine{
+		gatePorts:           pool,
+		resolver:            &countingGateResolver{},
+		allowedOutboundHost: func(h string) bool { return h == "public.example" },
+		testHooks:           &gateTestHooks{dialAddr: func(netip.Addr, string) string { return up.Addr().String() }},
+	}
+	t.Cleanup(func() { _ = e.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	u, closeGate, err := e.startOutboundGate(ctx)

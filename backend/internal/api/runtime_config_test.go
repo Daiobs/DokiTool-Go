@@ -1,0 +1,332 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestRuntimeConfigExampleMatchesDefaults(t *testing.T) {
+	cfg, err := LoadRuntimeConfigFile("../../../ops/examples/runtime.example.json")
+	if err != nil {
+		t.Fatalf("LoadRuntimeConfigFile(runtime.example.json) failed: %v", err)
+	}
+	want := DefaultRuntimeConfig()
+	if cfg.SchemaVersion != want.SchemaVersion ||
+		cfg.YTDLP != want.YTDLP ||
+		cfg.FastPool != want.FastPool ||
+		cfg.Cache != want.Cache ||
+		cfg.CircuitBreaker.Enabled != want.CircuitBreaker.Enabled ||
+		cfg.CircuitBreaker.ConsecutiveFailures != want.CircuitBreaker.ConsecutiveFailures ||
+		cfg.CircuitBreaker.WindowSize != want.CircuitBreaker.WindowSize ||
+		cfg.CircuitBreaker.FailureRateThreshold != want.CircuitBreaker.FailureRateThreshold ||
+		cfg.CircuitBreaker.OpenDuration != want.CircuitBreaker.OpenDuration ||
+		cfg.CircuitBreaker.HalfOpenMaxProbes != want.CircuitBreaker.HalfOpenMaxProbes ||
+		len(cfg.CircuitBreaker.DisabledPlatforms) != 0 {
+		t.Fatalf("runtime.example.json does not match DefaultRuntimeConfig():\ngot:  %+v\nwant: %+v", cfg, want)
+	}
+}
+
+func TestLoadRuntimeConfigEnvAndFileValidation(t *testing.T) {
+	// 1. Unset env returns (DefaultRuntimeConfig(), false, nil).
+	cfg, fromFile, err := LoadRuntimeConfig(func(string) string { return "" })
+	if err != nil || fromFile || cfg.YTDLP.YouTubeSlots != 4 {
+		t.Fatalf("unset LoadRuntimeConfig = (%+v, %v, %v), want defaults/false/nil", cfg, fromFile, err)
+	}
+	if _, _, err := LoadRuntimeConfig(nil); err == nil {
+		t.Fatal("expected nil getenv to fail")
+	}
+	if _, _, err := LoadRuntimeConfig(func(k string) string {
+		if k == EnvRuntimeConfigFile {
+			return "   "
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("expected whitespace path to fail")
+	}
+
+	// 2. Non-existent, directory, and oversized (> 64 KiB) files are rejected without leaking paths.
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "secret-canary-runtime.json")
+	if _, _, err := LoadRuntimeConfig(func(k string) string {
+		if k == EnvRuntimeConfigFile {
+			return secretPath
+		}
+		return ""
+	}); err == nil || strings.Contains(err.Error(), "secret-canary") {
+		t.Fatalf("missing file err leaked path or nil: %v", err)
+	}
+	if _, err := LoadRuntimeConfigFile(dir); err == nil || strings.Contains(err.Error(), dir) {
+		t.Fatalf("directory path err leaked path or nil: %v", err)
+	}
+	overPath := filepath.Join(dir, "oversized.json")
+	if err := os.WriteFile(overPath, []byte(`{"schema_version":"1.0","pad":"`+strings.Repeat("a", MaxRuntimeConfigFileBytes)+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRuntimeConfigFile(overPath); err == nil {
+		t.Fatal("expected oversized runtime config file to fail")
+	}
+
+	// 3. Partial valid JSON inherits defaults and deduplicates disabled_platforms.
+	partialJSON := `{
+		"schema_version": "1.0",
+		"ytdlp": {"youtube_slots": 6, "social_slots": 6, "generic_slots": 4, "youtube_ejs_concurrency": 1},
+		"circuit_breaker": {"disabled_platforms": ["douyin", "ytdlp_generic", "douyin"]},
+		"cache": {"youtube_parse_ttl": "0s", "stale_if_error_ttl": "0s", "upstream_blocked_neg_ttl": "0s"}
+	}`
+	parsed, err := ParseRuntimeConfig([]byte(partialJSON))
+	if err != nil {
+		t.Fatalf("partial valid runtime config rejected: %v", err)
+	}
+	if parsed.YTDLP.YouTubeSlots != 6 || parsed.YTDLP.SocialSlots != 6 || parsed.YTDLP.GenericSlots != 4 ||
+		parsed.YTDLP.YouTubeEJSConcurrency != 1 || parsed.YTDLP.YouTubeQueueSize != 32 ||
+		parsed.FastPool.PerPlatformMaxConcurrency != 24 ||
+		parsed.Cache.YouTubeParseTTL != 0 || parsed.Cache.StaleIfErrorTTL != 0 || parsed.Cache.UpstreamBlockedNegTTL != 0 {
+		t.Fatalf("unexpected parsed partial config: %+v", parsed)
+	}
+	if len(parsed.CircuitBreaker.DisabledPlatforms) != 2 ||
+		parsed.CircuitBreaker.DisabledPlatforms[0] != "douyin" ||
+		parsed.CircuitBreaker.DisabledPlatforms[1] != PlatformGeneric {
+		t.Fatalf("disabled_platforms deduplication failed: %v", parsed.CircuitBreaker.DisabledPlatforms)
+	}
+
+	// Verify ApplyRuntimeConfigToAdmissionConfig clamps YouTubeEJS.ClientConcurrency when concurrency=1.
+	admCfg := DefaultAdmissionConfig()
+	ApplyRuntimeConfigToAdmissionConfig(&admCfg, parsed)
+	if admCfg.YouTubeEJS.GlobalConcurrency != 1 || admCfg.YouTubeEJS.ClientConcurrency != 1 {
+		t.Fatalf("expected YouTubeEJS concurrency clamped to 1/1, got %+v", admCfg.YouTubeEJS)
+	}
+	if err := admCfg.Validate(); err != nil {
+		t.Fatalf("AdmissionConfig.Validate() failed after ApplyRuntimeConfigToAdmissionConfig: %v", err)
+	}
+
+	// 4. Exhaustive invalid payloads: unknown fields, trailing garbage, null values, and bound violations.
+	badPayloads := []struct {
+		name string
+		body string
+	}{
+		{"empty", ""},
+		{"array", "[]"},
+		{"trailing-garbage", `{"schema_version":"1.0"}{}`},
+		{"unknown-top", `{"schema_version":"1.0","extra":1}`},
+		{"unknown-ytdlp", `{"schema_version":"1.0","ytdlp":{"unknown":1}}`},
+		{"unknown-fast-pool", `{"schema_version":"1.0","fast_pool":{"unknown":1}}`},
+		{"unknown-cb", `{"schema_version":"1.0","circuit_breaker":{"unknown":1}}`},
+		{"unknown-cache", `{"schema_version":"1.0","cache":{"unknown":1}}`},
+		{"null-section", `{"schema_version":"1.0","ytdlp":null}`},
+		{"null-leaf", `{"schema_version":"1.0","ytdlp":{"youtube_slots":null}}`},
+		{"bad-schema-version", `{"schema_version":"2.0"}`},
+		{"missing-schema-version", `{}`},
+		{"yt-slots-0", `{"schema_version":"1.0","ytdlp":{"youtube_slots":0}}`},
+		{"yt-slots-17", `{"schema_version":"1.0","ytdlp":{"youtube_slots":17}}`},
+		{"social-slots-0", `{"schema_version":"1.0","ytdlp":{"social_slots":0}}`},
+		{"social-slots-17", `{"schema_version":"1.0","ytdlp":{"social_slots":17}}`},
+		{"generic-slots-0", `{"schema_version":"1.0","ytdlp":{"generic_slots":0}}`},
+		{"generic-slots-13", `{"schema_version":"1.0","ytdlp":{"generic_slots":13}}`},
+		{"total-slots-33", `{"schema_version":"1.0","ytdlp":{"youtube_slots":16,"social_slots":16,"generic_slots":1}}`},
+		{"queue-size-neg", `{"schema_version":"1.0","ytdlp":{"youtube_queue_size":-1}}`},
+		{"queue-size-over", `{"schema_version":"1.0","ytdlp":{"social_queue_size":1025}}`},
+		{"queue-wait-neg", `{"schema_version":"1.0","ytdlp":{"generic_queue_wait":"-1s"}}`},
+		{"queue-wait-over", `{"schema_version":"1.0","ytdlp":{"youtube_ejs_queue_wait":"31s"}}`},
+		{"queue-wait-invalid", `{"schema_version":"1.0","ytdlp":{"youtube_queue_wait":"not-a-dur"}}`},
+		{"ejs-conc-0", `{"schema_version":"1.0","ytdlp":{"youtube_ejs_concurrency":0}}`},
+		{"ejs-conc-17", `{"schema_version":"1.0","ytdlp":{"youtube_ejs_concurrency":17}}`},
+		{"fast-per-plat-1", `{"schema_version":"1.0","fast_pool":{"per_platform_max_concurrency":1}}`},
+		{"fast-per-plat-257", `{"schema_version":"1.0","fast_pool":{"per_platform_max_concurrency":257}}`},
+		{"cb-consec-0", `{"schema_version":"1.0","circuit_breaker":{"consecutive_failures":0}}`},
+		{"cb-consec-101", `{"schema_version":"1.0","circuit_breaker":{"consecutive_failures":101}}`},
+		{"cb-win-0", `{"schema_version":"1.0","circuit_breaker":{"window_size":0}}`},
+		{"cb-win-201", `{"schema_version":"1.0","circuit_breaker":{"window_size":201}}`},
+		{"cb-rate-0", `{"schema_version":"1.0","circuit_breaker":{"failure_rate_threshold":0}}`},
+		{"cb-rate-over", `{"schema_version":"1.0","circuit_breaker":{"failure_rate_threshold":1.01}}`},
+		{"cb-open-4s", `{"schema_version":"1.0","circuit_breaker":{"open_duration":"4s"}}`},
+		{"cb-open-601s", `{"schema_version":"1.0","circuit_breaker":{"open_duration":"601s"}}`},
+		{"cb-probes-0", `{"schema_version":"1.0","circuit_breaker":{"half_open_max_probes":0}}`},
+		{"cb-probes-17", `{"schema_version":"1.0","circuit_breaker":{"half_open_max_probes":17}}`},
+		{"cb-disabled-unknown", `{"schema_version":"1.0","circuit_breaker":{"disabled_platforms":["vimeo"]}}`},
+		{"cache-yt-ttl-over", `{"schema_version":"1.0","cache":{"youtube_parse_ttl":"601s"}}`},
+		{"cache-yt-ttl-neg", `{"schema_version":"1.0","cache":{"youtube_parse_ttl":"-1s"}}`},
+		{"cache-stale-over", `{"schema_version":"1.0","cache":{"stale_if_error_ttl":"3601s"}}`},
+		{"cache-neg-over", `{"schema_version":"1.0","cache":{"upstream_blocked_neg_ttl":"61s"}}`},
+	}
+	for _, tc := range badPayloads {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseRuntimeConfig([]byte(tc.body)); err == nil {
+				t.Fatalf("expected invalid runtime config %s to be rejected", tc.name)
+			}
+		})
+	}
+
+	// Boundary acceptance: 16 + 14 + 2 == 32 slots.
+	boundaryJSON := `{"schema_version":"1.0","ytdlp":{"youtube_slots":16,"social_slots":14,"generic_slots":2}}`
+	if _, err := ParseRuntimeConfig([]byte(boundaryJSON)); err != nil {
+		t.Fatalf("expected total 32 slots to pass: %v", err)
+	}
+}
+
+func TestApplyRuntimeConfigInPlacePreservesLeasesAndWakesWaiters(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	h, err := New(c, nil, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultAdmissionConfig()
+	cfg.SlowParse.GlobalConcurrency = 2
+	cfg.SlowParse.QueueSize = 8
+	cfg.SlowParse.QueueWait = 5 * time.Second
+	cfg.SlowParse.ClientBurst = 10
+	cfg.SlowParse.ClientRPS = 10
+	cfg.SlowParse.GlobalBurst = 50
+	cfg.SlowParse.GlobalRPS = 50
+
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	origSlowPtr := adm.slow
+
+	// Acquire 2 active leases on social slow pool.
+	rel1, retry1 := adm.slow.acquire(netip.MustParseAddr("198.51.100.1"), now)
+	rel2, retry2 := adm.slow.acquire(netip.MustParseAddr("198.51.100.2"), now)
+	if retry1 != 0 || retry2 != 0 {
+		t.Fatalf("initial acquires failed: retry1=%d retry2=%d", retry1, retry2)
+	}
+
+	// Queue 3 FIFO waiters.
+	type waiterResult struct {
+		idx     int
+		release func()
+		retry   int
+	}
+	woken := make(chan waiterResult, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ip := netip.MustParseAddr("198.51.100." + string(rune('3'+idx)))
+			rel, retry, canceled := adm.slow.acquireContext(context.Background(), ip, now)
+			if canceled {
+				t.Errorf("waiter %d unexpectedly canceled", idx)
+				return
+			}
+			woken <- waiterResult{idx: idx, release: rel, retry: retry}
+		}(i)
+	}
+
+	// Wait until all 3 waiters are queued.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snap := adm.slow.statsSnapshot()
+		if snap.Active == 2 && snap.Queued == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters did not enqueue in time: %+v", snap)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Hot-reload: increase social_slots from 2 -> 4 in-place!
+	nextRT := DefaultRuntimeConfig()
+	nextRT.YTDLP.SocialSlots = 4
+	nextRT.YTDLP.YouTubeSlots = 6
+	nextRT.YTDLP.GenericSlots = 3
+	nextRT.YTDLP.YouTubeEJSConcurrency = 8
+	nextRT.FastPool.PerPlatformMaxConcurrency = 16
+	nextRT.Cache.YouTubeParseTTL = 45 * time.Second
+	if ok := ApplyRuntimeConfig(entry, h, nextRT, true, true); !ok {
+		t.Fatal("ApplyRuntimeConfig returned false for valid config")
+	}
+
+	// Pool pointer MUST NOT have been replaced (P2-9 invariant).
+	if adm.slow != origSlowPtr {
+		t.Fatal("ApplyRuntimeConfig replaced *pool pointer instead of updating in-place")
+	}
+
+	// Exactly 2 queued waiters must wake immediately while 1 remains queued!
+	var wokenReleases []func()
+	for i := 0; i < 2; i++ {
+		select {
+		case res := <-woken:
+			if res.retry != 0 || res.release == nil {
+				t.Fatalf("woken waiter %d failed: retry=%d", res.idx, res.retry)
+			}
+			wokenReleases = append(wokenReleases, res.release)
+		case <-time.After(time.Second):
+			t.Fatalf("expected waiter #%d to wake immediately after increasing social_slots 2->4", i+1)
+		}
+	}
+	if snap := adm.slow.statsSnapshot(); snap.Active != 4 || snap.Queued != 1 || snap.ConcurrencyLimit != 4 {
+		t.Fatalf("unexpected pool state after scale-up: %+v", snap)
+	}
+
+	// Hot-reload scale-down: decrease social_slots from 4 -> 2 while 4 are active and 1 is queued!
+	downRT := nextRT
+	downRT.YTDLP.SocialSlots = 2
+	if ok := ApplyRuntimeConfig(entry, h, downRT, true, true); !ok {
+		t.Fatal("ApplyRuntimeConfig scale-down returned false")
+	}
+	// Release 2 active leases (4 -> 3 -> 2): waiter #3 MUST NOT wake while active >= 2!
+	rel1()
+	rel2()
+	time.Sleep(25 * time.Millisecond)
+	select {
+	case res := <-woken:
+		t.Fatalf("waiter %d woke prematurely during scale-down drain (active should still be 2)", res.idx)
+	default:
+	}
+	if snap := adm.slow.statsSnapshot(); snap.Active != 2 || snap.Queued != 1 || snap.ConcurrencyLimit != 2 {
+		t.Fatalf("unexpected pool state during scale-down drain: %+v", snap)
+	}
+
+	// Release 1 more active lease (2 -> 1 < 2): waiter #3 now wakes cleanly!
+	wokenReleases[0]()
+	select {
+	case res := <-woken:
+		if res.retry != 0 || res.release == nil {
+			t.Fatalf("waiter 3 failed after drain: retry=%d", res.retry)
+		}
+		res.release()
+	case <-time.After(time.Second):
+		t.Fatal("waiter 3 did not wake once active dropped below new limit 2")
+	}
+	wokenReleases[1]()
+	wg.Wait()
+
+	if snap := adm.slow.statsSnapshot(); snap.Active != 0 || snap.Queued != 0 {
+		t.Fatalf("lease leak after in-place reload drain: %+v", snap)
+	}
+
+	// Invalid reload must be rejected and retain previous policy + reload_count=2.
+	invalidRT := downRT
+	invalidRT.YTDLP.SocialSlots = 99
+	if ApplyRuntimeConfig(entry, h, invalidRT, true, true) {
+		t.Fatal("invalid RuntimeConfig unexpectedly applied")
+	}
+
+	statsSnap := h.Stats().Snapshot()
+	rp := statsSnap.RuntimePolicy
+	if !rp.ConfigFileActive || rp.ReloadCount != 2 || rp.LastReloadedAt == "" ||
+		rp.SocialSlots != 2 || rp.YouTubeSlots != 6 || rp.GenericSlots != 3 ||
+		rp.YouTubeEJSConcurrency != 8 || rp.FastPerPlatformMaxConcurrency != 16 ||
+		rp.YouTubeParseTTLSeconds != 45 {
+		t.Fatalf("unexpected RuntimePolicySummary after reloads: %+v", rp)
+	}
+
+	// Smoke check that HTTP handler continues serving cleanly after reloads.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/platforms?schema_version=1.0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("platforms after reload status=%d", rec.Code)
+	}
+}

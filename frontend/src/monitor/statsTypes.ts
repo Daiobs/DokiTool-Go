@@ -45,6 +45,7 @@ export interface RequestStatsSnapshot {
 export interface CacheChannelCounts {
   hits: number;
   misses: number;
+  stale_hits?: number;
   singleflight_shared: number;
   uncacheable: number;
 }
@@ -132,6 +133,56 @@ export interface YTDLPStatsSnapshot {
   queued?: number;
   total: ChannelSlotStatsSnapshot;
   by_channel: YTDLPChannelBreakdown;
+}
+
+export interface YTDLPCompartmentPoolSnapshot {
+  enabled: boolean;
+  active: number;
+  queued: number;
+  concurrency_limit: number;
+  queue_limit: number;
+  waited: number;
+  granted: number;
+  timeout: number;
+  full: number;
+  canceled: number;
+  wait_ms_total: number;
+  wait_ms_max: number;
+}
+
+export interface YTDLPPoolsSnapshot {
+  youtube: YTDLPCompartmentPoolSnapshot;
+  social: YTDLPCompartmentPoolSnapshot;
+  generic: YTDLPCompartmentPoolSnapshot;
+  youtube_ejs: YTDLPCompartmentPoolSnapshot;
+}
+
+export type CircuitBreakerState = "closed" | "open" | "half_open";
+
+export interface CircuitBreakerPlatformSnapshot {
+  platform: string;
+  state: CircuitBreakerState;
+  consecutive_failures: number;
+  window_failures: number;
+  window_total: number;
+  open_until: string;
+  disabled_by_config: boolean;
+}
+
+export interface RuntimePolicySummary {
+  config_file_active: boolean;
+  reload_count: number;
+  last_reloaded_at: string;
+  youtube_slots: number;
+  social_slots: number;
+  generic_slots: number;
+  youtube_ejs_concurrency: number;
+  fast_per_platform_max_concurrency: number;
+  circuit_breaker_enabled: boolean;
+  disabled_platforms: string[];
+  youtube_parse_ttl_seconds: number;
+  stale_if_error_ttl_seconds: number;
+  upstream_blocked_neg_ttl_seconds: number;
 }
 
 export interface ShanghaiChannelStats {
@@ -233,6 +284,9 @@ export interface StatsSnapshot {
   api_keys: APIKeyStatsSnapshot[];
   ytdlp: YTDLPStatsSnapshot;
   ytdlp_generic?: YTDLPStatsSnapshot;
+  ytdlp_pools?: YTDLPPoolsSnapshot;
+  circuit_breakers?: CircuitBreakerPlatformSnapshot[];
+  runtime_policy?: RuntimePolicySummary;
   shanghai: ShanghaiStatsSnapshot;
   parse_latency_ms: LatencyStatsSnapshot;
   runtime: RuntimeConfigSnapshot;
@@ -271,6 +325,75 @@ function isValidAdmissionPool(raw: unknown): raw is AdmissionPoolSnapshot {
 function isValidYtdlpSnapshot(raw: unknown): raw is YTDLPStatsSnapshot {
   if (!isRecord(raw)) return false;
   return isFiniteNum(raw.active) && isFiniteNum(raw.concurrency_limit);
+}
+
+function isValidYtdlpCompartmentPool(
+  raw: unknown,
+): raw is YTDLPCompartmentPoolSnapshot {
+  if (!isRecord(raw)) return false;
+  return (
+    typeof raw.enabled === "boolean" &&
+    isFiniteNum(raw.active) &&
+    isFiniteNum(raw.queued) &&
+    isFiniteNum(raw.concurrency_limit) &&
+    isFiniteNum(raw.queue_limit) &&
+    isFiniteNum(raw.waited) &&
+    isFiniteNum(raw.granted) &&
+    isFiniteNum(raw.timeout) &&
+    isFiniteNum(raw.full) &&
+    isFiniteNum(raw.canceled) &&
+    isFiniteNum(raw.wait_ms_total) &&
+    isFiniteNum(raw.wait_ms_max)
+  );
+}
+
+function isValidYtdlpPools(raw: unknown): raw is YTDLPPoolsSnapshot {
+  if (!isRecord(raw)) return false;
+  return (
+    isValidYtdlpCompartmentPool(raw.youtube) &&
+    isValidYtdlpCompartmentPool(raw.social) &&
+    isValidYtdlpCompartmentPool(raw.generic) &&
+    isValidYtdlpCompartmentPool(raw.youtube_ejs)
+  );
+}
+
+function isValidCircuitBreakerPlatform(
+  raw: unknown,
+): raw is CircuitBreakerPlatformSnapshot {
+  if (!isRecord(raw)) return false;
+  return (
+    typeof raw.platform === "string" &&
+    (raw.state === "closed" ||
+      raw.state === "open" ||
+      raw.state === "half_open") &&
+    isFiniteNum(raw.consecutive_failures) &&
+    isFiniteNum(raw.window_failures) &&
+    isFiniteNum(raw.window_total) &&
+    typeof raw.open_until === "string" &&
+    typeof raw.disabled_by_config === "boolean"
+  );
+}
+
+function isValidRuntimePolicySummary(
+  raw: unknown,
+): raw is RuntimePolicySummary {
+  if (!isRecord(raw)) return false;
+  return (
+    typeof raw.config_file_active === "boolean" &&
+    isFiniteNum(raw.reload_count) &&
+    typeof raw.last_reloaded_at === "string" &&
+    isFiniteNum(raw.youtube_slots) &&
+    isFiniteNum(raw.social_slots) &&
+    isFiniteNum(raw.generic_slots) &&
+    isFiniteNum(raw.youtube_ejs_concurrency) &&
+    isFiniteNum(raw.fast_per_platform_max_concurrency) &&
+    typeof raw.circuit_breaker_enabled === "boolean" &&
+    Array.isArray(raw.disabled_platforms) &&
+    raw.disabled_platforms.every((item) => typeof item === "string") &&
+    isFiniteNum(raw.youtube_parse_ttl_seconds) &&
+    isFiniteNum(raw.stale_if_error_ttl_seconds) &&
+    isFiniteNum(raw.upstream_blocked_neg_ttl_seconds)
+  );
 }
 
 function isValidRuntimeConfig(raw: unknown): raw is RuntimeConfigSnapshot {
@@ -354,6 +477,13 @@ export function isValidStatsSnapshot(raw: unknown): raw is StatsSnapshot {
   }
 
   if (
+    raw.cache.total.stale_hits !== undefined &&
+    !isFiniteNum(raw.cache.total.stale_hits)
+  ) {
+    return false;
+  }
+
+  if (
     !isRecord(raw.admission) ||
     !isRecord(raw.admission.fast) ||
     !isRecord(raw.admission.slow) ||
@@ -380,6 +510,25 @@ export function isValidStatsSnapshot(raw: unknown): raw is StatsSnapshot {
   if (
     raw.ytdlp_generic !== undefined &&
     !isValidYtdlpSnapshot(raw.ytdlp_generic)
+  ) {
+    return false;
+  }
+
+  if (raw.ytdlp_pools !== undefined && !isValidYtdlpPools(raw.ytdlp_pools)) {
+    return false;
+  }
+
+  if (
+    raw.circuit_breakers !== undefined &&
+    (!Array.isArray(raw.circuit_breakers) ||
+      !raw.circuit_breakers.every(isValidCircuitBreakerPlatform))
+  ) {
+    return false;
+  }
+
+  if (
+    raw.runtime_policy !== undefined &&
+    !isValidRuntimePolicySummary(raw.runtime_policy)
   ) {
     return false;
   }
@@ -530,6 +679,7 @@ function formatTitleCasePlatformFallback(key: string): string {
 export function formatStatsPlatformLabel(platform: string): string {
   const key = typeof platform === "string" ? platform.trim().toLowerCase() : "";
   if (!key || key === "unknown") return "无效输入 / 未路由";
+  if (key === "ytdlp_generic") return "通用长尾 (yt-dlp)";
   if (key === "ytdlp_unmatched") return "未匹配站点 (Tier-2)";
   if (key === "ytdlp_other") return "其他站点 (yt-dlp)";
   const core = CORE_PLATFORM_LABEL_MAP.get(key);
@@ -537,6 +687,40 @@ export function formatStatsPlatformLabel(platform: string): string {
   const tier2 = TIER2_PLATFORM_LABEL_MAP.get(key);
   if (tier2) return tier2;
   return formatTitleCasePlatformFallback(key);
+}
+
+export interface CircuitBreakerBadgeView {
+  label: string;
+  tone: "ok" | "warn" | "danger";
+}
+
+export function formatCircuitBreakerBadge(
+  item: Pick<CircuitBreakerPlatformSnapshot, "state" | "disabled_by_config">,
+): CircuitBreakerBadgeView {
+  if (item.disabled_by_config) {
+    return { label: "熔断保护中（运维禁用）", tone: "danger" };
+  }
+  if (item.state === "open") {
+    return { label: "熔断保护中", tone: "danger" };
+  }
+  if (item.state === "half_open") {
+    return { label: "半开探活", tone: "warn" };
+  }
+  return { label: "正常", tone: "ok" };
+}
+
+export function formatShanghaiTimestamp(raw: string | null | undefined): string {
+  if (typeof raw !== "string" || !raw.trim()) return "";
+  const trimmed = raw.trim();
+  const parsedMs = Date.parse(trimmed);
+  if (!Number.isFinite(parsedMs)) return trimmed;
+  const d = new Date(parsedMs + 8 * 3_600_000);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return `${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
 const LONG_HEX_SHA_RE = /^([0-9a-f]{12,64})(-dirty)?$/i;

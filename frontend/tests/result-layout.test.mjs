@@ -1832,3 +1832,156 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     else globalThis.chrome = prevChrome;
   }
 });
+
+test('Post-#37 九-2: ParticlesCanvas degrades to static first frame without rAF on mobile/coarse viewports or hardwareConcurrency <= 2', async () => {
+  const ParticlesCanvas = await loadSfc(
+    new URL('../src/components/ParticlesCanvas.vue', import.meta.url),
+  );
+  const origWin = globalThis.window;
+  const origDoc = globalThis.document;
+  const origNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+  async function runCanvasScenario({ reducedMotion = false, mobileOrCoarse = false, cores = 8 }) {
+    let rafCalls = 0;
+    let cancelCalls = 0;
+    let clearRectCalls = 0;
+    let arcCalls = 0;
+    const mqListeners = new Map();
+    const mqObjects = new Map();
+
+    const makeMq = (query, initialMatches) => {
+      const listeners = new Set();
+      mqListeners.set(query, listeners);
+      const mq = {
+        media: query,
+        matches: initialMatches,
+        addEventListener(type, fn) { if (type === 'change') listeners.add(fn); },
+        removeEventListener(type, fn) { if (type === 'change') listeners.delete(fn); },
+      };
+      mqObjects.set(query, mq);
+      return mq;
+    };
+
+    const winListeners = new Map();
+    const docListeners = new Map();
+    globalThis.window = {
+      innerWidth: mobileOrCoarse ? 390 : 1280,
+      innerHeight: mobileOrCoarse ? 844 : 800,
+      matchMedia(query) {
+        if (query.includes('prefers-reduced-motion')) return makeMq(query, reducedMotion);
+        if (query.includes('max-width: 767px') || query.includes('pointer: coarse')) return makeMq(query, mobileOrCoarse);
+        return makeMq(query, false);
+      },
+      requestAnimationFrame(_cb) {
+        rafCalls += 1;
+        return rafCalls;
+      },
+      cancelAnimationFrame(_id) {
+        cancelCalls += 1;
+      },
+      addEventListener(type, fn) {
+        if (!winListeners.has(type)) winListeners.set(type, new Set());
+        winListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        winListeners.get(type)?.delete(fn);
+      },
+    };
+    globalThis.document = {
+      hidden: false,
+      addEventListener(type, fn) {
+        if (!docListeners.has(type)) docListeners.set(type, new Set());
+        docListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        docListeners.get(type)?.delete(fn);
+      },
+    };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { hardwareConcurrency: cores },
+    });
+
+    const ctx2d = {
+      clearRect() { clearRectCalls += 1; },
+      beginPath() {},
+      arc() { arcCalls += 1; },
+      fill() {},
+      fillStyle: '',
+    };
+    const element = (type) => markRaw({
+      type,
+      props: {},
+      children: [],
+      parent: null,
+      width: 0,
+      height: 0,
+      getContext(kind) { return kind === '2d' ? ctx2d : null; },
+    });
+    const renderer = createRenderer({
+      createElement: element,
+      createText: (t) => element('#text'),
+      createComment: () => element('#comment'),
+      setText() {},
+      setElementText() {},
+      parentNode: (n) => n.parent,
+      nextSibling: () => null,
+      insert(node, parent) { node.parent = parent; parent.children.push(node); },
+      remove(node) { if (node.parent) node.parent.children = node.parent.children.filter(c => c !== node); node.parent = null; },
+      patchProp(node, key, _, value) { node.props[key] = value; },
+    });
+
+    const root = element('root');
+    const app = renderer.createApp(ParticlesCanvas);
+    app.mount(root);
+    await nextTick();
+    return {
+      get rafCalls() { return rafCalls; },
+      get cancelCalls() { return cancelCalls; },
+      get clearRectCalls() { return clearRectCalls; },
+      get arcCalls() { return arcCalls; },
+      mqObjects,
+      mqListeners,
+      unmount() { app.unmount(); },
+    };
+  }
+
+  try {
+    // 1. Mobile / coarse pointer: draws static first frame (50 dots), 0 rAF calls; transitions cleanly on media query change & disposes listeners
+    const mobile = await runCanvasScenario({ mobileOrCoarse: true, cores: 8 });
+    assert.equal(mobile.clearRectCalls, 1);
+    assert.equal(mobile.arcCalls, 50);
+    assert.equal(mobile.rafCalls, 0, 'mobile/coarse viewport must NOT start requestAnimationFrame loop');
+
+    const mqEntry = [...mobile.mqObjects.entries()].find(([q]) => q.includes('767px'));
+    assert.ok(mqEntry, 'must subscribe to (max-width: 767px), (pointer: coarse) media query');
+    mqEntry[1].matches = false;
+    for (const fn of mobile.mqListeners.get(mqEntry[0])) fn();
+    assert.equal(mobile.rafCalls, 1, 'switching from mobile to desktop starts rAF');
+    mqEntry[1].matches = true;
+    for (const fn of mobile.mqListeners.get(mqEntry[0])) fn();
+    assert.equal(mobile.cancelCalls, 1, 'switching back to mobile cancels rAF');
+    mobile.unmount();
+    assert.equal(mobile.mqListeners.get(mqEntry[0]).size, 0, 'unmount must remove mobile/coarse media query listener');
+
+    // 2. Low-power device (hardwareConcurrency <= 2) on desktop viewport: static frame only, 0 rAF calls
+    const lowPower = await runCanvasScenario({ mobileOrCoarse: false, cores: 2 });
+    assert.equal(lowPower.clearRectCalls, 1);
+    assert.equal(lowPower.arcCalls, 50);
+    assert.equal(lowPower.rafCalls, 0, 'hardwareConcurrency <= 2 must NOT start requestAnimationFrame loop');
+    lowPower.unmount();
+
+    // 3. Normal desktop with high core count: draws static frame AND schedules rAF
+    const desktop = await runCanvasScenario({ mobileOrCoarse: false, cores: 8 });
+    assert.equal(desktop.clearRectCalls, 1);
+    assert.equal(desktop.arcCalls, 50);
+    assert.equal(desktop.rafCalls, 1, 'high-core desktop must start rAF');
+    desktop.unmount();
+    assert.equal(desktop.cancelCalls, 1);
+  } finally {
+    globalThis.window = origWin;
+    globalThis.document = origDoc;
+    if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
+    else delete globalThis.navigator;
+  }
+});

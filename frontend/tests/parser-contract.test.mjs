@@ -445,11 +445,13 @@ test('YouTube mobile & desktop helper detection: mobile UA + helper succeeds ide
       assert.match(en.instance.parseError.value,/userscript manager/i);
     }
 
-    // 3. 桌面 UA + 未检测到助手时仍显示原安装说明
+    // 3. 桌面 UA + 未检测到助手时立即渲染降级引导，绝不调用 /api/parse 白跑服务端 yt-dlp
     Object.defineProperty(globalThis,'navigator',{configurable:true,value:{userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'}});
-    globalThis.fetch=async()=>Response.json(good({platform:'youtube',items:[file('yt-1','https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')]}));
+    let desktopMissingParseCalls=0;
+    globalThis.fetch=async()=>{desktopMissingParseCalls++;return Response.json(good({platform:'youtube',items:[file('yt-1','https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')]}));};
     const desktopMissing=harness('https://www.youtube.com/watch?v=I9JvDaciaFk');
     await desktopMissing.instance.parseVideo();
+    assert.equal(desktopMissingParseCalls,0,'desktop YouTube parse without extension/helper must make 0 /api/parse requests');
     assert.equal(desktopMissing.instance.parseError.value,'');
     assert.equal(desktopMissing.store.resultData?.extra?.youtube_helper?.status,'missing');
     assert.match(desktopMissing.store.resultData?.extra?.youtube_helper?.message || '',/请按说明安装并启用后重试/);
@@ -585,11 +587,14 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
       configurable: true,
       value: { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
     });
-    globalThis.fetch = async () =>
-      Response.json(good({
+    let outdatedParseCalls = 0;
+    globalThis.fetch = async () => {
+      outdatedParseCalls += 1;
+      return Response.json(good({
         platform: 'youtube',
         items: [file('yt-1', 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')],
       }));
+    };
 
     const zhStore = reactive({
       resultData: null,
@@ -649,11 +654,74 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
     assert.equal(enHelper?.status, 'outdated');
     assert.equal(enHelper?.provider, 'extension');
     assert.match(enHelper?.message || '', /v4\.1\.0.*v4\.2\.0\+/);
+    assert.equal(
+      outdatedParseCalls,
+      0,
+      'connected outdated extension without youtube_parse must make 0 /api/parse requests',
+    );
   } finally {
     globalThis.window = prevWin;
     if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
     else delete globalThis.navigator;
   }
+});
+
+test('Post-#37: runYouTubeHelperParse calls requestStandardParse 0 times when extension/helper missing and fetchJSON aligns timeout to 75000ms', async (t) => {
+  const origNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  try {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' },
+    });
+    let standardParseCalls = 0;
+    let capturedResult = null;
+    await parseHelpers.runYouTubeHelperParse({
+      videoId: 'I9JvDaciaFk',
+      locale: 'zh-CN',
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+      pingExtension: async () => ({ connected: false, version: '', extensionId: '', capabilities: [] }),
+      pingHelper: async () => ({ installed: false, version: null, supported: false }),
+      requestStandardParse: async () => {
+        standardParseCalls += 1;
+        throw new Error('requestStandardParse must not be called');
+      },
+      fetchJSON: async () => {
+        throw new Error('fetchJSON must not be called');
+      },
+      baseUrl: '',
+      onHelperReady: () => {},
+      setResult: (media) => { capturedResult = media; },
+      setError: () => {},
+    });
+    assert.equal(standardParseCalls, 0);
+    assert.equal(capturedResult?.platform, 'youtube');
+    assert.equal(capturedResult?.content_id, 'I9JvDaciaFk');
+    assert.equal(capturedResult?.items?.[0]?.state, 'unavailable');
+    assert.equal(capturedResult?.items?.[0]?.error?.code, 'HELPER_REQUIRED');
+    assert.equal(capturedResult?.extra?.youtube_helper?.status, 'missing');
+  } finally {
+    if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
+    else delete globalThis.navigator;
+  }
+
+  // Verify fetchJSON timeout is 75000ms (does not abort at 55000ms, aborts at 75000ms)
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let capturedSignal;
+  globalThis.fetch = async (_url, init) => {
+    capturedSignal = init.signal;
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    });
+  };
+  const pending = parser.fetchJSON('/api/parse?schema_version=1.0&url=https%3A%2F%2Fx.com%2Fdemo');
+  t.mock.timers.tick(55000);
+  assert.equal(capturedSignal.aborted, false, 'fetchJSON must NOT time out at legacy 55000ms');
+  t.mock.timers.tick(19999);
+  assert.equal(capturedSignal.aborted, false, 'fetchJSON must NOT time out before 75000ms');
+  t.mock.timers.tick(1);
+  assert.equal(capturedSignal.aborted, true, 'fetchJSON must time out at 75000ms');
+  await assert.rejects(pending, /解析请求超时/);
 });
 
 });

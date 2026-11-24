@@ -173,10 +173,22 @@ func run(args []string) error {
 		"zuiyou":      zuiyou.NewWithTBVideo(executor, zuiyouSave),
 		"xiaohongshu": xiaohongshu.New(xhsExecutor),
 	}
-	ytCfg, err := configureYTDLPFull(c, adapters, executor, *xTombstoneFallback, os.Getenv)
+	runtimeCfg, runtimeFromFile, err := api.LoadRuntimeConfig(os.Getenv)
 	if err != nil {
 		return err
 	}
+	limits, err := api.LoadAdmissionConfig(os.Getenv)
+	if err != nil {
+		return err
+	}
+	if runtimeFromFile {
+		api.ApplyRuntimeConfigToAdmissionConfig(&limits, runtimeCfg)
+	}
+	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, executor, *xTombstoneFallback, os.Getenv, runtimeCfg, runtimeFromFile)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ytCfg.Close() }()
 	handler, err := api.NewWithCacheConfig(c, adapters, time.Now, preparePublicMedia(os.Getenv("SNAP_MEDIA_SIGNING_KEY")), cacheCfg)
 	if err != nil {
 		return err
@@ -184,11 +196,16 @@ func run(args []string) error {
 	if ytCfg.genericAdapter != nil {
 		handler.SetGenericAdapter(ytCfg.genericAdapter)
 	}
-	if ytCfg.engine != nil {
+	if ytCfg.socialEngine != nil {
+		handler.Stats().SetYTDLPEngine(ytCfg.socialEngine)
+	} else if ytCfg.engine != nil {
 		handler.Stats().SetYTDLPEngine(ytCfg.engine)
 	}
 	if ytCfg.genericEngine != nil {
 		handler.Stats().SetGenericYTDLPEngine(ytCfg.genericEngine)
+	}
+	if ytCfg.engine != nil {
+		handler.Stats().SetYTDLPCompartmentSources(ytCfg.youtubeEngine, ytCfg.socialEngine, ytCfg.genericEngine)
 	}
 	shanghaiMode := "off"
 	shanghaiBilibili := false
@@ -220,10 +237,6 @@ func run(args []string) error {
 	// The route is present even without a configured key, where it returns the
 	// PHP-compatible legacy 503 media envelope without issuing network calls.
 	handler.SetWeiboRelay(weibo.NewMediaRelay(os.Getenv("SNAP_MEDIA_SIGNING_KEY")))
-	limits, err := api.LoadAdmissionConfig(os.Getenv)
-	if err != nil {
-		return err
-	}
 	keyRegistry, err := api.LoadAPIKeyRegistry(os.Getenv, limits)
 	if err != nil {
 		return err
@@ -231,6 +244,9 @@ func run(args []string) error {
 	entry, err := api.WithAdmissionWithRegistry(handler, control, *clientIdentity, os.Getenv("SNAP_INGRESS_KEY"), limits, keyRegistry)
 	if err != nil {
 		return err
+	}
+	if runtimeFromFile {
+		api.ApplyRuntimeConfig(entry, handler, runtimeCfg, true, false)
 	}
 	if statsSnapshotPath != "" {
 		_ = handler.Stats().LoadSnapshot(statsSnapshotPath, log.Printf)
@@ -241,8 +257,8 @@ func run(args []string) error {
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
-	stopKeyReload := startAPIKeySignalReloader(ctx, sighup, entry, os.Getenv, limits, log.Printf)
-	defer stopKeyReload()
+	stopReloader := startSignalReloader(ctx, sighup, entry, handler, &ytCfg, os.Getenv, limits, log.Printf)
+	defer stopReloader()
 	stopStatsLog := handler.Stats().StartPeriodicLog(ctx, api.DefaultStatsLogInterval, log.Printf)
 	defer stopStatsLog()
 	stopStatsSnap := handler.Stats().StartPeriodicSnapshot(ctx, statsSnapshotPath, api.DefaultStatsSnapshotInterval, log.Printf)
@@ -397,10 +413,62 @@ func reloadAPIKeysOnce(entry http.Handler, getenv func(string) string, limits ap
 	return true
 }
 
+func reloadRuntimeConfigOnce(
+	entry http.Handler,
+	handler *api.Handler,
+	ytCfg *ytdlpConfigResult,
+	getenv func(string) string,
+	logf func(string, ...any),
+) bool {
+	if getenv == nil || strings.TrimSpace(getenv(api.EnvRuntimeConfigFile)) == "" {
+		return false
+	}
+	next, fromFile, err := api.LoadRuntimeConfig(getenv)
+	if err != nil {
+		if logf != nil {
+			logf("dokitool: runtime config reload rejected (keeping previous configuration): %v", err)
+		}
+		return false
+	}
+	if !api.ApplyRuntimeConfig(entry, handler, next, fromFile, true) {
+		return false
+	}
+	if ytCfg != nil {
+		if err := ytCfg.SetCompartmentLimits(next.YTDLP.YouTubeSlots, next.YTDLP.SocialSlots, next.YTDLP.GenericSlots); err != nil && logf != nil {
+			logf("dokitool: runtime config ytengine slot resize warning: %v", err)
+		}
+	}
+	if logf != nil {
+		logf("dokitool: runtime config reloaded (yt=%d social=%d generic=%d ejs=%d fast_per_platform=%d cb_enabled=%t disabled=%d)",
+			next.YTDLP.YouTubeSlots,
+			next.YTDLP.SocialSlots,
+			next.YTDLP.GenericSlots,
+			next.YTDLP.YouTubeEJSConcurrency,
+			next.FastPool.PerPlatformMaxConcurrency,
+			next.CircuitBreaker.Enabled,
+			len(next.CircuitBreaker.DisabledPlatforms),
+		)
+	}
+	return true
+}
+
 func startAPIKeySignalReloader(
 	ctx context.Context,
 	sigCh <-chan os.Signal,
 	entry http.Handler,
+	getenv func(string) string,
+	limits api.AdmissionConfig,
+	logf func(string, ...any),
+) func() {
+	return startSignalReloader(ctx, sigCh, entry, nil, nil, getenv, limits, logf)
+}
+
+func startSignalReloader(
+	ctx context.Context,
+	sigCh <-chan os.Signal,
+	entry http.Handler,
+	handler *api.Handler,
+	ytCfg *ytdlpConfigResult,
 	getenv func(string) string,
 	limits api.AdmissionConfig,
 	logf func(string, ...any),
@@ -420,6 +488,7 @@ func startAPIKeySignalReloader(
 					return
 				}
 				reloadAPIKeysOnce(entry, getenv, limits, logf)
+				reloadRuntimeConfigOnce(entry, handler, ytCfg, getenv, logf)
 			}
 		}
 	}()
@@ -480,8 +549,40 @@ func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapt
 
 type ytdlpConfigResult struct {
 	engine         *ytengine.Engine
+	youtubeEngine  *ytengine.Engine
+	socialEngine   *ytengine.Engine
 	genericEngine  *ytengine.Engine
 	genericAdapter api.Adapter
+}
+
+func (r *ytdlpConfigResult) Close() error {
+	if r == nil || r.engine == nil {
+		return nil
+	}
+	return r.engine.Close()
+}
+
+func (r *ytdlpConfigResult) SetCompartmentLimits(ytSlots, socialSlots, genericSlots int) error {
+	if r == nil {
+		return nil
+	}
+	var firstErr error
+	if r.youtubeEngine != nil {
+		if err := r.youtubeEngine.SetConcurrencyLimit(ytSlots); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if r.socialEngine != nil {
+		if err := r.socialEngine.SetConcurrencyLimit(socialSlots); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if r.genericEngine != nil {
+		if err := r.genericEngine.SetConcurrencyLimit(genericSlots); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func parseYTDLPGenericConcurrency(getenv func(string) string) (int, error) {
@@ -505,6 +606,18 @@ func configureYTDLPWithEngine(c *catalog.Catalog, adapters map[string]api.Adapte
 }
 
 func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, executor fetch.Executor, xTombstoneFallback string, getenv func(string) string) (ytdlpConfigResult, error) {
+	return configureYTDLPFullWithRuntime(c, adapters, executor, xTombstoneFallback, getenv, api.DefaultRuntimeConfig(), false)
+}
+
+func configureYTDLPFullWithRuntime(
+	c *catalog.Catalog,
+	adapters map[string]api.Adapter,
+	executor fetch.Executor,
+	xTombstoneFallback string,
+	getenv func(string) string,
+	runtimeCfg api.RuntimeConfig,
+	runtimeFromFile bool,
+) (ytdlpConfigResult, error) {
 	if err := x.ValidateTombstoneFallback(xTombstoneFallback); err != nil {
 		return ytdlpConfigResult{}, err
 	}
@@ -553,13 +666,36 @@ func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, exe
 		log.Printf("dokitool: yt-dlp engine preflight failed (platforms not registered in catalog): %v", err)
 		return ytdlpConfigResult{}, nil
 	}
-	log.Printf("dokitool: yt-dlp shared engine verified (version=%s, asset=%s, sha256=%s)", ytengine.PinnedVersion, baseEngine.BinaryAsset(), baseEngine.BinarySHA256())
+	log.Printf("dokitool: yt-dlp shared engine verified (version=%s, asset=%s, sha256=%s, zipapp=%t)",
+		ytengine.PinnedVersion, baseEngine.BinaryAsset(), baseEngine.BinarySHA256(), baseEngine.UsingPythonZipapp())
+
+	youtubeSlots := ytengine.DefaultYouTubeSlots
+	socialSlots := ytengine.DefaultSocialSlots
+	if runtimeFromFile {
+		youtubeSlots = runtimeCfg.YTDLP.YouTubeSlots
+		socialSlots = runtimeCfg.YTDLP.SocialSlots
+		genericConc = runtimeCfg.YTDLP.GenericSlots
+	} else if rawConc := strings.TrimSpace(getenv("DOKITOOL_YTDLP_CONCURRENCY")); rawConc != "" {
+		if n := baseEngine.ConcurrencyLimit(); n >= 1 {
+			youtubeSlots = n
+			socialSlots = n
+		}
+	}
+
+	var socialEngine *ytengine.Engine
+	if xEnabled || igEnabled || len(genericSites) > 0 {
+		socialEngine = baseEngine.WithCompartment(socialSlots)
+	}
+	var youtubeEngine *ytengine.Engine
+	if ytEnabled {
+		youtubeEngine = baseEngine.WithCompartment(youtubeSlots)
+	}
 
 	if xEnabled {
 		if err := c.Register(catalog.XPlatform()); err != nil {
 			return ytdlpConfigResult{}, err
 		}
-		xEngine := newXEngine(baseEngine)
+		xEngine := newXEngine(socialEngine)
 		xParser, err := x.NewWithSizeProber(xEngine, x.NewSizeProber(executor)).
 			WithFetcher(executor).
 			WithTombstoneFallback(xTombstoneFallback)
@@ -572,14 +708,14 @@ func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, exe
 		if err := c.Register(catalog.YouTubePlatform()); err != nil {
 			return ytdlpConfigResult{}, err
 		}
-		ytEngine := baseEngine.WithTargetPolicy(youtube.AllowedTargetURL, youtube.AllowedOutboundHost)
+		ytEngine := youtubeEngine.WithTargetPolicy(youtube.AllowedTargetURL, youtube.AllowedOutboundHost)
 		adapters["youtube"] = youtube.NewWithSizeProber(ytEngine, ytengine.NewSizeProber(executor, youtube.AllowedMediaURL))
 	}
 	if igEnabled {
 		if err := c.Register(catalog.InstagramPlatform()); err != nil {
 			return ytdlpConfigResult{}, err
 		}
-		igEngine := baseEngine.WithTargetPolicy(instagram.AllowedTargetURL, instagram.AllowedOutboundHost)
+		igEngine := socialEngine.WithTargetPolicy(instagram.AllowedTargetURL, instagram.AllowedOutboundHost)
 		adapters["instagram"] = instagram.NewWithSizeProber(igEngine, ytengine.NewSizeProber(executor, instagram.AllowedMediaURL)).WithFetcher(executor)
 	}
 	for _, spec := range genericSites {
@@ -587,7 +723,7 @@ func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, exe
 			return ytdlpConfigResult{}, err
 		}
 		policyParser := ytgeneric.New(spec, nil, nil)
-		siteEngine := baseEngine.
+		siteEngine := socialEngine.
 			WithTargetPolicy(policyParser.AllowedTargetURL, policyParser.AllowedOutboundHost).
 			WithExtractors(spec.Extractors...)
 		var prober ytengine.SizeProber
@@ -597,7 +733,11 @@ func configureYTDLPFull(c *catalog.Catalog, adapters map[string]api.Adapter, exe
 		adapters[spec.PlatformID] = ytgeneric.NewWithResolver(spec, siteEngine, prober, net.DefaultResolver)
 	}
 
-	res := ytdlpConfigResult{engine: baseEngine}
+	res := ytdlpConfigResult{
+		engine:        baseEngine,
+		youtubeEngine: youtubeEngine,
+		socialEngine:  socialEngine,
+	}
 	if genericEnabled {
 		genericEngine := baseEngine.
 			WithGenericConcurrency(genericConc).

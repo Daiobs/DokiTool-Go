@@ -27,13 +27,17 @@ const (
 	minCacheMaxBytes     int64 = 1024      // 1 KiB
 	maxCacheMaxBytes     int64 = 512 << 20 // 512 MiB
 
-	defaultCacheTTL            = 300 * time.Second
-	maxCacheTTL                = 600 * time.Second
-	genericCacheTTL            = 60 * time.Second
-	shanghaiFallbackCacheTTL   = 15 * time.Second
-	minCacheTTL                = 10 * time.Second
-	expirySafetyMargin         = 60 * time.Second
-	contentUnavailableCacheTTL = 10 * time.Second
+	defaultCacheTTL              = 300 * time.Second
+	maxCacheTTL                  = 600 * time.Second
+	genericCacheTTL              = 60 * time.Second
+	defaultYouTubeParseCacheTTL  = 120 * time.Second
+	defaultStaleIfErrorTTL       = 600 * time.Second
+	defaultUpstreamBlockedNegTTL = 5 * time.Second
+	shanghaiFallbackCacheTTL     = 15 * time.Second
+	minCacheTTL                  = 10 * time.Second
+	expirySafetyMargin           = 60 * time.Second
+	staleExpiryHardMargin        = 15 * time.Second
+	contentUnavailableCacheTTL   = 10 * time.Second
 )
 
 // CacheConfig bounds the in-process /api/parse and /api/resolve response cache.
@@ -119,23 +123,27 @@ type cachedResponse struct {
 	platform   string
 	body       []byte
 	retryAfter string
+	retryable  bool
 }
 
 type cacheEntry struct {
-	key         cacheKey
-	res         cachedResponse
-	expiresAt   time.Time
-	size        int64
-	promotedSeq uint64
-	lastHitSeq  atomic.Uint64
+	key           cacheKey
+	res           cachedResponse
+	freshUntil    time.Time
+	hardExpiresAt time.Time
+	isOK          bool
+	size          int64
+	promotedSeq   uint64
+	lastHitSeq    atomic.Uint64
 }
 
 type inflightCall struct {
-	done      chan struct{}
-	cancel    context.CancelFunc
-	waiters   int
-	abandoned bool
-	res       cachedResponse
+	done        chan struct{}
+	cancel      context.CancelFunc
+	waiters     int
+	abandoned   bool
+	servedStale bool
+	res         cachedResponse
 }
 
 type parseCache struct {
@@ -175,7 +183,7 @@ func storeHitSeqMonotonic(dst *atomic.Uint64, seq uint64) {
 
 // getFresh performs a pure read-lock lookup, recording a monotonic hit sequence
 // number atomically without taking an exclusive lock or mutating the LRU list.
-// Expired entries return false and are lazily evicted under Lock() on miss/write.
+// Entries past freshUntil return false; entries past hardExpiresAt are lazily evicted under Lock().
 func (c *parseCache) getFresh(key cacheKey, now time.Time) (cachedResponse, bool) {
 	if c == nil || c.cfg.Disabled {
 		return cachedResponse{}, false
@@ -187,7 +195,7 @@ func (c *parseCache) getFresh(key cacheKey, now time.Time) (cachedResponse, bool
 		return cachedResponse{}, false
 	}
 	entry := elem.Value.(*cacheEntry)
-	if !now.Before(entry.expiresAt) {
+	if !now.Before(entry.freshUntil) {
 		c.mu.RUnlock()
 		return cachedResponse{}, false
 	}
@@ -206,8 +214,12 @@ func (c *parseCache) getLocked(key cacheKey, now time.Time) (cachedResponse, boo
 		return cachedResponse{}, false
 	}
 	entry := elem.Value.(*cacheEntry)
-	if !now.Before(entry.expiresAt) {
-		c.removeElementLocked(elem)
+	if !now.Before(entry.freshUntil) {
+		// Retain stale OK entries until hardExpiresAt so runSingleflight or open
+		// circuit breakers can serve stale-if-error fallback before media expiry.
+		if !now.Before(entry.hardExpiresAt) {
+			c.removeElementLocked(elem)
+		}
 		return cachedResponse{}, false
 	}
 	seq := c.hitSeq.Add(1)
@@ -215,6 +227,46 @@ func (c *parseCache) getLocked(key cacheKey, now time.Time) (cachedResponse, boo
 	entry.promotedSeq = entry.lastHitSeq.Load()
 	c.lru.MoveToFront(elem)
 	return entry.res, true
+}
+
+// getStaleLocked returns an expired-but-still-usable OK cache entry when now is
+// strictly before both entry.hardExpiresAt (enforcing the earliest_expires_at - 15s
+// ceiling) and entry.freshUntil + maxStaleTTL. Negative caches are never returned as stale.
+func (c *parseCache) getStaleLocked(key cacheKey, now time.Time, maxStaleTTL time.Duration) (cachedResponse, bool) {
+	if c == nil || c.cfg.Disabled {
+		return cachedResponse{}, false
+	}
+	elem, ok := c.entries[key]
+	if !ok {
+		return cachedResponse{}, false
+	}
+	entry := elem.Value.(*cacheEntry)
+	if !now.Before(entry.hardExpiresAt) {
+		c.removeElementLocked(elem)
+		return cachedResponse{}, false
+	}
+	if !entry.isOK || maxStaleTTL <= 0 || !now.Before(entry.freshUntil.Add(maxStaleTTL)) {
+		return cachedResponse{}, false
+	}
+	seq := c.hitSeq.Add(1)
+	storeHitSeqMonotonic(&entry.lastHitSeq, seq)
+	entry.promotedSeq = entry.lastHitSeq.Load()
+	c.lru.MoveToFront(elem)
+	return entry.res, true
+}
+
+func (c *parseCache) deleteIfNotFreshLocked(key cacheKey, now time.Time) {
+	if c == nil || c.cfg.Disabled {
+		return
+	}
+	elem, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	entry := elem.Value.(*cacheEntry)
+	if !now.Before(entry.freshUntil) {
+		c.removeElementLocked(elem)
+	}
 }
 
 // fresh reports whether key currently has an unexpired entry without touching
@@ -229,7 +281,7 @@ func (c *parseCache) fresh(key cacheKey, now time.Time) bool {
 		c.mu.RUnlock()
 		return false
 	}
-	fresh := now.Before(elem.Value.(*cacheEntry).expiresAt)
+	fresh := now.Before(elem.Value.(*cacheEntry).freshUntil)
 	c.mu.RUnlock()
 	return fresh
 }
@@ -265,9 +317,16 @@ func (c *parseCache) reconcileLRULocked() {
 	}
 }
 
-func (c *parseCache) putLocked(key cacheKey, res cachedResponse, expiresAt time.Time) {
+func (c *parseCache) putLocked(key cacheKey, res cachedResponse, freshUntil time.Time) {
+	c.putWithStaleLocked(key, res, freshUntil, freshUntil, res.code == "OK")
+}
+
+func (c *parseCache) putWithStaleLocked(key cacheKey, res cachedResponse, freshUntil, hardExpiresAt time.Time, isOK bool) {
 	if c == nil || c.cfg.Disabled {
 		return
+	}
+	if !isOK || hardExpiresAt.Before(freshUntil) {
+		hardExpiresAt = freshUntil
 	}
 	size := cacheEntrySize(key, res)
 	if old, ok := c.entries[key]; ok {
@@ -293,11 +352,13 @@ func (c *parseCache) putLocked(key cacheKey, res cachedResponse, expiresAt time.
 	}
 	seq := c.hitSeq.Add(1)
 	entry := &cacheEntry{
-		key:         key,
-		res:         res,
-		expiresAt:   expiresAt,
-		size:        size,
-		promotedSeq: seq,
+		key:           key,
+		res:           res,
+		freshUntil:    freshUntil,
+		hardExpiresAt: hardExpiresAt,
+		isOK:          isOK,
+		size:          size,
+		promotedSeq:   seq,
 	}
 	entry.lastHitSeq.Store(seq)
 	elem := c.lru.PushFront(entry)
@@ -402,65 +463,123 @@ func normalizeCacheURL(platform, source string) string {
 	return b.String()
 }
 
-// computeCacheTTLForPlatform applies computeCacheTTL and caps successful
-// Tier-2 generic fallback responses at genericCacheTTL (60s) for short-TTL
-// long-tail caching.
+func defaultRuntimeCachePolicy() RuntimeCachePolicy {
+	return RuntimeCachePolicy{
+		YouTubeParseTTL:       defaultYouTubeParseCacheTTL,
+		StaleIfErrorTTL:       defaultStaleIfErrorTTL,
+		UpstreamBlockedNegTTL: defaultUpstreamBlockedNegTTL,
+	}
+}
+
+// computeCacheTTLForPlatform applies computeCacheTTLForResult using default cache policy.
 func computeCacheTTLForPlatform(platform string, payload unified.Object, now time.Time) (time.Duration, bool) {
 	return computeCacheTTLForResult(platform, payload, now, false)
 }
 
-// computeCacheTTLForResult applies tiered caching TTLs:
+// computeCacheTTLForResult applies tiered caching TTLs using default cache policy:
 //   - Core OK responses: up to 600s (clamped by earliest_expires_at - now - 60s),
 //     or 300s default when no expires_at is present.
+//   - YouTube OK responses: capped at cache.youtube_parse_ttl (default 120s; 0s disables).
 //   - Tier-2 generic OK responses: capped at 60s.
 //   - Shanghai-enabled platforms (Douyin / Bilibili) that degraded/fell back to
 //     overseas routes: capped at 15s so the cache self-heals promptly on recovery.
+//   - CONTENT_UNAVAILABLE: 10s negative cache.
+//   - UPSTREAM_BLOCKED: cache.upstream_blocked_neg_ttl negative cache (default 5s; 0s disables).
 func computeCacheTTLForResult(platform string, payload unified.Object, now time.Time, shanghaiFallback bool) (time.Duration, bool) {
-	ttl, ok := computeCacheTTL(payload, now)
+	freshUntil, _, ok := computeCacheDeadlines(platform, payload, now, shanghaiFallback, defaultRuntimeCachePolicy())
 	if !ok {
 		return 0, false
 	}
-	if unified.Str(payload["code"]) == "OK" {
-		traits := traitsForPlatform(platform)
-		if traits.maxOKCacheTTL > 0 && ttl > traits.maxOKCacheTTL {
-			ttl = traits.maxOKCacheTTL
-		}
-		if shanghaiFallback && traits.shanghaiFallbackShortTTL && ttl > shanghaiFallbackCacheTTL {
-			ttl = shanghaiFallbackCacheTTL
-		}
-	}
-	return ttl, true
+	return freshUntil.Sub(now), true
 }
 
-// computeCacheTTL implements tiered caching TTL bounds:
-//   - code == "OK": TTL = min(600s, earliest_expires_at - now - 60s), or 300s
-//     when no expires_at exists anywhere in the response; skip if TTL < 10s.
-//   - code == "CONTENT_UNAVAILABLE": TTL = 10s.
-//   - all other codes: never cached.
-func computeCacheTTL(payload unified.Object, now time.Time) (time.Duration, bool) {
+// computeCacheDeadlines computes both freshUntil and hardExpiresAt (for stale-if-error).
+// IRON RULE: for OK responses with expires_at, hardExpiresAt never exceeds earliest_expires_at - 15s.
+// Negative caches (CONTENT_UNAVAILABLE, UPSTREAM_BLOCKED) set hardExpiresAt = freshUntil
+// and are never served as stale fallback.
+func computeCacheDeadlines(
+	platform string,
+	payload unified.Object,
+	now time.Time,
+	shanghaiFallback bool,
+	policy RuntimeCachePolicy,
+) (freshUntil, hardExpiresAt time.Time, ok bool) {
 	switch unified.Str(payload["code"]) {
 	case "CONTENT_UNAVAILABLE":
-		return contentUnavailableCacheTTL, true
+		until := now.Add(contentUnavailableCacheTTL)
+		return until, until, true
+	case "UPSTREAM_BLOCKED":
+		if policy.UpstreamBlockedNegTTL <= 0 {
+			return time.Time{}, time.Time{}, false
+		}
+		until := now.Add(policy.UpstreamBlockedNegTTL)
+		return until, until, true
 	case "OK":
 	default:
-		return 0, false
+		return time.Time{}, time.Time{}, false
+	}
+
+	if platform == "youtube" && policy.YouTubeParseTTL <= 0 {
+		return time.Time{}, time.Time{}, false
 	}
 	data := unified.Map(payload["data"])
 	if data == nil {
-		return 0, false
+		return time.Time{}, time.Time{}, false
 	}
 	earliest, hasExpiry, valid := earliestExpiresAt(data)
 	if !valid {
-		return 0, false
+		return time.Time{}, time.Time{}, false
 	}
+	var freshTTL time.Duration
 	if !hasExpiry {
-		return defaultCacheTTL, true
+		freshTTL = defaultCacheTTL
+	} else {
+		freshTTL = min(maxCacheTTL, earliest.Sub(now)-expirySafetyMargin)
+		if freshTTL < minCacheTTL {
+			return time.Time{}, time.Time{}, false
+		}
 	}
-	ttl := min(maxCacheTTL, earliest.Sub(now)-expirySafetyMargin)
-	if ttl < minCacheTTL {
+
+	traits := traitsForPlatform(platform)
+	if traits.maxOKCacheTTL > 0 && freshTTL > traits.maxOKCacheTTL {
+		freshTTL = traits.maxOKCacheTTL
+	}
+	if platform == "youtube" && policy.YouTubeParseTTL > 0 && freshTTL > policy.YouTubeParseTTL {
+		freshTTL = policy.YouTubeParseTTL
+	}
+	if shanghaiFallback && traits.shanghaiFallbackShortTTL && freshTTL > shanghaiFallbackCacheTTL {
+		freshTTL = shanghaiFallbackCacheTTL
+	}
+
+	freshUntil = now.Add(freshTTL)
+	hardExpiresAt = freshUntil
+	if policy.StaleIfErrorTTL > 0 {
+		hardExpiresAt = freshUntil.Add(policy.StaleIfErrorTTL)
+	}
+	if hasExpiry {
+		ceiling := earliest.Add(-staleExpiryHardMargin)
+		if ceiling.Before(hardExpiresAt) {
+			hardExpiresAt = ceiling
+		}
+		if hardExpiresAt.Before(freshUntil) {
+			hardExpiresAt = freshUntil
+		}
+	}
+	return freshUntil, hardExpiresAt, true
+}
+
+// computeCacheTTL implements base caching TTL bounds:
+//   - code == "OK": TTL = min(600s, earliest_expires_at - now - 60s), or 300s
+//     when no expires_at exists anywhere in the response; skip if TTL < 10s.
+//   - code == "CONTENT_UNAVAILABLE": TTL = 10s.
+//   - code == "UPSTREAM_BLOCKED": TTL = 5s (defaultUpstreamBlockedNegTTL).
+//   - all other codes: never cached.
+func computeCacheTTL(payload unified.Object, now time.Time) (time.Duration, bool) {
+	freshUntil, _, ok := computeCacheDeadlines("", payload, now, false, defaultRuntimeCachePolicy())
+	if !ok {
 		return 0, false
 	}
-	return ttl, true
+	return freshUntil.Sub(now), true
 }
 
 func earliestExpiresAt(data unified.Object) (earliest time.Time, hasExpiry bool, valid bool) {

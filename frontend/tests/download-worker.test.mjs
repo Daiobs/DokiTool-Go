@@ -14,17 +14,17 @@ const token = 'a'.repeat(32);
 const id = number => `task000000000000${number}`;
 const bytes = [new Uint8Array([0, 0, 0, 8]), new Uint8Array([102, 116, 121, 112])];
 
-function harness(fetcher, indexedDB) {
+function harness(fetcher, indexedDB, workerOrigin = origin) {
   const events = new Map(), timers = new Map(), updates = [], lifetime = [], clientLookups = [], deferredReplies = [];
   let nextTimer = 0;
   let now = 1_000_000;
   const clients = new Map([
-    ['page', { id: 'page', url: origin + '/', postMessage: value => updates.push(value.snapshot) }],
-    ['reloaded', { id: 'reloaded', url: origin + '/', postMessage: value => updates.push(value.snapshot) }],
+    ['page', { id: 'page', url: workerOrigin + '/', postMessage: value => updates.push(value.snapshot) }],
+    ['reloaded', { id: 'reloaded', url: workerOrigin + '/', postMessage: value => updates.push(value.snapshot) }],
     ['foreign', { id: 'foreign', url: 'https://foreign.test/', postMessage() {} }],
   ]);
   const context = vm.createContext({
-    self: { location: new URL(origin), clients: { get: async key => { clientLookups.push(key); return clients.get(key); } }, addEventListener: (key, handler) => events.set(key, handler) },
+    self: { location: new URL(workerOrigin), clients: { get: async key => { clientLookups.push(key); return clients.get(key); } }, addEventListener: (key, handler) => events.set(key, handler) },
     fetch: fetcher, URL, Response, Blob, ReadableStream, AbortController, DOMException, TextDecoder,
     crypto: { randomUUID }, indexedDB,
     Date: class extends Date { static now() { return now; } },
@@ -591,7 +591,7 @@ test('finished elapsed time and average speed remain stable across later queries
 test('worker reports its build and separates total elapsed time from transfer speed', async t => {
   const h = harness(async () => media()); t.after(() => h.close());
   const ping = await h.send({ action: 'ping' });
-  assert.equal(ping.workerBuild, 'downloads-20261123.1');
+  assert.equal(ping.workerBuild, 'downloads-20261124.1');
   assert.equal(ping.capabilities.admission, true);
   await h.start(1, [], { startedAt: 995_000 });
   assert.equal((await h.query(1)).elapsed, 5);
@@ -1842,4 +1842,157 @@ test('P2: safe idle hot-swap protects both open bridge.html lease and closed-tab
   await activeBridgeBusy.send({ action: 'cancel', id: id(2), token });
   for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
   assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting on worker-idle while /downloads/bridge.html is still mounted in 4000ms grace period');
+});
+
+test('P1-5: sourceUrl() hardens against private/reserved IPs, deformed IPv4, non-global IPv6, internal suffixes, and non-standard ports while preserving public sites, same-origin relay, and localhost test exemption', async t => {
+  // 1. Production origin (https://snap.dokitool.com)
+  const prod = harness(async () => media(), undefined, 'https://snap.dokitool.com');
+  t.after(() => prod.close());
+  let seq = 100;
+  const tryUrl = async (h, url) => {
+    const taskId = `ssrf000000000000${++seq}`;
+    const reply = await h.send({
+      action: 'start',
+      token,
+      request: { id: taskId, filename: 'clip.mp4', url },
+    });
+    if (!reply.error) {
+      await h.send({ action: 'cancel', id: taskId, token });
+    }
+    return reply;
+  };
+
+  const prodAllowed = [
+    'https://vimeo-cdn.example.com/clip.mp4',
+    'http://public-tier2.example.org/video.mp4',
+    'https://cdn.example.com:443/video.mp4',
+    'http://cdn.example.com:80/video.mp4',
+    'http://cdn.example.com:443/video.mp4',
+    'https://cdn.example.com:80/video.mp4',
+    '/api/media/weibo?ticket=signed.ticket',
+    'https://snap.dokitool.com/api/media/weibo?ticket=signed.ticket',
+    'https://1.1.1.1/video.mp4',
+    'https://93.184.216.34/video.mp4',
+    'https://100.63.255.255/video.mp4',
+    'https://100.128.0.1/video.mp4',
+    'https://172.15.255.255/video.mp4',
+    'https://172.32.0.1/video.mp4',
+    'https://198.17.255.255/video.mp4',
+    'https://198.20.0.1/video.mp4',
+    'https://223.255.255.254/video.mp4',
+    'https://[2606:4700:4700::1111]/video.mp4',
+    'https://[2001:4860:4860::8888]/video.mp4',
+    'https://[2001:200::1]/video.mp4',
+    'https://[3fff:1000::1]/video.mp4',
+  ];
+  for (const url of prodAllowed) {
+    const reply = await tryUrl(prod, url);
+    assert.equal(reply.error, undefined, `expected production SW to allow ${url}, got: ${reply.error}`);
+  }
+
+  const prodBlocked = [
+    // Same-origin /downloads/* must stay blocked
+    'https://snap.dokitool.com/downloads/worker.js',
+    '/downloads/bridge.html',
+    // Non-standard ports
+    'https://cdn.example.com:8443/video.mp4',
+    'http://cdn.example.com:8080/video.mp4',
+    'https://snap.dokitool.com:9080/api/media/weibo?ticket=a',
+    'http://1.1.1.1:6379/video.mp4',
+    // IPv4 private / reserved / loopback / link-local / CGNAT / documentation / multicast
+    'http://0.0.0.0/a.mp4',
+    'http://0.1.2.3/a.mp4',
+    'http://10.0.0.1/a.mp4',
+    'http://10.255.255.254/a.mp4',
+    'http://100.64.0.1/a.mp4',
+    'http://100.127.255.254/a.mp4',
+    'http://127.0.0.1/a.mp4',
+    'http://127.255.255.254/a.mp4',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://172.16.0.1/a.mp4',
+    'http://172.31.255.254/a.mp4',
+    'http://192.0.0.1/a.mp4',
+    'http://192.0.2.1/a.mp4',
+    'http://192.168.0.1/a.mp4',
+    'http://198.18.0.1/a.mp4',
+    'http://198.19.255.254/a.mp4',
+    'http://198.51.100.1/a.mp4',
+    'http://203.0.113.1/a.mp4',
+    'http://224.0.0.1/a.mp4',
+    'http://240.0.0.1/a.mp4',
+    'http://255.255.255.255/a.mp4',
+    // Deformed IPv4 literals (decimal, hex, octal, shorthand, trailing dots)
+    'http://2130706433/a.mp4',
+    'http://0x7f000001/a.mp4',
+    'http://0177.0.0.1/a.mp4',
+    'http://127.1/a.mp4',
+    'http://127.0.0.1./a.mp4',
+    'http://127.0.0.1../a.mp4',
+    'http://0x08080808/a.mp4',
+    'http://134744072/a.mp4',
+    'http://8.8/a.mp4',
+    'http://0x7f.0.0.1../a.mp4',
+    // IPv6 non-global-unicast & special-purpose ranges
+    'http://[::]/a.mp4',
+    'http://[::1]/a.mp4',
+    'http://[fc00::1]/a.mp4',
+    'http://[fd12:3456:789a::1]/a.mp4',
+    'http://[fe80::1]/a.mp4',
+    'http://[ff02::1]/a.mp4',
+    'http://[::ffff:127.0.0.1]/a.mp4',
+    'http://[::ffff:10.0.0.1]/a.mp4',
+    'http://[::ffff:169.254.169.254]/a.mp4',
+    'http://[::ffff:8.8.8.8]/a.mp4',
+    'http://[64:ff9b::1]/a.mp4',
+    'http://[2001::1]/a.mp4',
+    'http://[2001:1ff::1]/a.mp4',
+    'http://[2001:db8::1]/a.mp4',
+    'http://[2002:7f00:1::1]/a.mp4',
+    'http://[3fff::1]/a.mp4',
+    'http://[3fff:fff::1]/a.mp4',
+    // Reserved internal hostnames and suffixes (case-insensitive & trailing dot)
+    'http://localhost/a.mp4',
+    'http://LOCALHOST./a.mp4',
+    'http://api.localhost/a.mp4',
+    'http://service.local/a.mp4',
+    'http://metadata.google.internal/a.mp4',
+    'http://nas.LAN./a.mp4',
+    'http://sso.corp/a.mp4',
+    'http://router.home.arpa./a.mp4',
+    // Credentials / protocol / m3u8 remain blocked
+    'https://user:pass@cdn.example.com/a.mp4',
+    'ftp://cdn.example.com/a.mp4',
+    'https://cdn.example.com/playlist.m3u8',
+  ];
+  for (const url of prodBlocked) {
+    const reply = await tryUrl(prod, url);
+    assert.match(reply.error || '', /资源地址不支持完整文件下载/, `expected production SW to reject ${url}`);
+  }
+
+  // 2. Local headless test exemption (127.0.0.1 and localhost origins ONLY)
+  for (const localOrigin of ['http://127.0.0.1:41000', 'http://localhost:41000']) {
+    const local = harness(async () => media(), undefined, localOrigin);
+    t.after(() => local.close());
+    for (const allowed of [
+      'http://127.0.0.1:42000/fixture/plain-cors',
+      'http://localhost:42000/fixture/plain-cors',
+      `${localOrigin}/fixture/plain-basic`,
+      'https://cdn.example.com/video.mp4',
+    ]) {
+      const reply = await tryUrl(local, allowed);
+      assert.equal(reply.error, undefined, `expected local origin ${localOrigin} to allow ${allowed}, got: ${reply.error}`);
+    }
+    for (const blocked of [
+      `${localOrigin}/downloads/worker.js`,
+      'http://10.0.0.1/secret.mp4',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://[::1]:42000/a.mp4',
+      'http://sub.localhost:42000/a.mp4',
+      'http://2130706433:42000/a.mp4',
+      'https://cdn.example.com:8443/a.mp4',
+    ]) {
+      const reply = await tryUrl(local, blocked);
+      assert.match(reply.error || '', /资源地址不支持完整文件下载/, `expected local origin ${localOrigin} to still reject ${blocked}`);
+    }
+  }
 });

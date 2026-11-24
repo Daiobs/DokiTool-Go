@@ -9,9 +9,7 @@ import (
 )
 
 func gateLeases(e *Engine) int {
-	e.gatePorts.mu.Lock()
-	defer e.gatePorts.mu.Unlock()
-	return len(e.gatePorts.used)
+	return e.gatePorts.activeSessionCount()
 }
 
 func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
@@ -20,6 +18,7 @@ func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	x := e.WithTargetPolicy(nil, func(h string) bool { return h == "x.example" })
 	y := e.WithTargetPolicy(nil, func(h string) bool { return h == "y.example" })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,7 +36,7 @@ func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if gateLeases(e) != 2 {
-		t.Fatal("both tasks did not acquire separate fixed ports")
+		t.Fatal("both tasks did not acquire active gateway sessions")
 	}
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer waitCancel()
@@ -45,10 +44,10 @@ func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
 	_, err = x.Extract(waitCtx, "https://x.example/3")
 	var timedOut *Error
 	if !errors.As(err, &timedOut) || timedOut.Code != CodeUpstreamTimeout || time.Since(start) < 60*time.Millisecond || time.Since(start) > time.Second {
-		t.Fatalf("third request did not wait on shared semaphore until deadline: %v", err)
+		t.Fatalf("third request did not wait on shared slot pool until deadline: %v", err)
 	}
 	if gateLeases(e) != 2 {
-		t.Fatalf("waiting request mutated fixed gate port leases: got %d", gateLeases(e))
+		t.Fatalf("waiting request mutated active gate sessions: got %d", gateLeases(e))
 	}
 	cancel()
 	done := make(chan struct{})
@@ -58,8 +57,8 @@ func TestGateExtractSharedConcurrencyAndCancellation(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancel did not reap subprocesses")
 	}
-	if gateLeases(e) != 0 || len(e.sem) != 0 {
-		t.Fatal("cancel leaked shared ports or semaphore")
+	if gateLeases(e) != 0 || e.slotPool.Active() != 0 {
+		t.Fatal("cancel leaked shared gate sessions or slot pool")
 	}
 }
 
@@ -79,6 +78,7 @@ func TestGateExtractCompletionReleasesPorts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = e.Close() })
 			_, err = e.Extract(context.Background(), "https://public.example/1")
 			if (err == nil) != tc.success {
 				t.Fatalf("unexpected extraction outcome: %v", err)
@@ -89,8 +89,8 @@ func TestGateExtractCompletionReleasesPorts(t *testing.T) {
 					t.Fatalf("wrong timeout result: %v", err)
 				}
 			}
-			if gateLeases(e) != 0 || len(e.sem) != 0 {
-				t.Fatal("completion leaked port or execution slot")
+			if gateLeases(e) != 0 || e.slotPool.Active() != 0 {
+				t.Fatal("completion leaked gate session or execution slot")
 			}
 			_, closeGate, err := e.startOutboundGate(context.Background())
 			if err != nil {

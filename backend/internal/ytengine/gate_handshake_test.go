@@ -54,10 +54,16 @@ func TestPinnedYTDLPGateHandshake(t *testing.T) {
 			}
 			defer up.Close()
 			upURL, _ := url.Parse(up.URL)
-			e, err := New(Config{BinaryPath: bin, GatePorts: ports, AllowedOutboundHost: func(h string) bool { return h == "example.com" }, Resolver: &countingGateResolver{}, DialAddr: func(netip.Addr, string) string { return upURL.Host }})
+			e, err := New(Config{BinaryPath: bin, GatePorts: ports, AllowedOutboundHost: func(h string) bool { return h == "example.com" }, Resolver: &countingGateResolver{}})
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = e.Close() })
+			hooks := gateTestHooks{dialAddr: func(netip.Addr, string) string { return upURL.Host }}
+			if scheme == "https" {
+				hooks.rootCAs = certPoolFromCert(up.Certificate())
+			}
+			e = e.withGateTestHooks(hooks)
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			gate, closeGate, err := e.startOutboundGate(ctx)

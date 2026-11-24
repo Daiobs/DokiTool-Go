@@ -4,7 +4,7 @@ import { attachmentFormat, cleanFilename } from "./media-format.js";
 import { decodedLength } from "./decoded-length.js";
 import { readCandidate, validCandidate, reportTbvideo } from "./tbvideo.js";
 const PROTOCOL = 1;
-const BUILD = "downloads-20261123.1";
+const BUILD = "downloads-20261124.1";
 const INSTANCE = crypto.randomUUID();
 const store = createTaskStore();
 const MAX_ACTIVE = 2;
@@ -153,12 +153,160 @@ self.addEventListener("activate", event => {
 const terminal = status => ["completed", "failed", "cancelled", "manual"].includes(status);
 const abortError = () => new DOMException("下载已取消", "AbortError");
 const validKey = value => typeof value === "string" && /^[a-zA-Z0-9_-]{16,100}$/.test(value);
+const INTERNAL_HOST_SUFFIXES = ["localhost", "local", "internal", "lan", "corp", "home.arpa"];
+
+function extractRawAuthorityHost(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  const match = /^(?:https?:)?\/\/([^/?#\\]+)/i.exec(trimmed);
+  if (!match) return "";
+  let authority = match[1];
+  const atIdx = authority.lastIndexOf("@");
+  if (atIdx !== -1) authority = authority.slice(atIdx + 1);
+  if (authority.startsWith("[")) {
+    const closeIdx = authority.indexOf("]");
+    return closeIdx !== -1 ? authority.slice(0, closeIdx + 1).toLowerCase() : authority.toLowerCase();
+  }
+  const colonIdx = authority.indexOf(":");
+  return (colonIdx !== -1 ? authority.slice(0, colonIdx) : authority).toLowerCase();
+}
+
+function parseCanonicalIpv4(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4) return null;
+  const bytes = [];
+  for (const part of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(part)) return null;
+    const n = Number(part);
+    if (n > 255) return null;
+    bytes.push(n);
+  }
+  return bytes;
+}
+
+function parseIpv4NumberPart(part) {
+  if (/^0x[0-9a-f]+$/i.test(part)) return Number.parseInt(part.slice(2), 16);
+  if (/^0[0-7]+$/.test(part)) return Number.parseInt(part, 8);
+  if (/^(?:0|[1-9]\d*)$/.test(part)) return Number.parseInt(part, 10);
+  return NaN;
+}
+
+function isIpv4LikeLiteral(host) {
+  const parts = host.split(".");
+  if (parts.length < 1 || parts.length > 4) return false;
+  return parts.every(part => Number.isFinite(parseIpv4NumberPart(part)));
+}
+
+function isDisallowedIpv4(bytes) {
+  const [a, b, c] = bytes;
+  if (a === 0) return true; // 0.0.0.0/8
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10
+  if (a === 127) return true; // 127.0.0.0/8
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 0 && c === 0) return true; // 192.0.0.0/24
+  if (a === 192 && b === 0 && c === 2) return true; // 192.0.2.0/24
+  if (a === 192 && b === 88 && c === 99) return true; // 192.88.99.0/24
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24
+  if (a >= 224) return true; // 224.0.0.0/3 (multicast, reserved, broadcast)
+  return false;
+}
+
+function parseIpv6Literal(raw) {
+  let s = raw;
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  if (!s || s.includes("%")) return null;
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const parsePart = (segment, allowIpv4) => {
+    if (!segment) return [];
+    const tokens = segment.split(":");
+    const groups = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (allowIpv4 && i === tokens.length - 1 && token.includes(".")) {
+        const ipv4 = parseCanonicalIpv4(token);
+        if (!ipv4) return null;
+        groups.push((ipv4[0] << 8) | ipv4[1], (ipv4[2] << 8) | ipv4[3]);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/i.test(token)) return null;
+        groups.push(Number.parseInt(token, 16));
+      }
+    }
+    return groups;
+  };
+  if (halves.length === 1) {
+    const groups = parsePart(halves[0], true);
+    return groups && groups.length === 8 ? groups : null;
+  }
+  const head = parsePart(halves[0], false);
+  const tail = parsePart(halves[1], true);
+  if (!head || !tail) return null;
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return null;
+  return [...head, ...new Array(missing).fill(0), ...tail];
+}
+
+function isAllowedPublicIpv6(groups) {
+  if (!groups || groups.length !== 8) return false;
+  const [g0, g1] = groups;
+  // Only global unicast 2000::/3 is eligible.
+  if ((g0 & 0xe000) !== 0x2000) return false;
+  // Reject IETF special-purpose / documentation / 6to4 ranges inside 2000::/3.
+  if (g0 === 0x2001 && (g1 & 0xfe00) === 0x0000) return false; // 2001::/23
+  if (g0 === 0x2001 && g1 === 0x0db8) return false; // 2001:db8::/32
+  if (g0 === 0x2002) return false; // 2002::/16
+  if (g0 === 0x3fff && (g1 & 0xf000) === 0x0000) return false; // 3fff::/20
+  return true;
+}
+
 const sourceUrl = value => {
   const url = new URL(value, self.location.origin);
   if (!/^https?:$/.test(url.protocol) || url.username || url.password ||
       (url.origin === self.location.origin && url.pathname.startsWith("/downloads/")) || /\.m3u8(?:$|[?#])/i.test(url.href)) {
     throw new Error("资源地址不支持完整文件下载");
   }
+  const rawAuthorityHost = extractRawAuthorityHost(value);
+  const normalizedHostname = url.hostname.toLowerCase();
+  const host = normalizedHostname.replace(/\.+$/, "");
+  if (!host) throw new Error("资源地址不支持完整文件下载");
+
+  // Reject deformed IPv4 literals (decimal, hex, octal, shorthand, or trailing dots).
+  const canonicalIpv4 = parseCanonicalIpv4(normalizedHostname);
+  if (canonicalIpv4 && rawAuthorityHost && rawAuthorityHost !== normalizedHostname) {
+    throw new Error("资源地址不支持完整文件下载");
+  }
+  if (!canonicalIpv4 && isIpv4LikeLiteral(host)) {
+    throw new Error("资源地址不支持完整文件下载");
+  }
+
+  const selfHost = (self.location.hostname || "").toLowerCase().replace(/\.+$/, "");
+  const isLocalTestOrigin = selfHost === "127.0.0.1" || selfHost === "localhost";
+  const isLocalTestTarget = isLocalTestOrigin && (host === "127.0.0.1" || host === "localhost");
+
+  if (!isLocalTestTarget && url.host !== self.location.host) {
+    if (url.port !== "" && url.port !== "80" && url.port !== "443") {
+      throw new Error("资源地址不支持完整文件下载");
+    }
+  }
+
+  if (!isLocalTestTarget) {
+    if (INTERNAL_HOST_SUFFIXES.some(suffix => host === suffix || host.endsWith(`.${suffix}`))) {
+      throw new Error("资源地址不支持完整文件下载");
+    }
+    if (host.startsWith("[") || host.endsWith("]") || host.includes(":")) {
+      if (!isAllowedPublicIpv6(parseIpv6Literal(host))) {
+        throw new Error("资源地址不支持完整文件下载");
+      }
+    } else if (canonicalIpv4 && isDisallowedIpv4(canonicalIpv4)) {
+      throw new Error("资源地址不支持完整文件下载");
+    }
+  }
+
   return url.href;
 };
 

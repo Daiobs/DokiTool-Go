@@ -4478,13 +4478,17 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
     assert.match(envLogin.inst.parseError.value, /需要验证/);
     assert.equal(envLogin.toasts.at(-1)?.[1], 'error');
 
-    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> cleanly falls through to legacy userscript check
+    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> cleanly falls through to legacy userscript check, and when helper is missing renders fallback with ZERO /api/parse calls
     extParseMode = 'transport_timeout';
-    globalThis.fetch = async () => Response.json({
-      schema_version: '1.0',
-      code: 'OK',
-      data: makeYouTubeMedia('Server Redacted Preview'),
-    });
+    let fallbackStandardParseCalls = 0;
+    globalThis.fetch = async () => {
+      fallbackStandardParseCalls += 1;
+      return Response.json({
+        schema_version: '1.0',
+        code: 'OK',
+        data: makeYouTubeMedia('Server Redacted Preview'),
+      });
+    };
     const envFallback = createParserEnv(async () => {
       pingHelperCalls++;
       return { installed: false, version: null, supported: false };
@@ -4492,6 +4496,7 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
     envFallback.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await envFallback.inst.parseVideo();
     assert.equal(pingHelperCalls, 1, 'transport error must fall through to legacy userscript pingHelper');
+    assert.equal(fallbackStandardParseCalls, 0, 'fallback when helper is missing must NOT call /api/parse');
     assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.status, 'missing');
 
     // 4) Tab return & resumePendingYouTubeHelperInstall detect connected extension with `youtube_parse`, clear wait state, and auto-re-parse with zero reload and zero userscript check

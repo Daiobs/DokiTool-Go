@@ -99,10 +99,11 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 - **查询参数**：
   | 参数名 | 必填 | 约束与说明 |
   | --- | --- | --- |
-  | `schema_version` | **是** | 固定为 `"1.0"`。缺失、数组形式（如 `schema_version[]=`）或值不等于 `"1.0"` 时返回 HTTP `409`（`code: "INVALID_INPUT"`）。 |
+  | `schema_version` | **是** | 固定为 `"1.0"`。缺失、数组形式（如 `schema_version[]=`）或值不等于 `"1.0"` 时返回 HTTP `409`（`code: "INVALID_INPUT"`；携带有效 Bearer 凭据时返回明确提示文案 `"请传入必需查询参数 schema_version=1.0（详见 docs/AGENT-API.md）"`，匿名访客保持浏览器刷新提示不变）。 |
   | `url` | **是** | 作品分享链接或包含单个 `http(s)` 链接的分享口令文本（整体长度 `<= 8192` 字节；海外 `yt-dlp` 平台与第二级通用兜底提取出的 URL 长度 `<= 2048` 字节，且第二级通用兜底额外拒绝 `#fragment`、内网/本机主机名、本站域名及空路径+空查询）。服务端自动提取首个 `http(s)` URL 并剥离尾随标点。 |
   | `platform` | 否 | 指定平台 ID（见 `/api/platforms`）或 `"all"`。省略或传 `"all"` 时执行两级路由：优先按域名命中核心目录；若服务端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED`，未命中核心目录的合法公网链接自动进入第二级通用具名提取器兜底并返回规范化动态 `data.platform`（缓存 TTL 上限 `60s`）。显式指定具体平台 ID 时绝不触发第二级通用兜底，与链接实际平台不一致则返回 HTTP `400`。 |
   | `debug` | 否 | 传 `"1"` 时启用完整规范化诊断视图（保留被默认产品视图折叠的同规格备选 `mux` 等候选）；省略或传其他值均按常规产品视图处理。常规批量下载无需传 `debug=1`。 |
+- **缓存与容错响应头**：命中进程内新鲜缓存时返回 `X-DokiTool-Cache: hit`；当上游触发熔断保护或实时解析遇到可重试上游故障（`UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / 上游 `RATE_LIMITED`）且存在未超过 `earliest_expires_at - 15s` 硬顶的过期缓存副本时，服务端通过 `stale-if-error` 返回 HTTP `200 OK` 并附带 `X-DokiTool-Cache: stale`。`UPSTREAM_BLOCKED` 默认短负缓存 `5s`（可通过热配置 `cache.upstream_blocked_neg_ttl` 调整或置 `0s` 关闭），YouTube 服务端 `/api/parse` 默认短缓存 `120s`（受 `cache.youtube_parse_ttl` 与 `earliest_expires_at - 60s` 共同约束，置 `0s` 关闭）。
 
 - **成功响应（HTTP `200 OK`）示例**：
   ```json
@@ -258,7 +259,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.4 `GET /api/stats` — 查询进程内只读运行统计快照
 
-提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中率、`fast` / `slow` / `generic_slow` / `owner` 四池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`ytdlp` 与 `ytdlp_generic` 并发槽位等待直方图、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
+提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中与过期兜底命中（`stale_hits`）、`fast` / `slow` / `generic_slow` / `owner` 四池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`ytdlp` 与 `ytdlp_generic` 并发槽位等待直方图、分舱水位 `ytdlp_pools`（`youtube` / `social` / `generic` / `youtube_ejs`）、14 个核心平台熔断状态列表（`circuit_breakers`）、脱敏热配置生效策略摘要（`runtime_policy`）、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关、策略数值与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
 
 - **认证**：**严格要求 `owner` 角色 Bearer 凭据**（`DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥）。缺失、错误、已停用（`enabled: false`）、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或未配置任何启用密钥时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）；携带合法 `agent` 或 `friend` 角色密钥访问时同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥 `unauthorized` 计数，不扣减匿名单 IP 配额）。**通过 `owner` 鉴权的 `/api/stats` 请求不占用并发槽位，也不计入 `requests` 解析统计**。
 - **HTTP 方法与查询参数**：
@@ -302,6 +303,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
         "max_bytes": 67108864,
         "total": {
           "hits": 24,
+          "stale_hits": 1,
           "misses": 100,
           "singleflight_shared": 4,
           "uncacheable": 0
@@ -309,12 +311,14 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
         "by_channel": {
           "anonymous": {
             "hits": 6,
+            "stale_hits": 0,
             "misses": 20,
             "singleflight_shared": 2,
             "uncacheable": 0
           },
           "owner": {
             "hits": 18,
+            "stale_hits": 1,
             "misses": 80,
             "singleflight_shared": 2,
             "uncacheable": 0
@@ -338,7 +342,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
         "slow": {
           "active": 0,
           "queued": 0,
-          "concurrency_limit": 2,
+          "concurrency_limit": 4,
           "queue_limit": 32,
           "waited": 0,
           "granted": 0,
@@ -495,6 +499,95 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
             }
           }
         }
+      },
+      "ytdlp_pools": {
+        "youtube": {
+          "enabled": true,
+          "active": 0,
+          "queued": 0,
+          "concurrency_limit": 4,
+          "queue_limit": 32,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        },
+        "social": {
+          "enabled": true,
+          "active": 0,
+          "queued": 0,
+          "concurrency_limit": 4,
+          "queue_limit": 32,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        },
+        "generic": {
+          "enabled": false,
+          "active": 0,
+          "queued": 0,
+          "concurrency_limit": 2,
+          "queue_limit": 16,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        },
+        "youtube_ejs": {
+          "enabled": true,
+          "active": 0,
+          "queued": 0,
+          "concurrency_limit": 6,
+          "queue_limit": 64,
+          "waited": 0,
+          "granted": 0,
+          "timeout": 0,
+          "full": 0,
+          "canceled": 0,
+          "wait_ms_total": 0,
+          "wait_ms_max": 0
+        }
+      },
+      "circuit_breakers": [
+        {"platform": "douyin", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 10, "open_until": "", "disabled_by_config": false},
+        {"platform": "bilibili", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "weibo", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "toutiao", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "kuaishou", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "pipixia", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "pipigx", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "zuiyou", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "xiaohongshu", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "x", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 10, "open_until": "", "disabled_by_config": false},
+        {"platform": "youtube", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "instagram", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "facebook", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "tumblr", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false}
+      ],
+      "runtime_policy": {
+        "config_file_active": true,
+        "reload_count": 0,
+        "last_reloaded_at": "",
+        "youtube_slots": 4,
+        "social_slots": 4,
+        "generic_slots": 2,
+        "youtube_ejs_concurrency": 6,
+        "fast_per_platform_max_concurrency": 24,
+        "circuit_breaker_enabled": true,
+        "disabled_platforms": [],
+        "youtube_parse_ttl_seconds": 120,
+        "stale_if_error_ttl_seconds": 600,
+        "upstream_blocked_neg_ttl_seconds": 5
       },
       "shanghai": {
         "enabled": true,
@@ -677,7 +770,11 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 - **核心统计字段说明**：
   - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 遵循受控规范化模式 `^[a-z0-9][a-z0-9_:-]{0,31}$`（最长 32 字节），覆盖 14 个核心平台 ID、`"unknown"`、上限 64 个动态长尾提取器标识及溢出桶 `"ytdlp_other"`；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
   - `admission.{fast,slow,generic_slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（其中 `generic_slow` 独立反映第二级通用具名提取器兜底的 `PARSE_GENERIC` 准入池水位，`owner` 汇总 `owner` 角色池快照并保持向后兼容）。
-  - `ytdlp` 与 `ytdlp_generic`：两者采用相同的 `YTDLPStatsSnapshot` 结构，分别反映核心海外提取器共享并发槽位与第二级通用具名提取器独立隔离并发槽位（无论是否配置固定 `DOKITOOL_YTDLP_GATE_PORTS` 均独立统计通用子池水位与分渠道等待耗时）；未启用第二级通用兜底时，`ytdlp_generic.enabled` 为 `false` 且其余字段为 `0`。
+  - `cache.{total,by_channel.*}.stale_hits`：通过 `stale-if-error` 在熔断打开或上游可重试报错时返回未越界媒体签名过期缓存（`X-DokiTool-Cache: stale`）的累计命中次数。
+  - `ytdlp` 与 `ytdlp_generic`：两者采用相同的 `YTDLPStatsSnapshot` 结构，分别反映核心海外提取器共享并发槽位与第二级通用具名提取器独立隔离并发槽位；未启用第二级通用兜底时，`ytdlp_generic.enabled` 为 `false` 且其余字段为 `0`。
+  - `ytdlp_pools.{youtube,social,generic,youtube_ejs}`：分舱报告 YouTube 服务端慢池、社交慢池（X / IG / FB / Tumblr）、通用长尾慢池及解耦后的 YouTube EJS 助手池（`/api/youtube/context` 未命中与 `/api/youtube/finalize`）的启用状态、活跃槽位、队列等待与累计排队统计。
+  - `circuit_breakers[*]`：按固定顺序返回 14 个核心平台的熔断器只读状态（`state`: `"closed"` / `"open"` / `"half_open"`、`consecutive_failures`、`window_failures`、`window_total`、`open_until`、`disabled_by_config`）。
+  - `runtime_policy`：只读脱敏返回当前生效的运行时热配置策略摘要（`config_file_active`、`reload_count`、`last_reloaded_at`、各分舱并发数、快池单平台上限、熔断开关与手动止血列表 `disabled_platforms`、缓存 TTL 秒数；绝不泄露任何本地文件路径或密钥）。
   - `api_keys[*]`：按配置顺序返回每把已注册 API 密钥（最多 `64` 项，未配置时为空数组 `[]`；已停用密钥仍以 `enabled: false` 保留在列表中，绝不返回令牌或 SHA-256 摘要）的实时并发与累计指标，包含固定 22 个字段：`id`、`role`（`"owner"` / `"agent"` / `"friend"`）、`enabled`、`active`、`slow_active`、`queued`、`concurrency_limit`、`slow_concurrency_limit`、`queue_limit`、`requests_total`、`ok`、`errors`、`cache_hits`（零槽位缓存快路径命中次数）、`rate_limited`、`unauthorized`（角色或平台白名单拦截次数）、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`。`SIGHUP` 热重载时，相同 `id` 的密钥自动延续累计计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
   - `runtime`：只读脱敏返回 11 项运行开关（`version`、`shanghai_mode`、`shanghai_bilibili`、`bilibili_dash`、`youtube_helper`、`xhs_transport`、`ytdlp_enabled`、`ytdlp_generic_enabled`、`tbvideo_pipigx`、`tbvideo_zuiyou`、`stats_persistence_enabled`），绝不泄露任何宿主机路径、IP、URL 或凭据。
@@ -761,10 +858,10 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
 | `400` | `UNSUPPORTED_PLATFORM` | `false` | 链接域名不在支持目录（如未接入网站），或目标平台在当前实例未启用 | **不重试**；标记为不支持平台并跳过。 |
 | `404` | `NO_MEDIA` | `false` | 帖子公开存在但不含受支持媒体（如 X 纯文本推文、仅含不受支持流格式的作品） | **不重试**；标记为无媒体作品并跳过。 |
 | `404` | `CONTENT_UNAVAILABLE` | `false` | 作品已删除、不存在，或请求的 `item_id` 不存在（服务端会负缓存 `10s`） | **不重试**；标记为作品不可用并跳过。 |
-| `403` | `UPSTREAM_BLOCKED` | `false` | 作品私密、年龄受限、需登录查看（如 Instagram Stories、私密帖、未开回退的 X 受限推文）或触发上游页面风控 | **不在紧循环中重试**；标记为受限/风控阻塞并跳过。 |
-| **`429`** | `RATE_LIMITED` | `true` | `owner` 等待队列已满或排队满 `60s` 超时、上游平台返回 `429`，或鉴权失败累计触发单 IP 限流 | **退避后重试**（单条最多 2–3 次）：优先读取 `error.retry_after_seconds` 或 HTTP `Retry-After` 头（默认至少等待 `1s`）并加少量随机抖动；若此前曾发过无效 token，先排查鉴权配置。 |
+| `403` | `UPSTREAM_BLOCKED` | `false` | 作品私密、年龄受限、需登录查看（如 Instagram Stories、私密帖、未开回退的 X 受限推文）或触发上游页面风控（服务端默认短负缓存 `5s`，不计入平台熔断） | **不在紧循环中重试**；标记为受限/风控阻塞并跳过。 |
+| **`429`** | `RATE_LIMITED` | `true` | `owner` 等待队列已满或排队满 `60s` 超时、快池单平台并发舱壁满载、上游平台返回 `429`，或鉴权失败累计触发单 IP 限流 | **退避后重试**（单条最多 2–3 次）：优先读取 `error.retry_after_seconds` 或 HTTP `Retry-After` 头（默认至少等待 `1s`）并加少量随机抖动；若此前曾发过无效 token，先排查鉴权配置。 |
 | `504` | `UPSTREAM_TIMEOUT` | `true` | 上游平台页面/API 在解析预算内超时 | **有限指数退避重试**（最多 1–2 次，例如等待 `2s` -> `5s`），仍失败则记入失败清单留待后续人工或低峰补跑。 |
-| `502` | `UPSTREAM_UNAVAILABLE` | `true` | 上游接口暂时不可用或外部提取器瞬态错误 | **有限指数退避重试**（最多 1–2 次，等待 `2s` -> `5s`）。 |
+| `502` / `503` | `UPSTREAM_UNAVAILABLE` | `true` | 上游接口暂时不可用（`502`），或平台熔断器 / `disabled_platforms` 处于快速保护打开态且无可用过期缓存（`503`，携带 `Retry-After` 头与 `error.retry_after_seconds`） | **遵循 `Retry-After` / `retry_after_seconds` 退避后重试**（单条最多 1–2 次；收到 `503` 熔断响应时暂停向该平台批量发包直至冷却窗口结束）。 |
 | `502` | `UPSTREAM_INVALID_RESPONSE` | `false` | 上游返回结构变更或异常非预期载荷 | **不立即循环重试**；记录错误码与 URL 以便排查上游结构变化。 |
 | `503` | `SERVICE_NOT_CONFIGURED` | `false` | 目标平台适配器或必需运行组件未在服务端启用（如对未开启服务端提取器的实例调用 YouTube `/api/parse`） | **不重试该平台链接**；先对照 `/api/platforms` 检查实例能力。 |
 | `500` | `INTERNAL_ERROR` | `false` | 服务端内部异常 | **不紧循环重试**；最多间隔数秒重试 1 次，仍为 `500` 则中止或跳过并告警。 |

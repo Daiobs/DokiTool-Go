@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
@@ -19,11 +18,25 @@ const (
 	MaxFastParseQueueWait     = 15 * time.Second
 	MaxFastParseQueueSize     = 4096
 
-	DefaultSlowParseQueueWait = 5 * time.Second
-	DefaultSlowParseQueueSize = 32
-	MaxSlowParseQueueWait     = 30 * time.Second
-	MaxSlowParseQueueSize     = 1024
-	MaxSlowParseConcurrency   = 64
+	DefaultSlowParseQueueWait        = 20 * time.Second
+	DefaultSlowParseQueueSize        = 32
+	DefaultGenericSlowParseQueueWait = 15 * time.Second
+	DefaultGenericSlowParseQueueSize = 16
+	MaxSlowParseQueueWait            = 30 * time.Second
+	MaxSlowParseQueueSize            = 1024
+	MaxSlowParseConcurrency          = 64
+
+	DefaultYouTubeSlowConcurrency = 4
+	DefaultSocialSlowConcurrency  = 4
+	DefaultGenericSlowConcurrency = 2
+
+	DefaultYouTubeEJSConcurrency = 6
+	DefaultYouTubeEJSQueueSize   = 64
+	DefaultYouTubeEJSQueueWait   = 10 * time.Second
+
+	DefaultFastPerPlatformMaxConcurrency = 24
+	MinFastPerPlatformMaxConcurrency     = 2
+	MaxFastPerPlatformMaxConcurrency     = 256
 
 	MinOwnerTokenBytes      = bearer.MinTokenBytes
 	MaxOwnerTokenBytes      = bearer.MaxTokenBytes
@@ -99,21 +112,24 @@ type PoolConfig struct {
 }
 
 type AdmissionConfig struct {
-	Parse            PoolConfig
-	Resolve          PoolConfig
-	SlowParse        PoolConfig
-	GenericSlowParse PoolConfig
-	Catalog          PoolConfig
-	Relay            PoolConfig
-	Reports          PoolConfig
-	MaxClients       int
-	OwnerConcurrency int
-	OwnerQueueWait   time.Duration
-	OwnerQueueSize   int
+	Parse                         PoolConfig
+	Resolve                       PoolConfig
+	YouTubeSlowParse              PoolConfig
+	SlowParse                     PoolConfig
+	GenericSlowParse              PoolConfig
+	YouTubeEJS                    PoolConfig
+	Catalog                       PoolConfig
+	Relay                         PoolConfig
+	Reports                       PoolConfig
+	FastPerPlatformMaxConcurrency int
+	MaxClients                    int
+	OwnerConcurrency              int
+	OwnerQueueWait                time.Duration
+	OwnerQueueSize                int
 }
 
-// DefaultAdmissionConfig splits pure-Go fast platforms from yt-dlp slow platforms
-// while keeping the existing per-IP parse budget unchanged across both pools.
+// DefaultAdmissionConfig splits pure-Go fast platforms from yt-dlp slow compartments
+// and decouples YouTube EJS helper traffic from yt-dlp extraction pools.
 func DefaultAdmissionConfig() AdmissionConfig {
 	return AdmissionConfig{
 		Parse: PoolConfig{
@@ -139,13 +155,23 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			QueueWait:         DefaultFastParseQueueWait,
 			QueueSize:         DefaultFastParseQueueSize,
 		},
+		YouTubeSlowParse: PoolConfig{
+			ClientBurst:       4,
+			ClientRPS:         12.0 / 60,
+			GlobalBurst:       32,
+			GlobalRPS:         10,
+			ClientConcurrency: 1,
+			GlobalConcurrency: DefaultYouTubeSlowConcurrency,
+			QueueWait:         DefaultSlowParseQueueWait,
+			QueueSize:         DefaultSlowParseQueueSize,
+		},
 		SlowParse: PoolConfig{
 			ClientBurst:       4,
 			ClientRPS:         12.0 / 60,
 			GlobalBurst:       32,
 			GlobalRPS:         10,
 			ClientConcurrency: 1,
-			GlobalConcurrency: ytengine.DefaultConcurrency,
+			GlobalConcurrency: DefaultSocialSlowConcurrency,
 			QueueWait:         DefaultSlowParseQueueWait,
 			QueueSize:         DefaultSlowParseQueueSize,
 		},
@@ -155,9 +181,19 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			GlobalBurst:       12,
 			GlobalRPS:         4,
 			ClientConcurrency: 1,
-			GlobalConcurrency: ytgeneric.DefaultGenericConcurrency,
-			QueueWait:         DefaultSlowParseQueueWait,
-			QueueSize:         16,
+			GlobalConcurrency: DefaultGenericSlowConcurrency,
+			QueueWait:         DefaultGenericSlowParseQueueWait,
+			QueueSize:         DefaultGenericSlowParseQueueSize,
+		},
+		YouTubeEJS: PoolConfig{
+			ClientBurst:       8,
+			ClientRPS:         24.0 / 60,
+			GlobalBurst:       60,
+			GlobalRPS:         20,
+			ClientConcurrency: 2,
+			GlobalConcurrency: DefaultYouTubeEJSConcurrency,
+			QueueWait:         DefaultYouTubeEJSQueueWait,
+			QueueSize:         DefaultYouTubeEJSQueueSize,
 		},
 		Catalog: PoolConfig{
 			ClientBurst:       20,
@@ -183,10 +219,11 @@ func DefaultAdmissionConfig() AdmissionConfig {
 			ClientConcurrency: 2,
 			GlobalConcurrency: 16,
 		},
-		MaxClients:       4096,
-		OwnerConcurrency: DefaultOwnerConcurrency,
-		OwnerQueueWait:   DefaultOwnerQueueWait,
-		OwnerQueueSize:   DefaultOwnerQueueSize,
+		FastPerPlatformMaxConcurrency: DefaultFastPerPlatformMaxConcurrency,
+		MaxClients:                    4096,
+		OwnerConcurrency:              DefaultOwnerConcurrency,
+		OwnerQueueWait:                DefaultOwnerQueueWait,
+		OwnerQueueSize:                DefaultOwnerQueueSize,
 	}
 }
 
@@ -200,8 +237,10 @@ func (c AdmissionConfig) Validate() error {
 	}{
 		{"PARSE", c.Parse, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"RESOLVE", c.Resolve, 4096, MaxFastParseQueueWait, MaxFastParseQueueSize},
+		{"PARSE_YOUTUBE", c.YouTubeSlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"PARSE_SLOW", c.SlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"PARSE_GENERIC", c.GenericSlowParse, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"YOUTUBE_EJS", c.YouTubeEJS, MaxSlowParseConcurrency, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"CATALOG", c.Catalog, 4096, 0, 0},
 		{"WEIBO", c.Relay, 4096, 0, 0},
 		{"REPORT", c.Reports, 4096, 0, 0},
@@ -234,6 +273,9 @@ func (c AdmissionConfig) Validate() error {
 	if c.Relay.GlobalConcurrency > 12 {
 		return fmt.Errorf("DOKITOOL_WEIBO_GLOBAL_CONCURRENCY cannot exceed the existing 12 relay stream slots")
 	}
+	if c.FastPerPlatformMaxConcurrency < MinFastPerPlatformMaxConcurrency || c.FastPerPlatformMaxConcurrency > MaxFastPerPlatformMaxConcurrency {
+		return fmt.Errorf("DOKITOOL_PARSE_PER_PLATFORM_MAX_CONCURRENCY must be between %d and %d", MinFastPerPlatformMaxConcurrency, MaxFastPerPlatformMaxConcurrency)
+	}
 	if c.MaxClients < 1 || c.MaxClients > 65536 {
 		return fmt.Errorf("DOKITOOL_ADMISSION_MAX_CLIENTS must be between 1 and 65536")
 	}
@@ -262,6 +304,7 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 			return AdmissionConfig{}, fmt.Errorf("DOKITOOL_YTDLP_CONCURRENCY must be an integer between 1 and %d", ytengine.MaxConcurrency)
 		}
 		c.SlowParse.GlobalConcurrency = value
+		c.YouTubeSlowParse.GlobalConcurrency = value
 	}
 	if raw := strings.TrimSpace(getenv("DOKITOOL_YTDLP_GENERIC_CONCURRENCY")); raw != "" {
 		value, err := strconv.Atoi(raw)
@@ -276,8 +319,10 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 	}{
 		{"PARSE", &c.Parse},
 		{"RESOLVE", &c.Resolve},
+		{"PARSE_YOUTUBE", &c.YouTubeSlowParse},
 		{"PARSE_SLOW", &c.SlowParse},
 		{"PARSE_GENERIC", &c.GenericSlowParse},
+		{"YOUTUBE_EJS", &c.YouTubeEJS},
 		{"CATALOG", &c.Catalog},
 		{"WEIBO", &c.Relay},
 		{"REPORT", &c.Reports},
@@ -323,8 +368,10 @@ func LoadAdmissionConfig(getenv func(string) string) (AdmissionConfig, error) {
 	}{
 		{"PARSE", &c.Parse, MaxFastParseQueueWait, MaxFastParseQueueSize},
 		{"RESOLVE", &c.Resolve, MaxFastParseQueueWait, MaxFastParseQueueSize},
+		{"PARSE_YOUTUBE", &c.YouTubeSlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"PARSE_SLOW", &c.SlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 		{"PARSE_GENERIC", &c.GenericSlowParse, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
+		{"YOUTUBE_EJS", &c.YouTubeEJS, MaxSlowParseQueueWait, MaxSlowParseQueueSize},
 	} {
 		waitKey := "DOKITOOL_" + entry.name + "_QUEUE_WAIT"
 		if raw := strings.TrimSpace(getenv(waitKey)); raw != "" {

@@ -38,6 +38,7 @@ AGENT_API_DOC_PATH = ROOT / "docs/AGENT-API.md"
 DEPLOYMENT_DOC_PATH = ROOT / "docs/DEPLOYMENT.md"
 CADDY_EXAMPLE_PATH = ROOT / "ops/examples/snap.caddy"
 API_KEYS_EXAMPLE_PATH = ROOT / "ops/examples/api-keys.example.json"
+RUNTIME_CONFIG_EXAMPLE_PATH = ROOT / "ops/examples/runtime.example.json"
 UNIFIED_SCHEMA_PATH = ROOT / "docs/schema/unified-v1/unified-v1.schema.json"
 PLATFORMS_PATH = ROOT / "backend/config/platforms.json"
 EXAMPLES_DIR = ROOT / "docs/schema/unified-v1/examples"
@@ -139,6 +140,47 @@ EXPECTED_DAILY_BUCKET_REQUIRED = [
     "by_platform",
 ]
 EXPECTED_HOURLY_BUCKET_REQUIRED = ["hour_start", "total", "ok", "failed", "cache_hits"]
+EXPECTED_CACHE_CHANNEL_COUNTS_REQUIRED = ["hits", "stale_hits", "misses", "singleflight_shared", "uncacheable"]
+EXPECTED_YTDLP_COMPARTMENT_REQUIRED = [
+    "enabled",
+    "active",
+    "queued",
+    "concurrency_limit",
+    "queue_limit",
+    "waited",
+    "granted",
+    "timeout",
+    "full",
+    "canceled",
+    "wait_ms_total",
+    "wait_ms_max",
+]
+EXPECTED_YTDLP_POOLS_REQUIRED = ["youtube", "social", "generic", "youtube_ejs"]
+EXPECTED_CIRCUIT_BREAKER_STATES = ["closed", "open", "half_open"]
+EXPECTED_CIRCUIT_BREAKER_REQUIRED = [
+    "platform",
+    "state",
+    "consecutive_failures",
+    "window_failures",
+    "window_total",
+    "open_until",
+    "disabled_by_config",
+]
+EXPECTED_RUNTIME_POLICY_REQUIRED = [
+    "config_file_active",
+    "reload_count",
+    "last_reloaded_at",
+    "youtube_slots",
+    "social_slots",
+    "generic_slots",
+    "youtube_ejs_concurrency",
+    "fast_per_platform_max_concurrency",
+    "circuit_breaker_enabled",
+    "disabled_platforms",
+    "youtube_parse_ttl_seconds",
+    "stale_if_error_ttl_seconds",
+    "upstream_blocked_neg_ttl_seconds",
+]
 EMPTY_STRING_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
@@ -534,6 +576,94 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
             f"HourlyStatsBucket.{int_field} must be integer with minimum=0",
         )
 
+    cache_counts = comp_schemas.get("CacheChannelCounts") or {}
+    cache_counts_props = cache_counts.get("properties") or {}
+    require(
+        cache_counts.get("additionalProperties") is False
+        and cache_counts.get("required") == EXPECTED_CACHE_CHANNEL_COUNTS_REQUIRED
+        and list(cache_counts_props.keys()) == EXPECTED_CACHE_CHANNEL_COUNTS_REQUIRED,
+        "CacheChannelCounts must require hits, stale_hits, misses, singleflight_shared, uncacheable with additionalProperties=false",
+    )
+    for int_field in EXPECTED_CACHE_CHANNEL_COUNTS_REQUIRED:
+        require(
+            cache_counts_props[int_field].get("type") == "integer"
+            and cache_counts_props[int_field].get("minimum") == 0,
+            f"CacheChannelCounts.{int_field} must be integer with minimum=0",
+        )
+
+    yt_comp = comp_schemas.get("YTDLPCompartmentPoolSnapshot") or {}
+    yt_comp_props = yt_comp.get("properties") or {}
+    require(
+        yt_comp.get("additionalProperties") is False
+        and yt_comp.get("required") == EXPECTED_YTDLP_COMPARTMENT_REQUIRED
+        and list(yt_comp_props.keys()) == EXPECTED_YTDLP_COMPARTMENT_REQUIRED,
+        "YTDLPCompartmentPoolSnapshot must require exact 12 fields with additionalProperties=false",
+    )
+    require(yt_comp_props["enabled"].get("type") == "boolean", "YTDLPCompartmentPoolSnapshot.enabled must be boolean")
+    for int_field in EXPECTED_YTDLP_COMPARTMENT_REQUIRED[1:]:
+        require(
+            yt_comp_props[int_field].get("type") == "integer"
+            and yt_comp_props[int_field].get("minimum") == 0,
+            f"YTDLPCompartmentPoolSnapshot.{int_field} must be integer with minimum=0",
+        )
+
+    yt_pools = comp_schemas.get("YTDLPPoolsSnapshot") or {}
+    yt_pools_props = yt_pools.get("properties") or {}
+    require(
+        yt_pools.get("additionalProperties") is False
+        and yt_pools.get("required") == EXPECTED_YTDLP_POOLS_REQUIRED
+        and list(yt_pools_props.keys()) == EXPECTED_YTDLP_POOLS_REQUIRED,
+        "YTDLPPoolsSnapshot must require youtube, social, generic, youtube_ejs with additionalProperties=false",
+    )
+    for comp_key in EXPECTED_YTDLP_POOLS_REQUIRED:
+        require(
+            yt_pools_props[comp_key].get("$ref") == "#/components/schemas/YTDLPCompartmentPoolSnapshot",
+            f"YTDLPPoolsSnapshot.{comp_key} must reference YTDLPCompartmentPoolSnapshot",
+        )
+
+    require(
+        (comp_schemas.get("CircuitBreakerState") or {}).get("enum") == EXPECTED_CIRCUIT_BREAKER_STATES,
+        "CircuitBreakerState enum must equal ['closed', 'open', 'half_open']",
+    )
+    cb_snap = comp_schemas.get("CircuitBreakerPlatformSnapshot") or {}
+    cb_props = cb_snap.get("properties") or {}
+    require(
+        cb_snap.get("additionalProperties") is False
+        and cb_snap.get("required") == EXPECTED_CIRCUIT_BREAKER_REQUIRED
+        and list(cb_props.keys()) == EXPECTED_CIRCUIT_BREAKER_REQUIRED,
+        "CircuitBreakerPlatformSnapshot must require exact 7 fields with additionalProperties=false",
+    )
+    require(
+        set(cb_props["platform"].get("enum") or []) == set(platform_ids)
+        and len(cb_props["platform"].get("enum") or []) == 14
+        and cb_props["state"].get("$ref") == "#/components/schemas/CircuitBreakerState"
+        and cb_props["disabled_by_config"].get("type") == "boolean",
+        "CircuitBreakerPlatformSnapshot platform/state/disabled_by_config schema mismatch",
+    )
+    for int_field in ("consecutive_failures", "window_failures", "window_total"):
+        require(
+            cb_props[int_field].get("type") == "integer"
+            and cb_props[int_field].get("minimum") == 0,
+            f"CircuitBreakerPlatformSnapshot.{int_field} must be integer with minimum=0",
+        )
+
+    rp_snap = comp_schemas.get("RuntimePolicySummary") or {}
+    rp_props = rp_snap.get("properties") or {}
+    require(
+        rp_snap.get("additionalProperties") is False
+        and rp_snap.get("required") == EXPECTED_RUNTIME_POLICY_REQUIRED
+        and list(rp_props.keys()) == EXPECTED_RUNTIME_POLICY_REQUIRED,
+        "RuntimePolicySummary must require exact 13 fields with additionalProperties=false",
+    )
+    require(
+        rp_props["config_file_active"].get("type") == "boolean"
+        and rp_props["circuit_breaker_enabled"].get("type") == "boolean"
+        and rp_props["disabled_platforms"].get("type") == "array"
+        and (rp_props["disabled_platforms"].get("items") or {}).get("$ref") == "#/components/schemas/RuntimePolicyPlatform"
+        and set((comp_schemas.get("RuntimePolicyPlatform") or {}).get("enum") or []) == (set(platform_ids) | {"ytdlp_generic"}),
+        "RuntimePolicySummary boolean/disabled_platforms schema mismatch",
+    )
+
     adm_snap = comp_schemas.get("AdmissionStatsSnapshot") or {}
     adm_props = adm_snap.get("properties") or {}
     require(
@@ -551,7 +681,9 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
     require(
         comp_schemas["StatsSnapshot"]["required"] == [
             "started_at", "generated_at", "uptime_seconds",
-            "requests", "cache", "admission", "ytdlp", "ytdlp_generic", "shanghai", "parse_latency_ms", "api_keys",
+            "requests", "cache", "admission", "ytdlp", "ytdlp_generic",
+            "ytdlp_pools", "circuit_breakers", "runtime_policy",
+            "shanghai", "parse_latency_ms", "api_keys",
             "runtime", "daily", "hourly",
         ],
         "StatsSnapshot required fields mismatch",
@@ -560,6 +692,24 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
     require(
         ytdlp_generic_prop.get("$ref") == "#/components/schemas/YTDLPStatsSnapshot",
         "StatsSnapshot.ytdlp_generic must reference YTDLPStatsSnapshot",
+    )
+    ytdlp_pools_prop = comp_schemas["StatsSnapshot"]["properties"].get("ytdlp_pools") or {}
+    require(
+        ytdlp_pools_prop.get("$ref") == "#/components/schemas/YTDLPPoolsSnapshot",
+        "StatsSnapshot.ytdlp_pools must reference YTDLPPoolsSnapshot",
+    )
+    cb_list_prop = comp_schemas["StatsSnapshot"]["properties"].get("circuit_breakers") or {}
+    require(
+        cb_list_prop.get("type") == "array"
+        and cb_list_prop.get("minItems") == 14
+        and cb_list_prop.get("maxItems") == 14
+        and (cb_list_prop.get("items") or {}).get("$ref") == "#/components/schemas/CircuitBreakerPlatformSnapshot",
+        "StatsSnapshot.circuit_breakers must be fixed 14-item array of CircuitBreakerPlatformSnapshot",
+    )
+    rp_prop = comp_schemas["StatsSnapshot"]["properties"].get("runtime_policy") or {}
+    require(
+        rp_prop.get("$ref") == "#/components/schemas/RuntimePolicySummary",
+        "StatsSnapshot.runtime_policy must reference RuntimePolicySummary",
     )
     api_keys_prop = comp_schemas["StatsSnapshot"]["properties"].get("api_keys") or {}
     require(
@@ -664,11 +814,49 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "max_ms": 0,
         "buckets": {k: 0 for k in EXPECTED_HISTOGRAM_BUCKETS},
     }
-    zero_cache_ch = {"hits": 0, "misses": 0, "singleflight_shared": 0, "uncacheable": 0}
+    zero_cache_ch = {"hits": 0, "stale_hits": 0, "misses": 0, "singleflight_shared": 0, "uncacheable": 0}
     zero_pool = {
         "active": 0, "queued": 0, "concurrency_limit": 8, "queue_limit": 256,
         "waited": 0, "granted": 0, "timeout": 0, "full": 0, "canceled": 0,
         "wait_ms_total": 0, "wait_ms_max": 0,
+    }
+    zero_comp_pool = {"enabled": False, **zero_pool}
+    sample_ytdlp_pools = {
+        "youtube": {**zero_comp_pool, "enabled": True, "concurrency_limit": 4, "queue_limit": 32},
+        "social": {**zero_comp_pool, "enabled": True, "concurrency_limit": 4, "queue_limit": 32},
+        "generic": {**zero_comp_pool, "enabled": False, "concurrency_limit": 2, "queue_limit": 16},
+        "youtube_ejs": {**zero_comp_pool, "enabled": True, "concurrency_limit": 6, "queue_limit": 64},
+    }
+    core_14_platforms = [
+        "douyin", "bilibili", "weibo", "toutiao", "kuaishou", "pipixia", "pipigx",
+        "zuiyou", "xiaohongshu", "x", "youtube", "instagram", "facebook", "tumblr",
+    ]
+    sample_circuit_breakers = [
+        {
+            "platform": p,
+            "state": "closed",
+            "consecutive_failures": 0,
+            "window_failures": 0,
+            "window_total": 0,
+            "open_until": "",
+            "disabled_by_config": False,
+        }
+        for p in core_14_platforms
+    ]
+    sample_runtime_policy = {
+        "config_file_active": False,
+        "reload_count": 0,
+        "last_reloaded_at": "",
+        "youtube_slots": 4,
+        "social_slots": 4,
+        "generic_slots": 2,
+        "youtube_ejs_concurrency": 6,
+        "fast_per_platform_max_concurrency": 24,
+        "circuit_breaker_enabled": True,
+        "disabled_platforms": [],
+        "youtube_parse_ttl_seconds": 120,
+        "stale_if_error_ttl_seconds": 600,
+        "upstream_blocked_neg_ttl_seconds": 5,
     }
     zero_slot = {
         "acquired_count": 0, "wait_count": 0, "canceled_count": 0,
@@ -776,6 +964,9 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
             "total": zero_slot,
             "by_channel": {"anonymous": zero_slot, "owner": zero_slot},
         },
+        "ytdlp_pools": sample_ytdlp_pools,
+        "circuit_breakers": sample_circuit_breakers,
+        "runtime_policy": sample_runtime_policy,
         "shanghai": {
             "enabled": True, "mode": "pull", "waiting_workers": 3, "queued_tasks": 0, "pending_tasks": 0,
             "total": zero_sh,
@@ -801,12 +992,36 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "code": "OK",
         "data": {**base_stats_data, "api_keys": [], "daily": [], "hourly": []},
     })), "Valid /api/stats payload with empty api_keys/daily/hourly rejected")
-    for req_field in ("ytdlp_generic", "api_keys", "runtime", "daily", "hourly"):
+    for req_field in ("ytdlp_generic", "ytdlp_pools", "circuit_breakers", "runtime_policy", "api_keys", "runtime", "daily", "hourly"):
         require(bool(list(stats_val.iter_errors({
             "schema_version": "1.0",
             "code": "OK",
             "data": {k: v for k, v in base_stats_data.items() if k != req_field},
         }))), f"Missing {req_field} field in /api/stats must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "runtime_policy": {**sample_runtime_policy, "config_path": "/etc/dokitool/runtime.json"},
+        },
+    }))), "Unknown property in RuntimePolicySummary must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "circuit_breakers": sample_circuit_breakers[:13],
+        },
+    }))), "circuit_breakers with fewer than 14 items must be rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "ytdlp_pools": {k: v for k, v in sample_ytdlp_pools.items() if k != "youtube_ejs"},
+        },
+    }))), "Missing ytdlp_pools.youtube_ejs in /api/stats must be rejected")
     require(bool(list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
@@ -1000,14 +1215,95 @@ def check_caddy_whitelist() -> int:
         "ops/examples/snap.caddy must preserve the Caddy route ordering comment",
     )
 
+    require(
+        "try_files {path} /index.html" not in caddy,
+        "ops/examples/snap.caddy must not use site-wide SPA soft-404 'try_files {path} /index.html'",
+    )
+    require(
+        'header Strict-Transport-Security "max-age=31536000"' in caddy,
+        "ops/examples/snap.caddy must declare Strict-Transport-Security header",
+    )
+    require(
+        'header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"' in caddy,
+        "ops/examples/snap.caddy must declare Permissions-Policy header",
+    )
+    require(
+        '@download_bridge path /downloads/bridge.html' in caddy
+        and '@default_csp not path /monitor /monitor.html /downloads/bridge.html' in caddy,
+        "ops/examples/snap.caddy must declare mutually exclusive @download_bridge and @default_csp matchers",
+    )
+    bridge_csp_match = re.search(r'header\s+@download_bridge\s+Content-Security-Policy\s+"([^"]+)"', caddy)
+    require(bridge_csp_match is not None, "ops/examples/snap.caddy must declare @download_bridge Content-Security-Policy")
+    bridge_csp_val = bridge_csp_match.group(1)
+    bridge_csp_dirs = [part.strip() for part in bridge_csp_val.split(";") if part.strip()]
+    for required_dir in (
+        "default-src 'none'",
+        "script-src 'self'",
+        "connect-src 'self'",
+        "worker-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'self'",
+    ):
+        require(
+            required_dir in bridge_csp_dirs,
+            f"ops/examples/snap.caddy @download_bridge CSP missing directive: {required_dir}",
+        )
+    require(
+        "unsafe-inline" not in bridge_csp_val and "unsafe-eval" not in bridge_csp_val,
+        "ops/examples/snap.caddy @download_bridge CSP must forbid unsafe-inline and unsafe-eval",
+    )
+    default_csp_match = re.search(r'header\s+@default_csp\s+Content-Security-Policy\s+"([^"]+)"', caddy)
+    require(default_csp_match is not None, "ops/examples/snap.caddy must declare @default_csp Content-Security-Policy")
+    default_csp_val = default_csp_match.group(1)
+    default_csp_dirs = [part.strip() for part in default_csp_val.split(";") if part.strip()]
+    for required_dir in (
+        "default-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' https: http: data: blob:",
+        "media-src 'self' https: http: blob:",
+        "connect-src 'self' https: http:",
+        "worker-src 'self'",
+        "frame-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ):
+        require(
+            required_dir in default_csp_dirs,
+            f"ops/examples/snap.caddy @default_csp CSP missing directive: {required_dir}",
+        )
+    require(
+        re.search(r"script-src 'self' 'sha256-[A-Za-z0-9+/=]+'", default_csp_val) is not None,
+        "ops/examples/snap.caddy @default_csp script-src must pin 'self' and theme bootstrap sha256 hash",
+    )
+    require(
+        "unsafe-eval" not in default_csp_val
+        and not any(d.startswith("script-src ") and "unsafe-inline" in d for d in default_csp_dirs),
+        "ops/examples/snap.caddy @default_csp script-src must forbid unsafe-inline and unsafe-eval",
+    )
+
     idx_weibo = caddy.find("handle /api/media/weibo {")
     idx_api = caddy.find("handle @api {")
     idx_catchall = caddy.find("handle /api/* {")
     idx_source = caddy.find("handle @source {")
-    idx_spa = caddy.find("try_files {path} /index.html")
+    idx_llms = caddy.find("handle /llms.txt {")
+    idx_share = caddy.find("handle /social/dokitool-share-v1.png {")
+    idx_monitor = caddy.find("handle @monitor {")
+    idx_static_handle = caddy.find("\n    handle {", idx_monitor)
+    idx_real_404 = caddy.find("respond 404", idx_static_handle) if idx_static_handle > 0 else -1
     require(
-        0 < idx_weibo < idx_api < idx_catchall < idx_source < idx_spa,
-        "ops/examples/snap.caddy handle blocks must order /api/media/weibo -> @api -> /api/* 404 -> @source -> SPA",
+        0 < idx_weibo < idx_api < idx_catchall < idx_source < idx_llms < idx_share < idx_monitor < idx_static_handle < idx_real_404,
+        "ops/examples/snap.caddy handle blocks must order /api/media/weibo -> @api -> /api/* 404 -> @source -> /llms.txt -> share -> @monitor -> static real-404",
+    )
+    static_block = caddy[idx_static_handle:]
+    require(
+        "precompressed br gzip" in static_block
+        and r"(?:\.(?:br|gz))?$" in static_block
+        and "@existing_static" in static_block
+        and "file {path} {path}/index.html" in static_block,
+        "ops/examples/snap.caddy static fallback must enable precompressed br gzip, extended @versioned regex, and real-file-only @existing_static + 404",
     )
 
     catchall_block = caddy[idx_catchall:idx_source]
@@ -1028,14 +1324,7 @@ def check_caddy_whitelist() -> int:
         monitor_matcher.group(1).split() == ["/monitor", "/monitor.html"],
         f"ops/examples/snap.caddy @monitor paths mismatch: got {monitor_matcher.group(1).split()}",
     )
-    idx_share = caddy.find("handle /social/dokitool-share-v1.png {")
-    idx_monitor = caddy.find("handle @monitor {")
-    idx_spa_handle = caddy.find("\n    handle {", idx_monitor)
-    require(
-        0 < idx_source < idx_share < idx_monitor < idx_spa_handle < idx_spa,
-        "ops/examples/snap.caddy must place handle @monitor after /social/dokitool-share-v1.png and before SPA fallback",
-    )
-    monitor_block = caddy[idx_monitor:idx_spa_handle]
+    monitor_block = caddy[idx_monitor:idx_static_handle]
     require(
         'header Content-Type "text/html; charset=utf-8"' in monitor_block
         and 'header Cache-Control "no-store"' in monitor_block
@@ -1199,6 +1488,112 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
                 )
 
     return len(keys)
+
+
+def _parse_go_duration_seconds(raw: object, field_name: str) -> float:
+    require(isinstance(raw, str) and bool(raw.strip()), f"{field_name} must be a non-empty Go duration string")
+    text = raw.strip()
+    if text == "0":
+        return 0.0
+    m = re.fullmatch(r"^(\d+(?:\.\d+)?)(ms|s|m)$", text)
+    require(m is not None, f"{field_name} must be a valid Go duration string: {raw!r}")
+    val = float(m.group(1))
+    unit = m.group(2)
+    return val / 1000.0 if unit == "ms" else (val * 60.0 if unit == "m" else val)
+
+
+def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
+    require(RUNTIME_CONFIG_EXAMPLE_PATH.is_file(), f"Missing runtime config example: {RUNTIME_CONFIG_EXAMPLE_PATH}")
+    raw_bytes = RUNTIME_CONFIG_EXAMPLE_PATH.read_bytes()
+    require(len(raw_bytes) <= 64 * 1024, "ops/examples/runtime.example.json must not exceed 64 KiB")
+    doc = json.loads(raw_bytes.decode("utf-8"))
+    require(
+        isinstance(doc, dict)
+        and set(doc.keys()) == {"schema_version", "ytdlp", "fast_pool", "circuit_breaker", "cache"},
+        "ops/examples/runtime.example.json must contain exact top-level sections",
+    )
+    require(doc["schema_version"] == "1.0", "runtime.example.json schema_version must be '1.0'")
+
+    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
+    valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms) | {"ytdlp_generic"}
+    require(len(valid_platforms) == 15, "Expected 14 core platforms + ytdlp_generic")
+
+    def require_int_range(obj: dict, key: str, lo: int, hi: int, prefix: str) -> int:
+        val = obj.get(key)
+        require(
+            isinstance(val, int) and not isinstance(val, bool) and lo <= val <= hi,
+            f"runtime.example.json {prefix}.{key} must be int in {lo}..{hi}",
+        )
+        return val
+
+    ytdlp = doc["ytdlp"]
+    require(
+        isinstance(ytdlp, dict)
+        and set(ytdlp.keys()) == {
+            "youtube_slots", "youtube_queue_size", "youtube_queue_wait",
+            "social_slots", "social_queue_size", "social_queue_wait",
+            "generic_slots", "generic_queue_size", "generic_queue_wait",
+            "youtube_ejs_concurrency", "youtube_ejs_queue_size", "youtube_ejs_queue_wait",
+        },
+        "runtime.example.json ytdlp keys mismatch",
+    )
+    yt_slots = require_int_range(ytdlp, "youtube_slots", 1, 16, "ytdlp")
+    soc_slots = require_int_range(ytdlp, "social_slots", 1, 16, "ytdlp")
+    gen_slots = require_int_range(ytdlp, "generic_slots", 1, 12, "ytdlp")
+    require(yt_slots + soc_slots + gen_slots <= 32, "runtime.example.json total yt-dlp slots must be <= 32")
+    require_int_range(ytdlp, "youtube_ejs_concurrency", 1, 16, "ytdlp")
+    for q_key in ("youtube_queue_size", "social_queue_size", "generic_queue_size", "youtube_ejs_queue_size"):
+        require_int_range(ytdlp, q_key, 0, 1024, "ytdlp")
+    for w_key in ("youtube_queue_wait", "social_queue_wait", "generic_queue_wait", "youtube_ejs_queue_wait"):
+        secs = _parse_go_duration_seconds(ytdlp.get(w_key), f"ytdlp.{w_key}")
+        require(0.0 <= secs <= 30.0, f"runtime.example.json ytdlp.{w_key} must be in 0s..30s")
+
+    fast_pool = doc["fast_pool"]
+    require(
+        isinstance(fast_pool, dict) and set(fast_pool.keys()) == {"per_platform_max_concurrency"},
+        "runtime.example.json fast_pool keys mismatch",
+    )
+    require_int_range(fast_pool, "per_platform_max_concurrency", 2, 256, "fast_pool")
+
+    cb = doc["circuit_breaker"]
+    require(
+        isinstance(cb, dict)
+        and set(cb.keys()) == {
+            "enabled", "consecutive_failures", "window_size", "failure_rate_threshold",
+            "open_duration", "half_open_max_probes", "disabled_platforms",
+        },
+        "runtime.example.json circuit_breaker keys mismatch",
+    )
+    require(isinstance(cb.get("enabled"), bool), "runtime.example.json circuit_breaker.enabled must be boolean")
+    require_int_range(cb, "consecutive_failures", 1, 100, "circuit_breaker")
+    require_int_range(cb, "window_size", 1, 200, "circuit_breaker")
+    fr = cb.get("failure_rate_threshold")
+    require(
+        isinstance(fr, (int, float)) and not isinstance(fr, bool) and 0.0 < float(fr) <= 1.0,
+        "runtime.example.json circuit_breaker.failure_rate_threshold must satisfy 0.0 < v <= 1.0",
+    )
+    open_secs = _parse_go_duration_seconds(cb.get("open_duration"), "circuit_breaker.open_duration")
+    require(5.0 <= open_secs <= 600.0, "runtime.example.json circuit_breaker.open_duration must be in 5s..600s")
+    require_int_range(cb, "half_open_max_probes", 1, 16, "circuit_breaker")
+    disabled_plats = cb.get("disabled_platforms")
+    require(isinstance(disabled_plats, list), "runtime.example.json circuit_breaker.disabled_platforms must be a list")
+    require(len(disabled_plats) == len(set(disabled_plats)), "runtime.example.json disabled_platforms must not contain duplicates")
+    for p in disabled_plats:
+        require(isinstance(p, str) and p in valid_platforms, f"Invalid disabled platform in runtime.example.json: {p!r}")
+
+    cache = doc["cache"]
+    require(
+        isinstance(cache, dict)
+        and set(cache.keys()) == {"youtube_parse_ttl", "stale_if_error_ttl", "upstream_blocked_neg_ttl"},
+        "runtime.example.json cache keys mismatch",
+    )
+    yt_ttl = _parse_go_duration_seconds(cache.get("youtube_parse_ttl"), "cache.youtube_parse_ttl")
+    stale_ttl = _parse_go_duration_seconds(cache.get("stale_if_error_ttl"), "cache.stale_if_error_ttl")
+    neg_ttl = _parse_go_duration_seconds(cache.get("upstream_blocked_neg_ttl"), "cache.upstream_blocked_neg_ttl")
+    require(0.0 <= yt_ttl <= 600.0, "runtime.example.json cache.youtube_parse_ttl must be in 0s..600s")
+    require(0.0 <= stale_ttl <= 3600.0, "runtime.example.json cache.stale_if_error_ttl must be in 0s..3600s")
+    require(0.0 <= neg_ttl <= 60.0, "runtime.example.json cache.upstream_blocked_neg_ttl must be in 0s..60s")
+    return True
 
 
 def check_batch_downloader_behavior() -> dict:
@@ -1546,6 +1941,7 @@ def main(argv: list[str] | None = None) -> int:
     check_python_scripts()
     caddy_paths = check_caddy_whitelist()
     api_keys_count = check_api_keys_example(platforms_cfg)
+    runtime_cfg_ok = check_runtime_config_example(platforms_cfg)
     batch_report = check_batch_downloader_behavior()
 
     summary = {
@@ -1557,6 +1953,7 @@ def main(argv: list[str] | None = None) -> int:
         "jsonschema_draft2020_12": js_report,
         "caddy_whitelisted_paths": caddy_paths,
         "api_keys_example_entries": api_keys_count,
+        "runtime_config_example_valid": runtime_cfg_ok,
         "example_script_compiled": True,
         "batch_downloader_tests": batch_report,
         "passed": True,

@@ -14,7 +14,7 @@
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
-| `serve` | 启动主后端 HTTP API 解析、内部控制面与准入限流服务（支持 `SIGHUP` 原子热重载 Bearer 鉴权密钥表） | 否 |
+| `serve` | 启动主后端 HTTP API 解析、内部控制面与准入限流服务（支持 `SIGHUP` 原子热重载 Bearer 鉴权密钥表与运行时热配置 `DOKITOOL_RUNTIME_CONFIG_FILE`） | 否 |
 | `hash-token` | 从标准输入读取单条原始令牌（严禁通过命令行位置参数传递），校验长度与可打印 ASCII 合法性后向标准输出打印 64 位小写 SHA-256 十六进制摘要 | 是（标准输入含敏感凭据） |
 | `catalog` | 向标准输出打印当前内置平台目录的统一契约 JSON | 否 |
 | `validate` | 从标准输入读取 JSON 载荷并按统一媒体契约结构执行校验 | 否 |
@@ -71,6 +71,7 @@
 | `DOKITOOL_SHANGHAI_BILIBILI` | 控制主后端在启用上海解析通道时是否开启哔哩哔哩国内线路并行解析与合并 | 否 |
 | `DOKITOOL_BILIBILI_DASH` | 控制 `dokitool` 主后端与 `shanghai-resolver` 上海节点是否开启哔哩哔哩免登录 DASH（1080P 视频轨与独立 M4A 音频轨）并行解析与合并；默认关闭（`false`），关闭时两端均严格仅发送原有单次 `durl` 请求，传入非布尔值时进程在监听前即报错退出 | 否 |
 | `DOKITOOL_PARSE_CACHE` | 控制主后端是否启用 `/api/parse` 与 `/api/resolve` 进程内短时结果缓存及同键并发请求合并 | 否 |
+| `DOKITOOL_RUNTIME_CONFIG_FILE` | 指定统一运行时热配置 JSON 文件路径（体积上限 `64 KiB`，支持 `SIGHUP` 原地无损热更新 `yt-dlp` 三舱并发与队列、`YouTubeEJS` 助手池、快池单平台并发舱壁、平台级熔断器与手动止血列表 `disabled_platforms`、YouTube 短缓存 TTL、`stale-if-error` 窗口及 `UPSTREAM_BLOCKED` 短负缓存；未设置时保持现有环境变量与默认行为不变，详见文末第六节与 `ops/examples/runtime.example.json`） | 否 |
 | `DOKITOOL_STATS_SNAPSHOT_PATH` | 指定 `/api/stats` 统计快照的本地持久化文件路径（默认为空，纯内存运行不执行磁盘读写）；配置路径后，启动时加载未过期的近 30 天（`Asia/Shanghai` UTC+8）日桶与近 24 小时时桶，文件不存在则冷启动，若文件损坏或快照版本不匹配则打印告警并以安全空状态启动、不阻塞主服务；运行期每 5 分钟及收到 `SIGINT`/`SIGTERM` 停机时通过同目录临时文件 + `Sync` + 原子重命名以 `0600` 权限落盘；仅存聚合统计元数据，绝不写入 URL、IP 或令牌 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_PIPIGX` | 控制是否为皮皮搞笑视频生成同路径跨域可读无水印候选附件信息 | 否 |
 | `DOKITOOL_TBVIDEO_REWRITE_ZUIYOU` | 控制是否为最右视频生成同路径跨域可读无水印候选附件信息 | 否 |
@@ -144,14 +145,16 @@
 | `DOKITOOL_RESOLVE_GLOBAL_CONCURRENCY` | 按需单集解析池全局允许同时在途的最大请求数 | 否 |
 | `DOKITOOL_RESOLVE_QUEUE_WAIT` | 按需单集解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
 | `DOKITOOL_RESOLVE_QUEUE_SIZE` | 按需单集解析池 FIFO 等待队列的最大容量上限 | 否 |
-| `DOKITOOL_PARSE_SLOW_CLIENT_BURST` | 慢解析池（覆盖未命中缓存的海外提取器平台 `/api/parse`、`/api/resolve` 及 YouTube 助手接口）单客户端令牌桶突发容量 | 否 |
-| `DOKITOOL_PARSE_SLOW_CLIENT_RPS` | 慢解析池单客户端每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY` | 慢解析池单客户端允许同时在途的最大请求数 | 否 |
-| `DOKITOOL_PARSE_SLOW_GLOBAL_BURST` | 慢解析池全局令牌桶突发容量 | 否 |
-| `DOKITOOL_PARSE_SLOW_GLOBAL_RPS` | 慢解析池全局每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY` | 慢解析池全局允许同时在途的最大请求数（未显式设置时跟随 `DOKITOOL_YTDLP_CONCURRENCY`） | 否 |
-| `DOKITOOL_PARSE_SLOW_QUEUE_WAIT` | 慢解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长 | 否 |
-| `DOKITOOL_PARSE_SLOW_QUEUE_SIZE` | 慢解析池 FIFO 等待队列的最大容量上限 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_BURST` | 社交慢解析池（覆盖未命中缓存的 X / Instagram / Facebook / Tumblr 等海外提取器平台 `/api/parse` 与 `/api/resolve`）单客户端令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_RPS` | 社交慢解析池单客户端每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY` | 社交慢解析池单客户端允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_BURST` | 社交慢解析池全局令牌桶突发容量 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_RPS` | 社交慢解析池全局每秒补充的请求令牌速率 | 否 |
+| `DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY` | 社交慢解析池全局允许同时在途的最大请求数（默认 `4`；未显式设置时跟随 `DOKITOOL_YTDLP_CONCURRENCY`） | 否 |
+| `DOKITOOL_PARSE_SLOW_QUEUE_WAIT` | 社交慢解析池在全局并发满载时允许请求进入 FIFO 队列等待的最长时长（默认 `20s`） | 否 |
+| `DOKITOOL_PARSE_SLOW_QUEUE_SIZE` | 社交慢解析池 FIFO 等待队列的最大容量上限（默认 `32`） | 否 |
+| `DOKITOOL_PARSE_YOUTUBE_*` | YouTube 独立慢解析池（覆盖未命中缓存的 YouTube 服务端 `/api/parse` 与 `/api/resolve`，默认并发 `4`、队列 `32`、等待 `20s`；未显式设置并发时跟随 `DOKITOOL_YTDLP_CONCURRENCY`；支持与 `DOKITOOL_PARSE_SLOW_*` 相同的 8 个后缀） | 否 |
+| `DOKITOOL_YOUTUBE_EJS_*` | YouTube 浏览器助手独立准入池（覆盖未命中缓存的 `/api/youtube/context` 与 `POST /api/youtube/finalize`，与 `yt-dlp` 慢池彻底解耦；默认并发 `6`、`GlobalRPS=20`、`GlobalBurst=60`、`ClientConcurrency=2`、队列 `64`、等待 `10s`；支持与 `DOKITOOL_PARSE_SLOW_*` 相同的 8 个后缀） | 否 |
 | `DOKITOOL_PARSE_GENERIC_CLIENT_BURST` | 独立通用长尾慢解析池（覆盖未命中缓存的第二级通用具名提取器 `/api/parse` 请求，与快解析池及核心慢解析池完全隔离）单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_PARSE_GENERIC_CLIENT_RPS` | 独立通用长尾慢解析池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_PARSE_GENERIC_CLIENT_CONCURRENCY` | 独立通用长尾慢解析池单客户端允许同时在途的最大请求数 | 否 |
@@ -275,3 +278,40 @@
 - **无损切换与失败回退保护**：
   - 校验通过时，通过原子指针（`atomic.Pointer`）即时切换活动密钥注册表，并为所有新旧配置中 `id` 相同的密钥平滑继承累计观测计数器（`requests_total`、`ok`、`errors`、`cache_hits`、`rate_limited`、`unauthorized`、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`）；
   - 若热重载遇到文件不可读、JSON 语法或未知字段错误、摘要冲突或配额越界，服务端仅输出不含任何明文凭据或摘要的脱敏告警日志，并**保持原有活动密钥注册表继续生效**。
+
+---
+
+## 六、统一运行时热配置（`DOKITOOL_RUNTIME_CONFIG_FILE`）与 `SIGHUP` 原地调参
+
+源码定义：`backend/internal/api/runtime_config.go`、`backend/internal/api/circuit_breaker.go`、`backend/internal/api/admission.go`、`backend/internal/api/cache.go`  
+脱敏配置模板：[ops/examples/runtime.example.json](../ops/examples/runtime.example.json)
+
+### 1. 文件约束与配置优先级
+
+- **体积与解析约束**：须为常规文件且大小不超过 **`64 KiB`**（`MaxRuntimeConfigFileBytes = 65536`）；使用 `json.Decoder` 开启 `DisallowUnknownFields()` 严格拒绝未知字段、显式 `null` 与尾随内容；`schema_version` 固定为 `"1.0"`。
+- **配置优先级**：未设置 `DOKITOOL_RUNTIME_CONFIG_FILE` 时，100% 保持既有环境变量（`DOKITOOL_YTDLP_CONCURRENCY`、`DOKITOOL_PARSE_SLOW_*` 等）与默认值不变；设置后在启动阶段加载并覆盖对应动态池、快池舱壁、熔断与缓存策略，并在每次收到 **`SIGHUP`** 时与 `DOKITOOL_API_KEYS_FILE` 同步重新读取校验。
+- **失败保持原态（Fail-Safe Retention）**：若 `SIGHUP` 重载时新文件不存在、语法错误、含未知字段或数值越界，服务端仅输出脱敏告警日志，**完整保留当前内存中的活动策略**，不中断在途请求。
+- **原地平滑更新（租约零丢失）**：所有动态准入池（`YouTubeSlow`、`SocialSlow`、`GenericSlow`、`YouTubeEJS`、`FastParse` 单平台舱壁）均在原 `*pool` 实例锁内原地更新配额上限——调大并发上限时立即唤醒队列中符合条件的 FIFO 等待者，调小时自然排空既有在途租约而不中断请求。
+
+### 2. 标准 Schema 与硬边界约束
+
+| 配置路径 | 默认值 | 合法范围 | 说明 |
+| --- | --- | --- | --- |
+| `schema_version` | `"1.0"` | 固定 `"1.0"` | 配置契约版本号 |
+| `ytdlp.youtube_slots` | `4` | `1..16` | YouTube 服务端慢解析舱并发上限（与 `social_slots`、`generic_slots` 三者之和 `<= 32`） |
+| `ytdlp.social_slots` | `4` | `1..16` | 社交慢解析舱（X / IG / FB / Tumblr）并发上限 |
+| `ytdlp.generic_slots` | `2` | `1..12` | 第二级通用具名提取器慢解析舱并发上限 |
+| `ytdlp.*_queue_size` | `32` / `32` / `16` / `64` | `0..1024` | 各慢舱与 `youtube_ejs` 的 FIFO 等待队列上限 |
+| `ytdlp.*_queue_wait` | `20s` / `20s` / `15s` / `10s` | `0s..30s` | 各慢舱与 `youtube_ejs` 的最大排队等待时长 |
+| `ytdlp.youtube_ejs_concurrency` | `6` | `1..16` | YouTube 助手接口（未命中 `/api/youtube/context` 与 `POST /api/youtube/finalize`）独立池并发上限 |
+| `fast_pool.per_platform_max_concurrency` | `24` | `2..256` | 快解析池内单个核心平台允许同时占用的最大并发槽位（超限时仅限流该平台返回 `429`，保护其余 8 个快平台） |
+| `circuit_breaker.enabled` | `true` | `true` / `false` | 是否启用自动平台级熔断（仅统计 `UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` / `INTERNAL_ERROR`，绝不误判用户输入错误或内容状态） |
+| `circuit_breaker.consecutive_failures` | `5` | `1..100` | 触发熔断打开的连续真实上游失败阈值 |
+| `circuit_breaker.window_size` | `10` | `1..200` | 滑动窗口最小样本数与容量 |
+| `circuit_breaker.failure_rate_threshold` | `0.6` | `(0.0, 1.0]` | 滑动窗口失败率熔断阈值 |
+| `circuit_breaker.open_duration` | `"30s"` | `5s..600s` | 熔断打开后进入 `half_open` 探活前的冷却时长 |
+| `circuit_breaker.half_open_max_probes` | `2` | `1..16` | `half_open` 状态下允许并发放行的探活请求上限 |
+| `circuit_breaker.disabled_platforms` | `[]` | 14 核心平台 ID 或 `"ytdlp_generic"` | 手动强制熔断止血列表（自动去重；即使 `enabled: false` 也生效，优先返回未超硬顶的过期缓存，否则直接 `503` 快速失败） |
+| `cache.youtube_parse_ttl` | `"120s"` | `0s..600s` | YouTube 服务端 `/api/parse` 缓存上限（受 `earliest_expires_at - 60s` 收缩；`"0s"` 可一键停用 YouTube 服务端缓存） |
+| `cache.stale_if_error_ttl` | `"600s"` | `0s..3600s` | `stale-if-error` 过期兜底窗口（铁律：含 `expires_at` 的响应硬顶绝不超过 `earliest_expires_at - 15s`；`"0s"` 关闭） |
+| `cache.upstream_blocked_neg_ttl` | `"5s"` | `0s..60s` | `UPSTREAM_BLOCKED` 短负缓存时长（`"0s"` 关闭；负缓存绝不作为过期兜底返回） |

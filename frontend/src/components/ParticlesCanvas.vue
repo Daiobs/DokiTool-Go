@@ -11,6 +11,11 @@ onMounted(() => {
   const ctx = canvas.getContext('2d')
   if (!ctx) return
   const motion = window.matchMedia('(prefers-reduced-motion: reduce)')
+  const mobileOrCoarse = window.matchMedia('(max-width: 767px), (pointer: coarse)')
+  const hardwareCores =
+    typeof navigator !== 'undefined' ? Number(navigator.hardwareConcurrency) : NaN
+  const lowPowerDevice =
+    Number.isFinite(hardwareCores) && hardwareCores > 0 && hardwareCores <= 2
   let frame = 0
   let lastFrame = null
   let disposed = false
@@ -65,7 +70,12 @@ onMounted(() => {
     })
   }
 
-  const canAnimate = () => !disposed && !document.hidden && !motion.matches
+  const canAnimate = () =>
+    !disposed &&
+    !document.hidden &&
+    !motion.matches &&
+    !mobileOrCoarse.matches &&
+    !lowPowerDevice
   const stop = () => {
     if (frame) window.cancelAnimationFrame(frame)
     frame = 0
@@ -101,6 +111,8 @@ onMounted(() => {
   document.addEventListener('visibilitychange', updateActivity)
   if (motion.addEventListener) motion.addEventListener('change', updateActivity)
   else motion.addListener(updateActivity)
+  if (mobileOrCoarse.addEventListener) mobileOrCoarse.addEventListener('change', updateActivity)
+  else mobileOrCoarse.addListener(updateActivity)
   dispose = () => {
     disposed = true
     stop()
@@ -108,6 +120,8 @@ onMounted(() => {
     document.removeEventListener('visibilitychange', updateActivity)
     if (motion.removeEventListener) motion.removeEventListener('change', updateActivity)
     else motion.removeListener(updateActivity)
+    if (mobileOrCoarse.removeEventListener) mobileOrCoarse.removeEventListener('change', updateActivity)
+    else mobileOrCoarse.removeListener(updateActivity)
   }
 })
 

@@ -22,10 +22,16 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/xiaohongshu"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/zuiyou"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
@@ -930,6 +936,59 @@ func TestParseCacheErrorCodePolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("upstream-blocked-short-negative-cache-5s-and-disableable", func(t *testing.T) {
+		var nowSec atomic.Int64
+		nowSec.Store(startUnix)
+		var calls atomic.Int32
+		h, err := New(c, map[string]Adapter{
+			"douyin": AdapterFunc(func(_ context.Context, _ string, _ int64) (unified.Object, error) {
+				calls.Add(1)
+				return unified.ContractError("UPSTREAM_BLOCKED", "作品受限", false), nil
+			}),
+		}, func() time.Time { return time.Unix(nowSec.Load(), 0) }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := "/api/parse?schema_version=1.0&url=https://www.douyin.com/video/blocked-1"
+		w1 := httptest.NewRecorder()
+		h.ServeHTTP(w1, httptest.NewRequest(http.MethodGet, p, nil))
+		if w1.Code != http.StatusForbidden || calls.Load() != 1 {
+			t.Fatalf("initial UPSTREAM_BLOCKED: code=%d calls=%d", w1.Code, calls.Load())
+		}
+		// At +4s: hits 5s short negative cache.
+		nowSec.Store(startUnix + 4)
+		w2 := httptest.NewRecorder()
+		h.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, p, nil))
+		if w2.Code != http.StatusForbidden || calls.Load() != 1 || w2.Header().Get("X-DokiTool-Cache") != "hit" {
+			t.Fatalf("+4s UPSTREAM_BLOCKED expected negative cache hit: code=%d calls=%d hdr=%q", w2.Code, calls.Load(), w2.Header().Get("X-DokiTool-Cache"))
+		}
+		// At +5s: expired -> re-parses (never served as stale!).
+		nowSec.Store(startUnix + 5)
+		w3 := httptest.NewRecorder()
+		h.ServeHTTP(w3, httptest.NewRequest(http.MethodGet, p, nil))
+		if w3.Code != http.StatusForbidden || calls.Load() != 2 {
+			t.Fatalf("+5s UPSTREAM_BLOCKED expected re-parse: code=%d calls=%d", w3.Code, calls.Load())
+		}
+
+		// Disabling via upstream_blocked_neg_ttl=0s skips caching completely.
+		rt := DefaultRuntimeConfig()
+		rt.Cache.UpstreamBlockedNegTTL = 0
+		if !ApplyRuntimeConfig(nil, h, rt, true, false) {
+			t.Fatal("ApplyRuntimeConfig failed")
+		}
+		p2 := "/api/parse?schema_version=1.0&url=https://www.douyin.com/video/blocked-2"
+		for i := 0; i < 2; i++ {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, p2, nil))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("attempt %d status=%d", i+1, w.Code)
+			}
+		}
+		if calls.Load() != 4 {
+			t.Fatalf("UPSTREAM_BLOCKED with ttl=0s was cached: calls=%d, want 4", calls.Load())
+		}
+	})
+
 	t.Run("all-other-errors-never-cached", func(t *testing.T) {
 		nonCachedCodes := []struct {
 			code       string
@@ -940,7 +999,6 @@ func TestParseCacheErrorCodePolicy(t *testing.T) {
 			{code: "INVALID_INPUT", retryable: false, wantStatus: 400},
 			{code: "UNSUPPORTED_PLATFORM", retryable: false, wantStatus: 400},
 			{code: "NO_MEDIA", retryable: false, wantStatus: 404},
-			{code: "UPSTREAM_BLOCKED", retryable: false, wantStatus: 403},
 			{code: "RATE_LIMITED", retryable: true, wantStatus: 429},
 			{code: "UPSTREAM_TIMEOUT", retryable: true, wantStatus: 504},
 			{code: "UPSTREAM_UNAVAILABLE", retryable: true, wantStatus: 502},
@@ -1509,13 +1567,44 @@ func TestParseCacheExcludesRequesterBoundContent(t *testing.T) {
 		t.Fatal("weibo responses at distinct timestamps unexpectedly reused identical signed ticket payload")
 	}
 
-	// 2. YouTube /api/parse and /api/youtube/{context,finalize} must NEVER enter parseCache.
-	ytPath := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-	for i := 0; i < 2; i++ {
+	// 2. YouTube /api/youtube/{context,finalize} NEVER enter parseCache, while YouTube /api/parse
+	//    caches for youtube_parse_ttl (default 120s) with host canonicalization and can be disabled via 0s.
+	ytPathWWW := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+	ytPathMobile := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://m.youtube.com/watch?v=dQw4w9WgXcQ")
+	ytPathApex := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://youtube.com/watch?v=dQw4w9WgXcQ")
+
+	for i, ytPath := range []string{ytPathWWW, ytPathMobile, ytPathApex} {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, ytPath, nil))
 		if w.Code != http.StatusOK {
-			t.Fatalf("youtube parse status=%d body=%s", w.Code, w.Body.String())
+			t.Fatalf("youtube parse #%d status=%d body=%s", i, w.Code, w.Body.String())
+		}
+		if i > 0 && w.Header().Get("X-DokiTool-Cache") != "hit" {
+			t.Fatalf("youtube alias #%d expected cache hit, got hdr=%q", i, w.Header().Get("X-DokiTool-Cache"))
+		}
+	}
+	if youtubeCalls.Load() != 1 {
+		t.Fatalf("expected canonicalized YouTube /api/parse to hit 120s short cache (calls=%d, want 1)", youtubeCalls.Load())
+	}
+	// After 120s default youtube_parse_ttl: expires and re-parses!
+	nowSec.Add(120)
+	wYTExp := httptest.NewRecorder()
+	h.ServeHTTP(wYTExp, httptest.NewRequest(http.MethodGet, ytPathWWW, nil))
+	if wYTExp.Code != http.StatusOK || youtubeCalls.Load() != 2 {
+		t.Fatalf("youtube cache did not expire at +120s: code=%d calls=%d", wYTExp.Code, youtubeCalls.Load())
+	}
+
+	// Setting youtube_parse_ttl=0s immediately disables YouTube /api/parse caching!
+	rtNoYT := DefaultRuntimeConfig()
+	rtNoYT.Cache.YouTubeParseTTL = 0
+	if !ApplyRuntimeConfig(nil, h, rtNoYT, true, false) {
+		t.Fatal("ApplyRuntimeConfig youtube_parse_ttl=0s failed")
+	}
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, ytPathWWW, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("youtube uncached parse status=%d body=%s", w.Code, w.Body.String())
 		}
 		wCtx := httptest.NewRecorder()
 		h.ServeHTTP(wCtx, httptest.NewRequest(http.MethodGet, "/api/youtube/context?schema_version=1.0", nil))
@@ -1528,12 +1617,9 @@ func TestParseCacheExcludesRequesterBoundContent(t *testing.T) {
 			t.Fatalf("youtube finalize status=%d", wFin.Code)
 		}
 	}
-	if youtubeCalls.Load() != 2 || ytHelper.ctxCalls.Load() != 2 || ytHelper.finalizeCalls.Load() != 2 {
+	if youtubeCalls.Load() != 4 || ytHelper.ctxCalls.Load() != 2 || ytHelper.finalizeCalls.Load() != 2 {
 		t.Fatalf("youtube bypassed calls mismatch: parse=%d ctx=%d fin=%d",
 			youtubeCalls.Load(), ytHelper.ctxCalls.Load(), ytHelper.finalizeCalls.Load())
-	}
-	if entries, usedBytes := h.cache.stats(); entries != 0 || usedBytes != 0 {
-		t.Fatalf("excluded platforms leaked into parseCache: entries=%d bytes=%d", entries, usedBytes)
 	}
 }
 
@@ -2225,6 +2311,10 @@ func TestUncachedParseAndResolveRecoverPanicsWithoutLeak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Disable YouTube parse caching in Suite 1 so all 7 cases exercise the uncacheable path.
+	rtUncacheYT := DefaultRuntimeConfig()
+	rtUncacheYT.Cache.YouTubeParseTTL = 0
+	ApplyRuntimeConfig(nil, hEnabled, rtUncacheYT, false, false)
 	hEnabled.panicLogf = recordPanicLog
 
 	longXURL := "https://x.com/i/status/1800000000000000001?pad=" + strings.Repeat("a", maxYTDLPInputBytes+32) + "&tok=" + canary
@@ -2627,26 +2717,32 @@ func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
 
 func TestPlatformTraitsTableConsolidation(t *testing.T) {
 	// 1. Cacheability driven by platformTraits.disableParseCache
-	for _, uncacheable := range []string{"", "weibo", "youtube"} {
+	for _, uncacheable := range []string{"", "weibo"} {
 		if cacheablePlatform(uncacheable) {
 			t.Fatalf("cacheablePlatform(%q) = true, want false", uncacheable)
 		}
 	}
-	for _, cacheable := range []string{"douyin", "bilibili", "xiaohongshu", "x", "instagram", "facebook", "tumblr", PlatformGeneric} {
+	for _, cacheable := range []string{"douyin", "bilibili", "xiaohongshu", "x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
 		if !cacheablePlatform(cacheable) {
 			t.Fatalf("cacheablePlatform(%q) = false, want true", cacheable)
 		}
 	}
 
-	// 2. Slow-engine & strictInput2048 invariants preserved
-	for _, p := range []string{"x", "instagram", "facebook", "tumblr", PlatformGeneric} {
+	// 2. Slow-engine & strictInput2048 invariants preserved (youtube now has strictInput2048=true, disableParseCache=false)
+	for _, p := range []string{"x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
 		tr := traitsForPlatform(p)
-		if !tr.slowEngine || !tr.strictInput2048 {
-			t.Fatalf("platform %q traits = %+v, want slowEngine=true strictInput2048=true", p, tr)
+		if !tr.slowEngine || !tr.strictInput2048 || tr.disableParseCache {
+			t.Fatalf("platform %q traits = %+v, want slowEngine=true strictInput2048=true disableParseCache=false", p, tr)
 		}
 	}
-	if yt := traitsForPlatform("youtube"); !yt.slowEngine || yt.strictInput2048 || !yt.disableParseCache {
-		t.Fatalf("youtube traits = %+v, want slowEngine=true strictInput2048=false disableParseCache=true", yt)
+	for _, ytAlias := range []string{
+		"http://youtube.com/watch?v=dQw4w9WgXcQ",
+		"https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+		"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+	} {
+		if got := normalizeCacheURL("youtube", ytAlias); got != "https://www.youtube.com/watch?v=dQw4w9WgXcQ" {
+			t.Fatalf("normalizeCacheURL(youtube, %q) = %q", ytAlias, got)
+		}
 	}
 
 	// 3. Shanghai fallback 15s TTL cap applies only to Shanghai-enabled platforms (douyin, bilibili)
@@ -2667,8 +2763,112 @@ func TestPlatformTraitsTableConsolidation(t *testing.T) {
 	if ttl, ok := computeCacheTTLForResult("xiaohongshu", makeSyntheticEnvelope("xiaohongshu", "https://www.xiaohongshu.com/explore/1", startUnix, distantExp), baseNow, true); !ok || ttl != maxCacheTTL {
 		t.Fatalf("xiaohongshu with shanghaiFallback=true = (%v, %v), want (%v, true)", ttl, ok, maxCacheTTL)
 	}
+	// YouTube caps OK TTL at youtube_parse_ttl (default 120s) while enforcing earliest_expires_at - 60s clamp.
+	if ttl, ok := computeCacheTTLForResult("youtube", makeSyntheticEnvelope("youtube", "https://www.youtube.com/watch?v=abc", startUnix, distantExp), baseNow, false); !ok || ttl != defaultYouTubeParseCacheTTL {
+		t.Fatalf("youtube OK TTL = (%v, %v), want (%v, true)", ttl, ok, defaultYouTubeParseCacheTTL)
+	}
+	shortYTExp := baseNow.Add(100 * time.Second).Format(time.RFC3339) // 100s - 60s = 40s < 120s
+	if ttl, ok := computeCacheTTLForResult("youtube", makeSyntheticEnvelope("youtube", "https://www.youtube.com/watch?v=abc", startUnix, shortYTExp), baseNow, false); !ok || ttl != 40*time.Second {
+		t.Fatalf("youtube short expiry TTL = (%v, %v), want (40s, true)", ttl, ok)
+	}
 	// PlatformGeneric uses maxOKCacheTTL = genericCacheTTL (60s).
 	if ttl, ok := computeCacheTTLForResult(PlatformGeneric, makeSyntheticEnvelope("vimeo", "https://vimeo.com/123", startUnix, distantExp), baseNow, false); !ok || ttl != genericCacheTTL {
 		t.Fatalf("PlatformGeneric OK TTL = (%v, %v), want (%v, true)", ttl, ok, genericCacheTTL)
+	}
+}
+
+// TestChannelDependentPublicMediaMustDisableParseCache is a mandatory safety guard
+// preventing any platform whose PublicMedia output varies between anonymous visitors
+// and authenticated owner/agent callers (currently weibo) from ever sharing parseCache.
+func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
+	const now int64 = 1793448000
+	signingKey := strings.Repeat("k", 64)
+	weiboPrep := weiboplatform.PreparePublicWithOwner(signingKey, IsOwnerRequest)
+	prepareAll := func(ctx context.Context, platform string, payload unified.Object, ts int64) (unified.Object, error) {
+		switch platform {
+		case "douyin":
+			return douyin.PreparePublic(ctx, platform, payload, ts)
+		case "bilibili":
+			return bilibili.PreparePublic(ctx, platform, payload, ts)
+		case "xiaohongshu":
+			return xiaohongshu.PreparePublic(ctx, platform, payload, ts)
+		case "kuaishou":
+			return kuaishou.PreparePublic(ctx, platform, payload, ts)
+		case "pipixia":
+			return pipixia.PreparePublic(ctx, platform, payload, ts)
+		case "zuiyou":
+			return zuiyou.PreparePublic(ctx, platform, payload, ts)
+		default:
+			return weiboPrep(ctx, platform, payload, ts)
+		}
+	}
+
+	sampleURLs := map[string]struct {
+		sourceURL string
+		mediaURL  string
+	}{
+		"douyin":      {"https://www.douyin.com/video/7400000000000000001", "https://v26-web.douyinvod.com/demo/video.mp4"},
+		"bilibili":    {"https://www.bilibili.com/video/BV1xx411c7mD", "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/demo.mp4"},
+		"weibo":       {"https://weibo.com/tv/show/1034:5000000000000001", "https://f.video.weibocdn.com/000demo.mp4?Expires=1793451600"},
+		"toutiao":     {"https://www.toutiao.com/video/7400000000000000001/", "https://v3-default.ixigua.com/demo.mp4"},
+		"kuaishou":    {"https://www.kuaishou.com/short-video/3x123", "https://v2.kwaicdn.com/upic/demo.mp4"},
+		"pipixia":     {"https://h5.pipix.com/item/7400000000000000001", "https://v1-ppx.ixigua.com/demo.mp4"},
+		"pipigx":      {"https://h5.pipigx.com/pp/post/12345", "https://file.ippzone.com/video/demo.mp4"},
+		"zuiyou":      {"https://share.xiaochuankeji.cn/hybrid/share/post?pid=12345", "https://tbvideo.ixiaochuan.cn/zyvd/demo.mp4"},
+		"xiaohongshu": {"https://www.xiaohongshu.com/explore/66a1b2c3d4e5f6a7b8c9d0e1", "http://sns-video-bd.xhscdn.com/stream/demo.mp4"},
+		"x":           {"https://x.com/user/status/1800000000000000001", "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/demo.mp4"},
+		"youtube":     {"https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?itag=18"},
+		"instagram":   {"https://www.instagram.com/reel/C123456/", "https://scontent.cdninstagram.com/v/demo.mp4"},
+		"facebook":    {"https://www.facebook.com/watch/?v=123456", "https://video.xx.fbcdn.net/v/demo.mp4"},
+		"tumblr":      {"https://demo.tumblr.com/post/123456", "https://va.media.tumblr.com/tumblr_demo.mp4"},
+	}
+
+	anonCtx := context.Background()
+	ownerCtx := WithOwnerRequest(context.Background())
+	weiboVaried := false
+
+	for i := 0; i < numCorePlatforms; i++ {
+		plat := knownPlatforms[i]
+		sample, ok := sampleURLs[plat]
+		if !ok {
+			t.Fatalf("missing sample URL fixture for core platform %q", plat)
+		}
+		makeInput := func() unified.Object {
+			env := makeSyntheticEnvelope(plat, sample.sourceURL, now, "")
+			item := unified.Map(unified.Slice(unified.Map(env["data"])["items"])[0])
+			unified.Map(item["default"])["url"] = sample.mediaURL
+			variant := unified.Map(unified.Slice(item["variants"])[0])
+			src := unified.Map(unified.Slice(unified.Map(variant["delivery"])["sources"])[0])
+			src["url"] = sample.mediaURL
+			return env
+		}
+
+		anonOut, err := prepareAll(anonCtx, plat, makeInput(), now)
+		if err != nil {
+			t.Fatalf("prepareAll(anon, %q) failed: %v", plat, err)
+		}
+		ownerOut, err := prepareAll(ownerCtx, plat, makeInput(), now)
+		if err != nil {
+			t.Fatalf("prepareAll(owner, %q) failed: %v", plat, err)
+		}
+		anonBytes, err := unified.Encode(unified.PublicView(anonOut, false, now))
+		if err != nil {
+			t.Fatalf("encode anon %q: %v", plat, err)
+		}
+		ownerBytes, err := unified.Encode(unified.PublicView(ownerOut, false, now))
+		if err != nil {
+			t.Fatalf("encode owner %q: %v", plat, err)
+		}
+
+		variesByChannel := !bytes.Equal(anonBytes, ownerBytes)
+		if plat == "weibo" {
+			weiboVaried = variesByChannel
+		}
+		if variesByChannel && !traitsForPlatform(plat).disableParseCache {
+			t.Fatalf("SECURITY INVARIANT VIOLATION: platform %q PublicMedia output varies with IsOwnerRequest(ctx), MUST set disableParseCache=true in platformTraits!", plat)
+		}
+	}
+	if !weiboVaried {
+		t.Fatal("regression test sanity check failed: weibo PublicMedia did not differ between anonymous and owner")
 	}
 }

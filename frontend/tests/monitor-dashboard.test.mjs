@@ -1744,3 +1744,243 @@ test("MonitorApp.vue: 40-char SHA version copy, process-memory copy, Shanghai by
     }
   }
 });
+
+test("Post-#37: statsTypes & MonitorApp.vue render ytdlp_pools, stale_hits, circuit_breakers, and runtime_policy strictly read-only with zero inline styles", async () => {
+  const makeCompartment = (overrides = {}) => ({
+    enabled: true,
+    active: 1,
+    queued: 0,
+    concurrency_limit: 4,
+    queue_limit: 32,
+    waited: 3,
+    granted: 25,
+    timeout: 0,
+    full: 0,
+    canceled: 0,
+    wait_ms_total: 420,
+    wait_ms_max: 180,
+    ...overrides,
+  });
+
+  const post37Stats = createRichStatsSnapshot({
+    cache: {
+      enabled: true,
+      entries: 96,
+      bytes: 4_194_304,
+      max_entries: 1000,
+      max_bytes: 67_108_864,
+      total: {
+        hits: 140,
+        misses: 60,
+        stale_hits: 17,
+        singleflight_shared: 18,
+        uncacheable: 12,
+      },
+      by_channel: {
+        anonymous: {
+          hits: 50,
+          misses: 30,
+          stale_hits: 11,
+          singleflight_shared: 6,
+          uncacheable: 4,
+        },
+        owner: {
+          hits: 90,
+          misses: 30,
+          stale_hits: 6,
+          singleflight_shared: 12,
+          uncacheable: 8,
+        },
+      },
+    },
+    ytdlp_pools: {
+      youtube: makeCompartment({ active: 2, queued: 1, concurrency_limit: 4, queue_limit: 32 }),
+      social: makeCompartment({ active: 3, queued: 4, concurrency_limit: 4, queue_limit: 32 }),
+      generic: makeCompartment({ active: 1, queued: 0, concurrency_limit: 2, queue_limit: 16 }),
+      youtube_ejs: makeCompartment({ active: 2, queued: 0, concurrency_limit: 6, queue_limit: 64 }),
+    },
+    circuit_breakers: [
+      {
+        platform: "douyin",
+        state: "closed",
+        consecutive_failures: 0,
+        window_failures: 0,
+        window_total: 10,
+        open_until: "",
+        disabled_by_config: false,
+      },
+      {
+        platform: "kuaishou",
+        state: "half_open",
+        consecutive_failures: 3,
+        window_failures: 6,
+        window_total: 10,
+        open_until: "",
+        disabled_by_config: false,
+      },
+      {
+        platform: "instagram",
+        state: "open",
+        consecutive_failures: 5,
+        window_failures: 8,
+        window_total: 10,
+        open_until: "2026-11-24T06:00:00Z",
+        disabled_by_config: false,
+      },
+      {
+        platform: "tumblr",
+        state: "open",
+        consecutive_failures: 0,
+        window_failures: 0,
+        window_total: 0,
+        open_until: "",
+        disabled_by_config: true,
+      },
+    ],
+    runtime_policy: {
+      config_file_active: true,
+      reload_count: 3,
+      last_reloaded_at: "2026-11-24T05:30:00Z",
+      youtube_slots: 4,
+      social_slots: 4,
+      generic_slots: 2,
+      youtube_ejs_concurrency: 6,
+      fast_per_platform_max_concurrency: 24,
+      circuit_breaker_enabled: true,
+      disabled_platforms: ["tumblr"],
+      youtube_parse_ttl_seconds: 120,
+      stale_if_error_ttl_seconds: 600,
+      upstream_blocked_neg_ttl_seconds: 5,
+    },
+  });
+
+  // 1) Schema validator accepts new fields AND rejects malformed optional fields
+  assert.equal(statsTypes.isValidStatsSnapshot(post37Stats), true);
+
+  const badStale = structuredClone(post37Stats);
+  badStale.cache.total.stale_hits = "oops";
+  assert.equal(statsTypes.isValidStatsSnapshot(badStale), false);
+
+  const badPools = structuredClone(post37Stats);
+  delete badPools.ytdlp_pools.youtube_ejs;
+  assert.equal(statsTypes.isValidStatsSnapshot(badPools), false);
+
+  const badCb = structuredClone(post37Stats);
+  badCb.circuit_breakers[0].state = "tripped";
+  assert.equal(statsTypes.isValidStatsSnapshot(badCb), false);
+
+  const badPolicy = structuredClone(post37Stats);
+  badPolicy.runtime_policy.disabled_platforms = "tumblr";
+  assert.equal(statsTypes.isValidStatsSnapshot(badPolicy), false);
+
+  // Badge formatter checks
+  assert.deepEqual(
+    statsTypes.formatCircuitBreakerBadge({ state: "closed", disabled_by_config: false }),
+    { label: "正常", tone: "ok" },
+  );
+  assert.deepEqual(
+    statsTypes.formatCircuitBreakerBadge({ state: "half_open", disabled_by_config: false }),
+    { label: "半开探活", tone: "warn" },
+  );
+  assert.deepEqual(
+    statsTypes.formatCircuitBreakerBadge({ state: "open", disabled_by_config: false }),
+    { label: "熔断保护中", tone: "danger" },
+  );
+  assert.deepEqual(
+    statsTypes.formatCircuitBreakerBadge({ state: "open", disabled_by_config: true }),
+    { label: "熔断保护中（运维禁用）", tone: "danger" },
+  );
+
+  // 2) Mount MonitorApp.vue with Post-#37 snapshot and assert strictly read-only rendering
+  globalThis.localStorage.setItem(
+    monitorStorage.OWNER_TOKEN_LOCAL_KEY,
+    VALID_OWNER_TOKEN,
+  );
+  const fetchRequests = [];
+  globalThis.fetch = async (url, init) => {
+    fetchRequests.push({ url, method: init?.method || "GET" });
+    return new Response(
+      JSON.stringify({ schema_version: "1.0", code: "OK", data: post37Stats }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  const mounted = mountSfcTree(MonitorApp);
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    // Only GET /api/stats — zero write HTTP methods
+    assert.equal(fetchRequests.length, 1);
+    assert.equal(fetchRequests[0].method, "GET");
+
+    // Stale hits rendered on cache KPI card
+    const staleEl = mounted.findByTestId("kpi-cache-stale-hits")[0];
+    assert.ok(staleEl);
+    assert.match(mounted.textOf(staleEl), /过期兜底命中 17/);
+
+    // All 4 compartment pools rendered with active/limit & queued/queue_limit
+    const compWrap = mounted.findByTestId("ytdlp-compartment-pools")[0];
+    assert.ok(compWrap);
+    const compRows = mounted.findAll((n) => Boolean(n.props?.["data-compartment-pool-id"]));
+    assert.deepEqual(
+      compRows.map((n) => n.props["data-compartment-pool-id"]),
+      ["youtube", "social", "generic", "youtube_ejs"],
+    );
+    const compText = mounted.textOf(compWrap);
+    assert.match(compText, /YouTube 舱/);
+    assert.match(compText, /活跃 2 \/ 4 · 排队\s*1 \/ 32/);
+    assert.match(compText, /社交慢链舱/);
+    assert.match(compText, /活跃 3 \/ 4 · 排队\s*4 \/ 32/);
+    assert.match(compText, /长尾 Generic 舱/);
+    assert.match(compText, /活跃 1 \/ 2 · 排队\s*0 \/ 16/);
+    assert.match(compText, /YouTube EJS 池/);
+    assert.match(compText, /活跃 2 \/ 6 · 排队\s*0 \/ 64/);
+
+    // Circuit breakers card renders all 4 state labels
+    const cbCard = mounted.findByTestId("card-circuit-breakers")[0];
+    assert.ok(cbCard);
+    const cbItems = mounted.findByTestId("circuit-breaker-item");
+    assert.equal(cbItems.length, 4);
+    const cbTextByPlat = Object.fromEntries(
+      cbItems.map((n) => [n.props["data-platform"], mounted.textOf(n)]),
+    );
+    assert.match(cbTextByPlat.douyin, /抖音.*正常/);
+    assert.match(cbTextByPlat.kuaishou, /快手.*半开探活/);
+    assert.match(cbTextByPlat.instagram, /Instagram.*熔断保护中/);
+    assert.match(cbTextByPlat.tumblr, /Tumblr.*熔断保护中（运维禁用）/);
+
+    // Runtime policy read-only summary renders key parameters with ZERO forms/inputs/selects/textareas
+    const policyCard = mounted.findByTestId("card-runtime-policy")[0];
+    assert.ok(policyCard);
+    const policyText = mounted.textOf(policyCard);
+    assert.match(policyText, /热配置已激活/);
+    assert.match(policyText, /3 次/);
+    assert.match(policyText, /YT 4 · 社交 4 · 通用 2 · EJS 6/);
+    assert.match(policyText, /24 并发/);
+    assert.match(policyText, /120s/);
+    assert.match(policyText, /600s/);
+    assert.match(policyText, /5s/);
+    assert.match(policyText, /Tumblr/);
+
+    // Strictly read-only unlocked DOM: zero <form>, <input>, <select>, <textarea>, <script>, and zero inline style=
+    const writeControls = mounted.findAll((n) =>
+      ["form", "input", "select", "textarea", "script"].includes(n.type),
+    );
+    assert.equal(
+      writeControls.length,
+      0,
+      "unlocked /monitor dashboard must be 100% read-only with zero form/input/script controls",
+    );
+    const nodesWithInlineStyle = mounted.findAll(
+      (n) => n.props && ("style" in n.props || Object.keys(n.style || {}).length > 0),
+    );
+    assert.equal(
+      nodesWithInlineStyle.length,
+      0,
+      "strict CSP requires zero inline style attributes anywhere in MonitorApp.vue",
+    );
+  } finally {
+    mounted.unmount();
+  }
+});
