@@ -518,6 +518,7 @@ type RequestStatsSnapshot struct {
 // CacheChannelCounts reports parseCache and singleflight outcomes for one channel (or total).
 type CacheChannelCounts struct {
 	Hits               uint64 `json:"hits"`
+	StaleHits          uint64 `json:"stale_hits"`
 	Misses             uint64 `json:"misses"`
 	SingleflightShared uint64 `json:"singleflight_shared"`
 	Uncacheable        uint64 `json:"uncacheable"`
@@ -633,26 +634,119 @@ type YTDLPStatsSource interface {
 	StatsSnapshot() ytengine.SlotStatsSnapshot
 }
 
+// YTDLPCompartmentPoolSnapshot reports live occupancy, limits, and cumulative queue
+// outcomes for one isolated yt-dlp or YouTube EJS compartment pool.
+type YTDLPCompartmentPoolSnapshot struct {
+	Enabled          bool   `json:"enabled"`
+	Active           int    `json:"active"`
+	Queued           int    `json:"queued"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
+	QueueLimit       int    `json:"queue_limit"`
+	Waited           uint64 `json:"waited"`
+	Granted          uint64 `json:"granted"`
+	Timeout          uint64 `json:"timeout"`
+	Full             uint64 `json:"full"`
+	Canceled         uint64 `json:"canceled"`
+	WaitMSTotal      uint64 `json:"wait_ms_total"`
+	WaitMSMax        uint64 `json:"wait_ms_max"`
+}
+
+// YTDLPPoolsSnapshot summarizes the four decoupled yt-dlp / YouTube EJS compartment pools.
+type YTDLPPoolsSnapshot struct {
+	YouTube    YTDLPCompartmentPoolSnapshot `json:"youtube"`
+	Social     YTDLPCompartmentPoolSnapshot `json:"social"`
+	Generic    YTDLPCompartmentPoolSnapshot `json:"generic"`
+	YouTubeEJS YTDLPCompartmentPoolSnapshot `json:"youtube_ejs"`
+}
+
+// CircuitBreakerPlatformSnapshot reports the current circuit breaker state for one core platform.
+type CircuitBreakerPlatformSnapshot struct {
+	Platform            string `json:"platform"`
+	State               string `json:"state"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	WindowFailures      int    `json:"window_failures"`
+	WindowTotal         int    `json:"window_total"`
+	OpenUntil           string `json:"open_until"`
+	DisabledByConfig    bool   `json:"disabled_by_config"`
+}
+
+// RuntimePolicySummary exposes the strictly redacted active runtime hot-config policy
+// (zero file paths or secrets).
+type RuntimePolicySummary struct {
+	ConfigFileActive              bool     `json:"config_file_active"`
+	ReloadCount                   uint64   `json:"reload_count"`
+	LastReloadedAt                string   `json:"last_reloaded_at"`
+	YouTubeSlots                  int      `json:"youtube_slots"`
+	SocialSlots                   int      `json:"social_slots"`
+	GenericSlots                  int      `json:"generic_slots"`
+	YouTubeEJSConcurrency         int      `json:"youtube_ejs_concurrency"`
+	FastPerPlatformMaxConcurrency int      `json:"fast_per_platform_max_concurrency"`
+	CircuitBreakerEnabled         bool     `json:"circuit_breaker_enabled"`
+	DisabledPlatforms             []string `json:"disabled_platforms"`
+	YouTubeParseTTLSeconds        int      `json:"youtube_parse_ttl_seconds"`
+	StaleIfErrorTTLSeconds        int      `json:"stale_if_error_ttl_seconds"`
+	UpstreamBlockedNegTTLSeconds  int      `json:"upstream_blocked_neg_ttl_seconds"`
+}
+
+func defaultRuntimePolicySummary() RuntimePolicySummary {
+	def := DefaultRuntimeConfig()
+	return runtimePolicySummaryFromConfig(def, false, 0, "")
+}
+
+func runtimePolicySummaryFromConfig(cfg RuntimeConfig, fromFile bool, reloadCount uint64, lastReloadedAt string) RuntimePolicySummary {
+	disabled := make([]string, len(cfg.CircuitBreaker.DisabledPlatforms))
+	copy(disabled, cfg.CircuitBreaker.DisabledPlatforms)
+	return RuntimePolicySummary{
+		ConfigFileActive:              fromFile,
+		ReloadCount:                   reloadCount,
+		LastReloadedAt:                lastReloadedAt,
+		YouTubeSlots:                  cfg.YTDLP.YouTubeSlots,
+		SocialSlots:                   cfg.YTDLP.SocialSlots,
+		GenericSlots:                  cfg.YTDLP.GenericSlots,
+		YouTubeEJSConcurrency:         cfg.YTDLP.YouTubeEJSConcurrency,
+		FastPerPlatformMaxConcurrency: cfg.FastPool.PerPlatformMaxConcurrency,
+		CircuitBreakerEnabled:         cfg.CircuitBreaker.Enabled,
+		DisabledPlatforms:             disabled,
+		YouTubeParseTTLSeconds:        int(cfg.Cache.YouTubeParseTTL / time.Second),
+		StaleIfErrorTTLSeconds:        int(cfg.Cache.StaleIfErrorTTL / time.Second),
+		UpstreamBlockedNegTTLSeconds:  int(cfg.Cache.UpstreamBlockedNegTTL / time.Second),
+	}
+}
+
+func cloneRuntimePolicySummary(in RuntimePolicySummary) RuntimePolicySummary {
+	out := in
+	if in.DisabledPlatforms == nil {
+		out.DisabledPlatforms = make([]string, 0)
+	} else {
+		out.DisabledPlatforms = slices.Clone(in.DisabledPlatforms)
+	}
+	return out
+}
+
 // StatsSnapshot is the read-only data payload returned by GET /api/stats.
 type StatsSnapshot struct {
-	StartedAt      string                     `json:"started_at"`
-	GeneratedAt    string                     `json:"generated_at"`
-	UptimeSeconds  int64                      `json:"uptime_seconds"`
-	Requests       RequestStatsSnapshot       `json:"requests"`
-	Cache          CacheStatsSnapshot         `json:"cache"`
-	Admission      AdmissionStatsSnapshot     `json:"admission"`
-	APIKeys        []APIKeyStatsSnapshot      `json:"api_keys"`
-	YTDLP          ytengine.SlotStatsSnapshot `json:"ytdlp"`
-	YTDLPGeneric   ytengine.SlotStatsSnapshot `json:"ytdlp_generic"`
-	Shanghai       shresolver.StatsSnapshot   `json:"shanghai"`
-	ParseLatencyMS LatencyStatsSnapshot       `json:"parse_latency_ms"`
-	Runtime        RuntimeConfigSnapshot      `json:"runtime"`
-	Daily          []DailyStatsBucket         `json:"daily"`
-	Hourly         []HourlyStatsBucket        `json:"hourly"`
+	StartedAt       string                           `json:"started_at"`
+	GeneratedAt     string                           `json:"generated_at"`
+	UptimeSeconds   int64                            `json:"uptime_seconds"`
+	Requests        RequestStatsSnapshot             `json:"requests"`
+	Cache           CacheStatsSnapshot               `json:"cache"`
+	Admission       AdmissionStatsSnapshot           `json:"admission"`
+	APIKeys         []APIKeyStatsSnapshot            `json:"api_keys"`
+	YTDLP           ytengine.SlotStatsSnapshot       `json:"ytdlp"`
+	YTDLPGeneric    ytengine.SlotStatsSnapshot       `json:"ytdlp_generic"`
+	YTDLPPools      YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
+	CircuitBreakers []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
+	RuntimePolicy   RuntimePolicySummary             `json:"runtime_policy"`
+	Shanghai        shresolver.StatsSnapshot         `json:"shanghai"`
+	ParseLatencyMS  LatencyStatsSnapshot             `json:"parse_latency_ms"`
+	Runtime         RuntimeConfigSnapshot            `json:"runtime"`
+	Daily           []DailyStatsBucket               `json:"daily"`
+	Hourly          []HourlyStatsBucket              `json:"hourly"`
 }
 
 type cacheAtomicCounters struct {
 	hits               atomic.Uint64
+	staleHits          atomic.Uint64
 	misses             atomic.Uint64
 	singleflightShared atomic.Uint64
 	uncacheable        atomic.Uint64
@@ -661,6 +755,7 @@ type cacheAtomicCounters struct {
 func (c *cacheAtomicCounters) snapshot() CacheChannelCounts {
 	return CacheChannelCounts{
 		Hits:               c.hits.Load(),
+		StaleHits:          c.staleHits.Load(),
 		Misses:             c.misses.Load(),
 		SingleflightShared: c.singleflightShared.Load(),
 		Uncacheable:        c.uncacheable.Load(),
@@ -882,12 +977,17 @@ type Stats struct {
 	mu                     sync.RWMutex
 	cacheSrc               *parseCache
 	admSrc                 *admission
+	cbSrc                  *circuitBreakerManager
 	ytdlpSrc               *ytengine.Engine
 	ytdlpGenericSrc        YTDLPStatsSource
+	ytdlpYoutubeSrc        YTDLPStatsSource
+	ytdlpSocialSrc         YTDLPStatsSource
+	ytdlpGenericCompSrc    YTDLPStatsSource
 	shSrc                  shresolver.StatsProvider
 	shSrcGen               uint64
 	lastSyncedShanghaiHits uint64
 	runtimeCfg             RuntimeConfigSnapshot
+	runtimePolicy          RuntimePolicySummary
 
 	dynamicPlatforms map[string]*dynamicPlatformCounters
 	dynamicOther     dynamicPlatformCounters
@@ -905,6 +1005,7 @@ func NewStats(clock func() time.Time) *Stats {
 	return &Stats{
 		startedAt:        clock().UTC(),
 		clock:            clock,
+		runtimePolicy:    defaultRuntimePolicySummary(),
 		dynamicPlatforms: make(map[string]*dynamicPlatformCounters),
 	}
 }
@@ -931,6 +1032,77 @@ func (s *Stats) setAdmissionSource(a *admission) {
 	}
 	s.mu.Lock()
 	s.admSrc = a
+	s.mu.Unlock()
+}
+
+func (s *Stats) setCircuitBreakerSource(cb *circuitBreakerManager) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.cbSrc = cb
+	s.mu.Unlock()
+}
+
+func sanitizeYTDLPStatsSource(src YTDLPStatsSource) YTDLPStatsSource {
+	if eng, ok := src.(*ytengine.Engine); ok && eng == nil {
+		return nil
+	}
+	return src
+}
+
+// SetYTDLPCompartmentSources binds optional per-compartment yt-dlp slot stats
+// sources (youtube, social, generic) so GET /api/stats reflects both admission
+// and ytengine compartment slot watermarks.
+func (s *Stats) SetYTDLPCompartmentSources(youtube, social, generic YTDLPStatsSource) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.ytdlpYoutubeSrc = sanitizeYTDLPStatsSource(youtube)
+	s.ytdlpSocialSrc = sanitizeYTDLPStatsSource(social)
+	s.ytdlpGenericCompSrc = sanitizeYTDLPStatsSource(generic)
+	s.mu.Unlock()
+}
+
+func (s *Stats) syncRuntimePolicyFromAdmissionConfig(cfg AdmissionConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.runtimePolicy.ConfigFileActive {
+		if cfg.YouTubeSlowParse.GlobalConcurrency >= 1 {
+			s.runtimePolicy.YouTubeSlots = cfg.YouTubeSlowParse.GlobalConcurrency
+		}
+		if cfg.SlowParse.GlobalConcurrency >= 1 {
+			s.runtimePolicy.SocialSlots = cfg.SlowParse.GlobalConcurrency
+		}
+		if cfg.GenericSlowParse.GlobalConcurrency >= 1 {
+			s.runtimePolicy.GenericSlots = cfg.GenericSlowParse.GlobalConcurrency
+		}
+		if cfg.YouTubeEJS.GlobalConcurrency >= 1 {
+			s.runtimePolicy.YouTubeEJSConcurrency = cfg.YouTubeEJS.GlobalConcurrency
+		}
+		if cfg.FastPerPlatformMaxConcurrency >= MinFastPerPlatformMaxConcurrency {
+			s.runtimePolicy.FastPerPlatformMaxConcurrency = cfg.FastPerPlatformMaxConcurrency
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Stats) applyRuntimePolicy(cfg RuntimeConfig, fromFile bool, isReload bool) {
+	if s == nil {
+		return
+	}
+	nowStr := s.now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	reloadCount := s.runtimePolicy.ReloadCount
+	lastReloadedAt := s.runtimePolicy.LastReloadedAt
+	if isReload {
+		reloadCount++
+		lastReloadedAt = nowStr
+	}
+	s.runtimePolicy = runtimePolicySummaryFromConfig(cfg, fromFile, reloadCount, lastReloadedAt)
 	s.mu.Unlock()
 }
 
@@ -1157,6 +1329,13 @@ func (s *Stats) recordCacheHit(channel string) {
 	s.mu.Unlock()
 }
 
+func (s *Stats) recordCacheStaleHit(channel string) {
+	if s == nil {
+		return
+	}
+	s.cacheCh[channelIdx(channel)].staleHits.Add(1)
+}
+
 func (s *Stats) recordCacheMiss(channel string) {
 	if s == nil {
 		return
@@ -1178,6 +1357,48 @@ func (s *Stats) recordCacheUncacheable(channel string) {
 	s.cacheCh[channelIdx(channel)].uncacheable.Add(1)
 }
 
+func buildYTDLPCompartmentSnapshot(
+	admPool AdmissionPoolSnapshot,
+	hasAdm bool,
+	slotSrc YTDLPStatsSource,
+	fallbackEnabled bool,
+) YTDLPCompartmentPoolSnapshot {
+	out := YTDLPCompartmentPoolSnapshot{
+		Enabled:          fallbackEnabled,
+		Active:           admPool.Active,
+		Queued:           admPool.Queued,
+		ConcurrencyLimit: admPool.ConcurrencyLimit,
+		QueueLimit:       admPool.QueueLimit,
+		Waited:           admPool.Waited,
+		Granted:          admPool.Granted,
+		Timeout:          admPool.Timeout,
+		Full:             admPool.Full,
+		Canceled:         admPool.Canceled,
+		WaitMSTotal:      admPool.WaitMSTotal,
+		WaitMSMax:        admPool.WaitMSMax,
+	}
+	if slotSrc != nil {
+		slotSnap := slotSrc.StatsSnapshot()
+		out.Enabled = slotSnap.Enabled
+		if !hasAdm {
+			out.Active = slotSnap.Active
+			out.Queued = slotSnap.Waiting
+			out.ConcurrencyLimit = slotSnap.ConcurrencyLimit
+			out.Waited = slotSnap.Total.WaitCount
+			out.WaitMSTotal = slotSnap.Total.WaitMSTotal
+			out.WaitMSMax = slotSnap.Total.WaitMSMax
+		} else {
+			if slotSnap.Active > out.Active {
+				out.Active = slotSnap.Active
+			}
+			if slotSnap.Waiting > out.Queued {
+				out.Queued = slotSnap.Waiting
+			}
+		}
+	}
+	return out
+}
+
 // Snapshot captures a point-in-time read-only view of all aggregate counters and gauges.
 func (s *Stats) Snapshot() StatsSnapshot {
 	if s == nil {
@@ -1190,11 +1411,13 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			Requests: RequestStatsSnapshot{
 				ByPlatformCodeChannel: make([]PlatformOutcomeCount, 0),
 			},
-			APIKeys:  make([]APIKeyStatsSnapshot, 0),
-			Shanghai: shOff,
-			Runtime:  normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
-			Daily:    emptyDailyBuckets(nowRaw),
-			Hourly:   emptyHourlyBuckets(nowRaw),
+			APIKeys:         make([]APIKeyStatsSnapshot, 0),
+			CircuitBreakers: (*circuitBreakerManager)(nil).Snapshot(nowRaw),
+			RuntimePolicy:   defaultRuntimePolicySummary(),
+			Shanghai:        shOff,
+			Runtime:         normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
+			Daily:           emptyDailyBuckets(nowRaw),
+			Hourly:          emptyHourlyBuckets(nowRaw),
 		}
 	}
 
@@ -1237,6 +1460,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	cacheSnap := CacheStatsSnapshot{
 		Total: CacheChannelCounts{
 			Hits:               cacheAnon.Hits + cacheOwner.Hits,
+			StaleHits:          cacheAnon.StaleHits + cacheOwner.StaleHits,
 			Misses:             cacheAnon.Misses + cacheOwner.Misses,
 			SingleflightShared: cacheAnon.SingleflightShared + cacheOwner.SingleflightShared,
 			Uncacheable:        cacheAnon.Uncacheable + cacheOwner.Uncacheable,
@@ -1250,8 +1474,12 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	s.mu.RLock()
 	cacheSrc := s.cacheSrc
 	admSrc := s.admSrc
+	cbSrc := s.cbSrc
 	ytdlpSrc := s.ytdlpSrc
 	ytdlpGenericSrc := s.ytdlpGenericSrc
+	ytdlpYoutubeSrc := s.ytdlpYoutubeSrc
+	ytdlpSocialSrc := s.ytdlpSocialSrc
+	ytdlpGenericCompSrc := s.ytdlpGenericCompSrc
 	shSrc := s.shSrc
 	shGen := s.shSrcGen
 	s.mu.RUnlock()
@@ -1261,9 +1489,11 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 
 	var admSnap AdmissionStatsSnapshot
+	var admYT, admSocial, admGeneric, admEJS AdmissionPoolSnapshot
 	apiKeys := make([]APIKeyStatsSnapshot, 0)
 	if admSrc != nil {
 		admSnap = admSrc.statsSnapshot()
+		admYT, admSocial, admGeneric, admEJS = admSrc.compartmentAdmissionSnapshots()
 		apiKeys = admSrc.apiKeysStatsSnapshot()
 	}
 
@@ -1276,6 +1506,8 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	if ytdlpGenericSrc != nil {
 		ytdlpGenericSnap = ytdlpGenericSrc.StatsSnapshot()
 	}
+
+	cbSnaps := cbSrc.Snapshot(nowRaw)
 
 	shSnap := shresolver.StatsSnapshot{Mode: "off"}
 	if shSrc != nil {
@@ -1371,7 +1603,19 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 
 	runtimeCfg := normalizeRuntimeConfig(s.runtimeCfg, shSnap, shSrc != nil)
+	runtimePolicy := cloneRuntimePolicySummary(s.runtimePolicy)
 	s.mu.Unlock()
+
+	genericSrcForComp := ytdlpGenericCompSrc
+	if genericSrcForComp == nil {
+		genericSrcForComp = ytdlpGenericSrc
+	}
+	ytdlpPools := YTDLPPoolsSnapshot{
+		YouTube:    buildYTDLPCompartmentSnapshot(admYT, admSrc != nil, ytdlpYoutubeSrc, runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled),
+		Social:     buildYTDLPCompartmentSnapshot(admSocial, admSrc != nil, ytdlpSocialSrc, runtimeCfg.YTDLPEnabled || ytdlpSnap.Enabled),
+		Generic:    buildYTDLPCompartmentSnapshot(admGeneric, admSrc != nil, genericSrcForComp, runtimeCfg.YTDLPGenericEnabled || ytdlpGenericSnap.Enabled),
+		YouTubeEJS: buildYTDLPCompartmentSnapshot(admEJS, admSrc != nil, nil, runtimeCfg.YouTubeHelper),
+	}
 
 	latAnon := s.latency[chAnonIdx].snapshot()
 	latOwner := s.latency[chOwnerIdx].snapshot()
@@ -1386,12 +1630,15 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			ByChannel:             RequestChannelBreakdown{Anonymous: anonReq, Owner: ownerReq},
 			ByPlatformCodeChannel: cells,
 		},
-		Cache:        cacheSnap,
-		Admission:    admSnap,
-		APIKeys:      apiKeys,
-		YTDLP:        ytdlpSnap,
-		YTDLPGeneric: ytdlpGenericSnap,
-		Shanghai:     shSnap,
+		Cache:           cacheSnap,
+		Admission:       admSnap,
+		APIKeys:         apiKeys,
+		YTDLP:           ytdlpSnap,
+		YTDLPGeneric:    ytdlpGenericSnap,
+		YTDLPPools:      ytdlpPools,
+		CircuitBreakers: cbSnaps,
+		RuntimePolicy:   runtimePolicy,
+		Shanghai:        shSnap,
 		ParseLatencyMS: LatencyStatsSnapshot{
 			Total:     latTotal,
 			ByChannel: LatencyChannelBreakdown{Anonymous: latAnon, Owner: latOwner},
@@ -1516,7 +1763,7 @@ func (r *SummaryReporter) FormatLine() string {
 	line := fmt.Sprintf(
 		"dokitool: stats_summary uptime_s=%d window_s=%d "+
 			"req_total=%d req_anon=%d req_owner=%d win_req_anon=%d win_req_owner=%d "+
-			"cache_hits=%d win_cache_hits=%d cache_misses=%d cache_sf=%d cache_uncacheable=%d cache_entries=%d cache_bytes=%d "+
+			"cache_hits=%d cache_stale_hits=%d win_cache_hits=%d cache_misses=%d cache_sf=%d cache_uncacheable=%d cache_entries=%d cache_bytes=%d "+
 			"adm_fast_active=%d adm_fast_queued=%d adm_fast_waits=%d adm_fast_timeout=%d adm_fast_full=%d adm_fast_wait_ms=%d "+
 			"adm_slow_active=%d adm_slow_queued=%d adm_slow_waits=%d adm_slow_timeout=%d adm_slow_full=%d adm_slow_wait_ms=%d "+
 			"adm_owner_active=%d adm_owner_queued=%d adm_owner_waits=%d adm_owner_timeout=%d adm_owner_full=%d adm_owner_wait_ms=%d "+
@@ -1527,7 +1774,7 @@ func (r *SummaryReporter) FormatLine() string {
 			"outcomes=%s",
 		snap.UptimeSeconds, windowSec,
 		snap.Requests.Total, snap.Requests.ByChannel.Anonymous, snap.Requests.ByChannel.Owner, winAnon, winOwn,
-		snap.Cache.Total.Hits, winHits, snap.Cache.Total.Misses, snap.Cache.Total.SingleflightShared, snap.Cache.Total.Uncacheable, snap.Cache.Entries, snap.Cache.Bytes,
+		snap.Cache.Total.Hits, snap.Cache.Total.StaleHits, winHits, snap.Cache.Total.Misses, snap.Cache.Total.SingleflightShared, snap.Cache.Total.Uncacheable, snap.Cache.Entries, snap.Cache.Bytes,
 		snap.Admission.Fast.Active, snap.Admission.Fast.Queued, snap.Admission.Fast.Waited, snap.Admission.Fast.Timeout, snap.Admission.Fast.Full, snap.Admission.Fast.WaitMSTotal,
 		snap.Admission.Slow.Active, snap.Admission.Slow.Queued, snap.Admission.Slow.Waited, snap.Admission.Slow.Timeout, snap.Admission.Slow.Full, snap.Admission.Slow.WaitMSTotal,
 		snap.Admission.Owner.Active, snap.Admission.Owner.Queued, snap.Admission.Owner.Waited, snap.Admission.Owner.Timeout, snap.Admission.Owner.Full, snap.Admission.Owner.WaitMSTotal,

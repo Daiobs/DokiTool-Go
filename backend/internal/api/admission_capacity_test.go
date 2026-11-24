@@ -20,14 +20,22 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 		defaults.Resolve.GlobalConcurrency != 32 || defaults.Resolve.GlobalRPS != 50 || defaults.Resolve.GlobalBurst != 100 ||
 		defaults.Resolve.ClientConcurrency != 2 || defaults.Resolve.ClientBurst != 12 || defaults.Resolve.ClientRPS != 0.5 ||
 		defaults.Resolve.QueueWait != 1500*time.Millisecond || defaults.Resolve.QueueSize != 128 ||
-		defaults.SlowParse.GlobalConcurrency != 2 || defaults.SlowParse.GlobalRPS != 10 || defaults.SlowParse.GlobalBurst != 32 ||
+		defaults.YouTubeSlowParse.GlobalConcurrency != 4 || defaults.YouTubeSlowParse.GlobalRPS != 10 || defaults.YouTubeSlowParse.GlobalBurst != 32 ||
+		defaults.YouTubeSlowParse.ClientConcurrency != 1 || defaults.YouTubeSlowParse.ClientBurst != 4 ||
+		defaults.YouTubeSlowParse.QueueWait != 20*time.Second || defaults.YouTubeSlowParse.QueueSize != 32 ||
+		defaults.SlowParse.GlobalConcurrency != 4 || defaults.SlowParse.GlobalRPS != 10 || defaults.SlowParse.GlobalBurst != 32 ||
 		defaults.SlowParse.ClientConcurrency != 1 || defaults.SlowParse.ClientBurst != 4 ||
-		defaults.SlowParse.QueueWait != 5*time.Second || defaults.SlowParse.QueueSize != 32 ||
+		defaults.SlowParse.QueueWait != 20*time.Second || defaults.SlowParse.QueueSize != 32 ||
+		defaults.GenericSlowParse.GlobalConcurrency != 2 || defaults.GenericSlowParse.QueueWait != 15*time.Second || defaults.GenericSlowParse.QueueSize != 16 ||
+		defaults.YouTubeEJS.GlobalConcurrency != 6 || defaults.YouTubeEJS.GlobalRPS != 20 || defaults.YouTubeEJS.GlobalBurst != 60 ||
+		defaults.YouTubeEJS.ClientConcurrency != 2 || defaults.YouTubeEJS.ClientBurst != 8 || defaults.YouTubeEJS.ClientRPS != 24.0/60 ||
+		defaults.YouTubeEJS.QueueWait != 10*time.Second || defaults.YouTubeEJS.QueueSize != 64 ||
+		defaults.FastPerPlatformMaxConcurrency != 24 ||
 		defaults.Relay.GlobalConcurrency != 12 || defaults.MaxClients != 4096 {
 		t.Fatalf("wrong production defaults: %+v", defaults)
 	}
 
-	// SlowParse.GlobalConcurrency automatically inherits DOKITOOL_YTDLP_CONCURRENCY when unset.
+	// SlowParse and YouTubeSlowParse automatically inherit DOKITOOL_YTDLP_CONCURRENCY when unset.
 	inherited, err := LoadAdmissionConfig(func(k string) string {
 		if k == "DOKITOOL_YTDLP_CONCURRENCY" {
 			return "6"
@@ -37,8 +45,9 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inherited.SlowParse.GlobalConcurrency != 6 {
-		t.Fatalf("expected SlowParse.GlobalConcurrency to inherit DOKITOOL_YTDLP_CONCURRENCY=6, got %d", inherited.SlowParse.GlobalConcurrency)
+	if inherited.SlowParse.GlobalConcurrency != 6 || inherited.YouTubeSlowParse.GlobalConcurrency != 6 {
+		t.Fatalf("expected SlowParse & YouTubeSlowParse GlobalConcurrency to inherit DOKITOOL_YTDLP_CONCURRENCY=6, got social=%d youtube=%d",
+			inherited.SlowParse.GlobalConcurrency, inherited.YouTubeSlowParse.GlobalConcurrency)
 	}
 
 	values := map[string]string{
@@ -115,7 +124,10 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 		{"DOKITOOL_RESOLVE_QUEUE_SIZE", "secret-invalid"},
 		{"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY", "0"},
 		{"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY", "65"},
-		{"DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY", "3"},
+		{"DOKITOOL_PARSE_SLOW_CLIENT_CONCURRENCY", "5"},
+		{"DOKITOOL_PARSE_YOUTUBE_GLOBAL_CONCURRENCY", "0"},
+		{"DOKITOOL_YOUTUBE_EJS_GLOBAL_CONCURRENCY", "0"},
+		{"DOKITOOL_YOUTUBE_EJS_QUEUE_WAIT", "31s"},
 		{"DOKITOOL_PARSE_SLOW_QUEUE_WAIT", "-1s"},
 		{"DOKITOOL_PARSE_SLOW_QUEUE_WAIT", "31s"},
 		{"DOKITOOL_PARSE_SLOW_QUEUE_WAIT", "secret-invalid"},
@@ -146,6 +158,15 @@ func TestAdmissionConfigDefaultsAndOverrides(t *testing.T) {
 	badRelayQueue.Relay.QueueSize = 4
 	if err := badRelayQueue.Validate(); err == nil {
 		t.Fatal("expected Relay queue configuration to be rejected")
+	}
+
+	// FastPerPlatformMaxConcurrency must be in [2, 256].
+	for _, badCap := range []int{0, 1, 257} {
+		badBulkhead := DefaultAdmissionConfig()
+		badBulkhead.FastPerPlatformMaxConcurrency = badCap
+		if err := badBulkhead.Validate(); err == nil {
+			t.Fatalf("expected FastPerPlatformMaxConcurrency=%d to be rejected", badCap)
+		}
 	}
 }
 

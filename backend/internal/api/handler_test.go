@@ -498,3 +498,59 @@ func TestHandlerDefenseInDepthPlatformScopeAndStatsOwnerOnly(t *testing.T) {
 		t.Fatalf("direct /api/parse allowed douyin got %d %s", wAllowed.Code, wAllowed.Body.String())
 	}
 }
+
+func TestSchemaVersion409MessageAnonymousVsAuthenticated(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	h, err := New(c, nil, func() time.Time { return time.Unix(1793448000, 0) }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetYouTubeHelper(&countingYouTubeHelper{})
+
+	const wantAnonMsg = "接口版本已更新，请等待当前下载结束后刷新页面"
+	const wantAuthMsg = "请传入必需查询参数 schema_version=1.0（详见 docs/AGENT-API.md）"
+
+	cases := []struct {
+		method string
+		target string
+	}{
+		{http.MethodGet, "/api/parse?url=https://www.douyin.com/video/123"},
+		{http.MethodGet, "/api/parse?schema_version=2.0&url=https://www.douyin.com/video/123"},
+		{http.MethodGet, "/api/resolve?url=https://www.douyin.com/video/123&item_id=v1"},
+		{http.MethodGet, "/api/platforms"},
+		{http.MethodGet, "/api/platforms?schema_version=9.9"},
+		{http.MethodGet, "/api/youtube/context"},
+		{http.MethodPost, "/api/youtube/finalize"},
+	}
+
+	for _, tc := range cases {
+		// 1. Anonymous request MUST keep the exact legacy PHP-parity 409 message byte-for-byte.
+		anonRec := httptest.NewRecorder()
+		h.ServeHTTP(anonRec, httptest.NewRequest(tc.method, tc.target, strings.NewReader(`{}`)))
+		if anonRec.Code != http.StatusConflict {
+			t.Fatalf("anon %s %s status=%d, want 409", tc.method, tc.target, anonRec.Code)
+		}
+		anonEnv, err := unified.Decode(anonRec.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := unified.Str(unified.Map(anonEnv["error"])["message"]); got != wantAnonMsg {
+			t.Fatalf("anon %s %s 409 message = %q, want %q", tc.method, tc.target, got, wantAnonMsg)
+		}
+
+		// 2. Authenticated Bearer request receives the friendly AGENT-API guidance message.
+		authReq := httptest.NewRequest(tc.method, tc.target, strings.NewReader(`{}`)).WithContext(WithOwnerRequest(context.Background()))
+		authRec := httptest.NewRecorder()
+		h.ServeHTTP(authRec, authReq)
+		if authRec.Code != http.StatusConflict {
+			t.Fatalf("auth %s %s status=%d, want 409", tc.method, tc.target, authRec.Code)
+		}
+		authEnv, err := unified.Decode(authRec.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := unified.Str(unified.Map(authEnv["error"])["message"]); got != wantAuthMsg {
+			t.Fatalf("auth %s %s 409 message = %q, want %q", tc.method, tc.target, got, wantAuthMsg)
+		}
+	}
+}

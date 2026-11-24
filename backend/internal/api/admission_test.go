@@ -437,37 +437,54 @@ func TestFastAndSlowPoolClassificationAndIsolation(t *testing.T) {
 	cfg.SlowParse.GlobalConcurrency = 1
 	cfg.SlowParse.QueueWait = 0
 	cfg.SlowParse.QueueSize = 0
+	cfg.YouTubeSlowParse.GlobalConcurrency = 1
+	cfg.YouTubeSlowParse.QueueWait = 0
+	cfg.YouTubeSlowParse.QueueSize = 0
 	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	adm := entry.(*admission)
 
-	// Saturate the single SlowParse slot directly.
+	// 1. Saturate the single Social SlowParse slot directly.
 	relSlow, retry := adm.slow.acquire(netip.MustParseAddr("198.51.100.250"), time.Now())
 	if retry != 0 {
 		t.Fatal(retry)
 	}
 	defer relSlow()
 
-	// All 5 yt-dlp slow platforms hit 429 on SlowParse when saturated.
-	slowURLs := []string{
+	// All 4 social yt-dlp slow platforms hit 429 on SlowParse when saturated.
+	socialSlowURLs := []string{
 		"https://x.com/user/status/123456",
-		"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
 		"https://www.instagram.com/reel/C123456/",
 		"https://www.facebook.com/watch/?v=123456",
 		"https://demo.tumblr.com/post/123456",
 	}
-	for i, u := range slowURLs {
+	for i, u := range socialSlowURLs {
 		ip := fmt.Sprintf("198.51.100.%d", i+1)
 		w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(u), ip))
 		if w.Code != http.StatusTooManyRequests {
-			t.Fatalf("expected slow URL %s to use SlowParse and hit 429, got %d", u, w.Code)
+			t.Fatalf("expected social slow URL %s to use SlowParse and hit 429, got %d", u, w.Code)
 		}
 	}
 
+	// YouTube routes to its own YouTubeSlow compartment and succeeds even while Social SlowParse is full!
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "198.51.100.50")); w.Code != http.StatusOK {
+		t.Fatalf("expected youtube to use isolated YouTubeSlow pool while Social SlowParse full, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Conversely, saturating YouTubeSlow blocks ONLY YouTube without blocking fast platforms or Social SlowParse!
+	relYT, retryYT := adm.youtubeSlow.acquire(netip.MustParseAddr("198.51.100.251"), time.Now())
+	if retryYT != 0 {
+		t.Fatal(retryYT)
+	}
+	defer relYT()
+	if w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "198.51.100.51")); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected youtube to hit 429 when YouTubeSlow is saturated, got %d", w.Code)
+	}
+
 	// Pure-Go platforms, legacy routes, and malformed/unsupported /api/parse inputs
-	// route to Fast Pool (Parse) and never get blocked by SlowParse saturation!
+	// route to Fast Pool (Parse) and never get blocked by SlowParse or YouTubeSlow saturation!
 	fastURLs := []string{
 		"https://www.douyin.com/video/123",
 		"https://www.bilibili.com/video/BV1xx411c7mD",
@@ -1266,5 +1283,88 @@ func TestAuthContextHelpersPropagateIDAndRole(t *testing.T) {
 	}
 	if !gotIsOwner || gotID != "ci-agent" || gotRole != RoleAgent {
 		t.Fatalf("downstream context got isOwner=%v id=%q role=%q", gotIsOwner, gotID, gotRole)
+	}
+}
+
+func TestFastPoolPerPlatformConcurrencyBulkhead(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	adapters := make(map[string]Adapter)
+	for _, id := range []string{"douyin", "bilibili", "toutiao", "kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu"} {
+		plat := id
+		adapters[plat] = AdapterFunc(func(ctx context.Context, src string, now int64) (unified.Object, error) {
+			if plat == "douyin" {
+				started <- struct{}{}
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return makeSyntheticEnvelope(plat, src, now, ""), nil
+		})
+	}
+	h, err := NewWithCacheConfig(c, adapters, func() time.Time { return time.Unix(1793448000, 0) }, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse.GlobalConcurrency = 16
+	cfg.Parse.QueueWait = 0
+	cfg.Parse.QueueSize = 0
+	cfg.FastPerPlatformMaxConcurrency = 2
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Occupy both per-platform slots for douyin from 2 distinct IPs.
+	var wg sync.WaitGroup
+	for i := 1; i <= 2; i++ {
+		wg.Add(1)
+		ip := fmt.Sprintf("198.51.100.%d", i)
+		go func(clientIP string) {
+			defer wg.Done()
+			w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/123"), clientIP))
+			if w.Code != http.StatusOK {
+				t.Errorf("in-flight douyin request failed: %d %s", w.Code, w.Body.String())
+			}
+		}(ip)
+	}
+	<-started
+	<-started
+
+	// 3rd concurrent douyin request hits per-platform bulkhead 429 with Retry-After header!
+	wBlocked := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/456"), "198.51.100.3"))
+	if wBlocked.Code != http.StatusTooManyRequests || wBlocked.Header().Get("Retry-After") != "1" {
+		t.Fatalf("3rd concurrent douyin expected 429 Retry-After:1, got %d hdr=%v", wBlocked.Code, wBlocked.Header())
+	}
+
+	// Every other fast platform succeeds immediately without any impact from douyin saturation!
+	otherFastURLs := []string{
+		"https://www.bilibili.com/video/BV1xx411c7mD",
+		"https://www.toutiao.com/video/123/",
+		"https://www.kuaishou.com/short-video/3x123",
+		"https://h5.pipix.com/item/123",
+		"https://h5.pipigx.com/pp/post/123",
+		"https://share.xiaochuankeji.cn/hybrid/share/post?pid=123",
+		"https://www.xiaohongshu.com/explore/123",
+	}
+	for i, u := range otherFastURLs {
+		w := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape(u), fmt.Sprintf("203.0.113.%d", i+1)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("other fast platform %s blocked by douyin bulkhead: %d %s", u, w.Code, w.Body.String())
+		}
+	}
+
+	close(release)
+	wg.Wait()
+
+	// Once in-flight douyin leases release, douyin recovers immediately.
+	wRecovered := call(entry, edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.douyin.com/video/789"), "198.51.100.4"))
+	if wRecovered.Code != http.StatusOK {
+		t.Fatalf("douyin did not recover after bulkhead release: %d %s", wRecovered.Code, wRecovered.Body.String())
 	}
 }

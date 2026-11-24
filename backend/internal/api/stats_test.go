@@ -2143,3 +2143,111 @@ func TestStatsYTDLPUnmatchedReservedCardinalityAndPersistence(t *testing.T) {
 		t.Fatalf("reloaded daily ytdlp_other total = %d, want 3", other.Total)
 	}
 }
+
+func TestStatsSnapshotExtendedPoolsCircuitBreakersAndRuntimePolicy(t *testing.T) {
+	// 1. Nil and freshly initialized Stats emit valid non-nil circuit_breakers (14 core platforms),
+	//    runtime_policy (non-nil disabled_platforms []), ytdlp_pools, and cache.stale_hits.
+	nilSnap := (*Stats)(nil).Snapshot()
+	if len(nilSnap.CircuitBreakers) != 14 {
+		t.Fatalf("nil Stats CircuitBreakers len = %d, want 14", len(nilSnap.CircuitBreakers))
+	}
+	for i := 0; i < 14; i++ {
+		if nilSnap.CircuitBreakers[i].Platform != knownPlatforms[i] || nilSnap.CircuitBreakers[i].State != CircuitStateClosed {
+			t.Fatalf("nil Stats CircuitBreakers[%d] = %+v", i, nilSnap.CircuitBreakers[i])
+		}
+	}
+	if nilSnap.RuntimePolicy.DisabledPlatforms == nil || len(nilSnap.RuntimePolicy.DisabledPlatforms) != 0 {
+		t.Fatalf("nil Stats RuntimePolicy.DisabledPlatforms must be non-nil empty slice: %#v", nilSnap.RuntimePolicy.DisabledPlatforms)
+	}
+	rawNil, err := json.Marshal(nilSnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{`"stale_hits":0`, `"ytdlp_pools":{`, `"circuit_breakers":[`, `"runtime_policy":{`, `"disabled_platforms":[]`} {
+		if !strings.Contains(string(rawNil), needle) {
+			t.Fatalf("nil Stats JSON missing %s: %s", needle, string(rawNil))
+		}
+	}
+
+	// 2. SetYTDLPCompartmentSources + ApplyRuntimeConfig + live HTTP /api/stats verification.
+	ownerToken := randomPrintableToken(t, 48)
+	edgeKey := randomPrintableToken(t, 48)
+	c := makeStatsTestCatalog(t)
+	now := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeStatsOKPayload("douyin", src, ts), nil
+		}),
+	}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Stats().SetRuntimeConfig(RuntimeConfigSnapshot{
+		Version:             "test",
+		YTDLPEnabled:        true,
+		YTDLPGenericEnabled: true,
+		YouTubeHelper:       true,
+	})
+	h.Stats().SetYTDLPCompartmentSources(
+		stubYTDLPStatsSource{snap: ytengine.SlotStatsSnapshot{Enabled: true, Active: 2, Waiting: 1, ConcurrencyLimit: 4}},
+		stubYTDLPStatsSource{snap: ytengine.SlotStatsSnapshot{Enabled: true, Active: 1, Waiting: 0, ConcurrencyLimit: 4}},
+		stubYTDLPStatsSource{snap: ytengine.SlotStatsSnapshot{Enabled: true, Active: 0, Waiting: 0, ConcurrencyLimit: 2}},
+	)
+	auth, err := NewOwnerAuth(ownerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := WithAdmissionWithOwner(h, nil, "caddy", edgeKey, DefaultAdmissionConfig(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt := DefaultRuntimeConfig()
+	rt.YTDLP.YouTubeSlots = 6
+	rt.YTDLP.SocialSlots = 5
+	rt.YTDLP.GenericSlots = 3
+	rt.YTDLP.YouTubeEJSConcurrency = 8
+	rt.FastPool.PerPlatformMaxConcurrency = 18
+	rt.CircuitBreaker.DisabledPlatforms = []string{"instagram"}
+	rt.Cache.YouTubeParseTTL = 90 * time.Second
+	rt.Cache.StaleIfErrorTTL = 300 * time.Second
+	rt.Cache.UpstreamBlockedNegTTL = 10 * time.Second
+	if !ApplyRuntimeConfig(router, h, rt, true, true) {
+		t.Fatal("ApplyRuntimeConfig failed")
+	}
+
+	status, snap := fetchStatsSnapshot(t, router, edgeKey, ownerToken, "198.51.100.99", "schema_version=1.0")
+	if status != http.StatusOK {
+		t.Fatalf("/api/stats status = %d, want 200", status)
+	}
+	if !snap.YTDLPPools.YouTube.Enabled || snap.YTDLPPools.YouTube.Active != 2 || snap.YTDLPPools.YouTube.Queued != 1 || snap.YTDLPPools.YouTube.ConcurrencyLimit != 6 {
+		t.Fatalf("unexpected ytdlp_pools.youtube: %+v", snap.YTDLPPools.YouTube)
+	}
+	if !snap.YTDLPPools.Social.Enabled || snap.YTDLPPools.Social.Active != 1 || snap.YTDLPPools.Social.ConcurrencyLimit != 5 {
+		t.Fatalf("unexpected ytdlp_pools.social: %+v", snap.YTDLPPools.Social)
+	}
+	if !snap.YTDLPPools.Generic.Enabled || snap.YTDLPPools.Generic.ConcurrencyLimit != 3 {
+		t.Fatalf("unexpected ytdlp_pools.generic: %+v", snap.YTDLPPools.Generic)
+	}
+	if !snap.YTDLPPools.YouTubeEJS.Enabled || snap.YTDLPPools.YouTubeEJS.ConcurrencyLimit != 8 {
+		t.Fatalf("unexpected ytdlp_pools.youtube_ejs: %+v", snap.YTDLPPools.YouTubeEJS)
+	}
+	if len(snap.CircuitBreakers) != 14 {
+		t.Fatalf("circuit_breakers len = %d, want 14", len(snap.CircuitBreakers))
+	}
+	igIdx := corePlatformIndex("instagram")
+	if snap.CircuitBreakers[igIdx].Platform != "instagram" ||
+		snap.CircuitBreakers[igIdx].State != CircuitStateOpen ||
+		!snap.CircuitBreakers[igIdx].DisabledByConfig ||
+		snap.CircuitBreakers[igIdx].OpenUntil != "" {
+		t.Fatalf("unexpected instagram circuit breaker snapshot: %+v", snap.CircuitBreakers[igIdx])
+	}
+	rp := snap.RuntimePolicy
+	if !rp.ConfigFileActive || rp.ReloadCount != 1 || rp.LastReloadedAt == "" ||
+		rp.YouTubeSlots != 6 || rp.SocialSlots != 5 || rp.GenericSlots != 3 ||
+		rp.YouTubeEJSConcurrency != 8 || rp.FastPerPlatformMaxConcurrency != 18 ||
+		!rp.CircuitBreakerEnabled || len(rp.DisabledPlatforms) != 1 || rp.DisabledPlatforms[0] != "instagram" ||
+		rp.YouTubeParseTTLSeconds != 90 || rp.StaleIfErrorTTLSeconds != 300 || rp.UpstreamBlockedNegTTLSeconds != 10 {
+		t.Fatalf("unexpected runtime_policy snapshot: %+v", rp)
+	}
+}

@@ -198,10 +198,12 @@ func WithAdmissionWithRegistry(next, pullControl http.Handler, mode, edgeKey str
 		edgeKey:     edgeKey,
 		now:         time.Now,
 		stats:       st,
-		public:      newConfiguredPool(config.Parse, config.MaxClients),
+		public:      newConfiguredPoolWithPerPlatform(config.Parse, config.MaxClients, config.FastPerPlatformMaxConcurrency),
 		resolve:     newConfiguredPool(config.Resolve, config.MaxClients),
+		youtubeSlow: newConfiguredPool(config.YouTubeSlowParse, config.MaxClients),
 		slow:        newConfiguredPool(config.SlowParse, config.MaxClients),
 		genericSlow: newConfiguredPool(config.GenericSlowParse, config.MaxClients),
+		youtubeEJS:  newConfiguredPool(config.YouTubeEJS, config.MaxClients),
 		catalog:     newConfiguredPool(config.Catalog, config.MaxClients),
 		reports:     newConfiguredPool(config.Reports, config.MaxClients),
 		relay:       newConfiguredPool(config.Relay, config.MaxClients),
@@ -209,6 +211,7 @@ func WithAdmissionWithRegistry(next, pullControl http.Handler, mode, edgeKey str
 	}
 	adm.keys.Store(registry)
 	st.setAdmissionSource(adm)
+	st.syncRuntimePolicyFromAdmissionConfig(config)
 	return adm, nil
 }
 
@@ -224,14 +227,14 @@ func ReloadAPIKeys(handler http.Handler, next *APIKeyRegistry) bool {
 }
 
 type admission struct {
-	next, pullControl                                           http.Handler
-	edgeKey                                                     string
-	now                                                         func() time.Time
-	stats                                                       *Stats
-	public, resolve, slow, genericSlow, catalog, relay, reports *pool
-	owner                                                       *keyPool
-	reloadMu                                                    sync.Mutex
-	keys                                                        atomic.Pointer[APIKeyRegistry]
+	next, pullControl                                                                    http.Handler
+	edgeKey                                                                              string
+	now                                                                                  func() time.Time
+	stats                                                                                *Stats
+	public, resolve, youtubeSlow, slow, genericSlow, youtubeEJS, catalog, relay, reports *pool
+	owner                                                                                *keyPool
+	reloadMu                                                                             sync.Mutex
+	keys                                                                                 atomic.Pointer[APIKeyRegistry]
 }
 
 func (a *admission) reloadAPIKeys(next *APIKeyRegistry) {
@@ -368,11 +371,12 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	budget := a.selectPool(r, kind, path)
-	if budget.queueWait > 0 {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget.queueWait + serverWriteWindow))
+	budget, fastPlatform := a.selectPool(r, kind, path)
+	qWait := budget.currentQueueWait()
+	if qWait > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(qWait + serverWriteWindow))
 	}
-	release, retry, canceled := budget.acquireContext(r.Context(), client, a.now())
+	release, retry, canceled := budget.acquireContextForPlatform(r.Context(), client, a.now(), fastPlatform)
 	if canceled {
 		return
 	}
@@ -385,7 +389,7 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	if budget.queueWait > 0 {
+	if qWait > 0 {
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
 	}
 	if kind == parser {
@@ -490,40 +494,43 @@ func (a *admission) serveAuthenticated(
 	a.next.ServeHTTP(w, r)
 }
 
-func (a *admission) selectPool(r *http.Request, kind route, path string) *pool {
+func (a *admission) selectPool(r *http.Request, kind route, path string) (*pool, string) {
 	switch kind {
 	case media:
-		return a.relay
+		return a.relay, ""
 	case telemetry:
-		return a.reports
+		return a.reports, ""
 	case catalogRoute:
-		return a.catalog
+		return a.catalog, ""
 	case youtubeHelper:
 		if r.Method == http.MethodGet && path == "/api/youtube/context" && a.hasCachedYouTubeContext() {
-			return a.catalog
+			return a.catalog, ""
 		}
-		return a.slow
+		return a.youtubeEJS, ""
 	case parser:
 		if r.Method != http.MethodGet {
-			return a.public
+			return a.public, ""
 		}
 		// Fresh cache hits do no upstream work; charge them like catalog reads.
 		if a.hasFreshCachedParse(path, r.URL.RawQuery) {
-			return a.catalog
+			return a.catalog, ""
 		}
 		p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
 		if isGeneric {
-			return a.genericSlow
+			return a.genericSlow, ""
+		}
+		if p == "youtube" {
+			return a.youtubeSlow, ""
 		}
 		if traitsForPlatform(p).slowEngine {
-			return a.slow
+			return a.slow, ""
 		}
 		if path == "/api/resolve" {
-			return a.resolve
+			return a.resolve, ""
 		}
-		return a.public
+		return a.public, p
 	default:
-		return a.public
+		return a.public, ""
 	}
 }
 
@@ -619,8 +626,9 @@ type clientState struct {
 }
 
 type poolWaiter struct {
-	elem    *list.Element
-	granted chan struct{}
+	elem     *list.Element
+	platform string
+	granted  chan struct{}
 }
 
 type admQueueOutcome uint8
@@ -686,9 +694,12 @@ func (q *poolQueueCounters) snapshot(active, queued, concLimit, queueLimit int) 
 type pool struct {
 	mu                                               sync.Mutex
 	clientBurst, clientRate, globalBurst, globalRate float64
-	clientSlots, globalSlots, maxClients, active     int
+	baseClientSlots, clientSlots, globalSlots        int
+	maxClients, active                               int
 	queueWait                                        time.Duration
 	queueSize                                        int
+	perPlatformLimit                                 int
+	platformActive                                   map[string]int
 	global                                           bucket
 	clients                                          map[netip.Addr]*clientState
 	idle                                             list.List
@@ -704,16 +715,112 @@ func newConfiguredPool(c PoolConfig, maxClients int) *pool {
 	return p
 }
 
+func newConfiguredPoolWithPerPlatform(c PoolConfig, maxClients, perPlatformLimit int) *pool {
+	p := newConfiguredPool(c, maxClients)
+	p.perPlatformLimit = perPlatformLimit
+	p.platformActive = make(map[string]int)
+	return p
+}
+
 func newPool(clientBurst, clientRate, globalBurst, globalRate float64, clientSlots, globalSlots, maxClients int) *pool {
 	return &pool{
-		clientBurst: clientBurst,
-		clientRate:  clientRate,
-		globalBurst: globalBurst,
-		globalRate:  globalRate,
-		clientSlots: clientSlots,
-		globalSlots: globalSlots,
-		maxClients:  maxClients,
-		clients:     make(map[netip.Addr]*clientState),
+		clientBurst:     clientBurst,
+		clientRate:      clientRate,
+		globalBurst:     globalBurst,
+		globalRate:      globalRate,
+		baseClientSlots: clientSlots,
+		clientSlots:     clientSlots,
+		globalSlots:     globalSlots,
+		maxClients:      maxClients,
+		clients:         make(map[netip.Addr]*clientState),
+	}
+}
+
+func (p *pool) currentQueueWait() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	d := p.queueWait
+	p.mu.Unlock()
+	return d
+}
+
+// updateLimits modifies concurrency and queue bounds in-place under p.mu so all
+// active leases and queued FIFO waiters remain intact across SIGHUP reloads.
+// When globalSlots increases, eligible queued waiters are woken immediately.
+func (p *pool) updateLimits(globalSlots, queueSize int, queueWait time.Duration) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if globalSlots >= 1 {
+		p.globalSlots = globalSlots
+		effClient := p.baseClientSlots
+		if effClient < 1 {
+			effClient = 1
+		}
+		if effClient > globalSlots {
+			effClient = globalSlots
+		}
+		p.clientSlots = effClient
+	}
+	if queueSize >= 0 {
+		p.queueSize = queueSize
+	}
+	if queueWait >= 0 {
+		p.queueWait = queueWait
+	}
+	p.wakeEligibleWaitersLocked()
+}
+
+// updatePerPlatformLimit updates the fast-pool per-platform bulkhead cap in-place
+// and immediately wakes any eligible queued waiters if capacity opened up.
+func (p *pool) updatePerPlatformLimit(limit int) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if limit >= 0 {
+		p.perPlatformLimit = limit
+		if limit > 0 && p.platformActive == nil {
+			p.platformActive = make(map[string]int)
+		}
+	}
+	p.wakeEligibleWaitersLocked()
+}
+
+func (p *pool) hasEligibleWaiterLocked(platform string) bool {
+	for e := p.waiters.Front(); e != nil; e = e.Next() {
+		w := e.Value.(*poolWaiter)
+		if w.platform != "" && p.perPlatformLimit > 0 && p.platformActive[w.platform] >= p.perPlatformLimit {
+			continue
+		}
+		if w.platform == platform {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *pool) wakeEligibleWaitersLocked() {
+	for e := p.waiters.Front(); e != nil && p.active < p.globalSlots; {
+		next := e.Next()
+		w := e.Value.(*poolWaiter)
+		if w.platform != "" && p.perPlatformLimit > 0 && p.platformActive[w.platform] >= p.perPlatformLimit {
+			e = next
+			continue
+		}
+		p.waiters.Remove(e)
+		w.elem = nil
+		p.active++
+		if w.platform != "" && p.platformActive != nil {
+			p.platformActive[w.platform]++
+		}
+		w.granted <- struct{}{}
+		e = next
 	}
 }
 
@@ -723,6 +830,10 @@ func (p *pool) acquire(ip netip.Addr, now time.Time) (release func(), retrySecon
 }
 
 func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time) (release func(), retrySeconds int, canceled bool) {
+	return p.acquireContextForPlatform(ctx, ip, now, "")
+}
+
+func (p *pool) acquireContextForPlatform(ctx context.Context, ip netip.Addr, now time.Time, platform string) (release func(), retrySeconds int, canceled bool) {
 	if ctx.Err() != nil {
 		return nil, 0, true
 	}
@@ -754,8 +865,21 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 		return nil, 1, false
 	}
 
+	plat := ""
+	if p.platformActive != nil && platform != "" {
+		plat = platform
+	}
+	if plat != "" && p.perPlatformLimit > 0 && p.platformActive[plat] >= p.perPlatformLimit {
+		if c != nil && c.idleElem != nil {
+			p.idle.MoveToBack(c.idleElem)
+		}
+		p.mu.Unlock()
+		return nil, 1, false
+	}
+
+	immediate := p.active < p.globalSlots && !p.hasEligibleWaiterLocked(plat)
 	canQueue := p.queueWait > 0 && p.queueSize > 0 && p.waiters.Len() < p.queueSize
-	if p.active >= p.globalSlots && !canQueue {
+	if !immediate && !canQueue {
 		if c != nil && c.idleElem != nil {
 			p.idle.MoveToBack(c.idleElem)
 		}
@@ -786,13 +910,16 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 	p.global = bucket{tokens: global - 1, at: now}
 	c.active++
 
-	if p.active < p.globalSlots {
+	if immediate {
 		p.active++
+		if plat != "" {
+			p.platformActive[plat]++
+		}
 		p.mu.Unlock()
-		return p.makeRelease(c), 0, false
+		return p.makeRelease(c, plat), 0, false
 	}
 
-	w := &poolWaiter{granted: make(chan struct{}, 1)}
+	w := &poolWaiter{platform: plat, granted: make(chan struct{}, 1)}
 	w.elem = p.waiters.PushBack(w)
 	waitDur := p.queueWait
 	p.mu.Unlock()
@@ -805,12 +932,12 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 	case <-w.granted:
 		elapsed := time.Since(waitStart)
 		if ctx.Err() != nil {
-			p.releaseSlot(c)
+			p.releaseSlot(c, plat)
 			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
 		p.queueStats.recordWait(elapsed, admQueueGranted)
-		return p.makeRelease(c), 0, false
+		return p.makeRelease(c, plat), 0, false
 
 	case <-ctx.Done():
 		elapsed := time.Since(waitStart)
@@ -828,7 +955,7 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 		}
 		p.mu.Unlock()
 		<-w.granted
-		p.releaseSlot(c)
+		p.releaseSlot(c, plat)
 		p.queueStats.recordWait(time.Since(waitStart), admQueueCanceled)
 		return nil, 0, true
 
@@ -850,38 +977,40 @@ func (p *pool) acquireContext(ctx context.Context, ip netip.Addr, now time.Time)
 		<-w.granted
 		elapsed = time.Since(waitStart)
 		if ctx.Err() != nil {
-			p.releaseSlot(c)
+			p.releaseSlot(c, plat)
 			p.queueStats.recordWait(elapsed, admQueueCanceled)
 			return nil, 0, true
 		}
 		p.queueStats.recordWait(elapsed, admQueueGranted)
-		return p.makeRelease(c), 0, false
+		return p.makeRelease(c, plat), 0, false
 	}
 }
 
-func (p *pool) makeRelease(c *clientState) func() {
+func (p *pool) makeRelease(c *clientState, platform string) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			p.releaseSlot(c)
+			p.releaseSlot(c, platform)
 		})
 	}
 }
 
-func (p *pool) releaseSlot(c *clientState) {
+func (p *pool) releaseSlot(c *clientState, platform string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c.active--
 	if c.active == 0 && p.clients[c.ip] == c {
 		c.idleElem = p.idle.PushBack(c)
 	}
-	if front := p.waiters.Front(); front != nil {
-		w := p.waiters.Remove(front).(*poolWaiter)
-		w.elem = nil
-		w.granted <- struct{}{}
-		return
+	if platform != "" && p.platformActive != nil {
+		if cur := p.platformActive[platform]; cur > 1 {
+			p.platformActive[platform] = cur - 1
+		} else {
+			delete(p.platformActive, platform)
+		}
 	}
 	p.active--
+	p.wakeEligibleWaitersLocked()
 }
 
 // chargeClient deducts one token from the visitor's per-IP abuse budget without
@@ -953,6 +1082,13 @@ func (a *admission) statsSnapshot() AdmissionStatsSnapshot {
 		GenericSlow: a.genericSlow.statsSnapshot(),
 		Owner:       a.keys.Load().ownerStatsSnapshot(a.owner),
 	}
+}
+
+func (a *admission) compartmentAdmissionSnapshots() (youtube, social, generic, youtubeEJS AdmissionPoolSnapshot) {
+	if a == nil {
+		return AdmissionPoolSnapshot{}, AdmissionPoolSnapshot{}, AdmissionPoolSnapshot{}, AdmissionPoolSnapshot{}
+	}
+	return a.youtubeSlow.statsSnapshot(), a.slow.statsSnapshot(), a.genericSlow.statsSnapshot(), a.youtubeEJS.statsSnapshot()
 }
 
 func (a *admission) apiKeysStatsSnapshot() []APIKeyStatsSnapshot {

@@ -21,17 +21,14 @@ type platformTrait struct {
 	// strictInput2048 marks cacheable platforms whose parsers reject inputs
 	// exceeding maxYTDLPInputBytes (2048 bytes), preventing parseCache from
 	// normalizing or serving overlong inputs from a warm entry.
-	// YouTube sets slowEngine: true and strictInput2048: false because
-	// disableParseCache is true (egress-IP-bound stream URLs and helper sessions
-	// never enter parseCache), while youtube.ExtractVideoTarget enforces its own
-	// 2048-byte input cap directly on every request.
 	strictInput2048 bool
-	// disableParseCache excludes platforms whose responses carry requester-bound,
-	// channel-dependent, or server-egress-IP-bound artifacts:
+	// disableParseCache excludes platforms whose responses carry requester-bound
+	// or channel-dependent artifacts:
 	//   - weibo: mints HMAC-signed /api/media/weibo?ticket=... relay tickets (and
 	//     differs between anonymous visitors and owner-token callers).
-	//   - youtube: helper sessions use /api/youtube/context + /api/youtube/finalize,
-	//     and /api/parse yields egress-IP-bound googlevideo.com stream URLs.
+	// Note: youtube is allowed into parseCache with a short, dynamically configurable
+	// TTL (cache.youtube_parse_ttl, default 120s; 0s disables YouTube caching) while
+	// /api/youtube/context and /api/youtube/finalize remain outside parseCache.
 	disableParseCache bool
 	// shanghaiFallbackShortTTL caps OK parseCache TTL at shanghaiFallbackCacheTTL
 	// (15s) when a Shanghai-enabled platform degraded to overseas fallback so the
@@ -91,8 +88,13 @@ var platformTraits = map[string]platformTrait{
 	},
 	"youtube": {
 		slowEngine:        true,
-		strictInput2048:   false,
-		disableParseCache: true,
+		strictInput2048:   true,
+		disableParseCache: false,
+		canonicalHTTPSHosts: map[string]string{
+			"www.youtube.com": "www.youtube.com",
+			"youtube.com":     "www.youtube.com",
+			"m.youtube.com":   "www.youtube.com",
+		},
 	},
 	"instagram": {
 		slowEngine:      true,

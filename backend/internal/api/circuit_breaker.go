@@ -1,0 +1,371 @@
+package api
+
+import (
+	"math"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+)
+
+const (
+	// CircuitStateClosed indicates normal upstream operation.
+	CircuitStateClosed = "closed"
+	// CircuitStateOpen indicates fast-fail / stale-fallback protection is active.
+	CircuitStateOpen = "open"
+	// CircuitStateHalfOpen indicates bounded recovery probing is active.
+	CircuitStateHalfOpen = "half_open"
+
+	disabledPlatformRetryAfterSeconds = 30
+)
+
+var platformChineseNames = map[string]string{
+	"douyin":        "抖音",
+	"bilibili":      "B站",
+	"weibo":         "微博",
+	"toutiao":       "今日头条",
+	"kuaishou":      "快手",
+	"pipixia":       "皮皮虾",
+	"pipigx":        "皮皮搞笑",
+	"zuiyou":        "最右",
+	"xiaohongshu":   "小红书",
+	"x":             "X",
+	"youtube":       "YouTube",
+	"instagram":     "Instagram",
+	"facebook":      "Facebook",
+	"tumblr":        "Tumblr",
+	PlatformGeneric: "通用平台",
+}
+
+func platformDisplayName(platform string) string {
+	if name, ok := platformChineseNames[platform]; ok {
+		return name
+	}
+	return platform
+}
+
+// isCircuitBreakerFailure reports whether code represents a genuine upstream or
+// system failure eligible to trip the platform circuit breaker.
+// User input errors and content-level states (INVALID_INPUT, UNSUPPORTED_PLATFORM,
+// NO_MEDIA, CONTENT_UNAVAILABLE, UPSTREAM_BLOCKED, UNAUTHORIZED, RATE_LIMITED)
+// are strictly excluded to prevent false positives.
+func isCircuitBreakerFailure(code string) bool {
+	switch code {
+	case "UPSTREAM_TIMEOUT", "UPSTREAM_UNAVAILABLE", "UPSTREAM_INVALID_RESPONSE", "INTERNAL_ERROR":
+		return true
+	default:
+		return false
+	}
+}
+
+type platformCircuitState struct {
+	state               string
+	consecutiveFailures int
+	window              []bool
+	windowHead          int
+	windowCount         int
+	windowFailures      int
+	openUntil           time.Time
+	halfOpenInFlight    int
+	halfOpenGen         uint64
+}
+
+func newPlatformCircuitState(windowSize int) *platformCircuitState {
+	if windowSize < 1 {
+		windowSize = 1
+	}
+	return &platformCircuitState{
+		state:  CircuitStateClosed,
+		window: make([]bool, windowSize),
+	}
+}
+
+func (s *platformCircuitState) resizeWindow(newSize int) {
+	if newSize < 1 {
+		newSize = 1
+	}
+	if len(s.window) == newSize {
+		return
+	}
+	// Preserve the most recent min(windowCount, newSize) samples in chronological order.
+	keep := s.windowCount
+	if keep > newSize {
+		keep = newSize
+	}
+	startOffset := s.windowCount - keep
+	next := make([]bool, newSize)
+	failures := 0
+	oldLen := len(s.window)
+	for i := 0; i < keep; i++ {
+		val := s.window[(s.windowHead+startOffset+i)%oldLen]
+		next[i] = val
+		if val {
+			failures++
+		}
+	}
+	s.window = next
+	s.windowHead = 0
+	s.windowCount = keep
+	s.windowFailures = failures
+}
+
+func (s *platformCircuitState) pushSample(failed bool) {
+	n := len(s.window)
+	if n == 0 {
+		return
+	}
+	if s.windowCount < n {
+		idx := (s.windowHead + s.windowCount) % n
+		s.window[idx] = failed
+		s.windowCount++
+		if failed {
+			s.windowFailures++
+		}
+		return
+	}
+	if s.window[s.windowHead] {
+		s.windowFailures--
+	}
+	s.window[s.windowHead] = failed
+	if failed {
+		s.windowFailures++
+	}
+	s.windowHead = (s.windowHead + 1) % n
+}
+
+func (s *platformCircuitState) resetWindow() {
+	for i := range s.window {
+		s.window[i] = false
+	}
+	s.windowHead = 0
+	s.windowCount = 0
+	s.windowFailures = 0
+}
+
+type circuitBreakerManager struct {
+	mu       sync.Mutex
+	cfg      CircuitBreakerConfig
+	disabled map[string]struct{}
+	states   map[string]*platformCircuitState
+}
+
+func newCircuitBreakerManager(cfg CircuitBreakerConfig) *circuitBreakerManager {
+	if cfg.WindowSize < 1 {
+		cfg = DefaultRuntimeConfig().CircuitBreaker
+	}
+	m := &circuitBreakerManager{
+		cfg:      cfg,
+		disabled: make(map[string]struct{}, len(cfg.DisabledPlatforms)),
+		states:   make(map[string]*platformCircuitState, numCorePlatforms+1),
+	}
+	for _, p := range cfg.DisabledPlatforms {
+		m.disabled[p] = struct{}{}
+	}
+	for i := 0; i < numCorePlatforms; i++ {
+		m.states[knownPlatforms[i]] = newPlatformCircuitState(cfg.WindowSize)
+	}
+	m.states[PlatformGeneric] = newPlatformCircuitState(cfg.WindowSize)
+	return m
+}
+
+func (m *circuitBreakerManager) UpdateConfig(cfg CircuitBreakerConfig) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cfg
+	nextDisabled := make(map[string]struct{}, len(cfg.DisabledPlatforms))
+	for _, p := range cfg.DisabledPlatforms {
+		nextDisabled[p] = struct{}{}
+	}
+	m.disabled = nextDisabled
+	for _, st := range m.states {
+		st.resizeWindow(cfg.WindowSize)
+		if !cfg.Enabled {
+			st.state = CircuitStateClosed
+			st.openUntil = time.Time{}
+			st.halfOpenInFlight = 0
+			st.halfOpenGen++
+		}
+	}
+}
+
+// Allow checks whether an upstream call for platform is permitted at now.
+// When allowed is false, retryAfterSec is >= 1 (30s when disabled_by_config).
+// When halfOpenGen > 0, callers MUST call Finish(platform, code, halfOpenGen, finishNow)
+// once the upstream call completes so half-open probe capacity never leaks.
+func (m *circuitBreakerManager) Allow(platform string, now time.Time) (allowed bool, retryAfterSec int, halfOpenGen uint64) {
+	if m == nil {
+		return true, 0, 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, disabled := m.disabled[platform]; disabled {
+		return false, disabledPlatformRetryAfterSeconds, 0
+	}
+	if !m.cfg.Enabled {
+		return true, 0, 0
+	}
+	st, ok := m.states[platform]
+	if !ok {
+		return true, 0, 0
+	}
+	switch st.state {
+	case CircuitStateClosed:
+		return true, 0, 0
+	case CircuitStateOpen:
+		if now.Before(st.openUntil) {
+			rem := int(math.Ceil(st.openUntil.Sub(now).Seconds()))
+			if rem < 1 {
+				rem = 1
+			}
+			return false, rem, 0
+		}
+		// Open cooldown elapsed: transition to half_open and admit this caller as probe #1.
+		st.state = CircuitStateHalfOpen
+		st.halfOpenGen++
+		st.halfOpenInFlight = 1
+		return true, 0, st.halfOpenGen
+	case CircuitStateHalfOpen:
+		if st.halfOpenInFlight < m.cfg.HalfOpenMaxProbes {
+			st.halfOpenInFlight++
+			return true, 0, st.halfOpenGen
+		}
+		return false, 1, 0
+	default:
+		st.state = CircuitStateClosed
+		return true, 0, 0
+	}
+}
+
+// Finish records the outcome of a live upstream execution and releases any half-open probe slot.
+func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64, now time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	st, ok := m.states[platform]
+	if !ok {
+		return
+	}
+	if halfOpenGen > 0 && st.halfOpenGen == halfOpenGen && st.halfOpenInFlight > 0 {
+		st.halfOpenInFlight--
+	}
+	if !m.cfg.Enabled {
+		return
+	}
+
+	if code == "OK" {
+		st.consecutiveFailures = 0
+		if st.state == CircuitStateHalfOpen {
+			st.state = CircuitStateClosed
+			st.openUntil = time.Time{}
+			st.halfOpenInFlight = 0
+			st.halfOpenGen++
+			st.resetWindow()
+		}
+		st.pushSample(false)
+		return
+	}
+
+	if !isCircuitBreakerFailure(code) {
+		// Neutral user/content outcomes (NO_MEDIA, CONTENT_UNAVAILABLE, UPSTREAM_BLOCKED,
+		// INVALID_INPUT, UNAUTHORIZED, RATE_LIMITED, canceled) never trip the breaker
+		// and never break recovery streaks.
+		return
+	}
+
+	st.consecutiveFailures++
+	st.pushSample(true)
+
+	if st.state == CircuitStateHalfOpen {
+		st.state = CircuitStateOpen
+		st.openUntil = now.Add(m.cfg.OpenDuration)
+		st.halfOpenInFlight = 0
+		st.halfOpenGen++
+		return
+	}
+	if st.state == CircuitStateClosed {
+		consecTripped := st.consecutiveFailures >= m.cfg.ConsecutiveFailures
+		rateTripped := st.windowCount >= m.cfg.WindowSize &&
+			float64(st.windowFailures)/float64(st.windowCount) >= m.cfg.FailureRateThreshold
+		if consecTripped || rateTripped {
+			st.state = CircuitStateOpen
+			st.openUntil = now.Add(m.cfg.OpenDuration)
+		}
+	}
+}
+
+// Snapshot returns the closed 14-element slice of core platform circuit breaker states
+// in exact knownPlatforms[:14] order.
+func (m *circuitBreakerManager) Snapshot(now time.Time) []CircuitBreakerPlatformSnapshot {
+	out := make([]CircuitBreakerPlatformSnapshot, numCorePlatforms)
+	if m == nil {
+		for i := 0; i < numCorePlatforms; i++ {
+			out[i] = CircuitBreakerPlatformSnapshot{
+				Platform: knownPlatforms[i],
+				State:    CircuitStateClosed,
+			}
+		}
+		return out
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := 0; i < numCorePlatforms; i++ {
+		plat := knownPlatforms[i]
+		st := m.states[plat]
+		_, disabled := m.disabled[plat]
+		snap := CircuitBreakerPlatformSnapshot{
+			Platform:         plat,
+			State:            CircuitStateClosed,
+			DisabledByConfig: disabled,
+		}
+		if st != nil {
+			snap.ConsecutiveFailures = st.consecutiveFailures
+			snap.WindowFailures = st.windowFailures
+			snap.WindowTotal = st.windowCount
+		}
+		if disabled {
+			snap.State = CircuitStateOpen
+			snap.OpenUntil = ""
+		} else if m.cfg.Enabled && st != nil {
+			switch st.state {
+			case CircuitStateOpen:
+				if now.Before(st.openUntil) {
+					snap.State = CircuitStateOpen
+					snap.OpenUntil = st.openUntil.UTC().Format(time.RFC3339)
+				} else {
+					snap.State = CircuitStateHalfOpen
+					snap.OpenUntil = ""
+				}
+			case CircuitStateHalfOpen:
+				snap.State = CircuitStateHalfOpen
+			default:
+				snap.State = CircuitStateClosed
+			}
+		}
+		out[i] = snap
+	}
+	return out
+}
+
+func circuitBreakerOpenResponse(platform string, retryAfterSec int) cachedResponse {
+	if retryAfterSec < 1 {
+		retryAfterSec = 1
+	}
+	msg := platformDisplayName(platform) + "上游服务暂时响应异常，已触发快速保护，请稍后重试"
+	payload := unified.ContractError("UPSTREAM_UNAVAILABLE", msg, true)
+	unified.Map(payload["error"])["retry_after_seconds"] = retryAfterSec
+	res, _ := encodeResponse(http.StatusServiceUnavailable, payload)
+	if platform == PlatformGeneric {
+		res.platform = PlatformYTDLPUnmatched
+	}
+	return res
+}

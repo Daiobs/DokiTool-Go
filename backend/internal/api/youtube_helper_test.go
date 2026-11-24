@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -172,17 +173,35 @@ func TestYouTubeHelperRoutesEnabledAndParseAdmission(t *testing.T) {
 		t.Fatalf("oversized finalize body status = %d, want 400", rec.Code)
 	}
 
-	// SlowParse admission pool enforcement:
-	// 1) Cold cache (HasCachedContext() == false): GET /api/youtube/context consumes a SlowParse token,
-	//    so an immediate POST /api/youtube/finalize with SlowParse.ClientBurst=1 hits 429,
-	//    while Fast Pool (Parse) remains completely untouched.
+	// YouTubeEJS admission pool enforcement (completely decoupled from SlowParse and YouTubeSlowParse):
+	// 1) Cold cache (HasCachedContext() == false): GET /api/youtube/context consumes a YouTubeEJS token,
+	//    so an immediate POST /api/youtube/finalize with YouTubeEJS.ClientBurst=1 hits 429,
+	//    while SlowParse and YouTubeSlowParse saturation NEVER block YouTube helper calls.
 	cfg := DefaultAdmissionConfig()
-	cfg.SlowParse.ClientBurst = 1
-	cfg.SlowParse.ClientRPS = 0.1
+	cfg.YouTubeEJS.ClientBurst = 1
+	cfg.YouTubeEJS.ClientRPS = 0.1
+	cfg.YouTubeEJS.ClientConcurrency = 1
+	cfg.SlowParse.GlobalConcurrency = 1
+	cfg.SlowParse.QueueSize = 0
+	cfg.SlowParse.QueueWait = 0
+	cfg.YouTubeSlowParse.GlobalConcurrency = 1
+	cfg.YouTubeSlowParse.QueueSize = 0
+	cfg.YouTubeSlowParse.QueueWait = 0
 	entry, err := WithAdmissionConfig(h, nil, "direct", "", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	adm := entry.(*admission)
+	relSocial, retrySoc := adm.slow.acquire(netip.MustParseAddr("198.51.100.200"), time.Now())
+	if retrySoc != 0 {
+		t.Fatal(retrySoc)
+	}
+	defer relSocial()
+	relYTSlow, retryYT := adm.youtubeSlow.acquire(netip.MustParseAddr("198.51.100.201"), time.Now())
+	if retryYT != 0 {
+		t.Fatal(retryYT)
+	}
+	defer relYTSlow()
 
 	stub.cached = false
 	req1 := httptest.NewRequest(http.MethodGet, "/api/youtube/context?schema_version=1.0", nil)
@@ -300,16 +319,16 @@ func TestYouTubeFinalizeBodyReadDeadlineOversizedCloseAndSlowSlotRelease(t *test
 		t.Fatalf("unexpected oversized error envelope: err=%v body=%s", decErr, overRec.Body.String())
 	}
 
-	// Real TCP server with single-slot SlowParse admission (no queue) to prove slow-slot release.
+	// Real TCP server with single-slot YouTubeEJS admission (no queue) to prove slot release.
 	cfg := DefaultAdmissionConfig()
-	cfg.SlowParse.GlobalConcurrency = 1
-	cfg.SlowParse.ClientConcurrency = 1
-	cfg.SlowParse.QueueWait = 0
-	cfg.SlowParse.QueueSize = 0
-	cfg.SlowParse.ClientBurst = 10
-	cfg.SlowParse.ClientRPS = 10
-	cfg.SlowParse.GlobalBurst = 10
-	cfg.SlowParse.GlobalRPS = 10
+	cfg.YouTubeEJS.GlobalConcurrency = 1
+	cfg.YouTubeEJS.ClientConcurrency = 1
+	cfg.YouTubeEJS.QueueWait = 0
+	cfg.YouTubeEJS.QueueSize = 0
+	cfg.YouTubeEJS.ClientBurst = 10
+	cfg.YouTubeEJS.ClientRPS = 10
+	cfg.YouTubeEJS.GlobalBurst = 10
+	cfg.YouTubeEJS.GlobalRPS = 10
 	const edgeKey = testEdgeKey
 	entry, err := WithAdmissionConfig(h, nil, "caddy", edgeKey, cfg)
 	if err != nil {
@@ -380,11 +399,11 @@ func TestYouTubeFinalizeBodyReadDeadlineOversizedCloseAndSlowSlotRelease(t *test
 	case <-time.After(150 * time.Millisecond):
 		t.Fatal("slow finalize handler did not exit and release slow slot promptly")
 	}
-	adm.slow.mu.Lock()
-	slowActiveAfterTimeout := adm.slow.active
-	adm.slow.mu.Unlock()
-	if slowActiveAfterTimeout != 0 {
-		t.Fatalf("slow pool active = %d after timeout, want 0", slowActiveAfterTimeout)
+	adm.youtubeEJS.mu.Lock()
+	ejsActiveAfterTimeout := adm.youtubeEJS.active
+	adm.youtubeEJS.mu.Unlock()
+	if ejsActiveAfterTimeout != 0 {
+		t.Fatalf("youtubeEJS pool active = %d after timeout, want 0", ejsActiveAfterTimeout)
 	}
 	assertHealthyFinalize("198.51.100.21")
 
@@ -424,11 +443,11 @@ func TestYouTubeFinalizeBodyReadDeadlineOversizedCloseAndSlowSlotRelease(t *test
 	case <-time.After(150 * time.Millisecond):
 		t.Fatal("oversized finalize handler did not exit and release slow slot promptly")
 	}
-	adm.slow.mu.Lock()
-	slowActiveAfterOver := adm.slow.active
-	adm.slow.mu.Unlock()
-	if slowActiveAfterOver != 0 {
-		t.Fatalf("slow pool active = %d after oversized body, want 0", slowActiveAfterOver)
+	adm.youtubeEJS.mu.Lock()
+	ejsActiveAfterOver := adm.youtubeEJS.active
+	adm.youtubeEJS.mu.Unlock()
+	if ejsActiveAfterOver != 0 {
+		t.Fatalf("youtubeEJS pool active = %d after oversized body, want 0", ejsActiveAfterOver)
 	}
 	assertHealthyFinalize("198.51.100.23")
 }

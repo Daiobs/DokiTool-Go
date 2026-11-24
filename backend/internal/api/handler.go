@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
@@ -54,6 +55,9 @@ type Handler struct {
 	youtubeHelper       YouTubeHelper
 	finalizeReadTimeout time.Duration
 	cache               *parseCache
+	cb                  *circuitBreakerManager
+	policyMu            sync.RWMutex
+	cachePolicy         RuntimeCachePolicy
 	stats               *Stats
 	panicLogf           func(string, ...any)
 }
@@ -83,8 +87,11 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 	if now == nil {
 		now = time.Now
 	}
+	defaultRT := DefaultRuntimeConfig()
+	cb := newCircuitBreakerManager(defaultRT.CircuitBreaker)
 	stats := NewStats(nil)
 	stats.setCacheSource(cache)
+	stats.setCircuitBreakerSource(cb)
 	return &Handler{
 		catalog:             c,
 		adapters:            registered,
@@ -92,9 +99,40 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 		publicMedia:         media,
 		finalizeReadTimeout: defaultYouTubeFinalizeReadTimeout,
 		cache:               cache,
+		cb:                  cb,
+		cachePolicy:         defaultRT.Cache,
 		stats:               stats,
 		panicLogf:           log.Printf,
 	}, nil
+}
+
+func (h *Handler) getCachePolicy() RuntimeCachePolicy {
+	if h == nil {
+		return defaultRuntimeCachePolicy()
+	}
+	h.policyMu.RLock()
+	p := h.cachePolicy
+	h.policyMu.RUnlock()
+	return p
+}
+
+func (h *Handler) setCachePolicy(p RuntimeCachePolicy) {
+	if h == nil {
+		return
+	}
+	h.policyMu.Lock()
+	h.cachePolicy = p
+	h.policyMu.Unlock()
+}
+
+func (h *Handler) isCacheableRequest(platform, source string) bool {
+	if !cacheableRequest(platform, source) {
+		return false
+	}
+	if platform == "youtube" && h.getCachePolicy().YouTubeParseTTL <= 0 {
+		return false
+	}
+	return true
 }
 
 // Stats returns the handler's bounded-cardinality in-process telemetry collector.
@@ -197,7 +235,7 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 			return cacheKey{}, "", false
 		}
 	}
-	if !cacheableRequest(platform, source) {
+	if !h.isCacheableRequest(platform, source) {
 		return cacheKey{}, "", false
 	}
 	itemID := ""
@@ -256,6 +294,7 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 	if key != nil {
 		key.recordCachedParseStatus(res.status)
 	}
+	w.Header().Set("X-DokiTool-Cache", "hit")
 	writeResponse(w, res)
 	return true
 }
@@ -383,12 +422,36 @@ func encodeResponse(status int, payload unified.Object) (cachedResponse, bool) {
 	}
 	code := NormalizeOutcomeCode(unified.Str(payload["code"]))
 	retryAfter := ""
+	retryable := false
 	if unified.Str(payload["code"]) != "OK" {
-		if seconds, ok := unified.Numeric(unified.Map(payload["error"])["retry_after_seconds"]); ok && seconds >= 1 {
+		errObj := unified.Map(payload["error"])
+		if seconds, ok := unified.Numeric(errObj["retry_after_seconds"]); ok && seconds >= 1 {
 			retryAfter = strconv.FormatInt(int64(seconds), 10)
 		}
+		if flag, ok := errObj["retryable"].(bool); ok {
+			retryable = flag
+		}
 	}
-	return cachedResponse{status: status, code: code, body: body, retryAfter: retryAfter}, true
+	return cachedResponse{status: status, code: code, body: body, retryAfter: retryAfter, retryable: retryable}, true
+}
+
+func isStaleFallbackTrigger(res cachedResponse) bool {
+	if !res.retryable {
+		return false
+	}
+	switch res.code {
+	case "UPSTREAM_TIMEOUT", "UPSTREAM_UNAVAILABLE", "RATE_LIMITED":
+		return true
+	default:
+		return false
+	}
+}
+
+func schemaVersionConflictMessage(ctx context.Context) string {
+	if IsOwnerRequest(ctx) {
+		return "请传入必需查询参数 schema_version=1.0（详见 docs/AGENT-API.md）"
+	}
+	return "接口版本已更新，请等待当前下载结束后刷新页面"
 }
 
 func writeResponse(w http.ResponseWriter, res cachedResponse) {
@@ -483,7 +546,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if isParse {
 			h.stats.RecordParse(h.ParsePlatform(r.URL.RawQuery), "INVALID_INPUT", channel, time.Since(wallStart))
 		}
-		sendError(w, 409, "接口版本已更新，请等待当前下载结束后刷新页面")
+		sendError(w, 409, schemaVersionConflictMessage(r.Context()))
 		return
 	}
 	if path == "/api/platforms" {
@@ -554,11 +617,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "/api/resolve" {
 		resolveItemID = itemID
 	}
-	if h.cache == nil || h.cache.cfg.Disabled || !cacheableRequest(platform, source) {
+	if h.cache == nil || h.cache.cfg.Disabled || !h.isCacheableRequest(platform, source) {
 		h.stats.recordCacheUncacheable(channel)
+		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, h.now())
+		if !allowed {
+			res := circuitBreakerOpenResponse(platform, retryAfterSec)
+			h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
+			writeResponse(w, res)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), parseTimeout)
 		defer cancel()
 		res := h.runUncachedParse(ctx, path, platform, source, resolveItemID, debugView)
+		cbCode := res.code
+		if r.Context().Err() != nil {
+			cbCode = ""
+		}
+		h.cb.Finish(platform, cbCode, halfOpenGen, h.now())
 		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
@@ -588,17 +663,20 @@ func (h *Handler) serveCachedParse(
 			authKey.counters.cacheHits.Add(1)
 		}
 		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
+		w.Header().Set("X-DokiTool-Cache", "hit")
 		writeResponse(w, res)
 		return
 	}
 	h.cache.mu.Lock()
-	if res, ok := h.cache.getLocked(key, h.now()); ok {
+	now := h.now()
+	if res, ok := h.cache.getLocked(key, now); ok {
 		h.cache.mu.Unlock()
 		h.stats.recordCacheHit(channel)
 		if authKey, _ := authKeyFromContext(r.Context()); authKey != nil {
 			authKey.counters.cacheHits.Add(1)
 		}
 		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
+		w.Header().Set("X-DokiTool-Cache", "hit")
 		writeResponse(w, res)
 		return
 	}
@@ -608,6 +686,23 @@ func (h *Handler) serveCachedParse(
 	}
 	call, joining := h.cache.inflight[key]
 	if !joining {
+		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, now)
+		if !allowed {
+			policy := h.getCachePolicy()
+			if staleRes, ok := h.cache.getStaleLocked(key, now, policy.StaleIfErrorTTL); ok {
+				h.cache.mu.Unlock()
+				h.stats.recordCacheStaleHit(channel)
+				h.recordParseTelemetry(platform, staleRes.platform, staleRes.code, channel, time.Since(wallStart))
+				w.Header().Set("X-DokiTool-Cache", "stale")
+				writeResponse(w, staleRes)
+				return
+			}
+			h.cache.mu.Unlock()
+			res := circuitBreakerOpenResponse(platform, retryAfterSec)
+			h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
+			writeResponse(w, res)
+			return
+		}
 		execCtx, execCancel := context.WithTimeout(context.WithoutCancel(r.Context()), parseTimeout)
 		call = &inflightCall{
 			done:    make(chan struct{}),
@@ -617,7 +712,7 @@ func (h *Handler) serveCachedParse(
 		h.cache.inflight[key] = call
 		h.cache.mu.Unlock()
 		h.stats.recordCacheMiss(channel)
-		go h.runSingleflight(execCtx, execCancel, key, call, path, platform, source, itemID, debug)
+		go h.runSingleflight(execCtx, execCancel, key, call, path, platform, source, itemID, debug, halfOpenGen)
 	} else {
 		call.waiters++
 		h.cache.mu.Unlock()
@@ -626,6 +721,10 @@ func (h *Handler) serveCachedParse(
 
 	select {
 	case <-call.done:
+		if call.servedStale {
+			h.stats.recordCacheStaleHit(channel)
+			w.Header().Set("X-DokiTool-Cache", "stale")
+		}
 		h.recordParseTelemetry(platform, call.res.platform, call.res.code, channel, time.Since(wallStart))
 		writeResponse(w, call.res)
 	case <-r.Context().Done():
@@ -672,13 +771,15 @@ func (h *Handler) runSingleflight(
 	call *inflightCall,
 	path, platform, source, itemID string,
 	debug bool,
+	halfOpenGen uint64,
 ) {
 	var (
-		res       cachedResponse
-		finishNow time.Time
-		ttl       time.Duration
-		cacheable bool
-		completed bool
+		res           cachedResponse
+		finishNow     time.Time
+		freshUntil    time.Time
+		hardExpiresAt time.Time
+		cacheable     bool
+		completed     bool
 	)
 	defer func() {
 		if p := recover(); p != nil {
@@ -689,15 +790,40 @@ func (h *Handler) runSingleflight(
 			res = h.internalErrorResponse()
 			cacheable = false
 		}
+		if finishNow.IsZero() {
+			finishNow = h.now()
+		}
 
+		policy := h.getCachePolicy()
+
+		// Maintain strict lock order h.cache.mu -> h.cb.mu and complete circuit breaker
+		// accounting BEFORE closing call.done so waking waiters observe updated state.
 		h.cache.mu.Lock()
 		if h.cache.inflight[key] == call {
 			delete(h.cache.inflight, key)
 		}
-		if !call.abandoned && ctx.Err() == nil && cacheable {
-			h.cache.putLocked(key, res, finishNow.Add(ttl))
+		abandoned := call.abandoned
+		cbCode := res.code
+		if abandoned {
+			cbCode = ""
+		}
+		h.cb.Finish(platform, cbCode, halfOpenGen, finishNow)
+
+		servedStale := false
+		if !abandoned && ctx.Err() == nil {
+			if cacheable {
+				h.cache.putWithStaleLocked(key, res, freshUntil, hardExpiresAt, res.code == "OK")
+			} else if isStaleFallbackTrigger(res) {
+				if staleRes, ok := h.cache.getStaleLocked(key, finishNow, policy.StaleIfErrorTTL); ok {
+					res = staleRes
+					servedStale = true
+				}
+			} else if res.code == "NO_MEDIA" || res.code == "INVALID_INPUT" || res.code == "UNSUPPORTED_PLATFORM" {
+				h.cache.deleteIfNotFreshLocked(key, finishNow)
+			}
 		}
 		call.res = res
+		call.servedStale = servedStale
 		close(call.done)
 		h.cache.mu.Unlock()
 		cancel()
@@ -711,7 +837,7 @@ func (h *Handler) runSingleflight(
 	res, payload, encOK = h.executeParse(parseCtx, path, platform, source, itemID, debug, h.now())
 	finishNow = h.now()
 	if encOK && payload != nil {
-		ttl, cacheable = computeCacheTTLForResult(platform, payload, finishNow, shanghaiFallback())
+		freshUntil, hardExpiresAt, cacheable = computeCacheDeadlines(platform, payload, finishNow, shanghaiFallback(), h.getCachePolicy())
 	}
 	completed = true
 }
@@ -897,7 +1023,7 @@ func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 		}
 		version, scalar := queryValue(r.URL.RawQuery, "schema_version")
 		if !scalar || version != unified.SchemaVersion {
-			sendError(w, 409, "接口版本已更新，请等待当前下载结束后刷新页面")
+			sendError(w, 409, schemaVersionConflictMessage(r.Context()))
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -912,7 +1038,7 @@ func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 		}
 		version, scalar := queryValue(r.URL.RawQuery, "schema_version")
 		if !scalar || version != unified.SchemaVersion {
-			sendError(w, 409, "接口版本已更新，请等待当前下载结束后刷新页面")
+			sendError(w, 409, schemaVersionConflictMessage(r.Context()))
 			return
 		}
 		if r.Body == nil {

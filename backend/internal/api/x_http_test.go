@@ -298,13 +298,14 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 		t.Fatal(err)
 	}
 	admCfg := DefaultAdmissionConfig()
+	admCfg.SlowParse.GlobalConcurrency = 2
 	admCfg.SlowParse.QueueWait = 80 * time.Millisecond
 	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, admCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 1. Occupy the 2 shared SlowParse / yt-dlp execution slots from 2 distinct client IPs.
+	// 1. Occupy the 2 shared Social SlowParse / yt-dlp execution slots from 2 distinct client IPs.
 	var inFlightWG sync.WaitGroup
 	inFlightCodes := make([]int, 2)
 	inFlightDone := make(chan int, 2)
@@ -321,7 +322,7 @@ func TestYTDLPBusyDoesNotExhaustGlobalParsePoolForLegacyPlatforms(t *testing.T) 
 	}()
 	go func() {
 		defer inFlightWG.Done()
-		req := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "198.51.100.2")
+		req := edgeRequest("/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.instagram.com/reel/C999999999/"), "198.51.100.2")
 		inFlightCodes[1] = call(entry, req).Code
 		inFlightDone <- inFlightCodes[1]
 	}()
