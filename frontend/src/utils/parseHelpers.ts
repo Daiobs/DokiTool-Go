@@ -1,6 +1,7 @@
 import { supportedPlatforms } from "./platforms";
 import { withTbvideoItems } from "../services/tbvideo";
 import {
+  LATEST_EXTENSION_VERSION,
   resolveClientParseRoute,
   type ClientCapabilityEnvironment,
 } from "../core/capabilityHub";
@@ -329,7 +330,10 @@ export async function runYouTubeHelperParse(ctx: {
   if (!isCurrent()) return;
 
   if (!ping.installed || !ping.supported) {
-    if (!ping.installed && isMobileBrowser()) {
+    const hasOutdatedExtension =
+      Boolean(extState?.connected) &&
+      !extEnv.extensionCapabilities.includes("youtube_parse");
+    if (!ping.installed && !hasOutdatedExtension && isMobileBrowser()) {
       ctx.setError(
         ctx.locale === "en"
           ? "YouTube requires a browser with a userscript manager. Using a computer is recommended on mobile."
@@ -337,15 +341,35 @@ export async function runYouTubeHelperParse(ctx: {
       );
       return;
     }
-    const helperState: YouTubeHelperState = {
-      status: ping.installed ? "outdated" : "missing",
-      version: ping.version,
-      min_version: MIN_YOUTUBE_HELPER_VERSION,
-      script_url: YOUTUBE_HELPER_SCRIPT_URL,
-      message: ping.installed
-        ? `当前已安装的 YouTube 助手版本（v${ping.version}）低于最低要求（v${MIN_YOUTUBE_HELPER_VERSION}），推荐安装 DokiTool 扩展或更新脚本后重试`
-        : "当前未检测到 DokiTool 扩展或 YouTube 助手脚本，请按说明安装并启用后重试",
-    };
+    const isEn = ctx.locale === "en";
+    const normalizedExtVer = (extState?.version || "").trim().replace(/^v/i, "");
+    const extVerDisplay = normalizedExtVer
+      ? `v${normalizedExtVer}`
+      : isEn
+        ? "unknown"
+        : "未知";
+    const helperState: YouTubeHelperState = hasOutdatedExtension
+      ? {
+          status: "outdated",
+          provider: "extension",
+          version: normalizedExtVer || null,
+          ...(normalizedExtVer ? { extensionVersion: normalizedExtVer } : {}),
+          min_version: LATEST_EXTENSION_VERSION,
+          script_url: YOUTUBE_HELPER_SCRIPT_URL,
+          message: isEn
+            ? `Connected DokiTool extension (${extVerDisplay}) is outdated. Upgrade to v${LATEST_EXTENSION_VERSION}+ to parse and download YouTube without a userscript.`
+            : `检测到已连接的扩展版本（${extVerDisplay}）较低，升级至 v${LATEST_EXTENSION_VERSION}+ 即可免油猴解析下载 YouTube`,
+        }
+      : {
+          status: ping.installed ? "outdated" : "missing",
+          ...(ping.installed ? { provider: "userscript" as const } : {}),
+          version: ping.version,
+          min_version: MIN_YOUTUBE_HELPER_VERSION,
+          script_url: YOUTUBE_HELPER_SCRIPT_URL,
+          message: ping.installed
+            ? `当前已安装的 YouTube 助手版本（v${ping.version}）低于最低要求（v${MIN_YOUTUBE_HELPER_VERSION}），推荐安装 DokiTool 扩展或更新脚本后重试`
+            : "当前未检测到 DokiTool 扩展或 YouTube 助手脚本，请按说明安装并启用后重试",
+        };
     let media: UnifiedMedia;
     try {
       const parsed = await ctx.requestStandardParse();

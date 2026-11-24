@@ -577,4 +577,83 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
   assert.deepEqual(platforms.resolvePlatformPresentation('','en'),{id:'',label:'Media',icon:'fa-film',isBuiltin:false});
 });
 
+test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outdated extension helper state with upgrade guidance', async () => {
+  const prevWin = globalThis.window;
+  const origNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  try {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+    });
+    globalThis.fetch = async () =>
+      Response.json(good({
+        platform: 'youtube',
+        items: [file('yt-1', 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')],
+      }));
+
+    const zhStore = reactive({
+      resultData: null,
+      resultVersion: 0,
+      clearResult() { this.resultData = null; this.resultVersion++; },
+      setResult(d) { this.resultData = d; this.resultVersion++; },
+    });
+    const zhParser = parser.useVideoParser({
+      videoStore: zhStore,
+      locale: ref('zh-CN'),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: true,
+        version: '4.1.0',
+        extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+        capabilities: ['dash_mux', 'direct_download'],
+      }),
+      pingHelper: async () => ({ installed: false, version: null, supported: false }),
+    });
+    zhParser.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await zhParser.parseVideo();
+
+    const zhHelper = zhStore.resultData?.extra?.youtube_helper;
+    assert.equal(zhHelper?.status, 'outdated');
+    assert.equal(zhHelper?.provider, 'extension');
+    assert.equal(zhHelper?.version, '4.1.0');
+    assert.equal(zhHelper?.extensionVersion, '4.1.0');
+    assert.equal(zhHelper?.min_version, '4.2.0');
+    assert.equal(
+      zhHelper?.message,
+      '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.2.0+ 即可免油猴解析下载 YouTube',
+    );
+    assert.doesNotMatch(JSON.stringify(zhStore.resultData), /googlevideo\.com/);
+
+    // English locale wording
+    const enStore = reactive({
+      resultData: null,
+      resultVersion: 0,
+      clearResult() { this.resultData = null; this.resultVersion++; },
+      setResult(d) { this.resultData = d; this.resultVersion++; },
+    });
+    const enParser = parser.useVideoParser({
+      videoStore: enStore,
+      locale: ref('en'),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: true,
+        version: '4.1.0',
+        extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+        capabilities: ['dash_mux', 'direct_download'],
+      }),
+      pingHelper: async () => ({ installed: false, version: null, supported: false }),
+    });
+    enParser.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await enParser.parseVideo();
+    const enHelper = enStore.resultData?.extra?.youtube_helper;
+    assert.equal(enHelper?.status, 'outdated');
+    assert.equal(enHelper?.provider, 'extension');
+    assert.match(enHelper?.message || '', /v4\.1\.0.*v4\.2\.0\+/);
+  } finally {
+    globalThis.window = prevWin;
+    if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
+    else delete globalThis.navigator;
+  }
+});
+
 });

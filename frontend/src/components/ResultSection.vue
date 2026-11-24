@@ -84,6 +84,7 @@ const emit = defineEmits([
   "refresh-youtube-helper-page",
   "prompt-select-quality",
   "open-extension",
+  "extension-youtube-ready",
 ]);
 
 const context = { apiOrigin: apiConfig.baseUrl };
@@ -153,6 +154,11 @@ const canExtensionDashMux = computed(
   () =>
     isExtensionConnected.value &&
     extensionBridgeState.value.capabilities.includes("dash_mux"),
+);
+const canExtensionYouTubeParse = computed(
+  () =>
+    isExtensionConnected.value &&
+    extensionBridgeState.value.capabilities.includes("youtube_parse"),
 );
 
 const activeVariant = computed(() =>
@@ -658,9 +664,11 @@ const extInstallHintText = computed(() => {
 
 let bridgeDisposed = false;
 let bridgeProbeInFlight = false;
-const probeExtensionBridge = async () => {
+let autoReparseTriggeredVersion = -1;
+const probeExtensionBridge = async (fromWindowReturn = false) => {
   if (bridgeDisposed || bridgeProbeInFlight) return;
   bridgeProbeInFlight = true;
+  const wasYouTubeParseReady = canExtensionYouTubeParse.value;
   try {
     const { pingInstalledExtension } = await import(
       "../services/extensionBridge"
@@ -668,6 +676,18 @@ const probeExtensionBridge = async () => {
     const state = await pingInstalledExtension();
     if (!bridgeDisposed) {
       extensionBridgeState.value = state;
+      if (
+        fromWindowReturn &&
+        isYouTubeHelperInstallRequired.value &&
+        !wasYouTubeParseReady &&
+        state.connected &&
+        state.capabilities.includes("youtube_parse") &&
+        autoReparseTriggeredVersion !== props.resultVersion
+      ) {
+        autoReparseTriggeredVersion = props.resultVersion;
+        ytHelperModalDismissed.value = true;
+        emit("extension-youtube-ready");
+      }
     }
   } catch {
     if (!bridgeDisposed) {
@@ -689,8 +709,12 @@ const handleWindowReturnForBridge = () => {
   ) {
     return;
   }
-  if (!isExtensionConnected.value) {
-    void probeExtensionBridge();
+  if (
+    !isExtensionConnected.value ||
+    isExtensionOutdated.value ||
+    (isYouTubeHelperInstallRequired.value && !canExtensionYouTubeParse.value)
+  ) {
+    void probeExtensionBridge(true);
   }
 };
 

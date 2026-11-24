@@ -19,7 +19,10 @@ import {
   isWhitelistedMediaUrl,
   validateApiBaseUrl,
 } from "../../extension/hostWhitelist";
-import { isRefererProtectedMediaRoute } from "./cdnTransportHints";
+import {
+  isRefererProtectedMediaRoute,
+  prefersExtensionDirectAcceleration,
+} from "./cdnTransportHints";
 import {
   resolveVariantResolution,
   videoCodecCompatibilityRank,
@@ -50,6 +53,8 @@ export interface MuxTierSummary {
   audioCodec: string;
   specText: string;
 }
+
+const MAX_EXTENSION_BRIDGE_ROUTES = 8;
 
 function parsePositiveSafeBytes(raw: unknown): number | undefined {
   return typeof raw === "number" && Number.isSafeInteger(raw) && raw > 0
@@ -160,8 +165,12 @@ export function resolveWhitelistedExtensionMuxSpec(
   );
   const allowed = (url: string) =>
     isWhitelistedMediaUrl(url, allowedOrigins).allowed;
-  const videoRoutes = spec.videoRoutes.filter(allowed);
-  const audioRoutes = spec.audioRoutes.filter(allowed);
+  const videoRoutes = spec.videoRoutes
+    .filter(allowed)
+    .slice(0, MAX_EXTENSION_BRIDGE_ROUTES);
+  const audioRoutes = spec.audioRoutes
+    .filter(allowed)
+    .slice(0, MAX_EXTENSION_BRIDGE_ROUTES);
   if (!videoRoutes.length || !audioRoutes.length) {
     return null;
   }
@@ -291,7 +300,49 @@ export function resolveProtectedExtensionAudioRoutes(
   }
 
   return needsProtection && whitelistedRoutes.length > 0
-    ? whitelistedRoutes
+    ? whitelistedRoutes.slice(0, MAX_EXTENSION_BRIDGE_ROUTES)
+    : null;
+}
+
+/**
+ * Resolves pre-filtered whitelisted routes for a progressive direct file hosted
+ * on a slow single-connection CDN that benefits from connected-extension 4-way
+ * OPFS Range acceleration. Returns `null` when no route requests acceleration
+ * or zero available routes pass the extension host whitelist.
+ */
+export function resolveAcceleratedExtensionDirectRoutes(
+  resource: Pick<Resource, "delivery"> | null | undefined,
+  context: TargetContext = {},
+  extraAllowedOrigins?: string[],
+): string[] | null {
+  if (!resource || resource.delivery.kind !== "file") {
+    return null;
+  }
+  const allowedOrigins = resolveAllowedOriginsFromContext(
+    context,
+    extraAllowedOrigins,
+  );
+  let wantsAcceleration = false;
+  const seen = new Set<string>();
+  const whitelistedRoutes: string[] = [];
+
+  for (const src of availableSources(resource.delivery.sources, context.now)) {
+    for (const url of sourceRoutes(src, context)) {
+      if (prefersExtensionDirectAcceleration(url, src)) {
+        wantsAcceleration = true;
+      }
+      if (
+        !seen.has(url) &&
+        isWhitelistedMediaUrl(url, allowedOrigins).allowed
+      ) {
+        seen.add(url);
+        whitelistedRoutes.push(url);
+      }
+    }
+  }
+
+  return wantsAcceleration && whitelistedRoutes.length > 0
+    ? whitelistedRoutes.slice(0, MAX_EXTENSION_BRIDGE_ROUTES)
     : null;
 }
 

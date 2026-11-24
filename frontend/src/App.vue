@@ -336,6 +336,17 @@ const onVisibilityOrFocus = () => {
   void handleYouTubeHelperTabReturn();
 };
 
+const handleExtensionYouTubeReady = () => {
+  showExtensionModal.value = false;
+  const candidateUrl =
+    inputUrl.value.trim() || videoStore.resultData?.source_url || "";
+  if (!candidateUrl) return;
+  if (candidateUrl !== inputUrl.value) {
+    inputUrl.value = candidateUrl;
+  }
+  void parseVideo();
+};
+
 onMounted(() => {
   void refreshPlatformCatalog();
   let hasSavedDownloads = false;
@@ -456,6 +467,7 @@ onUnmounted(() => {
         :resolving-ids="videoStore.resolvingItems"
         @refresh-item="resolveSelectedItem"
         @open-extension="showExtensionModal = true"
+        @extension-youtube-ready="handleExtensionYouTubeReady"
         @install-youtube-helper="markWaitingForYouTubeHelperInstall"
         @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"
