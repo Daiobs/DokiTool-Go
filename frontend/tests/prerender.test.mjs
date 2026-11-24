@@ -1,6 +1,7 @@
 import test, { before } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, access } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, access, readdir, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import vm from 'node:vm';
 import { transformWithEsbuild } from 'vite';
@@ -128,5 +129,42 @@ test('#91 PR1 item 5: in-app browser UA detector matches WeChat/QQ/Douyin/Weibo 
     ['Empty/SSR UA', ''],
   ]) {
     assert.equal(state.isInAppBrowser(ua), false, `${label} must NOT be detected as in-app browser`);
+  }
+});
+
+test('Post-#37 CSP hash drift guard: ops/examples/snap.caddy Content-Security-Policy matches exact SHA-256 of dokitool-theme-bootstrap', async () => {
+  const match = html.match(/<script id="dokitool-theme-bootstrap">([\s\S]*?)<\/script>/);
+  assert.ok(match && match[1], 'dist/index.html must contain <script id="dokitool-theme-bootstrap">');
+  const expectedHash = `'sha256-${createHash('sha256').update(match[1], 'utf8').digest('base64')}'`;
+
+  const caddy = await readFile(new URL('../../ops/examples/snap.caddy', import.meta.url), 'utf8');
+  const cspLines = [...caddy.matchAll(/header\s+(?:@\S+\s+)?Content-Security-Policy\s+"([^"]+)"/g)].map(m => m[1]);
+  assert.ok(cspLines.length >= 1, 'snap.caddy must declare Content-Security-Policy headers');
+  assert.ok(
+    cspLines.some(policy => policy.includes(expectedHash)),
+    `snap.caddy Content-Security-Policy must include exact theme bootstrap hash ${expectedHash}`,
+  );
+});
+
+test('Post-#37 precompressed static assets: dist/assets/*.js.br and .gz sidecars exist and are strictly smaller than originals', async () => {
+  const assetsDirUrl = new URL('../dist/assets/', import.meta.url);
+  const names = await readdir(assetsDirUrl);
+  const brJs = names.filter(name => name.endsWith('.js.br'));
+  const gzJs = names.filter(name => name.endsWith('.js.gz'));
+  assert.ok(brJs.length >= 1, 'expected at least one precompressed dist/assets/*.js.br sidecar');
+  assert.ok(gzJs.length >= 1, 'expected at least one precompressed dist/assets/*.js.gz sidecar');
+
+  const sidecars = names.filter(name => name.endsWith('.br') || name.endsWith('.gz'));
+  for (const sidecar of sidecars) {
+    const rawName = sidecar.replace(/\.(?:br|gz)$/, '');
+    assert.match(rawName, /\.(?:js|css|svg)$/i, `unexpected precompressed asset type: ${sidecar}`);
+    const [sidecarInfo, rawInfo] = await Promise.all([
+      stat(new URL(sidecar, assetsDirUrl)),
+      stat(new URL(rawName, assetsDirUrl)),
+    ]);
+    assert.ok(
+      sidecarInfo.size > 0 && sidecarInfo.size < rawInfo.size,
+      `${sidecar} (${sidecarInfo.size} B) must be strictly smaller than ${rawName} (${rawInfo.size} B)`,
+    );
   }
 });

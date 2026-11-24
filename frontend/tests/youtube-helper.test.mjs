@@ -2504,22 +2504,24 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     return renderToString(app);
   }
 
-  test("without helper or with outdated helper (1.0.0 / 1.1.0 < 1.2.0): shows parse result + install/update guide, strips server-IP googlevideo links, and refuses download without 已交给浏览器", async () => {
+  test("without helper or with outdated helper (1.0.0 / 1.1.0 < 1.2.0): renders fallback upgrade guide immediately with ZERO /api/parse calls, no googlevideo links, and refuses download without 已交给浏览器", async () => {
     const env = setupEnvironment();
+    let parseApiCalls = 0;
     globalThis.fetch = async (url) => {
       const u = new URL(url, "https://snap.dokitool.com");
-      assert.equal(u.pathname, "/api/parse");
-      return Response.json({
-        schema_version: "1.0",
-        code: "OK",
-        data: sampleYouTubeUnifiedData(),
-      });
+      if (u.pathname === "/api/parse") parseApiCalls += 1;
+      throw new Error(`unexpected fetch when helper/extension is missing: ${u.pathname}`);
     };
 
     env.parserInstance.inputUrl.value =
       "https://www.youtube.com/watch?v=I9JvDaciaFk";
     await env.parserInstance.parseVideo();
 
+    assert.equal(
+      parseApiCalls,
+      0,
+      "desktop YouTube parse without extension/helper must NEVER call /api/parse",
+    );
     assert.ok(env.store.resultData);
     assert.equal(env.store.resultData.extra.youtube_helper.status, "missing");
     assert.doesNotMatch(
@@ -2550,6 +2552,11 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
         env.parserInstance.inputUrl.value =
           "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
         await env.parserInstance.parseVideo();
+        assert.equal(
+          parseApiCalls,
+          0,
+          `outdated helper v${outdatedVer} must NEVER call /api/parse`,
+        );
         assert.equal(
           env.store.resultData.extra.youtube_helper.status,
           "outdated",
@@ -4053,10 +4060,12 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
         },
       });
 
-    // 1. Parse without helper -> renders non-blocking corner CapabilityUpgradeNotice (role="region", data-capability-upgrade-notice, NO aria-modal="true")
+    // 1. Parse without helper -> renders non-blocking corner CapabilityUpgradeNotice (role="region", data-capability-upgrade-notice, NO aria-modal="true") with ZERO /api/parse calls
+    let standardParseCalls = 0;
     globalThis.fetch = async (url) => {
       const u = new URL(url, "https://snap.dokitool.com");
       if (u.pathname === "/api/parse") {
+        standardParseCalls += 1;
         return Response.json({
           schema_version: "1.0",
           code: "OK",
@@ -4113,6 +4122,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       const p1 = createTestParser();
       p1.inputUrl.value = "https://www.youtube.com/watch?v=I9JvDaciaFk";
       await p1.parseVideo();
+      assert.equal(standardParseCalls, 0, "missing helper must NOT invoke /api/parse");
 
       const modalHtml = await renderToString(
         createSSRApp({
@@ -4171,6 +4181,7 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
         "https://www.youtube.com/watch?v=I9JvDaciaFk",
       );
       assert.equal(pReloadedStillMissing.needsManualHelperRefresh.value, true);
+      assert.equal(standardParseCalls, 0, "reloaded still-missing helper must NOT invoke /api/parse");
 
       // Further tab focus events also do NOT trigger another reload loop
       await pReloadedStillMissing.handleYouTubeHelperTabReturn();

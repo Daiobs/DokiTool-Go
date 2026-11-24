@@ -370,16 +370,8 @@ export async function runYouTubeHelperParse(ctx: {
             ? `当前已安装的 YouTube 助手版本（v${ping.version}）低于最低要求（v${MIN_YOUTUBE_HELPER_VERSION}），推荐安装 DokiTool 扩展或更新脚本后重试`
             : "当前未检测到 DokiTool 扩展或 YouTube 助手脚本，请按说明安装并启用后重试",
         };
-    let media: UnifiedMedia;
-    try {
-      const parsed = await ctx.requestStandardParse();
-      media = redactServerBoundYouTubeMedia(parsed, helperState, videoId);
-    } catch {
-      if (!isCurrent()) return;
-      media = buildFallbackYouTubeMedia(videoId, helperState);
-    }
     if (isCurrent()) {
-      ctx.setResult(media);
+      ctx.setResult(buildFallbackYouTubeMedia(videoId, helperState));
     }
     return;
   }

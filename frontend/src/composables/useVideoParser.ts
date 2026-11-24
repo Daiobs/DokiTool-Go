@@ -98,7 +98,7 @@ export async function fetchJSON(
   else signal?.addEventListener("abort", abort, { once: true });
   const timeout = setTimeout(
     () => controller.abort(new Error("解析请求超时，请重试")),
-    55000,
+    75000,
   );
   try {
     const response = await fetch(url, { ...init, signal: controller.signal });

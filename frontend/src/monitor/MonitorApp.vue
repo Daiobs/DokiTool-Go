@@ -23,17 +23,22 @@ import {
   buildHourlyChartPoints,
   computeTodayVsYesterday,
   formatBytesCompact,
+  formatCircuitBreakerBadge,
   formatMonitorVersionBadge,
   formatPercent,
+  formatShanghaiTimestamp,
+  formatStatsPlatformLabel,
   formatUptimeDuration,
   resolveYtdlpQueuedCount,
   type AdmissionPoolSnapshot,
+  type CircuitBreakerBadgeView,
   type DailyChartPoint,
   type HourlyChartPoint,
   type MonitorVersionBadge,
   type PlatformHealthRange,
   type PlatformHealthRow,
   type StatsSnapshot,
+  type YTDLPCompartmentPoolSnapshot,
   type YTDLPStatsSnapshot,
 } from "./statsTypes";
 
@@ -73,6 +78,39 @@ interface PoolWatermarkRow {
   ratioPct: number;
   tone: "normal" | "warn" | "danger";
   footSummary: string;
+}
+
+interface CompartmentPoolRow {
+  id: "youtube" | "social" | "generic" | "youtube_ejs";
+  label: string;
+  enabled: boolean;
+  active: number;
+  limit: number;
+  queued: number;
+  queueLimit: number;
+  ratioPct: number;
+  tone: "normal" | "warn" | "danger";
+  footSummary: string;
+}
+
+interface CircuitBreakerRow {
+  platform: string;
+  label: string;
+  state: "closed" | "open" | "half_open";
+  disabledByConfig: boolean;
+  badge: CircuitBreakerBadgeView;
+  consecutiveFailures: number;
+  windowFailures: number;
+  windowTotal: number;
+  openUntilLabel: string;
+}
+
+interface RuntimePolicyRow {
+  key: string;
+  label: string;
+  valueText: string;
+  subText?: string;
+  tone: "on" | "off" | "accent" | "warn" | "danger";
 }
 
 const HEALTH_RANGE_OPTIONS: ReadonlyArray<{
@@ -227,6 +265,13 @@ const cacheHitRateText = computed<string>(() => {
   const c = stats.value?.cache?.total;
   if (!c) return "—";
   return formatPercent(c.hits, c.hits + c.misses, 1);
+});
+
+const cacheStaleHits = computed<number>(() => {
+  const raw = stats.value?.cache?.total?.stale_hits;
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0
+    ? Math.floor(raw)
+    : 0;
 });
 
 const shanghaiHitRateText = computed<string>(() => {
@@ -415,6 +460,148 @@ const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
       "yt-dlp 通用长尾槽位 (ytdlp_generic)",
       s.ytdlp_generic,
     ),
+  ];
+});
+
+const ytdlpCompartmentPools = computed<CompartmentPoolRow[]>(() => {
+  const pools = stats.value?.ytdlp_pools;
+  if (!pools) return [];
+
+  const makeRow = (
+    id: CompartmentPoolRow["id"],
+    label: string,
+    pool: YTDLPCompartmentPoolSnapshot,
+  ): CompartmentPoolRow => {
+    const limit = Math.max(0, pool.concurrency_limit || 0);
+    const active = Math.max(0, pool.active || 0);
+    const queued = Math.max(0, pool.queued || 0);
+    const queueLimit = Math.max(0, pool.queue_limit || 0);
+    const ratioPct =
+      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
+    return {
+      id,
+      label,
+      enabled: Boolean(pool.enabled),
+      active,
+      limit,
+      queued,
+      queueLimit,
+      ratioPct,
+      tone: buildPoolWatermarkTone(ratioPct),
+      footSummary: `本次启动等待 ${pool.waited ?? 0} · 放行 ${pool.granted ?? 0} · 超时 ${pool.timeout ?? 0} · 满载 ${pool.full ?? 0} · 最大等待 ${pool.wait_ms_max ?? 0} ms`,
+    };
+  };
+
+  return [
+    makeRow("youtube", "YouTube 舱", pools.youtube),
+    makeRow("social", "社交慢链舱", pools.social),
+    makeRow("generic", "长尾 Generic 舱", pools.generic),
+    makeRow("youtube_ejs", "YouTube EJS 池", pools.youtube_ejs),
+  ];
+});
+
+const circuitBreakerRows = computed<CircuitBreakerRow[]>(() => {
+  const list = stats.value?.circuit_breakers;
+  if (!Array.isArray(list) || list.length === 0) return [];
+  return list.map((item) => ({
+    platform: item.platform,
+    label: formatStatsPlatformLabel(item.platform),
+    state: item.state,
+    disabledByConfig: Boolean(item.disabled_by_config),
+    badge: formatCircuitBreakerBadge(item),
+    consecutiveFailures: Math.max(0, item.consecutive_failures || 0),
+    windowFailures: Math.max(0, item.window_failures || 0),
+    windowTotal: Math.max(0, item.window_total || 0),
+    openUntilLabel: formatShanghaiTimestamp(item.open_until),
+  }));
+});
+
+const circuitBreakerSummary = computed(() => {
+  const rows = circuitBreakerRows.value;
+  let open = 0;
+  let halfOpen = 0;
+  let ok = 0;
+  for (const row of rows) {
+    if (row.disabledByConfig || row.state === "open") open += 1;
+    else if (row.state === "half_open") halfOpen += 1;
+    else ok += 1;
+  }
+  return { total: rows.length, ok, halfOpen, open };
+});
+
+const runtimePolicyRows = computed<RuntimePolicyRow[]>(() => {
+  const p = stats.value?.runtime_policy;
+  if (!p) return [];
+  const disabledList = Array.isArray(p.disabled_platforms)
+    ? p.disabled_platforms
+    : [];
+  const disabledDisplay =
+    disabledList.length > 0
+      ? disabledList.map((id) => formatStatsPlatformLabel(id)).join("、")
+      : "无";
+  const reloadedAt = formatShanghaiTimestamp(p.last_reloaded_at);
+  return [
+    {
+      key: "config_file_active",
+      label: "热配置来源",
+      valueText: p.config_file_active ? "热配置文件 (SIGHUP)" : "环境变量默认",
+      tone: p.config_file_active ? "on" : "off",
+    },
+    {
+      key: "reload_count",
+      label: "热重载次数",
+      valueText: `${Math.max(0, p.reload_count || 0)} 次`,
+      subText: reloadedAt ? `最近：${reloadedAt}` : "启动后尚未重载",
+      tone: p.reload_count > 0 ? "accent" : "off",
+    },
+    {
+      key: "compartment_slots",
+      label: "分舱槽位配额",
+      valueText: `YT ${p.youtube_slots} · 社交 ${p.social_slots} · 通用 ${p.generic_slots} · EJS ${p.youtube_ejs_concurrency}`,
+      tone: "accent",
+    },
+    {
+      key: "fast_per_platform_max_concurrency",
+      label: "单平台快池上限",
+      valueText: `${p.fast_per_platform_max_concurrency} 并发`,
+      tone: "accent",
+    },
+    {
+      key: "circuit_breaker_enabled",
+      label: "平台熔断保护",
+      valueText: p.circuit_breaker_enabled ? "ON" : "OFF",
+      tone: p.circuit_breaker_enabled ? "on" : "warn",
+    },
+    {
+      key: "disabled_platforms",
+      label: "运维禁用平台",
+      valueText: disabledDisplay,
+      tone: disabledList.length > 0 ? "danger" : "off",
+    },
+    {
+      key: "youtube_parse_ttl_seconds",
+      label: "YouTube 解析缓存 TTL",
+      valueText:
+        p.youtube_parse_ttl_seconds > 0
+          ? `${p.youtube_parse_ttl_seconds}s`
+          : "0s (已关闭)",
+      tone: p.youtube_parse_ttl_seconds > 0 ? "on" : "off",
+    },
+    {
+      key: "stale_if_error_ttl_seconds",
+      label: "过期兜底缓存 TTL",
+      valueText:
+        p.stale_if_error_ttl_seconds > 0
+          ? `${p.stale_if_error_ttl_seconds}s`
+          : "0s (已关闭)",
+      tone: p.stale_if_error_ttl_seconds > 0 ? "on" : "off",
+    },
+    {
+      key: "upstream_blocked_neg_ttl_seconds",
+      label: "拦截短负缓存 TTL",
+      valueText: `${Math.max(0, p.upstream_blocked_neg_ttl_seconds || 0)}s`,
+      tone: p.upstream_blocked_neg_ttl_seconds > 0 ? "accent" : "off",
+    },
   ];
 });
 
@@ -1200,6 +1387,10 @@ onUnmounted(() => {
               <span>本次启动命中 {{ stats.cache.total.hits }} / 未命中 {{ stats.cache.total.misses }}</span>
               <span>合流复用 {{ stats.cache.total.singleflight_shared }}</span>
             </div>
+            <div class="mon-kpi__meta" data-testid="kpi-cache-stale-hits">
+              <span>过期兜底命中 {{ cacheStaleHits }}</span>
+              <span>不可缓存 {{ stats.cache.total.uncacheable }}</span>
+            </div>
           </article>
 
           <!-- KPI 4: Shanghai Exit Nodes & Hit Rate -->
@@ -1421,6 +1612,204 @@ onUnmounted(() => {
                   <span>{{ pool.footSummary }}</span>
                   <span>负载 {{ pool.ratioPct }}%</span>
                 </div>
+              </div>
+            </div>
+
+            <!-- 4-Compartment yt-dlp & YouTube EJS Pools (Read-Only) -->
+            <div
+              v-if="ytdlpCompartmentPools.length > 0"
+              class="mon-compartment-wrap"
+              data-testid="ytdlp-compartment-pools"
+            >
+              <div class="mon-compartment-head">
+                <h3 class="mon-compartment-title">yt-dlp 分舱 &amp; YouTube EJS 池</h3>
+                <span class="sp-badge sp-badge--accent">4 组独立分舱</span>
+              </div>
+              <div class="mon-pools-list">
+                <div
+                  v-for="cpool in ytdlpCompartmentPools"
+                  :key="cpool.id"
+                  class="mon-pool-row"
+                  :data-compartment-pool-id="cpool.id"
+                >
+                  <div class="mon-pool-row__top">
+                    <div class="mon-pool-row__title">
+                      <span class="mon-pool-row__name">{{ cpool.label }}</span>
+                      <span
+                        class="mon-pool-kind"
+                        :class="
+                          cpool.enabled
+                            ? 'mon-pool-kind--enabled'
+                            : 'mon-pool-kind--disabled'
+                        "
+                      >
+                        {{ cpool.enabled ? "已启用" : "未启用" }}
+                      </span>
+                    </div>
+                    <span class="mon-pool-row__usage">
+                      活跃 {{ cpool.active }} / {{ cpool.limit }} · 排队
+                      {{ cpool.queued }} / {{ cpool.queueLimit }}
+                    </span>
+                  </div>
+                  <svg
+                    class="mon-pool-bar-svg"
+                    viewBox="0 0 100 8"
+                    preserveAspectRatio="none"
+                    aria-hidden="true"
+                  >
+                    <rect
+                      class="mon-bar-track"
+                      x="0"
+                      y="0"
+                      width="100"
+                      height="8"
+                      rx="4"
+                    />
+                    <rect
+                      class="mon-bar-fill"
+                      :class="
+                        cpool.tone === 'normal'
+                          ? ''
+                          : `mon-bar-fill--${cpool.tone}`
+                      "
+                      x="0"
+                      y="0"
+                      :width="cpool.ratioPct"
+                      height="8"
+                      rx="4"
+                    />
+                  </svg>
+                  <div class="mon-pool-row__foot">
+                    <span>{{ cpool.footSummary }}</span>
+                    <span>负载 {{ cpool.ratioPct }}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- ================================================================ -->
+        <!-- Section 2.5: 平台熔断状态 & 运行时热策略摘要（严格只读）            -->
+        <!-- ================================================================ -->
+        <section
+          v-if="circuitBreakerRows.length > 0 || runtimePolicyRows.length > 0"
+          class="mon-split-grid"
+          aria-label="平台熔断状态与运行时热策略摘要"
+          data-testid="section-protection-policy"
+        >
+          <!-- Read-Only Circuit Breaker Status Grid -->
+          <article
+            v-if="circuitBreakerRows.length > 0"
+            class="mon-card"
+            data-testid="card-circuit-breakers"
+          >
+            <div class="mon-card__header">
+              <div class="mon-card__title-group">
+                <h2 class="mon-card__title">平台熔断状态（只读）</h2>
+                <span class="mon-card__subtitle">
+                  仅实时展示 14 核心平台及长尾链路的上游故障保护状态，公网零写接口
+                </span>
+              </div>
+              <div class="mon-cb-summary">
+                <span class="sp-badge sp-badge--saved">
+                  正常 {{ circuitBreakerSummary.ok }}
+                </span>
+                <span
+                  v-if="circuitBreakerSummary.halfOpen > 0"
+                  class="sp-badge sp-badge--warn"
+                >
+                  半开 {{ circuitBreakerSummary.halfOpen }}
+                </span>
+                <span
+                  v-if="circuitBreakerSummary.open > 0"
+                  class="sp-badge mon-badge--danger"
+                >
+                  熔断 {{ circuitBreakerSummary.open }}
+                </span>
+              </div>
+            </div>
+
+            <div class="mon-cb-grid" data-testid="circuit-breakers-grid">
+              <div
+                v-for="cb in circuitBreakerRows"
+                :key="cb.platform"
+                class="mon-cb-item"
+                :class="`mon-cb-item--${cb.badge.tone}`"
+                data-testid="circuit-breaker-item"
+                :data-platform="cb.platform"
+                :data-cb-state="cb.state"
+              >
+                <div class="mon-cb-item__top">
+                  <div class="mon-cb-item__title">
+                    <span class="mon-cb-item__name">{{ cb.label }}</span>
+                    <span class="mon-cb-item__id">{{ cb.platform }}</span>
+                  </div>
+                  <span
+                    class="mon-cb-pill"
+                    :class="`mon-cb-pill--${cb.badge.tone}`"
+                    data-testid="circuit-breaker-badge"
+                  >
+                    {{ cb.badge.label }}
+                  </span>
+                </div>
+                <div class="mon-cb-item__meta">
+                  <span>连续失败 {{ cb.consecutiveFailures }}</span>
+                  <span>窗口 {{ cb.windowFailures }}/{{ cb.windowTotal }}</span>
+                  <span v-if="cb.openUntilLabel">恢复 {{ cb.openUntilLabel }}</span>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <!-- Read-Only Runtime Policy Summary -->
+          <article
+            v-if="runtimePolicyRows.length > 0"
+            class="mon-card"
+            data-testid="card-runtime-policy"
+          >
+            <div class="mon-card__header">
+              <div class="mon-card__title-group">
+                <h2 class="mon-card__title">运行时热策略摘要（只读）</h2>
+                <span class="mon-card__subtitle">
+                  仅展示当前内存生效的 SIGHUP 热配置槽位与缓存 TTL，不暴露文件路径或密钥
+                </span>
+              </div>
+              <span
+                class="sp-badge"
+                :class="
+                  stats.runtime_policy?.config_file_active
+                    ? 'sp-badge--saved'
+                    : 'sp-badge--muted'
+                "
+              >
+                {{
+                  stats.runtime_policy?.config_file_active
+                    ? "热配置已激活"
+                    : "默认策略"
+                }}
+              </span>
+            </div>
+
+            <div class="mon-policy-grid" data-testid="runtime-policy-grid">
+              <div
+                v-for="item in runtimePolicyRows"
+                :key="item.key"
+                class="mon-policy-item"
+                :data-policy-key="item.key"
+              >
+                <div class="mon-policy-item__head">
+                  <span class="mon-policy-item__label">{{ item.label }}</span>
+                  <span
+                    class="mon-policy-pill"
+                    :class="`mon-policy-pill--${item.tone}`"
+                  >
+                    {{ item.valueText }}
+                  </span>
+                </div>
+                <span v-if="item.subText" class="mon-policy-item__sub">
+                  {{ item.subText }}
+                </span>
               </div>
             </div>
           </article>

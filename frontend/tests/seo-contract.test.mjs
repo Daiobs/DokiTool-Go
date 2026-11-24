@@ -73,11 +73,19 @@ test('crawler files expose only the homepage and keep APIs out of the crawl plan
   assert.doesNotMatch(sitemap, /<lastmod>|<changefreq>|<priority>/);
 });
 
-test('Caddy routes crawler and share files directly, before the SPA fallback', async () => {
+test('Caddy routes crawler, llms.txt, and share files directly before the final static fallback without SPA soft-404 try_files', async () => {
   const caddy = await readFile(new URL('../../ops/examples/snap.caddy', import.meta.url), 'utf8');
+  assert.doesNotMatch(
+    caddy,
+    /try_files\s+\{path\}\s+\/index\.html/,
+    'snap.caddy must not contain SPA soft-404 fallback `try_files {path} /index.html`',
+  );
+  const fallbackMatch = /\n[ \t]*handle\s*\{\s*\n[ \t]*root \* \/srv\/dokitool\/current\/frontend\/dist/.exec(caddy);
+  assert.ok(fallbackMatch, 'snap.caddy must contain the final static fallback `handle {` block');
   for (const [path, contentType] of [
     ['/robots.txt', 'text/plain; charset=utf-8'],
     ['/sitemap.xml', 'application/xml; charset=utf-8'],
+    ['/llms.txt', 'text/plain; charset=utf-8'],
     ['/social/dokitool-share-v1.png', 'image/png'],
   ]) {
     const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -88,8 +96,39 @@ test('Caddy routes crawler and share files directly, before the SPA fallback', a
     assert.ok(blocks[0][1].includes(`header Content-Type "${contentType}"`));
     assert.match(blocks[0][1], /header Cache-Control "no-cache"/);
     assert.doesNotMatch(blocks[0][1], /try_files|rewrite|pass_thru|index\.html/);
-    assert.ok(blocks[0].index < caddy.indexOf('try_files {path} /index.html'));
+    assert.ok(
+      blocks[0].index < fallbackMatch.index,
+      `${path} must appear before the final static fallback handle {`,
+    );
   }
+});
+
+test('public/llms.txt exists and accurately documents DokiTool, all 14 core platforms, and no-cookie architecture', async () => {
+  const llms = await readFile(new URL('../public/llms.txt', import.meta.url), 'utf8');
+  assert.ok(llms.includes('DokiTool'), 'public/llms.txt must mention DokiTool');
+  for (const [label, pattern] of [
+    ['Douyin', /douyin|抖音/i],
+    ['Kuaishou', /kuaishou|快手/i],
+    ['Bilibili', /bilibili|b站/i],
+    ['Xiaohongshu', /xiaohongshu|小红书/i],
+    ['Toutiao', /toutiao|今日头条/i],
+    ['Weibo', /weibo|微博/i],
+    ['Pipixia', /pipixia|皮皮虾/i],
+    ['Pipigx', /pipigx|皮皮搞笑/i],
+    ['Zuiyou', /zuiyou|最右/i],
+    ['X / Twitter', /\bx\b|twitter/i],
+    ['YouTube', /youtube/i],
+    ['Instagram', /instagram/i],
+    ['Facebook', /facebook/i],
+    ['Tumblr', /tumblr/i],
+  ]) {
+    assert.match(llms, pattern, `public/llms.txt must mention ${label}`);
+  }
+  assert.match(
+    llms,
+    /no[- ]?cookie|cookie[- ]?free|zero\s+(?:user\s+)?cookies?|无\s*cookie|不(?:需要|收集|携带).*cookie/i,
+    'public/llms.txt must describe the no-cookie architecture',
+  );
 });
 
 test('public favicon.ico exists with a valid ICO header and non-empty icon directory', async () => {
