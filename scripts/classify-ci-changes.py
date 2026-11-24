@@ -61,6 +61,8 @@ FRONTEND_EXACT_PATHS = frozenset(
     {
         "ops/examples/snap.caddy",
         "scripts/test-download-browser.mjs",
+        "scripts/download-browser-session.mjs",
+        "scripts/test-download-claim.mjs",
     }
 )
 
@@ -68,6 +70,11 @@ FRONTEND_EXACT_PATHS = frozenset(
 REPO_ONLY_EXACT_PATHS = frozenset(
     {
         "README.md",
+        "LICENSE",
+        "NOTICE",
+        "UPSTREAM.json",
+        ".gitattributes",
+        ".github/upstream-watch-baseline.json",
         "ops/examples/api-keys.example.json",
         "examples/agent_batch_download.py",
     }
@@ -143,7 +150,11 @@ def classify_paths(paths: Iterable[str]) -> Classification:
             add_reason("go")
             continue
 
-        if path in FRONTEND_EXACT_PATHS or path.startswith("frontend/"):
+        if (
+            path in FRONTEND_EXACT_PATHS
+            or path.startswith("frontend/")
+            or (path.startswith("scripts/") and path.endswith((".mjs", ".js")))
+        ):
             run_frontend = True
             add_reason("frontend")
             continue

@@ -32,7 +32,9 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache: true
-          cache-dependency-path: backend/go.sum
+          cache-dependency-path: |
+            backend/go.mod
+            backend/go.sum
       - name: Install network fixture tools on the disposable runner
         run: |
           sudo apt-get update -qq

@@ -33,7 +33,16 @@ class ClassifyPathsTests(unittest.TestCase):
             ["scripts/prod-smoke/smoke.py", "scripts/prod-smoke/test_smoke.py"],
             ["scripts/check-public-files.py", "scripts/tests/test_public_files.py"],
             ["docs/openapi.json", "docs/API.md", "docs/CONFIGURATION.md"],
-            ["README.md", "ops/examples/api-keys.example.json", "examples/agent_batch_download.py"],
+            [
+                "README.md",
+                "LICENSE",
+                "NOTICE",
+                "UPSTREAM.json",
+                ".gitattributes",
+                ".github/upstream-watch-baseline.json",
+                "ops/examples/api-keys.example.json",
+                "examples/agent_batch_download.py",
+            ],
         ]
         for paths in cases:
             with self.subTest(paths=paths):
@@ -49,6 +58,9 @@ class ClassifyPathsTests(unittest.TestCase):
             ["frontend/src/composables/useDownloadManager.ts", "docs/API.md"],
             ["ops/examples/snap.caddy"],
             ["scripts/test-download-browser.mjs"],
+            ["scripts/download-browser-session.mjs"],
+            ["scripts/test-download-claim.mjs"],
+            ["scripts/browser-helper.js"],
         ]
         for paths in cases:
             with self.subTest(paths=paths):

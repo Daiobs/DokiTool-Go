@@ -13,22 +13,6 @@ on:
       - codex/renewal-selection-stability
       - chat/product-refresh-closeout
       - dot/same-host-credential-recovery-product
-    paths:
-      - backend/**
-      - frontend/**
-      - scripts/**
-      - docs/**
-      - examples/agent_batch_download.py
-      - ops/examples/snap.caddy
-      - ops/examples/runtime.example.json
-      - ops/examples/api-keys.example.json
-      - .github/workflows/go-migration.yml
-      - .github/workflows/php-oracle.yml
-      - .github/workflows/release-build.yml
-      - .github/workflows/gateway-isolation.yml
-      - .github/workflows/upstream-watch.yml
-      - public-files.json
-      - .gitignore
 
 permissions:
   contents: read
@@ -224,6 +208,45 @@ jobs:
 
       - name: Install locked frontend dependencies
         run: npm ci --prefix frontend --ignore-scripts --registry=https://registry.npmjs.org --replace-registry-host=always
+
+      - name: Set up the pinned Go toolchain for cross-layer consumer exports
+        if: needs.changes.outputs.run_go != 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+          cache-dependency-path: |
+            backend/go.mod
+            backend/go.sum
+
+      - name: Verify Go-to-frontend cross-layer consumers (when offline-contract is skipped)
+        if: needs.changes.outputs.run_go != 'true'
+        env:
+          DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT: ${{ runner.temp }}/pipixia-representation.json
+          DOKITOOL_SHANGHAI_EXAMPLES: ${{ runner.temp }}/shanghai-originals.json
+          DOKITOOL_PULL_EXAMPLES: ${{ runner.temp }}/shanghai-pull.json
+          DOKITOOL_XHS_PUBLIC_INTEGRATION_OUTPUT: ${{ runner.temp }}/xhs-live-delivery.json
+        run: |
+          (
+            cd backend
+            go test -mod=readonly -count=1 \
+              ./internal/platform/pipixia \
+              ./internal/platform/douyin \
+              ./internal/shresolver \
+              ./cmd/dokitool \
+              -run '^(TestPipixiaRepresentationExport|TestShanghaiOriginalSelectionAndRefresh|TestPullDeliveryFrontendExamples|TestXHSPublicMediaIntegration)$'
+          )
+          for exported in \
+            "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT" \
+            "$DOKITOOL_SHANGHAI_EXAMPLES" \
+            "$DOKITOOL_PULL_EXAMPLES" \
+            "$DOKITOOL_XHS_PUBLIC_INTEGRATION_OUTPUT"; do
+            test -s "$exported"
+          done
+          node frontend/scripts/test-pipixia-representation.mjs "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT"
+          node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_SHANGHAI_EXAMPLES"
+          node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_PULL_EXAMPLES"
+          (cd frontend && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
 
       - name: Typecheck and test the frontend and download lifecycle
         working-directory: frontend
