@@ -19,12 +19,18 @@ snap.example.com {
     encode @compress zstd gzip
     header X-Content-Type-Options nosniff
     header Referrer-Policy no-referrer
+    header Strict-Transport-Security "max-age=31536000"
+    header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
     # The download bridge is a same-origin iframe, not a public embedding surface.
-    # Mutually exclusive setters avoid duplicate or conflicting framing headers.
+    # Mutually exclusive setters avoid duplicate or conflicting framing and CSP headers.
+    @monitor path /monitor /monitor.html
     @download_bridge path /downloads/bridge.html
     @not_download_bridge not path /downloads/bridge.html
+    @default_csp not path /monitor /monitor.html /downloads/bridge.html
     header @download_bridge X-Frame-Options SAMEORIGIN
     header @not_download_bridge X-Frame-Options DENY
+    header @download_bridge Content-Security-Policy "default-src 'none'; script-src 'self'; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+    header @default_csp Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-lU5QEegjpHofhq3MItVD2EtdZznktPh4EX6foieDHns='; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data: blob:; media-src 'self' https: http: blob:; connect-src 'self' https: http:; worker-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     # A 304 cannot replace Chromium's previously cached X-Frame-Options: DENY.
     # Return the small bridge document in full without touching Worker caching.
     request_header @download_bridge -If-None-Match
@@ -85,13 +91,18 @@ snap.example.com {
         header Cache-Control "no-cache"
         file_server
     }
+    handle /llms.txt {
+        root * /srv/dokitool/current/frontend/dist
+        header Content-Type "text/plain; charset=utf-8"
+        header Cache-Control "no-cache"
+        file_server
+    }
     handle /social/dokitool-share-v1.png {
         root * /srv/dokitool/current/frontend/dist
         header Content-Type "image/png"
         header Cache-Control "no-cache"
         file_server
     }
-    @monitor path /monitor /monitor.html
     handle @monitor {
         root * /srv/dokitool/current/frontend/dist
         header Content-Type "text/html; charset=utf-8"
@@ -107,17 +118,25 @@ snap.example.com {
             # HTML and non-versioned files revalidate; API/media routes above are unaffected.
             header Cache-Control "no-cache"
             @versioned {
-                path_regexp hashed ^/assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8}\.(js|css|png|webp|svg|ico|woff2|ttf)$
+                path_regexp hashed ^/assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8}\.(js|css|png|webp|svg|ico|woff2|ttf)(?:\.(?:br|gz))?$
                 file {path}
             }
             header @versioned Cache-Control "public, max-age=31536000, immutable"
-            # A missing chunk must return 404, never long-cache the SPA HTML as JavaScript.
+            # A missing chunk must return 404, never long-cache HTML as JavaScript.
             handle /assets/* {
+                file_server {
+                    precompressed br gzip
+                }
+            }
+            # Serve only real static files (/ and /index.html included); return true 404 for unknown paths.
+            @existing_static {
+                file {path} {path}/index.html
+            }
+            handle @existing_static {
                 file_server
             }
             handle {
-                try_files {path} /index.html
-                file_server
+                respond 404
             }
         }
     }

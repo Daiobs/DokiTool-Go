@@ -1,0 +1,47 @@
+# DokiTool
+
+> DokiTool (https://snap.dokitool.com/) is a multi-platform share-link parser and browser-direct media preview/download tool supporting 14 core platforms plus optional long-tail public sites via a unified JSON contract (v1.0).
+
+## Supported Platforms
+
+DokiTool supports 14 core platforms (14 个核心平台):
+
+- Douyin (抖音): video, image, live photo
+- Kuaishou (快手): video, image
+- Bilibili (B站): video, multipart, collection
+- Xiaohongshu (小红书): video, image, live photo
+- Toutiao (今日头条): video
+- Weibo (微博): video
+- Pipixia (皮皮虾): video, image
+- Pipigx (皮皮搞笑): video
+- Zuiyou (最右): video, image
+- X (Twitter): video, image
+- YouTube: video
+- Instagram: video, image
+- Facebook: video
+- Tumblr: video
+
+Optional Tier-2 long-tail public sites: when an instance enables `DOKITOOL_YTDLP_GENERIC_ENABLED` and `platform=all` (or `platform` is omitted), `GET /api/parse` also supports named `yt-dlp` extractors for public third-party media links (blind generic scraping is disabled).
+
+## Architecture & Privacy
+
+- Browser-direct downloads: media bytes are fetched directly from upstream platform CDNs by the user's browser; the backend performs link parsing and contract normalization only, with zero server media proxying (except the HMAC-signed same-origin `/api/media/weibo` relay for anonymous web visitors).
+- Zero user cookies or login (无 Cookie、免登录): requests do not read, collect, or forward browser site cookies, and no user account login is required.
+- Chrome MV3 Extension (`v4.2.0`): downloadable at https://snap.dokitool.com/helper/dokitool-chrome-extension.zip. Built with zero `<all_urls>` host wildcards and zero content script injection (`sidePanel` + `offscreen` OPFS + Mediabunny lossless muxing). Supports Bilibili 1080p login-free DASH muxing and zero-userscript YouTube HD / 4K60 parsing and lossless muxing.
+
+## Unified JSON Contract v1 API
+
+All public JSON API endpoints require `schema_version=1.0` and return `application/json; charset=utf-8` with `Cache-Control: no-store`:
+
+- `GET /api/platforms?schema_version=1.0`: list enabled core platforms and capabilities.
+- `GET /api/parse?schema_version=1.0&url=<encoded_url>`: parse a share URL or share text into unified media items, variants, and direct CDN sources (optional `platform` and `debug=1`).
+- `GET /api/resolve?schema_version=1.0&url=<encoded_url>&item_id=<id>`: resolve deferred media items on demand (such as Bilibili multipart episodes).
+
+### Agent Channel & Specifications
+
+- Optional Bearer API key authentication (`Authorization: Bearer <token>`) is available for automated agents and personal batch workflows; tokens must only be sent in the `Authorization` header (never in URL query parameters or forwarded to third-party media CDNs).
+- Machine-readable OpenAPI 3.1.0 specification and Agent integration guide are maintained in the repository at `docs/openapi.json` and `docs/AGENT-API.md`.
+
+## Monitoring
+
+- `/monitor` is a strictly read-only operational dashboard (`noindex`, zero public write endpoints) backed by `GET /api/stats`, which requires an `owner`-role Bearer token.
