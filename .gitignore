@@ -128,6 +128,7 @@
 !/backend/internal/probe/
 !/backend/internal/shresolver/
 !/backend/internal/testsupport/
+!/backend/internal/testutil/
 !/backend/internal/unified/
 !/backend/internal/urlpolicy/
 !/backend/internal/ytengine/
@@ -383,7 +384,10 @@
 !/backend/internal/api/bilibili_shanghai_test.go
 !/backend/internal/api/bilibili_test.go
 !/backend/internal/api/cache.go
+!/backend/internal/api/cache_concurrency_traits_test.go
+!/backend/internal/api/cache_safety_benchmark_test.go
 !/backend/internal/api/cache_test.go
+!/backend/internal/api/cache_ttl_lru_test.go
 !/backend/internal/api/capacity_test.go
 !/backend/internal/api/circuit_breaker.go
 !/backend/internal/api/circuit_breaker_test.go
@@ -399,8 +403,13 @@
 !/backend/internal/api/runtime_config.go
 !/backend/internal/api/runtime_config_test.go
 !/backend/internal/api/stats.go
+!/backend/internal/api/stats_buckets.go
+!/backend/internal/api/stats_histogram.go
 !/backend/internal/api/stats_persistence.go
+!/backend/internal/api/stats_reporter.go
+!/backend/internal/api/stats_snapshot.go
 !/backend/internal/api/stats_test.go
+!/backend/internal/api/stats_types.go
 !/backend/internal/api/tbvideo_outcome.go
 !/backend/internal/api/tbvideo_outcome_test.go
 !/backend/internal/api/toutiao_http_test.go
@@ -472,6 +481,9 @@
 !/backend/internal/shresolver/stats.go
 /backend/internal/testsupport/*
 !/backend/internal/testsupport/publicoracle/
+/backend/internal/testutil/*
+!/backend/internal/testutil/oracle.go
+!/backend/internal/testutil/oracle_test.go
 /backend/internal/unified/*
 !/backend/internal/unified/baseline_test.go
 !/backend/internal/unified/contract_test.go
@@ -505,7 +517,10 @@
 !/backend/internal/ytengine/adapter.go
 !/backend/internal/ytengine/cover.go
 !/backend/internal/ytengine/engine.go
+!/backend/internal/ytengine/engine_generic_pools_test.go
+!/backend/internal/ytengine/engine_review_regression_test.go
 !/backend/internal/ytengine/engine_test.go
+!/backend/internal/ytengine/engine_variants_zipapp_test.go
 !/backend/internal/ytengine/gate.go
 !/backend/internal/ytengine/gate_handshake_test.go
 !/backend/internal/ytengine/gate_lifecycle_test.go
@@ -786,7 +801,11 @@
 !/backend/internal/platform/x/fxtwitter.go
 !/backend/internal/platform/x/parser.go
 !/backend/internal/platform/x/parser_golden_test.go
+!/backend/internal/platform/x/parser_photos_test.go
+!/backend/internal/platform/x/parser_syndication_video_test.go
+!/backend/internal/platform/x/parser_tco_test.go
 !/backend/internal/platform/x/parser_test.go
+!/backend/internal/platform/x/parser_tombstone_test.go
 !/backend/internal/platform/x/probe.go
 !/backend/internal/platform/x/syndication.go
 /backend/internal/platform/xiaohongshu/*

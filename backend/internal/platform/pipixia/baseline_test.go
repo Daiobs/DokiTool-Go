@@ -3,16 +3,15 @@ package pipixia
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/testutil"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -106,56 +105,6 @@ func oracleParser(t *testing.T, input unified.Object) (*Parser, *oracleExecutor,
 	return parser, executor, &calls
 }
 
-func oracleDifference(got, want any, path string) string {
-	if unified.Equal(got, want) {
-		return ""
-	}
-	a, b := unified.Map(got), unified.Map(want)
-	if a != nil && b != nil {
-		keys := map[string]bool{}
-		for key := range a {
-			keys[key] = true
-		}
-		for key := range b {
-			keys[key] = true
-		}
-		ordered := make([]string, 0, len(keys))
-		for key := range keys {
-			ordered = append(ordered, key)
-		}
-		sort.Strings(ordered)
-		for _, key := range ordered {
-			av, ap := a[key]
-			bv, bp := b[key]
-			if ap != bp {
-				return fmt.Sprintf("%s.%s: presence got=%v want=%v", path, key, ap, bp)
-			}
-			if difference := oracleDifference(av, bv, path+"."+key); difference != "" {
-				return difference
-			}
-		}
-	}
-	x, y := unified.Slice(got), unified.Slice(want)
-	if x != nil && y != nil {
-		if len(x) != len(y) {
-			return fmt.Sprintf("%s: length got=%d want=%d", path, len(x), len(y))
-		}
-		for index := range x {
-			if difference := oracleDifference(x[index], y[index], fmt.Sprintf("%s[%d]", path, index)); difference != "" {
-				return difference
-			}
-		}
-	}
-	return fmt.Sprintf("%s: got %#v (%T); want %#v (%T)", path, got, got, want, want)
-}
-
-func oracleEqual(t *testing.T, got, want any) {
-	t.Helper()
-	if difference := oracleDifference(got, want, "$"); difference != "" {
-		t.Fatal(difference)
-	}
-}
-
 func oracleRequests(t *testing.T, executor *oracleExecutor, clockCalls int, expected unified.Object) {
 	t.Helper()
 	wanted := unified.Array{}
@@ -163,8 +112,8 @@ func oracleRequests(t *testing.T, executor *oracleExecutor, clockCalls int, expe
 		request := unified.Clone(unified.Map(raw))
 		wanted = append(wanted, request)
 	}
-	oracleEqual(t, executor.requests, wanted)
-	oracleEqual(t, clockCalls, expected["clock_calls"])
+	testutil.OracleEqual(t, executor.requests, wanted)
+	testutil.OracleEqual(t, clockCalls, expected["clock_calls"])
 	if executor.position != len(executor.responses) {
 		t.Fatal("unused HTTP tape entries")
 	}
@@ -211,7 +160,7 @@ func TestPHPPipixiaBaseline(t *testing.T) {
 				t.Run(view, func(t *testing.T) {
 					got := unified.PublicView(full, debug, now)
 					actual[view] = got
-					oracleEqual(t, got, expected[view])
+					testutil.OracleEqual(t, got, expected[view])
 					if err := unified.ValidateEnvelopeAt(got, now); err != nil {
 						t.Fatal(err)
 					}
@@ -226,12 +175,12 @@ func TestPHPPipixiaBaseline(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				oracleEqual(t, legacy, expected["parser_response"])
+				testutil.OracleEqual(t, legacy, expected["parser_response"])
 				wire, err := legacyWire(legacy)
 				if err != nil {
 					t.Fatal(err)
 				}
-				oracleEqual(t, wire, expected["legacy_response"])
+				testutil.OracleEqual(t, wire, expected["legacy_response"])
 				oracleRequests(t, legacyExecutor, *legacyCalls, expected)
 			})
 		})
