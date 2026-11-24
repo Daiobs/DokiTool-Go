@@ -26,7 +26,7 @@ import (
 )
 
 // PinnedVersion is the locked yt-dlp release approved for this build.
-const PinnedVersion = "2026.10.26"
+const PinnedVersion = "2026.11.23"
 
 const (
 	defaultStaleTempMaxAge     = 2 * time.Hour
@@ -46,12 +46,12 @@ var staleTempCleanupOnce sync.Once
 // OfficialSHA256Sums contains the official SHA2-256SUMS for PinnedVersion
 // (https://github.com/yt-dlp/yt-dlp/releases/download/<PinnedVersion>/SHA2-256SUMS).
 var OfficialSHA256Sums = map[string]string{
-	"e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3": "yt-dlp",
-	"767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795": "yt-dlp_linux",
-	"e87e9533e89fe5889abaa21f5114dfe7756d6aa6219b83551add04d48b18e483": "yt-dlp_linux_aarch64",
-	"0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa": "yt-dlp_macos",
-	"f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d": "yt-dlp.exe",
-	"0066dbac3c124028e2dcae2a197fccee33cd91f456313d24f7af89fd54590e98": "yt-dlp_arm64.exe",
+	"e8665ed64d6b9172773e812f891fb707a0cb1ee8d9ef4fc1acb00cabee4c5256": "yt-dlp",
+	"249ddb058234276bc449b9cd9492aad9f133bda5923c61a9e39983ae114ef17d": "yt-dlp_linux",
+	"fb847a2e4a9ddc8cf5fcfb4bb7f42ba8969ecf72068def0278074f9d300bd13c": "yt-dlp_linux_aarch64",
+	"57654854886d0398a798895aadf5173e2749fbb5e249b9f3728022ab376e11fb": "yt-dlp_macos",
+	"622ed48023cac1daa52a3bf3a6ac38f03514de214b5f0fa069389fd0f6d17e5c": "yt-dlp.exe",
+	"9bb324203d02970b70dab6c9f6a48bd5ff185db7859d562cdacd1dc655ccb72a": "yt-dlp_arm64.exe",
 }
 
 // Config configures a verified yt-dlp metadata extraction engine.
