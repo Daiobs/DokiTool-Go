@@ -11,19 +11,24 @@ tokens, tickets, signatures, and IP addresses from JSON and Markdown outputs.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import ipaddress
 import json
 from pathlib import Path
 import re
 import secrets
+import socket
+import ssl
 import sys
+import threading
 import time
 from typing import Any, Callable, Iterable
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -35,6 +40,10 @@ DEFAULT_MIN_PARSE_INTERVAL = 8.0
 DEFAULT_RETRY_INTERVAL = 10.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT_SECONDS = 50.0
+DEFAULT_FRONTEND_CONCURRENCY = 6
+MAX_FRONTEND_CONCURRENCY = 8
+DEFAULT_IPV6_PROBE_TIMEOUT = 1.5
+DEFAULT_IDLE_CONNECTION_TTL = 55.0
 
 PARSE_GROUPS: tuple[str, ...] = (
     "cache",
@@ -163,17 +172,306 @@ class SharedParseEntry:
     retry_count: int
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Forbid following any HTTP redirect so requests never leave --base-url."""
+_RETRIABLE_STALE_CONN_ERRORS: tuple[type[BaseException], ...] = (
+    http.client.RemoteDisconnected,
+    http.client.BadStatusLine,
+    http.client.CannotSendRequest,
+    http.client.ResponseNotReady,
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+)
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, D401
-        raise urllib.error.HTTPError(
-            req.full_url,
-            code,
-            f"unexpected HTTP redirect {code}",
-            headers,
-            fp,
+
+def _is_loopback_host(host: str) -> bool:
+    candidate = (host or "").strip().lower().rstrip(".")
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def _resolve_proxy_for_origin(scheme: str, host: str) -> tuple[str, int] | None:
+    """Resolve an HTTP CONNECT / forwarding proxy from environment or OS settings.
+
+    Loopback targets always bypass proxies. Proxy URLs containing credentials are
+    rejected so Proxy-Authorization is never transmitted.
+    """
+    if _is_loopback_host(host):
+        return None
+    try:
+        if urllib.request.proxy_bypass(host):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
+    proxies = urllib.request.getproxies()
+    raw_proxy = proxies.get(scheme)
+    if not raw_proxy:
+        return None
+    candidate = raw_proxy.strip()
+    if not candidate:
+        return None
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.username is not None or parsed.password is not None:
+        raise SmokeError("proxy credentials are forbidden")
+    if parsed.scheme != "http" or not parsed.hostname:
+        return None
+    return parsed.hostname, int(parsed.port or 80)
+
+
+def _interleave_addrinfos_by_family(infos: list[Any]) -> list[Any]:
+    """Interleave getaddrinfo tuples round-robin by address family (RFC 8305 order)."""
+    buckets: dict[int, deque[Any]] = {}
+    order: list[int] = []
+    for info in infos:
+        af = int(info[0])
+        if af not in buckets:
+            buckets[af] = deque()
+            order.append(af)
+        buckets[af].append(info)
+    interleaved: list[Any] = []
+    while order:
+        next_order: list[int] = []
+        for af in order:
+            bucket = buckets[af]
+            if bucket:
+                interleaved.append(bucket.popleft())
+            if bucket:
+                next_order.append(af)
+        order = next_order
+    return interleaved
+
+
+class _DualStackDialer:
+    """Dual-stack TCP dialer with fast IPv6 fallback and per-host address-family caching."""
+
+    def __init__(
+        self,
+        *,
+        ipv6_probe_timeout: float = DEFAULT_IPV6_PROBE_TIMEOUT,
+        getaddrinfo_fn: Callable[..., list[Any]] = socket.getaddrinfo,
+        socket_factory: Callable[[int, int, int], Any] = socket.socket,
+    ) -> None:
+        self._ipv6_probe_timeout = max(0.05, float(ipv6_probe_timeout))
+        self._getaddrinfo = getaddrinfo_fn
+        self._socket_factory = socket_factory
+        self._lock = threading.Lock()
+        self._probe_locks: dict[tuple[str, int], threading.Lock] = {}
+        self._preferred_families: dict[tuple[str, int], int] = {}
+        self._fallback_keys: set[tuple[str, int]] = set()
+
+    def preferred_family(self, host: str, port: int) -> int | None:
+        key = (host.lower(), int(port))
+        with self._lock:
+            return self._preferred_families.get(key)
+
+    def fallback_detected(self, host: str, port: int) -> bool:
+        key = (host.lower(), int(port))
+        with self._lock:
+            return key in self._fallback_keys
+
+    def _get_probe_lock(self, key: tuple[str, int]) -> threading.Lock:
+        with self._lock:
+            lock = self._probe_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._probe_locks[key] = lock
+            return lock
+
+    def _clear_preferred_family(self, key: tuple[str, int], expected: int) -> None:
+        with self._lock:
+            if self._preferred_families.get(key) == expected:
+                del self._preferred_families[key]
+
+    def _record_preferred_family(
+        self,
+        key: tuple[str, int],
+        family: int,
+        *,
+        fell_back: bool,
+    ) -> None:
+        with self._lock:
+            self._preferred_families[key] = family
+            if fell_back:
+                self._fallback_keys.add(key)
+
+    def _dial_single_family(
+        self,
+        host: str,
+        port: int,
+        family: int,
+        timeout: float | None,
+        source_address: tuple[str, int] | None,
+    ) -> Any:
+        infos = self._getaddrinfo(host, port, family, socket.SOCK_STREAM)
+        if not infos:
+            raise OSError("getaddrinfo returns an empty list")
+        last_err: OSError | None = None
+        for af, socktype, proto, _canonname, sa in infos:
+            sock = None
+            try:
+                sock = self._socket_factory(af, socktype, proto)
+                if timeout is not None:
+                    sock.settimeout(timeout)
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sa)
+                return sock
+            except OSError as exc:
+                last_err = exc
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        assert last_err is not None
+        raise last_err
+
+    def create_connection(
+        self,
+        address: tuple[str, int],
+        timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
+        source_address: tuple[str, int] | None = None,
+    ) -> Any:
+        host, port = address
+        key = (host.lower(), int(port))
+
+        cached = self.preferred_family(host, port)
+        if cached is not None:
+            try:
+                return self._dial_single_family(host, port, cached, timeout, source_address)
+            except OSError:
+                self._clear_preferred_family(key, cached)
+
+        # Single-flight initial dual-stack discovery so concurrent cold-start workers
+        # never trigger duplicate IPv6 fallback timeouts simultaneously.
+        probe_lock = self._get_probe_lock(key)
+        with probe_lock:
+            cached = self.preferred_family(host, port)
+            if cached is None:
+                raw_infos = self._getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+                if not raw_infos:
+                    raise OSError("getaddrinfo returns an empty list")
+                ordered = _interleave_addrinfos_by_family(raw_infos)
+                distinct_families = {int(info[0]) for info in ordered}
+                failed_families: set[int] = set()
+                last_err: OSError | None = None
+                for idx, (af, socktype, proto, _canonname, sa) in enumerate(ordered):
+                    has_alt_family_ahead = any(
+                        int(other[0]) != int(af) for other in ordered[idx + 1 :]
+                    )
+                    if (
+                        len(distinct_families) > 1
+                        and has_alt_family_ahead
+                        and int(af) == int(socket.AF_INET6)
+                    ):
+                        attempt_timeout = (
+                            min(timeout, self._ipv6_probe_timeout)
+                            if timeout is not None
+                            else self._ipv6_probe_timeout
+                        )
+                    else:
+                        attempt_timeout = timeout
+
+                    sock = None
+                    try:
+                        sock = self._socket_factory(af, socktype, proto)
+                        if attempt_timeout is not None:
+                            sock.settimeout(attempt_timeout)
+                        if source_address:
+                            sock.bind(source_address)
+                        sock.connect(sa)
+                        if timeout is not None and attempt_timeout != timeout:
+                            sock.settimeout(timeout)
+                        fell_back = bool(failed_families - {int(af)})
+                        self._record_preferred_family(key, int(af), fell_back=fell_back)
+                        return sock
+                    except OSError as exc:
+                        last_err = exc
+                        failed_families.add(int(af))
+                        if sock is not None:
+                            try:
+                                sock.close()
+                            except OSError:
+                                pass
+                assert last_err is not None
+                raise last_err
+
+        # Another thread cached the working family while we waited; dial concurrently.
+        return self._dial_single_family(host, port, cached, timeout, source_address)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP/1.1 Keep-Alive connection backed by _DualStackDialer."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        dialer: _DualStackDialer,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._dialer = dialer
+
+    def connect(self) -> None:
+        self.sock = self._dialer.create_connection(
+            (self.host, self.port),
+            self.timeout,
+            self.source_address,
         )
+        if self._tunnel_host:
+            try:
+                self._tunnel()
+            except Exception:
+                self.close()
+                raise
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS/1.1 Keep-Alive connection backed by _DualStackDialer and verified TLS."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        context: ssl.SSLContext,
+        dialer: _DualStackDialer,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._dialer = dialer
+
+    def connect(self) -> None:
+        raw_sock = self._dialer.create_connection(
+            (self.host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = raw_sock
+        try:
+            if self._tunnel_host:
+                server_hostname = self._tunnel_host
+                self._tunnel()
+            else:
+                server_hostname = self.host
+            self.sock = self._context.wrap_socket(
+                self.sock,
+                server_hostname=server_hostname,
+            )
+        except Exception:
+            self.close()
+            raise
 
 
 def _is_ip_literal(value: str) -> bool:
@@ -287,7 +585,13 @@ def parse_base_url(raw_base_url: str) -> tuple[str, str, str]:
 
 
 class OriginLockedClient:
-    """Read-only, cookie-free, credential-free HTTP GET client locked to one origin."""
+    """Read-only, cookie-free, credential-free HTTP GET client locked to one origin.
+
+    Maintains a thread-safe pool of persistent HTTP/1.1 Keep-Alive connections
+    backed by _DualStackDialer (with fast IPv6 fallback and per-host address
+    family caching), never follows HTTP redirects, and never stores cookies or
+    credentials.
+    """
 
     def __init__(
         self,
@@ -296,39 +600,148 @@ class OriginLockedClient:
         clock: Clock | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         min_parse_interval: float = DEFAULT_MIN_PARSE_INTERVAL,
+        pool_maxsize: int = DEFAULT_FRONTEND_CONCURRENCY,
+        ipv6_probe_timeout: float = DEFAULT_IPV6_PROBE_TIMEOUT,
+        idle_connection_ttl: float = DEFAULT_IDLE_CONNECTION_TTL,
+        dialer: _DualStackDialer | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+        use_env_proxies: bool = True,
     ) -> None:
         self.origin, self.scheme, self.netloc = parse_base_url(base_url)
         parsed = urllib.parse.urlsplit(self.origin)
-        self.target_host = sanitize_hostname(parsed.hostname or "")
+        self.host = parsed.hostname or ""
+        self.port = int(parsed.port or (443 if self.scheme == "https" else 80))
+        self.target_host = sanitize_hostname(self.host)
         self.clock = clock or Clock()
         self.timeout_seconds = timeout_seconds
         self.min_parse_interval = min_parse_interval
         self.last_parse_ts: float | None = None
         self.last_pool_ts: dict[str, float] = {}
 
-        opener = urllib.request.build_opener(_NoRedirectHandler())
-        # Explicitly verify no cookie jar / auth handler is attached.
-        opener.handlers = [
-            h
-            for h in opener.handlers
-            if not isinstance(
-                h,
-                (
-                    urllib.request.HTTPCookieProcessor,
-                    urllib.request.HTTPBasicAuthHandler,
-                    urllib.request.HTTPDigestAuthHandler,
-                    urllib.request.ProxyBasicAuthHandler,
-                    urllib.request.ProxyDigestAuthHandler,
-                ),
+        self._pool_maxsize = max(1, int(pool_maxsize))
+        self._idle_ttl = max(1.0, float(idle_connection_ttl))
+        self._dialer = dialer or _DualStackDialer(ipv6_probe_timeout=ipv6_probe_timeout)
+        self._ssl_context = (
+            ssl_context
+            if ssl_context is not None
+            else (ssl.create_default_context() if self.scheme == "https" else None)
+        )
+        self._proxy: tuple[str, int] | None = (
+            _resolve_proxy_for_origin(self.scheme, self.host) if use_env_proxies else None
+        )
+        self._pool_lock = threading.Lock()
+        self._idle_conns: deque[tuple[http.client.HTTPConnection, float]] = deque()
+        self._closed = False
+
+    def __enter__(self) -> "OriginLockedClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        self.close()
+
+    def close(self) -> None:
+        with self._pool_lock:
+            self._closed = True
+            pending = list(self._idle_conns)
+            self._idle_conns.clear()
+        for conn, _idle_since in pending:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _new_connection(self) -> http.client.HTTPConnection:
+        if self.scheme == "https":
+            assert self._ssl_context is not None
+            if self._proxy is not None:
+                proxy_host, proxy_port = self._proxy
+                conn = _PinnedHTTPSConnection(
+                    proxy_host,
+                    port=proxy_port,
+                    timeout=self.timeout_seconds,
+                    context=self._ssl_context,
+                    dialer=self._dialer,
+                )
+                conn.set_tunnel(self.host, self.port)
+                return conn
+            return _PinnedHTTPSConnection(
+                self.host,
+                port=self.port,
+                timeout=self.timeout_seconds,
+                context=self._ssl_context,
+                dialer=self._dialer,
             )
-        ]
-        self._opener = opener
+
+        if self._proxy is not None:
+            proxy_host, proxy_port = self._proxy
+            return _PinnedHTTPConnection(
+                proxy_host,
+                port=proxy_port,
+                timeout=self.timeout_seconds,
+                dialer=self._dialer,
+            )
+        return _PinnedHTTPConnection(
+            self.host,
+            port=self.port,
+            timeout=self.timeout_seconds,
+            dialer=self._dialer,
+        )
+
+    def _checkout_connection(self) -> tuple[http.client.HTTPConnection, bool]:
+        now_wall = time.monotonic()
+        stale: list[http.client.HTTPConnection] = []
+        chosen: http.client.HTTPConnection | None = None
+        with self._pool_lock:
+            while self._idle_conns:
+                conn, idle_since = self._idle_conns.pop()
+                if conn.sock is None or (now_wall - idle_since) > self._idle_ttl:
+                    stale.append(conn)
+                    continue
+                chosen = conn
+                break
+        for conn in stale:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if chosen is not None:
+            return chosen, True
+        return self._new_connection(), False
+
+    def _release_connection(
+        self,
+        conn: http.client.HTTPConnection,
+        *,
+        reusable: bool,
+    ) -> None:
+        if not reusable or conn.sock is None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        now_wall = time.monotonic()
+        evicted: http.client.HTTPConnection | None = None
+        with self._pool_lock:
+            if self._closed:
+                evicted = conn
+            elif len(self._idle_conns) >= self._pool_maxsize:
+                evicted = conn
+            else:
+                self._idle_conns.append((conn, now_wall))
+        if evicted is not None:
+            try:
+                evicted.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def get_raw(self, path_and_query: str, *, accept: str = "application/json") -> RawHttpResponse:
         if not path_and_query.startswith("/"):
             raise SmokeError("request path must start with '/'")
         if path_and_query.startswith("//"):
             raise SmokeError("protocol-relative paths are forbidden")
+        if "\r" in path_and_query or "\n" in path_and_query:
+            raise SmokeError("control characters in request path are forbidden")
         path_only = path_and_query.split("?", 1)[0]
         if path_only.startswith("/api/media"):
             raise SmokeError("fetching media relay endpoints is forbidden")
@@ -340,28 +753,68 @@ class OriginLockedClient:
         if parsed.username is not None or parsed.password is not None:
             raise SmokeError("URL credentials blocked by origin lock")
 
-        headers = {
+        headers: dict[str, str] = {
             "Accept": accept,
             "Accept-Encoding": "identity",
             "User-Agent": "DokiTool-ProdSmoke/1.0",
+            "Connection": "keep-alive",
         }
-        req = urllib.request.Request(full_url, headers=headers, method="GET")
-        for header_name, _ in req.header_items():
+        if self.scheme == "http" and self._proxy is not None:
+            request_target = full_url
+            headers["Host"] = self.netloc
+        else:
+            request_target = path_and_query
+
+        for header_name in headers:
             if header_name.lower() in FORBIDDEN_REQUEST_HEADERS or "token" in header_name.lower():
                 raise SmokeError(f"forbidden credential header blocked: {header_name}")
 
         t0 = self.clock.now()
-        try:
-            with self._opener.open(req, timeout=self.timeout_seconds) as resp:
+        conn, reused = self._checkout_connection()
+        for attempt in range(2):
+            try:
+                conn.request("GET", request_target, headers=headers)
+                resp = conn.getresponse()
                 body = resp.read()
                 status = int(resp.status)
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-        except urllib.error.HTTPError as exc:
-            body = exc.read() if exc.fp is not None else b""
-            status = int(exc.code)
-            resp_headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
-        elapsed_ms = max(0, int(round((self.clock.now() - t0) * 1000.0)))
-        return RawHttpResponse(status=status, headers=resp_headers, body=body, elapsed_ms=elapsed_ms)
+                resp_headers: dict[str, str] = {}
+                for raw_k, raw_v in resp.getheaders():
+                    lk = raw_k.lower()
+                    if lk in resp_headers:
+                        resp_headers[lk] = f"{resp_headers[lk]}, {raw_v}"
+                    else:
+                        resp_headers[lk] = raw_v
+                conn_hdr = resp_headers.get("connection", "").lower()
+                reusable = (
+                    not resp.will_close
+                    and "close" not in conn_hdr
+                    and conn.sock is not None
+                )
+                self._release_connection(conn, reusable=reusable)
+                elapsed_ms = max(0, int(round((self.clock.now() - t0) * 1000.0)))
+                return RawHttpResponse(
+                    status=status,
+                    headers=resp_headers,
+                    body=body,
+                    elapsed_ms=elapsed_ms,
+                )
+            except _RETRIABLE_STALE_CONN_ERRORS:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if reused and attempt == 0:
+                    conn = self._new_connection()
+                    reused = False
+                    continue
+                raise
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        raise SmokeError("unreachable HTTP request state")
 
     def get_parse(
         self,
@@ -642,6 +1095,7 @@ class SmokeRunner:
         enable_rate_limit: bool = False,
         retry_interval: float = DEFAULT_RETRY_INTERVAL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        frontend_concurrency: int = DEFAULT_FRONTEND_CONCURRENCY,
     ) -> None:
         self.client = client
         self.samples = samples
@@ -651,6 +1105,12 @@ class SmokeRunner:
         self.enable_rate_limit = enable_rate_limit
         self.retry_interval = retry_interval
         self.max_attempts = max(1, int(max_attempts))
+        concurrency = int(frontend_concurrency)
+        if concurrency < 1 or concurrency > MAX_FRONTEND_CONCURRENCY:
+            raise SmokeError(
+                f"invalid --frontend-concurrency {concurrency}: expected 1..{MAX_FRONTEND_CONCURRENCY}"
+            )
+        self.frontend_concurrency = concurrency
         self.shared_parses: dict[str, SharedParseEntry] = {}
 
     def _sample_entry(self, sample_key: str) -> tuple[str, str]:
@@ -821,24 +1281,38 @@ class SmokeRunner:
             )
             targets.append((rel_str, "/" + encoded_segments, str(dist_files[rel_path]).lower()))
 
-        total_elapsed = 0
-        mismatches: list[str] = []
-        last_status = 200
-        for label, req_path, expected_sha in targets:
+        t0 = self.client.clock.now()
+        worker_count = min(self.frontend_concurrency, len(targets))
+
+        def _verify_one(target: tuple[str, str, str]) -> tuple[str | None, int]:
+            label, req_path, expected_sha = target
             try:
                 resp = self.client.get_raw(req_path, accept="*/*")
+            except SmokeError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                mismatches.append(f"{label}:network_error({sanitize_text(str(exc))})")
-                last_status = 0
-                continue
-            total_elapsed += resp.elapsed_ms
+                return f"{label}:network_error({sanitize_text(str(exc))})", 0
             if resp.status != 200:
-                last_status = resp.status
-                mismatches.append(f"{label}:HTTP_{resp.status}")
-                continue
+                return f"{label}:HTTP_{resp.status}", resp.status
             actual_sha = hashlib.sha256(resp.body).hexdigest()
             if actual_sha != expected_sha:
-                mismatches.append(f"{label}:sha256_mismatch")
+                return f"{label}:sha256_mismatch", 200
+            return None, 200
+
+        if worker_count <= 1:
+            outcomes = [_verify_one(target) for target in targets]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                outcomes = list(executor.map(_verify_one, targets))
+
+        total_elapsed = max(0, int(round((self.client.clock.now() - t0) * 1000.0)))
+        mismatches: list[str] = []
+        last_status = 200
+        for err_msg, status_code in outcomes:
+            if err_msg is not None:
+                mismatches.append(err_msg)
+                if status_code != 200:
+                    last_status = status_code
 
         release_tag = sanitize_text(str(manifest.get("release_tag") or "manifest"))
         if mismatches:
@@ -1590,6 +2064,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Per-request HTTP timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS:g})",
     )
     parser.add_argument(
+        "--frontend-concurrency",
+        type=int,
+        default=DEFAULT_FRONTEND_CONCURRENCY,
+        help=(
+            f"Worker threads and Keep-Alive pool size for frontend_hashes "
+            f"(1..{MAX_FRONTEND_CONCURRENCY}, default: {DEFAULT_FRONTEND_CONCURRENCY})"
+        ),
+    )
+    parser.add_argument(
         "--json-out",
         type=Path,
         default=None,
@@ -1615,24 +2098,31 @@ def main(argv: list[str] | None = None, *, clock: Clock | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.frontend_concurrency < 1 or args.frontend_concurrency > MAX_FRONTEND_CONCURRENCY:
+            raise SmokeError(
+                f"invalid --frontend-concurrency {args.frontend_concurrency}: "
+                f"expected 1..{MAX_FRONTEND_CONCURRENCY}"
+            )
         samples = load_samples(args.samples, args.set_sample)
-        client = OriginLockedClient(
+        with OriginLockedClient(
             args.base_url,
             clock=clock,
             timeout_seconds=args.timeout,
             min_parse_interval=DEFAULT_MIN_PARSE_INTERVAL,
-        )
-        runner = SmokeRunner(
-            client,
-            samples,
-            manifest_path=args.manifest,
-            only_groups=args.only,
-            skip_groups=args.skip,
-            enable_rate_limit=args.enable_rate_limit,
-            retry_interval=DEFAULT_RETRY_INTERVAL,
-            max_attempts=DEFAULT_MAX_ATTEMPTS,
-        )
-        report = runner.run()
+            pool_maxsize=args.frontend_concurrency,
+        ) as client:
+            runner = SmokeRunner(
+                client,
+                samples,
+                manifest_path=args.manifest,
+                only_groups=args.only,
+                skip_groups=args.skip,
+                enable_rate_limit=args.enable_rate_limit,
+                retry_interval=DEFAULT_RETRY_INTERVAL,
+                max_attempts=DEFAULT_MAX_ATTEMPTS,
+                frontend_concurrency=args.frontend_concurrency,
+            )
+            report = runner.run()
         json_text = render_json_report(report)
         md_text = render_markdown_report(report)
 
