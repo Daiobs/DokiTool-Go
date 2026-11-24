@@ -361,6 +361,7 @@ export const filenameFor = (
   const isSingleItem = snapshot.total <= 1;
   const rawTitle = resolvePreferredMediaTitle({
     isSingleItem,
+    itemCount: snapshot.total,
     isAttachment: snapshot.isAttachment,
     isStandaloneAudioItem: Boolean(
       snapshot.hasClientHelper && snapshot.item.type === "audio",

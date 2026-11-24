@@ -5014,3 +5014,256 @@ test('P2: connected extension accelerates whitelisted slow progressive direct fi
     else globalThis.chrome = prevChrome;
   }
 });
+
+test('Issue #48 Batch 1: [P1-3] M2 YouTube 360p delegates to extension before attachment handoff, [P1-4] M2 Toutiao/tbvideo delegate to extension, and [P0-1] SW StreamingUnavailableError falls back to extension for whitelisted CDNs only', async () => {
+  const prevManager = globalThis.__uiDownloadManager;
+  const prevChrome = globalThis.chrome;
+
+  const enqueued = [];
+  const mockConnectedExtension = () => {
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version: '4.2.0',
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+              },
+            });
+            return;
+          }
+          if (msg.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+            const taskId = `b1-ext-${enqueued.length + 1}`;
+            enqueued.push({ taskId, payload: msg.payload });
+            cb({ ok: true, data: { taskId, status: 'queued' } });
+            return;
+          }
+          if (msg.type === 'WEB_EXT_GET_TASK_STATUS') {
+            const rec = enqueued.find((e) => e.taskId === msg.taskId);
+            cb({
+              ok: true,
+              data: {
+                taskId: msg.taskId,
+                status: 'completed',
+                phase: 'completed',
+                statusText: '已完成',
+                progress: 100,
+                loadedBytes: 4_000_000,
+                totalBytes: 4_000_000,
+                speedBytesPerSec: 0,
+                filename: rec?.payload?.filename || 'out.mp4',
+              },
+            });
+          }
+        },
+      },
+    };
+  };
+
+  try {
+    // 1. [P1-3] M2 YouTube 360p itag=18 with &title= MUST delegate to extension youtube_direct instead of opening a browser tab
+    mockConnectedExtension();
+    const yt360Url = 'https://rr1---sn-a5mekn6s.googlevideo.com/videoplayback?itag=18&expire=9999999999&title=Demo+Title';
+    const yt360Data = {
+      platform: 'youtube',
+      title: 'Demo Title',
+      default_item_id: 'yt-1',
+      items: [
+        {
+          id: 'yt-1',
+          type: 'video',
+          state: 'ready',
+          default: { variant_id: 'v-18', source_id: 's-18', url: yt360Url },
+          variants: [
+            {
+              id: 'v-18',
+              label: '360p (含音频)',
+              metadata: { width: 640, height: 360, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's-18', url: yt360Url, size_bytes: 4_000_000 }] },
+            },
+          ],
+        },
+      ],
+      extra: {
+        youtube_helper: { status: 'ready', provider: 'extension', version: '4.2.0', extensionVersion: '4.2.0' },
+      },
+    };
+    const hYt360 = harness(yt360Data);
+    await hYt360.instance.downloadMainVideo();
+    await waitUntil(() => hYt360.store.downloads[0]?.status === 'completed');
+    assert.equal(enqueued.length, 1);
+    assert.equal(enqueued[0].payload.kind, 'youtube_direct');
+    assert.equal(enqueued[0].payload.url, yt360Url);
+    assert.equal(clicked.length, 0, 'M2 YouTube 360p must NOT open a new browser tab');
+
+    // 2. [P1-4] M2 Toutiao (*.toutiaovod.com) delegates to extension direct_download with real Chinese filename
+    const toutiaoUrl = 'https://v3-default.toutiaovod.com/abc123/video/tos/cn/stream';
+    const toutiaoData = {
+      platform: 'toutiao',
+      title: '今日头条高清实测视频',
+      default_item_id: 'tt-1',
+      items: [
+        {
+          id: 'tt-1',
+          type: 'video',
+          state: 'ready',
+          default: { variant_id: 'v-tt', source_id: 's-tt', url: toutiaoUrl },
+          variants: [
+            {
+              id: 'v-tt',
+              label: '1080p',
+              metadata: { width: 1920, height: 1080, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's-tt', url: toutiaoUrl, size_bytes: 6_000_000 }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hToutiao = harness(toutiaoData);
+    await hToutiao.instance.downloadMainVideo();
+    await waitUntil(() => hToutiao.store.downloads[0]?.status === 'completed');
+    assert.equal(enqueued.length, 2);
+    assert.equal(enqueued[1].payload.kind, 'direct_download');
+    assert.equal(enqueued[1].payload.filename, '今日头条高清实测视频.mp4');
+    assert.deepEqual(enqueued[1].payload.routes, [toutiaoUrl]);
+    assert.equal(clicked.length, 0, 'M2 Toutiao must NOT fall back to opening raw tab');
+
+    // 3. [P1-4] M2 pipigx/zuiyou (item.tbvideo) delegates to extension direct_download with tbvideo candidate route
+    const tbPrimary = 'https://media.ippzone.com/video/primary.mp4';
+    const tbCandidate = 'https://tbvideo.ixiaochuan.cn/video/candidate.mp4';
+    const pipigxData = {
+      platform: 'pipigx',
+      title: '皮皮搞笑实测作品',
+      default_item_id: 'pg-1',
+      items: [
+        {
+          id: 'pg-1',
+          type: 'video',
+          state: 'ready',
+          tbvideo: { platform: 'pipigx', pid: '11', vid: '22', sources: { 's-pg': tbCandidate } },
+          default: { variant_id: 'v-pg', source_id: 's-pg', url: tbPrimary },
+          variants: [
+            {
+              id: 'v-pg',
+              label: '720p',
+              metadata: { width: 1280, height: 720, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's-pg', url: tbPrimary, size_bytes: 5_000_000 }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hPipigx = harness(pipigxData);
+    await hPipigx.instance.downloadMainVideo();
+    await waitUntil(() => hPipigx.store.downloads[0]?.status === 'completed');
+    assert.equal(enqueued.length, 3);
+    assert.equal(enqueued[2].payload.kind, 'direct_download');
+    assert.equal(enqueued[2].payload.filename, '皮皮搞笑实测作品.mp4');
+    assert.deepEqual(enqueued[2].payload.routes, [tbPrimary, tbCandidate]);
+
+    // 4. [P0-1] Web SW StreamingUnavailableError delegates whitelisted Kuaishou stream to connected extension,
+    //    while NEVER delegating an unwhitelisted generic domain to extension
+    let blobFallbackCalls = 0;
+    globalThis.__uiDownloadManager = {
+      async run(req, _signal, observe, opts) {
+        if (opts?.onStreamingUnavailable) {
+          const delegated = await opts.onStreamingUnavailable();
+          if (delegated) {
+            return {
+              id: req.id,
+              transport: 'browser_streaming',
+              status: 'handed-off',
+              filename: req.filename,
+              url: req.url,
+              loaded: 0,
+              total: 0,
+              speed: 0,
+              elapsed: 0.1,
+              averageSpeed: 0,
+            };
+          }
+        }
+        blobFallbackCalls++;
+        const doneSnap = {
+          id: req.id,
+          transport: 'blob',
+          status: 'completed',
+          filename: req.filename,
+          url: req.url,
+          loaded: 1024,
+          total: 1024,
+          speed: 0,
+          elapsed: 0.1,
+          averageSpeed: 10240,
+        };
+        observe(doneSnap);
+        return doneSnap;
+      },
+    };
+    const ksUrl = 'https://txmov2.a.kwimgs.com/upic/2026/demo.mp4';
+    const ksData = {
+      platform: 'kuaishou',
+      title: '快手SW降级测试',
+      default_item_id: 'ks-1',
+      items: [
+        {
+          id: 'ks-1',
+          type: 'video',
+          state: 'ready',
+          default: { variant_id: 'v-ks', source_id: 's-ks', url: ksUrl },
+          variants: [
+            {
+              id: 'v-ks',
+              label: '1080p',
+              metadata: { width: 1920, height: 1080, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's-ks', url: ksUrl, size_bytes: 3_000_000 }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hKs = harness(ksData);
+    await hKs.instance.downloadMainVideo();
+    await waitUntil(() => hKs.store.downloads[0]?.status === 'completed');
+    assert.equal(enqueued.length, 4, 'whitelisted Kuaishou must fall back to extension direct_download when SW is unavailable');
+    assert.equal(enqueued[3].payload.kind, 'direct_download');
+    assert.deepEqual(enqueued[3].payload.routes, [ksUrl]);
+    assert.equal(blobFallbackCalls, 0);
+
+    const genericUrl = 'https://cdn.unwhitelisted-generic.example/video.mp4';
+    const genericData = {
+      platform: 'vimeo',
+      title: 'Generic Unwhitelisted Clip',
+      default_item_id: 'g-1',
+      items: [
+        {
+          id: 'g-1',
+          type: 'video',
+          state: 'ready',
+          default: { variant_id: 'v-g', source_id: 's-g', url: genericUrl },
+          variants: [
+            {
+              id: 'v-g',
+              label: '1080p',
+              metadata: { width: 1920, height: 1080, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's-g', url: genericUrl, size_bytes: 3_000_000 }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hGeneric = harness(genericData);
+    await hGeneric.instance.downloadMainVideo();
+    await waitUntil(() => hGeneric.store.downloads[0]?.status === 'completed');
+    assert.equal(enqueued.length, 4, 'unwhitelisted generic domain must NEVER leak to extension on SW fallback');
+    assert.equal(blobFallbackCalls, 1, 'unwhitelisted generic domain must fall back to Web Blob');
+  } finally {
+    if (prevManager === undefined) delete globalThis.__uiDownloadManager;
+    else globalThis.__uiDownloadManager = prevManager;
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});

@@ -233,13 +233,16 @@ export function resolveExecutionPlan(
     };
   }
 
-  // 4. Protected or slow whitelisted direct files accelerated via connected extension
+  // 4. Protected, CORS-blocked, tbvideo, slow-CDN, or SW-unavailable whitelisted direct files via connected extension
   if (
     option.deliveryKind === "file" &&
     extDirect &&
     option.whitelistedForExtension !== false &&
     (option.requiresRefererOrBlockedFetch ||
-      option.preferExtensionDirectAcceleration)
+      option.preferExtensionDirectAcceleration ||
+      option.corsBlockedDirect ||
+      option.hasTbvideo ||
+      env.swMultiRangeAvailable === false)
   ) {
     return {
       channel: "extension_direct",

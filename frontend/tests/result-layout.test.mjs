@@ -27,6 +27,7 @@ before(async () => {
     '../core/media/layoutAndFilename',
     '../extension/hostWhitelist',
     '../extension/dashMuxSpec',
+    '../core/media/extensionRoutes',
     '../core/media/muxSpec',
     '../core/media/index',
     '../composables/useVideoSelection',
@@ -39,6 +40,7 @@ before(async () => {
         if (modules[reqId]) return modules[reqId];
         if (reqId === '../core/media' && modules['../core/media/index']) return modules['../core/media/index'];
         if (reqId === './cdnTransportHints') return modules['../core/media/cdnTransportHints'];
+        if (reqId === './extensionRoutes') return modules['../core/media/extensionRoutes'];
         if (reqId === './variantSort') return modules['../core/media/variantSort'];
         if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
         if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
@@ -1983,5 +1985,103 @@ test('Post-#37 九-2: ParticlesCanvas degrades to static first frame without rAF
     globalThis.document = origDoc;
     if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
     else delete globalThis.navigator;
+  }
+});
+
+test('Issue #48 [P1-2] & [P1-5]: M2 YouTube auto-upgrades default to 4K60 while keeping <video> preview on audible 360p, and ugc_season single-P displays real workTitle', async () => {
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+  const url360 = 'https://rr1---sn.googlevideo.com/videoplayback?itag=18&title=Sample';
+  const url4k = 'https://rr1---sn.googlevideo.com/videoplayback?itag=315';
+  const urlOpus = 'https://rr1---sn.googlevideo.com/videoplayback?itag=251';
+  const ytM2Data = {
+    platform: 'youtube',
+    content_id: 'YTAuto4K01',
+    title: 'YouTube 4K60 Auto Upgrade Sample',
+    source_url: 'https://www.youtube.com/watch?v=YTAuto4K01',
+    default_item_id: 'yt-1',
+    items: [
+      {
+        id: 'yt-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'v-18', source_id: 's-18', url: url360 },
+        variants: [
+          {
+            id: 'v-18',
+            label: '360p (含音频)',
+            metadata: { width: 640, height: 360, fps: 30, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: { kind: 'file', sources: [{ id: 's-18', url: url360, size_bytes: 5_000_000 }] },
+          },
+          {
+            id: 'v-315',
+            label: '2160p60 (4K)',
+            metadata: { width: 3840, height: 2160, fps: 60, has_audio: false, video_codec: 'vp9', container: 'webm', extension: 'webm', mime_type: 'video/webm' },
+            delivery: { kind: 'file', sources: [{ id: 's-315', url: url4k, size_bytes: 28_000_000 }] },
+          },
+          {
+            id: 'v-251',
+            label: '仅音频 Opus',
+            metadata: { has_audio: true, audio_codec: 'opus', container: 'webm', extension: 'webm', mime_type: 'audio/webm' },
+            delivery: { kind: 'file', sources: [{ id: 's-251', url: urlOpus, size_bytes: 3_000_000 }] },
+          },
+        ],
+      },
+    ],
+    extra: {
+      youtube_helper: { status: 'ready', provider: 'extension', version: '4.2.0', extensionVersion: '4.2.0' },
+    },
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: ytM2Data });
+
+  const ytView = await mount(ytM2Data);
+  try {
+    const primaryBtn = ytView.elements('rs-btn--primary')[0];
+    assert.equal(primaryBtn.props['data-youtube-mux-save'], true, 'M2 YouTube must auto-upgrade default selection to 4K60 mux');
+    assert.equal(textOf(primaryBtn), '下载 4K 有声视频');
+    const videoEl = ytView.findAll(n => n.type === 'video')[0];
+    assert.ok(videoEl, 'expected inline <video> preview element');
+    assert.equal(videoEl.props.src, url360, 'inline <video> preview must stay bound to audible 360p progressive stream');
+    assert.equal(ytView.state.value.selection.currentSelection.value?.variant_id, 'v-315');
+  } finally {
+    ytView.app.unmount();
+  }
+
+  // [P1-5] Bilibili ugc_season single-P collection item with placeholder item.title="P1" must display real workTitle in Details card
+  const biliSeasonSingle = {
+    platform: 'bilibili',
+    content_id: 'BV1bW411n7fY',
+    title: '【合集真实作品标题】单P合集测试',
+    source_url: 'https://www.bilibili.com/video/BV1bW411n7fY',
+    default_item_id: 'p1',
+    groups: [
+      { id: 'season-1', kind: 'collection', title: '完整系列合集', total_count: 12, item_ids: ['p1'] },
+    ],
+    items: [
+      {
+        id: 'p1',
+        index: 1,
+        type: 'video',
+        title: 'P1',
+        state: 'ready',
+        default: { variant_id: 'v-720', source_id: 's-720', url: 'https://upos-sz-mirrorcos.bilivideo.com/p1.mp4' },
+        variants: [
+          {
+            id: 'v-720',
+            label: '720p',
+            metadata: { width: 1280, height: 720, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: { kind: 'file', sources: [{ id: 's-720', url: 'https://upos-sz-mirrorcos.bilivideo.com/p1.mp4', size_bytes: 9_000_000 }] },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: biliSeasonSingle });
+
+  const biliView = await mount(biliSeasonSingle);
+  try {
+    const infoCardTexts = biliView.elements('rs-info-val').map(textOf);
+    assert.equal(infoCardTexts[0], '【合集真实作品标题】单P合集测试', 'result card title must show real workTitle instead of P1');
+  } finally {
+    biliView.app.unmount();
   }
 });

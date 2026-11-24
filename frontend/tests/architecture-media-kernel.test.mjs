@@ -1401,3 +1401,200 @@ test("P2: prefersExtensionDirectAcceleration and resolveAcceleratedExtensionDire
   assert.equal(cappedAccelerated.length, 8);
   assert.equal(cappedAccelerated[7], tenVideoSources[7].url);
 });
+
+test("Issue #48 Batch 1: [P1-2] clientSplitMux auto-upgrade, [P1-4]/[P0-1] unified direct delegation traits & capabilityHub, and [P1-5] ugc_season placeholder title & _P<n> dedup", async () => {
+  const videoFilenameMod = await vite.ssrLoadModule("/src/utils/videoFilename.ts");
+
+  // 1. [P1-2] shouldAutoUpgradeDefaultVariant upgrades audible 360p to clientSplitMux 4K60/1080p60 when higher resolution
+  const yt360 = {
+    variant: {
+      id: "v-18",
+      label: "360p (含音频)",
+      state: "ready",
+      metadata: { width: 640, height: 360, fps: 30, has_audio: true },
+      delivery: { kind: "file", sources: [{ id: "s18", url: "https://rr1---sn.googlevideo.com/videoplayback?itag=18" }] },
+    },
+    downloadable: true,
+    clientSplitMux: false,
+  };
+  const yt4kSplit = {
+    variant: {
+      id: "v-315",
+      label: "2160p60",
+      state: "ready",
+      metadata: { width: 3840, height: 2160, fps: 60, has_audio: false },
+      delivery: { kind: "file", sources: [{ id: "s315", url: "https://rr1---sn.googlevideo.com/videoplayback?itag=315" }] },
+    },
+    downloadable: true,
+    clientSplitMux: true,
+  };
+  assert.equal(
+    mediaKernel.shouldAutoUpgradeDefaultVariant(yt360, yt4kSplit),
+    true,
+    "must auto-upgrade 360p default to clientSplitMux 4K60 when YouTube mux pair is ready",
+  );
+  assert.equal(
+    mediaKernel.shouldAutoUpgradeDefaultVariant(yt360, { ...yt4kSplit, clientSplitMux: false }),
+    false,
+    "must NOT upgrade to silent split track when clientSplitMux is unavailable",
+  );
+  const progressive4k = {
+    variant: {
+      id: "v-prog-4k",
+      label: "2160p",
+      state: "ready",
+      metadata: { width: 3840, height: 2160, fps: 30, has_audio: true },
+      delivery: { kind: "file", sources: [{ id: "sp4k", url: "https://rr1---sn.googlevideo.com/videoplayback?itag=99" }] },
+    },
+    downloadable: true,
+    clientSplitMux: false,
+  };
+  const split1080 = {
+    variant: {
+      id: "v-137",
+      label: "1080p",
+      state: "ready",
+      metadata: { width: 1920, height: 1080, fps: 30, has_audio: false },
+      delivery: { kind: "file", sources: [{ id: "s137", url: "https://rr1---sn.googlevideo.com/videoplayback?itag=137" }] },
+    },
+    downloadable: true,
+    clientSplitMux: true,
+  };
+  assert.equal(
+    mediaKernel.shouldAutoUpgradeDefaultVariant(progressive4k, split1080),
+    false,
+    "must never downgrade a higher-resolution progressive default to a lower-resolution split track",
+  );
+
+  // 2. [P1-4] & [P0-1] capabilityHub routes corsBlockedDirect, hasTbvideo, and SW-unavailable whitelisted files to extension_direct
+  const extEnv = {
+    extensionConnected: true,
+    extensionVersion: capabilityHub.LATEST_EXTENSION_VERSION,
+    extensionCapabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux"],
+    userscriptReady: false,
+    swMultiRangeAvailable: true,
+  };
+  assert.equal(
+    capabilityHub.resolveExecutionPlan(
+      { deliveryKind: "file", corsBlockedDirect: true, whitelistedForExtension: true },
+      extEnv,
+    ).channel,
+    "extension_direct",
+  );
+  assert.equal(
+    capabilityHub.resolveExecutionPlan(
+      { deliveryKind: "file", hasTbvideo: true, whitelistedForExtension: true },
+      extEnv,
+    ).channel,
+    "extension_direct",
+  );
+  assert.equal(
+    capabilityHub.resolveExecutionPlan(
+      { deliveryKind: "file", whitelistedForExtension: true },
+      { ...extEnv, swMultiRangeAvailable: false },
+    ).channel,
+    "extension_direct",
+  );
+  assert.equal(
+    capabilityHub.resolveExecutionPlan(
+      { deliveryKind: "file", corsBlockedDirect: true, whitelistedForExtension: false },
+      extEnv,
+    ).channel,
+    "browser_direct",
+    "unwhitelisted CORS-blocked domain must NEVER delegate to extension",
+  );
+  assert.equal(
+    capabilityHub.resolveExecutionPlan(
+      { deliveryKind: "file", whitelistedForExtension: false },
+      { ...extEnv, swMultiRangeAvailable: false },
+    ).channel,
+    "browser_direct",
+    "unwhitelisted domain must NEVER delegate to extension on SW failure",
+  );
+
+  // 3. [P1-4] inspectDirectFileExtensionTraits + buildDirectFileRoutesWithTbvideo
+  const toutiaoTraits = mediaKernel.inspectDirectFileExtensionTraits({
+    routes: ["https://v3-default.toutiaovod.com/abc123/video/tos/cn/stream"],
+    context: { apiOrigin: PROD_API_ORIGIN },
+  });
+  assert.equal(toutiaoTraits.corsBlockedDirect, true);
+  assert.equal(toutiaoTraits.whitelistedForExtension, true);
+  assert.equal(toutiaoTraits.wantsProactiveExtensionDirect, true);
+
+  const tbItem = {
+    type: "video",
+    tbvideo: {
+      platform: "pipigx",
+      pid: "1",
+      vid: "2",
+      sources: { s1: "https://tbvideo.ixiaochuan.cn/clip-candidate.mp4" },
+    },
+  };
+  const tbRoutes = mediaKernel.buildDirectFileRoutesWithTbvideo(
+    ["https://media.ippzone.com/clip-primary.mp4"],
+    tbItem,
+    "s1",
+  );
+  assert.deepEqual(tbRoutes, [
+    "https://media.ippzone.com/clip-primary.mp4",
+    "https://tbvideo.ixiaochuan.cn/clip-candidate.mp4",
+  ]);
+  const tbTraits = mediaKernel.inspectDirectFileExtensionTraits({
+    routes: tbRoutes,
+    item: tbItem,
+    context: { apiOrigin: PROD_API_ORIGIN },
+  });
+  assert.equal(tbTraits.hasTbvideo, true);
+  assert.equal(tbTraits.wantsProactiveExtensionDirect, true);
+  assert.equal(tbTraits.whitelistedRoutes.length, 2);
+
+  // 4. [P1-5] Placeholder part title detection, ugc_season single-P title resolution, and _P<n> idempotent dedup
+  for (const ph of ["P1", "p01", "P12", "第1集", "第 2 话", "3期", "序列 01", "序列02", ""]) {
+    assert.equal(mediaKernel.isPlaceholderPartTitle(ph), true, `expected placeholder: ${ph}`);
+  }
+  for (const real of ["P1 开场介绍", "真实教程标题", "Episode 1 Overview", "第1集：架构拆解"]) {
+    assert.equal(mediaKernel.isPlaceholderPartTitle(real), false, `expected real title: ${real}`);
+  }
+  assert.equal(
+    mediaKernel.resolvePreferredMediaTitle({
+      isSingleItem: false,
+      itemCount: 1,
+      workTitle: "【合集】Go 并发原理全解析",
+      itemTitle: "P1",
+    }),
+    "【合集】Go 并发原理全解析",
+  );
+  assert.equal(
+    mediaKernel.resolvePreferredMediaTitle({
+      isSingleItem: false,
+      itemCount: 5,
+      workTitle: "【合集】Go 并发原理全解析",
+      itemTitle: "P1",
+    }),
+    "【合集】Go 并发原理全解析",
+  );
+  assert.equal(
+    mediaKernel.resolvePreferredMediaTitle({
+      isSingleItem: false,
+      itemCount: 5,
+      workTitle: "【合集】Go 并发原理全解析",
+      itemTitle: "第二讲：Channel 源码",
+    }),
+    "第二讲：Channel 源码",
+  );
+  assert.equal(
+    videoFilenameMod.buildMediaFilename({ title: "P1", index: 1, total: 2, fallback: "bili_1", extension: "mp4" }),
+    "P1.mp4",
+    "must never produce P1_P1.mp4",
+  );
+  assert.equal(
+    videoFilenameMod.buildMediaFilename({ title: "合集视频_P1", index: 1, total: 3, fallback: "bili_2", extension: "mp4" }),
+    "合集视频_P1.mp4",
+    "must deduplicate trailing _P1 idempotently",
+  );
+  assert.equal(
+    videoFilenameMod.buildMediaFilename({ title: "我的MVP1", index: 1, total: 3, fallback: "bili_3", extension: "mp4" }),
+    "我的MVP1_P1.mp4",
+    "must not strip non-boundary P1 suffix inside word",
+  );
+});

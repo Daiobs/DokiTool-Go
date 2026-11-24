@@ -32,7 +32,14 @@ export function createDownloadManager(implementations: Transports = transports) 
     return () => { active--; waiting.shift()?.(); };
   }
 
-  async function run(request: DownloadRequest, signal: AbortSignal, observe: DownloadObserver): Promise<DownloadSnapshot> {
+  async function run(
+    request: DownloadRequest,
+    signal: AbortSignal,
+    observe: DownloadObserver,
+    options?: {
+      onStreamingUnavailable?: () => Promise<boolean>;
+    },
+  ): Promise<DownloadSnapshot> {
     const startedAt = request.startedAt ?? Date.now();
     request = { ...request, startedAt };
     let snapshot: DownloadSnapshot = {
@@ -79,6 +86,13 @@ export function createDownloadManager(implementations: Transports = transports) 
         // A failed source, a lost START acknowledgement or an interrupted stream
         // is never permission to create a second download behind the user's back.
         if (!(error instanceof StreamingUnavailableError)) throw error;
+        if (options?.onStreamingUnavailable) {
+          const delegated = await options.onStreamingUnavailable();
+          if (delegated) {
+            return { ...snapshot, status: "handed-off" };
+          }
+          signal.throwIfAborted();
+        }
         return await implementations.downloadBlob(request, signal, publish);
       }
     } catch (error) {

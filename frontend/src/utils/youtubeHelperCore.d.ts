@@ -13,6 +13,9 @@ export const OPFS_QUOTA_HEADROOM_FACTOR: number;
 export function computeOpfsCleanupDelayMs(byteLength: number): number;
 
 export const DEFAULT_MUX_CHUNK_BYTES: number;
+export const DEFAULT_MUX_AUDIO_CHUNK_BYTES: number;
+export const DEFAULT_MUX_INITIAL_CHUNK_BYTES: number;
+export const DEFAULT_MUX_PROGRESS_THROTTLE_MS: number;
 export const DEFAULT_MUX_VIDEO_CONCURRENCY: number;
 export const DEFAULT_MUX_AUDIO_CONCURRENCY: number;
 export const DEFAULT_MUX_MAX_RETRIES: number;
@@ -88,6 +91,7 @@ export interface YouTubeHelperProgressDetail {
   total: number;
   percent: number;
   mode?: YouTubeHelperSaveMode;
+  statusText?: string;
 }
 
 export interface YouTubeHelperDownloadPayload {
@@ -187,6 +191,9 @@ export function createUserscriptController(options?: {
   mediabunny?: Record<string, unknown> | null;
   muxConfig?: {
     chunkSize?: number;
+    audioChunkSize?: number;
+    initialChunkSize?: number;
+    progressThrottleMs?: number;
     videoConcurrency?: number;
     audioConcurrency?: number;
     maxRetries?: number;

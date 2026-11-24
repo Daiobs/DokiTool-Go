@@ -92,6 +92,11 @@ export interface GmXhrDetailsLike {
     response: unknown;
     responseText: string;
   }) => void;
+  onprogress?: (event: {
+    loaded: number;
+    total: number;
+    lengthComputable: boolean;
+  }) => void;
   onerror?: (error: unknown) => void;
   ontimeout?: () => void;
   onabort?: () => void;
@@ -100,6 +105,8 @@ export interface GmXhrDetailsLike {
 export interface CreateFetchGmXhrAdapterOptions {
   fetchImpl?: typeof fetch;
   extraAllowedOrigins?: () => string[] | undefined;
+  progressIntervalMs?: number;
+  now?: () => number;
 }
 
 /**
@@ -202,7 +209,88 @@ export function createFetchGmXhrAdapter(
 
         const serializedHeaders = serializeResponseHeaders(resp.headers);
         if (responseType === "arraybuffer") {
-          const arrayBuffer = await resp.arrayBuffer();
+          const progressIntervalMs =
+            typeof options?.progressIntervalMs === "number" &&
+            Number.isFinite(options.progressIntervalMs) &&
+            options.progressIntervalMs >= 0
+              ? options.progressIntervalMs
+              : 150;
+          const nowFn = options?.now ?? Date.now;
+          const rawContentLen = Number(resp.headers.get("content-length"));
+          const totalBytes =
+            Number.isFinite(rawContentLen) && rawContentLen > 0
+              ? rawContentLen
+              : 0;
+
+          let arrayBuffer: ArrayBuffer;
+          if (
+            typeof details.onprogress === "function" &&
+            resp.body &&
+            typeof resp.body.getReader === "function"
+          ) {
+            const reader = resp.body.getReader();
+            const chunks: Uint8Array[] = [];
+            let loaded = 0;
+            let lastProgressAt = 0;
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (settled || abortedByCaller) {
+                  void reader.cancel().catch(() => {});
+                  return;
+                }
+                if (value && value.byteLength > 0) {
+                  chunks.push(value);
+                  loaded += value.byteLength;
+                  const nowMs = nowFn();
+                  if (
+                    lastProgressAt === 0 ||
+                    nowMs - lastProgressAt >= progressIntervalMs
+                  ) {
+                    lastProgressAt = nowMs;
+                    try {
+                      details.onprogress({
+                        loaded,
+                        total: totalBytes,
+                        lengthComputable: totalBytes > 0,
+                      });
+                    } catch {
+                      // Ignore progress callback errors
+                    }
+                  }
+                }
+              }
+            } finally {
+              try {
+                reader.releaseLock();
+              } catch {
+                // Ignore
+              }
+            }
+            if (settled || abortedByCaller) return;
+            if (loaded > 0) {
+              try {
+                details.onprogress({
+                  loaded,
+                  total: totalBytes || loaded,
+                  lengthComputable: true,
+                });
+              } catch {
+                // Ignore progress callback errors
+              }
+            }
+            const merged = new Uint8Array(loaded);
+            let offset = 0;
+            for (const part of chunks) {
+              merged.set(part, offset);
+              offset += part.byteLength;
+            }
+            arrayBuffer = merged.buffer;
+          } else {
+            arrayBuffer = await resp.arrayBuffer();
+          }
+
           if (settled || abortedByCaller) return;
           settled = true;
           clearTimer();
@@ -275,6 +363,9 @@ export interface YouTubeExtensionBridgeOptions {
   mediabunnyImpl?: Record<string, unknown> | null;
   muxConfig?: {
     chunkSize?: number;
+    audioChunkSize?: number;
+    initialChunkSize?: number;
+    progressThrottleMs?: number;
     videoConcurrency?: number;
     audioConcurrency?: number;
     maxRetries?: number;
@@ -487,6 +578,7 @@ export function createYouTubeExtensionBridge(
   const gmXmlhttpRequest = createFetchGmXhrAdapter({
     fetchImpl: options.fetchImpl,
     extraAllowedOrigins: options.extraAllowedOrigins,
+    now: nowFn,
   });
 
   // Synthetic window facade that ensures `showSaveFilePicker` is never triggered in Offscreen

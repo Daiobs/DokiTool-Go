@@ -8,8 +8,10 @@ import {
   sourceUrl,
 } from "../utils/mediaContract";
 import {
+  buildDirectFileRoutesWithTbvideo,
+  filterWhitelistedExtensionRoutes,
+  inspectDirectFileExtensionTraits,
   isTbvideoVideoItem,
-  resolveAcceleratedExtensionDirectRoutes,
   resolveProtectedExtensionAudioRoutes,
   resolveWhitelistedExtensionMuxSpec,
 } from "../core/media";
@@ -50,6 +52,13 @@ export { MAX_ARCHIVE_BYTES };
 const loadStreaming = () => import("../downloads/streaming");
 const loadDownloadManager = () => import("../downloads/manager");
 const loadExtensionBridge = () => import("../services/extensionBridge");
+
+function hasExternalExtensionRuntime(): boolean {
+  const g = globalThis as unknown as {
+    chrome?: { runtime?: { sendMessage?: unknown } };
+  };
+  return typeof g.chrome?.runtime?.sendMessage === "function";
+}
 
 const EXTENSION_DIRECT_FALLBACK_CODES = new Set<string>([
   "NO_CHROME_RUNTIME",
@@ -347,6 +356,53 @@ export function useMediaDownload({
         );
         return;
       }
+      if (ytHelper?.status === "ready" && ytHelper.provider === "extension") {
+        const ctx = sourceContexts.get(downloadId);
+        const matchedSource = (ctx?.sources ?? []).find(
+          (s) =>
+            comparableUrl(sourceUrl(s, apiContext)) === comparableUrl(url),
+        );
+        const knownSize = matchedSource?.size_bytes || 0;
+        const formatMime = ctx?.formatMime;
+        const selectionKey =
+          fileTaskSelections.get(downloadId) ||
+          JSON.stringify([
+            videoStore.resultVersion,
+            comparableUrl(url),
+            "ext-yt-direct",
+          ]);
+        let fellBackToBrowser = false;
+        await runExtensionBridgeDownload({
+          retryId: downloadId,
+          controller,
+          filename,
+          payload: {
+            kind: "youtube_direct",
+            platform: videoStore.resultData?.platform || "media",
+            title: videoStore.resultData?.title || filename,
+            filename,
+            url,
+            ...(knownSize ? { sizeBytes: knownSize } : {}),
+            ...(formatMime ? { mimeType: formatMime } : {}),
+          },
+          savePathLabel: "保存路径：Chrome 扩展后台下载",
+          startStatusText: "扩展后台保存中...",
+          selectionKey,
+          onBridgeUnavailable: () => {
+            fellBackToBrowser = true;
+            return false;
+          },
+        });
+        if (!fellBackToBrowser) {
+          deliveryTasks.delete(deliveryId);
+          return;
+        }
+        if (!ownsTask(downloadId, controller)) return;
+        videoStore.updateDownload(downloadId, {
+          savePath: undefined,
+          savePathLabel: undefined,
+        });
+      }
       if (canAttemptDirectAttachment(url)) {
         if (triggerBrowserDownload(url, filename, true)) {
           videoStore.updateDownload(downloadId, {
@@ -407,42 +463,7 @@ export function useMediaDownload({
         );
         return;
       }
-      if (ytHelper?.status === "ready") {
-        if (ytHelper.provider === "extension") {
-          deliveryTasks.delete(deliveryId);
-          const ctx = sourceContexts.get(downloadId);
-          const matchedSource = (ctx?.sources ?? []).find(
-            (s) =>
-              comparableUrl(sourceUrl(s, apiContext)) === comparableUrl(url),
-          );
-          const knownSize = matchedSource?.size_bytes || 0;
-          const formatMime = ctx?.formatMime;
-          const selectionKey =
-            fileTaskSelections.get(downloadId) ||
-            JSON.stringify([
-              videoStore.resultVersion,
-              comparableUrl(url),
-              "ext-yt-direct",
-            ]);
-          await runExtensionBridgeDownload({
-            retryId: downloadId,
-            controller,
-            filename,
-            payload: {
-              kind: "youtube_direct",
-              platform: videoStore.resultData?.platform || "media",
-              title: videoStore.resultData?.title || filename,
-              filename,
-              url,
-              ...(knownSize ? { sizeBytes: knownSize } : {}),
-              ...(formatMime ? { mimeType: formatMime } : {}),
-            },
-            savePathLabel: "保存路径：Chrome 扩展后台下载",
-            startStatusText: "扩展后台保存中...",
-            selectionKey,
-          });
-          return;
-        }
+      if (ytHelper?.status === "ready" && ytHelper.provider !== "extension") {
         await ytController.runYouTubeDirectHelperDownload({
           url,
           filename,
@@ -452,6 +473,83 @@ export function useMediaDownload({
           startedAt,
         });
         return;
+      }
+      if (!ytHelper && hasExternalExtensionRuntime()) {
+        const ctx = sourceContexts.get(downloadId);
+        const whitelistedRoutes = filterWhitelistedExtensionRoutes(
+          [url, ...(ctx?.routes ?? [])],
+          apiContext,
+        );
+        if (whitelistedRoutes.length > 0) {
+          const bridge = await loadExtensionBridge();
+          if (controller.signal.aborted || !ownsTask(downloadId, controller)) {
+            return;
+          }
+          const extState = await bridge.pingInstalledExtension();
+          if (controller.signal.aborted || !ownsTask(downloadId, controller)) {
+            return;
+          }
+          const plan = resolveExecutionPlan(
+            {
+              deliveryKind: "file",
+              whitelistedForExtension: true,
+              corsBlockedDirect: true,
+            },
+            {
+              extensionConnected: extState.connected,
+              extensionVersion: extState.version,
+              extensionCapabilities: extState.capabilities,
+              userscriptReady: false,
+            },
+          );
+          if (plan.channel === "extension_direct") {
+            const matchedSource = (ctx?.sources ?? []).find(
+              (s) =>
+                comparableUrl(sourceUrl(s, apiContext)) ===
+                comparableUrl(whitelistedRoutes[0]),
+            );
+            const knownSize = matchedSource?.size_bytes || 0;
+            const formatMime = ctx?.formatMime;
+            const selectionKey =
+              fileTaskSelections.get(downloadId) ||
+              JSON.stringify([
+                videoStore.resultVersion,
+                comparableUrl(whitelistedRoutes[0]),
+                "ext-cors-direct",
+              ]);
+            let fellBackToManual = false;
+            await runExtensionBridgeDownload({
+              retryId: downloadId,
+              controller,
+              filename,
+              payload: {
+                kind: "direct_download",
+                platform: videoStore.resultData?.platform || "media",
+                title: videoStore.resultData?.title || filename,
+                filename,
+                routes: whitelistedRoutes,
+                ...(knownSize ? { sizeBytes: knownSize } : {}),
+                ...(formatMime ? { mimeType: formatMime } : {}),
+              },
+              savePathLabel: "保存路径：Chrome 扩展后台下载",
+              startStatusText: "扩展后台保存中...",
+              selectionKey,
+              onBridgeUnavailable: () => {
+                fellBackToManual = true;
+                return false;
+              },
+            });
+            if (!fellBackToManual) {
+              deliveryTasks.delete(deliveryId);
+              return;
+            }
+            if (!ownsTask(downloadId, controller)) return;
+            videoStore.updateDownload(downloadId, {
+              savePath: undefined,
+              savePathLabel: undefined,
+            });
+          }
+        }
       }
       const isToutiaoManual = isToutiaovodVideoUrl(url);
       const openedToutiaoTab = isToutiaoManual
@@ -536,6 +634,7 @@ export function useMediaDownload({
         pid: metadata.pid,
         vid: metadata.vid,
       };
+      let delegatedToExtension = false;
       const result = await downloadManager.run(
         context?.tbvideo
           ? {
@@ -571,7 +670,90 @@ export function useMediaDownload({
             applyDelivery(context?.tbvideo ? { ...snapshot, url } : snapshot);
           }
         },
+        {
+          async onStreamingUnavailable() {
+            if (!hasExternalExtensionRuntime()) return false;
+            const fallbackCandidates = context?.tbvideo?.candidate
+              ? [...routes, context.tbvideo.candidate]
+              : routes;
+            const whitelistedRoutes = filterWhitelistedExtensionRoutes(
+              fallbackCandidates,
+              apiContext,
+            );
+            if (whitelistedRoutes.length === 0) return false;
+            const bridge = await loadExtensionBridge();
+            checkAbort(controller.signal);
+            if (!ownsTask(downloadId, controller)) return false;
+            const extState = await bridge.pingInstalledExtension();
+            checkAbort(controller.signal);
+            if (!ownsTask(downloadId, controller)) return false;
+            const plan = resolveExecutionPlan(
+              {
+                deliveryKind: "file",
+                whitelistedForExtension: true,
+                hasTbvideo: Boolean(context?.tbvideo),
+              },
+              {
+                extensionConnected: extState.connected,
+                extensionVersion: extState.version,
+                extensionCapabilities: extState.capabilities,
+                userscriptReady: false,
+                swMultiRangeAvailable: false,
+              },
+            );
+            if (plan.channel !== "extension_direct") return false;
+            const matchedSource = (context?.sources ?? []).find(
+              (s) =>
+                comparableUrl(sourceUrl(s, apiContext)) ===
+                comparableUrl(whitelistedRoutes[0]),
+            );
+            const knownSize = matchedSource?.size_bytes || 0;
+            const selectionKey =
+              fileTaskSelections.get(downloadId) ||
+              JSON.stringify([
+                videoStore.resultVersion,
+                comparableUrl(whitelistedRoutes[0]),
+                "ext-sw-fallback",
+              ]);
+            let bridgeUnavailable = false;
+            deliveryTasks.delete(deliveryId);
+            await runExtensionBridgeDownload({
+              retryId: downloadId,
+              controller,
+              filename,
+              payload: {
+                kind: "direct_download",
+                platform: videoStore.resultData?.platform || "media",
+                title: videoStore.resultData?.title || filename,
+                filename,
+                routes: whitelistedRoutes,
+                ...(knownSize ? { sizeBytes: knownSize } : {}),
+                ...(context?.formatMime ? { mimeType: context.formatMime } : {}),
+              },
+              savePathLabel: "保存路径：Chrome 扩展后台下载",
+              startStatusText: "流式通道不可用，已切至扩展后台下载...",
+              selectionKey,
+              onBridgeUnavailable: () => {
+                bridgeUnavailable = true;
+                return false;
+              },
+            });
+            if (bridgeUnavailable) {
+              deliveryTasks.set(deliveryId, downloadId);
+              if (ownsTask(downloadId, controller)) {
+                videoStore.updateDownload(downloadId, {
+                  savePath: undefined,
+                  savePathLabel: undefined,
+                });
+              }
+              return false;
+            }
+            delegatedToExtension = true;
+            return true;
+          },
+        },
       );
+      if (delegatedToExtension) return;
       if (!ownsTask(downloadId, controller)) return;
       if (context?.tbvideo) {
         if (result.status === "manual" && result.tbvideoAttempted === undefined)
@@ -857,7 +1039,7 @@ export function useMediaDownload({
           videoStore.updateDownload(id, {
             filename: displayName,
             status: st.phase === "queued" ? "queued" : "downloading",
-            statusText: extensionPhaseStatusText(st.phase),
+            statusText: st.statusText || extensionPhaseStatusText(st.phase),
             percent: Math.max(0, Math.min(99, Math.round(st.progress || 0))),
             loaded: st.loadedBytes || 0,
             total: st.totalBytes || payload.sizeBytes || 0,
@@ -1071,13 +1253,28 @@ export function useMediaDownload({
         if (
           target.kind === "file" &&
           delivery.kind === "file" &&
-          !isTbvideoVideoItem(item)
+          !snapshot.hasClientHelper &&
+          hasExternalExtensionRuntime()
         ) {
-          const acceleratedRoutes = resolveAcceleratedExtensionDirectRoutes(
-            { delivery },
-            apiContext,
+          const allDeliveryRoutes = [
+            target.url,
+            ...target.routes,
+            ...availableSources(delivery.sources).flatMap((src) =>
+              sourceRoutes(src, apiContext),
+            ),
+          ];
+          const candidateRoutes = buildDirectFileRoutesWithTbvideo(
+            allDeliveryRoutes,
+            item,
+            target.source.id,
           );
-          if (acceleratedRoutes && acceleratedRoutes.length > 0) {
+          const traits = inspectDirectFileExtensionTraits({
+            routes: candidateRoutes,
+            item,
+            source: target.source,
+            context: apiContext,
+          });
+          if (traits.wantsProactiveExtensionDirect) {
             const bridge = await loadExtensionBridge();
             checkAbort(controller.signal);
             if (!ownsTask(id, controller)) return false;
@@ -1087,9 +1284,13 @@ export function useMediaDownload({
             const plan = resolveExecutionPlan(
               {
                 deliveryKind: "file",
-                whitelistedForExtension: true,
-                preferExtensionDirectAcceleration: true,
-                hasTbvideo: false,
+                whitelistedForExtension: traits.whitelistedForExtension,
+                preferExtensionDirectAcceleration:
+                  traits.preferExtensionDirectAcceleration,
+                corsBlockedDirect: traits.corsBlockedDirect,
+                hasTbvideo: traits.hasTbvideo,
+                requiresRefererOrBlockedFetch:
+                  traits.requiresRefererOrBlockedFetch,
               },
               {
                 extensionConnected: extState.connected,
@@ -1117,15 +1318,7 @@ export function useMediaDownload({
                 target.variant,
               );
               videoStore.updateDownload(id, { filename });
-              const primaryUrl = target.url;
-              const orderedRoutes = (
-                acceleratedRoutes.includes(primaryUrl)
-                  ? [
-                      primaryUrl,
-                      ...acceleratedRoutes.filter((r) => r !== primaryUrl),
-                    ]
-                  : acceleratedRoutes
-              ).slice(0, 8);
+              const orderedRoutes = traits.whitelistedRoutes;
               const knownSize =
                 target.source.size_bytes ??
                 delivery.sources.find((s) =>
@@ -1137,7 +1330,9 @@ export function useMediaDownload({
                   snapshot.version,
                   item.id,
                   target.variant.id,
-                  "ext-direct-accel",
+                  traits.preferExtensionDirectAcceleration
+                    ? "ext-direct-accel"
+                    : "ext-direct-delegated",
                 ]);
               let fellBackToWeb = false;
               const bridgeOk = await runExtensionBridgeDownload({
@@ -1154,8 +1349,12 @@ export function useMediaDownload({
                   ...(knownSize ? { sizeBytes: knownSize } : {}),
                   ...(formatMime ? { mimeType: formatMime } : {}),
                 },
-                savePathLabel: "保存路径：Chrome 扩展后台加速下载",
-                startStatusText: "扩展 4 路并发高速下载中...",
+                savePathLabel: traits.preferExtensionDirectAcceleration
+                  ? "保存路径：Chrome 扩展后台加速下载"
+                  : "保存路径：Chrome 扩展后台下载",
+                startStatusText: traits.preferExtensionDirectAcceleration
+                  ? "扩展 4 路并发高速下载中..."
+                  : "扩展后台保存中...",
                 selectionKey,
                 onBridgeUnavailable: () => {
                   fellBackToWeb = true;

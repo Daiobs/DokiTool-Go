@@ -924,6 +924,7 @@
 !/frontend/src/composables/download/youtubeMux.ts
 /frontend/src/core/media/*
 !/frontend/src/core/media/cdnTransportHints.ts
+!/frontend/src/core/media/extensionRoutes.ts
 !/frontend/src/core/media/index.ts
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts

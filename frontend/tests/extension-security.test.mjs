@@ -2207,7 +2207,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
     assert.equal(exeStatus.data.filename.includes(".."), false);
     assert.deepEqual(
       Object.keys(dashStatus.data).sort(),
-      ["filename", "loadedBytes", "phase", "progress", "speedBytesPerSec", "status", "taskId", "totalBytes"],
+      ["filename", "loadedBytes", "phase", "progress", "speedBytesPerSec", "status", "statusText", "taskId", "totalBytes"],
     );
     assert.equal(
       JSON.stringify(dashStatus).includes("doki_top_secret_token_never_leak"),

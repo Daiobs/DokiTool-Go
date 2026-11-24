@@ -62,26 +62,100 @@ export async function existingWorker(): Promise<ServiceWorker | null> {
   return (await registration())?.active || null;
 }
 
-function activated(worker: ServiceWorker): Promise<ServiceWorker> {
+const ACTIVATION_TIMEOUT_MS = 8000;
+const WAITING_NUDGE_TIMEOUT_MS = 2500;
+
+function nudgeWaitingWorker(reg: ServiceWorkerRegistration | undefined): void {
+  if (!reg || reg.active || !reg.waiting) return;
+  try {
+    reg.waiting.postMessage({ protocol: PROTOCOL, action: "skip-waiting" });
+  } catch {
+    /* Best-effort wakeup; activation timeout self-heal handles unresponsive waiting workers. */
+  }
+}
+
+function activated(
+  worker: ServiceWorker,
+  reg?: ServiceWorkerRegistration,
+  timeoutMs = ACTIVATION_TIMEOUT_MS,
+): Promise<ServiceWorker> {
   if (worker.state === "activated") return Promise.resolve(worker);
+  if (reg?.active?.state === "activated") return Promise.resolve(reg.active);
   return new Promise((resolve, reject) => {
+    let nudged = false;
     const finish = () => { clearTimeout(timer); worker.removeEventListener("statechange", changed); };
     const changed = () => {
       if (worker.state === "activated") { finish(); resolve(worker); }
+      else if (reg?.active?.state === "activated") { finish(); resolve(reg.active); }
       else if (worker.state === "redundant") { finish(); reject(new Error("下载服务安装失败")); }
+      else if (worker.state === "installed" && !nudged) { nudged = true; nudgeWaitingWorker(reg); }
     };
-    const timer = setTimeout(() => { finish(); reject(new Error("下载服务激活超时")); }, 8000);
-    worker.addEventListener("statechange", changed); changed();
+    const timer = setTimeout(() => {
+      finish();
+      reject(new StreamingUnavailableError("下载服务激活超时"));
+    }, timeoutMs);
+    worker.addEventListener("statechange", changed);
+    changed();
   });
+}
+
+async function registerWorker(): Promise<ServiceWorkerRegistration> {
+  return bounded(
+    navigator.serviceWorker.register("/downloads/worker.js", {
+      scope: SCOPE,
+      type: "module",
+      updateViaCache: "none",
+    }),
+  );
+}
+
+async function ensureActivatedRegistration(
+  initialReg: ServiceWorkerRegistration,
+  create: boolean,
+): Promise<ServiceWorkerRegistration> {
+  let reg = initialReg;
+  let healed = false;
+  while (true) {
+    const pending = reg.active || reg.installing || reg.waiting;
+    if (!pending) {
+      if (create && !healed) {
+        healed = true;
+        try { await bounded(reg.unregister()); } catch { /* Best-effort reset of empty registration. */ }
+        reg = await registerWorker();
+        continue;
+      }
+      throw new StreamingUnavailableError("下载服务未激活");
+    }
+    const isOrphanWaiting = !reg.active && !!reg.waiting && pending === reg.waiting;
+    const waitMs =
+      create && !healed && isOrphanWaiting
+        ? WAITING_NUDGE_TIMEOUT_MS
+        : ACTIVATION_TIMEOUT_MS;
+    try {
+      await activated(pending, reg, waitMs);
+      return reg;
+    } catch (error) {
+      if (
+        create &&
+        !healed &&
+        !reg.active &&
+        error instanceof StreamingUnavailableError
+      ) {
+        healed = true;
+        try { await bounded(reg.unregister()); } catch { /* Best-effort reset of deadlocked waiting worker. */ }
+        reg = await registerWorker();
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 
 async function connect(create: boolean): Promise<WorkerSession | null> {
   let reg = await registration();
-  if (!reg && create) reg = await bounded(navigator.serviceWorker.register("/downloads/worker.js", { scope: SCOPE, type: "module", updateViaCache: "none" }));
+  if (!reg && create) reg = await registerWorker();
   if (!reg) return null;
-  const pending = reg.active || reg.installing || reg.waiting;
-  if (!pending) throw new Error("下载服务未激活");
-  await activated(pending);
+  reg = await ensureActivatedRegistration(reg, create);
   for (let attempt = 0; ; attempt++) {
     let worker = reg.active;
     try {

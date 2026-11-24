@@ -666,6 +666,11 @@ export function createWebExternalBridge(
           taskId: task.taskId,
           status: task.status,
           phase: mapTaskStatusToWebPhase(task.status),
+          ...(typeof task.statusText === "string" &&
+          task.statusText.trim() &&
+          !/https?:\/\//i.test(task.statusText)
+            ? { statusText: task.statusText.trim().slice(0, 120) }
+            : {}),
           progress: task.percent,
           loadedBytes: task.loaded,
           totalBytes: task.total,
