@@ -375,3 +375,81 @@ func TestAdmissionTableEvictsLeastRecentlyActiveIdleClient(t *testing.T) {
 	}
 	relNew()
 }
+
+func TestAdmissionConfigSlowCompartmentCapAndTotalLimitM2(t *testing.T) {
+	// 1. Each yt-dlp slow compartment must cap at ytengine.MaxConcurrency (24),
+	// while YOUTUBE_EJS retains MaxSlowParseConcurrency (64).
+	for _, key := range []string{
+		"DOKITOOL_PARSE_YOUTUBE_GLOBAL_CONCURRENCY",
+		"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY",
+		"DOKITOOL_PARSE_GENERIC_GLOBAL_CONCURRENCY",
+	} {
+		_, err := LoadAdmissionConfig(func(k string) string {
+			if k == key {
+				return "25"
+			}
+			return ""
+		})
+		if err == nil {
+			t.Fatalf("expected %s=25 (> 24) to be rejected", key)
+		}
+	}
+
+	ejsOK, err := LoadAdmissionConfig(func(k string) string {
+		if k == "DOKITOOL_YOUTUBE_EJS_GLOBAL_CONCURRENCY" {
+			return "32"
+		}
+		return ""
+	})
+	if err != nil || ejsOK.YouTubeEJS.GlobalConcurrency != 32 {
+		t.Fatalf("expected YOUTUBE_EJS=32 to remain valid, got %+v err=%v", ejsOK.YouTubeEJS, err)
+	}
+	if _, err := LoadAdmissionConfig(func(k string) string {
+		if k == "DOKITOOL_YOUTUBE_EJS_GLOBAL_CONCURRENCY" {
+			return "65"
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("expected YOUTUBE_EJS=65 (> 64) to be rejected")
+	}
+
+	// 2. Combined PARSE_YOUTUBE + PARSE_SLOW + PARSE_GENERIC == 32 is allowed; 33 is rejected.
+	atCap, err := LoadAdmissionConfig(func(k string) string {
+		switch k {
+		case "DOKITOOL_PARSE_YOUTUBE_GLOBAL_CONCURRENCY":
+			return "14"
+		case "DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY":
+			return "14"
+		case "DOKITOOL_PARSE_GENERIC_GLOBAL_CONCURRENCY":
+			return "4"
+		}
+		return ""
+	})
+	if err != nil || atCap.YouTubeSlowParse.GlobalConcurrency != 14 || atCap.SlowParse.GlobalConcurrency != 14 || atCap.GenericSlowParse.GlobalConcurrency != 4 {
+		t.Fatalf("expected combined slow concurrency 14+14+4=32 to pass, got err=%v", err)
+	}
+
+	if _, err := LoadAdmissionConfig(func(k string) string {
+		switch k {
+		case "DOKITOOL_PARSE_YOUTUBE_GLOBAL_CONCURRENCY":
+			return "14"
+		case "DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY":
+			return "14"
+		case "DOKITOOL_PARSE_GENERIC_GLOBAL_CONCURRENCY":
+			return "5"
+		}
+		return ""
+	}); err == nil || !strings.Contains(err.Error(), "32") {
+		t.Fatalf("expected combined slow concurrency 14+14+5=33 (> 32) to be rejected, got err=%v", err)
+	}
+
+	// 3. Inherited DOKITOOL_YTDLP_CONCURRENCY=16 + default generic 2 = 34 > 32 MUST also be rejected.
+	if _, err := LoadAdmissionConfig(func(k string) string {
+		if k == "DOKITOOL_YTDLP_CONCURRENCY" {
+			return "16"
+		}
+		return ""
+	}); err == nil || !strings.Contains(err.Error(), "32") {
+		t.Fatalf("expected DOKITOOL_YTDLP_CONCURRENCY=16 (16+16+2=34 > 32) to be rejected, got err=%v", err)
+	}
+}

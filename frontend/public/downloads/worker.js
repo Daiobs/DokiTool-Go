@@ -4,7 +4,7 @@ import { attachmentFormat, cleanFilename } from "./media-format.js";
 import { decodedLength } from "./decoded-length.js";
 import { readCandidate, validCandidate, reportTbvideo } from "./tbvideo.js";
 const PROTOCOL = 1;
-const BUILD = "downloads-20261124.1";
+const BUILD = "downloads-20261124.2";
 const INSTANCE = crypto.randomUUID();
 const store = createTaskStore();
 const MAX_ACTIVE = 2;
@@ -153,7 +153,7 @@ self.addEventListener("activate", event => {
 const terminal = status => ["completed", "failed", "cancelled", "manual"].includes(status);
 const abortError = () => new DOMException("下载已取消", "AbortError");
 const validKey = value => typeof value === "string" && /^[a-zA-Z0-9_-]{16,100}$/.test(value);
-const INTERNAL_HOST_SUFFIXES = ["localhost", "local", "internal", "lan", "corp", "home.arpa"];
+const INTERNAL_HOST_SUFFIXES = ["localhost", "local", "localdomain", "internal", "lan", "corp", "home.arpa"];
 
 function extractRawAuthorityHost(value) {
   if (typeof value !== "string") return "";
@@ -302,7 +302,11 @@ const sourceUrl = value => {
       if (!isAllowedPublicIpv6(parseIpv6Literal(host))) {
         throw new Error("资源地址不支持完整文件下载");
       }
-    } else if (canonicalIpv4 && isDisallowedIpv4(canonicalIpv4)) {
+    } else if (canonicalIpv4) {
+      if (isDisallowedIpv4(canonicalIpv4)) {
+        throw new Error("资源地址不支持完整文件下载");
+      }
+    } else if (!host.includes(".")) {
       throw new Error("资源地址不支持完整文件下载");
     }
   }
@@ -655,6 +659,14 @@ function createRangeScheduler(task, config) {
             void resp?.body?.cancel?.().catch(() => {});
             return;
           }
+          if (resp?.url) {
+            try {
+              sourceUrl(resp.url);
+            } catch (err) {
+              void resp?.body?.cancel?.().catch(() => {});
+              throw Object.assign(nonRetryable(err instanceof Error ? err.message : "资源地址不支持完整文件下载"), { fatal: true });
+            }
+          }
           if (resp.status !== 206 || resp.type === "opaque" || !resp.body) {
             void resp?.body?.cancel?.().catch(() => {});
             throw nonRetryable(`分片响应异常（HTTP ${resp.status}）`);
@@ -717,7 +729,7 @@ function createRangeScheduler(task, config) {
           return;
         } catch (error) {
           if (rangeController.signal.aborted || task.controller.signal.aborted) return;
-          if (!switched) {
+          if (!switched && !error?.fatal) {
             fallback();
             return;
           }
@@ -745,6 +757,7 @@ function createRangeScheduler(task, config) {
     chunk0End,
     isProbing: () => state === "probing",
     isActive: () => state === "active",
+    getFatalError: () => fatalError,
     hasReadySlice: () => state === "failed" || buffered.has(nextDeliverIdx) || nextDeliverIdx >= totalRangeChunks,
     startProbe() {
       if (state !== "idle") return;
@@ -842,6 +855,9 @@ async function prepare(task) {
         signal: attempt.signal, mode: "cors", credentials,
         referrerPolicy: "no-referrer", cache: "no-store",
       }));
+      if (response?.url) {
+        sourceUrl(response.url);
+      }
       const metadata = mediaHeaders(response, task.state.filename, task.formatMime, task.sourceSizes?.[url]);
       task.reader = response.body.getReader();
       const first = await timed(task, () => task.reader.read());
@@ -919,12 +935,14 @@ async function attachment(task) {
     async pull(controller) {
       try {
         if (task.controller.signal.aborted) throw abortError();
+        if (range?.getFatalError?.()) throw range.getFatalError();
         task.lastPullAt = Date.now();
         if (deliveryMode === "initial" && range && !first && task.state.loaded === range.chunk0End) {
           if (range.isProbing()) {
             await range.waitProbeSettled();
             if (task.controller.signal.aborted) throw abortError();
           }
+          if (range.getFatalError?.()) throw range.getFatalError();
           if (range.isActive()) {
             range.commitSwitch();
             deliveryMode = "range";
@@ -946,11 +964,13 @@ async function attachment(task) {
           item = first ? { value: first, done: false } : await timed(task, () => task.reader.read());
           task.timing?.received();
           first = undefined;
+          if (range?.getFatalError?.()) throw range.getFatalError();
           if (!item.done && range && task.state.loaded + item.value.length >= range.chunk0End) {
             if (range.isProbing() && task.state.loaded + item.value.length > range.chunk0End) {
               await range.waitProbeSettled();
               if (task.controller.signal.aborted) throw abortError();
             }
+            if (range.getFatalError?.()) throw range.getFatalError();
             if (range.isActive()) {
               const keep = range.chunk0End - task.state.loaded;
               if (keep < item.value.length) item = { value: item.value.subarray(0, keep), done: false };

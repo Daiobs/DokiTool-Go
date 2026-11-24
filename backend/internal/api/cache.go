@@ -372,6 +372,37 @@ func (c *parseCache) removeElementLocked(elem *list.Element) {
 	c.totalBytes -= entry.size
 }
 
+// purgePlatforms evicts all cached entries (both fresh and stale) belonging to
+// any platform listed in platforms so manual emergency disabled_platforms kill-switches
+// take immediate effect without waiting for fresh or stale TTL expiry.
+func (c *parseCache) purgePlatforms(platforms []string) int {
+	if c == nil || c.cfg.Disabled || len(platforms) == 0 {
+		return 0
+	}
+	target := make(map[string]struct{}, len(platforms))
+	for _, p := range platforms {
+		if p != "" {
+			target[p] = struct{}{}
+		}
+	}
+	if len(target) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	removed := 0
+	for e := c.lru.Front(); e != nil; {
+		next := e.Next()
+		entry := e.Value.(*cacheEntry)
+		if _, match := target[entry.key.platform]; match {
+			c.removeElementLocked(e)
+			removed++
+		}
+		e = next
+	}
+	return removed
+}
+
 func (c *parseCache) onWaiterCanceled(key cacheKey, call *inflightCall) {
 	var cancel context.CancelFunc
 	c.mu.Lock()
@@ -558,11 +589,11 @@ func computeCacheDeadlines(
 	}
 	if hasExpiry {
 		ceiling := earliest.Add(-staleExpiryHardMargin)
+		if ceiling.Before(freshUntil) {
+			return time.Time{}, time.Time{}, false
+		}
 		if ceiling.Before(hardExpiresAt) {
 			hardExpiresAt = ceiling
-		}
-		if hardExpiresAt.Before(freshUntil) {
-			hardExpiresAt = freshUntil
 		}
 	}
 	return freshUntil, hardExpiresAt, true

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -156,16 +157,21 @@ func (p *gatePortPool) ensureStartedLocked() error {
 	if len(p.listeners) > 0 {
 		return nil
 	}
+	var skippedPorts []int
 	for _, port := range p.ports {
 		ln, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 		if err != nil {
 			// Never connect to an existing service or fall back to :0.
+			skippedPorts = append(skippedPorts, port)
 			continue
 		}
 		p.listeners = append(p.listeners, newGateListener(ln))
 	}
 	if len(p.listeners) == 0 {
 		return errors.New("configured loopback gateway ports are busy or unavailable")
+	}
+	if len(skippedPorts) > 0 {
+		log.Printf("dokitool: yt-dlp outbound gateway skipped busy ports %v (listening on %d/%d configured ports)", skippedPorts, len(p.listeners), len(p.ports))
 	}
 	return nil
 }

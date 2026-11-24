@@ -379,6 +379,19 @@ func (e *Engine) runSubprocess(callCtx context.Context, rawURL, effectiveProxy, 
 	args := e.commandArgsWithProxy(rawURL, effectiveProxy)
 	var cmd *exec.Cmd
 	if e.pythonPath != "" {
+		_, currentResolved, err := validatePythonPath(e.pythonPath)
+		if err != nil || currentResolved == "" || currentResolved != e.resolvedPythonPath {
+			cause := err
+			if cause == nil {
+				cause = fmt.Errorf("yt-dlp python interpreter resolved target changed (%q -> %q)", e.resolvedPythonPath, currentResolved)
+			}
+			return nil, "", &Error{
+				Code:      CodeUpstreamUnavailable,
+				Message:   "外部提取器运行环境校验异常，请稍后重试",
+				Retryable: false,
+				Cause:     cause,
+			}
+		}
 		pyArgs := make([]string, 0, len(args)+1)
 		pyArgs = append(pyArgs, e.binaryPath)
 		pyArgs = append(pyArgs, args...)

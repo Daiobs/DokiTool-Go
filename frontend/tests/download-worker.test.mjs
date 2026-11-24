@@ -40,7 +40,7 @@ function harness(fetcher, indexedDB, workerOrigin = origin) {
   const admit = async number => send({ action: 'start', admission: true, token, request: { id: id(number), filename: '作品_P1.mp4', url: 'https://cdn.test/primary.mp4' } });
   const download = async (number, suppliedToken = token, signal) => {
     let response;
-    events.get('fetch')({ request: new Request(`${origin}/downloads/file/${id(number)}/${suppliedToken}`, { signal }), respondWith: value => { response = value; }, waitUntil: promise => lifetime.push(promise) });
+    events.get('fetch')({ request: new Request(`${workerOrigin}/downloads/file/${id(number)}/${suppliedToken}`, { signal }), respondWith: value => { response = value; }, waitUntil: promise => lifetime.push(promise) });
     return await response;
   };
   const query = async (number, client = 'page') => (await send({ action: 'query', tasks: [{ id: id(number), token }] }, client)).snapshots[0];
@@ -591,7 +591,7 @@ test('finished elapsed time and average speed remain stable across later queries
 test('worker reports its build and separates total elapsed time from transfer speed', async t => {
   const h = harness(async () => media()); t.after(() => h.close());
   const ping = await h.send({ action: 'ping' });
-  assert.equal(ping.workerBuild, 'downloads-20261124.1');
+  assert.equal(ping.workerBuild, 'downloads-20261124.2');
   assert.equal(ping.capabilities.admission, true);
   await h.start(1, [], { startedAt: 995_000 });
   assert.equal((await h.query(1)).elapsed, 5);
@@ -1950,15 +1950,20 @@ test('P1-5: sourceUrl() hardens against private/reserved IPs, deformed IPv4, non
     'http://[2002:7f00:1::1]/a.mp4',
     'http://[3fff::1]/a.mp4',
     'http://[3fff:fff::1]/a.mp4',
-    // Reserved internal hostnames and suffixes (case-insensitive & trailing dot)
+    // Reserved internal hostnames, suffixes, and single-label hostnames (case-insensitive & trailing dot)
     'http://localhost/a.mp4',
     'http://LOCALHOST./a.mp4',
     'http://api.localhost/a.mp4',
     'http://service.local/a.mp4',
+    'http://nas.localdomain/a.mp4',
+    'http://LOCALDOMAIN./a.mp4',
     'http://metadata.google.internal/a.mp4',
     'http://nas.LAN./a.mp4',
     'http://sso.corp/a.mp4',
     'http://router.home.arpa./a.mp4',
+    'http://router/a.mp4',
+    'http://wpad./a.mp4',
+    'http://intranet./a.mp4',
     // Credentials / protocol / m3u8 remain blocked
     'https://user:pass@cdn.example.com/a.mp4',
     'ftp://cdn.example.com/a.mp4',
@@ -1989,10 +1994,171 @@ test('P1-5: sourceUrl() hardens against private/reserved IPs, deformed IPv4, non
       'http://[::1]:42000/a.mp4',
       'http://sub.localhost:42000/a.mp4',
       'http://2130706433:42000/a.mp4',
+      'http://router/a.mp4',
+      'http://nas.localdomain/a.mp4',
       'https://cdn.example.com:8443/a.mp4',
     ]) {
       const reply = await tryUrl(local, blocked);
       assert.match(reply.error || '', /资源地址不支持完整文件下载/, `expected local origin ${localOrigin} to still reject ${blocked}`);
+    }
+  }
+});
+
+test('PR #39 F1+Low-11: prepare() and fetchChunk() allow valid public CDN 302 redirects and block malicious redirect landings with immediate body.cancel()', async t => {
+  const withFinalUrl = (resp, finalUrl) => {
+    Object.defineProperty(resp, 'url', { value: finalUrl, configurable: true });
+    return resp;
+  };
+  const makeTrackedResponse = (body, init, finalUrl, onCancel) => {
+    const stream = body instanceof ReadableStream ? body : new ReadableStream({
+      start(controller) {
+        controller.enqueue(body);
+        controller.close();
+      },
+      cancel() { onCancel?.(); },
+    });
+    return withFinalUrl(new Response(stream, init), finalUrl);
+  };
+
+  // 1. Valid public CDN 302 redirects (domain -> domain AND domain -> public IP) succeed in prepare() & fetchChunk().
+  for (const finalCdnUrl of [
+    'https://cdn2.example.com/resolved.mp4',
+    'https://1.1.1.1/resolved.mp4',
+  ]) {
+    const payload = makeRangePayload(3 * 1024 * 1024);
+    const expectedDigest = sha256(payload);
+    let rangeReqs = 0;
+    const h = harness(async (_url, options) => {
+      const rangeHeader = options.headers?.Range;
+      if (!rangeHeader) {
+        return withFinalUrl(new Response(makeChunkedStream(payload, 512 * 1024), {
+          status: 200,
+          headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), 'accept-ranges': 'bytes', etag: '"cdn-ok"' },
+        }), finalCdnUrl);
+      }
+      rangeReqs++;
+      const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+      const start = Number(a), end = Number(b);
+      const slice = payload.subarray(start, end + 1);
+      return withFinalUrl(new Response(slice, {
+        status: 206,
+        headers: {
+          'content-type': 'video/mp4',
+          'content-length': String(slice.length),
+          'content-range': `bytes ${start}-${end}/${payload.length}`,
+          etag: '"cdn-ok"',
+        },
+      }), finalCdnUrl);
+    }, undefined, 'https://snap.dokitool.com');
+    t.after(() => h.close());
+
+    const startReply = await h.send({
+      action: 'start',
+      admission: true,
+      token,
+      request: { id: id(1), filename: 'cdn-redirect.mp4', url: 'https://cdn1.example.com/a.mp4' },
+    });
+    assert.equal(startReply.error, undefined);
+    const downloadResp = await h.download(1);
+    assert.equal(downloadResp.status, 200);
+    const received = new Uint8Array(await downloadResp.arrayBuffer());
+    assert.equal(received.length, payload.length);
+    assert.equal(sha256(received), expectedDigest);
+    assert.ok(rangeReqs >= 1, `expected Range chunk requests against public redirect ${finalCdnUrl}`);
+    assert.equal((await h.query(1)).status, 'completed');
+  }
+
+  // 2. Malicious 302 redirect landings in prepare() MUST be rejected immediately and cancel response.body.
+  const maliciousTargets = [
+    'http://127.0.0.1/secret.mp4',
+    'http://192.168.1.1/secret.mp4',
+    'http://router/secret.mp4',
+    'http://nas.localdomain/secret.mp4',
+    'https://cdn2.example.com:8443/secret.mp4',
+  ];
+  for (const evilUrl of maliciousTargets) {
+    let cancelled = 0;
+    let fetchCalls = 0;
+    const h = harness(async () => {
+      fetchCalls++;
+      return makeTrackedResponse(bytes[0], {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'content-length': '4' },
+      }, evilUrl, () => { cancelled++; });
+    }, undefined, 'https://snap.dokitool.com');
+    t.after(() => h.close());
+
+    await h.send({
+      action: 'start',
+      admission: true,
+      token,
+      request: { id: id(2), filename: 'evil.mp4', url: 'https://cdn1.example.com/a.mp4' },
+    });
+    const resp = await h.download(2);
+    assert.equal(resp.status, 502, `prepare() must reject malicious redirect to ${evilUrl}`);
+    assert.equal(fetchCalls, 1, `prepare() must not retry rejected redirect to ${evilUrl}`);
+    assert.equal(cancelled, 1, `prepare() must cancel response body for malicious redirect to ${evilUrl}`);
+    const snap = await h.query(2);
+    assert.equal(snap.status, 'failed');
+    assert.match(snap.error, /资源地址不支持完整文件下载/);
+  }
+
+  // 3. Malicious 302 redirect landings in fetchChunk() (both during probe and post-switch) MUST cancel body immediately, never retry, and fail the task.
+  for (const evilUrl of maliciousTargets) {
+    for (const failOnPostSwitch of [false, true]) {
+      const payload = makeRangePayload(3 * 1024 * 1024);
+      let evilCancelled = 0;
+      let evilAttempts = 0;
+      const h = harness(async (_url, options) => {
+        const rangeHeader = options.headers?.Range;
+        if (!rangeHeader) {
+          return withFinalUrl(new Response(makeChunkedStream(payload, 512 * 1024), {
+            status: 200,
+            headers: { 'content-type': 'video/mp4', 'content-length': String(payload.length), 'accept-ranges': 'bytes', etag: '"ok"' },
+          }), 'https://cdn2.example.com/a.mp4');
+        }
+        const [, a, b] = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+        const start = Number(a), end = Number(b);
+        const slice = payload.subarray(start, end + 1);
+        const isProbeChunk = start === 512 * 1024;
+        const shouldRedirectEvil = failOnPostSwitch ? start === 1536 * 1024 : isProbeChunk;
+        if (shouldRedirectEvil) {
+          evilAttempts++;
+          return makeTrackedResponse(slice, {
+            status: 206,
+            headers: {
+              'content-type': 'video/mp4',
+              'content-length': String(slice.length),
+              'content-range': `bytes ${start}-${end}/${payload.length}`,
+              etag: '"ok"',
+            },
+          }, evilUrl, () => { evilCancelled++; });
+        }
+        return withFinalUrl(new Response(slice, {
+          status: 206,
+          headers: {
+            'content-type': 'video/mp4',
+            'content-length': String(slice.length),
+            'content-range': `bytes ${start}-${end}/${payload.length}`,
+            etag: '"ok"',
+          },
+        }), 'https://cdn2.example.com/a.mp4');
+      }, undefined, 'https://snap.dokitool.com');
+      t.after(() => h.close());
+
+      await h.send({
+        action: 'start',
+        admission: true,
+        token,
+        request: { id: id(3), filename: 'range-evil.mp4', url: 'https://cdn1.example.com/a.mp4' },
+      });
+      const resp = await h.download(3);
+      await assert.rejects(() => resp.arrayBuffer(), /资源地址不支持完整文件下载|Error/, `stream must fail for ${evilUrl} (postSwitch=${failOnPostSwitch})`);
+      const snap = await h.query(3);
+      assert.equal(snap.status, 'failed', `task must terminate failed for ${evilUrl} (postSwitch=${failOnPostSwitch})`);
+      assert.match(snap.error, /资源地址不支持完整文件下载/);
+      assert.equal(evilAttempts, 1, `fetchChunk() must NOT retry malicious redirect to ${evilUrl} (postSwitch=${failOnPostSwitch})`);
+      assert.equal(evilCancelled, 1, `fetchChunk() must cancel response body for malicious redirect to ${evilUrl} (postSwitch=${failOnPostSwitch})`);
     }
   }
 });

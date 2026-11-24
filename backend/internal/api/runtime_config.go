@@ -634,6 +634,9 @@ func ApplyRuntimeConfig(entry http.Handler, handler *Handler, cfg RuntimeConfig,
 		if handler.cb != nil {
 			handler.cb.UpdateConfig(norm.CircuitBreaker)
 		}
+		if handler.cache != nil && len(norm.CircuitBreaker.DisabledPlatforms) > 0 {
+			handler.cache.purgePlatforms(norm.CircuitBreaker.DisabledPlatforms)
+		}
 		handler.setCachePolicy(norm.Cache)
 		handler.stats.applyRuntimePolicy(norm, fromFile, isReload)
 	} else if adm != nil && adm.stats != nil {

@@ -2459,7 +2459,7 @@ func TestYTDLPThreeCompartmentsAndRuntimeHotReloadSIGHUP(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapters := map[string]api.Adapter{}
-	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, fetch.New(), x.TombstoneFallbackOff, getenv, rtCfg, fromFile)
+	ytCfg, err := configureYTDLPFullWithRuntime(c, adapters, fetch.New(), x.TombstoneFallbackOff, getenv, limits, rtCfg, fromFile)
 	if err != nil {
 		t.Fatalf("configureYTDLPFullWithRuntime failed: %v", err)
 	}
@@ -2601,5 +2601,64 @@ func TestYTDLPThreeCompartmentsAndRuntimeHotReloadSIGHUP(t *testing.T) {
 	snapAfterBad := h.Stats().Snapshot()
 	if snapAfterBad.RuntimePolicy.ReloadCount != 1 || snapAfterBad.RuntimePolicy.YouTubeSlots != 8 || ytCfg.youtubeEngine.ConcurrencyLimit() != 8 {
 		t.Fatalf("invalid reload mutated active config: policy=%+v ytLimit=%d", snapAfterBad.RuntimePolicy, ytCfg.youtubeEngine.ConcurrencyLimit())
+	}
+
+	// 4. Env-only startup (!runtimeFromFile) MUST align all 3 ytengine compartments with validated AdmissionConfig limits (M2 / Low-4).
+	envOnlyMap := map[string]string{
+		"DOKITOOL_YTDLP_BINARY":                     fakeBin,
+		"DOKITOOL_YTDLP_YOUTUBE_ENABLED":            "true",
+		"DOKITOOL_YTDLP_X_ENABLED":                  "true",
+		"DOKITOOL_YTDLP_GENERIC_ENABLED":            "true",
+		"DOKITOOL_PARSE_YOUTUBE_GLOBAL_CONCURRENCY": "7",
+		"DOKITOOL_PARSE_SLOW_GLOBAL_CONCURRENCY":    "9",
+		"DOKITOOL_PARSE_GENERIC_GLOBAL_CONCURRENCY": "5",
+	}
+	envOnlyGet := func(k string) string { return envOnlyMap[k] }
+	envOnlyLimits, err := api.LoadAdmissionConfig(envOnlyGet)
+	if err != nil {
+		t.Fatalf("env-only LoadAdmissionConfig failed: %v", err)
+	}
+	cEnvOnly, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ytEnvOnly, err := configureYTDLPFullWithRuntime(cEnvOnly, map[string]api.Adapter{}, fetch.New(), x.TombstoneFallbackOff, envOnlyGet, envOnlyLimits, api.DefaultRuntimeConfig(), false)
+	if err != nil {
+		t.Fatalf("env-only configureYTDLPFullWithRuntime failed: %v", err)
+	}
+	defer func() { _ = ytEnvOnly.Close() }()
+	if ytEnvOnly.youtubeEngine.ConcurrencyLimit() != 7 || ytEnvOnly.socialEngine.ConcurrencyLimit() != 9 || ytEnvOnly.genericEngine.ConcurrencyLimit() != 5 {
+		t.Fatalf("env-only compartment limits did not align with AdmissionConfig: yt=%d social=%d generic=%d, want 7/9/5",
+			ytEnvOnly.youtubeEngine.ConcurrencyLimit(), ytEnvOnly.socialEngine.ConcurrencyLimit(), ytEnvOnly.genericEngine.ConcurrencyLimit())
+	}
+
+	// 5. Fault-injected SIGHUP atomic rollback (F4 / NB-1):
+	// When socialEngine fails SetConcurrencyLimit (disabled engine), youtubeEngine MUST roll back to its previous limit
+	// and api.ApplyRuntimeConfig MUST NOT mutate admission/handler/runtime_policy!
+	rollbackJSON := strings.ReplaceAll(updatedJSON, `"youtube_slots": 8`, `"youtube_slots": 11`)
+	rollbackJSON = strings.ReplaceAll(rollbackJSON, `"social_slots": 7`, `"social_slots": 10`)
+	if err := os.WriteFile(runtimePath, []byte(rollbackJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	faultyYTCfg := ytdlpConfigResult{
+		engine:        ytCfg.engine,
+		youtubeEngine: ytCfg.youtubeEngine, // currently 8
+		socialEngine:  ytengine.NewDisabled("injected failure"),
+		genericEngine: ytCfg.genericEngine, // currently 4
+	}
+	if ok := reloadRuntimeConfigOnce(entry, h, &faultyYTCfg, getenv, logf); ok {
+		t.Fatal("expected reloadRuntimeConfigOnce to return false when SetCompartmentLimits fails")
+	}
+	if ytCfg.youtubeEngine.ConcurrencyLimit() != 8 || ytCfg.genericEngine.ConcurrencyLimit() != 4 {
+		t.Fatalf("SetCompartmentLimits failed to roll back youtubeEngine: yt=%d generic=%d, want 8/4",
+			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
+	}
+	snapAfterRollback := h.Stats().Snapshot()
+	if snapAfterRollback.RuntimePolicy.ReloadCount != 1 ||
+		snapAfterRollback.RuntimePolicy.YouTubeSlots != 8 ||
+		snapAfterRollback.YTDLPPools.YouTube.ConcurrencyLimit != 8 ||
+		snapAfterRollback.YTDLPPools.Social.ConcurrencyLimit != 7 {
+		t.Fatalf("admission/stats mutated despite ytengine slot resize failure: policy=%+v pools=%+v",
+			snapAfterRollback.RuntimePolicy, snapAfterRollback.YTDLPPools)
 	}
 }
