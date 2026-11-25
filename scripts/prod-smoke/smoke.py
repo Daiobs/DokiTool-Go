@@ -1190,6 +1190,7 @@ class SmokeRunner:
         tier: str = "tier-a",
         tier_b_limit: int | None = None,
         youtube_context_warn_ms: int | None = None,
+        youtube_context_fail_ms: int | None = None,
         strict_stale: bool = False,
         retry_interval: float = DEFAULT_RETRY_INTERVAL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -1213,11 +1214,22 @@ class SmokeRunner:
             if youtube_context_warn_ms is not None
             else int(yt_cfg.get("warn_latency_ms", DEFAULT_YOUTUBE_CONTEXT_WARN_MS))
         )
-        fail_ms = int(yt_cfg.get("fail_latency_ms", DEFAULT_YOUTUBE_CONTEXT_FAIL_MS))
         if warn_ms < 1:
             raise SmokeError("invalid --youtube-context-warn-ms: must be >= 1")
+        if youtube_context_fail_ms is not None:
+            fail_ms = int(youtube_context_fail_ms)
+            if fail_ms < 1:
+                raise SmokeError("invalid --youtube-context-fail-ms: must be >= 1")
+            if fail_ms < warn_ms:
+                raise SmokeError(
+                    f"invalid --youtube-context-fail-ms ({fail_ms}): "
+                    f"must be >= --youtube-context-warn-ms ({warn_ms})"
+                )
+        else:
+            cfg_fail_ms = int(yt_cfg.get("fail_latency_ms", DEFAULT_YOUTUBE_CONTEXT_FAIL_MS))
+            fail_ms = max(warn_ms, cfg_fail_ms)
         self.youtube_context_warn_ms = warn_ms
-        self.youtube_context_fail_ms = max(warn_ms, fail_ms)
+        self.youtube_context_fail_ms = fail_ms
         self.strict_stale = bool(strict_stale)
         self.retry_interval = retry_interval
         self.max_attempts = max(1, int(max_attempts))
@@ -2367,6 +2379,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Latency warning threshold (ms) for /api/youtube/context (default: {DEFAULT_YOUTUBE_CONTEXT_WARN_MS})",
     )
     parser.add_argument(
+        "--youtube-context-fail-ms",
+        type=int,
+        default=None,
+        help=(
+            "Latency failure threshold (ms) for /api/youtube/context; must be >= 1 and >= warn threshold "
+            f"(default: samples.json fail_latency_ms or {DEFAULT_YOUTUBE_CONTEXT_FAIL_MS})"
+        ),
+    )
+    parser.add_argument(
         "--strict-stale",
         action="store_true",
         help="Treat SAMPLE_STALE upstream takedowns as a non-zero exit failure",
@@ -2435,6 +2456,7 @@ def main(argv: list[str] | None = None, *, clock: Clock | None = None) -> int:
                 tier=args.tier,
                 tier_b_limit=args.tier_b_limit,
                 youtube_context_warn_ms=args.youtube_context_warn_ms,
+                youtube_context_fail_ms=args.youtube_context_fail_ms,
                 strict_stale=args.strict_stale,
                 retry_interval=DEFAULT_RETRY_INTERVAL,
                 max_attempts=DEFAULT_MAX_ATTEMPTS,

@@ -1769,6 +1769,127 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(rep_fail["checks"][0]["status"], "FAIL")
             self.assertEqual(rep_fail["checks"][0]["code"], "LATENCY_FAIL")
 
+    def test_youtube_context_fail_ms_cli_override_and_validation(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            def latency_handler(delay_seconds: float):
+                def _handler(_rec):
+                    clock.advance(delay_seconds)
+                    return 200, {
+                        "schema_version": "1.0",
+                        "code": "OK",
+                        "data": {"player_id": "a1b2c3d4", "expires_at": "2026-11-15T11:00:00Z"},
+                    }
+                return _handler
+
+            # 1. Default None keeps backward-compatible samples.json fail_latency_ms (15000ms):
+            #    6000ms with --youtube-context-warn-ms 1500 stays WARN (rc=0).
+            srv.custom_youtube_context_handler = latency_handler(6.0)
+            rc_default, out_default, err_default = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "youtube_context",
+                    "--youtube-context-warn-ms",
+                    "1500",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_default, 0, msg=err_default or out_default)
+            rep_default = json.loads(out_default)
+            self.assertEqual(rep_default["checks"][0]["status"], "WARN")
+            self.assertEqual(rep_default["checks"][0]["code"], "LATENCY_WARN")
+
+            # 2. Explicit --youtube-context-fail-ms 5000: 2500ms stays WARN, 5500ms breaches to FAIL.
+            srv.custom_youtube_context_handler = latency_handler(2.5)
+            rc_warn, out_warn, err_warn = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "youtube_context",
+                    "--youtube-context-warn-ms",
+                    "1500",
+                    "--youtube-context-fail-ms",
+                    "5000",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_warn, 0, msg=err_warn or out_warn)
+            rep_warn = json.loads(out_warn)
+            self.assertEqual(rep_warn["checks"][0]["status"], "WARN")
+            self.assertEqual(rep_warn["checks"][0]["code"], "LATENCY_WARN")
+
+            srv.custom_youtube_context_handler = latency_handler(5.5)
+            rc_fail, out_fail, _ = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "youtube_context",
+                    "--youtube-context-warn-ms",
+                    "1500",
+                    "--youtube-context-fail-ms",
+                    "5000",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_fail, 1)
+            rep_fail = json.loads(out_fail)
+            self.assertEqual(rep_fail["checks"][0]["status"], "FAIL")
+            self.assertEqual(rep_fail["checks"][0]["code"], "LATENCY_FAIL")
+            self.assertIn("5000ms", rep_fail["checks"][0]["note"])
+
+            # 3. Equal warn and fail thresholds are valid and fail when exceeded.
+            srv.custom_youtube_context_handler = latency_handler(2.5)
+            rc_eq, out_eq, _ = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "youtube_context",
+                    "--youtube-context-warn-ms",
+                    "2000",
+                    "--youtube-context-fail-ms",
+                    "2000",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_eq, 1)
+            self.assertEqual(json.loads(out_eq)["checks"][0]["status"], "FAIL")
+
+            # 4. Invalid --youtube-context-fail-ms (< 1 or < warn_ms) rejected cleanly.
+            for bad_args in (
+                ["--youtube-context-fail-ms", "0"],
+                ["--youtube-context-fail-ms", "-50"],
+                ["--youtube-context-warn-ms", "2000", "--youtube-context-fail-ms", "1500"],
+                ["--youtube-context-fail-ms", "1500"],  # default warn_ms from samples.json is 2000
+            ):
+                with self.subTest(bad_args=bad_args):
+                    rc_bad, _, err_bad = self._run_cli(
+                        [
+                            "--base-url",
+                            srv.base_url,
+                            "--only",
+                            "youtube_context",
+                            *bad_args,
+                            "--format",
+                            "json",
+                        ],
+                        clock,
+                    )
+                    self.assertEqual(rc_bad, 1)
+                    self.assertIn("invalid --youtube-context-fail-ms", err_bad)
+
     def test_l4_tier_a_and_tier_b_stratification_and_rotation(self) -> None:
         clock = FakeClock()
         with FakeDokiServer(clock) as srv:
