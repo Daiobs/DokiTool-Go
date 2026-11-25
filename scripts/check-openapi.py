@@ -1194,7 +1194,7 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
     }))), "Unknown property in HourlyStatsBucket must be rejected")
 
     # Positive & negative checks for Attachment.track_kind on Success envelope
-    sample_subtitle_envelope = json.loads((EXAMPLES_DIR / "02-single-video-file.json").read_text(encoding="utf-8"))
+    sample_subtitle_envelope = json.loads(next(EXAMPLES_DIR.glob("02-*.json")).read_text(encoding="utf-8"))
     def _with_subtitle_attachment(track_kind_present: bool, track_kind_value=None) -> dict:
         env = json.loads(json.dumps(sample_subtitle_envelope))
         att = {
