@@ -447,6 +447,41 @@ func (s *EJSSandbox) PreprocessPlayer(ctx context.Context, rawPlayerJS string) (
 	return out.PreprocessedPlayer, nil
 }
 
+// PreprocessAndProbePlayer parses raw YouTube player JS and probes its extracted
+// n-challenge solver in a single zero-permission Deno invocation. Variants that
+// pass AST preprocessing but fail runtime challenge solving are rejected here so
+// refresh-time variant fallback switches cleanly without adding latency or extra
+// Deno processes, and without introducing outbound network calls into Finalize.
+func (s *EJSSandbox) PreprocessAndProbePlayer(ctx context.Context, rawPlayerJS string) (string, error) {
+	if strings.TrimSpace(rawPlayerJS) == "" {
+		return "", errors.New("empty player js")
+	}
+	const probeChallenge = "dokitool_probe_n"
+	out, err := s.runJSC(ctx, ejsInputPayload{
+		Type:               "player",
+		Player:             rawPlayerJS,
+		Requests:           []ejsRequestItem{{Type: "n", Challenges: []string{probeChallenge}}},
+		OutputPreprocessed: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out.PreprocessedPlayer) == "" {
+		return "", errors.New("ejs did not return preprocessed_player")
+	}
+	if len(out.Responses) != 1 || out.Responses[0].Type != "result" {
+		errMsg := "missing probe response"
+		if len(out.Responses) > 0 && strings.TrimSpace(out.Responses[0].Error) != "" {
+			errMsg = out.Responses[0].Error
+		}
+		return "", fmt.Errorf("ejs n probe failed: %s", errMsg)
+	}
+	if strings.TrimSpace(out.Responses[0].Data[probeChallenge]) == "" {
+		return "", errors.New("ejs n probe returned empty result")
+	}
+	return out.PreprocessedPlayer, nil
+}
+
 // Solve evaluates n and sig challenges against a cached preprocessed_player.
 func (s *EJSSandbox) Solve(ctx context.Context, preprocessedPlayerJS string, nChallenges, sigChallenges []string) (map[string]string, map[string]string, error) {
 	if strings.TrimSpace(preprocessedPlayerJS) == "" {

@@ -3541,6 +3541,79 @@
           }
         }
       },
+      "YouTubeHelperStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "disabled_by_config",
+          "active_player_cached",
+          "active_variant",
+          "refresh_attempts",
+          "refresh_successes",
+          "refresh_failures",
+          "cooldown_skips",
+          "consecutive_failures",
+          "in_cooldown",
+          "challenge_lru_entries",
+          "challenge_lru_hits",
+          "challenge_lru_misses"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "disabled_by_config": {
+            "type": "boolean"
+          },
+          "active_player_cached": {
+            "type": "boolean"
+          },
+          "active_variant": {
+            "type": "string",
+            "enum": [
+              "",
+              "tv",
+              "main"
+            ]
+          },
+          "refresh_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "refresh_successes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "refresh_failures": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cooldown_skips": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "in_cooldown": {
+            "type": "boolean"
+          },
+          "challenge_lru_entries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "challenge_lru_hits": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "challenge_lru_misses": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "StatsSnapshot": {
         "type": "object",
         "additionalProperties": false,
@@ -3594,6 +3667,9 @@
           },
           "ytdlp_pools": {
             "$ref": "#/components/schemas/YTDLPPoolsSnapshot"
+          },
+          "youtube_helper": {
+            "$ref": "#/components/schemas/YouTubeHelperStatsSnapshot"
           },
           "circuit_breakers": {
             "type": "array",

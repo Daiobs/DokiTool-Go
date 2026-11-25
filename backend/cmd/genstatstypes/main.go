@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
@@ -42,6 +43,7 @@ var tsTypeNames = map[reflect.Type]string{
 	reflect.TypeOf(ytengine.ChannelSlotStatsSnapshot{}): "ChannelSlotStatsSnapshot",
 	reflect.TypeOf(ytengine.SlotChannelBreakdown{}):     "YTDLPChannelBreakdown",
 	reflect.TypeOf(ytengine.SlotStatsSnapshot{}):        "YTDLPStatsSnapshot",
+	reflect.TypeOf(youtube.HelperStatsSnapshot{}):       "YouTubeHelperStatsSnapshot",
 	reflect.TypeOf(shresolver.ChannelStatsSnapshot{}):   "ShanghaiChannelStats",
 	reflect.TypeOf(shresolver.ChannelBreakdown{}):       "ShanghaiChannelBreakdown",
 	reflect.TypeOf(shresolver.PlatformBreakdown{}):      "ShanghaiPlatformBreakdown",
@@ -58,6 +60,7 @@ var fieldOverrides = map[string]fieldOverride{
 	"CircuitBreakerPlatformSnapshot.state": {tsType: "CircuitBreakerState"},
 	"StatsSnapshot.ytdlp_generic":          {optional: true},
 	"StatsSnapshot.ytdlp_pools":            {optional: true},
+	"StatsSnapshot.youtube_helper":         {optional: true},
 	"StatsSnapshot.circuit_breakers":       {optional: true},
 	"StatsSnapshot.runtime_policy":         {optional: true},
 }

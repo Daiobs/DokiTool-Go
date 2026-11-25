@@ -30,6 +30,7 @@ const (
 	media
 	youtubeHelper
 	statsRoute
+	routeCount
 )
 
 // Match the same exact escaped paths for admission and dispatch.

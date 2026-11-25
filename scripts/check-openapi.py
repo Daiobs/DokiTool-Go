@@ -698,6 +698,11 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         ytdlp_pools_prop.get("$ref") == "#/components/schemas/YTDLPPoolsSnapshot",
         "StatsSnapshot.ytdlp_pools must reference YTDLPPoolsSnapshot",
     )
+    yt_helper_prop = comp_schemas["StatsSnapshot"]["properties"].get("youtube_helper") or {}
+    require(
+        yt_helper_prop.get("$ref") == "#/components/schemas/YouTubeHelperStatsSnapshot",
+        "StatsSnapshot.youtube_helper must reference YouTubeHelperStatsSnapshot",
+    )
     cb_list_prop = comp_schemas["StatsSnapshot"]["properties"].get("circuit_breakers") or {}
     require(
         cb_list_prop.get("type") == "array"

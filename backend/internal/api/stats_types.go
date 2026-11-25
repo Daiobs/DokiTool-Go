@@ -4,9 +4,19 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
+
+// YouTubeHelperStatsSnapshot aliases youtube.HelperStatsSnapshot so /api/stats
+// exposes YouTube helper refresh/cooldown/LRU telemetry with one canonical schema.
+type YouTubeHelperStatsSnapshot = youtube.HelperStatsSnapshot
+
+// YouTubeHelperStatsSource provides a point-in-time redacted YouTube helper telemetry snapshot.
+type YouTubeHelperStatsSource interface {
+	HelperStatsSnapshot() youtube.HelperStatsSnapshot
+}
 
 // HistogramBuckets aliases ytengine.HistogramBuckets so API telemetry shares one exact schema.
 type HistogramBuckets = ytengine.HistogramBuckets
@@ -255,6 +265,7 @@ type StatsSnapshot struct {
 	YTDLP           ytengine.SlotStatsSnapshot       `json:"ytdlp"`
 	YTDLPGeneric    ytengine.SlotStatsSnapshot       `json:"ytdlp_generic"`
 	YTDLPPools      YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
+	YouTubeHelper   YouTubeHelperStatsSnapshot       `json:"youtube_helper"`
 	CircuitBreakers []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
 	RuntimePolicy   RuntimePolicySummary             `json:"runtime_policy"`
 	Shanghai        shresolver.StatsSnapshot         `json:"shanghai"`

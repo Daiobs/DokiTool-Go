@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,8 @@ type Handler struct {
 	cb                  *circuitBreakerManager
 	policyMu            sync.RWMutex
 	cachePolicy         RuntimeCachePolicy
+	observersMu         sync.RWMutex
+	observers           []RuntimeConfigObserver
 	stats               *Stats
 	panicLogf           func(string, ...any)
 }
@@ -147,9 +150,57 @@ func (h *Handler) Stats() *Stats {
 // Its response is never passed through the unified JSON encoder.
 func (h *Handler) SetWeiboRelay(relay http.Handler) { h.weiboRelay = relay }
 
+// RegisterRuntimeConfigObserver registers an observer notified on every
+// ApplyRuntimeConfig startup and SIGHUP hot-reload update.
+func (h *Handler) RegisterRuntimeConfigObserver(obs RuntimeConfigObserver) {
+	if h == nil || obs == nil {
+		return
+	}
+	h.observersMu.Lock()
+	h.observers = append(h.observers, obs)
+	h.observersMu.Unlock()
+}
+
+func (h *Handler) notifyRuntimeConfigObservers(cfg RuntimeConfig) {
+	if h == nil {
+		return
+	}
+	h.observersMu.RLock()
+	list := slices.Clone(h.observers)
+	h.observersMu.RUnlock()
+	for _, obs := range list {
+		obs.OnRuntimeConfig(cfg)
+	}
+}
+
 // SetYouTubeHelper registers the browser-assisted YouTube context/finalize handler.
 // When unset, /api/youtube/context and /api/youtube/finalize return 404.
-func (h *Handler) SetYouTubeHelper(helper YouTubeHelper) { h.youtubeHelper = helper }
+// Registration automatically binds runtime kill-switch/circuit-breaker governance
+// and /api/stats telemetry so callers cannot forget cross-cutting wiring.
+func (h *Handler) SetYouTubeHelper(helper YouTubeHelper) {
+	if h == nil {
+		return
+	}
+	h.youtubeHelper = helper
+	if helper == nil {
+		h.stats.SetYouTubeHelperSource(nil)
+		return
+	}
+	if src, ok := helper.(YouTubeHelperStatsSource); ok {
+		h.stats.SetYouTubeHelperSource(src)
+	}
+	if gated, ok := helper.(interface{ SetUpstreamAllowed(func() bool) }); ok {
+		gated.SetUpstreamAllowed(func() bool {
+			return !h.cb.IsDisabled("youtube") && !h.cb.IsOpen("youtube", h.now())
+		})
+	}
+	if toggle, ok := helper.(interface{ SetEnabled(bool) }); ok {
+		toggle.SetEnabled(!h.cb.IsDisabled("youtube"))
+		h.RegisterRuntimeConfigObserver(RuntimeConfigObserverFunc(func(cfg RuntimeConfig) {
+			toggle.SetEnabled(!slices.Contains(cfg.CircuitBreaker.DisabledPlatforms, "youtube"))
+		}))
+	}
+}
 
 // SetGenericAdapter registers the optional Tier-2 named-extractor yt-dlp fallback
 // adapter before server startup. When unset, non-catalog URLs return UNSUPPORTED_PLATFORM.
@@ -190,7 +241,7 @@ func (h *Handler) recordParseTelemetry(routePlatform, dynamicPlatform, code, cha
 // HasCachedYouTubeContext reports whether the configured YouTube helper currently
 // holds a fresh in-memory player context that can be served without upstream/Deno work.
 func (h *Handler) HasCachedYouTubeContext() bool {
-	if h == nil || h.youtubeHelper == nil {
+	if h == nil || h.youtubeHelper == nil || h.cb.IsDisabled("youtube") {
 		return false
 	}
 	if checker, ok := h.youtubeHelper.(interface{ HasCachedContext() bool }); ok {
@@ -266,8 +317,11 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 // pre-cache validation guards and cache key derivation in ServeHTTP so invalid
 // requests never masquerade as cache hits, and it never mutates the cache.
 func (h *Handler) HasFreshCachedParse(path, rawQuery string) bool {
-	ck, _, ok := h.deriveCacheableParseKey(path, rawQuery)
-	return ok && h.cache.fresh(ck, h.now())
+	ck, platform, ok := h.deriveCacheableParseKey(path, rawQuery)
+	if !ok || h.cb.IsDisabled(platform) {
+		return false
+	}
+	return h.cache.fresh(ck, h.now())
 }
 
 // tryServeFreshCachedParse serves an authenticated GET /api/parse or /api/resolve
@@ -286,6 +340,15 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 		key.recordUnauthorized()
 		h.recordParseTelemetry(platform, "", OutcomeUnauthorized, ChannelOwner, time.Since(wallStart))
 		rejectUnauthorizedWithMessage(w, r, parser, "当前凭据无权访问该平台")
+		return true
+	}
+	if h.cb.IsDisabled(platform) {
+		res := circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
+		h.recordParseTelemetry(platform, res.platform, res.code, ChannelOwner, time.Since(wallStart))
+		if key != nil {
+			key.recordCachedParseStatus(res.status)
+		}
+		writeResponse(w, res)
 		return true
 	}
 	res, fresh := h.cache.getFresh(ck, h.now())
@@ -507,6 +570,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 410, "接口已更新，请等待当前下载结束后刷新页面")
 		return
 	case media:
+		if allowed, _ := h.enforcePlatformPolicy(w, r, media, "weibo"); !allowed {
+			return
+		}
 		if h.weiboRelay != nil {
 			h.weiboRelay.ServeHTTP(w, r)
 			return
@@ -1012,11 +1078,7 @@ func (h *Handler) serveYouTubeHelper(w http.ResponseWriter, r *http.Request) {
 		sendError(w, 404, "接口不存在")
 		return
 	}
-	if !authAllowsPlatform(r.Context(), "youtube") {
-		if authKey, viaAdm := authKeyFromContext(r.Context()); authKey != nil && !viaAdm {
-			authKey.recordUnauthorized()
-		}
-		sendError(w, http.StatusUnauthorized, "当前凭据无权访问该平台")
+	if allowed, _ := h.enforcePlatformPolicy(w, r, youtubeHelper, "youtube"); !allowed {
 		return
 	}
 	switch r.URL.EscapedPath() {
