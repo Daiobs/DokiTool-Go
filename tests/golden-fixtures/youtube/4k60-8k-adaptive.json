@@ -1,0 +1,176 @@
+{
+  "fixture_id": "youtube-4k60-8k-adaptive",
+  "description": "Sanitized YouTube 8K60/4K60/1080p60 adaptive split video + 360p progressive signed attachment + M4A standalone audio fixture.",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "youtube",
+    "platform_name": "YouTube",
+    "content_id": "dQw4w9WgXcQ",
+    "title": "Ultra HD 8K60 Nature Showcase",
+    "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "published_at": "2026-11-20T08:00:00Z",
+    "author": {
+      "id": "UCgolden8k",
+      "name": "Cinema8K"
+    },
+    "statistics": {
+      "views": { "value": 2450000, "state": "verified" },
+      "likes": { "value": 89400, "state": "verified" }
+    },
+    "tags": ["8K", "HDR"],
+    "extra": {
+      "youtube_helper": {
+        "status": "ready",
+        "provider": "extension",
+        "version": "4.3.0",
+        "extensionVersion": "4.3.0"
+      }
+    },
+    "default_item_id": "yt-main",
+    "items": [
+      {
+        "id": "yt-main",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "title": "Ultra HD 8K60 Nature Showcase",
+        "duration_ms": 212400,
+        "default": {
+          "variant_id": "yt-360p",
+          "source_id": "s-360"
+        },
+        "variants": [
+          {
+            "id": "yt-360p",
+            "label": "360p (含音频)",
+            "state": "ready",
+            "metadata": {
+              "width": 640,
+              "height": 360,
+              "fps": 30,
+              "video_codec": "avc1.42001e",
+              "audio_codec": "mp4a.40.2",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true,
+              "duration_ms": 212400
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-360",
+                  "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=18&source=youtube&sparams=itag%2Csource&title=Ultra_HD_8K60",
+                  "size_bytes": 9500000
+                }
+              ]
+            }
+          },
+          {
+            "id": "yt-1080p60",
+            "label": "1080p60 (仅视频无声)",
+            "state": "ready",
+            "metadata": {
+              "width": 1920,
+              "height": 1080,
+              "fps": 60,
+              "video_codec": "avc1.64002a",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": false,
+              "duration_ms": 212400
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-1080",
+                  "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=299&clen=48000000",
+                  "size_bytes": 48000000
+                }
+              ]
+            }
+          },
+          {
+            "id": "yt-2160p60",
+            "label": "2160p60 (4K · 仅视频无声)",
+            "state": "ready",
+            "metadata": {
+              "width": 3840,
+              "height": 2160,
+              "fps": 60,
+              "video_codec": "av01.0.13M.08",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": false,
+              "duration_ms": 212400
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-2160",
+                  "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=401&clen=140000000",
+                  "size_bytes": 140000000
+                }
+              ]
+            }
+          },
+          {
+            "id": "yt-4320p60",
+            "label": "4320p60 (8K · 仅视频无声)",
+            "state": "ready",
+            "metadata": {
+              "width": 7680,
+              "height": 4320,
+              "fps": 60,
+              "video_codec": "av01.0.16M.08",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": false,
+              "duration_ms": 212400
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-4320",
+                  "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=571&clen=320000000",
+                  "size_bytes": 320000000
+                }
+              ]
+            }
+          },
+          {
+            "id": "yt-audio-m4a",
+            "label": "音频 (M4A)",
+            "state": "ready",
+            "metadata": {
+              "audio_codec": "mp4a.40.2",
+              "audio_bitrate_bps": 128000,
+              "container": "m4a",
+              "extension": "m4a",
+              "mime_type": "audio/mp4",
+              "has_audio": true,
+              "duration_ms": 212400
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-m4a",
+                  "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=140&clen=3400000",
+                  "size_bytes": 3400000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,138 @@
+{
+  "fixture_id": "bilibili-ugc-season-single-p",
+  "description": "Sanitized Bilibili ugc_season collection containing a single returned video item whose part title is placeholder 'P1', with 1080P DASH mux, 720P direct fallback, and standalone protected M4A audio.",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "bilibili",
+    "platform_name": "B站",
+    "content_id": "BV1golden0001",
+    "title": "【技术实录】全链路架构演进",
+    "source_url": "https://www.bilibili.com/video/BV1golden0001",
+    "published_at": "2026-11-20T08:00:00Z",
+    "author": {
+      "id": "10086001",
+      "name": "EngineeringLab"
+    },
+    "statistics": {
+      "views": { "value": 125000, "state": "verified" },
+      "likes": { "value": 11200, "state": "verified" }
+    },
+    "tags": ["Architecture", "Media"],
+    "default_item_id": "item-p1",
+    "groups": [
+      {
+        "id": "season-42",
+        "kind": "collection",
+        "title": "架构演进合集",
+        "total_count": 12,
+        "item_ids": ["item-p1"]
+      }
+    ],
+    "items": [
+      {
+        "id": "item-p1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "title": "P1",
+        "duration_ms": 124600,
+        "default": {
+          "variant_id": "bili-720p-mp4",
+          "source_id": "s-720"
+        },
+        "variants": [
+          {
+            "id": "bili-1080p-dash",
+            "label": "1080p60 (DASH)",
+            "state": "ready",
+            "metadata": {
+              "width": 1920,
+              "height": 1080,
+              "fps": 60,
+              "video_codec": "avc1.640032",
+              "audio_codec": "mp4a.40.2",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true,
+              "duration_ms": 124600
+            },
+            "delivery": {
+              "kind": "mux",
+              "resources": [
+                {
+                  "id": "dash-v-1080",
+                  "role": "video",
+                  "metadata": {
+                    "width": 1920,
+                    "height": 1080,
+                    "video_codec": "avc1.640032",
+                    "container": "mp4",
+                    "mime_type": "video/mp4"
+                  },
+                  "delivery": {
+                    "kind": "file",
+                    "sources": [
+                      {
+                        "id": "sv-1080",
+                        "url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/golden/1080p.m4s",
+                        "size_bytes": 42000000
+                      }
+                    ]
+                  }
+                },
+                {
+                  "id": "dash-a-192k",
+                  "role": "audio",
+                  "metadata": {
+                    "audio_codec": "mp4a.40.2",
+                    "audio_bitrate_bps": 192000,
+                    "container": "m4a",
+                    "mime_type": "audio/mp4"
+                  },
+                  "delivery": {
+                    "kind": "file",
+                    "sources": [
+                      {
+                        "id": "sa-192k",
+                        "url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/golden/audio.m4s",
+                        "size_bytes": 3200000
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": "bili-720p-mp4",
+            "label": "720p",
+            "state": "ready",
+            "metadata": {
+              "width": 1280,
+              "height": 720,
+              "fps": 30,
+              "video_codec": "avc1.64001f",
+              "audio_codec": "mp4a.40.2",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true,
+              "duration_ms": 124600
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-720",
+                  "url": "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/golden/720p.mp4",
+                  "size_bytes": 18500000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

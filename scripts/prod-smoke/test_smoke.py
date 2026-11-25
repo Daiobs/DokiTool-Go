@@ -56,6 +56,7 @@ def make_envelope(
     platform: str,
     *,
     generated_at: str = "2026-11-15T05:00:00Z",
+    title: str | None = None,
     media_url: str | None = None,
     browser_fetch: str | None = None,
     access: str = "direct",
@@ -148,6 +149,7 @@ def make_envelope(
         "code": "OK",
         "data": {
             "platform": platform,
+            "title": f"Smoke sample {platform}" if title is None else title,
             "generated_at": generated_at,
             "items": [item],
         },
@@ -175,6 +177,7 @@ class FakeDokiServer:
         self.custom_parse_handler = None
         self.custom_stats_handler = None
         self.custom_unlisted_api_handler = None
+        self.custom_youtube_context_handler = None
         self.redirect_on_platforms = False
 
         outer = self
@@ -232,6 +235,27 @@ class FakeDokiServer:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Set-Cookie", "parse_cookie=forbidden; Path=/")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if parsed.path == "/api/youtube/context":
+                    if outer.custom_youtube_context_handler is not None:
+                        status, payload = outer.custom_youtube_context_handler(rec)
+                    else:
+                        status = 200
+                        payload = {
+                            "schema_version": "1.0",
+                            "code": "OK",
+                            "data": {
+                                "player_id": "a1b2c3d4",
+                                "expires_at": "2026-11-15T11:00:00Z",
+                            },
+                        }
+                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     self.wfile.write(body)
                     return
@@ -338,6 +362,9 @@ class FakeDokiServer:
             "instagram.com": "instagram",
             "facebook.com": "facebook",
             "tumblr.com": "tumblr",
+            "vimeo.com": "vimeo",
+            "reddit.com": "reddit",
+            "soundcloud.com": "soundcloud",
         }
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
         for suffix, plat in mapping.items():
@@ -408,10 +435,10 @@ class ProdSmokeUnitTests(unittest.TestCase):
             md_text = md_out.read_text(encoding="utf-8")
             self.assertTrue(report["passed"])
             self.assertEqual(report["summary"]["fail"], 0)
-            # rate_limit is SKIP by default
-            self.assertEqual(report["summary"]["skip"], 1)
-            # 1 frontend + 1 platforms + 1 cache + 1 x + 1 dy_dom + 4 dm + 14 platforms + 2 api_boundary = 25 PASS
-            self.assertEqual(report["summary"]["pass"], 25)
+            # tier_b_platforms and rate_limit are SKIP by default under --tier tier-a
+            self.assertEqual(report["summary"]["skip"], 2)
+            # 1 frontend + 1 platforms + 1 youtube_context + 1 cache + 1 x + 1 dy_dom + 4 dm + 14 platforms + 2 api_boundary = 26 PASS
+            self.assertEqual(report["summary"]["pass"], 26)
 
             # Verify api_boundary runs strictly AFTER all parse check groups and BEFORE rate_limit
             groups_in_order = [c["group"] for c in report["checks"]]
@@ -868,6 +895,7 @@ class ProdSmokeUnitTests(unittest.TestCase):
                         "code": "OK",
                         "data": {
                             "platform": "douyin",
+                            "title": "抖音实况混合样本",
                             "generated_at": "2026-11-15T05:00:00Z",
                             "items": [
                                 {
@@ -1651,6 +1679,241 @@ class ProdSmokeUnitTests(unittest.TestCase):
                 smoke._resolve_proxy_for_origin("https", "snap.dokitool.com"),
                 ("127.0.0.1", 7897),
             )
+
+    def test_l4_title_quality_assertions_reject_empty_and_placeholders(self) -> None:
+        clock = FakeClock()
+        bad_titles = ["", "   ", "P1", "p12", "第1集", "未知标题", "Unknown Title", "序列 01"]
+        for bad_title in bad_titles:
+            with self.subTest(title=bad_title):
+                payload = make_envelope("bilibili", title=bad_title)
+                resp = smoke.RawHttpResponse(
+                    status=200,
+                    headers={"content-type": "application/json"},
+                    body=json.dumps(payload).encode("utf-8"),
+                    elapsed_ms=25,
+                )
+                with self.assertRaisesRegex(AssertionError, "quality assertion failed"):
+                    smoke.validate_parse_envelope(resp, "bilibili", target_host="snap.dokitool.com")
+
+        good_payload = make_envelope("bilibili", title="【技术实录】全链路架构演进")
+        good_resp = smoke.RawHttpResponse(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(good_payload).encode("utf-8"),
+            elapsed_ms=25,
+        )
+        parsed, hosts = smoke.validate_parse_envelope(
+            good_resp, "bilibili", target_host="snap.dokitool.com"
+        )
+        self.assertEqual(parsed["data"]["title"], "【技术实录】全链路架构演进")
+        self.assertTrue(hosts)
+
+    def test_l4_youtube_context_latency_warn_and_fail_thresholds(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            # 1. Warm fast response -> PASS
+            rc, out, err = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "youtube_context", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc, 0, msg=err or out)
+            rep = json.loads(out)
+            self.assertEqual(rep["checks"][0]["status"], "PASS")
+            self.assertEqual(rep["summary"]["warn"], 0)
+
+            # 2. Slow response exceeding warn threshold (2000ms) -> WARN (non-failing)
+            def slow_warn(_rec):
+                clock.advance(2.5)
+                return 200, {
+                    "schema_version": "1.0",
+                    "code": "OK",
+                    "data": {"player_id": "slow1234", "expires_at": "2026-11-15T11:00:00Z"},
+                }
+
+            srv.custom_youtube_context_handler = slow_warn
+            rc_warn, out_warn, _ = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "youtube_context",
+                    "--youtube-context-warn-ms",
+                    "2000",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_warn, 0)
+            rep_warn = json.loads(out_warn)
+            self.assertEqual(rep_warn["checks"][0]["status"], "WARN")
+            self.assertEqual(rep_warn["checks"][0]["code"], "LATENCY_WARN")
+            self.assertEqual(rep_warn["summary"]["warn"], 1)
+
+            # 3. Severely stalled response exceeding fail threshold (15000ms) -> FAIL
+            def slow_fail(_rec):
+                clock.advance(16.0)
+                return 200, {
+                    "schema_version": "1.0",
+                    "code": "OK",
+                    "data": {"player_id": "cold9999", "expires_at": "2026-11-15T11:00:00Z"},
+                }
+
+            srv.custom_youtube_context_handler = slow_fail
+            rc_fail, out_fail, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "youtube_context", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_fail, 1)
+            rep_fail = json.loads(out_fail)
+            self.assertEqual(rep_fail["checks"][0]["status"], "FAIL")
+            self.assertEqual(rep_fail["checks"][0]["code"], "LATENCY_FAIL")
+
+    def test_l4_tier_a_and_tier_b_stratification_and_rotation(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            # Default --tier tier-a skips tier_b_platforms
+            rc_a, out_a, err_a = self._run_cli(
+                ["--base-url", srv.base_url, "--tier", "tier-a", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_a, 0, msg=err_a or out_a)
+            rep_a = json.loads(out_a)
+            self.assertEqual(rep_a["tier"], "tier-a")
+            tb_checks_a = [c for c in rep_a["checks"] if c["group"] == "tier_b_platforms"]
+            self.assertEqual(len(tb_checks_a), 1)
+            self.assertEqual(tb_checks_a[0]["status"], "SKIP")
+
+            # --tier tier-b with --tier-b-limit 2 runs rotated subset and skips Tier-A parse groups
+            rc_b, out_b, err_b = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--tier",
+                    "tier-b",
+                    "--tier-b-limit",
+                    "2",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_b, 0, msg=err_b or out_b)
+            rep_b = json.loads(out_b)
+            self.assertEqual(rep_b["tier"], "tier-b")
+            tb_checks_b = [c for c in rep_b["checks"] if c["group"] == "tier_b_platforms"]
+            self.assertEqual(len(tb_checks_b), 2)
+            self.assertTrue(all(c["status"] == "PASS" for c in tb_checks_b))
+            all_plat_b = [c for c in rep_b["checks"] if c["group"] == "all_platforms"]
+            self.assertEqual(len(all_plat_b), 1)
+            self.assertEqual(all_plat_b[0]["status"], "SKIP")
+
+            # --tier all executes BOTH Tier-A 14 core platforms and full Tier-B pool
+            rc_all, out_all, err_all = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--tier",
+                    "all",
+                    "--only",
+                    "all_platforms,tier_b_platforms",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_all, 0, msg=err_all or out_all)
+            rep_all = json.loads(out_all)
+            self.assertEqual(
+                sum(1 for c in rep_all["checks"] if c["group"] == "all_platforms" and c["status"] == "PASS"),
+                14,
+            )
+            self.assertEqual(
+                sum(1 for c in rep_all["checks"] if c["group"] == "tier_b_platforms" and c["status"] == "PASS"),
+                3,
+            )
+
+    def test_l4_sample_stale_distinguished_from_parser_failure_with_redaction(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            def custom_parse(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                if plat == "bilibili":
+                    # Simulate deleted/takedown video with sensitive URL/token in upstream message
+                    return 404, {
+                        "schema_version": "1.0",
+                        "code": "CONTENT_UNAVAILABLE",
+                        "error": {
+                            "code": "CONTENT_UNAVAILABLE",
+                            "message": "稿件已下架 https://api.bilibili.com/x?xsec_token=SECRET999 from 203.0.113.5",
+                        },
+                    }
+                if plat == "xiaohongshu":
+                    return 502, {
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_BLOCKED",
+                        "error": {
+                            "code": "UPSTREAM_BLOCKED",
+                            "message": "上游网关风控拦截",
+                        },
+                    }
+                return 200, make_envelope(plat)
+
+            srv.custom_parse_handler = custom_parse
+
+            # 1. Stale Bilibili sample + real XHS parser outage -> bilibili=SAMPLE_STALE, xhs=FAIL
+            rc, out, err = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc, 1)
+            rep = json.loads(out)
+            by_id = {c["id"]: c for c in rep["checks"]}
+            self.assertEqual(by_id["platform:bilibili"]["status"], "SAMPLE_STALE")
+            self.assertEqual(by_id["platform:bilibili"]["code"], "SAMPLE_STALE")
+            self.assertEqual(by_id["platform:xiaohongshu"]["status"], "FAIL")
+            self.assertEqual(by_id["platform:xiaohongshu"]["code"], "UPSTREAM_BLOCKED")
+            self.assertEqual(rep["summary"]["sample_stale"], 1)
+            self.assertEqual(rep["summary"]["fail"], 1)
+            # Redaction verified: sensitive URL, xsec_token, and IP scrubbed from SAMPLE_STALE note
+            self.assertNotIn("SECRET999", out)
+            self.assertNotIn("203.0.113.5", out)
+            self.assertNotIn("https://", out)
+
+            # 2. Only SAMPLE_STALE (no real parser failure): default exits 0, --strict-stale exits 1
+            def stale_only(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                if plat == "bilibili":
+                    return 404, {
+                        "schema_version": "1.0",
+                        "code": "CONTENT_UNAVAILABLE",
+                        "error": {"code": "CONTENT_UNAVAILABLE", "message": "视频已下架"},
+                    }
+                return 200, make_envelope(plat)
+
+            srv.custom_parse_handler = stale_only
+            rc_soft, out_soft, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "md"],
+                clock,
+            )
+            self.assertEqual(rc_soft, 0)
+            self.assertIn("SAMPLE_STALE=1", out_soft)
+            self.assertIn("**SAMPLE_STALE**", out_soft)
+
+            rc_strict, out_strict, _ = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "all_platforms",
+                    "--strict-stale",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc_strict, 1)
+            self.assertEqual(json.loads(out_strict)["passed"], False)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,10 @@ DEFAULT_FRONTEND_CONCURRENCY = 6
 MAX_FRONTEND_CONCURRENCY = 8
 DEFAULT_IPV6_PROBE_TIMEOUT = 1.5
 DEFAULT_IDLE_CONNECTION_TTL = 55.0
+DEFAULT_YOUTUBE_CONTEXT_WARN_MS = 2000
+DEFAULT_YOUTUBE_CONTEXT_FAIL_MS = 15000
+
+VALID_TIERS: tuple[str, ...] = ("tier-a", "tier-b", "all")
 
 PARSE_GROUPS: tuple[str, ...] = (
     "cache",
@@ -51,11 +55,13 @@ PARSE_GROUPS: tuple[str, ...] = (
     "douyin_domestic",
     "direct_markers",
     "all_platforms",
+    "tier_b_platforms",
 )
 
 DEFAULT_GROUPS: tuple[str, ...] = (
     "frontend_hashes",
     "platforms",
+    "youtube_context",
     "cache",
     "x_fast_path",
     "douyin_domestic",
@@ -63,7 +69,50 @@ DEFAULT_GROUPS: tuple[str, ...] = (
     "all_platforms",
     "api_boundary",
 )
-ALL_GROUPS: tuple[str, ...] = DEFAULT_GROUPS + ("rate_limit",)
+ALL_GROUPS: tuple[str, ...] = (
+    "frontend_hashes",
+    "platforms",
+    "youtube_context",
+    "cache",
+    "x_fast_path",
+    "douyin_domestic",
+    "direct_markers",
+    "all_platforms",
+    "tier_b_platforms",
+    "api_boundary",
+    "rate_limit",
+)
+
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(?:P\d+|第?\s*\d+\s*[集话期話]|序列\s*\d+|未知标题|unknown\s*title|untitled|null|none)$",
+    re.IGNORECASE,
+)
+_STALE_ERROR_CODES = frozenset(
+    {
+        "CONTENT_UNAVAILABLE",
+        "NOT_FOUND",
+        "CONTENT_NOT_FOUND",
+        "MEDIA_NOT_FOUND",
+        "VIDEO_UNAVAILABLE",
+    }
+)
+_NON_STALE_PARSER_ERROR_CODES = frozenset(
+    {
+        "UPSTREAM_BLOCKED",
+        "UPSTREAM_TIMEOUT",
+        "UPSTREAM_UNAVAILABLE",
+        "UPSTREAM_INVALID_RESPONSE",
+        "RATE_LIMITED",
+        "INTERNAL_ERROR",
+        "INVALID_INPUT",
+        "UNSUPPORTED_URL",
+        "SCHEMA_VERSION_MISMATCH",
+    }
+)
+_STALE_MESSAGE_RE = re.compile(
+    r"(?:下架|已删除|不存在|已失效|稿件不可见|作品不可见|内容不可用|私密|video\s+unavailable|not\s+found|deleted|removed|private\s+video|gone|expired)",
+    re.IGNORECASE,
+)
 
 FORBIDDEN_REQUEST_HEADERS = frozenset({
     "authorization",
@@ -140,7 +189,7 @@ class RawHttpResponse:
 class CheckResult:
     id: str
     group: str
-    status: str  # PASS | FAIL | SKIP
+    status: str  # PASS | WARN | SAMPLE_STALE | FAIL | SKIP
     http_status: int | None = None
     code: str = "-"
     elapsed_ms: int = 0
@@ -149,7 +198,7 @@ class CheckResult:
     note: str = ""
 
     def to_sanitized_dict(self) -> dict[str, Any]:
-        if self.status not in ("PASS", "FAIL", "SKIP"):
+        if self.status not in ("PASS", "WARN", "SAMPLE_STALE", "FAIL", "SKIP"):
             raise SmokeError(f"invalid check status: {self.status}")
         hosts = sorted({sanitize_hostname(h) for h in self.media_hostnames if h})
         return {
@@ -970,6 +1019,13 @@ def validate_parse_envelope(
     generated_at = data.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at.strip():
         raise AssertionError("missing data.generated_at")
+    title = str(data.get("title") or "").strip()
+    if not title:
+        raise AssertionError("quality assertion failed: data.title is missing or empty")
+    if _PLACEHOLDER_TITLE_RE.fullmatch(title):
+        raise AssertionError(
+            f"quality assertion failed: data.title is placeholder {sanitize_text(title)!r}"
+        )
     items = data.get("items")
     if not isinstance(items, list) or len(items) < 1:
         raise AssertionError("data.items is empty")
@@ -1035,8 +1091,18 @@ def load_samples(samples_path: Path, overrides: Iterable[str] = ()) -> dict[str,
             raise SmokeError(f"invalid sample URL for key '{sanitize_text(key)}'")
 
         platforms = config["platforms"]
+        tier_b_platforms = config.setdefault("tier_b_platforms", {})
         if key in platforms and isinstance(platforms[key], dict):
             platforms[key]["url"] = url
+        elif key in tier_b_platforms and isinstance(tier_b_platforms[key], dict):
+            tier_b_platforms[key]["url"] = url
+        elif key.startswith("tier_b."):
+            tb_key = key.split(".", 1)[1].strip()
+            if not tb_key:
+                raise SmokeError("invalid --set-sample: empty tier_b key")
+            existing = tier_b_platforms.get(tb_key)
+            pool = str(existing.get("pool") if isinstance(existing, dict) else "slow_parse")
+            tier_b_platforms[tb_key] = {"url": url, "pool": pool, "tier": "tier_b"}
         elif key == "cache":
             base_key = str(config.get("cache_sample_key") or "kuaishou")
             base_pool = str(platforms.get(base_key, {}).get("pool") or "parse")
@@ -1081,6 +1147,34 @@ def parse_group_list(raw_values: Iterable[str] | None) -> list[str]:
     return result
 
 
+def classify_sample_stale(resp: RawHttpResponse | None) -> tuple[bool, str, str]:
+    """Distinguish upstream sample takedown/expiry (SAMPLE_STALE) from parser failure."""
+    if resp is None or resp.status == 200:
+        return False, "-", ""
+    code = "-"
+    message = ""
+    try:
+        obj = resp.json_object()
+        if isinstance(obj.get("code"), str) and obj["code"]:
+            code = obj["code"]
+        err_block = obj.get("error")
+        if isinstance(err_block, dict):
+            if code == "-" and isinstance(err_block.get("code"), str):
+                code = err_block["code"]
+            if isinstance(err_block.get("message"), str):
+                message = err_block["message"]
+    except ValueError:
+        pass
+
+    if code in _NON_STALE_PARSER_ERROR_CODES:
+        return False, code, ""
+    if code in _STALE_ERROR_CODES:
+        return True, code, sanitize_text(message)[:160]
+    if resp.status in (404, 410) and _STALE_MESSAGE_RE.search(message):
+        return True, code if code != "-" else f"HTTP_{resp.status}", sanitize_text(message)[:160]
+    return False, code, ""
+
+
 class SmokeRunner:
     """Executes selected smoke check groups with pacing, retry, and redaction."""
 
@@ -1093,6 +1187,10 @@ class SmokeRunner:
         only_groups: Iterable[str] = (),
         skip_groups: Iterable[str] = (),
         enable_rate_limit: bool = False,
+        tier: str = "tier-a",
+        tier_b_limit: int | None = None,
+        youtube_context_warn_ms: int | None = None,
+        strict_stale: bool = False,
         retry_interval: float = DEFAULT_RETRY_INTERVAL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         frontend_concurrency: int = DEFAULT_FRONTEND_CONCURRENCY,
@@ -1103,6 +1201,24 @@ class SmokeRunner:
         self.only_groups = parse_group_list(only_groups)
         self.skip_groups = set(parse_group_list(skip_groups))
         self.enable_rate_limit = enable_rate_limit
+        if tier not in VALID_TIERS:
+            raise SmokeError(f"invalid --tier {sanitize_text(tier)!r}; valid: {', '.join(VALID_TIERS)}")
+        self.tier = tier
+        if tier_b_limit is not None and int(tier_b_limit) < 1:
+            raise SmokeError("invalid --tier-b-limit: must be >= 1")
+        self.tier_b_limit = int(tier_b_limit) if tier_b_limit is not None else None
+        yt_cfg = samples.get("youtube_context") if isinstance(samples.get("youtube_context"), dict) else {}
+        warn_ms = (
+            int(youtube_context_warn_ms)
+            if youtube_context_warn_ms is not None
+            else int(yt_cfg.get("warn_latency_ms", DEFAULT_YOUTUBE_CONTEXT_WARN_MS))
+        )
+        fail_ms = int(yt_cfg.get("fail_latency_ms", DEFAULT_YOUTUBE_CONTEXT_FAIL_MS))
+        if warn_ms < 1:
+            raise SmokeError("invalid --youtube-context-warn-ms: must be >= 1")
+        self.youtube_context_warn_ms = warn_ms
+        self.youtube_context_fail_ms = max(warn_ms, fail_ms)
+        self.strict_stale = bool(strict_stale)
         self.retry_interval = retry_interval
         self.max_attempts = max(1, int(max_attempts))
         concurrency = int(frontend_concurrency)
@@ -1113,12 +1229,13 @@ class SmokeRunner:
         self.frontend_concurrency = concurrency
         self.shared_parses: dict[str, SharedParseEntry] = {}
 
-    def _sample_entry(self, sample_key: str) -> tuple[str, str]:
-        platforms = self.samples.get("platforms", {})
+    def _sample_entry(self, sample_key: str, *, tier_b: bool = False) -> tuple[str, str]:
+        bucket = "tier_b_platforms" if tier_b else "platforms"
+        platforms = self.samples.get(bucket, {})
         entry = platforms.get(sample_key)
         if not isinstance(entry, dict) or not isinstance(entry.get("url"), str):
             raise SmokeError(f"missing sample configuration for '{sanitize_text(sample_key)}'")
-        return entry["url"], str(entry.get("pool") or "parse")
+        return entry["url"], str(entry.get("pool") or ("slow_parse" if tier_b else "parse"))
 
     def _extract_status_code(self, resp: RawHttpResponse | None) -> tuple[int | None, str]:
         if resp is None:
@@ -1140,8 +1257,9 @@ class SmokeRunner:
         sample_key: str,
         expected_platform: str | None,
         extra_assertion: Callable[[dict[str, Any], list[str]], str] | None = None,
+        tier_b: bool = False,
     ) -> CheckResult:
-        sample_url, pool = self._sample_entry(sample_key)
+        sample_url, pool = self._sample_entry(sample_key, tier_b=tier_b)
 
         # Reuse an already-validated 200 OK response for the exact same sample URL if it
         # also satisfies this check's derived assertion; otherwise fall back to fresh retries.
@@ -1220,6 +1338,20 @@ class SmokeRunner:
                 last_error = sanitize_text(str(exc)) or exc.__class__.__name__
 
         http_status, code = self._extract_status_code(last_resp)
+        is_stale, orig_code, stale_reason = classify_sample_stale(last_resp)
+        if is_stale:
+            suffix = f": {stale_reason}" if stale_reason else ""
+            return CheckResult(
+                id=check_id,
+                group=group,
+                status="SAMPLE_STALE",
+                http_status=http_status,
+                code="SAMPLE_STALE",
+                elapsed_ms=total_elapsed_ms,
+                retry_count=self.max_attempts - 1,
+                media_hostnames=last_hosts,
+                note=f"upstream sample stale/removed (backend_code={sanitize_text(orig_code)}; refresh sample URL){suffix}",
+            )
         return CheckResult(
             id=check_id,
             group=group,
@@ -1408,6 +1540,96 @@ class SmokeRunner:
             code="OK",
             elapsed_ms=resp.elapsed_ms,
             note=f"count={len(actual_ids)}; all {len(expected_ids)} platform IDs verified",
+        )
+
+    def check_youtube_context(self) -> CheckResult:
+        try:
+            resp = self.client.get_raw(
+                f"/api/youtube/context?schema_version={SCHEMA_VERSION}",
+                accept="application/json",
+            )
+        except SmokeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(
+                id="youtube_context",
+                group="youtube_context",
+                status="FAIL",
+                code="NETWORK_ERROR",
+                note=sanitize_text(str(exc)),
+            )
+
+        if resp.status != 200:
+            http_status, code = self._extract_status_code(resp)
+            return CheckResult(
+                id="youtube_context",
+                group="youtube_context",
+                status="FAIL",
+                http_status=http_status,
+                code=code,
+                elapsed_ms=resp.elapsed_ms,
+                note=f"expected HTTP 200 on /api/youtube/context, got HTTP {resp.status}",
+            )
+
+        try:
+            payload = resp.json_object()
+            if payload.get("schema_version") != SCHEMA_VERSION or payload.get("code") != "OK":
+                raise AssertionError(f"unexpected envelope code={payload.get('code')!r}")
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise AssertionError("missing data object")
+            player_id = str(data.get("player_id") or "").strip()
+            if not player_id:
+                raise AssertionError("missing non-empty data.player_id")
+            expires_at = data.get("expires_at")
+            if not isinstance(expires_at, (int, float, str)) or not str(expires_at).strip():
+                raise AssertionError("missing data.expires_at")
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(
+                id="youtube_context",
+                group="youtube_context",
+                status="FAIL",
+                http_status=resp.status,
+                code="CONTRACT_MISMATCH",
+                elapsed_ms=resp.elapsed_ms,
+                note=sanitize_text(str(exc)),
+            )
+
+        safe_pid = sanitize_text(player_id)[:16]
+        if resp.elapsed_ms > self.youtube_context_fail_ms:
+            return CheckResult(
+                id="youtube_context",
+                group="youtube_context",
+                status="FAIL",
+                http_status=200,
+                code="LATENCY_FAIL",
+                elapsed_ms=resp.elapsed_ms,
+                note=(
+                    f"player_id={safe_pid} latency {resp.elapsed_ms}ms exceeded "
+                    f"fail threshold {self.youtube_context_fail_ms}ms"
+                ),
+            )
+        if resp.elapsed_ms > self.youtube_context_warn_ms:
+            return CheckResult(
+                id="youtube_context",
+                group="youtube_context",
+                status="WARN",
+                http_status=200,
+                code="LATENCY_WARN",
+                elapsed_ms=resp.elapsed_ms,
+                note=(
+                    f"player_id={safe_pid} latency {resp.elapsed_ms}ms exceeded "
+                    f"warn threshold {self.youtube_context_warn_ms}ms (possible cold start)"
+                ),
+            )
+        return CheckResult(
+            id="youtube_context",
+            group="youtube_context",
+            status="PASS",
+            http_status=200,
+            code="OK",
+            elapsed_ms=resp.elapsed_ms,
+            note=f"player_id={safe_pid} warm (<= {self.youtube_context_warn_ms}ms)",
         )
 
     def check_cache(self) -> CheckResult:
@@ -1630,6 +1852,37 @@ class SmokeRunner:
                     group="all_platforms",
                     sample_key=plat,
                     expected_platform=plat,
+                )
+            )
+        return results
+
+    def check_tier_b_platforms(self) -> list[CheckResult]:
+        tier_b_cfg = self.samples.get("tier_b_platforms")
+        if not isinstance(tier_b_cfg, dict) or not tier_b_cfg:
+            return [
+                CheckResult(
+                    id="tier_b_platforms",
+                    group="tier_b_platforms",
+                    status="SKIP",
+                    note="no tier_b_platforms configured in samples.json",
+                )
+            ]
+        keys = sorted(str(k) for k in tier_b_cfg.keys())
+        if self.tier_b_limit is not None and self.tier_b_limit < len(keys):
+            # Deterministic UTC day-of-year rotation across the Tier-B long-tail pool
+            day_ordinal = self.client.clock.utc_now_fn().timetuple().tm_yday
+            offset = day_ordinal % len(keys)
+            rotated = keys[offset:] + keys[:offset]
+            keys = rotated[: self.tier_b_limit]
+        results: list[CheckResult] = []
+        for site_key in keys:
+            results.append(
+                self._run_parse_check(
+                    check_id=f"tier_b:{site_key}",
+                    group="tier_b_platforms",
+                    sample_key=site_key,
+                    expected_platform=None,
+                    tier_b=True,
                 )
             )
         return results
@@ -1902,16 +2155,45 @@ class SmokeRunner:
                 )
             elif group == "platforms":
                 results.append(self.check_platforms())
+            elif group == "youtube_context":
+                results.append(self.check_youtube_context())
             elif group == "cache":
-                results.append(self.check_cache())
+                if self.tier == "tier-b" and group not in only_set:
+                    results.append(CheckResult(id="cache", group="cache", status="SKIP", note="skipped in --tier tier-b"))
+                else:
+                    results.append(self.check_cache())
             elif group == "x_fast_path":
-                results.append(self.check_x_fast_path())
+                if self.tier == "tier-b" and group not in only_set:
+                    results.append(CheckResult(id="x_fast_path", group="x_fast_path", status="SKIP", note="skipped in --tier tier-b"))
+                else:
+                    results.append(self.check_x_fast_path())
             elif group == "douyin_domestic":
-                results.append(self.check_douyin_domestic())
+                if self.tier == "tier-b" and group not in only_set:
+                    results.append(CheckResult(id="douyin_domestic", group="douyin_domestic", status="SKIP", note="skipped in --tier tier-b"))
+                else:
+                    results.append(self.check_douyin_domestic())
             elif group == "direct_markers":
-                results.extend(self.check_direct_markers())
+                if self.tier == "tier-b" and group not in only_set:
+                    results.append(CheckResult(id="direct_markers", group="direct_markers", status="SKIP", note="skipped in --tier tier-b"))
+                else:
+                    results.extend(self.check_direct_markers())
             elif group == "all_platforms":
-                results.extend(self.check_all_platforms())
+                if self.tier == "tier-b" and group not in only_set:
+                    results.append(CheckResult(id="all_platforms", group="all_platforms", status="SKIP", note="skipped in --tier tier-b"))
+                else:
+                    results.extend(self.check_all_platforms())
+            elif group == "tier_b_platforms":
+                if self.tier in ("tier-b", "all") or group in only_set:
+                    results.extend(self.check_tier_b_platforms())
+                else:
+                    results.append(
+                        CheckResult(
+                            id="tier_b_platforms",
+                            group="tier_b_platforms",
+                            status="SKIP",
+                            note="disabled in --tier tier-a (pass --tier tier-b or --tier all to run)",
+                        )
+                    )
             elif group == "api_boundary":
                 results.extend(self.check_api_boundary())
             elif group == "rate_limit":
@@ -1942,14 +2224,20 @@ class SmokeRunner:
         summary = {
             "total": len(sanitized_items),
             "pass": sum(1 for item in sanitized_items if item["status"] == "PASS"),
+            "warn": sum(1 for item in sanitized_items if item["status"] == "WARN"),
+            "sample_stale": sum(1 for item in sanitized_items if item["status"] == "SAMPLE_STALE"),
             "fail": sum(1 for item in sanitized_items if item["status"] == "FAIL"),
             "skip": sum(1 for item in sanitized_items if item["status"] == "SKIP"),
         }
+        passed = summary["fail"] == 0 and (
+            not self.strict_stale or summary["sample_stale"] == 0
+        )
         report = {
             "schema_version": SCHEMA_VERSION,
             "generated_at_utc": self.client.clock.utc_iso(),
             "target_host": self.client.target_host,
-            "passed": summary["fail"] == 0,
+            "tier": self.tier,
+            "passed": passed,
             "summary": summary,
             "checks": sanitized_items,
         }
@@ -1968,11 +2256,14 @@ def _escape_md_cell(text: str) -> str:
 
 def render_markdown_report(report: dict[str, Any]) -> str:
     summary = report["summary"]
+    warn_count = summary.get("warn", 0)
+    stale_count = summary.get("sample_stale", 0)
     lines = [
         (
             f"- 目标站点: `{_escape_md_cell(report['target_host'])}` | "
             f"生成时间 (UTC): `{_escape_md_cell(report['generated_at_utc'])}` | "
-            f"汇总: `PASS={summary['pass']}, FAIL={summary['fail']}, SKIP={summary['skip']}`"
+            f"汇总: `PASS={summary['pass']}, WARN={warn_count}, SAMPLE_STALE={stale_count}, "
+            f"FAIL={summary['fail']}, SKIP={summary['skip']}`"
         ),
         "",
         "| 检查项 (`id`) | 分组 (`group`) | 结论 (`status`) | HTTP | `code` | 耗时 (ms) | 重试 (`retry_count`) | 媒体域名 (`media_hostnames`) | 说明 (`note`) |",
@@ -2058,6 +2349,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Opt in to the unspaced burst rate_limit (HTTP 429) check (runs last)",
     )
     parser.add_argument(
+        "--tier",
+        choices=VALID_TIERS,
+        default="tier-a",
+        help="Platform tier selection: tier-a (14 core release platforms, default), tier-b (long-tail pool), or all",
+    )
+    parser.add_argument(
+        "--tier-b-limit",
+        type=int,
+        default=None,
+        help="Optional cap on Tier-B long-tail sites sampled per run (rotates daily by UTC day-of-year)",
+    )
+    parser.add_argument(
+        "--youtube-context-warn-ms",
+        type=int,
+        default=None,
+        help=f"Latency warning threshold (ms) for /api/youtube/context (default: {DEFAULT_YOUTUBE_CONTEXT_WARN_MS})",
+    )
+    parser.add_argument(
+        "--strict-stale",
+        action="store_true",
+        help="Treat SAMPLE_STALE upstream takedowns as a non-zero exit failure",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
@@ -2118,6 +2432,10 @@ def main(argv: list[str] | None = None, *, clock: Clock | None = None) -> int:
                 only_groups=args.only,
                 skip_groups=args.skip,
                 enable_rate_limit=args.enable_rate_limit,
+                tier=args.tier,
+                tier_b_limit=args.tier_b_limit,
+                youtube_context_warn_ms=args.youtube_context_warn_ms,
+                strict_stale=args.strict_stale,
                 retry_interval=DEFAULT_RETRY_INTERVAL,
                 max_attempts=DEFAULT_MAX_ATTEMPTS,
                 frontend_concurrency=args.frontend_concurrency,

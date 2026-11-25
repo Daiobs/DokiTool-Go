@@ -4,16 +4,20 @@
 Maps changed repository paths (from ``git diff --no-renames --name-only -z
 <base>...<head>``) to boolean job gates:
 
-- ``run_go``: triggers ``offline-contract`` (Go race suite + cross-layer
-  Go->frontend exports + Go builds) and ``xhs-dependency-review``.
-- ``run_frontend``: triggers ``frontend-and-browser`` (typecheck, unit tests,
+- ``run_go``: triggers ``offline-contract`` (Go race suite + L1 golden fixtures
+  offline contracts + cross-layer Go->frontend exports + Go builds) and
+  ``xhs-dependency-review``.
+- ``run_frontend``: triggers ``frontend-and-browser`` (typecheck, L1 + unit tests,
   production build + load budget, and headless Chrome delivery checks).
+- ``run_l2_e2e``: triggers the full L2 real-extension 6-prototype + SW upgrade
+  deadlock + filename-conflict adversarial headless Chrome E2E suite inside
+  ``frontend-and-browser``.
 
 ``repo-contracts`` (inventory, Python scripts, smoke tests, OpenAPI, local pin
 consistency, static unified schema) always runs independently on every PR.
 
 Any unrecognized path, malformed path, empty diff, or git failure fails closed
-with ``run_go=true`` and ``run_frontend=true``.
+with ``run_go=true``, ``run_frontend=true``, and ``run_l2_e2e=true``.
 """
 
 from __future__ import annotations
@@ -45,6 +49,30 @@ FULL_EXACT_PATHS = frozenset(
 FULL_PREFIXES = (
     ".github/workflows/",
     "docs/schema/",
+    "tests/golden-fixtures/",
+    "backend/internal/ytengine/",
+)
+
+# Frontend & browser-harness core paths that require full L1 + L2 real-extension E2E.
+L2_E2E_FRONTEND_PREFIXES = (
+    "frontend/src/core/",
+    "frontend/src/downloads/",
+    "frontend/public/downloads/",
+    "frontend/src/extension/",
+    "frontend/tests/fixtures/download/",
+)
+L2_E2E_FRONTEND_EXACT_PATHS = frozenset(
+    {
+        "frontend/src/utils/youtubeHelperCore.js",
+        "frontend/src/composables/useMediaDownload.ts",
+        "frontend/src/services/extensionBridge.ts",
+        "frontend/scripts/build-extension.mjs",
+        "ops/examples/snap.caddy",
+        "scripts/test-download-browser.mjs",
+        "scripts/test-extension-e2e.mjs",
+        "scripts/download-browser-session.mjs",
+        "scripts/test-download-claim.mjs",
+    }
 )
 
 # Paths outside backend/ that directly feed Go tests or Go export validation.
@@ -61,6 +89,7 @@ FRONTEND_EXACT_PATHS = frozenset(
     {
         "ops/examples/snap.caddy",
         "scripts/test-download-browser.mjs",
+        "scripts/test-extension-e2e.mjs",
         "scripts/download-browser-session.mjs",
         "scripts/test-download-claim.mjs",
         "scripts/prod-smoke/stage2_browser.mjs",
@@ -87,6 +116,7 @@ REPO_ONLY_EXACT_PATHS = frozenset(
 class Classification:
     run_go: bool
     run_frontend: bool
+    run_l2_e2e: bool
     changed_count: int
     reason: str
 
@@ -94,6 +124,7 @@ class Classification:
         return {
             "run_go": self.run_go,
             "run_frontend": self.run_frontend,
+            "run_l2_e2e": self.run_l2_e2e,
             "changed_count": self.changed_count,
             "reason": self.reason,
         }
@@ -119,12 +150,14 @@ def classify_paths(paths: Iterable[str]) -> Classification:
         return Classification(
             run_go=True,
             run_frontend=True,
+            run_l2_e2e=True,
             changed_count=0,
             reason="fail-closed: empty changed file list",
         )
 
     run_go = False
     run_frontend = False
+    run_l2_e2e = False
     reasons: list[str] = []
 
     def add_reason(label: str) -> None:
@@ -137,6 +170,7 @@ def classify_paths(paths: Iterable[str]) -> Classification:
             return Classification(
                 run_go=True,
                 run_frontend=True,
+                run_l2_e2e=True,
                 changed_count=len(raw_list),
                 reason=f"fail-closed: invalid path {raw!r}",
             )
@@ -144,7 +178,19 @@ def classify_paths(paths: Iterable[str]) -> Classification:
         if path in FULL_EXACT_PATHS or path.startswith(FULL_PREFIXES):
             run_go = True
             run_frontend = True
+            run_l2_e2e = True
             add_reason(f"full:{path}")
+            continue
+
+        if path in L2_E2E_FRONTEND_EXACT_PATHS or path.startswith(L2_E2E_FRONTEND_PREFIXES):
+            run_frontend = True
+            run_l2_e2e = True
+            add_reason("frontend-l2-core")
+            continue
+
+        if path.startswith("backend/internal/platform/"):
+            run_go = True
+            add_reason("go-platform-adapter")
             continue
 
         if path in GO_EXACT_PATHS or path.startswith("backend/"):
@@ -169,6 +215,7 @@ def classify_paths(paths: Iterable[str]) -> Classification:
         return Classification(
             run_go=True,
             run_frontend=True,
+            run_l2_e2e=True,
             changed_count=len(raw_list),
             reason=f"fail-closed: unclassified path {path}",
         )
@@ -176,6 +223,7 @@ def classify_paths(paths: Iterable[str]) -> Classification:
     return Classification(
         run_go=run_go,
         run_frontend=run_frontend,
+        run_l2_e2e=run_l2_e2e,
         changed_count=len(raw_list),
         reason=",".join(reasons) if reasons else "repo-only",
     )
@@ -233,6 +281,7 @@ def write_github_output(output_path: Path, result: Classification) -> None:
     lines = [
         f"run_go={'true' if result.run_go else 'false'}\n",
         f"run_frontend={'true' if result.run_frontend else 'false'}\n",
+        f"run_l2_e2e={'true' if result.run_l2_e2e else 'false'}\n",
         f"changed_count={result.changed_count}\n",
     ]
     with output_path.open("a", encoding="utf-8") as fh:
@@ -275,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = Classification(
                 run_go=True,
                 run_frontend=True,
+                run_l2_e2e=True,
                 changed_count=0,
                 reason=f"fail-closed: {err}",
             )

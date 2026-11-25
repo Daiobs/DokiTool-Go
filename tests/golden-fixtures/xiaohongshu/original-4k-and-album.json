@@ -1,0 +1,198 @@
+{
+  "fixture_id": "xiaohongshu-original-4k-and-album",
+  "description": "Sanitized Xiaohongshu fixtures: (1) 4K original_endpoint video alongside 720p/1080p transcodes, and (2) 3-item image + live_photo album.",
+  "video_media": {
+    "schema_version": "1.0",
+    "platform": "xiaohongshu",
+    "platform_name": "小红书",
+    "content_id": "xhs_golden_4k",
+    "title": "城市夜景航拍原画",
+    "source_url": "https://www.xiaohongshu.com/explore/xhs_golden_4k",
+    "default_item_id": "xhs-v1",
+    "items": [
+      {
+        "id": "xhs-v1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "duration_ms": 42000,
+        "default": { "variant_id": "xhs-720p", "source_id": "s-720" },
+        "variants": [
+          {
+            "id": "xhs-720p",
+            "label": "720p",
+            "state": "ready",
+            "provenance": "transcode",
+            "metadata": {
+              "width": 720,
+              "height": 1280,
+              "video_codec": "avc1.640028",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-720",
+                  "url": "https://sns-video-bd.xhscdn.com/stream/golden-720p.mp4",
+                  "size_bytes": 4200000,
+                  "browser_fetch": "allowed"
+                }
+              ]
+            }
+          },
+          {
+            "id": "xhs-orig-4k",
+            "label": "原始入口",
+            "state": "ready",
+            "provenance": "original_endpoint",
+            "metadata": {
+              "width": 2160,
+              "height": 3840,
+              "video_codec": "hev1.1.6.L150.90",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-orig",
+                  "url": "https://sns-video-bd.xhscdn.com/stream/golden-orig-4k.mp4",
+                  "size_bytes": 26000000,
+                  "browser_fetch": "allowed"
+                }
+              ]
+            }
+          },
+          {
+            "id": "xhs-1080p",
+            "label": "1080p",
+            "state": "ready",
+            "provenance": "transcode",
+            "metadata": {
+              "width": 1080,
+              "height": 1920,
+              "video_codec": "avc1.640028",
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-1080",
+                  "url": "https://sns-video-bd.xhscdn.com/stream/golden-1080p.mp4",
+                  "size_bytes": 11000000,
+                  "browser_fetch": "allowed"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "album_media": {
+    "schema_version": "1.0",
+    "platform": "xiaohongshu",
+    "platform_name": "小红书",
+    "content_id": "xhs_golden_album",
+    "title": "京都秋日胶片实况",
+    "source_url": "https://www.xiaohongshu.com/explore/xhs_golden_album",
+    "default_item_id": "img-1",
+    "items": [
+      {
+        "id": "img-1",
+        "index": 0,
+        "type": "image",
+        "state": "ready",
+        "default": { "variant_id": "img-1-orig", "source_id": "si-1" },
+        "variants": [
+          {
+            "id": "img-1-orig",
+            "label": "原图",
+            "state": "ready",
+            "metadata": { "extension": "jpg", "mime_type": "image/jpeg", "width": 1440, "height": 1920 },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                { "id": "si-1", "url": "https://sns-webpic-qc.xhscdn.com/golden/photo-1.jpg", "browser_fetch": "allowed" }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "live-2",
+        "index": 1,
+        "type": "live_photo",
+        "state": "ready",
+        "default": { "variant_id": "live-2-pair", "source_id": "sl-img-2" },
+        "variants": [
+          {
+            "id": "live-2-pair",
+            "label": "实况照片",
+            "state": "ready",
+            "metadata": { "extension": "jpg", "mime_type": "image/jpeg" },
+            "delivery": {
+              "kind": "pair",
+              "resources": [
+                {
+                  "id": "live-2-still",
+                  "role": "image",
+                  "metadata": { "extension": "jpg", "mime_type": "image/jpeg" },
+                  "delivery": {
+                    "kind": "file",
+                    "sources": [
+                      { "id": "sl-img-2", "url": "https://sns-webpic-qc.xhscdn.com/golden/live-2.jpg", "browser_fetch": "allowed" }
+                    ]
+                  }
+                },
+                {
+                  "id": "live-2-motion",
+                  "role": "motion",
+                  "metadata": { "extension": "mp4", "mime_type": "video/mp4" },
+                  "delivery": {
+                    "kind": "file",
+                    "sources": [
+                      { "id": "sl-mov-2", "url": "https://sns-video-bd.xhscdn.com/golden/live-2.mp4", "browser_fetch": "allowed" }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "img-3",
+        "index": 2,
+        "type": "image",
+        "state": "ready",
+        "default": { "variant_id": "img-3-orig", "source_id": "si-3" },
+        "variants": [
+          {
+            "id": "img-3-orig",
+            "label": "原图",
+            "state": "ready",
+            "metadata": { "extension": "jpg", "mime_type": "image/jpeg", "width": 1440, "height": 1920 },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                { "id": "si-3", "url": "https://sns-webpic-qc.xhscdn.com/golden/photo-3.jpg", "browser_fetch": "allowed" }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

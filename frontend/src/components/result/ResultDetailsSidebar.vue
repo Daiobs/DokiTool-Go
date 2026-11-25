@@ -168,7 +168,8 @@ const visibleAttachments = computed(() => {
       list.push({
         id: `mux-audio-${currentId}`,
         role: "background_audio",
-        title: "原声音频 (M4A)",
+        title:
+          props.locale === "en" ? "Original Audio (M4A)" : "原声音频 (M4A)",
         resource: bestAudioLeaf,
       });
     }
@@ -675,7 +676,11 @@ onUnmounted(() => {
               class="rs-music-player"
             />
             <p v-else-if="!attachmentUrl(attachment)" class="rs-stat-note">
-              该附件暂不支持直接播放
+              {{
+                locale === "en"
+                  ? "Direct playback is not supported for this attachment"
+                  : "该附件暂不支持直接播放"
+              }}
             </p>
             <button
               @click="emit('download-music', attachment)"

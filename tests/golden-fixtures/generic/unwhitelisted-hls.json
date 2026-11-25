@@ -1,0 +1,47 @@
+{
+  "fixture_id": "generic-unwhitelisted-hls",
+  "description": "Sanitized long-tail generic HLS stream hosted on a non-whitelisted domain to lock zero-egress extension isolation.",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "generic_hls",
+    "platform_name": "Generic Site",
+    "content_id": "gen-hls-001",
+    "title": "Long-Tail Unwhitelisted HLS Sample",
+    "source_url": "https://media.unlisted-generic.example/watch/gen-hls-001",
+    "default_item_id": "gen-1",
+    "items": [
+      {
+        "id": "gen-1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "duration_ms": 95000,
+        "default": { "variant_id": "gen-hls-720p", "source_id": "s-hls" },
+        "variants": [
+          {
+            "id": "gen-hls-720p",
+            "label": "720p (HLS)",
+            "state": "ready",
+            "metadata": {
+              "width": 1280,
+              "height": 720,
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "application/vnd.apple.mpegurl",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "hls",
+              "sources": [
+                {
+                  "id": "s-hls",
+                  "url": "https://cdn.unlisted-generic.example/hls/master.m3u8"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

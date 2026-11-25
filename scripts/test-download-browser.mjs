@@ -557,4 +557,11 @@ async function checkNative() {
 if (command === 'serve' || (command === 'serve-ui' && profile)) await serve()
 else if (command === 'check' && profile) await check()
 else if (command === 'check-native' && profile) await checkNative()
-else throw new Error('Expected serve <run-dir>, check <run-dir> <browser-profile> [case], or check-native <run-dir> <browser-profile> [dist-dir]')
+else if (command === 'check-extension-e2e' && directory) {
+  const { runExtensionE2E } = await import('./test-extension-e2e.mjs')
+  await runExtensionE2E({
+    runDir: directory,
+    ...(profile ? { distDir: path.resolve(profile) } : {}),
+    ...(only ? { extDir: path.resolve(only) } : {}),
+  })
+} else throw new Error('Expected serve <run-dir>, check <run-dir> <browser-profile> [case], check-native <run-dir> <browser-profile> [dist-dir], or check-extension-e2e <run-dir> [dist-dir] [ext-dir]')

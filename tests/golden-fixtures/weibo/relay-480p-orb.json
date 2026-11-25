@@ -1,0 +1,57 @@
+{
+  "fixture_id": "weibo-relay-480p-orb",
+  "description": "Sanitized Weibo 480p relay video with Referer-blocked sinaimg.cn cover (proactive Web ORB suppression).",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "weibo",
+    "platform_name": "微博",
+    "content_id": "1034:5339966948180025",
+    "title": "微博标清中转样本",
+    "source_url": "https://weibo.com/tv/show/1034:5339966948180025",
+    "default_item_id": "wb-1",
+    "items": [
+      {
+        "id": "wb-1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "duration_ms": 18500,
+        "cover": {
+          "url": "https://wx1.sinaimg.cn/orj480/golden-cover.jpg",
+          "access": "direct"
+        },
+        "default": {
+          "variant_id": "wb-480p",
+          "source_id": "s-wb-relay",
+          "access": "relay"
+        },
+        "variants": [
+          {
+            "id": "wb-480p",
+            "label": "480p",
+            "state": "ready",
+            "metadata": {
+              "width": 854,
+              "height": 480,
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-wb-relay",
+                  "url": "/api/media/weibo?ticket=mock_golden_relay_ticket",
+                  "access": "relay",
+                  "size_bytes": 3100000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

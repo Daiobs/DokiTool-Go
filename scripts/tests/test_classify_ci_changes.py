@@ -49,17 +49,14 @@ class ClassifyPathsTests(unittest.TestCase):
                 res = MOD.classify_paths(paths)
                 self.assertFalse(res.run_go)
                 self.assertFalse(res.run_frontend)
+                self.assertFalse(res.run_l2_e2e)
                 self.assertEqual(res.changed_count, len(paths))
 
-    def test_frontend_only_skips_go_and_runs_frontend(self) -> None:
+    def test_frontend_non_core_runs_frontend_without_l2_or_go(self) -> None:
         cases = [
             ["frontend/src/App.vue", "frontend/src/styles/main.css"],
             ["frontend/tests/ui-download-contract.test.mjs"],
-            ["frontend/src/composables/useDownloadManager.ts", "docs/API.md"],
-            ["ops/examples/snap.caddy"],
-            ["scripts/test-download-browser.mjs"],
-            ["scripts/download-browser-session.mjs"],
-            ["scripts/test-download-claim.mjs"],
+            ["frontend/src/components/FaqSection.vue", "docs/API.md"],
             ["scripts/prod-smoke/stage2_browser.mjs"],
             ["scripts/prod-smoke/test_stage2_browser.mjs"],
             ["scripts/browser-helper.js"],
@@ -69,10 +66,37 @@ class ClassifyPathsTests(unittest.TestCase):
                 res = MOD.classify_paths(paths)
                 self.assertFalse(res.run_go)
                 self.assertTrue(res.run_frontend)
+                self.assertFalse(res.run_l2_e2e)
 
-    def test_backend_only_runs_go_and_skips_frontend(self) -> None:
+    def test_frontend_core_and_browser_harness_trigger_l2_e2e(self) -> None:
         cases = [
-            ["backend/internal/ytengine/engine.go"],
+            ["frontend/src/core/capabilityHub.ts"],
+            ["frontend/src/core/media/variantSort.ts"],
+            ["frontend/src/downloads/session.ts"],
+            ["frontend/public/downloads/worker.js"],
+            ["frontend/src/extension/bg/downloadCoordinator.ts"],
+            ["frontend/src/utils/youtubeHelperCore.js"],
+            ["frontend/src/composables/useMediaDownload.ts"],
+            ["frontend/src/services/extensionBridge.ts"],
+            ["frontend/scripts/build-extension.mjs"],
+            ["frontend/tests/fixtures/download/one-frame-avc.mp4"],
+            ["ops/examples/snap.caddy"],
+            ["scripts/test-download-browser.mjs"],
+            ["scripts/test-extension-e2e.mjs"],
+            ["scripts/download-browser-session.mjs"],
+            ["scripts/test-download-claim.mjs"],
+        ]
+        for paths in cases:
+            with self.subTest(paths=paths):
+                res = MOD.classify_paths(paths)
+                self.assertFalse(res.run_go)
+                self.assertTrue(res.run_frontend)
+                self.assertTrue(res.run_l2_e2e)
+
+    def test_backend_single_platform_and_non_ytengine_skip_frontend_and_l2(self) -> None:
+        cases = [
+            ["backend/internal/platform/bilibili/parser.go"],
+            ["backend/internal/platform/youtube/helper.go"],
             ["backend/internal/api/stats_snapshot.go", "backend/internal/api/cache_test.go"],
             ["backend/docs/视频解析统一JSON格式3.0.md"],
             ["ops/examples/runtime.example.json"],
@@ -84,8 +108,9 @@ class ClassifyPathsTests(unittest.TestCase):
                 res = MOD.classify_paths(paths)
                 self.assertTrue(res.run_go)
                 self.assertFalse(res.run_frontend)
+                self.assertFalse(res.run_l2_e2e)
 
-    def test_cross_layer_contracts_and_workflows_run_full_suite(self) -> None:
+    def test_cross_layer_contracts_ytengine_golden_fixtures_and_workflows_run_full_suite_with_l2(self) -> None:
         full_triggers = [
             ".github/workflows/go-migration.yml",
             ".github/workflows/gateway-isolation.yml",
@@ -94,6 +119,10 @@ class ClassifyPathsTests(unittest.TestCase):
             ".gitignore",
             "docs/schema/unified-v1/unified-v1.schema.json",
             "docs/schema/unified-v1/examples/01-douyin-quality-and-cdn.json",
+            "tests/golden-fixtures/bilibili/ugc-season-single-p.json",
+            "tests/golden-fixtures/youtube/ytengine-8k-input.json",
+            "backend/internal/ytengine/engine.go",
+            "backend/internal/ytengine/variants.go",
             "backend/config/platforms.json",
             "frontend/src/monitor/statsTypes.generated.ts",
             "frontend/scripts/test-pipixia-representation.mjs",
@@ -105,6 +134,7 @@ class ClassifyPathsTests(unittest.TestCase):
                 res = MOD.classify_paths([path])
                 self.assertTrue(res.run_go, f"{path} must trigger run_go")
                 self.assertTrue(res.run_frontend, f"{path} must trigger run_frontend")
+                self.assertTrue(res.run_l2_e2e, f"{path} must trigger run_l2_e2e")
 
     def test_mixed_backend_and_frontend_runs_both(self) -> None:
         res = MOD.classify_paths([
@@ -113,6 +143,7 @@ class ClassifyPathsTests(unittest.TestCase):
         ])
         self.assertTrue(res.run_go)
         self.assertTrue(res.run_frontend)
+        self.assertFalse(res.run_l2_e2e)
 
     def test_fail_closed_on_empty_unknown_or_malformed_paths(self) -> None:
         bad_cases = [
@@ -129,6 +160,7 @@ class ClassifyPathsTests(unittest.TestCase):
                 res = MOD.classify_paths(paths)
                 self.assertTrue(res.run_go)
                 self.assertTrue(res.run_frontend)
+                self.assertTrue(res.run_l2_e2e)
                 self.assertTrue(res.reason.startswith("fail-closed:"))
 
 
@@ -194,10 +226,12 @@ class GitIntegrationTests(unittest.TestCase):
             payload = json.loads(proc.stdout)
             self.assertEqual(payload["run_go"], False)
             self.assertEqual(payload["run_frontend"], True)
+            self.assertEqual(payload["run_l2_e2e"], False)
             self.assertEqual(payload["changed_count"], 1)
             output_text = gh_out.read_text(encoding="utf-8")
             self.assertIn("run_go=false\n", output_text)
             self.assertIn("run_frontend=true\n", output_text)
+            self.assertIn("run_l2_e2e=false\n", output_text)
 
             # Moving a backend file into docs/ must still trigger run_go via --no-renames.
             self._git(repo, "checkout", "-b", "pr-move-backend")
@@ -242,9 +276,11 @@ class GitIntegrationTests(unittest.TestCase):
                     payload = json.loads(proc.stdout)
                     self.assertTrue(payload["run_go"])
                     self.assertTrue(payload["run_frontend"])
+                    self.assertTrue(payload["run_l2_e2e"])
                     self.assertIn("fail-closed:", payload["reason"])
                     self.assertIn("run_go=true\n", gh_out.read_text(encoding="utf-8"))
                     self.assertIn("run_frontend=true\n", gh_out.read_text(encoding="utf-8"))
+                    self.assertIn("run_l2_e2e=true\n", gh_out.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

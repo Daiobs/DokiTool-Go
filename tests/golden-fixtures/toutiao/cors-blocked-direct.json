@@ -1,0 +1,48 @@
+{
+  "fixture_id": "toutiao-cors-blocked-direct",
+  "description": "Sanitized Toutiao extensionless CORS-blocked direct video on *.toutiaovod.com.",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "toutiao",
+    "platform_name": "今日头条",
+    "content_id": "7501991960077500979",
+    "title": "深海科考纪录片片段",
+    "source_url": "https://www.toutiao.com/video/7501991960077500979/",
+    "default_item_id": "tt-1",
+    "items": [
+      {
+        "id": "tt-1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "duration_ms": 65000,
+        "default": { "variant_id": "tt-1080p", "source_id": "s-tt" },
+        "variants": [
+          {
+            "id": "tt-1080p",
+            "label": "1080p",
+            "state": "ready",
+            "metadata": {
+              "width": 1920,
+              "height": 1080,
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-tt",
+                  "url": "https://v26-default.toutiaovod.com/golden/stream-no-ext",
+                  "size_bytes": 12400000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
