@@ -63,6 +63,8 @@ L2_E2E_FRONTEND_PREFIXES = (
 )
 L2_E2E_FRONTEND_EXACT_PATHS = frozenset(
     {
+        "frontend/package.json",
+        "frontend/package-lock.json",
         "frontend/src/utils/youtubeHelperCore.js",
         "frontend/src/composables/useMediaDownload.ts",
         "frontend/src/services/extensionBridge.ts",

@@ -4,9 +4,15 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - backend/go.mod
+      - backend/go.sum
       - backend/internal/ytengine/**
+      - backend/internal/fetch/**
+      - backend/internal/urlpolicy/**
+      - backend/internal/platform/x/**
       - backend/cmd/dokitool/**
       - scripts/test-gateway-nft.py
+      - scripts/check-ytdlp-extractors.py
       - .github/workflows/gateway-isolation.yml
 
 permissions:
@@ -48,6 +54,8 @@ jobs:
           echo '249ddb058234276bc449b9cd9492aad9f133bda5923c61a9e39983ae114ef17d  '"$RUNNER_TEMP/gateway-bin/yt-dlp_linux" | sha256sum --check --strict
           chmod 0555 "$RUNNER_TEMP/gateway-bin/yt-dlp_linux"
           "$RUNNER_TEMP/gateway-bin/yt-dlp_linux" --version
+      - name: Verify pinned yt-dlp Twitter/X extractor coverage
+        run: python3 -B scripts/check-ytdlp-extractors.py --ytdlp "${{ runner.temp }}/gateway-bin/yt-dlp_linux"
       - name: Verify real gateways and pinned extractor as nonroot
         working-directory: backend
         env:

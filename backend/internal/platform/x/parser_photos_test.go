@@ -693,11 +693,42 @@ func TestParseXIssue73PhotoPriorityAndExtractorMatrix(t *testing.T) {
 	const extlinkTweetURL = "https://x.com/lalala9529/status/" + extlinkTweetID + "?s=19"
 	const wantPhotoURL = "https://pbs.twimg.com/media/HV0v-QhbAAAdG9e?format=jpg&name=orig"
 
-	// Verify AllowedExtractors matches pinned yt-dlp 2026.10.26 Twitter media extractors without generic/shortener.
+	// Verify AllowedExtractors and ExcludedExtractors match pinned yt-dlp Twitter extractors without generic/event/shortener.
 	gotExtractors := AllowedExtractors()
 	wantExtractors := []string{"twitter", "twitter:amplify", "twitter:broadcast", "twitter:card", "twitter:spaces"}
 	if strings.Join(gotExtractors, ",") != strings.Join(wantExtractors, ",") {
 		t.Fatalf("AllowedExtractors() = %v, want %v", gotExtractors, wantExtractors)
+	}
+	gotExcluded := ExcludedExtractors()
+	wantExcluded := []string{"twitter:event", "twitter:shortener"}
+	if strings.Join(gotExcluded, ",") != strings.Join(wantExcluded, ",") {
+		t.Fatalf("ExcludedExtractors() = %v, want %v", gotExcluded, wantExcluded)
+	}
+	allowedSet := make(map[string]struct{}, len(gotExtractors))
+	for _, name := range gotExtractors {
+		if name == "" || name != strings.ToLower(strings.TrimSpace(name)) {
+			t.Fatalf("AllowedExtractors() contains non-normalized entry %q", name)
+		}
+		if _, dup := allowedSet[name]; dup {
+			t.Fatalf("AllowedExtractors() contains duplicate entry %q", name)
+		}
+		allowedSet[name] = struct{}{}
+	}
+	excludedSet := make(map[string]struct{}, len(gotExcluded))
+	for _, name := range gotExcluded {
+		if name == "" || name != strings.ToLower(strings.TrimSpace(name)) {
+			t.Fatalf("ExcludedExtractors() contains non-normalized entry %q", name)
+		}
+		if _, dup := excludedSet[name]; dup {
+			t.Fatalf("ExcludedExtractors() contains duplicate entry %q", name)
+		}
+		if _, overlap := allowedSet[name]; overlap {
+			t.Fatalf("extractor %q appears in both AllowedExtractors() and ExcludedExtractors()", name)
+		}
+		excludedSet[name] = struct{}{}
+	}
+	if _, _, _, ok := ExtractTweetTarget("https://x.com/i/events/1234567890123456789"); ok {
+		t.Fatal("ExtractTweetTarget must reject curated /i/events/<id> URLs (twitter:event is explicitly excluded)")
 	}
 
 	extlinkPhotoSyndicationBody, _ := json.Marshal(map[string]any{

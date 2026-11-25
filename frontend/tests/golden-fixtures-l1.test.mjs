@@ -718,6 +718,97 @@ test("L1 EN Zero-CJK Gate: PlatformGrid, App.vue formatNumber, ResultDetailsSide
     );
   }
 
+  // 3b. PR #52 [P3-Low]: backend-provided bilibili-audio-* attachment with default Chinese title
+  //     ("原声音频 (M4A)") must map to "Original Audio (M4A)" under locale="en" (and stay Chinese in zh-CN).
+  const backendBiliAudioAttachments = [
+    {
+      id: "bilibili-audio-item-1",
+      role: "background_audio",
+      title: "原声音频 (M4A)",
+      resource: {
+        id: "bili-audio-backend-1",
+        role: "audio",
+        metadata: { audio_bitrate_bps: 192000, container: "m4a" },
+        delivery: {
+          kind: "file",
+          sources: [
+            {
+              id: "sa-backend",
+              url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/en/a.m4s",
+              size_bytes: 2000000,
+            },
+          ],
+        },
+      },
+    },
+  ];
+  for (const isExtensionConnected of [false, true]) {
+    const biliMusicEnHtml = await renderToString(
+      createSSRApp({
+        render: () =>
+          h(ResultDetailsSidebar, {
+            resultData: enMediaFixture,
+            locale: "en",
+            currentItem: enMediaFixture.items[0],
+            activeVariant: enMediaFixture.items[0].variants[0],
+            metadata: enMediaFixture.items[0].variants[0].metadata,
+            attachments: backendBiliAudioAttachments,
+            hasBackup: true,
+            activeTab: "music",
+            formatNumber: enFormatNumber,
+            formatDuration: enFormatDuration,
+            safeImageUrl: () => "",
+            displayVariantLabel: (v) => v?.label || "1080p",
+            formatOptionSize: () => "22 MB",
+            qualityOptions: sidebarQualityOptions,
+            downloadableCount: sidebarQualityOptions.length,
+            isBilibili: true,
+            isExtensionConnected,
+            bilibiliDashSummary: { tierCount: 1, maxResolution: "1080p" },
+          }),
+      }),
+    );
+    const biliMusicEnVisible = stripHtmlTags(biliMusicEnHtml);
+    assert.equal(
+      CJK_RE.test(biliMusicEnVisible),
+      false,
+      `EN ResultDetailsSidebar[bilibili-audio-*, ext=${isExtensionConnected}] leaked CJK: ${JSON.stringify(biliMusicEnVisible.match(/[\u4e00-\u9fff]+/g))}`,
+    );
+    assert.ok(
+      biliMusicEnVisible.includes("Original Audio (M4A)"),
+      `EN ResultDetailsSidebar[bilibili-audio-*, ext=${isExtensionConnected}] must map backend audio title to "Original Audio (M4A)", got: ${biliMusicEnVisible}`,
+    );
+  }
+  const biliMusicZhHtml = await renderToString(
+    createSSRApp({
+      render: () =>
+        h(ResultDetailsSidebar, {
+          resultData: enMediaFixture,
+          locale: "zh-CN",
+          currentItem: enMediaFixture.items[0],
+          activeVariant: enMediaFixture.items[0].variants[0],
+          metadata: enMediaFixture.items[0].variants[0].metadata,
+          attachments: backendBiliAudioAttachments,
+          hasBackup: true,
+          activeTab: "music",
+          formatNumber: enFormatNumber,
+          formatDuration: enFormatDuration,
+          safeImageUrl: () => "",
+          displayVariantLabel: (v) => v?.label || "1080p",
+          formatOptionSize: () => "22 MB",
+          qualityOptions: sidebarQualityOptions,
+          downloadableCount: sidebarQualityOptions.length,
+          isBilibili: true,
+          isExtensionConnected: false,
+          bilibiliDashSummary: { tierCount: 1, maxResolution: "1080p" },
+        }),
+    }),
+  );
+  assert.ok(
+    stripHtmlTags(biliMusicZhHtml).includes("原声音频 (M4A)"),
+    "zh-CN ResultDetailsSidebar[bilibili-audio-*] must keep Chinese title",
+  );
+
   // 4. ResultSection under locale="en" across key scenarios:
   //    (a) YouTube 8K ready, (b) YouTube login_required alert, (c) Bilibili video, (d) Album
   const ytEnBase = structuredClone(

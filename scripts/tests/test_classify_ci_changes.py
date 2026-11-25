@@ -32,6 +32,8 @@ class ClassifyPathsTests(unittest.TestCase):
         cases = [
             ["scripts/prod-smoke/smoke.py", "scripts/prod-smoke/test_smoke.py"],
             ["scripts/check-public-files.py", "scripts/tests/test_public_files.py"],
+            ["scripts/check-go-file-budgets.py", "scripts/tests/test_check_go_file_budgets.py"],
+            ["scripts/check-ytdlp-extractors.py", "scripts/tests/test_check_ytdlp_extractors.py"],
             ["docs/openapi.json", "docs/API.md", "docs/CONFIGURATION.md"],
             [
                 "README.md",
@@ -70,6 +72,8 @@ class ClassifyPathsTests(unittest.TestCase):
 
     def test_frontend_core_and_browser_harness_trigger_l2_e2e(self) -> None:
         cases = [
+            ["frontend/package.json"],
+            ["frontend/package-lock.json"],
             ["frontend/src/core/capabilityHub.ts"],
             ["frontend/src/core/media/variantSort.ts"],
             ["frontend/src/downloads/session.ts"],
