@@ -1169,4 +1169,13 @@ describe("Loopback mock end-to-end headless Chrome verification", () => {
       await mock.close();
     }
   });
+
+  test("relies on Default/Preferences rather than CDP Browser.setDownloadBehavior allow mode", async () => {
+    const src = await fsp.readFile(
+      new URL("./stage2_browser.mjs", import.meta.url),
+      "utf8",
+    );
+    assert.match(src, /default_directory:\s*downloadDir/);
+    assert.doesNotMatch(src, /browser\.send\(\s*["']Browser\.setDownloadBehavior["']/);
+  });
 });

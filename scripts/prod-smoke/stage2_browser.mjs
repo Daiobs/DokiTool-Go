@@ -1683,13 +1683,14 @@ export class ChromeProcessPool {
       }
 
       const versionInfo = await browser.send("Browser.getVersion");
-      if (downloadDir) {
-        await browser.send("Browser.setDownloadBehavior", {
-          behavior: "allow",
-          downloadPath: downloadDir,
-          eventsEnabled: false,
-        });
-      }
+      // NOTE: Do NOT call `Browser.setDownloadBehavior({ behavior: "allow" })` when
+      // testing `chrome.downloads` extensions: CDP's `allow` mode installs
+      // `DevToolsDownloadManagerDelegate`, which bypasses `ChromeDownloadManagerDelegate`
+      // and replaces saved filenames with random 36-char GUIDs (short-circuiting both
+      // extension-provided filenames and `onDeterminingFilename` listeners).
+      // `Default/Preferences` (`download.default_directory`, `prompt_for_download: false`,
+      // `automatic_downloads: 1`) configured above natively drives Chrome's real download
+      // manager in `--headless=new`.
 
       let extensionLoadMethod = null;
       if (extensionDir) {
