@@ -827,6 +827,18 @@
     "tests/golden-fixtures/xiaohongshu/original-4k-and-album.json",
     "tests/golden-fixtures/youtube/4k60-8k-adaptive.json",
     "tests/golden-fixtures/youtube/ytengine-8k-input.json",
-    "tests/golden-fixtures/zuiyou/tbvideo-direct.json"
+    "tests/golden-fixtures/zuiyou/tbvideo-direct.json",
+    "tools/dokitool-agent/README.md",
+    "tools/dokitool-agent/SKILL.md",
+    "tools/dokitool-agent/api_client.py",
+    "tools/dokitool-agent/cli.py",
+    "tools/dokitool-agent/dokitool_agent.py",
+    "tools/dokitool-agent/downloader.py",
+    "tools/dokitool-agent/mcp_server.py",
+    "tools/dokitool-agent/security.py",
+    "tools/dokitool-agent/subtitles.py",
+    "tools/dokitool-agent/tests/test_cli_and_subtitles.py",
+    "tools/dokitool-agent/tests/test_mcp_server.py",
+    "tools/dokitool-agent/tests/test_security.py"
   ]
 }

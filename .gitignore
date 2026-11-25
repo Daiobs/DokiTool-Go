@@ -16,6 +16,7 @@
 !/public-files.json
 !/scripts/
 !/tests/
+!/tools/
 /.github/*
 !/.github/upstream-watch-baseline.json
 !/.github/workflows/
@@ -97,6 +98,8 @@
 !/scripts/validate-unified-schema.py
 /tests/*
 !/tests/golden-fixtures/
+/tools/*
+!/tools/dokitool-agent/
 /.github/workflows/*
 !/.github/workflows/gateway-isolation.yml
 !/.github/workflows/go-migration.yml
@@ -380,6 +383,17 @@
 !/tests/golden-fixtures/xiaohongshu/
 !/tests/golden-fixtures/youtube/
 !/tests/golden-fixtures/zuiyou/
+/tools/dokitool-agent/*
+!/tools/dokitool-agent/README.md
+!/tools/dokitool-agent/SKILL.md
+!/tools/dokitool-agent/api_client.py
+!/tools/dokitool-agent/cli.py
+!/tools/dokitool-agent/dokitool_agent.py
+!/tools/dokitool-agent/downloader.py
+!/tools/dokitool-agent/mcp_server.py
+!/tools/dokitool-agent/security.py
+!/tools/dokitool-agent/subtitles.py
+!/tools/dokitool-agent/tests/
 /backend/api/bilibili/*
 !/backend/api/bilibili/bilibili.php
 /backend/api/douyin/*
@@ -746,6 +760,10 @@
 !/tests/golden-fixtures/youtube/ytengine-8k-input.json
 /tests/golden-fixtures/zuiyou/*
 !/tests/golden-fixtures/zuiyou/tbvideo-direct.json
+/tools/dokitool-agent/tests/*
+!/tools/dokitool-agent/tests/test_cli_and_subtitles.py
+!/tools/dokitool-agent/tests/test_mcp_server.py
+!/tools/dokitool-agent/tests/test_security.py
 /backend/internal/media/tbvideo/*
 !/backend/internal/media/tbvideo/delivery.go
 !/backend/internal/media/tbvideo/delivery_test.go
