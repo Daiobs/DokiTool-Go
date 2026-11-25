@@ -74,6 +74,14 @@
           "title": "Language",
           "type": "string"
         },
+        "track_kind": {
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "title": "Track Kind",
+          "type": "string"
+        },
         "author": {
           "$ref": "#/$defs/Author"
         },

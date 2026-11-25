@@ -714,3 +714,96 @@ func TestG2AudibleDefaultAcrossCoreAndDynamicPlatforms(t *testing.T) {
 		}
 	}
 }
+
+func TestAttachmentTrackKindContract(t *testing.T) {
+	const now = int64(1793448000)
+
+	makeSub := func(trackKind any, includeTrackKind bool) Object {
+		att := Object{
+			"id":       "sub-en",
+			"role":     "subtitle",
+			"language": "en",
+			"title":    "English",
+			"resource": Object{
+				"id":   "res-sub-en",
+				"role": "subtitle",
+				"metadata": Object{
+					"container": "vtt",
+					"extension": "vtt",
+					"mime_type": "text/vtt",
+					"evidence":  "upstream",
+				},
+				"delivery": Object{
+					"kind": "file",
+					"sources": Array{
+						Object{
+							"id":     "s-sub-en",
+							"url":    "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt",
+							"access": "direct",
+						},
+					},
+				},
+			},
+		}
+		if includeTrackKind {
+			att["track_kind"] = trackKind
+		}
+		return att
+	}
+
+	// Positive cases: subtitle with manual, auto, or omitted track_kind.
+	for _, tc := range []struct {
+		name    string
+		val     any
+		include bool
+	}{
+		{"manual", "manual", true},
+		{"auto", "auto", true},
+		{"omitted", nil, false},
+	} {
+		t.Run("valid-subtitle-"+tc.name, func(t *testing.T) {
+			payload := contractExample(t, "02")
+			Map(payload["data"])["attachments"] = Array{makeSub(tc.val, tc.include)}
+			if err := ValidateEnvelopeAt(payload, now); err != nil {
+				t.Fatalf("expected valid subtitle attachment (%s), got err=%v", tc.name, err)
+			}
+			view := PublicView(payload, false, now)
+			if err := ValidateEnvelopeAt(view, now); err != nil {
+				t.Fatalf("expected valid PublicView subtitle attachment (%s), got err=%v", tc.name, err)
+			}
+		})
+	}
+
+	// Negative cases: track_kind on background_audio MUST fail.
+	for _, kind := range []string{"manual", "auto"} {
+		t.Run("reject-background-audio-"+kind, func(t *testing.T) {
+			payload := contractExample(t, "10")
+			att := Map(Slice(Map(payload["data"])["attachments"])[0])
+			att["track_kind"] = kind
+			if err := ValidateEnvelopeAt(payload, now); err == nil {
+				t.Fatalf("expected background_audio with track_kind=%q to be rejected", kind)
+			}
+		})
+	}
+
+	// Negative cases: unknown enum / wrong type track_kind on subtitle MUST fail.
+	for _, tc := range []struct {
+		name string
+		val  any
+	}{
+		{"translated", "translated"},
+		{"asr", "asr"},
+		{"empty", ""},
+		{"nil", nil},
+		{"int", 42},
+		{"bool", true},
+	} {
+		t.Run("reject-subtitle-invalid-"+tc.name, func(t *testing.T) {
+			payload := contractExample(t, "02")
+			Map(payload["data"])["attachments"] = Array{makeSub(tc.val, true)}
+			if err := ValidateEnvelopeAt(payload, now); err == nil {
+				t.Fatalf("expected invalid subtitle track_kind=%v to be rejected", tc.val)
+			}
+		})
+	}
+}

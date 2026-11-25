@@ -402,6 +402,16 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         rhs = normalize_for_parity(comp_schemas[def_name])
         require(lhs == rhs, f"Schema drift detected between unified-v1.schema.json and openapi.json for {def_name}")
 
+    attachment_schema = comp_schemas.get("Attachment") or {}
+    attachment_props = attachment_schema.get("properties") or {}
+    track_kind_schema = attachment_props.get("track_kind") or {}
+    require(
+        attachment_schema.get("additionalProperties") is False
+        and track_kind_schema.get("type") == "string"
+        and track_kind_schema.get("enum") == ["manual", "auto"],
+        "Attachment.properties.track_kind must be string enum ['manual', 'auto'] with additionalProperties=false",
+    )
+
     # Parity check with backend/config/platforms.json + 5 optional Go-registered platforms
     optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
     platform_ids = [entry["id"] for entry in platforms_cfg] + optional_go_platforms
@@ -1183,7 +1193,48 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "data": {**base_stats_data, "hourly": [{**sample_hourly_bucket, "extra": 1}]},
     }))), "Unknown property in HourlyStatsBucket must be rejected")
 
-    return {"enabled": True, "validated_fixtures": len(fixture_files) + 26 + validate_doc_json_blocks(
+    # Positive & negative checks for Attachment.track_kind on Success envelope
+    sample_subtitle_envelope = json.loads((EXAMPLES_DIR / "02-single-video-file.json").read_text(encoding="utf-8"))
+    def _with_subtitle_attachment(track_kind_present: bool, track_kind_value=None) -> dict:
+        env = json.loads(json.dumps(sample_subtitle_envelope))
+        att = {
+            "id": "sub-en-manual",
+            "role": "subtitle",
+            "language": "en",
+            "title": "English",
+            "resource": {
+                "id": "res-sub-en-manual",
+                "role": "subtitle",
+                "metadata": {
+                    "container": "vtt",
+                    "extension": "vtt",
+                    "mime_type": "text/vtt",
+                    "evidence": "upstream",
+                },
+                "delivery": {
+                    "kind": "file",
+                    "sources": [
+                        {
+                            "id": "s-sub-en",
+                            "url": "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt",
+                            "access": "direct",
+                        }
+                    ],
+                },
+            },
+        }
+        if track_kind_present:
+            att["track_kind"] = track_kind_value
+        env["data"]["attachments"] = [att]
+        return env
+
+    require(not list(success_val.iter_errors(_with_subtitle_attachment(True, "manual"))), "Valid subtitle track_kind='manual' rejected")
+    require(not list(success_val.iter_errors(_with_subtitle_attachment(True, "auto"))), "Valid subtitle track_kind='auto' rejected")
+    require(not list(success_val.iter_errors(_with_subtitle_attachment(False))), "Valid subtitle with omitted track_kind rejected")
+    require(bool(list(success_val.iter_errors(_with_subtitle_attachment(True, "translated")))), "Invalid subtitle track_kind='translated' must be rejected")
+    require(bool(list(success_val.iter_errors(_with_subtitle_attachment(True, 123)))), "Non-string subtitle track_kind must be rejected")
+
+    return {"enabled": True, "validated_fixtures": len(fixture_files) + 31 + validate_doc_json_blocks(
         success_val, failure_val, catalog_val, stats_val, unauth_val, ratelimit_val
     )}
 

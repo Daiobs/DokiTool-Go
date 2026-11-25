@@ -341,6 +341,9 @@ def validate_semantics(response):
             require(set(reference['requires']) == expected[reference['variant_id']] and len(reference['requires']) == len(set(reference['requires'])), 'higher-quality capabilities differ from delivery')
     unique([a['id'] for a in data.get('attachments', [])], 'attachment')
     for attachment in data.get('attachments', []):
+        if 'track_kind' in attachment:
+            require(attachment['role'] == 'subtitle', 'track_kind is only allowed on subtitle attachments')
+            require(attachment['track_kind'] in {'manual', 'auto'}, 'invalid attachment track_kind')
         resource = attachment['resource']
         metadata_valid(resource.get('metadata', {}), resource['role'])
         delivery_valid(resource['delivery'], resource.get('metadata'))

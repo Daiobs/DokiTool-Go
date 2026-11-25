@@ -40,6 +40,7 @@ export interface YouTubeHelperContextResponse {
   signature_timestamp: number;
   client: YouTubeHelperClientInfo;
   expires_at: string;
+  supports_captions?: boolean;
 }
 
 export interface YouTubeHelperPingResult {

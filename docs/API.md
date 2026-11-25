@@ -114,13 +114,14 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
          "player_id": "1a2b3c4d",
          "signature_timestamp": 20000,
          "client": { "name": "TVHTML5", "version": "5.20260707" },
-         "expires_at": "2026-11-13T12:00:00Z"
+         "expires_at": "2026-11-13T12:00:00Z",
+         "supports_captions": true
        }
      }
      ```
 2. **`POST /api/youtube/finalize?schema_version=1.0`**（可选 `&debug=1`）
    - 走 `PARSE_SLOW` 准入池；请求体上限为 **`512 KiB`**，`formats` 与 `adaptiveFormats` 条目总数上限为 **`256`**。
-   - 请求 JSON 字段：`video_id`（11 位视频 ID）、`player_id`（8 位十六进制播放器 ID）、可选元数据（`title`、`author`、`duration_seconds`、`thumbnail`）以及客户端从 `www.youtube.com` 取回的 `formats` / `adaptiveFormats` 数组。
+   - 请求 JSON 字段：`video_id`（11 位视频 ID）、`player_id`（8 位十六进制播放器 ID）、可选元数据（`title`、`author`、`duration_seconds`、`thumbnail`）、客户端从 `www.youtube.com` 取回的 `formats` / `adaptiveFormats` 数组，以及可选的 `captions`（含 `playerCaptionsTracklistRenderer.captionTracks`；服务端仅白名单校验 `https://www.youtube.com/api/timedtext` 元数据直链，绝不在服务端拉取字幕正文）。
    - 服务端在零权限 Deno 沙箱中批量解算 `s` / `n` 挑战参数，严格校验生成的直链必须为 `https://*.googlevideo.com/videoplayback`（无凭据、无自定义端口、无片段锚点），最终返回标准统一媒体 v1 响应（`extra.youtube_helper.status = "ready"`）。
 
 ## 错误码、限流退避与分 P 语义
