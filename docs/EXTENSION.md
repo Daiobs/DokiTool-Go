@@ -11,7 +11,7 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
 2. **内置免油猴 YouTube 4K60 无损合流**
    - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
 3. **内置 B 站 1080P（免登录）DASH 无损合流（AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
-   - **DNR Rule `1004` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则 `1004`，仅对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com` / `akamaized.net` 的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头，解决纯网页端无法携带 B 站防盗链 Referer 的限制，且绝不干扰浏览器正常标签页访问。
+   - **DNR Rule `1004` 与窄匹配规则 `1006–1008` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则，对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com`（Rule `1004`）以及 B 站海外 Akamai UPOS 节点（高优先级 `priority: 3` 的窄匹配 Rule `1006`：`upos-*.akamaized.net`、Rule `1007`：`*bili*.akamaized.net`、Rule `1008`：`akamaized.net` + `/upgcxcode/`）的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头；其余非 B 站 `*.akamaized.net` 流量（如 Vimeo、Facebook、Tumblr）落入 Rule `1005` 仅剥离 `Origin` 与 `Cookie`（零 B 站 Referer 污染），且绝不干扰浏览器正常标签页访问。
    - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
    - **独立 M4A、画质记忆与多 P 无缝衔接**：侧边栏顶部 `<video>` 预览继续使用 `durl` 渐进式 MP4 秒开播放；画质列表完整呈现各档位分辨率、编解码（同分辨率默认优先 `H.264` 兼顾全平台硬解与剪辑软件兼容，同时保留 `HEVC` / `AV1` 自由切换）与估算体积；选择「仅音频」时直接下载 `30280` 独立 `.m4a`；支持 B 站多 P 勾选批量合流与右键「极速下载」。
    - **零 Cookie、零服务端媒体中转**：服务端仅并行解析返回官方优先 CDN 地址（自动过滤未知第三方 PCDN，优先国内加速节点），全部 `.m4s` 媒体流量由用户本机扩展直连拉取；严格遵守零 Cookie 原则，免登录支持 **1080P（免登录，AVC/HEVC/AV1）+ 30280 AAC**，绝不读取或采集浏览器已登录的 B 站 Cookie。
@@ -24,7 +24,7 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
    - **跟随标签页自动同步（严格核心 14 平台隐私防火墙）**：仅在本地命中 14 个核心受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）；浏览任何长尾或外部网站时绝不自动外发后端请求。
    - **主动输入与批量链接队列模式（支持长尾平台与三档安全交付）**：用户主动在侧边栏输入框或批量队列粘贴分享文本时，自动提取并去重核心 14 平台及合法公网长尾分享链接（拒绝 `chrome://`、`file://`、IP、内网主机名、本站域名及裸根域名），按序解析并落盘。下载执行按目标媒体域名自动分级：
      - **白名单 CDN（OPFS / 无损合流）**：继续走 `offscreen` OPFS 拉流、多线路回退与 `Mediabunny` 无损封装；
-     - **非白名单单文件直链（浏览器直下）**：无需扩展通配权限，直接交由 Chrome 原生 `chrome.downloads.download` 下载并追踪进度与打开文件夹；
+     - **非白名单单文件直链（移交浏览器原生下载器）**：无需申请 `<all_urls>` 扩展通配权限，直接移交 Chrome 原生 `chrome.downloads.download` 下载器保存并追踪进度与打开文件夹——在此模式下扩展**不代理请求、不读取响应体、不附加 Cookie**，等价于浏览器原生点击下载；
      - **非白名单 HLS / 分离流（需外链）**：清晰标注 **「需外链 · 非白名单流」**，自动优先选中可直下的渐进式单文件版本，同时提供 **「复制直链」** 与 **「打开原帖」** 操作。
 5. **Pixiv 式勾选与子文件夹无上限保存**
    - 图集、实况照片（支持「视频 + 封面 / 仅视频 / 仅封面」三档过滤）与哔哩哔哩多 P 支持全选、反选与单项勾选。
@@ -104,4 +104,4 @@ npm run build:extension:zip
 
 - **零网页注入、零 `<all_urls>` 通配符**：`manifest.json` 不声明任何 `content_scripts`，不包含 `cookies`、`scripting`、`debugger`、`webRequestBlocking` 或未受限的 `declarativeNetRequest` 权限；`host_permissions` 仅列出 `https://snap.dokitool.com/*` 与 14 个平台显式媒体 CDN 域名。
 - **浏览隐私防火墙**：标签页自动同步（`autoFollowTab` / `onUpdated` / `onActivated`）严格限定在本地 14 个核心平台域名与路径语法匹配；浏览长尾站点、`chrome://`、`file://` 或内网页面时均静默忽略，**向后端发送 0 请求**。仅在用户主动手动输入、批量队列粘贴或点击右键菜单时才允许将合法公网长尾链接提交至 `GET /api/parse?platform=all`。
-- **全链路无 Cookie 直连、零服务端媒体中转与监控页隔离**：扩展发往后端 API（含只读 `/api/stats` 监控查询）与各平台媒体 CDN（含 B 站 DASH `.m4s` 音视频流）的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则（含针对 B 站防盗链的 Rule `1004`）剥离 `Cookie` 与扩展 `Origin` 头；扩展不再打包重复的 `monitor.html`，侧边栏「解析监控大盘 ↗」仅以纯净 URL（`${apiOrigin}/monitor`，零查询串、零 `#hash`、零令牌透传）在新标签页打开 Web 原生监控大盘，`Mediabunny` 严格隔离于 `offscreen` 打包产物内而不进入 `background` 或 `sidepanel`；全部媒体数据与 `Mediabunny` 无损合流均在用户本机浏览器内完成，服务端不中转媒体流量，亦不触碰浏览器已登录的站点账号状态或干扰正常网页浏览。
+- **全链路无 Cookie 直连、非白名单原生移交、零服务端媒体中转与监控页隔离**：扩展发往后端 API（含只读 `/api/stats` 监控查询）与各平台白名单媒体 CDN（含 B 站 DASH `.m4s` 音视频流）的全部 `fetch` 请求均强制 `credentials: "omit"` 与 `referrerPolicy: "no-referrer"`，并由精确限定 `initiatorDomains: [chrome.runtime.id]` 的动态 DNR 规则（含针对 B 站国内 CDN 的 Rule `1004` 与严格收窄至 B 站海外 Akamai UPOS 节点的 `priority: 3` 规则 `1006–1008`，同时保证非 B 站 `akamaized.net` 落入 Rule `1005` 零 Referer 注入）剥离 `Cookie` 与扩展 `Origin` 头；对不在白名单内的长尾渐进式单文件直链，扩展不申请 `<all_urls>` 权限，而是直接移交 Chrome 浏览器原生下载器（`chrome.downloads.download`），扩展本身不代理请求、不读取响应体、不附加 Cookie；扩展不再打包重复的 `monitor.html`，侧边栏「解析监控大盘 ↗」仅以纯净 URL（`${apiOrigin}/monitor`，零查询串、零 `#hash`、零令牌透传）在新标签页打开 Web 原生监控大盘，`Mediabunny` 严格隔离于 `offscreen` 打包产物内而不进入 `background` 或 `sidepanel`；全部媒体数据与 `Mediabunny` 无损合流均在用户本机浏览器内完成，服务端不中转媒体流量，亦不触碰浏览器已登录的站点账号状态或干扰正常网页浏览。

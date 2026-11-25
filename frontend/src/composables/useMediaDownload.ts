@@ -561,6 +561,8 @@ export function useMediaDownload({
       const openedToutiaoTab = isToutiaoManual
         ? triggerBrowserDownload(url, filename, true)
         : false;
+      const nonToutiaoManualHint =
+        "该源站受浏览器跨域（CORS）或附件下载头限制，请点击下载卡片中的「打开源链接」并在新标签页右键选择「视频另存为」（手机端长按保存），或安装 Chrome 扩展一键下载";
       videoStore.updateDownload(downloadId, {
         deliveryId,
         transport: undefined,
@@ -575,6 +577,7 @@ export function useMediaDownload({
         averageSpeed: 0,
         transferred: 0,
         error: null,
+        fallbackReason: isToutiaoManual ? null : nonToutiaoManualHint,
         progressKind: "bytes",
         nativeAvailable: true,
         observation: undefined,
@@ -587,7 +590,7 @@ export function useMediaDownload({
           ? openedToutiaoTab
             ? "因头条 CDN 限制跨域直下，已切换为打开源链接，请在新标签页右键选择「视频另存为」（手机端长按保存）"
             : "因头条 CDN 限制跨域直下，已切换为打开源链接；请点击下载卡片中的「打开源链接」，在新标签页右键选择「视频另存为」（手机端长按保存）"
-          : "该直链未提供附件下载头，请点击下载卡片中的“打开源链接”手动保存",
+          : nonToutiaoManualHint,
         "info",
         6000,
       );

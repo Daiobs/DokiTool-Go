@@ -1722,7 +1722,14 @@ async function handleBatchZipSave() {
           </button>
 
           <div
-            v-if="opt.deliveryMode === 'external_only'"
+            v-if="opt.deliveryMode === 'native_direct'"
+            class="sp-native-notice"
+            data-testid="native-direct-notice"
+          >
+            该长尾直链域名不在扩展白名单内，将移交浏览器原生下载器直接保存（扩展不代理请求、不读取响应体、不附加 Cookie）。
+          </div>
+          <div
+            v-else-if="opt.deliveryMode === 'external_only'"
             class="sp-external-fallback"
             data-testid="external-only-fallback"
           >
@@ -2674,6 +2681,16 @@ async function handleBatchZipSave() {
   background: var(--sp-warning-soft);
   color: var(--sp-warning-text);
   border: 1px solid var(--sp-warning-border);
+}
+
+.sp-native-notice {
+  padding: 5px 9px;
+  border-radius: var(--sp-radius-sm);
+  background: var(--sp-muted-pill-bg);
+  border: 1px solid var(--sp-border);
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--sp-text-secondary);
 }
 
 .sp-external-fallback {

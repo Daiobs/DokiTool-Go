@@ -1,9 +1,11 @@
 import {
+  deliveryRoutes,
   readyItem,
   readyVariant,
   getDownloadTarget,
   requiredCapabilities,
   sourceAvailable,
+  sourceUrl,
 } from "../../utils/mediaContract";
 import {
   buildCanonicalVariantDescriptor,
@@ -76,6 +78,23 @@ export function buildAllQualityOptions(
     const downloadable =
       ["file", "hls", "segments", "pair"].includes(downloadTarget.kind) ||
       extensionMux;
+    let streamCopyUrl = "";
+    if (
+      !downloadable &&
+      readyVariant(variant) &&
+      (variant.delivery.kind === "hls" || variant.delivery.kind === "dash")
+    ) {
+      try {
+        const routes = deliveryRoutes(variant.delivery.sources, context);
+        if (routes.length > 0) {
+          streamCopyUrl = routes[0];
+        } else if (variant.delivery.sources[0]) {
+          streamCopyUrl = sourceUrl(variant.delivery.sources[0], context);
+        }
+      } catch {
+        streamCopyUrl = "";
+      }
+    }
     return {
       variant,
       source: downloadTarget.kind === "file" ? downloadTarget.source : source,
@@ -85,6 +104,7 @@ export function buildAllQualityOptions(
       extensionMux,
       clientSplitMux,
       downloadable,
+      ...(streamCopyUrl ? { streamCopyUrl } : {}),
       capabilities: readyVariant(variant)
         ? requiredCapabilities(variant.delivery)
         : [],

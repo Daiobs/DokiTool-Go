@@ -11,6 +11,7 @@ import {
   isExtensionVersionOutdated,
 } from "../core/capabilityHub";
 import {
+  deliveryRoutes,
   readyItem,
   readyVariant,
   getDownloadTarget,
@@ -258,13 +259,31 @@ const activeVideoUrl = computed(() => {
   if (isActiveExtensionDashMux.value) return playableFallbackVideoUrl.value;
   return "";
 });
-const copyVideoUrl = computed(() =>
-  isActiveExtensionDashMux.value || isYouTubeHelperBlocked.value
-    ? ""
-    : target.value?.kind === "file"
-      ? target.value.url
-      : "",
-);
+const copyVideoUrl = computed(() => {
+  if (isActiveExtensionDashMux.value || isYouTubeHelperBlocked.value) {
+    return "";
+  }
+  if (target.value?.kind === "file") {
+    return target.value.url;
+  }
+  if (
+    target.value?.kind === "hls" &&
+    target.value.variant?.delivery?.kind === "hls"
+  ) {
+    try {
+      const routes = deliveryRoutes(
+        target.value.variant.delivery.sources,
+        context,
+      );
+      if (routes.length > 0) return routes[0];
+      const first = target.value.variant.delivery.sources[0];
+      return first ? sourceUrl(first, context) : "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
+});
 const metadata = computed(() => activeVariant.value?.metadata || {});
 const attachments = computed(() => props.resultData?.attachments || []);
 
@@ -1041,6 +1060,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :player-quality-tag-text="playerQualityTagText"
           :primary-download-label="primaryDownloadLabel"
           :is-resolving="Boolean(isResolving)"
+          :can-refresh-item="Boolean(currentItem?.resolve_url || resultData?.refresh_url)"
           :target-message="targetMessage"
           :downloadable-count="downloadableQualityOptions.length"
           :is-you-tube-helper-install-required="isYouTubeHelperInstallRequired"
@@ -1147,6 +1167,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         @select-quality="selectQuality"
         @open-extension="emit('open-extension')"
         @copy-text="copyToClipboard"
+        @copy-url="emit('copy-url', $event)"
         @download-music="emit('download-music', $event)"
         @mark-image-broken="markImageBroken"
         @baseline-change="onBaselineChange"

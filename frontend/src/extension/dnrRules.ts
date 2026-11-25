@@ -6,7 +6,16 @@ import { CDN_REQUEST_DOMAINS, validateApiBaseUrl } from "./hostWhitelist";
 export const YOUTUBE_TVHTML5_USER_AGENT =
   "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1" as const;
 
-export const EXTENSION_DNR_RULE_IDS = [1001, 1002, 1003, 1004, 1005] as const;
+export const EXTENSION_DNR_RULE_IDS = [
+  1001,
+  1002,
+  1003,
+  1004,
+  1005,
+  1006,
+  1007,
+  1008,
+] as const;
 
 export type DnrResourceType = "xmlhttprequest" | "media" | "image";
 
@@ -52,8 +61,31 @@ const RULE_1004_BILIBILI_DOMAINS = [
   "bilivideo.com",
   "bilivideo.cn",
   "hdslb.com",
-  "akamaized.net",
 ] as const;
+
+/**
+ * Narrow Bilibili overseas Akamai UPOS matchers (Guardrail G1).
+ * Kept strictly isomorphic with `isBilibiliAkamaiMediaUrl` in
+ * `frontend/src/core/media/cdnTransportHints.ts` and
+ * `backend/internal/platform/bilibili/adapter.go` so public Akamai CDNs
+ * (e.g. Vimeo `vod-progressive.akamaized.net`, Facebook, Tumblr) fall through
+ * to Rule 1005 (Origin/Cookie stripped, zero Bilibili Referer injected).
+ */
+const RULE_1006_1008_BILIBILI_AKAMAI_RULES = [
+  { id: 1006, urlFilter: "||upos-*.akamaized.net/" },
+  { id: 1007, urlFilter: "://*bili*.akamaized.net/" },
+  { id: 1008, urlFilter: "/upgcxcode/" },
+] as const;
+
+const BILIBILI_REQUEST_HEADERS: DnrModifyHeaderInfo[] = [
+  {
+    header: "Referer",
+    operation: "set",
+    value: "https://www.bilibili.com/",
+  },
+  { header: "Origin", operation: "remove" },
+  { header: "Cookie", operation: "remove" },
+];
 
 const SPECIALIZED_RULE_DOMAINS = new Set<string>([
   ...RULE_1002_YOUTUBE_DOMAINS,
@@ -189,15 +221,7 @@ export function buildExtensionDnrRules(
       priority: 2,
       action: {
         type: "modifyHeaders",
-        requestHeaders: [
-          {
-            header: "Referer",
-            operation: "set",
-            value: "https://www.bilibili.com/",
-          },
-          { header: "Origin", operation: "remove" },
-          { header: "Cookie", operation: "remove" },
-        ],
+        requestHeaders: BILIBILI_REQUEST_HEADERS.map((item) => ({ ...item })),
       },
       condition: {
         initiatorDomains: [extensionId],
@@ -221,5 +245,21 @@ export function buildExtensionDnrRules(
         resourceTypes: ["xmlhttprequest", "media", "image"],
       },
     },
+    ...RULE_1006_1008_BILIBILI_AKAMAI_RULES.map(
+      ({ id, urlFilter }): ExtensionDnrRule => ({
+        id,
+        priority: 3,
+        action: {
+          type: "modifyHeaders",
+          requestHeaders: BILIBILI_REQUEST_HEADERS.map((item) => ({ ...item })),
+        },
+        condition: {
+          initiatorDomains: [extensionId],
+          requestDomains: ["akamaized.net"],
+          urlFilter,
+          resourceTypes: ["xmlhttprequest", "media", "image"],
+        },
+      }),
+    ),
   ];
 }

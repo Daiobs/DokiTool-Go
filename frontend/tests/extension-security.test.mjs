@@ -343,7 +343,7 @@ test("hostWhitelist: validateApiBaseUrl enforces HTTPS public domains or HTTP lo
   }
 });
 
-test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures Rules 1001-1005", () => {
+test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Rules 1001-1008, and narrows Bilibili Akamai Referer (G1)", () => {
   for (const badId of ["", "UPPERCASE", "ext/id", "ext id", "../bad"]) {
     assert.throws(() => dnrRules.buildExtensionDnrRules(badId));
   }
@@ -361,7 +361,11 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures
 
   assert.deepEqual(
     rules.map((r) => r.id),
-    [1001, 1002, 1003, 1004, 1005],
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
+  );
+  assert.deepEqual(
+    Array.from(dnrRules.EXTENSION_DNR_RULE_IDS),
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
   );
 
   for (const rule of rules) {
@@ -373,7 +377,7 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures
     assert.equal(rule.action.type, "modifyHeaders");
   }
 
-  const [r1001, r1002, r1003, r1004, r1005] = rules;
+  const [r1001, r1002, r1003, r1004, r1005, r1006, r1007, r1008] = rules;
 
   // Rule 1001: YouTube TVHTML5 player endpoint
   assert.equal(r1001.priority, 3);
@@ -429,21 +433,25 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures
     { header: "Cookie", operation: "remove" },
   ]);
 
-  // Rule 1004: Bilibili Referer + remove Origin/Cookie
+  // Rule 1004: Bilibili domestic CDNs ONLY (G1 removes global akamaized.net)
   assert.equal(r1004.priority, 2);
   assert.deepEqual(r1004.condition.requestDomains, [
     "bilivideo.com",
     "bilivideo.cn",
     "hdslb.com",
-    "akamaized.net",
   ]);
+  assert.equal(
+    r1004.condition.requestDomains.includes("akamaized.net"),
+    false,
+    "G1: global akamaized.net must NOT remain in Rule 1004",
+  );
   assert.deepEqual(r1004.action.requestHeaders, [
     { header: "Referer", operation: "set", value: "https://www.bilibili.com/" },
     { header: "Origin", operation: "remove" },
     { header: "Cookie", operation: "remove" },
   ]);
 
-  // Rule 1005: Remaining CDNs + prod/loopback/custom API origins
+  // Rule 1005: Remaining CDNs (including non-Bilibili akamaized.net) + prod/loopback/custom API origins
   assert.equal(r1005.priority, 1);
   assert.deepEqual(r1005.action.requestHeaders, [
     { header: "Origin", operation: "remove" },
@@ -454,6 +462,7 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures
     "127.0.0.1",
     "localhost",
     "custom-gateway.example.com",
+    "akamaized.net",
     "douyinvod.com",
     "xhscdn.com",
     "rednotecdn.com",
@@ -480,6 +489,117 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule and configures
       `Rule 1005 should not duplicate specialized domain ${specialized}`,
     );
   }
+
+  // Rules 1006-1008 (G1): Narrow priority-3 Bilibili overseas Akamai UPOS matchers
+  for (const [rule, expectedFilter] of [
+    [r1006, "||upos-*.akamaized.net/"],
+    [r1007, "://*bili*.akamaized.net/"],
+    [r1008, "/upgcxcode/"],
+  ]) {
+    assert.equal(rule.priority, 3);
+    assert.deepEqual(rule.condition.initiatorDomains, [extId]);
+    assert.deepEqual(rule.condition.requestDomains, ["akamaized.net"]);
+    assert.equal(rule.condition.urlFilter, expectedFilter);
+    assert.deepEqual(rule.condition.resourceTypes, [
+      "xmlhttprequest",
+      "media",
+      "image",
+    ]);
+    assert.deepEqual(rule.action.requestHeaders, [
+      { header: "Referer", operation: "set", value: "https://www.bilibili.com/" },
+      { header: "Origin", operation: "remove" },
+      { header: "Cookie", operation: "remove" },
+    ]);
+  }
+
+  // Bidirectional Chrome MV3 DNR matching simulation (G1)
+  const matchesDnrUrlFilter = (urlStr, filter) => {
+    if (!filter) return true;
+    const escapeRegex = (s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+    if (filter.startsWith("||")) {
+      const body = filter.slice(2).split("*").map(escapeRegex).join(".*");
+      return new RegExp(`^[a-z][a-z0-9+.-]*://(?:[^/]+\\.)?${body}`, "i").test(
+        urlStr,
+      );
+    }
+    const body = filter.split("*").map(escapeRegex).join(".*");
+    return new RegExp(body, "i").test(urlStr);
+  };
+  const simulateDnrRequest = (urlStr, initiatorDomain, resourceType = "xmlhttprequest") => {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    const matched = rules
+      .filter((rule) => {
+        if (!rule.condition.initiatorDomains.includes(initiatorDomain)) return false;
+        if (!rule.condition.resourceTypes.includes(resourceType)) return false;
+        if (rule.condition.requestDomains) {
+          const domainOk = rule.condition.requestDomains.some(
+            (d) => host === d || host.endsWith(`.${d}`),
+          );
+          if (!domainOk) return false;
+        }
+        return matchesDnrUrlFilter(urlStr, rule.condition.urlFilter);
+      })
+      .sort((a, b) => b.priority - a.priority || a.id - b.id);
+    const headers = new Map([
+      ["Origin", `chrome-extension://${initiatorDomain}`],
+      ["Cookie", "sid=secret"],
+    ]);
+    const decided = new Set();
+    for (const rule of matched) {
+      for (const op of rule.action.requestHeaders) {
+        const key = op.header.toLowerCase();
+        if (decided.has(key)) continue;
+        decided.add(key);
+        if (op.operation === "set") headers.set(op.header, op.value);
+        else if (op.operation === "remove") headers.delete(op.header);
+      }
+    }
+    return { matchedIds: matched.map((r) => r.id), headers };
+  };
+
+  // Positive: Bilibili overseas Akamai UPOS / *bili* / /upgcxcode/ MUST get Bilibili Referer + stripped Origin/Cookie
+  for (const biliAkamaiUrl of [
+    "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/720p.mp4",
+    "https://upos-sz-mirrorakam.akamaized.net/dash/1080p.m4s",
+    "https://bili-edge.akamaized.net/media/720p.mp4",
+    "https://cn-bili-cdn.akamaized.net/chunk.m4s",
+    "https://edge-mirror.akamaized.net/upgcxcode/12/34/56.m4s",
+  ]) {
+    const sim = simulateDnrRequest(biliAkamaiUrl, extId);
+    assert.ok(
+      sim.matchedIds.some((id) => id >= 1006 && id <= 1008),
+      `expected narrow Bilibili Akamai rule (1006-1008) for ${biliAkamaiUrl}, got ${JSON.stringify(sim.matchedIds)}`,
+    );
+    assert.equal(sim.headers.get("Referer"), "https://www.bilibili.com/");
+    assert.equal(sim.headers.has("Origin"), false);
+    assert.equal(sim.headers.has("Cookie"), false);
+  }
+
+  // Negative: Vimeo / Facebook / Tumblr / generic Akamai URLs MUST match Rule 1005 ONLY with ZERO Referer
+  for (const nonBiliAkamaiUrl of [
+    "https://vod-progressive.akamaized.net/exp=1700/vimeo-1080p.mp4",
+    "https://fbcdn-video-a.akamaized.net/hvideo-ak-prn/clip.mp4",
+    "https://tumblr-media.akamaized.net/video/post123.mp4",
+    "https://vod-progressive.akamaized.net/media/ability/video.mp4",
+  ]) {
+    const sim = simulateDnrRequest(nonBiliAkamaiUrl, extId);
+    assert.deepEqual(
+      sim.matchedIds,
+      [1005],
+      `non-Bilibili Akamai URL ${nonBiliAkamaiUrl} must fall strictly into Rule 1005, got ${JSON.stringify(sim.matchedIds)}`,
+    );
+    assert.equal(sim.headers.has("Referer"), false, `must inject zero Referer for ${nonBiliAkamaiUrl}`);
+    assert.equal(sim.headers.has("Origin"), false);
+    assert.equal(sim.headers.has("Cookie"), false);
+  }
+
+  // Normal browser tabs (non-extension initiator) match ZERO rules
+  const tabSim = simulateDnrRequest(
+    "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/720p.mp4",
+    "www.bilibili.com",
+  );
+  assert.deepEqual(tabSim.matchedIds, []);
 });
 
 test("urlMatcher: matches all 14 platforms & shortlinks and strictly blocks non-supported/private URLs", () => {
@@ -1585,24 +1705,36 @@ test("Bilibili DASH security boundary: hostWhitelist & DNR Rule 1004 permit offi
     assert.equal(res.allowed, false, `PCDN/non-standard URL must be blocked: ${blockedUrl}`);
   }
 
-  // DNR Rule 1004 injects Referer: https://www.bilibili.com/, removes Origin & Cookie, and pins initiatorDomains
+  // DNR Rule 1004 injects Referer: https://www.bilibili.com/ for domestic Bilibili domains while Rules 1006-1008 narrow Akamai UPOS
   const rules = dnrRules.buildExtensionDnrRules("abcdefghijklmnopabcdefghijklmnop");
   const biliRule = rules.find((r) => r.id === 1004);
   assert.ok(biliRule, "DNR Rule 1004 must exist for Bilibili DASH");
   assert.deepEqual(biliRule.condition.initiatorDomains, [
     "abcdefghijklmnopabcdefghijklmnop",
   ]);
-  for (const domain of ["bilivideo.com", "bilivideo.cn", "hdslb.com", "akamaized.net"]) {
+  for (const domain of ["bilivideo.com", "bilivideo.cn", "hdslb.com"]) {
     assert.ok(
       biliRule.condition.requestDomains.includes(domain),
       `DNR Rule 1004 must cover ${domain}`,
     );
   }
+  assert.equal(
+    biliRule.condition.requestDomains.includes("akamaized.net"),
+    false,
+    "G1: akamaized.net must be narrowed to priority-3 Rules 1006-1008",
+  );
   assert.deepEqual(biliRule.action.requestHeaders, [
     { header: "Referer", operation: "set", value: "https://www.bilibili.com/" },
     { header: "Origin", operation: "remove" },
     { header: "Cookie", operation: "remove" },
   ]);
+  const biliAkamaiRules = rules.filter((r) => r.id >= 1006 && r.id <= 1008);
+  assert.equal(biliAkamaiRules.length, 3);
+  for (const r of biliAkamaiRules) {
+    assert.equal(r.priority, 3);
+    assert.deepEqual(r.condition.requestDomains, ["akamaized.net"]);
+    assert.deepEqual(r.action.requestHeaders, biliRule.action.requestHeaders);
+  }
 });
 
 test("PR-C urlMatcher: matchSupportedPlatformUrl stays strict 14-core while matchActiveParseUrl & extractActiveParseUrlsFromText accept long-tail sites and block unsafe/local/bare URLs", () => {

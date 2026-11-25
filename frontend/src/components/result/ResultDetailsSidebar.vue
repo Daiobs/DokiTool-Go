@@ -50,6 +50,7 @@ const emit = defineEmits([
   "select-quality",
   "open-extension",
   "copy-text",
+  "copy-url",
   "download-music",
   "mark-image-broken",
   "baseline-change",
@@ -596,6 +597,7 @@ onUnmounted(() => {
         :format-option-size="formatOptionSize"
         @select-quality="emit('select-quality', $event)"
         @toggle-show-all="emit('toggle-show-all-qualities')"
+        @copy-url="emit('copy-url', $event)"
       />
 
       <div v-if="activeTab === 'tags'" class="rs-tab-panel">

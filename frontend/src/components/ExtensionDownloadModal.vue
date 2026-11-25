@@ -51,7 +51,7 @@ const copy = computed(() =>
           "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact. If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.",
         privacyLabel: "Privacy:",
         privacyNote:
-          "Zero cookies, zero page script injection, on-demand parsing for the 14 core platforms and user-initiated long-tail sites only, and zero outbound traffic during normal browsing on unsupported websites.",
+          "Zero cookies, zero page script injection, and zero <all_urls> wildcard: auto-sync only matches the 14 core platforms; non-whitelisted long-tail direct links are handed off directly to Chrome's native downloader (the extension does not proxy requests, read response bodies, or attach cookies); Bilibili Referer DNR rules (1004, 1006–1008) are strictly scoped to extension-initiated Bilibili CDN and overseas Akamai UPOS requests without affecting other sites.",
       }
     : {
         badge: `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
@@ -82,7 +82,7 @@ const copy = computed(() =>
           "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。",
         privacyLabel: "隐私边界：",
         privacyNote:
-          "零 Cookie、零网页脚本注入、仅对 14 核心平台及用户主动提交的长尾站点按需解析，日常浏览非支持网站零外发请求。",
+          "零 Cookie、零网页脚本注入、零 <all_urls> 通配权限：自动跟随仅匹配 14 核心平台；非白名单长尾渐进直链直接移交浏览器原生下载器（扩展不代理请求、不读取响应体、不附加 Cookie）；B 站防盗链 DNR 规则（1004、1006–1008）仅作用于扩展自身的 B 站及海外 Akamai UPOS 请求，不影响其他站点与正常浏览。",
       },
 );
 

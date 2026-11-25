@@ -24,7 +24,7 @@ const props = defineProps({
   formatOptionSize: Function,
 });
 
-const emit = defineEmits(["select-quality", "toggle-show-all"]);
+const emit = defineEmits(["select-quality", "toggle-show-all", "copy-url"]);
 
 const panelEl = ref(null);
 
@@ -181,6 +181,17 @@ defineExpose({ focusFirstOption });
           }}</span>
         </div>
         <p class="rs-stat-note">{{ option.downloadTarget.message }}</p>
+        <div v-if="option.streamCopyUrl" class="rs-other-version-actions">
+          <button
+            type="button"
+            class="rs-other-copy-btn"
+            data-testid="copy-stream-url-btn"
+            @click="emit('copy-url', option.streamCopyUrl)"
+          >
+            <AppIcon class="fas fa-copy" />
+            <span>{{ locale === "en" ? "Copy stream URL" : "复制流链接" }}</span>
+          </button>
+        </div>
       </div>
     </details>
   </div>
@@ -233,6 +244,32 @@ defineExpose({ focusFirstOption });
   gap: 0.25rem;
   padding: 0.5rem 0;
   border-bottom: 1px solid var(--c-border-2);
+}
+.rs-other-version-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+.rs-other-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--r-sm, 0.375rem);
+  border: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+  color: var(--c-fg-2);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all var(--t-fast);
+}
+.rs-other-copy-btn:hover {
+  border-color: var(--c-accent);
+  color: var(--c-fg);
+  background: var(--c-bg-3);
 }
 .rs-backup-item {
   display: flex;

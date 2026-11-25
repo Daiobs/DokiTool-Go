@@ -164,7 +164,7 @@ function harness(data, resolver, selectionFactory) {
     for (const variant of item?.variants || []) if (variant.delivery.kind==='file') for (const source of variant.delivery.sources) if(mediaContract.sourceUrl(source)===url || source.url===url) {selection.choose({variant_id:variant.id,source_id:source.id});return;}
     throw new Error('Test must explicitly declare its selected source');
   }});
-  const resolveItem = async (item,signal) => { const resolved=await resolver?.(item,signal); if (!resolved) throw new Error('解析失败'); return resolved.variants || resolved.state ? resolved : {...fixtureItem(resolved,item.index),id:item.id}; };
+  const resolveItem = async (item,signal,options) => { const resolved=await resolver?.(item,signal,options); if (!resolved) throw new Error('解析失败'); return resolved.variants || resolved.state ? resolved : {...fixtureItem(resolved,item.index),id:item.id}; };
   const instance = downloads.useMediaDownload({videoStore:store,selection,resolveItem,showToast:(...args)=>toasts.push(args)});
   return {store,currentVideoUrl,instance,toasts,selection};
 }
@@ -5399,4 +5399,92 @@ test('Issue #48 [B2-Polish-1] & [P2-5f]: extension bridge preserves refreshAvail
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
   }
+});
+
+test('PR-B1 [G4 + CORS guidance]: Tier-2 refresh_url enables handleRefreshDownload without item.resolve_url, and non-Toutiao CORS manual fallback enriches guidance', async () => {
+  // 1) Tier-2 item omitting item.resolve_url but providing top-level data.refresh_url
+  const staleUrl = 'https://cdn.vimeo.test/old-signed.mp4';
+  const freshUrl = 'https://cdn.vimeo.test/new-signed.mp4';
+  const tier2Item = {
+    id: 'vimeo-1',
+    type: 'video',
+    variants: [
+      {
+        id: 'hd',
+        metadata: { extension: 'mp4', mime_type: 'video/mp4', has_audio: true },
+        delivery: { kind: 'file', sources: [{ id: 's1', url: staleUrl }] },
+      },
+    ],
+    default: { variant_id: 'hd', source_id: 's1', url: staleUrl },
+  };
+  const freshItem = {
+    ...tier2Item,
+    variants: [
+      {
+        ...tier2Item.variants[0],
+        delivery: { kind: 'file', sources: [{ id: 's1', url: freshUrl }] },
+      },
+    ],
+    default: { variant_id: 'hd', source_id: 's1', url: freshUrl },
+  };
+  const seenResolveOptions = [];
+  const fetchedUrls = [];
+  const hRefresh = harness(
+    {
+      platform: 'vimeo',
+      title: 'Vimeo Refresh',
+      refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
+      items: [tier2Item],
+    },
+    async (_item, _signal, opts) => {
+      seenResolveOptions.push(opts);
+      return freshItem;
+    },
+  );
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(String(url));
+    if (String(url) === staleUrl) return new Response('expired', { status: 403 });
+    return new Response(new Uint8Array(12), {
+      headers: { 'content-type': 'video/mp4', 'content-length': '12' },
+    });
+  };
+  await hRefresh.instance.downloadMainVideo();
+  await settled(hRefresh.store.downloads[0]);
+  assert.equal(hRefresh.store.downloads[0].status, 'failed');
+  assert.equal(hRefresh.store.downloads[0].refreshAvailable, true, 'data.refresh_url must enable refreshAvailable when item.resolve_url is omitted');
+
+  await hRefresh.instance.handleRefreshDownload(hRefresh.store.downloads[0].id);
+  await settled(hRefresh.store.downloads[0]);
+  assert.equal(hRefresh.store.downloads[0].status, 'completed');
+  assert.equal(seenResolveOptions.length, 1);
+  assert.equal(
+    seenResolveOptions[0]?.refreshUrl,
+    '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
+  );
+  assert.ok(fetchedUrls.includes(freshUrl));
+
+  // 2) Non-Toutiao CORS-blocked manual fallback keeps statusText="打开源链接" while providing enriched CORS + 视频另存为 + Chrome 扩展 guidance
+  const corsUrl = 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=137';
+  const corsItem = {
+    id: 'yt-cors',
+    type: 'video',
+    variants: [
+      {
+        id: 'v1080',
+        metadata: { width: 1920, height: 1080, extension: 'mp4', mime_type: 'video/mp4' },
+        delivery: { kind: 'file', sources: [{ id: 's1', url: corsUrl }] },
+      },
+    ],
+    default: { variant_id: 'v1080', source_id: 's1', url: corsUrl },
+  };
+  const hCors = harness({ platform: 'youtube', title: 'CORS Manual', items: [corsItem] });
+  await hCors.instance.downloadMainVideo();
+  assert.equal(hCors.store.downloads[0].status, 'manual');
+  assert.equal(hCors.store.downloads[0].statusText, '打开源链接');
+  assert.match(hCors.store.downloads[0].fallbackReason || '', /CORS/);
+  assert.match(hCors.store.downloads[0].fallbackReason || '', /视频另存为/);
+  assert.match(hCors.store.downloads[0].fallbackReason || '', /Chrome 扩展/);
+  assert.ok(
+    hCors.toasts.some(([msg]) => msg.includes('CORS') && msg.includes('视频另存为') && msg.includes('Chrome 扩展')),
+  );
 });

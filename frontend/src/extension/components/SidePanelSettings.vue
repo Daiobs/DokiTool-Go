@@ -591,6 +591,14 @@ onUnmounted(() => {
             </button>
           </div>
 
+          <!-- Privacy & Permission Boundary Disclosure (Q5A + G1) -->
+          <div class="sp-field" data-testid="privacy-boundary-disclosure">
+            <span class="sp-field__label">权限与下载边界说明</span>
+            <span class="sp-field__hint">
+              非白名单长尾渐进直链会直接移交 Chrome 浏览器原生下载器（扩展不申请 &lt;all_urls&gt;、不代理请求、不读取响应体、不附加 Cookie）；B 站防盗链来源头仅针对扩展自身请求且严格收窄至 B 站 CDN 及海外 Akamai UPOS 节点（DNR 规则 1004 / 1006–1008），绝不干扰其他站点或正常网页访问。
+            </span>
+          </div>
+
           <div v-if="localError" class="sp-conn-banner sp-conn-banner--err">
             {{ localError }}
           </div>
