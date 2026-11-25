@@ -181,6 +181,27 @@ const isActiveExtensionDashMux = computed(() =>
 const playableFallbackVideoUrl = computed(() => {
   if (!readyItem(currentItem.value)) return "";
   const defaultDecision = getDownloadTarget(currentItem.value, null, context);
+  if (
+    defaultDecision.kind === "file" &&
+    defaultDecision.variant.metadata?.has_audio !== false
+  ) {
+    return defaultDecision.url;
+  }
+  const audibleVariant = currentItem.value.variants.find(
+    (v) =>
+      readyVariant(v) &&
+      v.delivery.kind === "file" &&
+      !isAudioOnlyVariant(v) &&
+      v.metadata?.has_audio !== false,
+  );
+  if (audibleVariant) {
+    const decision = getDownloadTarget(
+      currentItem.value,
+      { variant_id: audibleVariant.id },
+      context,
+    );
+    if (decision.kind === "file") return decision.url;
+  }
   if (defaultDecision.kind === "file") return defaultDecision.url;
   const fileVariant = currentItem.value.variants.find(
     (v) => readyVariant(v) && v.delivery.kind === "file",
@@ -193,17 +214,51 @@ const playableFallbackVideoUrl = computed(() => {
   );
   return decision.kind === "file" ? decision.url : "";
 });
-const activeVideoUrl = computed(() =>
-  isYouTubeHelperBlocked.value
+const playableAudibleFallbackVideoUrl = computed(() => {
+  if (!readyItem(currentItem.value)) return "";
+  const defaultDecision = getDownloadTarget(currentItem.value, null, context);
+  if (
+    defaultDecision.kind === "file" &&
+    !isAudioOnlyVariant(defaultDecision.variant) &&
+    defaultDecision.variant.metadata?.has_audio !== false
+  ) {
+    return defaultDecision.url;
+  }
+  const audibleVariant = currentItem.value.variants.find(
+    (v) =>
+      readyVariant(v) &&
+      v.delivery.kind === "file" &&
+      !isAudioOnlyVariant(v) &&
+      v.metadata?.has_audio !== false,
+  );
+  if (!audibleVariant) return "";
+  const decision = getDownloadTarget(
+    currentItem.value,
+    { variant_id: audibleVariant.id },
+    context,
+  );
+  return decision.kind === "file" ? decision.url : "";
+});
+const activeVideoUrl = computed(() => {
+  if (isYouTubeHelperBlocked.value) return "";
+  if (
+    target.value?.kind === "file" &&
+    isActiveYouTubeSplitVideo.value &&
+    activeYouTubeMuxPair.value &&
+    playableAudibleFallbackVideoUrl.value
+  ) {
+    return playableAudibleFallbackVideoUrl.value;
+  }
+  if (target.value?.kind === "file") return target.value.url;
+  if (isActiveExtensionDashMux.value) return playableFallbackVideoUrl.value;
+  return "";
+});
+const copyVideoUrl = computed(() =>
+  isActiveExtensionDashMux.value || isYouTubeHelperBlocked.value
     ? ""
     : target.value?.kind === "file"
       ? target.value.url
-      : isActiveExtensionDashMux.value
-        ? playableFallbackVideoUrl.value
-        : "",
-);
-const copyVideoUrl = computed(() =>
-  isActiveExtensionDashMux.value ? "" : activeVideoUrl.value,
+      : "",
 );
 const metadata = computed(() => activeVariant.value?.metadata || {});
 const attachments = computed(() => props.resultData?.attachments || []);
@@ -315,6 +370,8 @@ watch(
     currentItem.value?.state,
     readyItem(currentItem.value) ? currentItem.value.variants.length : 0,
     canExtensionDashMux.value,
+    isYouTubeHelperReady.value,
+    youtubeMuxPairsByVariantId.value.size,
   ],
   () => {
     const item = currentItem.value;
@@ -573,6 +630,10 @@ const updatePlaybackStatus = (event, failed) => {
     return;
   }
   if (target.value?.kind !== "file") return;
+  if (activeVideoUrl.value !== target.value.url) {
+    playbackFailed.value = true;
+    return;
+  }
   attemptedSources.add(target.value.url);
   const next = target.value.routes.find((url) => !attemptedSources.has(url));
   if (next && attemptedSources.size < 3) {

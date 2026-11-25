@@ -591,7 +591,7 @@ test('finished elapsed time and average speed remain stable across later queries
 test('worker reports its build and separates total elapsed time from transfer speed', async t => {
   const h = harness(async () => media()); t.after(() => h.close());
   const ping = await h.send({ action: 'ping' });
-  assert.equal(ping.workerBuild, 'downloads-20261124.2');
+  assert.equal(ping.workerBuild, 'downloads-20261124.3');
   assert.equal(ping.capabilities.admission, true);
   await h.start(1, [], { startedAt: 995_000 });
   assert.equal((await h.query(1)).elapsed, 5);
@@ -1814,34 +1814,143 @@ test('P2: safe idle hot-swap protects both open bridge.html lease and closed-tab
   await installBgPromise;
   waitingOverBg.sw.state = 'installed';
   assert.equal(waitingOverBg.skipWaitingCalls, 0, 'must NOT skipWaiting while old SW is streaming a closed-tab background download');
-  // Once background download settles, old SW broadcasts worker-idle -> waiting SW re-verifies no bridge.html and calls skipWaiting!
+  // Once background download settles, old SW broadcasts worker-idle -> waiting SW re-verifies no busy peer/bridge and calls skipWaiting!
   await bgActiveWorker.send({ action: 'cancel', id: id(1), token });
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  waitingOverBg.tickAll(80);
   for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
   assert.equal(waitingOverBg.skipWaitingCalls, 1, 'waiting SW must skipWaiting once closed-tab background task finishes and no bridge.html is open');
 
-  // Case (c1): Open /downloads/bridge.html with old SW tasks.size === 0 (handshake or 4000ms grace period) -> NEVER skipWaiting!
+  // Case (c1): Open /downloads/bridge.html controlled by old SW (tasks.size === 0, handshake or 4000ms grace period) -> NEVER skipWaiting even though waiting SW sees [] for includeUncontrolled=false!
   const busBridgeIdle = createChannelBus();
   const activeBridgeIdle = lifecycleHarness({ bus: busBridgeIdle, controlledClients: bridgeClient, swState: 'activated' });
   t.after(() => activeBridgeIdle.close());
-  const waitingBridgeIdle = lifecycleHarness({ bus: busBridgeIdle, controlledClients: bridgeClient, swState: 'installing' });
+  const waitingBridgeIdle = lifecycleHarness({ bus: busBridgeIdle, controlledClients: noBridgeClients, swState: 'installing' });
   t.after(() => waitingBridgeIdle.close());
-  await waitingBridgeIdle.dispatchLifecycle('install');
-  assert.equal(waitingBridgeIdle.skipWaitingCalls, 0, 'must NOT skipWaiting while /downloads/bridge.html is mounted even when tasks.size === 0');
+  const installBridgeIdlePromise = waitingBridgeIdle.dispatchLifecycle('install');
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  waitingBridgeIdle.tickAll(80);
+  await installBridgeIdlePromise;
+  assert.equal(waitingBridgeIdle.skipWaitingCalls, 0, 'must NOT skipWaiting while active peer controls /downloads/bridge.html even when tasks.size === 0');
 
-  // Case (c2): Open /downloads/bridge.html with old SW tasks.size === 1 -> NEVER skipWaiting on install OR on worker-idle while bridge.html remains mounted!
+  // Case (c2): Open /downloads/bridge.html controlled by old SW with tasks.size === 1 -> NEVER skipWaiting on install, worker-idle, OR direct skip-waiting while bridge.html remains mounted!
   const busBridgeBusy = createChannelBus();
   const activeBridgeBusy = lifecycleHarness({ bus: busBridgeBusy, controlledClients: bridgeClient, swState: 'activated' });
   t.after(() => activeBridgeBusy.close());
   await activeBridgeBusy.send({ action: 'start', token, request: { id: id(2), filename: 'active-bridge.mp4', url: 'https://cdn.test/a.mp4' } });
-  const waitingBridgeBusy = lifecycleHarness({ bus: busBridgeBusy, controlledClients: bridgeClient, swState: 'installing' });
+  const waitingBridgeBusy = lifecycleHarness({ bus: busBridgeBusy, controlledClients: noBridgeClients, swState: 'installing' });
   t.after(() => waitingBridgeBusy.close());
-  await waitingBridgeBusy.dispatchLifecycle('install');
+  const installBridgeBusyPromise = waitingBridgeBusy.dispatchLifecycle('install');
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  waitingBridgeBusy.tickAll(80);
+  await installBridgeBusyPromise;
   waitingBridgeBusy.sw.state = 'installed';
   assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting when bridge.html is open and tasks.size === 1');
-  // Even after task finishes and broadcasts worker-idle, bridge.html is still in its 4000ms post-completion grace lease -> STILL must NOT skipWaiting!
+  // Even after task finishes, active peer still controls bridge.html in its 4000ms post-completion grace lease -> STILL must NOT skipWaiting!
   await activeBridgeBusy.send({ action: 'cancel', id: id(2), token });
   for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting on worker-idle while /downloads/bridge.html is still mounted in 4000ms grace period');
+  waitingBridgeBusy.tickAll(80);
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(waitingBridgeBusy.skipWaitingCalls, 0, 'must NOT skipWaiting on worker-idle while active peer still controls /downloads/bridge.html in 4000ms grace period');
+  // Even an explicit skip-waiting message must refuse while active peer still controls bridge.html!
+  const blockedSkipReply = await waitingBridgeBusy.send({ action: 'skip-waiting' });
+  assert.equal(blockedSkipReply.skipped, false, 'direct skip-waiting must NOT evict an active peer holding bridge.html');
+  assert.equal(waitingBridgeBusy.skipWaitingCalls, 0);
+});
+
+test('Issue #48 [P0-1]: worker uses includeUncontrolled=false for controlled-client check and honors authorized skip-waiting only when idle', async t => {
+  const events = new Map(), timers = new Map(), lifetime = [];
+  let nextTimer = 0, skipWaitingCalls = 0;
+  const matchAllOptions = [];
+  const sw = { state: 'installed' };
+  const clientsMap = new Map([
+    ['page', { id: 'page', url: origin + '/', postMessage() {} }],
+    ['evil', { id: 'evil', url: 'https://evil.example/', postMessage() {} }],
+  ]);
+  const context = vm.createContext({
+    self: {
+      location: new URL(origin),
+      serviceWorker: sw,
+      skipWaiting: async () => { skipWaitingCalls++; },
+      clients: {
+        get: async key => clientsMap.get(key),
+        matchAll: async opts => {
+          matchAllOptions.push(opts);
+          // Real browser returns [] for an installing/waiting worker when includeUncontrolled is false
+          // even if an uncontrolled orphan /downloads/bridge.html exists.
+          return opts?.includeUncontrolled ? [{ url: origin + '/downloads/bridge.html' }] : [];
+        },
+        claim: async () => {},
+      },
+      addEventListener: (key, handler) => events.set(key, handler),
+    },
+    fetch: async () => media(), URL, Response, Blob, ReadableStream, AbortController, DOMException, TextDecoder,
+    crypto: { randomUUID },
+    setTimeout(callback, delay) { const handle = ++nextTimer; timers.set(handle, { callback, delay }); return handle; },
+    clearTimeout: handle => timers.delete(handle),
+  });
+  vm.runInContext(source, context);
+  t.after(() => Promise.all(lifetime));
+
+  // 1. Install with uncontrolled orphan bridge.html must pass includeUncontrolled: false and call skipWaiting!
+  const installPromises = [];
+  events.get('install')({ waitUntil: p => installPromises.push(p) });
+  for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+  for (const [k, tm] of [...timers]) { if (tm.delay === 80) { timers.delete(k); tm.callback(); } }
+  await Promise.all(installPromises);
+  assert.ok(matchAllOptions.length >= 1);
+  assert.equal(matchAllOptions.every(opts => opts?.includeUncontrolled === false), true);
+  assert.equal(skipWaitingCalls, 1, 'uncontrolled orphan bridge.html must NOT block install skipWaiting');
+
+  // 2. Unauthorized origin or wrong protocol skip-waiting must be rejected without calling skipWaiting.
+  const evilReply = await new Promise(resolve => {
+    events.get('message')({
+      data: { protocol: 1, action: 'skip-waiting' },
+      source: { id: 'evil' },
+      ports: [{ postMessage: resolve }],
+      waitUntil: p => lifetime.push(p),
+    });
+  });
+  assert.match(evilReply.error, /下载通信校验失败/);
+  assert.equal(skipWaitingCalls, 1);
+
+  // 3. Fire-and-forget same-origin skip-waiting (no MessageChannel port, as sent by session.ts) triggers skipWaiting when idle!
+  events.get('message')({
+    data: { protocol: 1, action: 'skip-waiting' },
+    source: { id: 'page' },
+    ports: [],
+    waitUntil: p => lifetime.push(p),
+  });
+  await Promise.all(lifetime);
+  assert.equal(skipWaitingCalls, 2, 'fire-and-forget authorized skip-waiting must invoke self.skipWaiting()');
+
+  // 4. When tasks.size > 0, skip-waiting refuses to skip and reports skipped: false.
+  await new Promise(resolve => {
+    events.get('message')({
+      data: { protocol: 1, action: 'start', token, request: { id: id(9), filename: 'busy.mp4', url: 'https://cdn.test/busy.mp4' } },
+      source: { id: 'page' },
+      ports: [{ postMessage: resolve }],
+      waitUntil: p => lifetime.push(p),
+    });
+  });
+  const busySkipReply = await new Promise(resolve => {
+    events.get('message')({
+      data: { protocol: 1, action: 'skip-waiting' },
+      source: { id: 'page' },
+      ports: [{ postMessage: resolve }],
+      waitUntil: p => lifetime.push(p),
+    });
+  });
+  assert.equal(busySkipReply.skipped, false);
+  assert.equal(skipWaitingCalls, 2, 'must NOT skipWaiting while active tasks exist');
+  await new Promise(resolve => {
+    events.get('message')({
+      data: { protocol: 1, action: 'cancel', id: id(9), token },
+      source: { id: 'page' },
+      ports: [{ postMessage: resolve }],
+      waitUntil: p => lifetime.push(p),
+    });
+  });
 });
 
 test('P1-5: sourceUrl() hardens against private/reserved IPs, deformed IPv4, non-global IPv6, internal suffixes, and non-standard ports while preserving public sites, same-origin relay, and localhost test exemption', async t => {

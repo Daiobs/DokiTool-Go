@@ -239,7 +239,9 @@ export function createYouTubeDownloadController(deps: {
                   savePathLabel: formatYouTubeSavePathLabel(detail.mode),
                 }
               : {}),
-            statusText: `通过助手分块并发保存中（${detail.percent}%）...`,
+            statusText:
+              detail.statusText ||
+              `通过助手分块并发保存中（${detail.percent}%）...`,
           });
         },
       });
@@ -613,7 +615,9 @@ export function createYouTubeDownloadController(deps: {
                 savePathLabel: formatYouTubeSavePathLabel(detail.mode),
               }
             : {}),
-          statusText: `浏览器内无损合流保存中（${detail.percent}%）...`,
+          statusText:
+            detail.statusText ||
+            `浏览器内无损合流保存中（${detail.percent}%）...`,
         });
       },
     });

@@ -590,6 +590,7 @@
     "frontend/src/core/capabilityHub.ts",
     "frontend/src/core/extensionReleaseMeta.json",
     "frontend/src/core/media/cdnTransportHints.ts",
+    "frontend/src/core/media/extensionRoutes.ts",
     "frontend/src/core/media/index.ts",
     "frontend/src/core/media/layoutAndFilename.ts",
     "frontend/src/core/media/muxSpec.ts",

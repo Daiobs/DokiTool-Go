@@ -4,7 +4,7 @@ import { attachmentFormat, cleanFilename } from "./media-format.js";
 import { decodedLength } from "./decoded-length.js";
 import { readCandidate, validCandidate, reportTbvideo } from "./tbvideo.js";
 const PROTOCOL = 1;
-const BUILD = "downloads-20261124.2";
+const BUILD = "downloads-20261124.3";
 const INSTANCE = crypto.randomUUID();
 const store = createTaskStore();
 const MAX_ACTIVE = 2;
@@ -45,7 +45,7 @@ function isCurrentActiveWorker() {
 async function hasControlledDownloadClients() {
   if (typeof self.clients?.matchAll !== "function") return false;
   try {
-    const list = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const list = await self.clients.matchAll({ type: "window", includeUncontrolled: false });
     return list.some(client => {
       try {
         const u = new URL(client.url);
@@ -63,10 +63,10 @@ async function canSafelySkipWaiting() {
   if (tasks.size > 0 || queue.length > 0) return false;
   if (await hasControlledDownloadClients()) return false;
   if (!controlChannel) return true;
-  // No `/downloads/` bridge document is mounted, but an active worker may still
-  // be streaming a background attachment download after the tab closed.
-  // Probe live peers over BroadcastChannel for a short window; any awake worker
-  // still streaming a task replies immediately with activeTasks > 0.
+  // No `/downloads/` bridge document is controlled by this worker, but an active
+  // peer worker may still be streaming a background download or holding a
+  // controlled `/downloads/bridge.html` grace window. Probe awake peers over
+  // BroadcastChannel; any busy peer replies immediately.
   const hasBusyPeer = await new Promise(resolve => {
     const probeId = crypto.randomUUID();
     let settled = false;
@@ -80,7 +80,7 @@ async function canSafelySkipWaiting() {
     const onReply = event => {
       const data = event.data;
       if (!data || data.type !== "idle-reply" || data.probeId !== probeId || data.from === INSTANCE) return;
-      if (Number(data.activeTasks) > 0) {
+      if (Number(data.activeTasks) > 0 || data.hasBridge === true) {
         finish(true);
       }
     };
@@ -98,9 +98,14 @@ async function canSafelySkipWaiting() {
 
 function notifyIdleIfEmpty() {
   if (!controlChannel || tasks.size > 0 || queue.length > 0) return;
-  try {
-    controlChannel.postMessage({ type: "worker-idle", from: INSTANCE });
-  } catch {}
+  void (async () => {
+    if (tasks.size > 0 || queue.length > 0) return;
+    const hasBridge = await hasControlledDownloadClients();
+    if (hasBridge || tasks.size > 0 || queue.length > 0) return;
+    try {
+      controlChannel.postMessage({ type: "worker-idle", from: INSTANCE, hasBridge: false });
+    } catch {}
+  })();
 }
 
 controlChannel?.addEventListener("message", event => {
@@ -108,21 +113,25 @@ controlChannel?.addEventListener("message", event => {
   if (!data || data.from === INSTANCE) return;
   if (data.type === "idle-probe" && typeof data.probeId === "string") {
     if (isCurrentActiveWorker() || tasks.size > 0 || queue.length > 0) {
-      try {
-        controlChannel.postMessage({
-          type: "idle-reply",
-          probeId: data.probeId,
-          from: INSTANCE,
-          activeTasks: tasks.size + queue.length,
-        });
-      } catch {}
+      void (async () => {
+        const hasBridge = await hasControlledDownloadClients();
+        try {
+          controlChannel.postMessage({
+            type: "idle-reply",
+            probeId: data.probeId,
+            from: INSTANCE,
+            activeTasks: tasks.size + queue.length,
+            hasBridge,
+          });
+        } catch {}
+      })();
     }
     return;
   }
-  if (data.type === "worker-idle" && waitingToActivate && !isCurrentActiveWorker() && tasks.size === 0 && queue.length === 0) {
+  if (data.type === "worker-idle" && data.hasBridge !== true && waitingToActivate && !isCurrentActiveWorker() && tasks.size === 0 && queue.length === 0) {
     void (async () => {
       if (!waitingToActivate || isCurrentActiveWorker() || tasks.size > 0 || queue.length > 0) return;
-      if (await hasControlledDownloadClients()) return;
+      if (!(await canSafelySkipWaiting())) return;
       if (typeof self.skipWaiting === "function") {
         await self.skipWaiting();
       }
@@ -1062,13 +1071,22 @@ async function authorizedClient(event) {
 
 self.addEventListener("message", event => {
   const port = event.ports?.[0];
-  if (!port) return;
+  const message = event.data;
+  const isSkipWaitingCommand = message?.protocol === PROTOCOL && message?.action === "skip-waiting";
+  if (!port && !isSkipWaitingCommand) return;
   event.waitUntil((async () => {
     const client = await authorizedClient(event);
-    if (!client || event.data?.protocol !== PROTOCOL) { port.postMessage({ error: "下载通信校验失败" }); return; }
+    if (!client || message?.protocol !== PROTOCOL) { port?.postMessage({ error: "下载通信校验失败" }); return; }
     prune();
-    const message = event.data;
     try {
+      if (message.action === "skip-waiting") {
+        const canSkip = !isCurrentActiveWorker() && (await canSafelySkipWaiting());
+        if (canSkip && typeof self.skipWaiting === "function") {
+          await self.skipWaiting();
+        }
+        port?.postMessage({ protocol: PROTOCOL, skipped: canSkip, workerBuild: BUILD, workerInstance: INSTANCE });
+        return;
+      }
       if (message.action === "ping") { port.postMessage({ protocol: PROTOCOL, workerBuild: BUILD, workerInstance: INSTANCE, capabilities: { admission: true, recovery: true, tbvideo: true } }); return; }
       if (message.action === "start") {
         const request = message.request;

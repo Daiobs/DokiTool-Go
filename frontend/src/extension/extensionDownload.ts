@@ -36,6 +36,7 @@ import {
   buildCanonicalVariantDescriptor,
   compareCanonicalVariantDesc,
   inferDirectVideoExtension,
+  isPlaceholderPartTitle,
   videoCodecCompatibilityRank,
   type CanonicalVariantDescriptor,
 } from "../core/media";
@@ -1031,9 +1032,13 @@ export function buildEnqueueItemsForMedia(
       }
     }
     usedItemNumbers.add(itemNumber);
-    const distinctEpisodeTitle =
-      item.title?.trim() && item.title.trim() !== media.title?.trim()
+    const cleanEpisodeTitle =
+      item.title?.trim() && !isPlaceholderPartTitle(item.title)
         ? item.title.trim()
+        : undefined;
+    const distinctEpisodeTitle =
+      cleanEpisodeTitle && cleanEpisodeTitle !== media.title?.trim()
+        ? cleanEpisodeTitle
         : undefined;
     const singleItemStem =
       media.title?.trim() ||
@@ -1043,7 +1048,7 @@ export function buildEnqueueItemsForMedia(
         ? `${media.platform}_${media.content_id.trim()}`
         : media.platform || "download");
     const itemDisplayTitle = isMultiItemCollection
-      ? item.title?.trim() || rawWorkTitle
+      ? cleanEpisodeTitle || rawWorkTitle
       : singleItemStem;
     const fallbackUrl = item.source_url || media.source_url;
     const parseUrlForItem =
@@ -1673,6 +1678,9 @@ export interface CreateOffscreenDownloadExecutorOptions {
   mediabunnyImpl?: Record<string, unknown> | null;
   youtubeMuxConfig?: {
     chunkSize?: number;
+    audioChunkSize?: number;
+    initialChunkSize?: number;
+    progressThrottleMs?: number;
     videoConcurrency?: number;
     audioConcurrency?: number;
     maxRetries?: number;
@@ -1715,6 +1723,80 @@ export interface OffscreenDownloadExecutor {
   getActiveDynamicAllowedOrigins(): string[] | undefined;
   waitForIdle(): Promise<void>;
   dispose(): void;
+}
+
+export const SPEED_WINDOW_MS = 2500;
+export const SPEED_EWMA_TAU_MS = 1200;
+export const SPEED_STALE_ZERO_MS = 2500;
+
+/**
+ * Sliding 2.5s time-window + continuous-time EWMA (tau ≈ 1.2s) speed estimator.
+ * Holds smoothed speed across brief chunk transitions and only decays to 0
+ * when no new bytes arrive for >= 2500ms, eliminating sawtooth zero flicker.
+ */
+export function createSmoothedSpeedEstimator(options?: {
+  startedAt?: number;
+  windowMs?: number;
+  tauMs?: number;
+  staleZeroMs?: number;
+}) {
+  const windowMs = options?.windowMs ?? SPEED_WINDOW_MS;
+  const tauMs = options?.tauMs ?? SPEED_EWMA_TAU_MS;
+  const staleZeroMs = options?.staleZeroMs ?? SPEED_STALE_ZERO_MS;
+  const startAt = options?.startedAt ?? Date.now();
+  const samples: Array<{ t: number; bytes: number }> = [{ t: startAt, bytes: 0 }];
+  let lastProgressAt = startAt;
+  let lastBytes = 0;
+  let lastUpdateAt = startAt;
+  let ewmaSpeed = 0;
+  let hasSpeed = false;
+
+  return {
+    update(loadedBytes: number, now: number): number {
+      const bytes = Math.max(
+        lastBytes,
+        Number.isFinite(loadedBytes) && loadedBytes > 0 ? loadedBytes : 0,
+      );
+      if (bytes > lastBytes) {
+        const tail = samples[samples.length - 1];
+        if (tail && tail.t === now) {
+          tail.bytes = bytes;
+        } else {
+          samples.push({ t: now, bytes });
+        }
+        const cutoff = now - windowMs;
+        while (samples.length > 2 && samples[1].t <= cutoff) {
+          samples.shift();
+        }
+        const anchor = samples[0];
+        const spanSec = (now - anchor.t) / 1000;
+        if (spanSec >= 0.05) {
+          const windowRate = (bytes - anchor.bytes) / spanSec;
+          if (!hasSpeed) {
+            ewmaSpeed = windowRate;
+            hasSpeed = true;
+          } else {
+            const dtMs = Math.max(1, now - lastUpdateAt);
+            const alpha = 1 - Math.exp(-dtMs / tauMs);
+            ewmaSpeed += alpha * (windowRate - ewmaSpeed);
+          }
+        }
+        lastProgressAt = now;
+        lastBytes = bytes;
+        lastUpdateAt = now;
+      } else if (now - lastProgressAt >= staleZeroMs) {
+        ewmaSpeed = 0;
+        hasSpeed = false;
+        samples.length = 0;
+        samples.push({ t: now, bytes });
+        lastUpdateAt = now;
+      }
+      return Math.max(0, Math.round(ewmaSpeed));
+    },
+    current(): number {
+      return Math.max(0, Math.round(ewmaSpeed));
+    },
+  };
 }
 
 export function createOffscreenDownloadExecutor(
@@ -1817,10 +1899,8 @@ export function createOffscreenDownloadExecutor(
     defaultStatus: "downloading" | "muxing" | "saving" = "downloading",
   ) => {
     const startedAt = nowFn();
+    const speedEstimator = createSmoothedSpeedEstimator({ startedAt });
     let lastEmitAt = 0;
-    let lastSampleAt = startedAt;
-    let lastSampleBytes = 0;
-    let currentSpeed = 0;
 
     return (
       update: {
@@ -1837,12 +1917,7 @@ export function createOffscreenDownloadExecutor(
       if (!force && progressThrottleMs > 0 && now - lastEmitAt < progressThrottleMs) {
         return;
       }
-      const dt = (now - lastSampleAt) / 1000;
-      if (dt >= 0.05 && update.loaded >= lastSampleBytes) {
-        currentSpeed = Math.round((update.loaded - lastSampleBytes) / dt);
-        lastSampleAt = now;
-        lastSampleBytes = update.loaded;
-      }
+      const smoothedSpeed = speedEstimator.update(update.loaded, now);
       lastEmitAt = now;
       const computedPercent =
         update.percent !== undefined
@@ -1864,7 +1939,7 @@ export function createOffscreenDownloadExecutor(
             ? Math.max(0, update.speed)
             : update.status === "saving"
               ? 0
-              : Math.max(0, currentSpeed),
+              : smoothedSpeed,
       });
     };
   };
@@ -2717,13 +2792,18 @@ export function createOffscreenDownloadExecutor(
         sizeBytes: spec.sizeBytes,
         signal,
         onProgress(detail) {
-          reportProgress({
-            status: "downloading",
-            statusText: `YouTube 分块并发下载中（${detail.percent}%）...`,
-            loaded: detail.loaded,
-            total: detail.total,
-            percent: detail.percent,
-          });
+          reportProgress(
+            {
+              status: "downloading",
+              statusText:
+                detail.statusText ||
+                `YouTube 分块并发下载中（${detail.percent}%）...`,
+              loaded: detail.loaded,
+              total: detail.total,
+              percent: detail.percent,
+            },
+            Boolean(detail.statusText),
+          );
         },
       });
     } finally {
@@ -2761,13 +2841,18 @@ export function createOffscreenDownloadExecutor(
         outputContainer: mux.outputContainer,
         signal,
         onProgress(detail) {
-          reportProgress({
-            status: "muxing",
-            statusText: `YouTube 4K 无损合流中（${detail.percent}%）...`,
-            loaded: detail.loaded,
-            total: detail.total,
-            percent: detail.percent,
-          });
+          reportProgress(
+            {
+              status: "muxing",
+              statusText:
+                detail.statusText ||
+                `YouTube 4K 无损合流中（${detail.percent}%）...`,
+              loaded: detail.loaded,
+              total: detail.total,
+              percent: detail.percent,
+            },
+            Boolean(detail.statusText),
+          );
         },
       });
     } finally {

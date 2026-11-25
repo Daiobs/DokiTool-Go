@@ -23,7 +23,10 @@ export function computeOpfsCleanupDelayMs(byteLength) {
   );
 }
 
-export const DEFAULT_MUX_CHUNK_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_MUX_CHUNK_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_MUX_AUDIO_CHUNK_BYTES = 1 * 1024 * 1024;
+export const DEFAULT_MUX_INITIAL_CHUNK_BYTES = 512 * 1024;
+export const DEFAULT_MUX_PROGRESS_THROTTLE_MS = 200;
 export const DEFAULT_MUX_VIDEO_CONCURRENCY = 3;
 export const DEFAULT_MUX_AUDIO_CONCURRENCY = 2;
 export const DEFAULT_MUX_MAX_RETRIES = 3;
@@ -1635,7 +1638,18 @@ export function createUserscriptController(options = {}) {
           : "MP4 Video";
 
     const chunkSize =
-      positiveSafeInt(muxConfig.chunkSize) || DEFAULT_MUX_CHUNK_BYTES;
+      acceptExt === ".m4a"
+        ? positiveSafeInt(muxConfig.audioChunkSize) ||
+          (positiveSafeInt(muxConfig.chunkSize)
+            ? Math.min(positiveSafeInt(muxConfig.chunkSize), DEFAULT_MUX_AUDIO_CHUNK_BYTES)
+            : DEFAULT_MUX_AUDIO_CHUNK_BYTES)
+        : positiveSafeInt(muxConfig.chunkSize) || DEFAULT_MUX_CHUNK_BYTES;
+    const initialChunkSize =
+      positiveSafeInt(muxConfig.initialChunkSize) || DEFAULT_MUX_INITIAL_CHUNK_BYTES;
+    const progressThrottleMs =
+      Number.isFinite(muxConfig.progressThrottleMs) && muxConfig.progressThrottleMs >= 0
+        ? muxConfig.progressThrottleMs
+        : DEFAULT_MUX_PROGRESS_THROTTLE_MS;
     const concurrency =
       acceptExt === ".m4a"
         ? positiveSafeInt(muxConfig.audioConcurrency) ||
@@ -1698,10 +1712,21 @@ export function createUserscriptController(options = {}) {
         cancelState,
       });
 
-      const emitProgress = () => {
+      let lastReportedLoaded = 0;
+      let lastEmitAt = 0;
+      let currentStatusText = "";
+      const emitProgress = (force = false) => {
         if (!stream || cancelState.aborted) return;
+        const nowMs = now();
+        if (!force && progressThrottleMs > 0 && nowMs - lastEmitAt < progressThrottleMs) {
+          return;
+        }
         const total = stream.getKnownSize() || estSize;
-        const loaded = stream.getLoadedBytes();
+        const rawLoaded = stream.getLoadedBytes();
+        const boundedLoaded = total > 0 ? Math.min(total, rawLoaded) : rawLoaded;
+        const loaded = Math.max(lastReportedLoaded, boundedLoaded);
+        lastReportedLoaded = loaded;
+        lastEmitAt = nowMs;
         const percent =
           total > 0 ? Math.min(99, Math.round((loaded / total) * 100)) : 0;
         dispatchBridgeEvent(eventTarget, YOUTUBE_HELPER_PROGRESS_EVENT, {
@@ -1710,7 +1735,14 @@ export function createUserscriptController(options = {}) {
           total,
           percent,
           mode: saveTarget?.mode,
+          ...(currentStatusText ? { statusText: currentStatusText } : {}),
         });
+      };
+      const handleStatusNote = (note) => {
+        const nextNote = typeof note === "string" ? note : "";
+        if (nextNote === currentStatusText) return;
+        currentStatusText = nextNote;
+        emitProgress(true);
       };
 
       stream = createChunkedGooglevideoSource(
@@ -1718,6 +1750,7 @@ export function createUserscriptController(options = {}) {
         estSize,
         {
           chunkSize,
+          initialChunkSize,
           concurrency,
           maxRetries,
           maxCachedChunks: Math.max(2, concurrency + 1),
@@ -1727,6 +1760,7 @@ export function createUserscriptController(options = {}) {
         },
         cancelState,
         emitProgress,
+        handleStatusNote,
       );
 
       const totalBytes = await stream.ensureSize();
@@ -1841,7 +1875,7 @@ export function createUserscriptController(options = {}) {
     });
   }
 
-  function gmRequestRangeBuffer(reqUrl, timeoutMs, cancelState) {
+  function gmRequestRangeBuffer(reqUrl, timeoutMs, cancelState, onChunkProgress) {
     return new Promise((resolve, reject) => {
       if (cancelState.aborted) {
         reject(makeUserCancelledError());
@@ -1886,6 +1920,17 @@ export function createUserscriptController(options = {}) {
         responseType: "arraybuffer",
         anonymous: true,
         timeout: timeoutMs,
+        ...(typeof onChunkProgress === "function"
+          ? {
+              onprogress(ev) {
+                if (finished || cancelState.aborted) return;
+                const chunkLoaded = Number(ev?.loaded);
+                if (Number.isFinite(chunkLoaded) && chunkLoaded >= 0) {
+                  onChunkProgress(chunkLoaded);
+                }
+              },
+            }
+          : {}),
         onload(response) {
           finish(() => resolve(response));
         },
@@ -1919,6 +1964,7 @@ export function createUserscriptController(options = {}) {
     streamOpts,
     cancelState,
     onProgressTick,
+    onStatusNote,
   ) {
     const {
       chunkSize,
@@ -1929,13 +1975,35 @@ export function createUserscriptController(options = {}) {
       chunkTimeoutMs,
       CustomSourceCtor,
     } = streamOpts;
+    const firstChunkSize = Math.min(
+      chunkSize,
+      positiveSafeInt(streamOpts.initialChunkSize) || chunkSize,
+    );
+
+    const computeTotalChunks = (size) => {
+      if (size <= 0) return 0;
+      if (size <= firstChunkSize) return 1;
+      return 1 + Math.ceil((size - firstChunkSize) / chunkSize);
+    };
+    const chunkStartOffset = (chunkIdx) =>
+      chunkIdx <= 0 ? 0 : firstChunkSize + (chunkIdx - 1) * chunkSize;
+    const chunkEndOffset = (chunkIdx, size) => {
+      const start = chunkStartOffset(chunkIdx);
+      const span = chunkIdx === 0 ? firstChunkSize : chunkSize;
+      return Math.min(size - 1, start + span - 1);
+    };
+    const chunkIndexForOffset = (byteOffset) =>
+      byteOffset < firstChunkSize
+        ? 0
+        : 1 + Math.floor((byteOffset - firstChunkSize) / chunkSize);
 
     let activeBaseUrl = initialUrl.trim();
     let resolvedSize =
       positiveSafeInt(declaredSize) || extractUrlClen(activeBaseUrl);
-    let totalChunks = resolvedSize > 0 ? Math.ceil(resolvedSize / chunkSize) : 0;
+    let totalChunks = computeTotalChunks(resolvedSize);
     let loadedBytes = 0;
     const completedChunks = new Set();
+    const inFlightLoaded = new Map();
     const cache = new Map();
     const inFlight = new Map();
     const prefetchQueue = [];
@@ -1946,7 +2014,17 @@ export function createUserscriptController(options = {}) {
       if (metSec <= 0) return;
       const waitMs = Math.ceil((metSec + 4.5) * 1000 - now());
       if (waitMs > 0 && waitMs <= 15000) {
-        await abortableSleep(waitMs, cancelState);
+        if (waitMs > 300 && typeof onStatusNote === "function") {
+          const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
+          onStatusNote(`等待媒体节点就绪（约 ${waitSec} 秒）…`);
+        }
+        try {
+          await abortableSleep(waitMs, cancelState);
+        } finally {
+          if (waitMs > 300 && typeof onStatusNote === "function") {
+            onStatusNote("");
+          }
+        }
       }
     }
 
@@ -1983,7 +2061,7 @@ export function createUserscriptController(options = {}) {
     async function ensureSize() {
       if (cancelState.aborted) throw makeUserCancelledError();
       if (resolvedSize > 0) {
-        totalChunks = Math.ceil(resolvedSize / chunkSize);
+        totalChunks = computeTotalChunks(resolvedSize);
         return resolvedSize;
       }
       await ensureMetGate();
@@ -2008,90 +2086,104 @@ export function createUserscriptController(options = {}) {
         );
       }
       resolvedSize = parsed;
-      totalChunks = Math.ceil(resolvedSize / chunkSize);
+      totalChunks = computeTotalChunks(resolvedSize);
       return resolvedSize;
     }
 
     async function downloadSingleChunk(chunkIdx) {
       await ensureMetGate();
       const size = await ensureSize();
-      const start = chunkIdx * chunkSize;
-      const end = Math.min(size - 1, start + chunkSize - 1);
+      const start = chunkStartOffset(chunkIdx);
+      const end = chunkEndOffset(chunkIdx, size);
       const expectedLen = end - start + 1;
 
       let lastErr = null;
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        if (cancelState.aborted) throw makeUserCancelledError();
-        if (attempt > 0) {
-          await abortableSleep(
-            retryBaseDelayMs * Math.pow(2, attempt - 1),
-            cancelState,
-          );
-        }
-        const u = new URL(activeBaseUrl);
-        u.searchParams.set("range", `${start}-${end}`);
-        u.searchParams.set("rn", String(++muxRnCounter));
-        let resp;
-        try {
-          resp = await gmRequestRangeBuffer(
-            u.toString(),
-            chunkTimeoutMs,
-            cancelState,
-          );
-        } catch (err) {
-          if (
-            cancelState.aborted ||
-            err?.code === "USER_CANCELLED" ||
-            err?.code === "INVALID_MEDIA_URL"
-          ) {
-            throw err;
+      try {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          if (cancelState.aborted) throw makeUserCancelledError();
+          inFlightLoaded.delete(chunkIdx);
+          if (attempt > 0) {
+            await abortableSleep(
+              retryBaseDelayMs * Math.pow(2, attempt - 1),
+              cancelState,
+            );
           }
-          lastErr = err;
-          if (attempt === maxRetries) throw err;
-          continue;
+          const u = new URL(activeBaseUrl);
+          u.searchParams.set("range", `${start}-${end}`);
+          u.searchParams.set("rn", String(++muxRnCounter));
+          let resp;
+          try {
+            resp = await gmRequestRangeBuffer(
+              u.toString(),
+              chunkTimeoutMs,
+              cancelState,
+              (chunkLoaded) => {
+                if (completedChunks.has(chunkIdx)) return;
+                inFlightLoaded.set(chunkIdx, Math.min(expectedLen, chunkLoaded));
+                onProgressTick(false);
+              },
+            );
+          } catch (err) {
+            inFlightLoaded.delete(chunkIdx);
+            if (
+              cancelState.aborted ||
+              err?.code === "USER_CANCELLED" ||
+              err?.code === "INVALID_MEDIA_URL"
+            ) {
+              throw err;
+            }
+            lastErr = err;
+            if (attempt === maxRetries) throw err;
+            continue;
+          }
+          if (resp?.finalUrl) {
+            adoptFinalUrl(resp.finalUrl);
+          }
+          if (resp?.status !== 200 && resp?.status !== 206) {
+            inFlightLoaded.delete(chunkIdx);
+            lastErr = makeCodedError(
+              "MUX_CHUNK_HTTP_ERROR",
+              `分块 #${chunkIdx} 请求失败（HTTP ${resp?.status ?? 0}）`,
+            );
+            if (attempt === maxRetries) throw lastErr;
+            continue;
+          }
+          const rawBuf = resp?.response;
+          const u8 =
+            rawBuf instanceof Uint8Array
+              ? rawBuf
+              : rawBuf instanceof ArrayBuffer
+                ? new Uint8Array(rawBuf)
+                : ArrayBuffer.isView(rawBuf)
+                  ? new Uint8Array(
+                      rawBuf.buffer,
+                      rawBuf.byteOffset,
+                      rawBuf.byteLength,
+                    )
+                  : null;
+          const gotLen = u8 ? u8.byteLength : 0;
+          if (gotLen !== expectedLen) {
+            inFlightLoaded.delete(chunkIdx);
+            lastErr = makeCodedError(
+              "MUX_CHUNK_TRUNCATED",
+              `分块 #${chunkIdx} 字节不完整（收到 ${gotLen}，预期 ${expectedLen}）`,
+            );
+            if (attempt === maxRetries) throw lastErr;
+            continue;
+          }
+          inFlightLoaded.delete(chunkIdx);
+          if (!completedChunks.has(chunkIdx)) {
+            completedChunks.add(chunkIdx);
+            loadedBytes += gotLen;
+            onProgressTick(true);
+          }
+          touchCache(chunkIdx, u8);
+          return u8;
         }
-        if (resp?.finalUrl) {
-          adoptFinalUrl(resp.finalUrl);
-        }
-        if (resp?.status !== 200 && resp?.status !== 206) {
-          lastErr = makeCodedError(
-            "MUX_CHUNK_HTTP_ERROR",
-            `分块 #${chunkIdx} 请求失败（HTTP ${resp?.status ?? 0}）`,
-          );
-          if (attempt === maxRetries) throw lastErr;
-          continue;
-        }
-        const rawBuf = resp?.response;
-        const u8 =
-          rawBuf instanceof Uint8Array
-            ? rawBuf
-            : rawBuf instanceof ArrayBuffer
-              ? new Uint8Array(rawBuf)
-              : ArrayBuffer.isView(rawBuf)
-                ? new Uint8Array(
-                    rawBuf.buffer,
-                    rawBuf.byteOffset,
-                    rawBuf.byteLength,
-                  )
-                : null;
-        const gotLen = u8 ? u8.byteLength : 0;
-        if (gotLen !== expectedLen) {
-          lastErr = makeCodedError(
-            "MUX_CHUNK_TRUNCATED",
-            `分块 #${chunkIdx} 字节不完整（收到 ${gotLen}，预期 ${expectedLen}）`,
-          );
-          if (attempt === maxRetries) throw lastErr;
-          continue;
-        }
-        if (!completedChunks.has(chunkIdx)) {
-          completedChunks.add(chunkIdx);
-          loadedBytes += gotLen;
-          onProgressTick();
-        }
-        touchCache(chunkIdx, u8);
-        return u8;
+        throw lastErr || new Error(`分块 #${chunkIdx} 重试耗尽`);
+      } finally {
+        inFlightLoaded.delete(chunkIdx);
       }
-      throw lastErr || new Error(`分块 #${chunkIdx} 重试耗尽`);
     }
 
     function getChunk(chunkIdx) {
@@ -2155,13 +2247,13 @@ export function createUserscriptController(options = {}) {
               const len = clampedEnd - start;
               if (len <= 0) return new Uint8Array(0);
 
-              const firstChunk = Math.floor(start / chunkSize);
-              const lastChunk = Math.floor((clampedEnd - 1) / chunkSize);
+              const firstChunk = chunkIndexForOffset(start);
+              const lastChunk = chunkIndexForOffset(clampedEnd - 1);
 
               if (firstChunk === lastChunk) {
                 const chunkBytes = await getChunk(firstChunk);
                 schedulePrefetchFrom(lastChunk + 1);
-                const offset = start - firstChunk * chunkSize;
+                const offset = start - chunkStartOffset(firstChunk);
                 return chunkBytes.slice(offset, offset + len);
               }
 
@@ -2176,7 +2268,7 @@ export function createUserscriptController(options = {}) {
               for (let i = 0; i < chunks.length; i++) {
                 const c = firstChunk + i;
                 const chunkBytes = chunks[i];
-                const chunkStart = c * chunkSize;
+                const chunkStart = chunkStartOffset(c);
                 const sliceStart = Math.max(0, start - chunkStart);
                 const sliceEnd = Math.min(
                   chunkBytes.byteLength,
@@ -2201,9 +2293,19 @@ export function createUserscriptController(options = {}) {
         cache.delete(idx);
       },
       getKnownSize: () => resolvedSize,
-      getLoadedBytes: () => loadedBytes,
+      getLoadedBytes: () => {
+        let activeBytes = 0;
+        for (const [idx, val] of inFlightLoaded.entries()) {
+          if (!completedChunks.has(idx)) {
+            activeBytes += val;
+          }
+        }
+        const total = loadedBytes + activeBytes;
+        return resolvedSize > 0 ? Math.min(resolvedSize, total) : total;
+      },
       clear: () => {
         prefetchQueue.length = 0;
+        inFlightLoaded.clear();
         cache.clear();
       },
     };
@@ -2290,6 +2392,17 @@ export function createUserscriptController(options = {}) {
     }
 
     const chunkSize = positiveSafeInt(muxConfig.chunkSize) || DEFAULT_MUX_CHUNK_BYTES;
+    const audioChunkSize =
+      positiveSafeInt(muxConfig.audioChunkSize) ||
+      (positiveSafeInt(muxConfig.chunkSize)
+        ? Math.min(chunkSize, DEFAULT_MUX_AUDIO_CHUNK_BYTES)
+        : DEFAULT_MUX_AUDIO_CHUNK_BYTES);
+    const initialChunkSize =
+      positiveSafeInt(muxConfig.initialChunkSize) || DEFAULT_MUX_INITIAL_CHUNK_BYTES;
+    const progressThrottleMs =
+      Number.isFinite(muxConfig.progressThrottleMs) && muxConfig.progressThrottleMs >= 0
+        ? muxConfig.progressThrottleMs
+        : DEFAULT_MUX_PROGRESS_THROTTLE_MS;
     const videoConcurrency =
       positiveSafeInt(muxConfig.videoConcurrency) ||
       DEFAULT_MUX_VIDEO_CONCURRENCY;
@@ -2371,12 +2484,23 @@ export function createUserscriptController(options = {}) {
         );
       }
 
-      const emitProgress = () => {
+      let lastReportedLoaded = 0;
+      let lastEmitAt = 0;
+      let currentStatusText = "";
+      const emitProgress = (force = false) => {
         if (!vStream || !aStream || cancelState.aborted) return;
+        const nowMs = now();
+        if (!force && progressThrottleMs > 0 && nowMs - lastEmitAt < progressThrottleMs) {
+          return;
+        }
         const total =
           (vStream.getKnownSize() || estVideo) +
           (aStream.getKnownSize() || estAudio);
-        const loaded = vStream.getLoadedBytes() + aStream.getLoadedBytes();
+        const rawLoaded = vStream.getLoadedBytes() + aStream.getLoadedBytes();
+        const boundedLoaded = total > 0 ? Math.min(total, rawLoaded) : rawLoaded;
+        const loaded = Math.max(lastReportedLoaded, boundedLoaded);
+        lastReportedLoaded = loaded;
+        lastEmitAt = nowMs;
         const percent =
           total > 0 ? Math.min(99, Math.round((loaded / total) * 100)) : 0;
         dispatchBridgeEvent(eventTarget, YOUTUBE_HELPER_PROGRESS_EVENT, {
@@ -2385,7 +2509,14 @@ export function createUserscriptController(options = {}) {
           total,
           percent,
           mode: saveTarget?.mode,
+          ...(currentStatusText ? { statusText: currentStatusText } : {}),
         });
+      };
+      const handleStatusNote = (note) => {
+        const nextNote = typeof note === "string" ? note : "";
+        if (nextNote === currentStatusText) return;
+        currentStatusText = nextNote;
+        emitProgress(true);
       };
 
       vStream = createChunkedGooglevideoSource(
@@ -2393,7 +2524,25 @@ export function createUserscriptController(options = {}) {
         estVideo,
         {
           chunkSize,
+          initialChunkSize,
           concurrency: videoConcurrency,
+          maxRetries,
+          maxCachedChunks: 4,
+          retryBaseDelayMs,
+          chunkTimeoutMs,
+          CustomSourceCtor: mediabunny.CustomSource,
+        },
+        cancelState,
+        emitProgress,
+        handleStatusNote,
+      );
+      aStream = createChunkedGooglevideoSource(
+        audioUrl,
+        estAudio,
+        {
+          chunkSize: audioChunkSize,
+          initialChunkSize,
+          concurrency: audioConcurrency,
           maxRetries,
           maxCachedChunks: 3,
           retryBaseDelayMs,
@@ -2402,21 +2551,7 @@ export function createUserscriptController(options = {}) {
         },
         cancelState,
         emitProgress,
-      );
-      aStream = createChunkedGooglevideoSource(
-        audioUrl,
-        estAudio,
-        {
-          chunkSize,
-          concurrency: audioConcurrency,
-          maxRetries,
-          maxCachedChunks: 2,
-          retryBaseDelayMs,
-          chunkTimeoutMs,
-          CustomSourceCtor: mediabunny.CustomSource,
-        },
-        cancelState,
-        emitProgress,
+        handleStatusNote,
       );
 
       const [resolvedVSize, resolvedASize] = await Promise.all([

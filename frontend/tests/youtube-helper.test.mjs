@@ -9,6 +9,10 @@ import { createSSRApp, createRenderer, h, markRaw, nextTick, reactive, ref } fro
 import { renderToString } from "vue/server-renderer";
 
 import {
+  DEFAULT_MUX_AUDIO_CHUNK_BYTES,
+  DEFAULT_MUX_CHUNK_BYTES,
+  DEFAULT_MUX_INITIAL_CHUNK_BYTES,
+  DEFAULT_MUX_PROGRESS_THROTTLE_MS,
   DEFAULT_OPFS_CLEANUP_DELAY_MS,
   MAX_OPFS_CLEANUP_DELAY_MS,
   MIN_YOUTUBE_HELPER_VERSION,
@@ -2798,17 +2802,25 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       ]);
       assert.equal(env.store.resultData.extra.youtube_helper.status, "ready");
 
-      // 1. Default 360p (itag=18) -> slimmed top status capsule without full-row .rs-yt-helper-notice or 分开保存
-      const html360 = await renderResultHtml(env.store, env.selection);
+      // 1. [P1-2] Helper ready auto-upgrades default selection to highest mux-capable 1080p60 (v-299)
+      //    while keeping inline <video> preview bound to audible 360p (itag=18)
+      const htmlAutoHigh = await renderResultHtml(env.store, env.selection);
       assert.ok(
-        html360.includes(
+        htmlAutoHigh.includes(
           `助手 v${YOUTUBE_HELPER_VERSION} 已就绪 · 自动合成原声`,
         ),
       );
-      assert.ok(!html360.includes("rs-yt-helper-notice"));
-      assert.ok(!html360.includes("rs-backup-split-actions"));
-      assert.ok(!html360.includes("受 2 倍码率限速"));
-      assert.ok(!html360.includes("分开保存"));
+      assert.ok(!htmlAutoHigh.includes("rs-yt-helper-notice"));
+      assert.ok(!htmlAutoHigh.includes("rs-backup-split-actions"));
+      assert.ok(!htmlAutoHigh.includes("受 2 倍码率限速"));
+      assert.ok(!htmlAutoHigh.includes("分开保存"));
+      assert.ok(htmlAutoHigh.includes("data-youtube-mux-save"));
+      assert.ok(htmlAutoHigh.includes("下载 1080p 有声视频"));
+      assert.ok(!htmlAutoHigh.includes("data-youtube-separate-save"));
+
+      // Explicit switch to 360p (itag=18) still allows direct browser attachment download in userscript mode
+      env.selection.choose({ variant_id: "v-18", source_id: "s-18" });
+      const html360 = await renderResultHtml(env.store, env.selection, false);
       assert.ok(html360.includes("下载视频"));
       assert.ok(!html360.includes("data-youtube-separate-save"));
 
@@ -5077,6 +5089,129 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
       assert.deepEqual(readyView.musicDownloads, ["att-bgm-1"]);
     } finally {
       readyView.app.unmount();
+    }
+  });
+
+  test("Issue #48 [P0-2] Spec B.2: 2 MiB/1 MiB/512 KiB chunk geometry, met-gate waiting statusText, monotonic inFlightLoaded progress on retry, and 200ms throttle", async () => {
+    assert.equal(DEFAULT_MUX_CHUNK_BYTES, 2 * 1024 * 1024);
+    assert.equal(DEFAULT_MUX_AUDIO_CHUNK_BYTES, 1 * 1024 * 1024);
+    assert.equal(DEFAULT_MUX_INITIAL_CHUNK_BYTES, 512 * 1024);
+    assert.equal(DEFAULT_MUX_PROGRESS_THROTTLE_MS, 200);
+
+    // Build deterministic byte stream spanning chunk 0 (512B), chunk 1 (2048B), chunk 2 (2048B), chunk 3 (392B) = 5000B
+    const totalBytes = 5000;
+    const expectedBytes = new Uint8Array(totalBytes);
+    for (let i = 0; i < totalBytes; i++) expectedBytes[i] = (i * 31 + 7) & 0xff;
+
+    let fakeNow = 10_000;
+    const metSec = (fakeNow - 1500) / 1000; // met + 4.5s -> waitMs = 3000ms (> 300ms)
+    const testUrl = `https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&clen=${totalBytes}&met=${metSec.toFixed(2)}`;
+    const observedRanges = [];
+    let chunk1Attempts = 0;
+    let savedBuffer = null;
+
+    const eventTarget = new EventTarget();
+    const progressEvents = [];
+    eventTarget.addEventListener("dokitool:youtube-helper:progress", (ev) => {
+      const detail = typeof ev.detail === "string" ? JSON.parse(ev.detail) : ev.detail;
+      progressEvents.push(detail);
+    });
+
+    const controller = createUserscriptController({
+      eventTarget,
+      now: () => fakeNow,
+      opfsStorage: null,
+      saveBuffer(buf) {
+        savedBuffer = new Uint8Array(buf);
+      },
+      muxConfig: {
+        chunkSize: 2048,
+        initialChunkSize: 512,
+        videoConcurrency: 1,
+        maxRetries: 1,
+        retryBaseDelayMs: 1,
+        progressThrottleMs: 200,
+      },
+      gmXmlhttpRequest(details) {
+        const u = new URL(details.url);
+        const range = u.searchParams.get("range") || "";
+        observedRanges.push(range);
+        const [startStr, endStr] = range.split("-");
+        const start = Number(startStr);
+        const end = Number(endStr);
+        const slice = expectedBytes.slice(start, end + 1);
+
+        queueMicrotask(() => {
+          // Simulate chunk 1 failing halfway on first attempt to verify monotonic progress clamp!
+          if (start === 512 && chunk1Attempts === 0) {
+            chunk1Attempts++;
+            fakeNow += 250;
+            details.onprogress?.({ loaded: 1200, total: slice.byteLength, lengthComputable: true });
+            details.onerror?.(new Error("transient chunk drop"));
+            return;
+          }
+          // Simulate 2 incremental in-flight ticks before chunk completion
+          fakeNow += 250;
+          details.onprogress?.({ loaded: Math.floor(slice.byteLength / 2), total: slice.byteLength, lengthComputable: true });
+          // Within 200ms throttle window -> should be coalesced
+          fakeNow += 50;
+          details.onprogress?.({ loaded: Math.floor(slice.byteLength * 0.75), total: slice.byteLength, lengthComputable: true });
+          fakeNow += 250;
+          details.onload?.({
+            status: 206,
+            statusText: "Partial Content",
+            finalUrl: details.url,
+            responseHeaders: `content-range: bytes ${start}-${end}/${totalBytes}`,
+            response: slice.buffer,
+            responseText: "",
+          });
+        });
+        return { abort() {} };
+      },
+    });
+    const unmount = controller.mount();
+    try {
+      // Advance clock right as met-gate sleep starts so abortableSleep finishes fast? Note: setTimeout uses real timers,
+      // so test ensureMetGate with waitMs=350ms (triggers >300ms statusText cleanly in ~350ms!).
+      const fastMetSec = (fakeNow - 4150) / 1000; // met + 4.5s - fakeNow = 350ms
+      const fastUrl = `https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&clen=${totalBytes}&met=${fastMetSec.toFixed(3)}`;
+      const res = await sendHelperRequest(
+        "download",
+        { url: fastUrl, filename: "smooth_test.mp4", size: totalBytes },
+        { eventTarget, timeoutMs: 10_000 },
+      );
+      assert.equal(res.filename, "smooth_test.mp4");
+      assert.ok(savedBuffer, "must produce exact saved output buffer");
+      assert.deepEqual(savedBuffer, expectedBytes, "chunk 0 (512B) + 2048B chunks must reassemble byte-for-byte");
+
+      // Exact chunk range geometry: 0-511, 512-2559 (retried), 2560-4607, 4608-4999
+      assert.equal(observedRanges[0], "0-511", "chunk 0 must use fast 512B initialChunkSize");
+      assert.ok(observedRanges.includes("512-2559"));
+      assert.ok(observedRanges.includes("2560-4607"));
+      assert.ok(observedRanges.includes("4608-4999"));
+
+      // Met-gate waiting statusText emitted before sleep
+      assert.ok(
+        progressEvents.some((e) => typeof e.statusText === "string" && e.statusText.includes("等待媒体节点就绪")),
+        "ensureMetGate (>300ms) must emit waiting statusText immediately",
+      );
+
+      // In-flight incremental progress emitted AND strictly monotonic despite chunk 1 retry
+      assert.ok(progressEvents.length >= 6, `expected incremental progress ticks, got ${progressEvents.length}`);
+      for (let i = 1; i < progressEvents.length; i++) {
+        assert.ok(
+          progressEvents[i].loaded >= progressEvents[i - 1].loaded,
+          `loaded bytes must remain monotonic across chunk retries (idx=${i}: ${progressEvents[i].loaded} < ${progressEvents[i - 1].loaded})`,
+        );
+      }
+      // Verify at least one in-flight intermediate loaded value appeared (not just chunk-end boundaries)
+      assert.ok(
+        progressEvents.some((e) => e.loaded > 0 && e.loaded < 512),
+        "must report in-flight progress before chunk 0 completes",
+      );
+      void testUrl;
+    } finally {
+      unmount();
     }
   });
 });

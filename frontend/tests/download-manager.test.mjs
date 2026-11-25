@@ -148,3 +148,28 @@ test('cancellation never borrows a failure or an uncertain snapshot diagnostic',
     assert.equal(states.at(-1).error, undefined);
   }
 });
+
+test('Issue #48 [P0-1]: onStreamingUnavailable delegates to extension when handled and falls back to Blob otherwise', async () => {
+  const { manager: m1, calls: c1 } = harness({
+    downloadStreaming: async () => { throw new StreamingUnavailableError('下载服务激活超时'); },
+  });
+  let delegatedCalls = 0;
+  const res1 = await m1.run(request(), new AbortController().signal, () => {}, {
+    async onStreamingUnavailable() {
+      delegatedCalls++;
+      return true;
+    },
+  });
+  assert.equal(delegatedCalls, 1);
+  assert.equal(res1.status, 'handed-off');
+  assert.deepEqual(c1, ['probe'], 'must not invoke downloadBlob when external delegation handled it');
+
+  const { manager: m2, calls: c2 } = harness({
+    downloadStreaming: async () => { throw new StreamingUnavailableError('下载服务激活超时'); },
+  });
+  const res2 = await m2.run(request(), new AbortController().signal, () => {}, {
+    async onStreamingUnavailable() { return false; },
+  });
+  assert.equal(res2.transport, 'browser_blob');
+  assert.deepEqual(c2, ['probe', 'blob'], 'must fall back to downloadBlob when external delegation declined');
+});

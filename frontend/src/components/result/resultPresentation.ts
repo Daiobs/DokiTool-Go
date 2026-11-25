@@ -66,6 +66,7 @@ export function buildAllQualityOptions(
       ? resolveWhitelistedExtensionMuxSpec(variant, context)
       : null;
     const extensionMux = Boolean(allowExtensionDashMux && dashMux);
+    const clientSplitMux = Boolean(variant?.id && muxPairs?.has(variant.id));
     const isActive = extensionMux
       ? active
       : active &&
@@ -82,6 +83,7 @@ export function buildAllQualityOptions(
       downloadTarget,
       dashMux,
       extensionMux,
+      clientSplitMux,
       downloadable,
       capabilities: readyVariant(variant)
         ? requiredCapabilities(variant.delivery)

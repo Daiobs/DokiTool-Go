@@ -510,6 +510,7 @@ export interface WebExtTaskStatusData {
   taskId: string;
   status: ExtensionTaskStatus;
   phase: WebExtTaskPhase;
+  statusText?: string;
   progress: number;
   loadedBytes: number;
   totalBytes: number;

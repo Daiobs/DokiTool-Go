@@ -1045,3 +1045,126 @@ test('refresh preserves unconfirmed cancellation intent and reissues cancel with
   assert.equal(observed.at(-1).status, 'cancelled'); assert.equal(observed.at(-1).observation, undefined);
   assert.equal(h.api.hasStreamingTask(request.id), false); assert.equal(h.attachments.length, 0);
 });
+
+test('Issue #48 [P0-1]: orphan waiting worker is nudged with skip-waiting and activates immediately', async t => {
+  const h = await harness(t, message =>
+    message.action === 'ping' ? { protocol: 1, workerBuild: build }
+      : { snapshot: state(), downloadUrl: `/downloads/file/${request.id}/${message.token}` });
+  const waitingMessages = [];
+  const waitingListeners = new Set();
+  const waitingWorker = {
+    scriptURL: origin + '/downloads/worker.js',
+    state: 'installed',
+    addEventListener(type, fn) { if (type === 'statechange') waitingListeners.add(fn); },
+    removeEventListener(type, fn) { if (type === 'statechange') waitingListeners.delete(fn); },
+    postMessage(msg) {
+      waitingMessages.push(msg);
+      if (msg?.protocol === 1 && msg?.action === 'skip-waiting') {
+        queueMicrotask(() => {
+          waitingWorker.state = 'activated';
+          h.registration.waiting = null;
+          h.registration.active = h.worker;
+          for (const fn of [...waitingListeners]) fn();
+        });
+      }
+    },
+  };
+  h.registration.active = null;
+  h.registration.waiting = waitingWorker;
+
+  const task = h.api.downloadStreaming(request, new AbortController().signal, () => {});
+  await flush();
+  assert.deepEqual(waitingMessages, [{ protocol: 1, action: 'skip-waiting' }]);
+  assert.equal(h.messages.filter(m => m.action === 'start').length, 1);
+  h.update(state('completed'));
+  assert.equal((await task).status, 'completed');
+});
+
+test('Issue #48 [P0-1]: unresponsive waiting worker self-heals via single unregister + re-register, and double timeout throws StreamingUnavailableError', async t => {
+  // 1. Stuck old waiting worker ignores skip-waiting -> 2500ms timeout triggers unregister + register -> activates cleanly!
+  const h = await harness(t, message =>
+    message.action === 'ping' ? { protocol: 1, workerBuild: build }
+      : { snapshot: state(), downloadUrl: `/downloads/file/${request.id}/${message.token}` });
+  let unregisterCalls = 0;
+  let registerCalls = 0;
+  const stuckWaiting = {
+    scriptURL: origin + '/downloads/worker.js',
+    state: 'installed',
+    addEventListener() {},
+    removeEventListener() {},
+    postMessage() {},
+  };
+  const stuckReg = {
+    active: null,
+    installing: null,
+    waiting: stuckWaiting,
+    scope: origin + '/downloads/',
+    unregister: async () => { unregisterCalls++; return true; },
+    update: async () => {},
+  };
+  const freshReg = {
+    active: h.worker,
+    installing: null,
+    waiting: null,
+    scope: origin + '/downloads/',
+    unregister: async () => true,
+    update: async () => {},
+  };
+  const origSw = globalThis.navigator.serviceWorker;
+  globalThis.navigator.serviceWorker = {
+    ...origSw,
+    getRegistration: async () => stuckReg,
+    register: async () => {
+      registerCalls++;
+      h.registration.active = h.worker;
+      return freshReg;
+    },
+  };
+  const origLoadBridge = h.loadBridge;
+  // Ensure auto-load bridge gets freshReg.active as controller
+  h.registration.active = h.worker;
+  const task = h.api.downloadStreaming(request, new AbortController().signal, () => {});
+  await flush();
+  assert.equal(unregisterCalls, 0);
+  h.tick(2500);
+  await flush();
+  assert.equal(unregisterCalls, 1, 'must unregister deadlocked waiting registration once');
+  assert.equal(registerCalls, 1, 'must re-register worker once after unregister');
+  assert.equal(h.messages.filter(m => m.action === 'start').length, 1);
+  h.update(state('completed'));
+  assert.equal((await task).status, 'completed');
+  void origLoadBridge;
+
+  // 2. If re-registered worker ALSO fails to activate -> throws StreamingUnavailableError (permitting Blob/extension fallback)
+  let unregisterCalls2 = 0;
+  let registerCalls2 = 0;
+  const stuckAgain = {
+    active: null,
+    installing: null,
+    waiting: stuckWaiting,
+    scope: origin + '/downloads/',
+    unregister: async () => { unregisterCalls2++; return true; },
+    update: async () => {},
+  };
+  globalThis.navigator.serviceWorker = {
+    ...origSw,
+    getRegistration: async () => stuckAgain,
+    register: async () => { registerCalls2++; return stuckAgain; },
+  };
+  const failedTask = h.api.downloadStreaming(
+    { ...request, id: 'task0000000000099' },
+    new AbortController().signal,
+    () => {},
+  );
+  const rejected = assert.rejects(
+    failedTask,
+    error => error.name === 'StreamingUnavailableError' && error.safeToFallback === true,
+  );
+  await flush();
+  h.tick(2500);
+  await flush();
+  h.tick(8000);
+  await rejected;
+  assert.equal(unregisterCalls2, 1, 'must unregister at most once');
+  assert.equal(registerCalls2, 1, 'must re-register at most once');
+});

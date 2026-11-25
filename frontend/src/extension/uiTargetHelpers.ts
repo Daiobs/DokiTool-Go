@@ -52,6 +52,7 @@ import {
   compareCanonicalVariantDesc,
   hasMultiCollectionGroups,
   inferDirectVideoExtension,
+  isPlaceholderPartTitle,
   isTbvideoVideoItem,
   resolvePreferredMediaTitle,
   sortVariantsCanonical,
@@ -2101,6 +2102,7 @@ export function resolveItemBaseName(
 ): string {
   return resolvePreferredMediaTitle({
     isSingleItem: classifyMediaLayout(media) === "single",
+    itemCount: media.items.length,
     workTitle: media.title,
     itemTitle: item?.title,
     authorName: media.author?.name,
@@ -2610,7 +2612,9 @@ export function buildChecklistSubfolderEnqueueItems(params: {
     const episodeStem =
       item.type === "image"
         ? undefined
-        : item.title?.trim() && item.title.trim() !== subfolder
+        : item.title?.trim() &&
+            !isPlaceholderPartTitle(item.title) &&
+            item.title.trim() !== subfolder
           ? item.title.trim()
           : undefined;
 

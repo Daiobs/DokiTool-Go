@@ -516,11 +516,13 @@ export function shouldAutoUpgradeDefaultVariant(
     variant: Variant;
     downloadable?: boolean;
     extensionMux?: boolean;
+    clientSplitMux?: boolean;
   } | null,
   bestOption: {
     variant: Variant;
     downloadable: boolean;
     extensionMux?: boolean;
+    clientSplitMux?: boolean;
   } | null,
 ): boolean {
   if (!defaultOption || !bestOption || !bestOption.downloadable) return false;
@@ -528,6 +530,18 @@ export function shouldAutoUpgradeDefaultVariant(
 
   if (bestOption.extensionMux && !defaultOption.extensionMux) {
     return true;
+  }
+  if (bestOption.clientSplitMux && !defaultOption.clientSplitMux) {
+    const defaultRes = resolveVariantResolution(defaultOption.variant);
+    const bestRes = resolveVariantResolution(bestOption.variant);
+    if (
+      defaultRes.resolutionTier <= 0 ||
+      bestRes.resolutionTier > defaultRes.resolutionTier ||
+      (bestRes.resolutionTier === defaultRes.resolutionTier &&
+        bestRes.fps > defaultRes.fps)
+    ) {
+      return true;
+    }
   }
   if (
     bestOption.variant.provenance === "original_endpoint" &&

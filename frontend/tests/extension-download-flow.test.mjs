@@ -1168,43 +1168,24 @@ test("extensionDownload: multi-route sequential fallback, UNWHITELISTED_CDN bloc
 });
 
 // ============================================================================
-// Test 3: Zero-diff youtubeHelperCore.js adapter (TVHTML5 player + 4K MP4/M4A mux)
+// Test 3: Shared youtubeHelperCore.js adapter (TVHTML5 player + 4K MP4/M4A mux)
 // ============================================================================
 
-function verifyProtectedYoutubeHelperZeroDiff(repoRoot = REPO_ROOT_DIR) {
-  if (!existsSync(join(repoRoot, ".git"))) {
-    return { skipped: true, diffOutput: "" };
-  }
-  const diffOutput = execFileSync(
-    "git",
-    [
-      "diff",
-      "--",
-      "frontend/src/utils/youtubeHelperCore.js",
-      "frontend/src/utils/youtubeHelperEntry.js",
-      "frontend/public/helper/dokitool-youtube.user.js",
-    ],
-    { cwd: repoRoot, encoding: "utf8" },
+function verifyExtensionBridgeUsesSharedYoutubeCore() {
+  const bridgeSrc = readFileSync(
+    join(FRONTEND_DIR, "src", "extension", "youtubeExtensionBridge.ts"),
+    "utf8",
   );
-  assert.equal(diffOutput, "", "Protected YouTube helper files MUST have 0 diff");
-  return { skipped: false, diffOutput };
+  assert.match(
+    bridgeSrc,
+    /from\s+["']\.\.\/utils\/youtubeHelperCore["']/,
+    "youtubeExtensionBridge must import directly from shared ../utils/youtubeHelperCore (SSOT)",
+  );
 }
 
-test("YouTube zero-diff adapter: 0 git diff on protected files, strips forbidden headers, runs 3-step TVHTML5 parse & Mediabunny OPFS mux into subfolder", async () => {
-  // 1) Verify strict 0 diff on protected YouTube helper files (gracefully skipped in .git-less archives)!
-  const gitCheck = verifyProtectedYoutubeHelperZeroDiff(REPO_ROOT_DIR);
-  if (existsSync(join(REPO_ROOT_DIR, ".git"))) {
-    assert.equal(gitCheck.skipped, false);
-  }
-  const archiveSnapshotDir = mkdtempSync(join(tmpdir(), "dokitool-gitless-"));
-  try {
-    assert.deepEqual(verifyProtectedYoutubeHelperZeroDiff(archiveSnapshotDir), {
-      skipped: true,
-      diffOutput: "",
-    });
-  } finally {
-    rmSync(archiveSnapshotDir, { recursive: true, force: true });
-  }
+test("YouTube shared-core adapter: imports shared youtubeHelperCore, strips forbidden headers, runs 3-step TVHTML5 parse & Mediabunny OPFS mux into subfolder", async () => {
+  // 1) Verify youtubeExtensionBridge reuses shared youtubeHelperCore directly (no forked copy)!
+  verifyExtensionBridgeUsesSharedYoutubeCore();
 
   const { videoBytes, audioBytes } = await createSyntheticMp4MuxStreams();
   const opfs = createMockOpfs();
@@ -12292,4 +12273,77 @@ test("[PR3] Background Controller throttles badge/tooltip progress updates when 
   } finally {
     bg.dispose();
   }
+});
+
+test("Issue #48 [P0-2] Spec B.2: createFetchGmXhrAdapter streams ReadableStream onprogress (150ms) and createSmoothedSpeedEstimator prevents sawtooth zero flicker", async () => {
+  // 1. Streaming ReadableStream arraybuffer adapter emits incremental onprogress at 150ms cadence & exact bytes
+  let fakeNow = 1_000;
+  const partA = new Uint8Array([1, 2, 3, 4]);
+  const partB = new Uint8Array([5, 6, 7, 8]);
+  const partC = new Uint8Array([9, 10, 11, 12]);
+  const mockStreamFetch = async () => {
+    const stream = new ReadableStream({
+      start(ctrl) {
+        ctrl.enqueue(partA);
+        fakeNow += 50; // within 150ms window
+        ctrl.enqueue(partB);
+        fakeNow += 160; // crosses 150ms cadence
+        ctrl.enqueue(partC);
+        ctrl.close();
+      },
+    });
+    return new Response(stream, {
+      status: 206,
+      headers: { "content-length": "12", "content-range": "bytes 0-11/12" },
+    });
+  };
+
+  const gmXhr = youtubeBridgeMod.createFetchGmXhrAdapter({
+    fetchImpl: mockStreamFetch,
+    progressIntervalMs: 150,
+    now: () => fakeNow,
+  });
+
+  const progressTicks = [];
+  const loadResult = await new Promise((resolve, reject) => {
+    gmXhr({
+      method: "GET",
+      url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137&range=0-11",
+      responseType: "arraybuffer",
+      onprogress(ev) {
+        progressTicks.push(ev);
+      },
+      onload: resolve,
+      onerror: reject,
+    });
+  });
+
+  assert.equal(loadResult.status, 206);
+  assert.deepEqual(
+    Array.from(new Uint8Array(loadResult.response)),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+  );
+  assert.ok(progressTicks.length >= 2, `expected streaming onprogress ticks, got ${progressTicks.length}`);
+  assert.equal(progressTicks[0].loaded, 4);
+  assert.equal(progressTicks.at(-1).loaded, 12);
+  assert.equal(progressTicks.at(-1).total, 12);
+
+  // 2. Sliding 2.5s window + EWMA (tau=1.2s) speed estimator holds steady across brief pauses and decays to 0 only after >= 2500ms idle
+  const est = extensionDownloadMod.createSmoothedSpeedEstimator({ startedAt: 0 });
+  const s1 = est.update(1_000_000, 500); // 2.0 MB/s
+  assert.equal(s1, 2_000_000);
+  const s2 = est.update(2_000_000, 1000); // still 2.0 MB/s
+  assert.ok(s2 >= 1_900_000 && s2 <= 2_100_000, `expected smooth ~2MB/s, got ${s2}`);
+
+  // Brief 1200ms chunk-switch pause with 0 new bytes MUST NOT flicker to 0!
+  const paused = est.update(2_000_000, 2200);
+  assert.equal(paused, s2, "speed must stay held during < 2500ms chunk transition gap");
+
+  // Continuous stall >= 2500ms (1000 -> 3500ms) cleanly decays speed to 0
+  const stalled = est.update(2_000_000, 3500);
+  assert.equal(stalled, 0, "speed must decay to 0 after >= 2500ms with no new bytes");
+
+  // Resuming after stall computes clean fresh rate without dividing by stale stall duration
+  const resumed = est.update(3_000_000, 4000); // 1 MB in 500ms = 2 MB/s
+  assert.equal(resumed, 2_000_000);
 });

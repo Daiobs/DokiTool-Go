@@ -93,7 +93,13 @@ export function buildMediaFilename(input: {
   if (rawTitle) {
     const base = cleanBase(rawTitle);
     if (base) {
-      return `${base}${pageTag}${suffixTag}.${extension}`;
+      const effectivePageTag =
+        pageTag &&
+        page !== undefined &&
+        new RegExp(`(?:^|[\\s_-])P0*${page}$`, "i").test(base)
+          ? ""
+          : pageTag;
+      return `${base}${effectivePageTag}${suffixTag}.${extension}`;
     }
   }
   return `${hashMediaName(input.fallback)}${pageTag}${suffixTag}.${extension}`;

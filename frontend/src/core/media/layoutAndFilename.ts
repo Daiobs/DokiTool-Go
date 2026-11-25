@@ -86,16 +86,35 @@ export function isSingleVideoWork(
   return kind === "single_video" || kind === "single_audio";
 }
 
+const PLACEHOLDER_PART_TITLE_RE =
+  /^(?:P\d+|第?\s*\d+\s*[集话期話]|序列\s*\d+)$/i;
+
 /**
- * Resolves the cleanest human title for download filenames:
- * - For single-item works, strictly prioritizes work title (`media.title`) over
- *   raw single-part `item.title` (preventing `mmexport*.mp4` / `序列 01` pollution).
+ * Identifies meaningless single-part / collection episode placeholders such as
+ * `P1`, `第1集`, `第2话`, `3期`, or `序列 01` that must never overshadow the
+ * real work title (`media.title`).
+ */
+export function isPlaceholderPartTitle(
+  title: string | null | undefined,
+): boolean {
+  const trimmed = (title ?? "").trim();
+  if (!trimmed) return true;
+  return PLACEHOLDER_PART_TITLE_RE.test(trimmed);
+}
+
+/**
+ * Resolves the cleanest human title for download filenames & result cards:
+ * - For single-item works (or responses with `itemCount === 1`), strictly
+ *   prioritizes work title (`media.title`) over raw single-part `item.title`
+ *   (preventing `mmexport*.mp4` / `序列 01` / `P1` pollution).
  * - For audio-only client-session items, strips trailing container hints before
  *   falling back to work title.
- * - For multi-item works, prioritizes episode `item.title` with work title fallback.
+ * - For multi-item works, skips meaningless placeholder episode titles (`P1`,
+ *   `第1集`, `序列 01`) in favor of `workTitle`, otherwise uses `itemTitle`.
  */
 export function resolvePreferredMediaTitle(params: {
   isSingleItem: boolean;
+  itemCount?: number;
   isAttachment?: boolean;
   isStandaloneAudioItem?: boolean;
   workTitle?: string | null;
@@ -107,6 +126,10 @@ export function resolvePreferredMediaTitle(params: {
   const itemTitle = (params.itemTitle ?? "").trim();
   const authorName = (params.authorName ?? "").trim();
   const fallback = (params.fallback ?? "").trim();
+  const itemIsPlaceholder = isPlaceholderPartTitle(itemTitle);
+  const effectiveSingle =
+    params.isSingleItem ||
+    (typeof params.itemCount === "number" && params.itemCount === 1);
 
   if (params.isStandaloneAudioItem) {
     return (
@@ -116,14 +139,19 @@ export function resolvePreferredMediaTitle(params: {
       fallback
     );
   }
-  if (params.isSingleItem) {
+  if (effectiveSingle) {
     return (
-      (params.isAttachment && itemTitle ? itemTitle : "") ||
+      (params.isAttachment && itemTitle && !itemIsPlaceholder
+        ? itemTitle
+        : "") ||
       workTitle ||
       itemTitle ||
       authorName ||
       fallback
     );
+  }
+  if (itemIsPlaceholder) {
+    return workTitle || itemTitle || authorName || fallback;
   }
   return itemTitle || workTitle || authorName || fallback;
 }

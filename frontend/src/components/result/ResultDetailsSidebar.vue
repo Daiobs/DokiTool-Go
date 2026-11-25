@@ -5,6 +5,7 @@ import ResultVariantPicker from "./ResultVariantPicker.vue";
 import { resourceSource, sourceUrl } from "../../utils/mediaContract";
 import {
   hasRefererProtectedAudioSource,
+  resolvePreferredMediaTitle,
   resolveProtectedExtensionAudioRoutes,
   resolveWhitelistedExtensionMuxSpec,
 } from "../../core/media";
@@ -187,10 +188,12 @@ const infoCards = computed(() => [
     icon: "fa-pen",
     label: t(props.locale, "infoTitle"),
     value:
-      (props.isMulti
-        ? props.currentItem?.title || props.resultData?.title
-        : props.resultData?.title || props.currentItem?.title) ||
-      t(props.locale, "unknownTitle"),
+      resolvePreferredMediaTitle({
+        isSingleItem: !props.isMulti,
+        itemCount: props.resultData?.items?.length,
+        workTitle: props.resultData?.title,
+        itemTitle: props.currentItem?.title,
+      }) || t(props.locale, "unknownTitle"),
   },
   {
     icon: "fa-calendar",
