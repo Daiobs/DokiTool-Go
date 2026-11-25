@@ -244,17 +244,26 @@ func comparePHPID(a, b string) int {
 	return 0
 }
 
-// requiresAudibleDefault reports whether unified-v1 contract rule #38 requires
-// default video file selection to prefer audible files (has_audio: true, with
-// Instagram's unknown-audio MP4 fallback) over silent DASH video-only tracks.
-// This is a contract-level media selection rule for these three platforms only,
-// NOT a general list of yt-dlp or slow-parse platforms.
+// requiresAudibleDefault reports whether default video file selection prefers
+// audible files (has_audio: true, with unknown-audio MP4 fallback) over silent
+// DASH video-only tracks. The 9 native PHP-baseline platforms (and empty
+// platform calls) retain legacy spatial-only selection so frozen baseline
+// fixtures whose progressive variants omit has_audio remain unchanged.
 func requiresAudibleDefault(platform string) bool {
 	switch platform {
-	case "x", "youtube", "instagram":
-		return true
-	default:
+	case "",
+		"douyin",
+		"bilibili",
+		"weibo",
+		"toutiao",
+		"kuaishou",
+		"pipixia",
+		"pipigx",
+		"zuiyou",
+		"xiaohongshu":
 		return false
+	default:
+		return true
 	}
 }
 
@@ -285,6 +294,19 @@ func isUnknownAudioMP4VideoFile(v Object) bool {
 	return mime == "video/mp4" && container == "mp4" && ext == "mp4"
 }
 
+// allowsUnknownAudioMP4Fallback reports whether a platform that may emit
+// codec-less progressive MP4s (e.g. Instagram, Facebook, Tumblr, and Tier-2
+// ytgeneric extractors) should prefer an unknown-audio MP4 over explicitly
+// silent DASH video-only tracks when no has_audio=true variant exists.
+// X and YouTube always provide explicit codec metadata and keep strict
+// has_audio=true preference so unknown-audio streams never override 4K tracks.
+func allowsUnknownAudioMP4Fallback(platform string) bool {
+	if !requiresAudibleDefault(platform) {
+		return false
+	}
+	return platform != "x" && platform != "youtube"
+}
+
 func defaultEligibleFiles(platform, itemType string, usableFiles []Object) []Object {
 	if !requiresAudibleDefault(platform) || itemType != "video" {
 		return usableFiles
@@ -298,7 +320,7 @@ func defaultEligibleFiles(platform, itemType string, usableFiles []Object) []Obj
 	if len(audible) > 0 {
 		return audible
 	}
-	if platform == "instagram" {
+	if allowsUnknownAudioMP4Fallback(platform) {
 		unknownMP4 := make([]Object, 0, len(usableFiles))
 		for _, v := range usableFiles {
 			if isUnknownAudioMP4VideoFile(v) {

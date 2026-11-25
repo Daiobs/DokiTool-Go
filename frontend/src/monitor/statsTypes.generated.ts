@@ -301,6 +301,7 @@ export interface StatsSnapshot {
   ytdlp_pools?: YTDLPPoolsSnapshot;
   youtube_helper?: YouTubeHelperStatsSnapshot;
   circuit_breakers?: CircuitBreakerPlatformSnapshot[];
+  generic_circuit_breaker?: CircuitBreakerPlatformSnapshot;
   runtime_policy?: RuntimePolicySummary;
   shanghai: ShanghaiStatsSnapshot;
   parse_latency_ms: LatencyStatsSnapshot;

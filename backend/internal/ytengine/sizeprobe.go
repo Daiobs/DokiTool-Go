@@ -166,6 +166,19 @@ func hasValidMediaMagic(body []byte) bool {
 	if len(body) >= 4 && bytes.Equal(body[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}) {
 		return true
 	}
+	// Progressive audio containers (MP3 ID3 / MPEG sync, Ogg/Opus, FLAC, WAV).
+	if len(body) >= 3 && bytes.Equal(body[:3], []byte("ID3")) {
+		return true
+	}
+	if len(body) >= 2 && body[0] == 0xff && (body[1]&0xe0) == 0xe0 {
+		return true
+	}
+	if len(body) >= 4 && (bytes.Equal(body[:4], []byte("OggS")) || bytes.Equal(body[:4], []byte("fLaC"))) {
+		return true
+	}
+	if len(body) >= 12 && bytes.Equal(body[:4], []byte("RIFF")) && bytes.Equal(body[8:12], []byte("WAVE")) {
+		return true
+	}
 	return false
 }
 
@@ -181,8 +194,9 @@ func parsePositiveContentLength(raw string) (int64, bool) {
 	return n, true
 }
 
-// PopulateMissingMP4Sizes concurrently probes exact byte lengths for progressive MP4
-// formats that lack an exact Filesize from yt-dlp. Any probe failure is ignored (fail-soft).
+// PopulateMissingMP4Sizes concurrently probes exact byte lengths for progressive video
+// (and, when opts.AllowAudioOnly is enabled, progressive audio) formats that lack an
+// exact Filesize from yt-dlp. Any probe failure is ignored (fail-soft).
 func PopulateMissingMP4Sizes(ctx context.Context, info *Info, prober SizeProber, opts AdaptOptions) {
 	if info == nil || prober == nil || opts.SingleStreamHLSOnly {
 		return
@@ -217,7 +231,9 @@ func PopulateMissingMP4Sizes(ctx context.Context, info *Info, prober SizeProber,
 			}
 			fCopy := f
 			fCopy.URL = cleanURL
-			if !isProgressiveVideoFormat(fCopy, opts) {
+			isVideoCandidate := isProgressiveVideoFormat(fCopy, opts)
+			isAudioCandidate := opts.AllowAudioOnly && isProgressiveAudioExtensionFormat(fCopy)
+			if !isVideoCandidate && !isAudioCandidate {
 				continue
 			}
 			if !seen[cleanURL] {

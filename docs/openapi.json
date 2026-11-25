@@ -3425,6 +3425,63 @@
           }
         }
       },
+      "GenericCircuitBreakerSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "platform",
+          "state",
+          "consecutive_failures",
+          "window_failures",
+          "window_total",
+          "open_until",
+          "disabled_by_config"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string",
+            "enum": [
+              "ytdlp_generic"
+            ],
+            "description": "Tier-2 generic named-extractor circuit breaker identifier."
+          },
+          "state": {
+            "$ref": "#/components/schemas/CircuitBreakerState"
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Current consecutive genuine upstream/system failures."
+          },
+          "window_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Genuine upstream/system failures inside the sliding evaluation window."
+          },
+          "window_total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total eligible outcomes recorded inside the sliding evaluation window."
+          },
+          "open_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": ""
+              },
+              {
+                "type": "string",
+                "format": "date-time"
+              }
+            ],
+            "description": "RFC 3339 UTC timestamp when an automatic open circuit expires into half_open, or empty string when closed/half_open/disabled_by_config."
+          },
+          "disabled_by_config": {
+            "type": "boolean",
+            "description": "Whether Tier-2 ytdlp_generic is manually forced open via runtime config circuit_breaker.disabled_platforms."
+          }
+        }
+      },
       "RuntimePolicyPlatform": {
         "type": "string",
         "enum": [
@@ -3679,6 +3736,9 @@
             "items": {
               "$ref": "#/components/schemas/CircuitBreakerPlatformSnapshot"
             }
+          },
+          "generic_circuit_breaker": {
+            "$ref": "#/components/schemas/GenericCircuitBreakerSnapshot"
           },
           "runtime_policy": {
             "$ref": "#/components/schemas/RuntimePolicySummary"

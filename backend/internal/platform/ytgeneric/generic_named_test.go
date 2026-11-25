@@ -1062,3 +1062,119 @@ func TestAttributeGenericFailurePlatformAndParseWithPlatform(t *testing.T) {
 		t.Fatalf("SSRF attributed platform = %q, want %q", plat, PlatformUnmatched)
 	}
 }
+
+func TestGenericNamedPrA1AudibleDefaultOmitResolveURLAndAudioSizeProbe(t *testing.T) {
+	const now = int64(1793448000)
+	pubResolver := stubResolver{ips: map[string][]netip.Addr{
+		"vimeo.com":      {netip.MustParseAddr("93.184.216.34")},
+		"soundcloud.com": {netip.MustParseAddr("93.184.216.34")},
+	}}
+
+	// 1. G2 + G4: Tier-2 DASH + progressive selects audible 720p over silent 1080p,
+	//    omits invalid item.resolve_url, and emits working data.refresh_url.
+	vimeoSrc := "https://vimeo.com/76979871"
+	vimeoParser := NewGenericNamed(&stubExtractor{
+		enabled: true,
+		extract: func(context.Context, string) (*ytengine.Info, error) {
+			return &ytengine.Info{
+				ID:           "76979871",
+				ExtractorKey: "Vimeo",
+				Title:        "Vimeo Audible Default Regression",
+				Formats: []ytengine.Format{
+					{
+						FormatID: "dash-1080",
+						URL:      "https://vod-progressive.akamaized.net/exp/1080-video-only.mp4",
+						Ext:      "mp4",
+						Protocol: "https",
+						Width:    genInt64Ptr(1920),
+						Height:   genInt64Ptr(1080),
+						VCodec:   "avc1.640028",
+						ACodec:   "none",
+					},
+					{
+						FormatID: "prog-720",
+						URL:      "https://vod-progressive.akamaized.net/exp/720-audible.mp4",
+						Ext:      "mp4",
+						Protocol: "https",
+						Width:    genInt64Ptr(1280),
+						Height:   genInt64Ptr(720),
+						VCodec:   "avc1.64001f",
+						ACodec:   "mp4a.40.2",
+					},
+				},
+			}, nil
+		},
+	}, nil, pubResolver)
+
+	payload, plat, err := vimeoParser.ParseWithPlatform(context.Background(), vimeoSrc, now)
+	if err != nil {
+		t.Fatalf("ParseWithPlatform(vimeo) err: %v", err)
+	}
+	assertGenericEnvelopeValid(t, payload, now, "OK")
+	if plat != "vimeo" {
+		t.Fatalf("platform = %q, want vimeo", plat)
+	}
+	data := unified.Map(payload["data"])
+	wantRefresh := "/api/parse?schema_version=1.0&url=" + unified.RFC3986Query(vimeoSrc)
+	if got := unified.Str(data["refresh_url"]); got != wantRefresh {
+		t.Fatalf("data.refresh_url = %q, want %q", got, wantRefresh)
+	}
+	items := unified.Slice(data["items"])
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1", len(items))
+	}
+	item := unified.Map(items[0])
+	if _, hasResolve := item["resolve_url"]; hasResolve {
+		t.Fatalf("Tier-2 ReadyItem must omit resolve_url, got %v", item["resolve_url"])
+	}
+	def := unified.Map(item["default"])
+	if def == nil || !strings.Contains(unified.Str(def["url"]), "720-audible.mp4") {
+		t.Fatalf("expected audible 720p default over silent 1080p DASH, got %+v", def)
+	}
+
+	// 2. Audio-only progressive SoundCloud track probes missing Filesize via sizeProber.
+	var probedURLs []string
+	scParser := NewGenericNamed(&stubExtractor{
+		enabled: true,
+		extract: func(context.Context, string) (*ytengine.Info, error) {
+			return &ytengine.Info{
+				ID:           "track-42",
+				ExtractorKey: "SoundCloud",
+				Title:        "Ambient Demo",
+				Formats: []ytengine.Format{
+					{
+						FormatID: "http_mp3_128",
+						URL:      "https://cf-media.sndcdn.com/demo/track-42.mp3",
+						Ext:      "mp3",
+						Protocol: "https",
+						VCodec:   "none",
+						ACodec:   "mp3",
+					},
+				},
+			}, nil
+		},
+	}, func(_ context.Context, rawURL string) (int64, bool) {
+		probedURLs = append(probedURLs, rawURL)
+		return 4194304, true
+	}, pubResolver)
+
+	scPayload, scPlat, err := scParser.ParseWithPlatform(context.Background(), "https://soundcloud.com/artist/ambient-demo", now)
+	if err != nil {
+		t.Fatalf("ParseWithPlatform(soundcloud) err: %v", err)
+	}
+	assertGenericEnvelopeValid(t, scPayload, now, "OK")
+	if scPlat != "soundcloud" {
+		t.Fatalf("soundcloud platform = %q, want soundcloud", scPlat)
+	}
+	if len(probedURLs) != 1 || probedURLs[0] != "https://cf-media.sndcdn.com/demo/track-42.mp3" {
+		t.Fatalf("expected audio size probe on MP3 URL, got %v", probedURLs)
+	}
+	scItem := unified.Map(unified.Slice(unified.Map(scPayload["data"])["items"])[0])
+	if _, hasResolve := scItem["resolve_url"]; hasResolve {
+		t.Fatalf("Tier-2 audio ReadyItem must omit resolve_url, got %v", scItem["resolve_url"])
+	}
+	scSource := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(scItem["variants"])[0])["delivery"])["sources"])[0])
+	if !unified.Equal(scSource["size_bytes"], int64(4194304)) {
+		t.Fatalf("expected probed audio size_bytes=4194304, got %v", scSource["size_bytes"])
+	}
+}

@@ -647,6 +647,27 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
             f"CircuitBreakerPlatformSnapshot.{int_field} must be integer with minimum=0",
         )
 
+    gcb_snap = comp_schemas.get("GenericCircuitBreakerSnapshot") or {}
+    gcb_props = gcb_snap.get("properties") or {}
+    require(
+        gcb_snap.get("additionalProperties") is False
+        and gcb_snap.get("required") == EXPECTED_CIRCUIT_BREAKER_REQUIRED
+        and list(gcb_props.keys()) == EXPECTED_CIRCUIT_BREAKER_REQUIRED,
+        "GenericCircuitBreakerSnapshot must require exact 7 fields with additionalProperties=false",
+    )
+    require(
+        gcb_props["platform"].get("enum") == ["ytdlp_generic"]
+        and gcb_props["state"].get("$ref") == "#/components/schemas/CircuitBreakerState"
+        and gcb_props["disabled_by_config"].get("type") == "boolean",
+        "GenericCircuitBreakerSnapshot platform/state/disabled_by_config schema mismatch",
+    )
+    for int_field in ("consecutive_failures", "window_failures", "window_total"):
+        require(
+            gcb_props[int_field].get("type") == "integer"
+            and gcb_props[int_field].get("minimum") == 0,
+            f"GenericCircuitBreakerSnapshot.{int_field} must be integer with minimum=0",
+        )
+
     rp_snap = comp_schemas.get("RuntimePolicySummary") or {}
     rp_props = rp_snap.get("properties") or {}
     require(
@@ -710,6 +731,11 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         and cb_list_prop.get("maxItems") == 14
         and (cb_list_prop.get("items") or {}).get("$ref") == "#/components/schemas/CircuitBreakerPlatformSnapshot",
         "StatsSnapshot.circuit_breakers must be fixed 14-item array of CircuitBreakerPlatformSnapshot",
+    )
+    gcb_prop = comp_schemas["StatsSnapshot"]["properties"].get("generic_circuit_breaker") or {}
+    require(
+        gcb_prop.get("$ref") == "#/components/schemas/GenericCircuitBreakerSnapshot",
+        "StatsSnapshot.generic_circuit_breaker must reference GenericCircuitBreakerSnapshot",
     )
     rp_prop = comp_schemas["StatsSnapshot"]["properties"].get("runtime_policy") or {}
     require(
@@ -1019,6 +1045,28 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
             "circuit_breakers": sample_circuit_breakers[:13],
         },
     }))), "circuit_breakers with fewer than 14 items must be rejected")
+    sample_generic_cb = {
+        "platform": "ytdlp_generic",
+        "state": "closed",
+        "consecutive_failures": 0,
+        "window_failures": 0,
+        "window_total": 0,
+        "open_until": "",
+        "disabled_by_config": False,
+    }
+    require(not list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {**base_stats_data, "generic_circuit_breaker": sample_generic_cb},
+    })), "Valid /api/stats payload with generic_circuit_breaker rejected")
+    require(bool(list(stats_val.iter_errors({
+        "schema_version": "1.0",
+        "code": "OK",
+        "data": {
+            **base_stats_data,
+            "generic_circuit_breaker": {**sample_generic_cb, "platform": "douyin"},
+        },
+    }))), "generic_circuit_breaker with non-ytdlp_generic platform must be rejected")
     require(bool(list(stats_val.iter_errors({
         "schema_version": "1.0",
         "code": "OK",
@@ -1686,6 +1734,92 @@ def check_batch_downloader_behavior() -> dict:
         mod.infer_extension(douyin_meta, douyin_vod_url, "application/octet-stream", unknown_head) == "bin",
         "Tier 4 unknown bytes + generic Content-Type must fall back to 'bin'",
     )
+
+    # CDN Referer rules: Weibo + Bilibili (including narrow Akamai UPOS only, never generic Akamai)
+    for bili_url in (
+        "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/demo.m4s",
+        "https://cn-sh-fx-01.bilivideo.cn/upgcxcode/12/34/demo.mp4",
+        "https://i0.hdslb.com/bfs/archive/cover.jpg",
+        "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/12/34/demo.m4s",
+        "https://bili-overseas.akamaized.net/stream/demo.mp4",
+        "https://generic-edge.akamaized.net/upgcxcode/12/34/demo.mp4",
+    ):
+        hdrs = mod.cdn_headers_for_url(bili_url)
+        require(
+            hdrs.get("Referer") == "https://www.bilibili.com/" and "Cookie" not in hdrs and "Authorization" not in hdrs,
+            f"Expected Bilibili Referer without credentials for {bili_url}, got {hdrs}",
+        )
+    vimeo_akamai_hdrs = mod.cdn_headers_for_url("https://vod-progressive.akamaized.net/exp/clip.mp4")
+    require(
+        "Referer" not in vimeo_akamai_hdrs,
+        f"Non-Bilibili Akamai URL must not receive Bilibili Referer, got {vimeo_akamai_hdrs}",
+    )
+
+    # 503 circuit-breaker retryable backoff vs non-retryable 503 fail-fast
+    retry_503_calls = {"n": 0}
+    sleeps: list[float] = []
+
+    class Retry503Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:  # noqa: A002
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.startswith("/api/parse?retry503"):
+                retry_503_calls["n"] += 1
+                if retry_503_calls["n"] == 1:
+                    body = json.dumps({
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_UNAVAILABLE",
+                        "error": {"code": "UPSTREAM_UNAVAILABLE", "message": "breaker open", "retryable": True, "retry_after_seconds": 2},
+                    }).encode("utf-8")
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "2")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({"schema_version": "1.0", "code": "OK", "data": {}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps({
+                "schema_version": "1.0",
+                "code": "SERVICE_NOT_CONFIGURED",
+                "error": {"code": "SERVICE_NOT_CONFIGURED", "message": "disabled", "retryable": False},
+            }).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    retry_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Retry503Handler)
+    retry_thread = threading.Thread(target=retry_srv.serve_forever, daemon=True)
+    retry_thread.start()
+    try:
+        rclient = mod.AgentClient(f"http://127.0.0.1:{retry_srv.server_port}", "t" * 64, threading.Event())
+        rclient._sleep = lambda sec: sleeps.append(sec)  # type: ignore[method-assign]
+        ok_res = rclient.api_get("/api/parse?retry503=1")
+        require(
+            ok_res.get("code") == "OK" and retry_503_calls["n"] == 2 and len(sleeps) == 1 and 2.0 <= sleeps[0] <= 2.3,
+            f"Retryable 503 circuit-breaker backoff failed: res={ok_res} calls={retry_503_calls} sleeps={sleeps}",
+        )
+        try:
+            rclient.api_get("/api/parse?nonretry503=1")
+            require(False, "Non-retryable 503 SERVICE_NOT_CONFIGURED must raise PermanentAPIError")
+        except mod.PermanentAPIError as exc:
+            require(
+                exc.status == 503 and exc.code == "SERVICE_NOT_CONFIGURED" and len(sleeps) == 1,
+                f"Non-retryable 503 should fail immediately without sleeping: {exc} sleeps={sleeps}",
+            )
+    finally:
+        retry_srv.shutdown()
+        retry_srv.server_close()
+        retry_thread.join(timeout=5.0)
 
     # End-to-end loopback mock server test covering all 4 priority tiers + 206 Range resume + manifest idempotency
     test_token = "t" * 64

@@ -521,3 +521,87 @@ func TestStaleFallbackCoversUpstreamInvalidResponseAndInternalErrorM6AndCeilingL
 		t.Fatal("UPSTREAM_INVALID_RESPONSE and INTERNAL_ERROR must trigger stale fallback")
 	}
 }
+
+func TestGenericCircuitBreakerSnapshotIsolation(t *testing.T) {
+	baseTime := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	// 1. Nil stats and fresh handler preserve exact 14-core circuit_breakers array
+	//    while exposing ytdlp_generic via dedicated generic_circuit_breaker field.
+	nilSnap := (*Stats)(nil).Snapshot()
+	if len(nilSnap.CircuitBreakers) != numCorePlatforms {
+		t.Fatalf("nil CircuitBreakers len = %d, want %d", len(nilSnap.CircuitBreakers), numCorePlatforms)
+	}
+	if nilSnap.GenericCircuitBreaker.Platform != PlatformGeneric || nilSnap.GenericCircuitBreaker.State != CircuitStateClosed || nilSnap.GenericCircuitBreaker.DisabledByConfig {
+		t.Fatalf("unexpected nil GenericCircuitBreaker: %+v", nilSnap.GenericCircuitBreaker)
+	}
+
+	c := makeGenericTestCatalog(t)
+	var nowSec atomic.Int64
+	nowSec.Store(baseTime.Unix())
+	clock := func() time.Time { return time.Unix(nowSec.Load(), 0).UTC() }
+	h, err := New(c, nil, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stats.clock = clock
+	var calls atomic.Int32
+	h.SetGenericAdapter(AdapterFunc(func(_ context.Context, _ string, _ int64) (unified.Object, error) {
+		calls.Add(1)
+		return unified.ContractError("UPSTREAM_TIMEOUT", "上游超时", true), nil
+	}))
+
+	rt := DefaultRuntimeConfig()
+	rt.CircuitBreaker.Enabled = true
+	rt.CircuitBreaker.ConsecutiveFailures = 2
+	rt.CircuitBreaker.OpenDuration = 30 * time.Second
+	if !ApplyRuntimeConfig(nil, h, rt, true, false) {
+		t.Fatal("ApplyRuntimeConfig failed")
+	}
+
+	reqURL := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://vimeo.com/999001")
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
+		if w.Code != http.StatusGatewayTimeout {
+			t.Fatalf("attempt %d status = %d, want 504", i+1, w.Code)
+		}
+	}
+
+	snapOpen := h.Stats().Snapshot()
+	if len(snapOpen.CircuitBreakers) != numCorePlatforms {
+		t.Fatalf("CircuitBreakers len = %d, want %d", len(snapOpen.CircuitBreakers), numCorePlatforms)
+	}
+	for _, core := range snapOpen.CircuitBreakers {
+		if core.Platform == PlatformGeneric {
+			t.Fatalf("ytdlp_generic leaked into 14-core circuit_breakers: %+v", snapOpen.CircuitBreakers)
+		}
+	}
+	if snapOpen.GenericCircuitBreaker.Platform != PlatformGeneric ||
+		snapOpen.GenericCircuitBreaker.State != CircuitStateOpen ||
+		snapOpen.GenericCircuitBreaker.ConsecutiveFailures != 2 ||
+		snapOpen.GenericCircuitBreaker.WindowFailures != 2 ||
+		snapOpen.GenericCircuitBreaker.WindowTotal != 2 ||
+		snapOpen.GenericCircuitBreaker.OpenUntil == "" ||
+		snapOpen.GenericCircuitBreaker.DisabledByConfig {
+		t.Fatalf("unexpected open GenericCircuitBreaker: %+v", snapOpen.GenericCircuitBreaker)
+	}
+
+	// 2. After open_until elapses, GenericCircuitBreaker reports half_open without mutating state.
+	nowSec.Store(baseTime.Add(31 * time.Second).Unix())
+	snapHalfOpen := h.Stats().Snapshot()
+	if snapHalfOpen.GenericCircuitBreaker.State != CircuitStateHalfOpen || snapHalfOpen.GenericCircuitBreaker.OpenUntil != "" {
+		t.Fatalf("expected half_open GenericCircuitBreaker after cooldown, got %+v", snapHalfOpen.GenericCircuitBreaker)
+	}
+
+	// 3. Disabled via runtime config sets disabled_by_config=true, state=open, open_until="".
+	rt.CircuitBreaker.DisabledPlatforms = []string{PlatformGeneric}
+	if !ApplyRuntimeConfig(nil, h, rt, true, false) {
+		t.Fatal("ApplyRuntimeConfig disable failed")
+	}
+	snapDisabled := h.Stats().Snapshot()
+	if !snapDisabled.GenericCircuitBreaker.DisabledByConfig ||
+		snapDisabled.GenericCircuitBreaker.State != CircuitStateOpen ||
+		snapDisabled.GenericCircuitBreaker.OpenUntil != "" {
+		t.Fatalf("unexpected disabled GenericCircuitBreaker: %+v", snapDisabled.GenericCircuitBreaker)
+	}
+}

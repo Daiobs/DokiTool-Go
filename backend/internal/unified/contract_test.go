@@ -629,3 +629,88 @@ func TestSchemaPatternCacheIsSharedAndConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestG2AudibleDefaultAcrossCoreAndDynamicPlatforms(t *testing.T) {
+	const now = int64(1793448000)
+	makeVariant := func(id, label string, meta Object, rawURL string) Object {
+		return Object{
+			"id":       id,
+			"label":    label,
+			"metadata": meta,
+			"delivery": Object{
+				"kind": "file",
+				"sources": Array{
+					Object{"id": "src-" + id, "url": rawURL},
+				},
+			},
+		}
+	}
+	v1080Silent := makeVariant("v-1080-silent", "1080p (仅视频无声)", Object{
+		"width": 1920, "height": 1080, "has_audio": false,
+		"video_codec": "avc1.640028", "container": "mp4", "extension": "mp4", "mime_type": "video/mp4", "evidence": "upstream",
+	}, "https://cdn.example.test/1080-silent.mp4")
+	v720Audible := makeVariant("v-720-audible", "720p", Object{
+		"width": 1280, "height": 720, "has_audio": true,
+		"video_codec": "avc1.64001f", "audio_codec": "mp4a.40.2",
+		"container": "mp4", "extension": "mp4", "mime_type": "video/mp4", "evidence": "upstream",
+	}, "https://cdn.example.test/720-audible.mp4")
+	vUnknownMP4 := makeVariant("v-unknown-mp4", "默认画质", Object{
+		"container": "mp4", "extension": "mp4", "mime_type": "video/mp4", "evidence": "upstream",
+	}, "https://cdn.example.test/progressive.mp4")
+
+	// 1. All 9 native PHP-baseline platforms (and empty platform) retain legacy spatial selection.
+	legacyPlatforms := []string{
+		"", "douyin", "bilibili", "weibo", "toutiao",
+		"kuaishou", "pipixia", "pipigx", "zuiyou", "xiaohongshu",
+	}
+	for _, plat := range legacyPlatforms {
+		if requiresAudibleDefault(plat) {
+			t.Fatalf("requiresAudibleDefault(%q) = true, want false", plat)
+		}
+		item := Object{
+			"id":       "video-1",
+			"type":     "video",
+			"index":    int64(1),
+			"default":  nil,
+			"variants": Array{Clone(v1080Silent), Clone(v720Audible)},
+		}
+		sel := SelectDefaultForPlatform(plat, item, now)
+		if got := Str(Map(sel["default"])["variant_id"]); got != "v-1080-silent" {
+			t.Fatalf("legacy platform %q default = %q, want v-1080-silent", plat, got)
+		}
+	}
+
+	// 2. Facebook, Tumblr, and Tier-2 dynamic platforms (vimeo/reddit/tiktok) prefer audible video
+	//    and fall back to unknown-audio progressive MP4 over silent DASH video-only tracks.
+	for _, plat := range []string{"facebook", "tumblr", "vimeo", "reddit", "tiktok"} {
+		if !requiresAudibleDefault(plat) || !allowsUnknownAudioMP4Fallback(plat) {
+			t.Fatalf("platform %q expected audible default + unknown-audio MP4 fallback", plat)
+		}
+		basePayload := contractExample(t, "02")
+		data := Map(basePayload["data"])
+		data["platform"] = plat
+		data["source_url"] = "https://example.test/video/1"
+		item := contractFirstItem(basePayload)
+		delete(item, "higher_quality_variants")
+
+		// Case A: explicit audible 720p beats silent 1080p DASH.
+		item["variants"] = Array{Clone(v1080Silent), Clone(v720Audible)}
+		outA := FinalizeData(data, now)
+		if got := Str(Map(contractFirstItem(outA)["default"])["variant_id"]); got != "v-720-audible" {
+			t.Fatalf("platform %q audible default = %q, want v-720-audible", plat, got)
+		}
+		if err := ValidateEnvelopeAt(outA, now); err != nil {
+			t.Fatalf("platform %q audible envelope invalid: %v", plat, err)
+		}
+
+		// Case B: unknown-audio progressive MP4 beats silent 1080p DASH when no explicit audible file exists.
+		item["variants"] = Array{Clone(v1080Silent), Clone(vUnknownMP4)}
+		outB := FinalizeData(data, now)
+		if got := Str(Map(contractFirstItem(outB)["default"])["variant_id"]); got != "v-unknown-mp4" {
+			t.Fatalf("platform %q unknown-audio MP4 fallback default = %q, want v-unknown-mp4", plat, got)
+		}
+		if err := ValidateEnvelopeAt(outB, now); err != nil {
+			t.Fatalf("platform %q unknown-audio MP4 envelope invalid: %v", plat, err)
+		}
+	}
+}
