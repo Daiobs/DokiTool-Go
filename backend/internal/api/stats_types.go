@@ -255,22 +255,23 @@ func cloneRuntimePolicySummary(in RuntimePolicySummary) RuntimePolicySummary {
 
 // StatsSnapshot is the read-only data payload returned by GET /api/stats.
 type StatsSnapshot struct {
-	StartedAt       string                           `json:"started_at"`
-	GeneratedAt     string                           `json:"generated_at"`
-	UptimeSeconds   int64                            `json:"uptime_seconds"`
-	Requests        RequestStatsSnapshot             `json:"requests"`
-	Cache           CacheStatsSnapshot               `json:"cache"`
-	Admission       AdmissionStatsSnapshot           `json:"admission"`
-	APIKeys         []APIKeyStatsSnapshot            `json:"api_keys"`
-	YTDLP           ytengine.SlotStatsSnapshot       `json:"ytdlp"`
-	YTDLPGeneric    ytengine.SlotStatsSnapshot       `json:"ytdlp_generic"`
-	YTDLPPools      YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
-	YouTubeHelper   YouTubeHelperStatsSnapshot       `json:"youtube_helper"`
-	CircuitBreakers []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
-	RuntimePolicy   RuntimePolicySummary             `json:"runtime_policy"`
-	Shanghai        shresolver.StatsSnapshot         `json:"shanghai"`
-	ParseLatencyMS  LatencyStatsSnapshot             `json:"parse_latency_ms"`
-	Runtime         RuntimeConfigSnapshot            `json:"runtime"`
-	Daily           []DailyStatsBucket               `json:"daily"`
-	Hourly          []HourlyStatsBucket              `json:"hourly"`
+	StartedAt             string                           `json:"started_at"`
+	GeneratedAt           string                           `json:"generated_at"`
+	UptimeSeconds         int64                            `json:"uptime_seconds"`
+	Requests              RequestStatsSnapshot             `json:"requests"`
+	Cache                 CacheStatsSnapshot               `json:"cache"`
+	Admission             AdmissionStatsSnapshot           `json:"admission"`
+	APIKeys               []APIKeyStatsSnapshot            `json:"api_keys"`
+	YTDLP                 ytengine.SlotStatsSnapshot       `json:"ytdlp"`
+	YTDLPGeneric          ytengine.SlotStatsSnapshot       `json:"ytdlp_generic"`
+	YTDLPPools            YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
+	YouTubeHelper         YouTubeHelperStatsSnapshot       `json:"youtube_helper"`
+	CircuitBreakers       []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
+	GenericCircuitBreaker CircuitBreakerPlatformSnapshot   `json:"generic_circuit_breaker"`
+	RuntimePolicy         RuntimePolicySummary             `json:"runtime_policy"`
+	Shanghai              shresolver.StatsSnapshot         `json:"shanghai"`
+	ParseLatencyMS        LatencyStatsSnapshot             `json:"parse_latency_ms"`
+	Runtime               RuntimeConfigSnapshot            `json:"runtime"`
+	Daily                 []DailyStatsBucket               `json:"daily"`
+	Hourly                []HourlyStatsBucket              `json:"hourly"`
 }

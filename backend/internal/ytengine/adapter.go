@@ -33,6 +33,10 @@ type AdaptOptions struct {
 	SingleStreamHLSOnly          bool
 	AllowAudioOnly               bool
 	AllowProgressiveWebM         bool
+	// OmitItemResolveURL omits per-item resolve_url on ReadyItem and emits
+	// data.refresh_url instead (used for Tier-2 ytgeneric platforms that do
+	// not support /api/resolve).
+	OmitItemResolveURL bool
 }
 
 // SanitizeMediaURL strips URL fragments and validates the URL against allowedMediaURL.
@@ -167,6 +171,9 @@ func AdaptInfo(info *Info, opts AdaptOptions, now int64) unified.Object {
 		"items":           items,
 		"generated_at":    time.Unix(now, 0).UTC().Format("2006-01-02T15:04:05Z"),
 	}
+	if opts.OmitItemResolveURL && opts.SourceURL != "" {
+		data["refresh_url"] = "/api/parse?schema_version=" + unified.SchemaVersion + "&url=" + unified.RFC3986Query(opts.SourceURL)
+	}
 	if len(attachments) > 0 {
 		data["attachments"] = attachments
 	}
@@ -247,12 +254,14 @@ func buildEntryVideoItem(entry, parent *Info, opts AdaptOptions, position, total
 
 	itemID := itemPrefix + shortDigest(opts.PlatformID+":item:"+opts.ContentID+":"+entryKey)
 	item := unified.Object{
-		"id":          itemID,
-		"type":        itemType,
-		"index":       int64(position),
-		"default":     nil,
-		"variants":    variants,
-		"resolve_url": unified.ResolveURL(opts.SourceURL, itemID),
+		"id":       itemID,
+		"type":     itemType,
+		"index":    int64(position),
+		"default":  nil,
+		"variants": variants,
+	}
+	if !opts.OmitItemResolveURL {
+		item["resolve_url"] = unified.ResolveURL(opts.SourceURL, itemID)
 	}
 
 	if itemTitle != "" {

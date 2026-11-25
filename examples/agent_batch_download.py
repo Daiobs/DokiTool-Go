@@ -122,9 +122,9 @@ def validate_api_base(api_base: str) -> str:
 def validate_owner_token(raw: str) -> str:
     token = raw.strip()
     if not token:
-        raise ValueError("Environment variable DOKITOOL_OWNER_TOKEN is empty or unset")
+        raise ValueError("Environment variable DOKITOOL_API_TOKEN (or legacy DOKITOOL_OWNER_TOKEN) is empty or unset")
     if len(token) < 32 or len(token) > 512 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
-        raise ValueError("DOKITOOL_OWNER_TOKEN must be 32-512 printable non-whitespace ASCII characters")
+        raise ValueError("API Bearer token must be 32-512 printable non-whitespace ASCII characters")
     return token
 
 
@@ -223,6 +223,13 @@ def safe_output_path(output_dir: Path, filename: str) -> Path:
     return candidate
 
 
+def _is_bilibili_akamai_cdn(host: str, path: str) -> bool:
+    if not host.endswith(".akamaized.net"):
+        return False
+    first_label = host.split(".", 1)[0]
+    return host.startswith("upos-") or "bili" in first_label or "/upgcxcode/" in path.lower()
+
+
 def cdn_headers_for_url(url: str, byte_offset: int = 0, byte_end: int | None = None) -> dict[str, str]:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
@@ -235,6 +242,17 @@ def cdn_headers_for_url(url: str, byte_offset: int = 0, byte_end: int | None = N
     # Weibo raw CDN URLs require Referer: https://weibo.com/ (without Cookie).
     if host == "weibo.com" or host.endswith(".weibocdn.com") or host.endswith(".sinaimg.cn"):
         headers["Referer"] = "https://weibo.com/"
+    # Bilibili media CDNs (incl. overseas Akamai UPOS nodes) require Referer: https://www.bilibili.com/ (without Cookie).
+    elif (
+        host == "bilivideo.com"
+        or host.endswith(".bilivideo.com")
+        or host == "bilivideo.cn"
+        or host.endswith(".bilivideo.cn")
+        or host == "hdslb.com"
+        or host.endswith(".hdslb.com")
+        or _is_bilibili_akamai_cdn(host, parsed.path)
+    ):
+        headers["Referer"] = "https://www.bilibili.com/"
     if byte_end is not None:
         headers["Range"] = f"bytes={byte_offset}-{byte_end}"
     elif byte_offset > 0:
@@ -296,7 +314,7 @@ class AgentClient:
                 if exc.code == 401:
                     self.abort_event.set()
                     raise FatalAuthError(
-                        f"HTTP 401 ({code}: {message}) - check DOKITOOL_OWNER_TOKEN and server config"
+                        f"HTTP 401 ({code}: {message}) - check DOKITOOL_API_TOKEN / DOKITOOL_OWNER_TOKEN and server config"
                     ) from exc
 
                 if exc.code == 429:
@@ -307,6 +325,16 @@ class AgentClient:
                     if not isinstance(retry_sec, int) or retry_sec < 1:
                         header_val = exc.headers.get("Retry-After", "1") if exc.headers else "1"
                         retry_sec = int(header_val) if header_val.isdigit() else 1
+                    delay = min(60.0, float(max(1, retry_sec))) + random.uniform(0.05, 0.25)
+                    self._sleep(delay)
+                    continue
+
+                if exc.code == 503 and retryable and transient_attempts < 2:
+                    transient_attempts += 1
+                    retry_sec = err.get("retry_after_seconds")
+                    if not isinstance(retry_sec, int) or retry_sec < 1:
+                        header_val = exc.headers.get("Retry-After", "") if exc.headers else ""
+                        retry_sec = int(header_val) if header_val.isdigit() else int(2 * transient_attempts)
                     delay = min(60.0, float(max(1, retry_sec))) + random.uniform(0.05, 0.25)
                     self._sleep(delay)
                     continue
@@ -783,7 +811,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         api_base = validate_api_base(args.api_base)
-        token = validate_owner_token(os.environ.get("DOKITOOL_OWNER_TOKEN", ""))
+        raw_token = os.environ.get("DOKITOOL_API_TOKEN") or os.environ.get("DOKITOOL_OWNER_TOKEN", "")
+        token = validate_owner_token(raw_token)
     except ValueError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2

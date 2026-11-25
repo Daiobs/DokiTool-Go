@@ -53,16 +53,17 @@ var tsTypeNames = map[reflect.Type]string{
 // fieldOverrides preserves narrow TypeScript union types and rolling-upgrade
 // optionality markers without weakening Go's authoritative field list.
 var fieldOverrides = map[string]fieldOverride{
-	"CacheChannelCounts.stale_hits":        {optional: true},
-	"AdmissionStatsSnapshot.generic_slow":  {optional: true},
-	"YTDLPStatsSnapshot.enabled":           {optional: true},
-	"YTDLPStatsSnapshot.waiting":           {optional: true},
-	"CircuitBreakerPlatformSnapshot.state": {tsType: "CircuitBreakerState"},
-	"StatsSnapshot.ytdlp_generic":          {optional: true},
-	"StatsSnapshot.ytdlp_pools":            {optional: true},
-	"StatsSnapshot.youtube_helper":         {optional: true},
-	"StatsSnapshot.circuit_breakers":       {optional: true},
-	"StatsSnapshot.runtime_policy":         {optional: true},
+	"CacheChannelCounts.stale_hits":         {optional: true},
+	"AdmissionStatsSnapshot.generic_slow":   {optional: true},
+	"YTDLPStatsSnapshot.enabled":            {optional: true},
+	"YTDLPStatsSnapshot.waiting":            {optional: true},
+	"CircuitBreakerPlatformSnapshot.state":  {tsType: "CircuitBreakerState"},
+	"StatsSnapshot.ytdlp_generic":           {optional: true},
+	"StatsSnapshot.ytdlp_pools":             {optional: true},
+	"StatsSnapshot.youtube_helper":          {optional: true},
+	"StatsSnapshot.circuit_breakers":        {optional: true},
+	"StatsSnapshot.generic_circuit_breaker": {optional: true},
+	"StatsSnapshot.runtime_policy":          {optional: true},
 }
 
 // extraCompatFields retains strictly read-only legacy wire aliases that the

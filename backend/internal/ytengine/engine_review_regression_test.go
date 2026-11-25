@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -749,5 +750,142 @@ func TestPR36Review5788284772C1AndExport(t *testing.T) {
 		if err := os.WriteFile(dest, append(raw, '\n'), 0600); err != nil {
 			t.Fatalf("write DOKITOOL_GO_YTDLP_OUTPUT: %v", err)
 		}
+	}
+}
+
+func TestPrA1StderrClassificationAudioProbeAndResolveURLToggle(t *testing.T) {
+	// 1. Fine-grained stderr error classification (DRM, geo-restriction, live/offline, WAF/impersonation).
+	cases := []struct {
+		name      string
+		stderr    string
+		wantCode  ErrorCode
+		retryable bool
+		msgSubstr string
+	}{
+		{
+			name:      "drm-protected",
+			stderr:    "ERROR: [vimeo] 123: This video is DRM protected",
+			wantCode:  CodeUpstreamBlocked,
+			retryable: false,
+			msgSubstr: "DRM",
+		},
+		{
+			name:      "geo-restricted",
+			stderr:    "ERROR: [youtube] abc: The uploader has not made this video available in your country",
+			wantCode:  CodeUpstreamBlocked,
+			retryable: false,
+			msgSubstr: "地区访问限制",
+		},
+		{
+			name:      "live-offline",
+			stderr:    "ERROR: [twitch:stream] demo: demo is offline",
+			wantCode:  CodeContentUnavailable,
+			retryable: false,
+			msgSubstr: "直播",
+		},
+		{
+			name:      "premiere-upcoming",
+			stderr:    "ERROR: [youtube] xyz: Premieres in 120 minutes",
+			wantCode:  CodeContentUnavailable,
+			retryable: false,
+			msgSubstr: "直播",
+		},
+		{
+			name:      "waf-cloudflare-impersonation",
+			stderr:    "ERROR: [tiktok] 999: Unable to download webpage: HTTP Error 403 (caused by Cloudflare challenge; try --impersonate)",
+			wantCode:  CodeUpstreamBlocked,
+			retryable: false,
+			msgSubstr: "人机验证或风控拦截",
+		},
+		{
+			name:      "bot-captcha",
+			stderr:    "ERROR: [reddit] 777: Sign in to confirm you're not a bot",
+			wantCode:  CodeUpstreamBlocked,
+			retryable: false,
+			msgSubstr: "人机验证或风控拦截",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyStderr(tc.stderr, nil)
+			if got.Code != tc.wantCode || got.Retryable != tc.retryable || !strings.Contains(got.Message, tc.msgSubstr) {
+				t.Fatalf("classifyStderr(%q) = {Code:%s Retryable:%v Message:%q}, want {Code:%s Retryable:%v substr:%q}",
+					tc.stderr, got.Code, got.Retryable, got.Message, tc.wantCode, tc.retryable, tc.msgSubstr)
+			}
+		})
+	}
+
+	// 2. Audio size probe triggers ONLY when AllowAudioOnly=true, and validates audio magic on 200 OK.
+	infoWithAudio := &Info{
+		ID: "aud1",
+		Formats: []Format{
+			{
+				FormatID: "mp3-128",
+				URL:      "https://cf-media.sndcdn.com/track.mp3",
+				Ext:      "mp3",
+				Protocol: "https",
+				VCodec:   "none",
+				ACodec:   "mp3",
+			},
+		},
+	}
+	probedCount := 0
+	stubProber := func(context.Context, string) (int64, bool) {
+		probedCount++
+		return 123456, true
+	}
+	PopulateMissingMP4Sizes(context.Background(), infoWithAudio, stubProber, AdaptOptions{AllowAudioOnly: false})
+	if probedCount != 0 || infoWithAudio.Formats[0].Filesize != nil {
+		t.Fatalf("AllowAudioOnly=false must not probe audio formats, got count=%d size=%v", probedCount, infoWithAudio.Formats[0].Filesize)
+	}
+	PopulateMissingMP4Sizes(context.Background(), infoWithAudio, stubProber, AdaptOptions{AllowAudioOnly: true})
+	if probedCount != 1 || infoWithAudio.Formats[0].Filesize == nil || *infoWithAudio.Formats[0].Filesize != 123456 {
+		t.Fatalf("AllowAudioOnly=true must probe audio formats, got count=%d size=%v", probedCount, infoWithAudio.Formats[0].Filesize)
+	}
+	for _, audioMagic := range [][]byte{
+		append([]byte("ID3\x04\x00\x00\x00\x00\x00\x00"), make([]byte, 16)...),
+		append([]byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00"), make([]byte, 16)...),
+		append([]byte("fLaC\x00\x00\x00\x22\x10\x00\x10\x00"), make([]byte, 16)...),
+		append([]byte("RIFF\x24\x00\x00\x00WAVEfmt "), make([]byte, 16)...),
+	} {
+		hdr := http.Header{
+			"Content-Type":   {"audio/mpeg"},
+			"Content-Length": {strconv.Itoa(len(audioMagic))},
+		}
+		if sz, ok := ValidateProbedMediaResponse(http.StatusOK, hdr, audioMagic); !ok || sz != int64(len(audioMagic)) {
+			t.Fatalf("ValidateProbedMediaResponse rejected valid 200 audio magic %q: sz=%d ok=%v", audioMagic[:4], sz, ok)
+		}
+	}
+
+	// 3. G4: OmitItemResolveURL=false (Tier-1 default) preserves item.resolve_url unchanged.
+	const now = int64(1793448000)
+	w720, h720 := int64(1280), int64(720)
+	sampleInfo := &Info{
+		ID:    "fb1",
+		Title: "Facebook Clip",
+		Formats: []Format{
+			{
+				FormatID: "hd",
+				URL:      "https://video.xx.fbcdn.net/v/t42/clip.mp4",
+				Ext:      "mp4",
+				Protocol: "https",
+				Width:    &w720,
+				Height:   &h720,
+				VCodec:   "avc1.64001f",
+				ACodec:   "mp4a.40.2",
+			},
+		},
+	}
+	tier1Env := AdaptInfo(sampleInfo, AdaptOptions{
+		PlatformID: "facebook",
+		ContentID:  "fb1",
+		SourceURL:  "https://www.facebook.com/reel/12345",
+	}, now)
+	tier1Item := unified.Map(unified.Slice(unified.Map(tier1Env["data"])["items"])[0])
+	if !strings.HasPrefix(unified.Str(tier1Item["resolve_url"]), "/api/resolve?") {
+		t.Fatalf("Tier-1 default AdaptOptions must preserve item.resolve_url, got %v", tier1Item["resolve_url"])
+	}
+	if _, hasRefresh := unified.Map(tier1Env["data"])["refresh_url"]; hasRefresh {
+		t.Fatalf("Tier-1 default AdaptOptions must not alter data.refresh_url unexpectedly")
 	}
 }

@@ -520,6 +520,7 @@ func (p *GenericParser) ParseWithPlatform(ctx context.Context, source string, no
 		AllowCodecLessProgressiveMP4: true,
 		AllowAudioOnly:               true,
 		AllowProgressiveWebM:         true,
+		OmitItemResolveURL:           true,
 	}
 	ytengine.PopulateMissingMP4Sizes(ctx, info, p.sizeProber, opts)
 	if ctxErr := ctx.Err(); ctxErr != nil {

@@ -630,6 +630,63 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Extractor: extractor,
 			Cause:     runErr,
 		}
+	case strings.Contains(lower, "drm protected") ||
+		strings.Contains(lower, "widevine") ||
+		strings.Contains(lower, "playready") ||
+		strings.Contains(lower, "fairplay"):
+		return &Error{
+			Code:      CodeUpstreamBlocked,
+			Message:   "该内容受 DRM 数字版权保护，无法解析下载",
+			Retryable: false,
+			Extractor: extractor,
+			Cause:     runErr,
+		}
+	case strings.Contains(lower, "not available in your country") ||
+		strings.Contains(lower, "available in your country") ||
+		strings.Contains(lower, "geo-restricted") ||
+		strings.Contains(lower, "geo restricted") ||
+		strings.Contains(lower, "geo-blocked") ||
+		strings.Contains(lower, "geoblocked") ||
+		strings.Contains(lower, "blocked in your country") ||
+		strings.Contains(lower, "not available in your region") ||
+		strings.Contains(lower, "not available from your location"):
+		return &Error{
+			Code:      CodeUpstreamBlocked,
+			Message:   "该内容存在地区访问限制，当前服务节点无法解析",
+			Retryable: false,
+			Extractor: extractor,
+			Cause:     runErr,
+		}
+	case strings.Contains(lower, "this live event will begin") ||
+		strings.Contains(lower, "premieres in") ||
+		strings.Contains(lower, "live stream is offline") ||
+		strings.Contains(lower, "live streams are not supported") ||
+		strings.Contains(lower, "currently live") ||
+		strings.Contains(lower, "broadcast has ended") ||
+		strings.Contains(lower, "is offline"):
+		return &Error{
+			Code:      CodeContentUnavailable,
+			Message:   "暂不支持直播中、已下播或尚未开播的内容解析",
+			Retryable: false,
+			Extractor: extractor,
+			Cause:     runErr,
+		}
+	case strings.Contains(lower, "captcha") ||
+		strings.Contains(lower, "cloudflare") ||
+		strings.Contains(lower, "impersonating") ||
+		strings.Contains(lower, "impersonation") ||
+		strings.Contains(lower, "--impersonate") ||
+		strings.Contains(lower, "verify you are human") ||
+		strings.Contains(lower, "bot detection") ||
+		strings.Contains(lower, "confirm you're not a bot") ||
+		strings.Contains(lower, "confirm you’re not a bot"):
+		return &Error{
+			Code:      CodeUpstreamBlocked,
+			Message:   "上游触发人机验证或风控拦截，暂无法无凭据解析",
+			Retryable: false,
+			Extractor: extractor,
+			Cause:     runErr,
+		}
 	case strings.Contains(lower, "protected tweet") ||
 		strings.Contains(lower, "nsfw tweet") ||
 		strings.Contains(lower, "age-restricted") ||

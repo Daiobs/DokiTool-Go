@@ -382,6 +382,42 @@ func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64
 	}
 }
 
+func (m *circuitBreakerManager) snapshotPlatformLocked(plat string, now time.Time, maxAge time.Duration) CircuitBreakerPlatformSnapshot {
+	st := m.states[plat]
+	_, disabled := m.disabled[plat]
+	snap := CircuitBreakerPlatformSnapshot{
+		Platform:         plat,
+		State:            CircuitStateClosed,
+		DisabledByConfig: disabled,
+	}
+	if st != nil {
+		st.pruneExpired(now, maxAge)
+		snap.ConsecutiveFailures = st.consecutiveFailures
+		snap.WindowFailures = st.windowFailures
+		snap.WindowTotal = st.windowCount
+	}
+	if disabled {
+		snap.State = CircuitStateOpen
+		snap.OpenUntil = ""
+	} else if m.cfg.Enabled && st != nil {
+		switch st.state {
+		case CircuitStateOpen:
+			if now.Before(st.openUntil) {
+				snap.State = CircuitStateOpen
+				snap.OpenUntil = st.openUntil.UTC().Format(time.RFC3339)
+			} else {
+				snap.State = CircuitStateHalfOpen
+				snap.OpenUntil = ""
+			}
+		case CircuitStateHalfOpen:
+			snap.State = CircuitStateHalfOpen
+		default:
+			snap.State = CircuitStateClosed
+		}
+	}
+	return snap
+}
+
 // Snapshot returns the closed 14-element slice of core platform circuit breaker states
 // in exact knownPlatforms[:14] order.
 func (m *circuitBreakerManager) Snapshot(now time.Time) []CircuitBreakerPlatformSnapshot {
@@ -401,42 +437,24 @@ func (m *circuitBreakerManager) Snapshot(now time.Time) []CircuitBreakerPlatform
 
 	maxAge := m.sampleMaxAge()
 	for i := 0; i < numCorePlatforms; i++ {
-		plat := knownPlatforms[i]
-		st := m.states[plat]
-		_, disabled := m.disabled[plat]
-		snap := CircuitBreakerPlatformSnapshot{
-			Platform:         plat,
-			State:            CircuitStateClosed,
-			DisabledByConfig: disabled,
-		}
-		if st != nil {
-			st.pruneExpired(now, maxAge)
-			snap.ConsecutiveFailures = st.consecutiveFailures
-			snap.WindowFailures = st.windowFailures
-			snap.WindowTotal = st.windowCount
-		}
-		if disabled {
-			snap.State = CircuitStateOpen
-			snap.OpenUntil = ""
-		} else if m.cfg.Enabled && st != nil {
-			switch st.state {
-			case CircuitStateOpen:
-				if now.Before(st.openUntil) {
-					snap.State = CircuitStateOpen
-					snap.OpenUntil = st.openUntil.UTC().Format(time.RFC3339)
-				} else {
-					snap.State = CircuitStateHalfOpen
-					snap.OpenUntil = ""
-				}
-			case CircuitStateHalfOpen:
-				snap.State = CircuitStateHalfOpen
-			default:
-				snap.State = CircuitStateClosed
-			}
-		}
-		out[i] = snap
+		out[i] = m.snapshotPlatformLocked(knownPlatforms[i], now, maxAge)
 	}
 	return out
+}
+
+// GenericSnapshot returns the circuit breaker state for the isolated Tier-2
+// generic named-extractor pool ("ytdlp_generic") without altering the fixed
+// 14-element core platform array returned by Snapshot.
+func (m *circuitBreakerManager) GenericSnapshot(now time.Time) CircuitBreakerPlatformSnapshot {
+	if m == nil {
+		return CircuitBreakerPlatformSnapshot{
+			Platform: PlatformGeneric,
+			State:    CircuitStateClosed,
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snapshotPlatformLocked(PlatformGeneric, now, m.sampleMaxAge())
 }
 
 func circuitBreakerOpenResponse(platform string, retryAfterSec int) cachedResponse {

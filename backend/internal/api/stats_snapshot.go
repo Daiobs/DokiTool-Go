@@ -115,13 +115,14 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			Requests: RequestStatsSnapshot{
 				ByPlatformCodeChannel: make([]PlatformOutcomeCount, 0),
 			},
-			APIKeys:         make([]APIKeyStatsSnapshot, 0),
-			CircuitBreakers: (*circuitBreakerManager)(nil).Snapshot(nowRaw),
-			RuntimePolicy:   defaultRuntimePolicySummary(),
-			Shanghai:        shOff,
-			Runtime:         normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
-			Daily:           emptyDailyBuckets(nowRaw),
-			Hourly:          emptyHourlyBuckets(nowRaw),
+			APIKeys:               make([]APIKeyStatsSnapshot, 0),
+			CircuitBreakers:       (*circuitBreakerManager)(nil).Snapshot(nowRaw),
+			GenericCircuitBreaker: (*circuitBreakerManager)(nil).GenericSnapshot(nowRaw),
+			RuntimePolicy:         defaultRuntimePolicySummary(),
+			Shanghai:              shOff,
+			Runtime:               normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
+			Daily:                 emptyDailyBuckets(nowRaw),
+			Hourly:                emptyHourlyBuckets(nowRaw),
 		}
 	}
 
@@ -219,6 +220,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	}
 
 	cbSnaps := cbSrc.Snapshot(nowRaw)
+	genericCBSnap := cbSrc.GenericSnapshot(nowRaw)
 
 	shSnap := shresolver.StatsSnapshot{Mode: "off"}
 	if shSrc != nil {
@@ -344,16 +346,17 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			ByChannel:             RequestChannelBreakdown{Anonymous: anonReq, Owner: ownerReq},
 			ByPlatformCodeChannel: cells,
 		},
-		Cache:           cacheSnap,
-		Admission:       admSnap,
-		APIKeys:         apiKeys,
-		YTDLP:           ytdlpSnap,
-		YTDLPGeneric:    ytdlpGenericSnap,
-		YTDLPPools:      ytdlpPools,
-		YouTubeHelper:   ytHelperSnap,
-		CircuitBreakers: cbSnaps,
-		RuntimePolicy:   runtimePolicy,
-		Shanghai:        shSnap,
+		Cache:                 cacheSnap,
+		Admission:             admSnap,
+		APIKeys:               apiKeys,
+		YTDLP:                 ytdlpSnap,
+		YTDLPGeneric:          ytdlpGenericSnap,
+		YTDLPPools:            ytdlpPools,
+		YouTubeHelper:         ytHelperSnap,
+		CircuitBreakers:       cbSnaps,
+		GenericCircuitBreaker: genericCBSnap,
+		RuntimePolicy:         runtimePolicy,
+		Shanghai:              shSnap,
 		ParseLatencyMS: LatencyStatsSnapshot{
 			Total:     latTotal,
 			ByChannel: LatencyChannelBreakdown{Anonymous: latAnon, Owner: latOwner},
