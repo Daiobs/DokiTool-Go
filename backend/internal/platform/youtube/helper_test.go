@@ -127,15 +127,20 @@ func TestEJSSandboxBlocksNetworkAndFilesystem(t *testing.T) {
 }
 
 type mockYouTubeFetchExecutor struct {
-	playerID      string
-	playerBaseJS  []byte
-	fetchDelay    time.Duration
-	failRefresh   atomic.Bool
-	panicRefresh  atomic.Bool
-	startedHits   atomic.Int32
-	iframeHits    atomic.Int32
-	playerJSHits  atomic.Int32
-	forbiddenHits atomic.Int32
+	playerID         string
+	playerBaseJS     []byte
+	tvPlayerJS       []byte
+	fetchDelay       time.Duration
+	failRefresh      atomic.Bool
+	failTVFetch      atomic.Bool
+	failMainFetch    atomic.Bool
+	panicRefresh     atomic.Bool
+	startedHits      atomic.Int32
+	iframeHits       atomic.Int32
+	playerJSHits     atomic.Int32
+	tvPlayerJSHits   atomic.Int32
+	mainPlayerJSHits atomic.Int32
+	forbiddenHits    atomic.Int32
 }
 
 func (m *mockYouTubeFetchExecutor) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
@@ -176,9 +181,26 @@ func (m *mockYouTubeFetchExecutor) Do(ctx context.Context, req fetch.Request) (f
 			Body:       []byte(body),
 			URL:        req.URL,
 		}, nil
+	case "https://www.youtube.com/s/player/" + m.playerID + "/tv-player-ias.vflset/tv-player-ias.js":
+		m.playerJSHits.Add(1)
+		m.tvPlayerJSHits.Add(1)
+		if m.failRefresh.Load() || m.failTVFetch.Load() {
+			return fetch.Response{StatusCode: http.StatusBadGateway}, nil
+		}
+		body := m.tvPlayerJS
+		if len(body) == 0 {
+			body = m.playerBaseJS
+		}
+		return fetch.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/javascript"}},
+			Body:       body,
+			URL:        req.URL,
+		}, nil
 	case "https://www.youtube.com/s/player/" + m.playerID + "/player_ias.vflset/en_US/base.js":
 		m.playerJSHits.Add(1)
-		if m.failRefresh.Load() {
+		m.mainPlayerJSHits.Add(1)
+		if m.failRefresh.Load() || m.failMainFetch.Load() {
 			return fetch.Response{StatusCode: http.StatusBadGateway}, nil
 		}
 		return fetch.Response{
@@ -1410,5 +1432,119 @@ func TestYouTubeHelperRound2StaleGraceWritebackAndBgShutdown(t *testing.T) {
 	stopBg()
 	if elapsed := time.Since(stopBegin); elapsed >= 1500*time.Millisecond {
 		t.Fatalf("stopBg() took %s; expected fast cancellation via h.bgCtx (< 1.5s)", elapsed)
+	}
+}
+
+func TestYouTubeHelperPlayerJSVariantPreferenceAndFallback(t *testing.T) {
+	sb := newTestSandbox(t)
+	playerJS, err := os.ReadFile(filepath.Join("testdata", "player_base_fixture.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sampleJSON, err := os.ReadFile(filepath.Join("testdata", "finalize_sample_46.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentNow := time.Date(2026, 11, 25, 6, 0, 0, 0, time.UTC)
+
+	// 0. URL allowlist permits both TV and main player variants on https://www.youtube.com only.
+	if !AllowYouTubePlayerFetchURL("https://www.youtube.com/s/player/b485e332/tv-player-ias.vflset/tv-player-ias.js") {
+		t.Fatal("expected TV player variant URL to be allowed")
+	}
+	if !AllowYouTubePlayerFetchURL("https://www.youtube.com/s/player/b485e332/player_ias.vflset/en_US/base.js") {
+		t.Fatal("expected main player variant URL to be allowed")
+	}
+	if AllowYouTubePlayerFetchURL("http://www.youtube.com/s/player/b485e332/tv-player-ias.vflset/tv-player-ias.js") ||
+		AllowYouTubePlayerFetchURL("https://evil.example.com/s/player/b485e332/tv-player-ias.vflset/tv-player-ias.js") {
+		t.Fatal("expected non-HTTPS or non-youtube.com player variant URLs to be rejected")
+	}
+
+	// 1. Default path prefers tv-player-ias.js without touching main base.js.
+	primaryExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+	}
+	primaryHelper, err := NewHelper(primaryExec, sb, func() time.Time { return currentNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload, status := primaryHelper.Context(context.Background()); status != http.StatusOK {
+		t.Fatalf("primary TV Context status = %d, payload = %#v", status, payload)
+	}
+	if primaryExec.tvPlayerJSHits.Load() != 1 || primaryExec.mainPlayerJSHits.Load() != 0 || primaryExec.forbiddenHits.Load() != 0 {
+		t.Fatalf("expected tv=1 main=0 forbidden=0, got tv=%d main=%d forbidden=%d",
+			primaryExec.tvPlayerJSHits.Load(), primaryExec.mainPlayerJSHits.Load(), primaryExec.forbiddenHits.Load())
+	}
+
+	// 2. When tv-player-ias.js fetch fails (e.g. HTTP 502), automatically falls back to main base.js.
+	fetchFallbackExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+	}
+	fetchFallbackExec.failTVFetch.Store(true)
+	fetchFallbackHelper, err := NewHelper(fetchFallbackExec, sb, func() time.Time { return currentNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload, status := fetchFallbackHelper.Context(context.Background()); status != http.StatusOK {
+		t.Fatalf("fetch fallback Context status = %d, payload = %#v", status, payload)
+	}
+	if fetchFallbackExec.tvPlayerJSHits.Load() != 1 || fetchFallbackExec.mainPlayerJSHits.Load() != 1 || fetchFallbackExec.forbiddenHits.Load() != 0 {
+		t.Fatalf("expected tv=1 main=1 forbidden=0, got tv=%d main=%d forbidden=%d",
+			fetchFallbackExec.tvPlayerJSHits.Load(), fetchFallbackExec.mainPlayerJSHits.Load(), fetchFallbackExec.forbiddenHits.Load())
+	}
+	// Cache hit avoids re-fetching either variant.
+	if _, status := fetchFallbackHelper.Context(context.Background()); status != http.StatusOK {
+		t.Fatalf("cached fallback Context status = %d, want 200", status)
+	}
+	if fetchFallbackExec.tvPlayerJSHits.Load() != 1 || fetchFallbackExec.mainPlayerJSHits.Load() != 1 {
+		t.Fatalf("expected cached Context not to refetch variants, got tv=%d main=%d",
+			fetchFallbackExec.tvPlayerJSHits.Load(), fetchFallbackExec.mainPlayerJSHits.Load())
+	}
+
+	// 3. When tv-player-ias.js downloads 200 with a valid signatureTimestamp but fails EJS preprocessing
+	// (e.g. AST/runtime syntax or solver mismatch), automatically falls back to main base.js.
+	preprocessFallbackExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		tvPlayerJS:   []byte(`var meta = {signatureTimestamp:20779}; function broken( { syntax error`),
+		playerBaseJS: playerJS,
+	}
+	preprocessFallbackHelper, err := NewHelper(preprocessFallbackExec, sb, func() time.Time { return currentNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ppPayload, ppStatus := preprocessFallbackHelper.Context(context.Background())
+	if ppStatus != http.StatusOK {
+		t.Fatalf("preprocess fallback Context status = %d, payload = %#v", ppStatus, ppPayload)
+	}
+	if preprocessFallbackExec.tvPlayerJSHits.Load() != 1 || preprocessFallbackExec.mainPlayerJSHits.Load() != 1 {
+		t.Fatalf("expected tv=1 main=1 after preprocess fallback, got tv=%d main=%d",
+			preprocessFallbackExec.tvPlayerJSHits.Load(), preprocessFallbackExec.mainPlayerJSHits.Load())
+	}
+	if gotSTS, ok := unified.Numeric(unified.Map(ppPayload["data"])["signature_timestamp"]); !ok || int(gotSTS) != 20760 {
+		t.Fatalf("expected fallback signature_timestamp=20760, got %v", unified.Map(ppPayload["data"])["signature_timestamp"])
+	}
+	if finPayload, finStatus := preprocessFallbackHelper.Finalize(context.Background(), sampleJSON, false); finStatus != http.StatusOK {
+		t.Fatalf("Finalize after preprocess fallback status = %d, payload = %#v", finStatus, finPayload)
+	}
+
+	// 4. When both variants fail, Context returns 502 UPSTREAM_UNAVAILABLE cleanly.
+	bothFailExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+	}
+	bothFailExec.failTVFetch.Store(true)
+	bothFailExec.failMainFetch.Store(true)
+	bothFailHelper, err := NewHelper(bothFailExec, sb, func() time.Time { return currentNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	failPayload, failStatus := bothFailHelper.Context(context.Background())
+	if failStatus != http.StatusBadGateway || unified.Str(failPayload["code"]) != "UPSTREAM_UNAVAILABLE" {
+		t.Fatalf("expected 502 UPSTREAM_UNAVAILABLE when both variants fail, got status=%d payload=%#v", failStatus, failPayload)
+	}
+	if bothFailExec.tvPlayerJSHits.Load() != 1 || bothFailExec.mainPlayerJSHits.Load() != 1 {
+		t.Fatalf("expected both variants attempted once, got tv=%d main=%d",
+			bothFailExec.tvPlayerJSHits.Load(), bothFailExec.mainPlayerJSHits.Load())
 	}
 }
