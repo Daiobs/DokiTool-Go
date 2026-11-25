@@ -19,6 +19,10 @@
   "cache_sample_key": "kuaishou",
   "x_fast_path_key": "x",
   "douyin_domestic_key": "douyin",
+  "youtube_context": {
+    "warn_latency_ms": 2000,
+    "fail_latency_ms": 15000
+  },
   "direct_marker_platforms": {
     "douyin": {
       "sample_key": "douyin",
@@ -57,59 +61,90 @@
   "platforms": {
     "douyin": {
       "url": "https://www.douyin.com/jingxuan?modal_id=7704056737233449610",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "kuaishou": {
       "url": "https://www.kuaishou.com/short-video/3xngkmw8vacriqu",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "bilibili": {
       "url": "https://www.bilibili.com/video/BV1uv411q7Mv",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "xiaohongshu": {
       "url": "http://xhslink.com/o/ATlAvhS71F8",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "toutiao": {
       "url": "https://www.toutiao.com/video/7501991960077500979/",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "weibo": {
       "url": "https://weibo.com/tv/show/1034:5339966948180025?from=old_pc_videoshow",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "pipixia": {
       "url": "https://h5.pipix.com/item/7385813877985909043",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "pipigx": {
       "url": "https://h5.pipigx.com/pp/post/860538173891?pid=860538173891&mid=165822485",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "zuiyou": {
       "url": "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
-      "pool": "parse"
+      "pool": "parse",
+      "tier": "tier_a"
     },
     "x": {
       "url": "https://x.com/i/status/1575560063510810624",
-      "pool": "slow_parse"
+      "pool": "slow_parse",
+      "tier": "tier_a"
     },
     "youtube": {
       "url": "https://www.youtube.com/watch?v=I9JvDaciaFk",
-      "pool": "slow_parse"
+      "pool": "slow_parse",
+      "tier": "tier_a"
     },
     "instagram": {
       "url": "https://www.instagram.com/p/CTApqC8BGWd/",
-      "pool": "slow_parse"
+      "pool": "slow_parse",
+      "tier": "tier_a"
     },
     "facebook": {
       "url": "https://www.facebook.com/watch/?v=401590806345712",
-      "pool": "slow_parse"
+      "pool": "slow_parse",
+      "tier": "tier_a"
     },
     "tumblr": {
       "url": "https://maskofthedragon.tumblr.com/post/626907179849564160/mona-talking-in-english",
-      "pool": "slow_parse"
+      "pool": "slow_parse",
+      "tier": "tier_a"
+    }
+  },
+  "tier_b_platforms": {
+    "vimeo": {
+      "url": "https://vimeo.com/76979871",
+      "pool": "slow_parse",
+      "tier": "tier_b"
+    },
+    "reddit": {
+      "url": "https://www.reddit.com/r/aww/comments/101b6v2/sample/",
+      "pool": "slow_parse",
+      "tier": "tier_b"
+    },
+    "soundcloud": {
+      "url": "https://soundcloud.com/forss/flickermood",
+      "pool": "slow_parse",
+      "tier": "tier_b"
     }
   },
   "rate_limit": {

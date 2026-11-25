@@ -29,6 +29,7 @@ jobs:
     outputs:
       run_go: ${{ steps.classify.outputs.run_go }}
       run_frontend: ${{ steps.classify.outputs.run_frontend }}
+      run_l2_e2e: ${{ steps.classify.outputs.run_l2_e2e }}
     steps:
       - name: Check out repository history for path classification
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -185,7 +186,7 @@ jobs:
           node frontend/scripts/test-pipixia-representation.mjs "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_SHANGHAI_EXAMPLES"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_PULL_EXAMPLES"
-          (cd frontend && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
+          (cd frontend && node --test tests/golden-fixtures-l1.test.mjs && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
 
       - name: Build Go executables (dokitool and shanghai-resolver)
         working-directory: backend
@@ -252,7 +253,7 @@ jobs:
           node frontend/scripts/test-pipixia-representation.mjs "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_SHANGHAI_EXAMPLES"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_PULL_EXAMPLES"
-          (cd frontend && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
+          (cd frontend && node --test tests/golden-fixtures-l1.test.mjs && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
 
       - name: Typecheck and test the frontend and download lifecycle
         working-directory: frontend
@@ -295,6 +296,10 @@ jobs:
         env:
           DOKITOOL_STAGE2_REQUIRE_BROWSER: '1'
         run: node --test scripts/prod-smoke/test_stage2_browser.mjs
+
+      - name: Run L2 real-extension 6-prototype, SW deadlock, and filename-conflict E2E suite
+        if: needs.changes.outputs.run_l2_e2e == 'true'
+        run: node scripts/test-download-browser.mjs check-extension-e2e "$RUNNER_TEMP/l2-extension-e2e"
 
   xhs-dependency-review:
     needs: changes

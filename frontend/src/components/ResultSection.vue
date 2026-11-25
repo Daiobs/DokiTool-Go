@@ -465,16 +465,30 @@ const needsQualitySelection = computed(
     downloadableQualityOptions.value.length > 0,
 );
 
-const targetMessage = computed(() =>
-  isYouTubeHelperBlocked.value
-    ? youtubeHelper.value?.message ||
-      "请先按说明安装并启用 YouTube 助手脚本后下载"
-    : target.value && "message" in target.value
-      ? target.value.message
-      : target.value?.kind === "file"
-        ? ""
-        : "该版本需要处理后下载，暂不能在播放器直接播放",
-);
+const targetMessage = computed(() => {
+  const hasCjk = (value) => /[\u4e00-\u9fff]/.test(String(value || ""));
+  if (isYouTubeHelperBlocked.value) {
+    const helperMsg = youtubeHelper.value?.message;
+    if (helperMsg && !(props.locale === "en" && hasCjk(helperMsg))) {
+      return helperMsg;
+    }
+    return props.locale === "en"
+      ? "Please install and enable the YouTube helper before downloading"
+      : "请先按说明安装并启用 YouTube 助手脚本后下载";
+  }
+  if (target.value && "message" in target.value && target.value.message) {
+    if (props.locale === "en" && hasCjk(target.value.message)) {
+      return "This version requires processing before download and cannot play directly here";
+    }
+    return target.value.message;
+  }
+  if (target.value?.kind === "file") {
+    return "";
+  }
+  return props.locale === "en"
+    ? "This version requires processing before download and cannot play directly here"
+    : "该版本需要处理后下载，暂不能在播放器直接播放";
+});
 const sourceHint = computed(() =>
   t(
     props.locale,
@@ -991,10 +1005,18 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
     >
       <div class="rs-yt-helper-alert-title">
         <AppIcon class="fas fa-exclamation-triangle" />
-        <span>当前网络出口被 YouTube 要求验证，请更换节点后重试</span>
+        <span>{{
+          locale === "en"
+            ? "YouTube requested verification for your current network exit. Switch nodes and retry."
+            : "当前网络出口被 YouTube 要求验证，请更换节点后重试"
+        }}</span>
       </div>
       <p class="rs-yt-helper-alert-desc">
-        本站与助手脚本均采用无 Cookie 匿名请求，不提供也不要求登录 YouTube 账号或导入 Cookie。请切换至未被风控的网络出口节点后重新点击解析。
+        {{
+          locale === "en"
+            ? "This site and helper use cookie-free anonymous requests and never ask for YouTube sign-in or cookies. Switch to an unblocked network exit and parse again."
+            : "本站与助手脚本均采用无 Cookie 匿名请求，不提供也不要求登录 YouTube 账号或导入 Cookie。请切换至未被风控的网络出口节点后重新点击解析。"
+        }}
       </p>
     </div>
     <div

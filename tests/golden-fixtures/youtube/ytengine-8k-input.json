@@ -1,0 +1,71 @@
+{
+  "id": "ytGolden8K01",
+  "title": "Ultra HD 8K60 Golden Input",
+  "uploader": "Cinema8K",
+  "duration": 180,
+  "formats": [
+    {
+      "format_id": "571",
+      "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=571&clen=320000000",
+      "ext": "mp4",
+      "protocol": "https",
+      "width": 7680,
+      "height": 4320,
+      "fps": 60,
+      "tbr": 24000,
+      "filesize": 320000000,
+      "vcodec": "av01.0.16M.08",
+      "acodec": "none"
+    },
+    {
+      "format_id": "401",
+      "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=401&clen=140000000",
+      "ext": "mp4",
+      "protocol": "https",
+      "width": 3840,
+      "height": 2160,
+      "fps": 60,
+      "tbr": 12000,
+      "filesize": 140000000,
+      "vcodec": "av01.0.13M.08",
+      "acodec": "none"
+    },
+    {
+      "format_id": "299",
+      "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=299&clen=48000000",
+      "ext": "mp4",
+      "protocol": "https",
+      "width": 1920,
+      "height": 1080,
+      "fps": 60,
+      "tbr": 4200,
+      "filesize": 48000000,
+      "vcodec": "avc1.64002a",
+      "acodec": "none"
+    },
+    {
+      "format_id": "18",
+      "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=18&clen=9500000",
+      "ext": "mp4",
+      "protocol": "https",
+      "width": 640,
+      "height": 360,
+      "fps": 30,
+      "tbr": 600,
+      "filesize": 9500000,
+      "vcodec": "avc1.42001e",
+      "acodec": "mp4a.40.2"
+    },
+    {
+      "format_id": "140",
+      "url": "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=140&clen=3400000",
+      "ext": "m4a",
+      "protocol": "https",
+      "abr": 128,
+      "tbr": 128,
+      "filesize": 3400000,
+      "vcodec": "none",
+      "acodec": "mp4a.40.2"
+    }
+  ]
+}

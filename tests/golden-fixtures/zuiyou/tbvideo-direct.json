@@ -1,0 +1,52 @@
+{
+  "fixture_id": "zuiyou-tbvideo-direct",
+  "description": "Sanitized Zuiyou/Pipigx tbvideo item requiring M2/M3 extension delegation when connected.",
+  "media": {
+    "schema_version": "1.0",
+    "platform": "zuiyou",
+    "platform_name": "最右",
+    "content_id": "163566379",
+    "title": "搞笑宠物合集测试",
+    "source_url": "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
+    "default_item_id": "zy-1",
+    "items": [
+      {
+        "id": "zy-1",
+        "index": 0,
+        "type": "video",
+        "state": "ready",
+        "duration_ms": 24000,
+        "tbvideo": {
+          "download_hint": true,
+          "url": "https://tbvideo.ixiaochuan.cn/zy/golden-video.mp4"
+        },
+        "default": { "variant_id": "zy-720p", "source_id": "s-zy" },
+        "variants": [
+          {
+            "id": "zy-720p",
+            "label": "720p",
+            "state": "ready",
+            "metadata": {
+              "width": 720,
+              "height": 1280,
+              "container": "mp4",
+              "extension": "mp4",
+              "mime_type": "video/mp4",
+              "has_audio": true
+            },
+            "delivery": {
+              "kind": "file",
+              "sources": [
+                {
+                  "id": "s-zy",
+                  "url": "https://tbvideo.ixiaochuan.cn/zy/golden-video.mp4",
+                  "size_bytes": 5400000
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
