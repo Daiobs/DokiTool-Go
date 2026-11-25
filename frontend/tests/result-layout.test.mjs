@@ -2364,6 +2364,67 @@ test('PR-B1: adaptive HLS/DASH streamCopyUrl copy button, single-HLS copyVideoUr
     vSingleHls.app.unmount();
   }
 
+  // 2b) Unavailable item must NOT render "刷新此条目" button even when top-level resultData.refresh_url is present (P1)
+  const vUnavailable = await mount({
+    platform: 'vimeo',
+    title: 'Unavailable Tier-2',
+    refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F789',
+    default_item_id: 'unavail-1',
+    items: [
+      {
+        id: 'unavail-1',
+        type: 'video',
+        state: 'unavailable',
+        default: null,
+        default_unavailable_reason: 'unavailable',
+        error: { code: 'CONTENT_UNAVAILABLE', message: '作品不可用' },
+      },
+    ],
+  });
+  try {
+    const refreshBtns = vUnavailable.findAll((n) => n.type === 'button' && textOf(n).includes('刷新此条目'));
+    assert.equal(refreshBtns.length, 0, 'unavailable item must never render 刷新此条目 button');
+  } finally {
+    vUnavailable.app.unmount();
+  }
+
+  // 2c) Adaptive HLS/DASH source explicitly marked availability="unavailable" must NOT expose streamCopyUrl (P2)
+  const vUnavailStream = await mount({
+    platform: 'vimeo',
+    title: 'Unavailable Stream Source Guard',
+    default_item_id: 'stream-guard-1',
+    items: [
+      {
+        id: 'stream-guard-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'mp4-720', url: 'https://cdn.vimeo.test/720.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://cdn.vimeo.test/720.mp4', { width: 1280, height: 720, has_audio: true }),
+          {
+            id: 'hls-dead',
+            label: '1080p Dead HLS',
+            metadata: { width: 1920, height: 1080, has_audio: true },
+            delivery: {
+              kind: 'hls',
+              scope: 'adaptive',
+              sources: [{ id: 'dead-1', url: 'https://cdn.vimeo.test/dead.m3u8', availability: 'unavailable' }],
+            },
+          },
+        ],
+      },
+    ],
+  });
+  try {
+    const backupTab = vUnavailStream.findAll((n) => n.type === 'button' && textOf(n).includes('画质'))[0];
+    backupTab.props.onClick();
+    await vUnavailStream.flush();
+    const deadCopyBtns = vUnavailStream.findAll((n) => n.props?.['data-testid'] === 'copy-stream-url-btn');
+    assert.equal(deadCopyBtns.length, 0, 'unavailable HLS source must not expose 复制流链接 button');
+  } finally {
+    vUnavailStream.app.unmount();
+  }
+
   // 3) ExtensionDownloadModal.vue reflects Q5A native_direct disclosure & G1 DNR rules 1006–1008 in zh-CN & en
   const zhCtx = {};
   await renderToString(

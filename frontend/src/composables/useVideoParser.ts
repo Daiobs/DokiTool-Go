@@ -505,12 +505,13 @@ export function useVideoParser(options: {
         import("../services/tbvideo"),
       ]);
     const data = withTbvideoItems(validateMediaEnvelope(rawPayload));
+    const exactMatch = data.items.find((candidate) => candidate.id === item.id);
     const resolved =
-      data.items.find((candidate) => candidate.id === item.id) ||
+      exactMatch ??
       (!rawResolveUrl &&
       data.items.length === 1 &&
       data.items[0].type === item.type
-        ? data.items[0]
+        ? { ...data.items[0], id: item.id }
         : undefined);
     if (!resolved) throw new Error("解析响应缺少所请求条目");
     return resolved;

@@ -905,14 +905,19 @@ test('PR-B1 [G4]: resolveRefreshApiUrl and resolveItem fall back to data.refresh
   assert.equal(requested, '/api/parse?url=https%3A%2F%2Fvimeo.com%2F123&schema_version=1.0');
   assert.equal(resolved.default.url, 'https://vod-progressive.akamaized.net/fresh.mp4');
 
-  // Single matching-type item fallback when Tier-2 item id changes on re-parse
+  // Single matching-type item fallback when Tier-2 item id changes on re-parse preserves original item.id for store.replaceItem & download refresh
+  const { instance: rotInst, store: rotStore } = harness();
+  rotStore.setResult(good({ platform: 'vimeo', refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123', items: [tier2Item] }).data);
   const rotatedItem = file('vimeo-rotated', 'https://vod-progressive.akamaized.net/fresh2.mp4');
   globalThis.fetch = async () => Response.json(good({ platform: 'vimeo', items: [rotatedItem] }));
-  const resolvedRotated = await instance.resolveItem(tier2Item, undefined, {
+  const resolvedRotated = await rotInst.resolveItem(tier2Item, undefined, {
     refreshUrl: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
   });
-  assert.equal(resolvedRotated.id, 'vimeo-rotated');
+  assert.equal(resolvedRotated.id, 'vimeo-1', 'rotated single-item fallback must preserve original item.id');
   assert.equal(resolvedRotated.default.url, 'https://vod-progressive.akamaized.net/fresh2.mp4');
+  assert.equal(rotStore.replaceItem(resolvedRotated, rotStore.resultVersion), true);
+  assert.equal(rotStore.resultData.items[0].id, 'vimeo-1');
+  assert.equal(rotStore.resultData.items[0].default.url, 'https://vod-progressive.akamaized.net/fresh2.mp4');
 });
 
 test('PR-B1: platform mismatch exposes 1-click switchToAllAndRetry while keeping parseError wording and HeroSection button', async () => {

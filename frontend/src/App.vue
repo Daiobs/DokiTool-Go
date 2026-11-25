@@ -140,6 +140,7 @@ const resolveSelectedItem = async (item) => {
   const refreshUrl = videoStore.resultData?.refresh_url?.trim() || "";
   if (
     !item ||
+    item.state === "unavailable" ||
     (!item.resolve_url && !refreshUrl) ||
     videoStore.resolvingItems.has(item.id)
   )

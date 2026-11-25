@@ -88,8 +88,13 @@ export function buildAllQualityOptions(
         const routes = deliveryRoutes(variant.delivery.sources, context);
         if (routes.length > 0) {
           streamCopyUrl = routes[0];
-        } else if (variant.delivery.sources[0]) {
-          streamCopyUrl = sourceUrl(variant.delivery.sources[0], context);
+        } else {
+          const fallbackSource = variant.delivery.sources.find(
+            (src: any) => src?.availability !== "unavailable",
+          );
+          if (fallbackSource) {
+            streamCopyUrl = sourceUrl(fallbackSource, context);
+          }
         }
       } catch {
         streamCopyUrl = "";

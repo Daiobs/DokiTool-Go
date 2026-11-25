@@ -688,13 +688,16 @@ function handleLazyItemResolve(
         showToast(rpc.error || "分集解析失败", "error");
         return null;
       }
+      const exactResolved = rpc.data.media.items.find(
+        (cand) => cand.id === item.id,
+      );
       const rawResolvedItem =
-        rpc.data.media.items.find((cand) => cand.id === item.id) ??
+        exactResolved ??
         (resolveUrl
           ? rpc.data.media.items[0] ?? null
           : rpc.data.media.items.length === 1 &&
               rpc.data.media.items[0].type === item.type
-            ? rpc.data.media.items[0]
+            ? { ...rpc.data.media.items[0], id: item.id }
             : null);
       const resolvedItem: MediaItem | null =
         rawResolvedItem &&

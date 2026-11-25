@@ -5463,6 +5463,71 @@ test('PR-B1 [G4 + CORS guidance]: Tier-2 refresh_url enables handleRefreshDownlo
   );
   assert.ok(fetchedUrls.includes(freshUrl));
 
+  // 1b) End-to-end with real useVideoParser.resolveItem when Tier-2 backend rotates item.id on /api/parse refresh
+  const { useVideoParser } = await vite.ssrLoadModule('/src/composables/useVideoParser.ts');
+  const rotatedFreshUrl = 'https://cdn.vimeo.test/rotated-fresh.mp4';
+  const rotatedFetched = [];
+  const parserStore = {
+    resultData: null,
+    resultVersion: 0,
+    clearResult() { this.resultData = null; this.resultVersion++; },
+    setResult(d) { this.resultData = d; this.resultVersion++; },
+    replaceItem(item, ver) {
+      if (ver !== this.resultVersion || !this.resultData || !this.resultData.items.some((e) => e.id === item.id)) return false;
+      this.resultData = { ...this.resultData, items: this.resultData.items.map((e) => (e.id === item.id ? item : e)) };
+      return true;
+    },
+  };
+  const realParser = useVideoParser({ videoStore: parserStore, locale: ref('zh-CN'), showToast: () => {} });
+  const hRotated = harness(
+    {
+      platform: 'vimeo',
+      title: 'Vimeo Rotated ID Refresh',
+      refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F999',
+      items: [tier2Item],
+    },
+    (item, signal, opts) => realParser.resolveItem(item, signal, opts),
+  );
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    rotatedFetched.push(u);
+    if (u.startsWith('/api/parse?')) {
+      return Response.json({
+        schema_version: '1.0',
+        code: 'OK',
+        data: {
+          platform: 'vimeo',
+          items: [
+            {
+              ...tier2Item,
+              id: 'vimeo-rotated-id-2',
+              variants: [
+                {
+                  ...tier2Item.variants[0],
+                  delivery: { kind: 'file', sources: [{ id: 's1', url: rotatedFreshUrl }] },
+                },
+              ],
+              default: { variant_id: 'hd', source_id: 's1', url: rotatedFreshUrl },
+            },
+          ],
+        },
+      });
+    }
+    if (u === staleUrl) return new Response('expired', { status: 403 });
+    return new Response(new Uint8Array(12), {
+      headers: { 'content-type': 'video/mp4', 'content-length': '12' },
+    });
+  };
+  await hRotated.instance.downloadMainVideo();
+  await settled(hRotated.store.downloads[0]);
+  assert.equal(hRotated.store.downloads[0].status, 'failed');
+  assert.equal(hRotated.store.downloads[0].refreshAvailable, true);
+  await hRotated.instance.handleRefreshDownload(hRotated.store.downloads[0].id);
+  await settled(hRotated.store.downloads[0]);
+  assert.equal(hRotated.store.downloads[0].status, 'completed', 'rotated Tier-2 item.id refresh must preserve slot identity and complete download');
+  assert.ok(rotatedFetched.some((u) => u.startsWith('/api/parse?')));
+  assert.ok(rotatedFetched.includes(rotatedFreshUrl));
+
   // 2) Non-Toutiao CORS-blocked manual fallback keeps statusText="打开源链接" while providing enriched CORS + 视频另存为 + Chrome 扩展 guidance
   const corsUrl = 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=137';
   const corsItem = {

@@ -276,8 +276,10 @@ const copyVideoUrl = computed(() => {
         context,
       );
       if (routes.length > 0) return routes[0];
-      const first = target.value.variant.delivery.sources[0];
-      return first ? sourceUrl(first, context) : "";
+      const fallbackSource = target.value.variant.delivery.sources.find(
+        (src) => src?.availability !== "unavailable",
+      );
+      return fallbackSource ? sourceUrl(fallbackSource, context) : "";
     } catch {
       return "";
     }
@@ -1060,7 +1062,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :player-quality-tag-text="playerQualityTagText"
           :primary-download-label="primaryDownloadLabel"
           :is-resolving="Boolean(isResolving)"
-          :can-refresh-item="Boolean(currentItem?.resolve_url || resultData?.refresh_url)"
+          :can-refresh-item="Boolean(currentItem && currentItem.state !== 'unavailable' && (currentItem.resolve_url || resultData?.refresh_url))"
           :target-message="targetMessage"
           :downloadable-count="downloadableQualityOptions.length"
           :is-you-tube-helper-install-required="isYouTubeHelperInstallRequired"

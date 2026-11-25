@@ -149,7 +149,7 @@ const emit = defineEmits([
         >
           {{ t(locale, "reopenUpgradeNotice") }}</button
         ><button
-          v-if="(canRefreshItem !== undefined ? canRefreshItem : Boolean(currentItem.resolve_url)) && !isResolving"
+          v-if="(canRefreshItem !== undefined ? canRefreshItem : Boolean(currentItem && currentItem.state !== 'unavailable' && currentItem.resolve_url)) && !isResolving"
           class="rs-btn rs-btn--ghost"
           @click="emit('refresh-item', currentItem)"
         >
