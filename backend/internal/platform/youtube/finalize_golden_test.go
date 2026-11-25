@@ -37,7 +37,7 @@ func (g *goldenYouTubeExecutor) Do(_ context.Context, req fetch.Request) (fetch.
 			Body:       []byte(body),
 			URL:        req.URL,
 		}, nil
-	case "https://www.youtube.com/s/player/" + g.playerID + "/player_ias.vflset/en_US/base.js":
+	case "https://www.youtube.com/s/player/" + g.playerID + "/tv-player-ias.vflset/tv-player-ias.js":
 		return fetch.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": {"application/javascript"}},

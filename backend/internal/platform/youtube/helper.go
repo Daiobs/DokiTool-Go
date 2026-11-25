@@ -593,13 +593,9 @@ func (h *Helper) refreshActivePlayer(ctx context.Context) (*playerCacheEntry, er
 	}
 	h.mu.Unlock()
 
-	rawJS, sts, err := h.fetchPlayerJS(ctx, playerID)
+	rawJS, sts, preprocessed, err := h.fetchAndPreprocessPlayerJS(ctx, playerID)
 	if err != nil {
 		return nil, err
-	}
-	preprocessed, err := h.sandbox.PreprocessPlayer(ctx, rawJS)
-	if err != nil {
-		return nil, fmt.Errorf("preprocess player %s: %w", playerID, err)
 	}
 
 	now = h.now()
@@ -678,8 +674,53 @@ func (h *Helper) fetchCurrentPlayerID(ctx context.Context) (string, error) {
 	return strings.ToLower(string(m[1])), nil
 }
 
-func (h *Helper) fetchPlayerJS(ctx context.Context, playerID string) (string, int, error) {
-	targetURL := fmt.Sprintf("https://www.youtube.com/s/player/%s/player_ias.vflset/en_US/base.js", playerID)
+type playerJSVariant struct {
+	name    string
+	urlPath string
+}
+
+// playerJSVariants lists YouTube player script variants in preference order.
+// The TV variant matches our TVHTML5 Innertube client stack and mirrors
+// yt-dlp's default player_js_variant ("tv"), avoiding main-variant AST
+// regressions in yt-dlp/ejs (e.g. yt-dlp/ejs#79 on player b485e332) while
+// keeping the classic web base.js as an automatic fallback.
+var playerJSVariants = []playerJSVariant{
+	{name: "tv", urlPath: "tv-player-ias.vflset/tv-player-ias.js"},
+	{name: "main", urlPath: "player_ias.vflset/en_US/base.js"},
+}
+
+func (h *Helper) fetchAndPreprocessPlayerJS(ctx context.Context, playerID string) (string, int, string, error) {
+	var errs []string
+	for idx, variant := range playerJSVariants {
+		if ctx.Err() != nil {
+			return "", 0, "", ctx.Err()
+		}
+		rawJS, sts, err := h.fetchPlayerJSVariant(ctx, playerID, variant)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", 0, "", ctx.Err()
+			}
+			errs = append(errs, fmt.Sprintf("%s fetch: %v", variant.name, err))
+			continue
+		}
+		preprocessed, err := h.sandbox.PreprocessPlayer(ctx, rawJS)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", 0, "", ctx.Err()
+			}
+			errs = append(errs, fmt.Sprintf("%s preprocess: %v", variant.name, err))
+			continue
+		}
+		if idx > 0 && len(errs) > 0 {
+			log.Printf("WARN: youtube helper player %s fell back to %s variant after %s", playerID, variant.name, strings.Join(errs, "; "))
+		}
+		return rawJS, sts, preprocessed, nil
+	}
+	return "", 0, "", fmt.Errorf("preprocess player %s failed across variants (%s)", playerID, strings.Join(errs, "; "))
+}
+
+func (h *Helper) fetchPlayerJSVariant(ctx context.Context, playerID string, variant playerJSVariant) (string, int, error) {
+	targetURL := fmt.Sprintf("https://www.youtube.com/s/player/%s/%s", playerID, variant.urlPath)
 	resp, err := h.executor.Do(ctx, fetch.Request{
 		Method: http.MethodGet,
 		URL:    targetURL,
@@ -700,15 +741,15 @@ func (h *Helper) fetchPlayerJS(ctx context.Context, playerID string) (string, in
 		return "", 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("player base.js returned status %d", resp.StatusCode)
+		return "", 0, fmt.Errorf("player %s variant returned status %d", variant.name, resp.StatusCode)
 	}
 	m := signatureTimestampPattern.FindSubmatch(resp.Body)
 	if m == nil {
-		return "", 0, errors.New("signatureTimestamp not found in player base.js")
+		return "", 0, fmt.Errorf("signatureTimestamp not found in player %s variant", variant.name)
 	}
 	sts, err := strconv.Atoi(string(m[1]))
 	if err != nil || sts <= 0 {
-		return "", 0, errors.New("invalid signatureTimestamp in player base.js")
+		return "", 0, fmt.Errorf("invalid signatureTimestamp in player %s variant", variant.name)
 	}
 	return string(resp.Body), sts, nil
 }
