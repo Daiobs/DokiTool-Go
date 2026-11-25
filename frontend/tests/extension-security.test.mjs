@@ -3398,3 +3398,232 @@ test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloa
     else globalThis.showSaveFilePicker = prevPicker;
   }
 });
+
+test("Issue #48 PR #50 [F1]: SidePanel saveFilePicker enforces hostWhitelist + redirect validation, full-file 200 checks, anti-HTML/manifest poisoning, truncation abort, and idle timeout", async () => {
+  const saveFilePicker = await bundleTsModule("../src/downloads/saveFilePicker.ts");
+  const allowedOrigins = ["https://snap.dokitool.com"];
+  const validateWhitelisted = (u) =>
+    hostWhitelist.isWhitelistedMediaUrl(u, allowedOrigins).allowed;
+
+  const makeTrackedHandle = () => {
+    let createCalls = 0;
+    let closeCalls = 0;
+    let abortCalls = 0;
+    const writes = [];
+    const handle = {
+      name: "audit.mp4",
+      async createWritable() {
+        createCalls++;
+        return {
+          async write(chunk) { writes.push(new Uint8Array(chunk)); },
+          async close() { closeCalls++; },
+          async abort() { abortCalls++; },
+        };
+      },
+    };
+    return {
+      handle,
+      stats: () => ({ createCalls, closeCalls, abortCalls, writes }),
+    };
+  };
+
+  // 1) SidePanelApp.vue enforces isWhitelistedMediaUrl pre-filter and passes validateUrl into streamRoutesToFileHandle
+  const sidePanelSrc = await readFile(
+    fileURLToPath(new URL("../src/extension/SidePanelApp.vue", import.meta.url)),
+    "utf8",
+  );
+  assert.match(sidePanelSrc, /import\s*\{\s*isWhitelistedMediaUrl\s*\}\s*from\s*["']\.\/hostWhitelist["']/);
+  assert.match(sidePanelSrc, /const\s+whitelistedRoutes\s*=\s*single\.spec\.routes\.filter\(validateWhitelistedUrl\)/);
+  assert.match(sidePanelSrc, /if\s*\(\s*whitelistedRoutes\.length\s*>\s*0\s*\)/);
+  assert.match(sidePanelSrc, /validateUrl:\s*validateWhitelistedUrl/);
+
+  // 2) Non-whitelisted initial URLs, credentials, fragments, manifests, and chrome-extension: relative paths -> 0 fetch, 0 write
+  const prevLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  let blockedFetchCount = 0;
+  try {
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: {
+        protocol: "chrome-extension:",
+        origin: `chrome-extension://${DOKITOOL_EXTENSION_ID}`,
+      },
+    });
+    const hBlocked = makeTrackedHandle();
+    await assert.rejects(
+      saveFilePicker.streamRoutesToFileHandle({
+        handle: hBlocked.handle,
+        routes: [
+          "https://cdn.vimeo.example/video.mp4",
+          "https://user:pass@upos-sz-mirrorcos.bilivideo.com/v.mp4",
+          "https://upos-sz-mirrorcos.bilivideo.com/v.mp4#frag",
+          "https://upos-sz-mirrorcos.bilivideo.com/playlist.m3u8",
+          "https://upos-sz-mirrorcos.bilivideo.com/manifest.mpd",
+          "/manifest.json",
+          "//upos-sz-mirrorcos.bilivideo.com/v.mp4",
+        ],
+        validateUrl: validateWhitelisted,
+        fetchImpl: async () => {
+          blockedFetchCount++;
+          return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+        },
+      }),
+      /安全规则/,
+    );
+    assert.equal(blockedFetchCount, 0, "must make 0 fetch calls for blocked/non-whitelisted/extension-relative routes");
+    assert.equal(hBlocked.stats().createCalls, 0);
+  } finally {
+    if (prevLocation) Object.defineProperty(globalThis, "location", prevLocation);
+    else delete globalThis.location;
+  }
+
+  // 3) 302 redirect (resp.url) escaping to non-whitelisted or loopback host -> body cancelled, 0 writable calls
+  for (const escapedUrl of [
+    "https://rogue-redirect.evil.example/payload.mp4",
+    "http://127.0.0.1:9999/secret.mp4",
+  ]) {
+    let bodyCancelled = false;
+    const hRedirect = makeTrackedHandle();
+    await assert.rejects(
+      saveFilePicker.streamRoutesToFileHandle({
+        handle: hRedirect.handle,
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/start.mp4"],
+        validateUrl: validateWhitelisted,
+        fetchImpl: async () => ({
+          status: 200,
+          ok: true,
+          type: "cors",
+          url: escapedUrl,
+          headers: new Headers({ "content-length": "4" }),
+          body: {
+            async cancel() { bodyCancelled = true; },
+            getReader() { throw new Error("must not read body of rejected redirect"); },
+          },
+        }),
+      }),
+      /重定向目标不在安全白名单内/,
+    );
+    assert.equal(bodyCancelled, true, `must cancel response body for redirected URL ${escapedUrl}`);
+    assert.equal(hRedirect.stats().createCalls, 0);
+    assert.equal(hRedirect.stats().closeCalls, 0);
+  }
+
+  // 4) Non-200 / partial / opaque responses (204, 206, 200+Content-Range) rejected without writing
+  for (const badResp of [
+    () => ({ status: 204, ok: true, type: "cors", url: "", headers: new Headers(), body: null }),
+    () => new Response(new Uint8Array([1, 2]), { status: 206, headers: { "content-range": "bytes 0-1/10" } }),
+    () => new Response(new Uint8Array([1, 2]), { status: 200, headers: { "content-range": "bytes 0-1/10" } }),
+    () => ({ status: 200, ok: true, type: "opaque", url: "", headers: new Headers(), body: { async cancel() {} } }),
+  ]) {
+    const hBad = makeTrackedHandle();
+    await assert.rejects(
+      saveFilePicker.streamRoutesToFileHandle({
+        handle: hBad.handle,
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/bad-status.mp4"],
+        validateUrl: validateWhitelisted,
+        fetchImpl: async () => badResp(),
+      }),
+      /不是完整文件响应/,
+    );
+    assert.equal(hBad.stats().createCalls, 0);
+    assert.equal(hBad.stats().closeCalls, 0);
+  }
+
+  // 5) 200 OK HTML / JSON / #EXTM3U poisoning -> calls writable.abort(), NEVER writable.close()
+  for (const payload of [
+    "<!DOCTYPE html><html><body>403 Forbidden</body></html>",
+    "<html><body>Blocked</body></html>",
+    '{"code":403,"message":"denied"}',
+    '[{"error":"denied"}]',
+    "#EXTM3U\n#EXT-X-VERSION:3\n",
+  ]) {
+    const bytes = new TextEncoder().encode(payload);
+    const hPoison = makeTrackedHandle();
+    await assert.rejects(
+      saveFilePicker.streamRoutesToFileHandle({
+        handle: hPoison.handle,
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/poison.mp4"],
+        validateUrl: validateWhitelisted,
+        fetchImpl: async () =>
+          new Response(bytes, {
+            status: 200,
+            headers: { "content-length": String(bytes.byteLength) },
+          }),
+      }),
+      /页面或播放清单/,
+    );
+    assert.equal(hPoison.stats().abortCalls, 1, `poisoned payload must call writable.abort(): ${payload.slice(0, 16)}`);
+    assert.equal(hPoison.stats().closeCalls, 0, "poisoned payload must NEVER call writable.close()");
+  }
+
+  // 6) Truncated stream (Content-Length mismatch) & 0-byte body -> calls writable.abort(), NEVER writable.close()
+  const hTrunc = makeTrackedHandle();
+  await assert.rejects(
+    saveFilePicker.streamRoutesToFileHandle({
+      handle: hTrunc.handle,
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/trunc.mp4"],
+      validateUrl: validateWhitelisted,
+      fetchImpl: async () => {
+        const stream = new ReadableStream({
+          start(ctrl) {
+            ctrl.enqueue(new Uint8Array([0x00, 0x00, 0x00, 0x18]));
+            ctrl.close();
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-length": "1024" },
+        });
+      },
+    }),
+    /下载不完整/,
+  );
+  assert.equal(hTrunc.stats().abortCalls, 1, "truncated stream must call writable.abort()");
+  assert.equal(hTrunc.stats().closeCalls, 0, "truncated stream must NEVER call writable.close()");
+
+  const hEmpty = makeTrackedHandle();
+  await assert.rejects(
+    saveFilePicker.streamRoutesToFileHandle({
+      handle: hEmpty.handle,
+      routes: ["https://upos-sz-mirrorcos.bilivideo.com/empty.mp4"],
+      validateUrl: validateWhitelisted,
+      fetchImpl: async () =>
+        new Response(new ReadableStream({ start(ctrl) { ctrl.close(); } }), {
+          status: 200,
+        }),
+    }),
+    /下载不完整/,
+  );
+  assert.equal(hEmpty.stats().abortCalls, 1, "0-byte body must call writable.abort()");
+  assert.equal(hEmpty.stats().closeCalls, 0, "0-byte body must NEVER call writable.close()");
+
+  // 7) Per-route idle timeout aborts stalled route 1 and falls back cleanly to route 2
+  const hTimeoutFallback = makeTrackedHandle();
+  let route1Aborted = false;
+  const fallbackRes = await saveFilePicker.streamRoutesToFileHandle({
+    handle: hTimeoutFallback.handle,
+    routes: [
+      "https://upos-sz-mirrorcos.bilivideo.com/slow-route.mp4",
+      "https://upos-sz-mirrorhw.bilivideo.com/fast-route.mp4",
+    ],
+    validateUrl: validateWhitelisted,
+    idleTimeoutMs: 35,
+    fetchImpl: async (url, init) => {
+      if (url.includes("slow-route")) {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            route1Aborted = true;
+            reject(init.signal.reason);
+          });
+        });
+      }
+      return new Response(new Uint8Array([0x00, 0x00, 0x00, 0x20]), {
+        status: 200,
+        headers: { "content-length": "4" },
+      });
+    },
+  });
+  assert.equal(route1Aborted, true, "stalled route 1 must be aborted on idle timeout");
+  assert.equal(fallbackRes.loaded, 4);
+  assert.equal(hTimeoutFallback.stats().closeCalls, 1);
+  assert.equal(hTimeoutFallback.stats().abortCalls, 0);
+});

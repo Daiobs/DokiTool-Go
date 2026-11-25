@@ -483,7 +483,13 @@ func (h *Helper) executeRefreshCall(ctx context.Context, call *playerRefreshCall
 		h.mu.Unlock()
 	}()
 
-	refreshBase := context.WithoutCancel(ctx)
+	h.mu.Lock()
+	bgCtx := h.bgCtx
+	h.mu.Unlock()
+	refreshBase := bgCtx
+	if refreshBase == nil {
+		refreshBase = context.WithoutCancel(ctx)
+	}
 	if ctx.Err() != nil {
 		refreshBase = ctx
 	}
@@ -503,6 +509,7 @@ func (h *Helper) executeRefreshCall(ctx context.Context, call *playerRefreshCall
 				}
 				if graceExpiry.After(served.ExpiresAt) {
 					served.ExpiresAt = graceExpiry
+					h.storeCacheEntryLocked(&served)
 				}
 				log.Printf("WARN: youtube player refresh failed (%v); continuing with stale player %s", err, stale.PlayerID)
 				entry = &served

@@ -44,6 +44,7 @@ import {
   promptSaveFileHandle,
   streamRoutesToFileHandle,
 } from "../downloads/saveFilePicker";
+import { isWhitelistedMediaUrl } from "./hostWhitelist";
 import {
   extractActiveParseUrlsFromText,
   extractSupportedUrlsFromText,
@@ -724,25 +725,39 @@ async function handleEnqueueDownloads(payload: {
     isSaveFilePickerSupported()
   ) {
     const single = payload.items[0];
-    const promptRes = await promptSaveFileHandle(
-      single.spec.filename,
-      single.spec.mimeType,
+    const effectiveAllowedOrigins = Array.from(
+      new Set(
+        [
+          single.spec.apiOrigin,
+          ...(single.spec.extraAllowedOrigins || []),
+        ].filter((origin): origin is string => Boolean(origin && origin.trim())),
+      ),
     );
-    if (promptRes.status === "cancelled") {
-      showToast("已取消另存为", "info");
-      return;
-    }
-    if (promptRes.status === "granted") {
-      showToast("正在通过系统另存为流式直写...", "info");
-      try {
-        await streamRoutesToFileHandle({
-          handle: promptRes.handle,
-          routes: single.spec.routes,
-        });
-        showToast(`已直写保存：${promptRes.suggestedName}`, "success");
+    const validateWhitelistedUrl = (u: string): boolean =>
+      isWhitelistedMediaUrl(u, effectiveAllowedOrigins).allowed;
+    const whitelistedRoutes = single.spec.routes.filter(validateWhitelistedUrl);
+    if (whitelistedRoutes.length > 0) {
+      const promptRes = await promptSaveFileHandle(
+        single.spec.filename,
+        single.spec.mimeType,
+      );
+      if (promptRes.status === "cancelled") {
+        showToast("已取消另存为", "info");
         return;
-      } catch {
-        showToast("流式直写受限，已自动回退后台队列保存", "info");
+      }
+      if (promptRes.status === "granted") {
+        showToast("正在通过系统另存为流式直写...", "info");
+        try {
+          await streamRoutesToFileHandle({
+            handle: promptRes.handle,
+            routes: whitelistedRoutes,
+            validateUrl: validateWhitelistedUrl,
+          });
+          showToast(`已直写保存：${promptRes.suggestedName}`, "success");
+          return;
+        } catch {
+          showToast("流式直写受限，已自动回退后台队列保存", "info");
+        }
       }
     }
   }
