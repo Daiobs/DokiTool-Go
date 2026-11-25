@@ -1,0 +1,127 @@
+name: Upstream canary probe
+
+on:
+  schedule:
+    # Run every 12 hours at 01:30 and 13:30 UTC (09:30 / 21:30 Asia/Shanghai),
+    # offset by 30 minutes from upstream-watch.yml (01:00 UTC).
+    - cron: '30 1,13 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Evaluate probes without creating, updating, or closing the alert Issue'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: dokitool-upstream-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    if: github.repository == 'Daiobs/DokiTool-Go' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the maintained repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify public inventory and offline canary evaluator tests
+        run: |
+          set -euo pipefail
+          python3 -B scripts/check-public-files.py --staged
+          python3 -B -X utf8 -m unittest scripts/tests/test_upstream_canary.py scripts/prod-smoke/test_smoke.py -v
+
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+          cache-dependency-path: |
+            backend/go.mod
+            backend/go.sum
+
+      - name: Install pinned Deno 2.9.8
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/deno"
+          curl --fail --silent --show-error --location \
+            https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-unknown-linux-gnu.zip \
+            --output "$RUNNER_TEMP/deno/deno.zip"
+          unzip -q -o "$RUNNER_TEMP/deno/deno.zip" -d "$RUNNER_TEMP/deno"
+          rm -f "$RUNNER_TEMP/deno/deno.zip"
+          echo "368bca08999e02c6911b8f248167b582276b1f547db5712b6e736d7eda1dbda7  $RUNNER_TEMP/deno/deno" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/deno/deno"
+          first_line="$("$RUNNER_TEMP/deno/deno" --version | head -n 1)"
+          printf '%s\n' "$first_line"
+          case "$first_line" in
+            "deno 2.9.8"|"deno 2.9.8 "*) ;;
+            *)
+              echo "Error: unexpected deno --version first line: $first_line" >&2
+              exit 1
+              ;;
+          esac
+          echo "DOKITOOL_DENO_BINARY=$RUNNER_TEMP/deno/deno" >> "$GITHUB_ENV"
+
+      - name: Run zero-permission Deno/EJS YouTube player canary (tv + main)
+        id: deno_canary
+        run: |
+          set +e
+          report_path="$RUNNER_TEMP/deno-canary.json"
+          rm -f "$report_path"
+          (
+            cd backend
+            DOKITOOL_CANARY_JSON_OUT="$report_path" \
+              go test -mod=readonly -tags canary -count=1 -v \
+                -run '^TestCanaryLiveYouTubePlayerVariants$' \
+                ./internal/platform/youtube
+          )
+          rc=$?
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          echo "report_path=${report_path}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run read-only production smoke probe (platforms, youtube_context, api_boundary)
+        id: prod_smoke
+        run: |
+          set +e
+          report_path="$RUNNER_TEMP/smoke-canary.json"
+          rm -f "$report_path"
+          python3 -B scripts/prod-smoke/smoke.py \
+            --only platforms,youtube_context,api_boundary \
+            --youtube-context-warn-ms 1500 \
+            --youtube-context-fail-ms 5000 \
+            --format json \
+            --json-out "$report_path"
+          rc=$?
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          echo "report_path=${report_path}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Evaluate canary reports and manage debounced alert Issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          DENO_REPORT: ${{ steps.deno_canary.outputs.report_path }}
+          DENO_EXIT_CODE: ${{ steps.deno_canary.outputs.exit_code }}
+          SMOKE_REPORT: ${{ steps.prod_smoke.outputs.report_path }}
+          SMOKE_EXIT_CODE: ${{ steps.prod_smoke.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          args=(
+            --deno-report "$DENO_REPORT"
+            --smoke-report "$SMOKE_REPORT"
+            --deno-exit-code "$DENO_EXIT_CODE"
+            --smoke-exit-code "$SMOKE_EXIT_CODE"
+          )
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 -B scripts/check-upstream-canary.py "${args[@]}"
