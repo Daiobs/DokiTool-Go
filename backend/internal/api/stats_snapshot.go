@@ -185,6 +185,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	ytdlpYoutubeSrc := s.ytdlpYoutubeSrc
 	ytdlpSocialSrc := s.ytdlpSocialSrc
 	ytdlpGenericCompSrc := s.ytdlpGenericCompSrc
+	ytHelperSrc := s.ytHelperSrc
 	shSrc := s.shSrc
 	shGen := s.shSrcGen
 	s.mu.RUnlock()
@@ -210,6 +211,11 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	var ytdlpGenericSnap ytengine.SlotStatsSnapshot
 	if ytdlpGenericSrc != nil {
 		ytdlpGenericSnap = ytdlpGenericSrc.StatsSnapshot()
+	}
+
+	var ytHelperSnap YouTubeHelperStatsSnapshot
+	if ytHelperSrc != nil {
+		ytHelperSnap = ytHelperSrc.HelperStatsSnapshot()
 	}
 
 	cbSnaps := cbSrc.Snapshot(nowRaw)
@@ -344,6 +350,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		YTDLP:           ytdlpSnap,
 		YTDLPGeneric:    ytdlpGenericSnap,
 		YTDLPPools:      ytdlpPools,
+		YouTubeHelper:   ytHelperSnap,
 		CircuitBreakers: cbSnaps,
 		RuntimePolicy:   runtimePolicy,
 		Shanghai:        shSnap,

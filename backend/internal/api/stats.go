@@ -306,6 +306,7 @@ type Stats struct {
 	ytdlpYoutubeSrc        YTDLPStatsSource
 	ytdlpSocialSrc         YTDLPStatsSource
 	ytdlpGenericCompSrc    YTDLPStatsSource
+	ytHelperSrc            YouTubeHelperStatsSource
 	shSrc                  shresolver.StatsProvider
 	shSrcGen               uint64
 	lastSyncedShanghaiHits uint64
@@ -452,6 +453,17 @@ func (s *Stats) SetGenericYTDLPEngine(src YTDLPStatsSource) {
 	}
 	s.mu.Lock()
 	s.ytdlpGenericSrc = src
+	s.mu.Unlock()
+}
+
+// SetYouTubeHelperSource binds the YouTube helper stats source so GET /api/stats
+// exposes proactive refresh counts, cooldown skips, active variant, and challenge LRU telemetry.
+func (s *Stats) SetYouTubeHelperSource(src YouTubeHelperStatsSource) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.ytHelperSrc = src
 	s.mu.Unlock()
 }
 

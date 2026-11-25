@@ -1241,21 +1241,21 @@ func TestYouTubeHelperSpecB1PrewarmSWRAndChallengeLRU(t *testing.T) {
 
 	// 1. Bounded challenge LRU capacity & eviction semantics.
 	lru := newChallengeLRU(3)
-	lru.Put("a5c2aafe", "n", "k1", "v1")
-	lru.Put("a5c2aafe", "n", "k2", "v2")
-	lru.Put("a5c2aafe", "n", "k3", "v3")
-	if v, ok := lru.Get("a5c2aafe", "n", "k1"); !ok || v != "v1" {
+	lru.Put("a5c2aafe", "tv", "d1", "n", "k1", "v1")
+	lru.Put("a5c2aafe", "tv", "d1", "n", "k2", "v2")
+	lru.Put("a5c2aafe", "tv", "d1", "n", "k3", "v3")
+	if v, ok := lru.Get("a5c2aafe", "tv", "d1", "n", "k1"); !ok || v != "v1" {
 		t.Fatalf("expected k1 hit=v1, got ok=%v v=%q", ok, v)
 	}
 	// k2 is now least recently used; inserting k4 must evict k2 and keep Len() == 3.
-	lru.Put("a5c2aafe", "n", "k4", "v4")
+	lru.Put("a5c2aafe", "tv", "d1", "n", "k4", "v4")
 	if lru.Len() != 3 {
 		t.Fatalf("expected bounded len 3, got %d", lru.Len())
 	}
-	if _, ok := lru.Get("a5c2aafe", "n", "k2"); ok {
+	if _, ok := lru.Get("a5c2aafe", "tv", "d1", "n", "k2"); ok {
 		t.Fatal("expected LRU k2 to be evicted")
 	}
-	if v, ok := lru.Get("a5c2aafe", "n", "k1"); !ok || v != "v1" {
+	if v, ok := lru.Get("a5c2aafe", "tv", "d1", "n", "k1"); !ok || v != "v1" {
 		t.Fatalf("expected recently touched k1 to remain cached, got ok=%v v=%q", ok, v)
 	}
 
@@ -1546,5 +1546,146 @@ func TestYouTubeHelperPlayerJSVariantPreferenceAndFallback(t *testing.T) {
 	if bothFailExec.tvPlayerJSHits.Load() != 1 || bothFailExec.mainPlayerJSHits.Load() != 1 {
 		t.Fatalf("expected both variants attempted once, got tv=%d main=%d",
 			bothFailExec.tvPlayerJSHits.Load(), bothFailExec.mainPlayerJSHits.Load())
+	}
+}
+
+func TestYouTubeHelperGovernanceWave1Hardening(t *testing.T) {
+	sb := newTestSandbox(t)
+	playerJS, err := os.ReadFile(filepath.Join("testdata", "player_base_fixture.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sampleJSON, err := os.ReadFile(filepath.Join("testdata", "finalize_sample_46.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. M2 Refresh-time Solve Smoke Probe: a tv variant that passes AST preprocessing
+	// cleanly yet throws at runtime inside the n-solver must automatically fall back to
+	// main base.js during refresh (keeping Finalize zero-network and sts-consistent).
+	brokenNSolverTVJS := []byte(`var _yt_player={};
+(function(g){
+  var window=this;
+  g.sts={signatureTimestamp:20779};
+  function U(u){this.m={};}
+  U.prototype.set=function(k,v){this.m[k]=v;};
+  U.prototype.get=function(k){return this.m[k];};
+  U.prototype.clone=function(){return new U("");};
+  U.prototype.apply=function(){
+    if(this.m.s){var d=decodeURIComponent(this.m.s);this.m.s=encodeURIComponent("SOLVED_SIG_"+d.split("").reverse().join(""));}
+    if(this.m.n){throw new TypeError("simulated tv n-solver runtime failure");}
+  };
+  var makeUrl=function(raw,k,v){
+    var u=new U(raw);
+    u.set("alr","yes");
+    if(k&&v!==undefined){u.set(k,v);}
+    return u;
+  };
+})(_yt_player);`)
+	// Confirm brokenNSolverTVJS genuinely passes plain PreprocessPlayer so the test proves
+	// the Solve smoke probe (not AST syntax rejection) triggered the fallback.
+	if _, preErr := sb.PreprocessPlayer(context.Background(), string(brokenNSolverTVJS)); preErr != nil {
+		t.Fatalf("expected brokenNSolverTVJS to pass plain PreprocessPlayer, got: %v", preErr)
+	}
+	probeFallbackExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		tvPlayerJS:   brokenNSolverTVJS,
+		playerBaseJS: playerJS,
+	}
+	probeNow := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	probeHelper, err := NewHelper(probeFallbackExec, sb, func() time.Time { return probeNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	pPayload, pStatus := probeHelper.Context(context.Background())
+	if pStatus != http.StatusOK {
+		t.Fatalf("Context after n-probe fallback = %d, want 200 (%#v)", pStatus, pPayload)
+	}
+	if probeFallbackExec.tvPlayerJSHits.Load() != 1 || probeFallbackExec.mainPlayerJSHits.Load() != 1 {
+		t.Fatalf("expected tv=1 main=1 on n-probe fallback, got tv=%d main=%d",
+			probeFallbackExec.tvPlayerJSHits.Load(), probeFallbackExec.mainPlayerJSHits.Load())
+	}
+	probeStats := probeHelper.HelperStatsSnapshot()
+	if probeStats.ActiveVariant != "main" || !probeStats.ActivePlayerCached || probeStats.RefreshSuccesses != 1 {
+		t.Fatalf("unexpected stats after n-probe fallback: %+v", probeStats)
+	}
+	if finPayload, finStatus := probeHelper.Finalize(context.Background(), sampleJSON, false); finStatus != http.StatusOK {
+		t.Fatalf("Finalize after n-probe fallback = %d, want 200 (%#v)", finStatus, finPayload)
+	}
+
+	// 2. M1 Exponential Failure Cooldown & Telemetry: cold refresh failure activates 5s cooldown
+	// so immediate retries fail fast without hammering upstream or Deno.
+	var nowMu sync.Mutex
+	coolNow := time.Date(2026, 11, 25, 11, 0, 0, 0, time.UTC)
+	coolExec := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+	}
+	coolExec.failRefresh.Store(true)
+	coolHelper, err := NewHelper(coolExec, sb, func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return coolNow
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, st := coolHelper.Context(context.Background()); st != http.StatusBadGateway {
+		t.Fatalf("first failing Context = %d, want 502", st)
+	}
+	hitsAfterFirstFail := coolExec.iframeHits.Load()
+	if hitsAfterFirstFail != 1 {
+		t.Fatalf("expected 1 iframe hit after first fail, got %d", hitsAfterFirstFail)
+	}
+	// Immediate second Context within 5s cooldown must NOT hit upstream.
+	if _, st := coolHelper.Context(context.Background()); st != http.StatusBadGateway {
+		t.Fatalf("cooldown Context = %d, want 502", st)
+	}
+	if coolExec.iframeHits.Load() != hitsAfterFirstFail {
+		t.Fatalf("cooldown retry hit upstream: got %d, want %d", coolExec.iframeHits.Load(), hitsAfterFirstFail)
+	}
+	coolStats := coolHelper.HelperStatsSnapshot()
+	if !coolStats.InCooldown || coolStats.CooldownSkips != 1 || coolStats.RefreshFailures != 1 || coolStats.ConsecutiveFailures != 1 {
+		t.Fatalf("unexpected cooldown stats: %+v", coolStats)
+	}
+	// Advance clock by 5s and recover upstream -> retry succeeds and clears cooldown.
+	nowMu.Lock()
+	coolNow = coolNow.Add(5 * time.Second)
+	nowMu.Unlock()
+	coolExec.failRefresh.Store(false)
+	if _, st := coolHelper.Context(context.Background()); st != http.StatusOK {
+		t.Fatalf("post-cooldown recovered Context = %d, want 200", st)
+	}
+	recoveredStats := coolHelper.HelperStatsSnapshot()
+	if recoveredStats.InCooldown || recoveredStats.ConsecutiveFailures != 0 || recoveredStats.RefreshSuccesses != 1 {
+		t.Fatalf("unexpected recovered stats: %+v", recoveredStats)
+	}
+
+	// 3. M6 Variant + Preprocessed Digest Namespaced LRU & MaxPlayerRenewalAge (24h) Cap.
+	lru := newChallengeLRU(16)
+	lru.Put("a5c2aafe", "tv", "digest_tv_1", "n", "ch1", "val_tv")
+	if got, ok := lru.Get("a5c2aafe", "main", "digest_main_1", "n", "ch1"); ok || got != "" {
+		t.Fatalf("expected cross-variant LRU miss, got (%q, %v)", got, ok)
+	}
+	if got, ok := lru.Get("a5c2aafe", "tv", "digest_tv_2", "n", "ch1"); ok || got != "" {
+		t.Fatalf("expected cross-digest LRU miss, got (%q, %v)", got, ok)
+	}
+	if got, ok := lru.Get("a5c2aafe", "tv", "digest_tv_1", "n", "ch1"); !ok || got != "val_tv" {
+		t.Fatalf("expected exact variant+digest LRU hit, got (%q, %v)", got, ok)
+	}
+	// Advance coolHelper past MaxPlayerRenewalAge (24h) via successive renewals with unchanged player_id;
+	// refreshActivePlayer must eventually force a fresh player JS fetch instead of renewing forever.
+	initialPlayerFetches := coolExec.playerJSHits.Load()
+	for step := 0; step < 5; step++ {
+		nowMu.Lock()
+		coolNow = coolNow.Add(DefaultPlayerCacheTTL - 30*time.Minute)
+		nowMu.Unlock()
+		if _, err := coolHelper.refreshActivePlayer(context.Background()); err != nil {
+			t.Fatalf("refreshActivePlayer step %d failed: %v", step, err)
+		}
+	}
+	if coolExec.playerJSHits.Load() <= initialPlayerFetches {
+		t.Fatalf("expected MaxPlayerRenewalAge (24h) to force fresh player JS fetch (initial=%d, final=%d)",
+			initialPlayerFetches, coolExec.playerJSHits.Load())
 	}
 }

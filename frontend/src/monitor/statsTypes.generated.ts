@@ -157,6 +157,22 @@ export interface YTDLPPoolsSnapshot {
   youtube_ejs: YTDLPCompartmentPoolSnapshot;
 }
 
+export interface YouTubeHelperStatsSnapshot {
+  enabled: boolean;
+  disabled_by_config: boolean;
+  active_player_cached: boolean;
+  active_variant: string;
+  refresh_attempts: number;
+  refresh_successes: number;
+  refresh_failures: number;
+  cooldown_skips: number;
+  consecutive_failures: number;
+  in_cooldown: boolean;
+  challenge_lru_entries: number;
+  challenge_lru_hits: number;
+  challenge_lru_misses: number;
+}
+
 export interface CircuitBreakerPlatformSnapshot {
   platform: string;
   state: CircuitBreakerState;
@@ -283,6 +299,7 @@ export interface StatsSnapshot {
   ytdlp: YTDLPStatsSnapshot;
   ytdlp_generic?: YTDLPStatsSnapshot;
   ytdlp_pools?: YTDLPPoolsSnapshot;
+  youtube_helper?: YouTubeHelperStatsSnapshot;
   circuit_breakers?: CircuitBreakerPlatformSnapshot[];
   runtime_policy?: RuntimePolicySummary;
   shanghai: ShanghaiStatsSnapshot;

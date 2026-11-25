@@ -247,6 +247,28 @@ func (m *circuitBreakerManager) IsDisabled(platform string) bool {
 	return disabled
 }
 
+// IsOpen reports whether platform is currently in an active automatic circuit-open
+// window at now without mutating half-open probe state. Used by background tasks
+// (such as YouTube helper proactive refresh) to stand down during upstream outages.
+func (m *circuitBreakerManager) IsOpen(platform string, now time.Time) bool {
+	if m == nil || platform == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, disabled := m.disabled[platform]; disabled {
+		return true
+	}
+	if !m.cfg.Enabled {
+		return false
+	}
+	st, ok := m.states[platform]
+	if !ok {
+		return false
+	}
+	return st.state == CircuitStateOpen && now.Before(st.openUntil)
+}
+
 // Allow checks whether an upstream call for platform is permitted at now.
 // When allowed is false, retryAfterSec is >= 1 (30s when disabled_by_config).
 // When halfOpenGen > 0, callers MUST call Finish(platform, code, halfOpenGen, finishNow)

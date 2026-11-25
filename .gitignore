@@ -423,6 +423,8 @@
 !/backend/internal/api/pipigx_http_test.go
 !/backend/internal/api/pipixia_http_test.go
 !/backend/internal/api/platform_traits.go
+!/backend/internal/api/route_policy.go
+!/backend/internal/api/route_policy_test.go
 !/backend/internal/api/runtime_config.go
 !/backend/internal/api/runtime_config_test.go
 !/backend/internal/api/stats.go
@@ -864,12 +866,16 @@
 !/backend/internal/platform/xiaohongshu/wire.go
 !/backend/internal/platform/xiaohongshu/wire_test.go
 /backend/internal/platform/youtube/*
+!/backend/internal/platform/youtube/challenge_lru.go
 !/backend/internal/platform/youtube/ejs_sandbox.go
+!/backend/internal/platform/youtube/finalize.go
 !/backend/internal/platform/youtube/finalize_golden_test.go
+!/backend/internal/platform/youtube/finalize_media.go
 !/backend/internal/platform/youtube/helper.go
 !/backend/internal/platform/youtube/helper_test.go
 !/backend/internal/platform/youtube/parser.go
 !/backend/internal/platform/youtube/parser_test.go
+!/backend/internal/platform/youtube/player_cache.go
 !/backend/internal/platform/youtube/testdata/
 /backend/internal/platform/ytgeneric/*
 !/backend/internal/platform/ytgeneric/generic_named.go
