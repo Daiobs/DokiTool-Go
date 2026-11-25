@@ -681,11 +681,14 @@
 !/frontend/src/generated/platform-catalog.json
 /frontend/src/monitor/*
 !/frontend/src/monitor/MonitorApp.vue
+!/frontend/src/monitor/chartGeometry.ts
+!/frontend/src/monitor/components/
 !/frontend/src/monitor/main.ts
 !/frontend/src/monitor/monitor.css
 !/frontend/src/monitor/monitorStorage.ts
 !/frontend/src/monitor/statsTypes.generated.ts
 !/frontend/src/monitor/statsTypes.ts
+!/frontend/src/monitor/statsValidation.ts
 /frontend/src/services/*
 !/frontend/src/services/apiConfig.ts
 !/frontend/src/services/extensionBridge.ts
@@ -985,6 +988,9 @@
 !/frontend/src/extension/components/SidePanelHeader.vue
 !/frontend/src/extension/components/SidePanelResult.vue
 !/frontend/src/extension/components/SidePanelSettings.vue
+/frontend/src/monitor/components/*
+!/frontend/src/monitor/components/ProtectionPolicySection.vue
+!/frontend/src/monitor/components/YouTubeHelperCard.vue
 /frontend/tests/fixtures/download/*
 !/frontend/tests/fixtures/download/one-frame-audio.m4a
 !/frontend/tests/fixtures/download/one-frame-avc.mp4

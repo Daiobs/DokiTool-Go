@@ -1,6 +1,6 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1203,28 +1203,43 @@ test("monitorStorage: dual-tier storage semantics, theme sync, URL strip, token 
 // 3. Static CSP, Security & Isolation Audit
 // ============================================================================
 
-test("static CSP & isolation audit: zero inline script/style/v-show/v-html and zero ../extension imports", () => {
+test("static CSP & isolation audit: zero inline script/style/v-show/v-html and zero ../extension imports across all src/monitor/** files", () => {
   const monitorHtml = readFileSync(resolve(FRONTEND_DIR, "monitor.html"), "utf8");
-  const monitorVue = readFileSync(
-    resolve(FRONTEND_DIR, "src/monitor/MonitorApp.vue"),
-    "utf8",
-  );
-  const monitorCss = readFileSync(
-    resolve(FRONTEND_DIR, "src/monitor/monitor.css"),
-    "utf8",
-  );
-  const statsTs = readFileSync(
-    resolve(FRONTEND_DIR, "src/monitor/statsTypes.ts"),
-    "utf8",
-  );
-  const storageTs = readFileSync(
-    resolve(FRONTEND_DIR, "src/monitor/monitorStorage.ts"),
-    "utf8",
-  );
-  const mainTs = readFileSync(
-    resolve(FRONTEND_DIR, "src/monitor/main.ts"),
-    "utf8",
-  );
+  const monitorDir = resolve(FRONTEND_DIR, "src/monitor");
+
+  const requiredMonitorFiles = [
+    "MonitorApp.vue",
+    "components/YouTubeHelperCard.vue",
+    "components/ProtectionPolicySection.vue",
+    "monitor.css",
+    "statsTypes.ts",
+    "statsValidation.ts",
+    "chartGeometry.ts",
+    "monitorStorage.ts",
+    "main.ts",
+  ];
+
+  const walkMonitorRelFiles = (dir, prefix = "") => {
+    const out = [];
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        out.push(...walkMonitorRelFiles(resolve(dir, ent.name), rel));
+      } else if (ent.isFile()) {
+        out.push(rel);
+      }
+    }
+    return out.sort();
+  };
+
+  const allMonitorRelFiles = walkMonitorRelFiles(monitorDir);
+  for (const reqFile of requiredMonitorFiles) {
+    assert.equal(
+      allMonitorRelFiles.includes(reqFile),
+      true,
+      `expected ${reqFile} to exist under src/monitor/`,
+    );
+  }
 
   // monitor.html meta hardening
   assert.match(
@@ -1256,30 +1271,41 @@ test("static CSP & isolation audit: zero inline script/style/v-show/v-html and z
   assert.match(scriptTags[0], /\bsrc="\/src\/monitor\/main\.ts"/);
   assert.match(scriptTags[0], />\s*<\/script>/);
 
-  // MonitorApp.vue: ZERO inline style, :style, v-show, v-html, innerHTML, extension settings copy
-  assert.equal(/\bstyle\s*=/i.test(monitorVue), false, "zero inline style=");
-  assert.equal(/:style\s*=/i.test(monitorVue), false, "zero dynamic :style=");
-  assert.equal(/v-bind:style/i.test(monitorVue), false, "zero v-bind:style");
-  assert.equal(/\bv-show\b/i.test(monitorVue), false, "zero v-show (violates strict CSP style-src 'self')");
-  assert.equal(/\bv-html\b/i.test(monitorVue), false, "zero v-html");
-  assert.equal(/\binnerHTML\b/.test(monitorVue), false, "zero innerHTML");
-  assert.equal(monitorVue.includes("扩展侧边栏"), false);
-  assert.equal(monitorVue.includes("点击右上角「设置」"), false);
-  assert.equal(monitorVue.includes("chrome-extension://"), false);
-
-  // ZERO imports from ../extension/* anywhere in src/monitor/
-  for (const [name, content] of [
-    ["MonitorApp.vue", monitorVue],
-    ["monitor.css", monitorCss],
-    ["statsTypes.ts", statsTs],
-    ["monitorStorage.ts", storageTs],
-    ["main.ts", mainTs],
-  ]) {
+  // Scan ALL files under src/monitor/ for strict CSP, read-only & zero extension coupling
+  for (const relPath of allMonitorRelFiles) {
+    const content = readFileSync(resolve(monitorDir, relPath), "utf8");
+    assert.equal(/\bstyle\s*=/i.test(content), false, `${relPath}: zero inline style=`);
+    assert.equal(/:style\s*=/i.test(content), false, `${relPath}: zero dynamic :style=`);
+    assert.equal(/v-bind:style/i.test(content), false, `${relPath}: zero v-bind:style`);
     assert.equal(
-      content.includes("../extension"),
+      /\bv-show\b/i.test(content),
       false,
-      `${name} must not import anything from ../extension/*`,
+      `${relPath}: zero v-show (violates strict CSP style-src 'self')`,
     );
+    assert.equal(/\bv-html\b/i.test(content), false, `${relPath}: zero v-html`);
+    assert.equal(/\binnerHTML\b/.test(content), false, `${relPath}: zero innerHTML`);
+    assert.equal(
+      content.includes("../extension") || content.includes("../../extension"),
+      false,
+      `${relPath}: must not import anything from ../extension/* or ../../extension/*`,
+    );
+    if (relPath.endsWith(".vue")) {
+      assert.equal(
+        content.includes("扩展侧边栏"),
+        false,
+        `${relPath}: zero extension sidebar copy`,
+      );
+      assert.equal(
+        content.includes("点击右上角「设置」"),
+        false,
+        `${relPath}: zero extension settings copy`,
+      );
+      assert.equal(
+        content.includes("chrome-extension://"),
+        false,
+        `${relPath}: zero chrome-extension:// URLs`,
+      );
+    }
   }
 });
 
@@ -1980,6 +2006,702 @@ test("Post-#37: statsTypes & MonitorApp.vue render ytdlp_pools, stale_hits, circ
       0,
       "strict CSP requires zero inline style attributes anywhere in MonitorApp.vue",
     );
+  } finally {
+    mounted.unmount();
+  }
+});
+
+// ============================================================================
+// 5. Batch A PR A2: YouTube Helper Telemetry & Tier-2 Generic Circuit Breaker
+// ============================================================================
+
+function createYouTubeHelperStats(overrides = {}) {
+  return {
+    enabled: true,
+    disabled_by_config: false,
+    active_player_cached: true,
+    active_variant: "tv",
+    refresh_attempts: 20,
+    refresh_successes: 19,
+    refresh_failures: 1,
+    cooldown_skips: 0,
+    consecutive_failures: 0,
+    in_cooldown: false,
+    challenge_lru_entries: 1024,
+    challenge_lru_hits: 900,
+    challenge_lru_misses: 100,
+    ...overrides,
+  };
+}
+
+function createGenericCircuitBreaker(overrides = {}) {
+  return {
+    platform: "ytdlp_generic",
+    state: "closed",
+    consecutive_failures: 0,
+    window_failures: 1,
+    window_total: 25,
+    open_until: "",
+    disabled_by_config: false,
+    ...overrides,
+  };
+}
+
+function assertUnlockedReadOnlyAndStrictCsp(mounted, contextLabel) {
+  const writeControls = mounted.findAll((n) =>
+    ["form", "input", "select", "textarea", "script"].includes(n.type),
+  );
+  assert.equal(
+    writeControls.length,
+    0,
+    `${contextLabel}: unlocked /monitor dashboard must be 100% read-only with zero form/input/select/textarea/script controls`,
+  );
+  const nodesWithInlineStyle = mounted.findAll(
+    (n) => n.props && ("style" in n.props || Object.keys(n.style || {}).length > 0),
+  );
+  assert.equal(
+    nodesWithInlineStyle.length,
+    0,
+    `${contextLabel}: strict CSP requires zero inline style attributes on rendered nodes`,
+  );
+}
+
+test("PR A2: validation guards (isValidStatsSnapshot, isValidYouTubeHelperStats, isValidGenericCircuitBreaker) and formatters cover all states & invalid shapes", () => {
+  // Valid 13-field youtube_helper across allowed variants ("tv", "main", "")
+  const healthyHelper = createYouTubeHelperStats();
+  assert.equal(statsTypes.isValidYouTubeHelperStats(healthyHelper), true);
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ active_variant: "main" })),
+    true,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ active_variant: "" })),
+    true,
+  );
+
+  // Reject invalid youtube_helper shapes
+  assert.equal(statsTypes.isValidYouTubeHelperStats(null), false);
+  assert.equal(statsTypes.isValidYouTubeHelperStats([]), false);
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ active_variant: "bogus" })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ refresh_attempts: -1 })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ refresh_successes: NaN })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ challenge_lru_entries: -5 })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ challenge_lru_hits: Infinity })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ consecutive_failures: -1 })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ cooldown_skips: -2 })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ enabled: "true" })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidYouTubeHelperStats(createYouTubeHelperStats({ in_cooldown: 0 })),
+    false,
+  );
+
+  // Reject when ANY of the 13 required fields is missing
+  const all13Fields = Object.keys(healthyHelper);
+  assert.equal(all13Fields.length, 13);
+  for (const field of all13Fields) {
+    const missingOne = createYouTubeHelperStats();
+    delete missingOne[field];
+    assert.equal(
+      statsTypes.isValidYouTubeHelperStats(missingOne),
+      false,
+      `youtube_helper missing required field "${field}" must be rejected`,
+    );
+  }
+
+  // Valid generic_circuit_breaker across states
+  assert.equal(statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker()), true);
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(
+      createGenericCircuitBreaker({ state: "open", open_until: "2026-11-25T10:00:00Z" }),
+    ),
+    true,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(
+      createGenericCircuitBreaker({ state: "half_open", disabled_by_config: true }),
+    ),
+    true,
+  );
+
+  // Reject invalid generic_circuit_breaker shapes (wrong platform, invalid state, negative/NaN)
+  assert.equal(statsTypes.isValidGenericCircuitBreaker(null), false);
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker({ platform: "vimeo" })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker({ platform: "youtube" })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker({ state: "tripped" })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(
+      createGenericCircuitBreaker({ consecutive_failures: -1 }),
+    ),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker({ window_failures: NaN })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(createGenericCircuitBreaker({ window_total: -3 })),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidGenericCircuitBreaker(
+      createGenericCircuitBreaker({ disabled_by_config: "no" }),
+    ),
+    false,
+  );
+
+  // isValidStatsSnapshot: valid with both fields + rolling-upgrade compat (both undefined) + invalid rejection
+  const fullSnap = createRichStatsSnapshot({
+    youtube_helper: healthyHelper,
+    generic_circuit_breaker: createGenericCircuitBreaker(),
+  });
+  assert.equal(statsTypes.isValidStatsSnapshot(fullSnap), true);
+
+  const rollingUpgradeSnap = createRichStatsSnapshot();
+  assert.equal(rollingUpgradeSnap.youtube_helper, undefined);
+  assert.equal(rollingUpgradeSnap.generic_circuit_breaker, undefined);
+  assert.equal(statsTypes.isValidStatsSnapshot(rollingUpgradeSnap), true);
+
+  assert.equal(
+    statsTypes.isValidStatsSnapshot(
+      createRichStatsSnapshot({
+        youtube_helper: createYouTubeHelperStats({ active_variant: "bogus" }),
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidStatsSnapshot(
+      createRichStatsSnapshot({
+        youtube_helper: createYouTubeHelperStats({ challenge_lru_misses: -1 }),
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidStatsSnapshot(
+      createRichStatsSnapshot({
+        generic_circuit_breaker: createGenericCircuitBreaker({ platform: "vimeo" }),
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    statsTypes.isValidStatsSnapshot(
+      createRichStatsSnapshot({
+        generic_circuit_breaker: createGenericCircuitBreaker({ state: "broken" }),
+      }),
+    ),
+    false,
+  );
+
+  // formatYouTubeHelperBadge across all precedence states
+  assert.equal(statsTypes.YOUTUBE_HELPER_CHALLENGE_LRU_CAPACITY, 4096);
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: true,
+      disabled_by_config: true,
+      active_player_cached: true,
+      in_cooldown: true,
+    }),
+    { label: "运维已禁用", tone: "danger" },
+  );
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: false,
+      disabled_by_config: false,
+      active_player_cached: false,
+      in_cooldown: false,
+    }),
+    { label: "未启用", tone: "muted" },
+  );
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: true,
+      disabled_by_config: false,
+      active_player_cached: true,
+      in_cooldown: true,
+    }),
+    { label: "冷却退避中", tone: "warn" },
+  );
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: true,
+      disabled_by_config: false,
+      active_player_cached: false,
+      in_cooldown: true,
+    }),
+    { label: "冷却退避中", tone: "danger" },
+  );
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: true,
+      disabled_by_config: false,
+      active_player_cached: true,
+      in_cooldown: false,
+    }),
+    { label: "预热就绪", tone: "ok" },
+  );
+  assert.deepEqual(
+    statsTypes.formatYouTubeHelperBadge({
+      enabled: true,
+      disabled_by_config: false,
+      active_player_cached: false,
+      in_cooldown: false,
+    }),
+    { label: "待预热", tone: "warn" },
+  );
+
+  // formatYouTubeHelperVariant across "tv", "main", "", null/undefined, and unknown variant
+  assert.deepEqual(statsTypes.formatYouTubeHelperVariant("tv"), {
+    label: "tv",
+    detail: "TV 首选变体",
+    tone: "ok",
+    isDegraded: false,
+  });
+  assert.deepEqual(statsTypes.formatYouTubeHelperVariant("main"), {
+    label: "main（降级回退）",
+    detail: "TV 不可用，已自动回退主站播放器",
+    tone: "warn",
+    isDegraded: true,
+  });
+  assert.deepEqual(statsTypes.formatYouTubeHelperVariant(""), {
+    label: "—",
+    detail: "尚未缓存活动变体",
+    tone: "muted",
+    isDegraded: false,
+  });
+  assert.deepEqual(statsTypes.formatYouTubeHelperVariant(undefined), {
+    label: "—",
+    detail: "尚未缓存活动变体",
+    tone: "muted",
+    isDegraded: false,
+  });
+  assert.deepEqual(statsTypes.formatYouTubeHelperVariant("web_embedded"), {
+    label: "web_embedded",
+    detail: "非默认变体",
+    tone: "warn",
+    isDegraded: true,
+  });
+});
+
+test("PR A2 MonitorApp.vue: healthy tv + closed generic breaker renders all 13 fields, SVG LRU bar, G3 isolation, and strict CSP/read-only", async () => {
+  const healthyStats = createRichStatsSnapshot({
+    youtube_helper: createYouTubeHelperStats({
+      active_variant: "tv",
+      refresh_attempts: 20,
+      refresh_successes: 19,
+      refresh_failures: 1,
+      consecutive_failures: 0,
+      cooldown_skips: 0,
+      in_cooldown: false,
+      challenge_lru_entries: 1024,
+      challenge_lru_hits: 900,
+      challenge_lru_misses: 100,
+    }),
+    circuit_breakers: [
+      {
+        platform: "douyin",
+        state: "closed",
+        consecutive_failures: 0,
+        window_failures: 0,
+        window_total: 12,
+        open_until: "",
+        disabled_by_config: false,
+      },
+      {
+        platform: "youtube",
+        state: "closed",
+        consecutive_failures: 0,
+        window_failures: 1,
+        window_total: 20,
+        open_until: "",
+        disabled_by_config: false,
+      },
+    ],
+    generic_circuit_breaker: createGenericCircuitBreaker({
+      state: "closed",
+      consecutive_failures: 0,
+      window_failures: 1,
+      window_total: 25,
+    }),
+  });
+
+  globalThis.localStorage.setItem(
+    monitorStorage.OWNER_TOKEN_LOCAL_KEY,
+    VALID_OWNER_TOKEN,
+  );
+  const fetchMethods = [];
+  globalThis.fetch = async (_url, init) => {
+    fetchMethods.push(init?.method || "GET");
+    return new Response(
+      JSON.stringify({ schema_version: "1.0", code: "OK", data: healthyStats }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  const mounted = mountSfcTree(MonitorApp);
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    assert.deepEqual(fetchMethods, ["GET"]);
+
+    // YouTubeHelperCard rendered cleanly in healthy tv state
+    const ytCard = mounted.findByTestId("card-youtube-helper")[0];
+    assert.ok(ytCard);
+    const statusBadge = mounted.findByTestId("yt-helper-status-badge")[0];
+    assert.ok(statusBadge);
+    assert.equal(mounted.textOf(statusBadge).trim(), "预热就绪");
+    assert.match(String(statusBadge.props.class || ""), /\bsp-badge--saved\b/);
+
+    const variantBadge = mounted.findByTestId("yt-helper-variant-badge")[0];
+    assert.ok(variantBadge);
+    assert.equal(mounted.textOf(variantBadge).trim(), "tv");
+    assert.equal(variantBadge.props["data-variant"], "tv");
+    assert.equal(
+      String(variantBadge.props.class || "").includes("mon-yth-variant-badge--degraded"),
+      false,
+    );
+
+    // Zero alert banners in healthy state
+    assert.equal(mounted.findByTestId("yt-helper-disabled-banner").length, 0);
+    assert.equal(mounted.findByTestId("yt-helper-cooldown-banner").length, 0);
+    assert.equal(mounted.findByTestId("yt-helper-degraded-banner").length, 0);
+
+    // All 13 data-yt-helper-field elements present
+    const fieldNames = mounted
+      .findAll((n) => typeof n.props?.["data-yt-helper-field"] === "string")
+      .map((n) => n.props["data-yt-helper-field"])
+      .sort();
+    assert.deepEqual(fieldNames, [
+      "active_player_cached",
+      "active_variant",
+      "challenge_lru_entries",
+      "challenge_lru_hits",
+      "challenge_lru_misses",
+      "consecutive_failures",
+      "cooldown_skips",
+      "disabled_by_config",
+      "enabled",
+      "in_cooldown",
+      "refresh_attempts",
+      "refresh_failures",
+      "refresh_successes",
+    ]);
+
+    // Pure SVG <rect> LRU bar (1024 / 4096 = 25.0%)
+    const lruSvg = mounted.findByTestId("yt-helper-lru-bar")[0];
+    assert.ok(lruSvg);
+    assert.equal(lruSvg.type, "svg");
+    const rects = mounted.findAll((n) => n.type === "rect", lruSvg);
+    assert.equal(rects.length, 2);
+    assert.equal(String(rects[0].props.width), "100");
+    assert.equal(Number(rects[1].props.width), 25);
+    assert.match(String(rects[1].props.class || ""), /\bmon-bar-fill--ok\b/);
+
+    const ytCardText = mounted.textOf(ytCard);
+    assert.match(ytCardText, /成功率 95\.0%/);
+    assert.match(ytCardText, /命中率 90\.0%/);
+    assert.match(ytCardText, /1024 \/\s*4096（25\.0%）/);
+
+    // Guardrail G3: core circuit-breaker-item list isolated from generic-circuit-breaker-item
+    const coreCbPlatforms = mounted
+      .findByTestId("circuit-breaker-item")
+      .map((n) => n.props["data-platform"]);
+    assert.deepEqual(coreCbPlatforms, ["douyin", "youtube"]);
+    assert.equal(coreCbPlatforms.includes("ytdlp_generic"), false);
+
+    assert.equal(mounted.findByTestId("generic-circuit-breaker-section").length, 1);
+    const genericItem = mounted.findByTestId("generic-circuit-breaker-item")[0];
+    assert.ok(genericItem);
+    assert.equal(genericItem.props["data-platform"], "ytdlp_generic");
+    assert.equal(genericItem.props["data-cb-state"], "closed");
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-circuit-breaker-badge")[0]).trim(),
+      "正常",
+    );
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-cb-summary-badge")[0]).trim(),
+      "长尾：正常",
+    );
+
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 healthy tv + closed generic");
+  } finally {
+    mounted.unmount();
+  }
+});
+
+test("PR A2 MonitorApp.vue: degraded main + cooldown banners and generic_circuit_breaker open / half_open / disabled_by_config states", async () => {
+  let currentStats = createRichStatsSnapshot({
+    youtube_helper: createYouTubeHelperStats({
+      enabled: true,
+      disabled_by_config: false,
+      active_player_cached: true,
+      active_variant: "main",
+      refresh_attempts: 15,
+      refresh_successes: 9,
+      refresh_failures: 6,
+      consecutive_failures: 4,
+      cooldown_skips: 9,
+      in_cooldown: true,
+      challenge_lru_entries: 3800,
+      challenge_lru_hits: 400,
+      challenge_lru_misses: 100,
+    }),
+    // Omit core circuit_breakers to also verify G3 subsection renders independently
+    generic_circuit_breaker: createGenericCircuitBreaker({
+      state: "open",
+      consecutive_failures: 6,
+      window_failures: 8,
+      window_total: 10,
+      open_until: "2026-11-25T10:00:00Z",
+      disabled_by_config: false,
+    }),
+  });
+
+  globalThis.localStorage.setItem(
+    monitorStorage.OWNER_TOKEN_LOCAL_KEY,
+    VALID_OWNER_TOKEN,
+  );
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({ schema_version: "1.0", code: "OK", data: currentStats }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+
+  const mounted = mountSfcTree(MonitorApp);
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    // 1) Degraded main + in_cooldown (cached -> warn) + generic breaker open
+    const statusBadge = mounted.findByTestId("yt-helper-status-badge")[0];
+    assert.equal(mounted.textOf(statusBadge).trim(), "冷却退避中");
+    assert.match(String(statusBadge.props.class || ""), /\bsp-badge--warn\b/);
+
+    const variantBadge = mounted.findByTestId("yt-helper-variant-badge")[0];
+    assert.equal(mounted.textOf(variantBadge).trim(), "main（降级回退）");
+    assert.equal(variantBadge.props["data-variant"], "main");
+    assert.match(
+      String(variantBadge.props.class || ""),
+      /\bmon-yth-variant-badge--degraded\b/,
+    );
+
+    assert.equal(mounted.findByTestId("yt-helper-disabled-banner").length, 0);
+    const cooldownBanner = mounted.findByTestId("yt-helper-cooldown-banner")[0];
+    assert.ok(cooldownBanner);
+    assert.match(mounted.textOf(cooldownBanner), /已连续失败 4 次/);
+    assert.match(mounted.textOf(cooldownBanner), /跳过刷新\s*9 次/);
+
+    const degradedBanner = mounted.findByTestId("yt-helper-degraded-banner")[0];
+    assert.ok(degradedBanner);
+    assert.match(mounted.textOf(degradedBanner), /main（降级回退）/);
+
+    // High LRU occupancy (3800 / 4096 = 92.8%) switches SVG fill rect to danger tone
+    const lruRects = mounted.findAll(
+      (n) => n.type === "rect",
+      mounted.findByTestId("yt-helper-lru-bar")[0],
+    );
+    assert.match(String(lruRects[1].props.class || ""), /\bmon-bar-fill--danger\b/);
+
+    // Generic breaker open state (isolated with 0 core circuit-breaker-items)
+    assert.equal(mounted.findByTestId("circuit-breaker-item").length, 0);
+    const openGeneric = mounted.findByTestId("generic-circuit-breaker-item")[0];
+    assert.ok(openGeneric);
+    assert.equal(openGeneric.props["data-platform"], "ytdlp_generic");
+    assert.equal(openGeneric.props["data-cb-state"], "open");
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-circuit-breaker-badge")[0]).trim(),
+      "熔断保护中",
+    );
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-cb-summary-badge")[0]).trim(),
+      "长尾：熔断保护中",
+    );
+    assert.match(mounted.textOf(openGeneric), /恢复 11-25 18:00:00/);
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 degraded main + generic open");
+
+    // 2) Refresh to generic_circuit_breaker half_open + uncached cooldown (danger)
+    currentStats = createRichStatsSnapshot({
+      youtube_helper: createYouTubeHelperStats({
+        active_player_cached: false,
+        active_variant: "main",
+        in_cooldown: true,
+        consecutive_failures: 5,
+        cooldown_skips: 12,
+      }),
+      generic_circuit_breaker: createGenericCircuitBreaker({
+        state: "half_open",
+        consecutive_failures: 2,
+        window_failures: 4,
+        window_total: 10,
+        open_until: "",
+        disabled_by_config: false,
+      }),
+    });
+    await mounted.fire(mounted.findByTestId("monitor-refresh-btn")[0], "onClick");
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    assert.match(
+      String(mounted.findByTestId("yt-helper-status-badge")[0].props.class || ""),
+      /\bmon-badge--danger\b/,
+    );
+    const halfOpenGeneric = mounted.findByTestId("generic-circuit-breaker-item")[0];
+    assert.equal(halfOpenGeneric.props["data-cb-state"], "half_open");
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-circuit-breaker-badge")[0]).trim(),
+      "半开探活",
+    );
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-cb-summary-badge")[0]).trim(),
+      "长尾：半开探活",
+    );
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 generic half_open");
+
+    // 3) Refresh to generic_circuit_breaker disabled_by_config: true
+    currentStats = createRichStatsSnapshot({
+      youtube_helper: createYouTubeHelperStats({
+        active_variant: "main",
+        in_cooldown: true,
+        consecutive_failures: 5,
+        cooldown_skips: 14,
+      }),
+      generic_circuit_breaker: createGenericCircuitBreaker({
+        state: "open",
+        consecutive_failures: 0,
+        window_failures: 0,
+        window_total: 0,
+        open_until: "",
+        disabled_by_config: true,
+      }),
+    });
+    await mounted.fire(mounted.findByTestId("monitor-refresh-btn")[0], "onClick");
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-circuit-breaker-badge")[0]).trim(),
+      "熔断保护中（运维禁用）",
+    );
+    assert.equal(
+      mounted.textOf(mounted.findByTestId("generic-cb-summary-badge")[0]).trim(),
+      "长尾：熔断保护中（运维禁用）",
+    );
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 generic disabled_by_config");
+  } finally {
+    mounted.unmount();
+  }
+});
+
+test("PR A2 MonitorApp.vue: youtube_helper.disabled_by_config danger banner and legacy snapshot hides new sections cleanly", async () => {
+  let currentStats = createRichStatsSnapshot({
+    youtube_helper: createYouTubeHelperStats({
+      enabled: true,
+      disabled_by_config: true,
+      active_player_cached: false,
+      active_variant: "main",
+      in_cooldown: true,
+      consecutive_failures: 3,
+      cooldown_skips: 2,
+    }),
+    circuit_breakers: [
+      {
+        platform: "bilibili",
+        state: "closed",
+        consecutive_failures: 0,
+        window_failures: 0,
+        window_total: 10,
+        open_until: "",
+        disabled_by_config: false,
+      },
+    ],
+  });
+
+  globalThis.localStorage.setItem(
+    monitorStorage.OWNER_TOKEN_LOCAL_KEY,
+    VALID_OWNER_TOKEN,
+  );
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({ schema_version: "1.0", code: "OK", data: currentStats }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+
+  const mounted = mountSfcTree(MonitorApp);
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    // 1) youtube_helper.disabled_by_config: true -> danger badge "运维已禁用" + disabled banner only
+    assert.equal(mounted.findByTestId("card-youtube-helper").length, 1);
+    const disabledBadge = mounted.findByTestId("yt-helper-status-badge")[0];
+    assert.equal(mounted.textOf(disabledBadge).trim(), "运维已禁用");
+    assert.match(String(disabledBadge.props.class || ""), /\bmon-badge--danger\b/);
+
+    assert.equal(mounted.findByTestId("yt-helper-disabled-banner").length, 1);
+    assert.equal(mounted.findByTestId("yt-helper-cooldown-banner").length, 0);
+    assert.equal(mounted.findByTestId("yt-helper-degraded-banner").length, 0);
+    assert.equal(mounted.findByTestId("generic-circuit-breaker-section").length, 0);
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 youtube_helper disabled_by_config");
+
+    // 2) Legacy snapshot (without youtube_helper & generic_circuit_breaker) cleanly hides both
+    currentStats = createRichStatsSnapshot({
+      circuit_breakers: [
+        {
+          platform: "bilibili",
+          state: "closed",
+          consecutive_failures: 0,
+          window_failures: 0,
+          window_total: 10,
+          open_until: "",
+          disabled_by_config: false,
+        },
+      ],
+    });
+    await mounted.fire(mounted.findByTestId("monitor-refresh-btn")[0], "onClick");
+    await new Promise((r) => setTimeout(r, 25));
+    await mounted.flush();
+
+    assert.equal(mounted.findByTestId("card-youtube-helper").length, 0);
+    assert.equal(mounted.findByTestId("generic-circuit-breaker-section").length, 0);
+    assert.equal(mounted.findByTestId("generic-cb-summary-badge").length, 0);
+    assert.equal(mounted.findByTestId("section-protection-policy").length, 1);
+    assert.equal(mounted.findByTestId("circuit-breaker-item").length, 1);
+    assertUnlockedReadOnlyAndStrictCsp(mounted, "PR A2 legacy snapshot");
   } finally {
     mounted.unmount();
   }

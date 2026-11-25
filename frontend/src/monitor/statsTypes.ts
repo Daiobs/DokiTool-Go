@@ -6,289 +6,21 @@
 // Wire interfaces are generated from Go's backend/internal/api StatsSnapshot
 // via `cd backend && go run ./cmd/genstatstypes`.
 import type {
-  AdmissionPoolSnapshot,
   CircuitBreakerPlatformSnapshot,
-  CircuitBreakerState,
   DailyStatsBucket,
-  HourlyStatsBucket,
-  RuntimeConfigSnapshot,
-  RuntimePolicySummary,
   StatsSnapshot,
-  YTDLPCompartmentPoolSnapshot,
-  YTDLPPoolsSnapshot,
+  YouTubeHelperStatsSnapshot,
   YTDLPStatsSnapshot,
 } from "./statsTypes.generated";
 
 export * from "./statsTypes.generated";
+export * from "./statsValidation";
+export * from "./chartGeometry";
 
 export interface OwnerStatsResult {
   stats: StatsSnapshot;
   apiOrigin: string;
   fetchedAt: number;
-}
-
-// ============================================================================
-// Runtime Validation Guard
-// ============================================================================
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isFiniteNum(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function isValidAdmissionPool(raw: unknown): raw is AdmissionPoolSnapshot {
-  if (!isRecord(raw)) return false;
-  return (
-    isFiniteNum(raw.active) &&
-    isFiniteNum(raw.queued) &&
-    isFiniteNum(raw.concurrency_limit) &&
-    isFiniteNum(raw.queue_limit)
-  );
-}
-
-function isValidYtdlpSnapshot(raw: unknown): raw is YTDLPStatsSnapshot {
-  if (!isRecord(raw)) return false;
-  return isFiniteNum(raw.active) && isFiniteNum(raw.concurrency_limit);
-}
-
-function isValidYtdlpCompartmentPool(
-  raw: unknown,
-): raw is YTDLPCompartmentPoolSnapshot {
-  if (!isRecord(raw)) return false;
-  return (
-    typeof raw.enabled === "boolean" &&
-    isFiniteNum(raw.active) &&
-    isFiniteNum(raw.queued) &&
-    isFiniteNum(raw.concurrency_limit) &&
-    isFiniteNum(raw.queue_limit) &&
-    isFiniteNum(raw.waited) &&
-    isFiniteNum(raw.granted) &&
-    isFiniteNum(raw.timeout) &&
-    isFiniteNum(raw.full) &&
-    isFiniteNum(raw.canceled) &&
-    isFiniteNum(raw.wait_ms_total) &&
-    isFiniteNum(raw.wait_ms_max)
-  );
-}
-
-function isValidYtdlpPools(raw: unknown): raw is YTDLPPoolsSnapshot {
-  if (!isRecord(raw)) return false;
-  return (
-    isValidYtdlpCompartmentPool(raw.youtube) &&
-    isValidYtdlpCompartmentPool(raw.social) &&
-    isValidYtdlpCompartmentPool(raw.generic) &&
-    isValidYtdlpCompartmentPool(raw.youtube_ejs)
-  );
-}
-
-function isValidCircuitBreakerPlatform(
-  raw: unknown,
-): raw is CircuitBreakerPlatformSnapshot {
-  if (!isRecord(raw)) return false;
-  return (
-    typeof raw.platform === "string" &&
-    (raw.state === "closed" ||
-      raw.state === "open" ||
-      raw.state === "half_open") &&
-    isFiniteNum(raw.consecutive_failures) &&
-    isFiniteNum(raw.window_failures) &&
-    isFiniteNum(raw.window_total) &&
-    typeof raw.open_until === "string" &&
-    typeof raw.disabled_by_config === "boolean"
-  );
-}
-
-function isValidRuntimePolicySummary(
-  raw: unknown,
-): raw is RuntimePolicySummary {
-  if (!isRecord(raw)) return false;
-  return (
-    typeof raw.config_file_active === "boolean" &&
-    isFiniteNum(raw.reload_count) &&
-    typeof raw.last_reloaded_at === "string" &&
-    isFiniteNum(raw.youtube_slots) &&
-    isFiniteNum(raw.social_slots) &&
-    isFiniteNum(raw.generic_slots) &&
-    isFiniteNum(raw.youtube_ejs_concurrency) &&
-    isFiniteNum(raw.fast_per_platform_max_concurrency) &&
-    typeof raw.circuit_breaker_enabled === "boolean" &&
-    Array.isArray(raw.disabled_platforms) &&
-    raw.disabled_platforms.every((item) => typeof item === "string") &&
-    isFiniteNum(raw.youtube_parse_ttl_seconds) &&
-    isFiniteNum(raw.stale_if_error_ttl_seconds) &&
-    isFiniteNum(raw.upstream_blocked_neg_ttl_seconds)
-  );
-}
-
-function isValidRuntimeConfig(raw: unknown): raw is RuntimeConfigSnapshot {
-  if (!isRecord(raw)) return false;
-  return (
-    typeof raw.version === "string" &&
-    typeof raw.shanghai_mode === "string" &&
-    typeof raw.shanghai_bilibili === "boolean" &&
-    typeof raw.bilibili_dash === "boolean" &&
-    typeof raw.youtube_helper === "boolean" &&
-    typeof raw.xhs_transport === "string" &&
-    typeof raw.ytdlp_enabled === "boolean" &&
-    typeof raw.ytdlp_generic_enabled === "boolean" &&
-    typeof raw.tbvideo_pipigx === "boolean" &&
-    typeof raw.tbvideo_zuiyou === "boolean" &&
-    typeof raw.stats_persistence_enabled === "boolean"
-  );
-}
-
-function isValidDailyBucket(raw: unknown): raw is DailyStatsBucket {
-  if (!isRecord(raw)) return false;
-  if (
-    typeof raw.date !== "string" ||
-    !isFiniteNum(raw.total) ||
-    !isFiniteNum(raw.ok) ||
-    !isFiniteNum(raw.failed) ||
-    !isFiniteNum(raw.cache_hits) ||
-    !isFiniteNum(raw.shanghai_hits)
-  ) {
-    return false;
-  }
-  if (!isRecord(raw.latency_ms)) return false;
-  if (
-    !isFiniteNum(raw.latency_ms.p50_ms) ||
-    !isFiniteNum(raw.latency_ms.p95_ms) ||
-    !isFiniteNum(raw.latency_ms.max_ms)
-  ) {
-    return false;
-  }
-  return isRecord(raw.by_platform);
-}
-
-function isValidHourlyBucket(raw: unknown): raw is HourlyStatsBucket {
-  if (!isRecord(raw)) return false;
-  return (
-    typeof raw.hour_start === "string" &&
-    isFiniteNum(raw.total) &&
-    isFiniteNum(raw.ok) &&
-    isFiniteNum(raw.failed) &&
-    isFiniteNum(raw.cache_hits)
-  );
-}
-
-export function isValidStatsSnapshot(raw: unknown): raw is StatsSnapshot {
-  if (!isRecord(raw)) return false;
-  if (
-    typeof raw.started_at !== "string" ||
-    typeof raw.generated_at !== "string" ||
-    !isFiniteNum(raw.uptime_seconds)
-  ) {
-    return false;
-  }
-
-  if (
-    !isRecord(raw.requests) ||
-    !isFiniteNum(raw.requests.total) ||
-    !isRecord(raw.requests.by_channel) ||
-    !Array.isArray(raw.requests.by_platform_code_channel)
-  ) {
-    return false;
-  }
-
-  if (
-    !isRecord(raw.cache) ||
-    typeof raw.cache.enabled !== "boolean" ||
-    !isFiniteNum(raw.cache.entries) ||
-    !isFiniteNum(raw.cache.bytes) ||
-    !isRecord(raw.cache.total)
-  ) {
-    return false;
-  }
-
-  if (
-    raw.cache.total.stale_hits !== undefined &&
-    !isFiniteNum(raw.cache.total.stale_hits)
-  ) {
-    return false;
-  }
-
-  if (
-    !isRecord(raw.admission) ||
-    !isRecord(raw.admission.fast) ||
-    !isRecord(raw.admission.slow) ||
-    !isRecord(raw.admission.owner)
-  ) {
-    return false;
-  }
-
-  if (
-    raw.admission.generic_slow !== undefined &&
-    !isValidAdmissionPool(raw.admission.generic_slow)
-  ) {
-    return false;
-  }
-
-  if (!Array.isArray(raw.api_keys)) {
-    return false;
-  }
-
-  if (!isValidYtdlpSnapshot(raw.ytdlp)) {
-    return false;
-  }
-
-  if (
-    raw.ytdlp_generic !== undefined &&
-    !isValidYtdlpSnapshot(raw.ytdlp_generic)
-  ) {
-    return false;
-  }
-
-  if (raw.ytdlp_pools !== undefined && !isValidYtdlpPools(raw.ytdlp_pools)) {
-    return false;
-  }
-
-  if (
-    raw.circuit_breakers !== undefined &&
-    (!Array.isArray(raw.circuit_breakers) ||
-      !raw.circuit_breakers.every(isValidCircuitBreakerPlatform))
-  ) {
-    return false;
-  }
-
-  if (
-    raw.runtime_policy !== undefined &&
-    !isValidRuntimePolicySummary(raw.runtime_policy)
-  ) {
-    return false;
-  }
-
-  if (
-    !isRecord(raw.shanghai) ||
-    typeof raw.shanghai.enabled !== "boolean" ||
-    typeof raw.shanghai.mode !== "string" ||
-    !isFiniteNum(raw.shanghai.waiting_workers)
-  ) {
-    return false;
-  }
-
-  if (
-    !isRecord(raw.parse_latency_ms) ||
-    !isRecord(raw.parse_latency_ms.total)
-  ) {
-    return false;
-  }
-
-  if (!isValidRuntimeConfig(raw.runtime)) {
-    return false;
-  }
-
-  if (!Array.isArray(raw.daily) || !raw.daily.every(isValidDailyBucket)) {
-    return false;
-  }
-
-  if (!Array.isArray(raw.hourly) || !raw.hourly.every(isValidHourlyBucket)) {
-    return false;
-  }
-
-  return true;
 }
 
 // ============================================================================
@@ -436,6 +168,60 @@ export function formatCircuitBreakerBadge(
   return { label: "正常", tone: "ok" };
 }
 
+export const YOUTUBE_HELPER_CHALLENGE_LRU_CAPACITY = 4096;
+
+export interface YouTubeHelperBadgeView {
+  label: string;
+  tone: "ok" | "warn" | "danger" | "muted";
+}
+
+export function formatYouTubeHelperBadge(
+  helper: Pick<
+    YouTubeHelperStatsSnapshot,
+    "enabled" | "disabled_by_config" | "active_player_cached" | "in_cooldown"
+  >,
+): YouTubeHelperBadgeView {
+  if (helper.disabled_by_config) {
+    return { label: "运维已禁用", tone: "danger" };
+  }
+  if (!helper.enabled) {
+    return { label: "未启用", tone: "muted" };
+  }
+  if (helper.in_cooldown) {
+    return {
+      label: "冷却退避中",
+      tone: helper.active_player_cached ? "warn" : "danger",
+    };
+  }
+  if (helper.active_player_cached) {
+    return { label: "预热就绪", tone: "ok" };
+  }
+  return { label: "待预热", tone: "warn" };
+}
+
+export interface YouTubeHelperVariantView {
+  label: string;
+  detail: string;
+  tone: "ok" | "warn" | "muted";
+  isDegraded: boolean;
+}
+
+export function formatYouTubeHelperVariant(
+  variant: string | null | undefined,
+): YouTubeHelperVariantView {
+  const trimmed = typeof variant === "string" ? variant.trim() : "";
+  if (!trimmed) {
+    return { label: "—", detail: "尚未缓存活动变体", tone: "muted", isDegraded: false };
+  }
+  if (trimmed === "tv") {
+    return { label: "tv", detail: "TV 首选变体", tone: "ok", isDegraded: false };
+  }
+  if (trimmed === "main") {
+    return { label: "main（降级回退）", detail: "TV 不可用，已自动回退主站播放器", tone: "warn", isDegraded: true };
+  }
+  return { label: trimmed, detail: "非默认变体", tone: "warn", isDegraded: true };
+}
+
 export function formatShanghaiTimestamp(raw: string | null | undefined): string {
   if (typeof raw !== "string" || !raw.trim()) return "";
   const trimmed = raw.trim();
@@ -578,21 +364,17 @@ export function computeEffectiveSuccessRate(
   const safeOk = Number.isFinite(ok) ? Math.max(0, ok) : 0;
 
   let excludedCount = 0;
-  if (byCode instanceof Map) {
-    for (const [rawCode, count] of byCode.entries()) {
-      if (!Number.isFinite(count) || count <= 0) continue;
-      const code = String(rawCode || "").trim().toUpperCase();
-      if (EXCLUDED_NON_UPSTREAM_CODES.has(code)) {
-        excludedCount += count;
-      }
-    }
-  } else if (byCode && typeof byCode === "object") {
-    for (const [rawCode, count] of Object.entries(byCode)) {
-      if (!Number.isFinite(count) || count <= 0) continue;
-      const code = String(rawCode || "").trim().toUpperCase();
-      if (EXCLUDED_NON_UPSTREAM_CODES.has(code)) {
-        excludedCount += count;
-      }
+  const entries =
+    byCode instanceof Map
+      ? byCode.entries()
+      : byCode && typeof byCode === "object"
+        ? Object.entries(byCode)
+        : [];
+  for (const [rawCode, count] of entries) {
+    if (!Number.isFinite(count) || count <= 0) continue;
+    const code = String(rawCode || "").trim().toUpperCase();
+    if (EXCLUDED_NON_UPSTREAM_CODES.has(code)) {
+      excludedCount += count;
     }
   }
 
@@ -806,15 +588,9 @@ export function formatUptimeDuration(seconds: number): string {
   const minutes = Math.floor((totalSec % 3_600) / 60);
   const secs = totalSec % 60;
 
-  if (days > 0) {
-    return `${days}天 ${hours}小时 ${minutes}分`;
-  }
-  if (hours > 0) {
-    return `${hours}小时 ${minutes}分`;
-  }
-  if (minutes > 0) {
-    return secs > 0 ? `${minutes}分 ${secs}秒` : `${minutes}分`;
-  }
+  if (days > 0) return `${days}天 ${hours}小时 ${minutes}分`;
+  if (hours > 0) return `${hours}小时 ${minutes}分`;
+  if (minutes > 0) return secs > 0 ? `${minutes}分 ${secs}秒` : `${minutes}分`;
   return `${secs}秒`;
 }
 
@@ -852,26 +628,6 @@ export function formatBytesCompact(bytes: number): string {
   return `${Math.round(bytes)} B`;
 }
 
-export function formatShanghaiHourLabel(hourStart: string): string {
-  if (typeof hourStart !== "string" || !hourStart.trim()) return "--:--";
-  const trimmed = hourStart.trim();
-  const explicitOffsetMatch = /T(\d{2}):(\d{2})(?::\d{2})?\+08:00$/.exec(
-    trimmed,
-  );
-  if (explicitOffsetMatch) {
-    return `${explicitOffsetMatch[1]}:${explicitOffsetMatch[2]}`;
-  }
-  const parsedMs = Date.parse(trimmed);
-  if (Number.isFinite(parsedMs)) {
-    const shanghaiDate = new Date(parsedMs + 8 * 3_600_000);
-    const hh = String(shanghaiDate.getUTCHours()).padStart(2, "0");
-    const mm = String(shanghaiDate.getUTCMinutes()).padStart(2, "0");
-    return `${hh}:${mm}`;
-  }
-  const fallbackMatch = /T(\d{2}):(\d{2})/.exec(trimmed);
-  return fallbackMatch ? `${fallbackMatch[1]}:${fallbackMatch[2]}` : trimmed;
-}
-
 export function resolveYtdlpQueuedCount(ytdlp?: YTDLPStatsSnapshot | null): number {
   if (!ytdlp) return 0;
   if (typeof ytdlp.waiting === "number" && Number.isFinite(ytdlp.waiting)) {
@@ -881,329 +637,4 @@ export function resolveYtdlpQueuedCount(ytdlp?: YTDLPStatsSnapshot | null): numb
     return Math.max(0, ytdlp.queued);
   }
   return 0;
-}
-
-// ============================================================================
-// Pure Native SVG Chart Geometry Builders
-// ============================================================================
-
-export interface ChartYAxisTick {
-  value: number;
-  y: number;
-  label: string;
-}
-
-export interface DailyChartPoint {
-  index: number;
-  date: string;
-  shortDate: string;
-  total: number;
-  ok: number;
-  failed: number;
-  cacheHits: number;
-  shanghaiHits: number;
-  p50Ms: number;
-  p95Ms: number;
-  maxMs: number;
-  successRate: number | null;
-  x: number;
-  barWidth: number;
-  centerX: number;
-  okY: number;
-  okHeight: number;
-  failedY: number;
-  failedHeight: number;
-  totalY: number;
-  totalHeight: number;
-  rateY: number | null;
-  showXLabel: boolean;
-}
-
-export interface DailyChartGeometry {
-  days: 7 | 30;
-  width: number;
-  height: number;
-  plotLeft: number;
-  plotTop: number;
-  plotRight: number;
-  plotBottom: number;
-  plotWidth: number;
-  plotHeight: number;
-  maxTotal: number;
-  yTicks: ChartYAxisTick[];
-  points: DailyChartPoint[];
-  ratePathD: string;
-  ratePolylinePoints: string;
-}
-
-export interface HourlyChartPoint {
-  index: number;
-  hourStart: string;
-  hourLabel: string;
-  total: number;
-  ok: number;
-  failed: number;
-  cacheHits: number;
-  successRate: number | null;
-  x: number;
-  barWidth: number;
-  centerX: number;
-  okY: number;
-  okHeight: number;
-  failedY: number;
-  failedHeight: number;
-  totalY: number;
-  totalHeight: number;
-  showXLabel: boolean;
-}
-
-export interface HourlyChartGeometry {
-  width: number;
-  height: number;
-  plotLeft: number;
-  plotTop: number;
-  plotRight: number;
-  plotBottom: number;
-  plotWidth: number;
-  plotHeight: number;
-  maxTotal: number;
-  yTicks: ChartYAxisTick[];
-  points: HourlyChartPoint[];
-}
-
-function niceAxisCeiling(rawMax: number): number {
-  if (!Number.isFinite(rawMax) || rawMax <= 0) return 4;
-  const magnitude = Math.pow(10, Math.floor(Math.log10(rawMax)));
-  const normalized = rawMax / magnitude;
-  let niceNorm: number;
-  if (normalized <= 1) niceNorm = 1;
-  else if (normalized <= 2) niceNorm = 2;
-  else if (normalized <= 4) niceNorm = 4;
-  else if (normalized <= 5) niceNorm = 5;
-  else if (normalized <= 8) niceNorm = 8;
-  else niceNorm = 10;
-  return Math.max(4, Math.ceil(niceNorm * magnitude));
-}
-
-function roundCoord(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
-function formatCompactAxisTick(val: number): string {
-  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(1)}M`;
-  if (val >= 10_000) return `${Math.round(val / 1_000)}k`;
-  if (val >= 1_000) return `${(val / 1_000).toFixed(val % 1000 === 0 ? 0 : 1)}k`;
-  return String(Math.round(val));
-}
-
-export function buildDailyChartPoints(
-  daily: readonly DailyStatsBucket[],
-  days: 7 | 30,
-  options?: { width?: number; height?: number },
-): DailyChartGeometry {
-  const width = options?.width ?? 640;
-  const height = options?.height ?? 240;
-  const plotLeft = 44;
-  const plotRight = width - 44;
-  const plotTop = 18;
-  const plotBottom = height - 30;
-  const plotWidth = Math.max(10, plotRight - plotLeft);
-  const plotHeight = Math.max(10, plotBottom - plotTop);
-
-  const sliced = Array.isArray(daily) ? daily.slice(-days) : [];
-  const rawMax = sliced.reduce((m, b) => Math.max(m, b.total || 0), 0);
-  const maxTotal = niceAxisCeiling(rawMax);
-
-  const tickCount = 4;
-  const yTicks: ChartYAxisTick[] = [];
-  for (let i = 0; i <= tickCount; i++) {
-    const ratio = i / tickCount;
-    const value = Math.round(maxTotal * ratio);
-    const y = roundCoord(plotBottom - ratio * plotHeight);
-    yTicks.push({ value, y, label: formatCompactAxisTick(value) });
-  }
-
-  const count = sliced.length;
-  const step = count > 0 ? plotWidth / count : plotWidth;
-  const barRatio = days === 7 ? 0.46 : 0.64;
-  const barWidth = roundCoord(Math.max(4, Math.min(36, step * barRatio)));
-
-  const points: DailyChartPoint[] = [];
-  const ratePathSegments: string[] = [];
-  const ratePolylinePairs: string[] = [];
-  let inSegment = false;
-
-  for (let i = 0; i < count; i++) {
-    const b = sliced[i];
-    const total = Math.max(0, b.total || 0);
-    const ok = Math.max(0, b.ok || 0);
-    const failed = Math.max(0, b.failed || 0);
-    const stackedTotal = Math.max(total, ok + failed);
-
-    const centerX = roundCoord(plotLeft + step * (i + 0.5));
-    const x = roundCoord(centerX - barWidth / 2);
-
-    const okHeight = roundCoord((ok / maxTotal) * plotHeight);
-    const failedHeight = roundCoord((failed / maxTotal) * plotHeight);
-    const totalHeight = roundCoord((stackedTotal / maxTotal) * plotHeight);
-
-    const okY = roundCoord(plotBottom - okHeight);
-    const failedY = roundCoord(okY - failedHeight);
-    const totalY = roundCoord(plotBottom - totalHeight);
-
-    const successRate = safeRatePct(ok, total);
-    const rateY =
-      successRate !== null
-        ? roundCoord(plotBottom - (successRate / 100) * plotHeight)
-        : null;
-
-    if (rateY !== null) {
-      ratePathSegments.push(`${inSegment ? "L" : "M"}${centerX} ${rateY}`);
-      ratePolylinePairs.push(`${centerX},${rateY}`);
-      inSegment = true;
-    } else {
-      inSegment = false;
-    }
-
-    const shortDate =
-      typeof b.date === "string" && b.date.length >= 10
-        ? b.date.slice(5, 10)
-        : b.date;
-
-    const showXLabel =
-      days === 7
-        ? true
-        : i === 0 || i === count - 1 || i % 5 === 0;
-
-    points.push({
-      index: i,
-      date: b.date,
-      shortDate,
-      total,
-      ok,
-      failed,
-      cacheHits: b.cache_hits || 0,
-      shanghaiHits: b.shanghai_hits || 0,
-      p50Ms: b.latency_ms?.p50_ms || 0,
-      p95Ms: b.latency_ms?.p95_ms || 0,
-      maxMs: b.latency_ms?.max_ms || 0,
-      successRate,
-      x,
-      barWidth,
-      centerX,
-      okY,
-      okHeight,
-      failedY,
-      failedHeight,
-      totalY,
-      totalHeight,
-      rateY,
-      showXLabel,
-    });
-  }
-
-  return {
-    days,
-    width,
-    height,
-    plotLeft,
-    plotTop,
-    plotRight,
-    plotBottom,
-    plotWidth,
-    plotHeight,
-    maxTotal,
-    yTicks,
-    points,
-    ratePathD: ratePathSegments.join(" "),
-    ratePolylinePoints: ratePolylinePairs.join(" "),
-  };
-}
-
-export function buildHourlyChartPoints(
-  hourly: readonly HourlyStatsBucket[],
-  options?: { width?: number; height?: number },
-): HourlyChartGeometry {
-  const width = options?.width ?? 560;
-  const height = options?.height ?? 240;
-  const plotLeft = 40;
-  const plotRight = width - 16;
-  const plotTop = 18;
-  const plotBottom = height - 30;
-  const plotWidth = Math.max(10, plotRight - plotLeft);
-  const plotHeight = Math.max(10, plotBottom - plotTop);
-
-  const sliced = Array.isArray(hourly) ? hourly.slice(-24) : [];
-  const rawMax = sliced.reduce((m, b) => Math.max(m, b.total || 0), 0);
-  const maxTotal = niceAxisCeiling(rawMax);
-
-  const tickCount = 4;
-  const yTicks: ChartYAxisTick[] = [];
-  for (let i = 0; i <= tickCount; i++) {
-    const ratio = i / tickCount;
-    const value = Math.round(maxTotal * ratio);
-    const y = roundCoord(plotBottom - ratio * plotHeight);
-    yTicks.push({ value, y, label: formatCompactAxisTick(value) });
-  }
-
-  const count = sliced.length;
-  const step = count > 0 ? plotWidth / count : plotWidth;
-  const barWidth = roundCoord(Math.max(4, Math.min(20, step * 0.62)));
-
-  const points: HourlyChartPoint[] = [];
-  for (let i = 0; i < count; i++) {
-    const b = sliced[i];
-    const total = Math.max(0, b.total || 0);
-    const ok = Math.max(0, b.ok || 0);
-    const failed = Math.max(0, b.failed || 0);
-    const stackedTotal = Math.max(total, ok + failed);
-
-    const centerX = roundCoord(plotLeft + step * (i + 0.5));
-    const x = roundCoord(centerX - barWidth / 2);
-
-    const okHeight = roundCoord((ok / maxTotal) * plotHeight);
-    const failedHeight = roundCoord((failed / maxTotal) * plotHeight);
-    const totalHeight = roundCoord((stackedTotal / maxTotal) * plotHeight);
-
-    const okY = roundCoord(plotBottom - okHeight);
-    const failedY = roundCoord(okY - failedHeight);
-    const totalY = roundCoord(plotBottom - totalHeight);
-
-    const showXLabel = i === 0 || i === count - 1 || i % 4 === 0;
-
-    points.push({
-      index: i,
-      hourStart: b.hour_start,
-      hourLabel: formatShanghaiHourLabel(b.hour_start),
-      total,
-      ok,
-      failed,
-      cacheHits: b.cache_hits || 0,
-      successRate: safeRatePct(ok, total),
-      x,
-      barWidth,
-      centerX,
-      okY,
-      okHeight,
-      failedY,
-      failedHeight,
-      totalY,
-      totalHeight,
-      showXLabel,
-    });
-  }
-
-  return {
-    width,
-    height,
-    plotLeft,
-    plotTop,
-    plotRight,
-    plotBottom,
-    plotWidth,
-    plotHeight,
-    maxTotal,
-    yTicks,
-    points,
-  };
 }
