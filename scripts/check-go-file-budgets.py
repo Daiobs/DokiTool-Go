@@ -31,12 +31,11 @@ LEGACY_FILE_LINE_RATCHETS: Dict[str, int] = {
     "backend/cmd/loadtest/main.go": 1310,
     "backend/internal/api/admission.go": 1150,
     "backend/internal/api/apikeys.go": 970,
-    "backend/internal/api/handler.go": 1100,
+    "backend/internal/api/handler.go": 1020,
     "backend/internal/fetch/fetch.go": 840,
     "backend/internal/platform/bilibili/shanghai.go": 870,
     "backend/internal/platform/x/parser.go": 1020,
     "backend/internal/platform/x/syndication.go": 1090,
-    "backend/internal/platform/youtube/helper.go": 1710,
     "backend/internal/ytengine/engine.go": 900,
     "backend/internal/ytengine/variants.go": 1360,
 }

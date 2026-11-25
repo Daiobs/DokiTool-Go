@@ -89,6 +89,7 @@
     "backend/internal/api/weibo_test.go",
     "backend/internal/api/x_http_test.go",
     "backend/internal/api/xiaohongshu_test.go",
+    "backend/internal/api/youtube_helper.go",
     "backend/internal/api/youtube_helper_test.go",
     "backend/internal/api/zuiyou_http_test.go",
     "backend/internal/bearer/bearer.go",

@@ -112,9 +112,11 @@ class CheckGoFileBudgetsTests(unittest.TestCase):
     def test_cli_root_flag_with_temp_repo_shrunk_and_violation_cases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            # Create all registered legacy files; shrink youtube/helper.go to 472 lines.
+            # Create all registered legacy files; shrink ytengine/engine.go to 472 lines.
+            shrunk_key = "backend/internal/ytengine/engine.go"
+            self.assertIn(shrunk_key, cgfb.LEGACY_FILE_LINE_RATCHETS)
             for rel, ceiling in cgfb.LEGACY_FILE_LINE_RATCHETS.items():
-                size = 472 if rel.endswith("youtube/helper.go") else ceiling
+                size = 472 if rel == shrunk_key else ceiling
                 _write_go_file(repo, rel, size)
 
             ok_proc = subprocess.run(
@@ -125,7 +127,7 @@ class CheckGoFileBudgetsTests(unittest.TestCase):
             )
             self.assertEqual(ok_proc.returncode, 0, msg=ok_proc.stderr)
             self.assertIn("NOTICE:", ok_proc.stdout)
-            self.assertIn("youtube/helper.go", ok_proc.stdout)
+            self.assertIn(shrunk_key, ok_proc.stdout)
             self.assertIn("PASSED", ok_proc.stdout)
 
             # Adding an oversized unratcheted file must fail via CLI.

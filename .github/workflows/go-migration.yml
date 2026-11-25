@@ -39,7 +39,8 @@ jobs:
           if ! git rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null \
             || ! git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null 2>&1; then
             git fetch --no-tags origin "$PR_HEAD_SHA" \
-              || git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+              || git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head" \
+              || true
           fi
           python3 -B scripts/classify-ci-changes.py \
             --base="$PR_BASE_SHA" \
