@@ -35,7 +35,7 @@ STATE_RE = re.compile(re.escape(MARKER) + r'([A-Za-z0-9+/=]+) -->')
 DEFAULT_DEBOUNCE_THRESHOLD = 2
 REQUIRED_SMOKE_GROUPS: Tuple[str, ...] = ('platforms', 'youtube_context', 'api_boundary')
 WORKFLOW_RUNS_PATH = (
-    f'/repos/{TARGET}/actions/workflows/{WORKFLOW_FILE}/runs?branch=main&status=completed&per_page=5'
+    f'/repos/{TARGET}/actions/workflows/{WORKFLOW_FILE}/runs?branch=main&event=schedule&status=completed&per_page=10'
 )
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_API_BYTES = 8 * 1024 * 1024
@@ -58,7 +58,9 @@ IGNORED_CONCLUSIONS = frozenset({'cancelled', 'skipped', 'neutral'})
 
 _URL_RE = re.compile(r'(?i)\b(?:https?|wss?|file)://[^\s"\'<>`|)\]]+')
 _ALLOWED_GITHUB_URL_RE = re.compile(
-    r'^https://github\.com/' + re.escape(TARGET) + r'(?:/(?:actions/runs/[0-9]+|blob/main/docs/[A-Za-z0-9_.-]+))?\Z',
+    r'^https://github\.com/'
+    + re.escape(TARGET)
+    + r'(?:/(?:actions/runs/[0-9]+|issues/[1-9][0-9]*|blob/main/docs/[A-Za-z0-9_.-]+))?\Z',
     re.ASCII,
 )
 _LOCAL_PATH_RE = re.compile(
@@ -142,24 +144,31 @@ def assert_desensitized(text: str, *, description: str = 'outgoing text') -> str
         raise DesensitizationError(f'{description} must be a string')
     if len(text.encode('utf-8')) > MAX_BODY_BYTES:
         raise DesensitizationError(f'{description} exceeds maximum byte size')
-    if _LOCAL_PATH_RE.search(text):
+    scan_text = text
+    if MARKER in scan_text:
+        try:
+            extract_state(scan_text)
+        except CanaryError as exc:
+            raise DesensitizationError(f'Invalid canary state marker in {description}: {exc}') from exc
+        scan_text = STATE_RE.sub(' ', scan_text)
+    if _LOCAL_PATH_RE.search(scan_text):
         raise DesensitizationError(f'Forbidden local filesystem path detected in {description}')
-    if _BEARER_RE.search(text):
+    if _BEARER_RE.search(scan_text):
         raise DesensitizationError(f'Forbidden Bearer credential marker detected in {description}')
-    if _GITHUB_TOKEN_RE.search(text):
+    if _GITHUB_TOKEN_RE.search(scan_text):
         raise DesensitizationError(f'Forbidden token literal detected in {description}')
-    if _SENSITIVE_KEY_RE.search(text):
+    if _SENSITIVE_KEY_RE.search(scan_text):
         raise DesensitizationError(f'Forbidden sensitive header/token key detected in {description}')
-    if _SIGNED_PARAM_RE.search(text):
+    if _SIGNED_PARAM_RE.search(scan_text):
         raise DesensitizationError(f'Forbidden signed URL parameter detected in {description}')
-    for match in _URL_RE.finditer(text):
+    for match in _URL_RE.finditer(scan_text):
         candidate_url = match.group(0).rstrip('.,;:')
         if not _ALLOWED_GITHUB_URL_RE.fullmatch(candidate_url):
             raise DesensitizationError(f'Forbidden non-allowlisted URL detected in {description}')
-    for match in _IPV4_CANDIDATE_RE.finditer(text):
+    for match in _IPV4_CANDIDATE_RE.finditer(scan_text):
         if _is_ip_literal(match.group(0)):
             raise DesensitizationError(f'Forbidden IPv4 literal detected in {description}')
-    for match in _IPV6_CANDIDATE_RE.finditer(text):
+    for match in _IPV6_CANDIDATE_RE.finditer(scan_text):
         token = match.group(0)
         inner = token[1:-1] if token.startswith('[') and token.endswith(']') else token
         if _is_ip_literal(inner):
@@ -829,7 +838,7 @@ def evaluate_and_apply(
     )
     assert_desensitized(summary_md, description='canary summary markdown')
 
-    issue_url = f'https://github.com/{TARGET}/issues/{issue["number"]}' if issue else None
+    existing_issue_url = f'https://github.com/{TARGET}/issues/{issue["number"]}' if issue else None
     result: Dict[str, Any] = {
         'overall_ok': overall_ok,
         'action': 'healthy_noop',
@@ -840,12 +849,13 @@ def evaluate_and_apply(
         'player_id': deno['player_id'],
         'smoke_ok': smoke['ok'],
         'dry_run': dry_run,
-        'issue_url': issue_url,
+        'issue_url': None,
         'summary_markdown': summary_md,
     }
 
     if overall_ok:
         if issue_open and issue is not None:
+            result['issue_url'] = existing_issue_url
             new_state = normalize_state(
                 {
                     'schema': SCHEMA_VERSION,
@@ -883,6 +893,7 @@ def evaluate_and_apply(
     )
 
     if issue_open and issue is not None:
+        result['issue_url'] = existing_issue_url
         if (
             prev_state is not None
             and prev_state.get('status') == 'failing'
@@ -920,6 +931,7 @@ def evaluate_and_apply(
         return result
 
     if issue_closed:
+        result['issue_url'] = existing_issue_url
         if dry_run:
             result['action'] = 'dry_run_would_reopen_issue'
             return result

@@ -709,6 +709,147 @@ class UpstreamCanaryTests(unittest.TestCase):
             make_workflow_run(13, 'success', created_at='2026-11-25T13:30:00Z', run_number=13),
         ]
         self.assertEqual(canary.count_prior_failure_streak(runs, current_run_id='13'), 2)
+        self.assertIn('event=schedule', canary.WORKFLOW_RUNS_PATH)
+
+    def test_cli_full_issue_lifecycle_and_step_summary_desensitization(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            summary_file = tmp / 'step_summary.md'
+            api = FakeGitHub(
+                workflow_runs=[
+                    make_workflow_run(50, 'failure', created_at='2026-11-25T01:30:00Z', event='schedule', run_number=50),
+                ]
+            )
+
+            def run_cli_case(deno_obj, smoke_obj, deno_rc: int, smoke_rc: int):
+                summary_file.write_text('', encoding='utf-8')
+                deno_p, smoke_p = self._write_reports(tmp, deno_obj, smoke_obj)
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                env = {
+                    'GITHUB_TOKEN': 'fake-test-value',
+                    'GITHUB_REPOSITORY': canary.TARGET,
+                    'GITHUB_REPOSITORY_OWNER': canary.OWNER,
+                    'GITHUB_RUN_ID': '45643359936',
+                    'GITHUB_STEP_SUMMARY': str(summary_file),
+                }
+                with patch.dict(os.environ, env, clear=True), patch.object(
+                    canary, 'GitHub', return_value=api
+                ), patch('sys.stdout', out_buf), patch('sys.stderr', err_buf):
+                    rc = canary.cli(
+                        [
+                            '--deno-report',
+                            str(deno_p),
+                            '--smoke-report',
+                            str(smoke_p),
+                            '--deno-exit-code',
+                            str(deno_rc),
+                            '--smoke-exit-code',
+                            str(smoke_rc),
+                        ]
+                    )
+                self.assertEqual(err_buf.getvalue(), '')
+                payload = json.loads(out_buf.getvalue())
+                summary_text = summary_file.read_text(encoding='utf-8')
+                return rc, payload, summary_text
+
+            # 1. streak=2 -> issue_created (rc=1, step summary includes allowlisted Issue URL)
+            rc1, res1, sum1 = run_cli_case(
+                make_deno_report(tv_ok=True, main_ok=False, main_error_code='EJS_N_PROBE_FAILED'),
+                make_smoke_report(),
+                1,
+                0,
+            )
+            self.assertEqual(rc1, 1)
+            self.assertEqual(res1['action'], 'issue_created')
+            self.assertEqual(res1['issue_url'], 'https://github.com/Daiobs/DokiTool-Go/issues/100')
+            self.assertIn('[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/100)', sum1)
+
+            # 2. Same failure while open -> deduplicated (rc=1, step summary keeps Issue URL)
+            rc2, res2, sum2 = run_cli_case(
+                make_deno_report(tv_ok=True, main_ok=False, main_error_code='EJS_N_PROBE_FAILED', elapsed_ms=2500),
+                make_smoke_report(),
+                1,
+                0,
+            )
+            self.assertEqual(rc2, 1)
+            self.assertEqual(res2['action'], 'deduplicated')
+            self.assertEqual(res2['issue_url'], 'https://github.com/Daiobs/DokiTool-Go/issues/100')
+            self.assertIn('[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/100)', sum2)
+
+            # 3. Changed failure fingerprint -> issue_updated (rc=1)
+            rc3, res3, sum3 = run_cli_case(
+                make_deno_report(
+                    tv_ok=False,
+                    main_ok=False,
+                    tv_error_code='EJS_N_PROBE_FAILED',
+                    main_error_code='EJS_N_PROBE_FAILED',
+                ),
+                make_smoke_report(),
+                1,
+                0,
+            )
+            self.assertEqual(rc3, 1)
+            self.assertEqual(res3['action'], 'issue_updated')
+            self.assertIn('[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/100)', sum3)
+
+            # 4. Recovery -> issue_closed (rc=0, step summary links the closed Issue)
+            rc4, res4, sum4 = run_cli_case(make_deno_report(), make_smoke_report(), 0, 0)
+            self.assertEqual(rc4, 0)
+            self.assertEqual(res4['action'], 'issue_closed')
+            self.assertEqual(res4['issue_url'], 'https://github.com/Daiobs/DokiTool-Go/issues/100')
+            self.assertIn('[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/100)', sum4)
+
+            # 5. Post-close healthy run -> healthy_noop (rc=0, NO historical [告警 Issue] link!)
+            rc5, res5, sum5 = run_cli_case(make_deno_report(), make_smoke_report(), 0, 0)
+            self.assertEqual(rc5, 0)
+            self.assertEqual(res5['action'], 'healthy_noop')
+            self.assertIsNone(res5['issue_url'])
+            self.assertNotIn('[告警 Issue]', sum5)
+
+    def test_desensitization_allows_validated_base64_markers_with_tricky_substrings(self) -> None:
+        valid_state = {
+            'schema': 1,
+            'status': 'failing',
+            'fingerprint': '0123456789abcdef',
+            'consecutive_failures': 2,
+            'observed_at': '2026-11-25T13:30:00+00:00',
+            'player_id': 'b485e332',
+            'deno_status': 'degraded_main_only',
+            'smoke_ok': True,
+        }
+        # Simulate base64 state markers ending in +ip= / /key= / /sig= that would trip
+        # _SIGNED_PARAM_RE if scanned raw, while still validating the marker via extract_state.
+        for suffix in ('+ip=', '/key=', '+sig='):
+            synthetic_marker = canary.MARKER + 'AAAA' + suffix + ' -->'
+            body = '## 上游 Canary 告警\n\n状态正常校验\n\n' + synthetic_marker
+            with self.subTest(suffix=suffix):
+                with patch.object(canary, 'extract_state', return_value=valid_state) as mock_extract:
+                    self.assertEqual(canary.assert_desensitized(body), body)
+                    mock_extract.assert_called_once_with(body)
+
+                # Raw signed param outside the validated marker MUST still fail closed!
+                tainted_body = body + '\nleaked ip' + '=example'
+                with patch.object(canary, 'extract_state', return_value=valid_state):
+                    with self.assertRaises(canary.DesensitizationError):
+                        canary.assert_desensitized(tainted_body)
+
+        # Malformed or duplicated marker without valid state MUST fail closed!
+        with self.assertRaises(canary.DesensitizationError):
+            canary.assert_desensitized('## Bad\n' + canary.MARKER + 'not-valid-base64!!! -->')
+        real_marker = canary.state_marker(valid_state)
+        with self.assertRaises(canary.DesensitizationError):
+            canary.assert_desensitized('## Dup\n' + real_marker + '\n' + real_marker)
+
+        # Allowlisted Issue URL passes; non-allowlisted Issue URL (wrong repo/query) fails!
+        self.assertEqual(
+            canary.assert_desensitized('[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/61)'),
+            '[告警 Issue](https://github.com/Daiobs/DokiTool-Go/issues/61)',
+        )
+        with self.assertRaises(canary.DesensitizationError):
+            canary.assert_desensitized('[Bad](https://github.com/Daiobs/DokiTool-Go/issues/61?token=abc)')
+        with self.assertRaises(canary.DesensitizationError):
+            canary.assert_desensitized('[Bad](https://github.com/Other/Repo/issues/61)')
 
 
 if __name__ == '__main__':
