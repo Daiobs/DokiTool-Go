@@ -676,6 +676,11 @@ export function createWebExternalBridge(
           totalBytes: task.total,
           speedBytesPerSec: task.speed,
           filename: task.filename,
+          ...(typeof task.filenameWarning === "string" &&
+          task.filenameWarning.trim() &&
+          !/https?:\/\//i.test(task.filenameWarning)
+            ? { filenameWarning: task.filenameWarning.trim().slice(0, 160) }
+            : {}),
           ...(task.error ? { error: task.error } : {}),
         });
       }

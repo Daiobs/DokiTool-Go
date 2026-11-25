@@ -7,11 +7,14 @@ import {
   muxDownloadViaYouTubeHelper,
   pingYouTubeHelper,
   requestYouTubePlayerViaHelper,
+  requestYouTubePrefetchViaHelper,
   type YouTubeHelperDownloadPayload,
   type YouTubeHelperMuxDownloadPayload,
   type YouTubeHelperPingResult,
   type YouTubeHelperPlayerPayload,
   type YouTubeHelperPlayerResult,
+  type YouTubeHelperPrefetchPayload,
+  type YouTubeHelperPrefetchResult,
   type YouTubeHelperProgressDetail,
   type YouTubeHelperSaveMode,
 } from "../utils/youtubeHelperCore";
@@ -394,6 +397,10 @@ interface PendingBlobEntry {
 export interface YouTubeExtensionBridge {
   getHelperVersion(): string;
   ping(timeoutMs?: number): Promise<YouTubeHelperPingResult>;
+  requestPrefetch(
+    payload: YouTubeHelperPrefetchPayload,
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<YouTubeHelperPrefetchResult>;
   requestPlayer(
     payload: YouTubeHelperPlayerPayload,
     options?: { timeoutMs?: number; signal?: AbortSignal },
@@ -646,6 +653,17 @@ export function createYouTubeExtensionBridge(
 
     ping(timeoutMs = 600): Promise<YouTubeHelperPingResult> {
       return pingYouTubeHelper({ timeoutMs, eventTarget });
+    },
+
+    requestPrefetch(
+      payload: YouTubeHelperPrefetchPayload,
+      reqOptions?: { timeoutMs?: number; signal?: AbortSignal },
+    ): Promise<YouTubeHelperPrefetchResult> {
+      return requestYouTubePrefetchViaHelper(payload, {
+        eventTarget,
+        timeoutMs: reqOptions?.timeoutMs ?? 8_000,
+        signal: reqOptions?.signal,
+      });
     },
 
     requestPlayer(

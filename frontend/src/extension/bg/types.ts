@@ -41,6 +41,10 @@ export interface ChromeContextMenuClickInfo {
 
 export interface ChromeDownloadDelta {
   id: number;
+  filename?: {
+    previous?: string;
+    current?: string;
+  };
   state?: {
     previous?: string;
     current?: string;
@@ -196,6 +200,7 @@ export interface ChromeBackgroundApi {
     }): Promise<number>;
     cancel?(downloadId: number): Promise<void>;
     show?(downloadId: number): void;
+    search?(query: { id?: number }): Promise<ChromeDownloadItemLike[]>;
     onChanged: {
       addListener(listener: (delta: ChromeDownloadDelta) => void): void;
       removeListener?(listener: (delta: ChromeDownloadDelta) => void): void;

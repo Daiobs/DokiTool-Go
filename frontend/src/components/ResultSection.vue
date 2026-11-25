@@ -18,6 +18,7 @@ import {
 } from "../utils/mediaContract";
 import {
   isAudioOnlyVariant,
+  isRefererBlockedWebImageUrl,
   isSplitSilentVideoVariant,
   isTbvideoVideoItem,
   resolveEffectiveDefaultVariant,
@@ -85,12 +86,16 @@ const emit = defineEmits([
   "prompt-select-quality",
   "open-extension",
   "extension-youtube-ready",
+  "extension-state-change",
 ]);
 
 const context = { apiOrigin: apiConfig.baseUrl };
 const urlOf = (source) => (source ? sourceUrl(source, context) : "");
 const brokenImageUrls = ref({});
-const safeImageUrl = (raw) => (raw && !brokenImageUrls.value[raw] ? raw : "");
+const safeImageUrl = (raw) =>
+  raw && !brokenImageUrls.value[raw] && !isRefererBlockedWebImageUrl(raw)
+    ? raw
+    : "";
 const markImageBroken = (raw) => {
   if (raw && !brokenImageUrls.value[raw]) {
     brokenImageUrls.value = { ...brokenImageUrls.value, [raw]: true };
@@ -571,7 +576,14 @@ const mediaTypeBadge = computed(() => {
 const activeTab = ref("info");
 const sidebarRef = ref(null);
 const playbackFailed = ref(false);
+const detectedDurationSeconds = ref(0);
 const manualSelection = ref(0);
+const handleDurationDetected = (rawSeconds) => {
+  const sec = Number(rawSeconds);
+  if (Number.isFinite(sec) && sec > 0) {
+    detectedDurationSeconds.value = sec;
+  }
+};
 const mediaIdentity = computed(() =>
   JSON.stringify([props.resultVersion, currentItem.value?.id]),
 );
@@ -590,6 +602,7 @@ const attemptedSources = new Set();
 watch(mediaIdentity, () => {
   attemptedSources.clear();
   playbackFailed.value = false;
+  detectedDurationSeconds.value = 0;
   brokenImageUrls.value = {};
   activeTab.value = "info";
   showAllQualityVariants.value = false;
@@ -737,6 +750,10 @@ const probeExtensionBridge = async (fromWindowReturn = false) => {
     const state = await pingInstalledExtension();
     if (!bridgeDisposed) {
       extensionBridgeState.value = state;
+      emit("extension-state-change", {
+        connected: Boolean(state.connected),
+        version: state.version || "",
+      });
       if (
         fromWindowReturn &&
         isYouTubeHelperInstallRequired.value &&
@@ -896,12 +913,14 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
             v-if="isExtensionConnected"
             data-testid="extension-connected-badge"
             class="rs-header-hint rs-header-hint--ready rs-header-hint--ext"
-            :title="extConnectedTitleText"
+            :title="isYouTubeHelperReady ? headerStatusTitle : extConnectedTitleText"
             role="status"
             ><AppIcon
               class="fas fa-circle-check rs-header-hint-icon"
             /><span class="rs-header-hint-text">{{
-              t(locale, "extConnected")
+              isYouTubeHelperReady
+                ? headerStatusText
+                : t(locale, "extConnected")
             }}</span></span
           ><button
             v-if="isExtensionOutdated"
@@ -915,7 +934,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
               >{{ extUpdateBadgeText }}</span
             ></button
           ><span
-            v-if="isYouTubeHelperReady || !isExtensionConnected"
+            v-if="!isExtensionConnected"
             class="rs-header-hint"
             :class="{ 'rs-header-hint--ready': isYouTubeHelperReady }"
             :title="headerStatusTitle"
@@ -932,6 +951,28 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           >
         </div>
       </div>
+    </div>
+    <div
+      v-if="isExtensionOutdated"
+      data-testid="extension-reload-banner"
+      class="rs-ext-reload-banner"
+      role="status"
+    >
+      <div class="rs-ext-reload-banner-copy">
+        <AppIcon class="fas fa-redo rs-ext-reload-banner-icon" />
+        <span>{{
+          locale === "en"
+            ? `Your loaded DokiTool extension (v${extensionBridgeState.version || "old"}) is behind v${LATEST_EXTENSION_VERSION}. Open chrome://extensions and click Reload to update the background worker.`
+            : `检测到当前内存中的 DokiTool 扩展（v${extensionBridgeState.version || "旧版"}）低于最新版 v${LATEST_EXTENSION_VERSION}，请前往扩展管理页点击「刷新」升级后台 Worker 以启用最新防改名与平滑合流能力。`
+        }}</span>
+      </div>
+      <button
+        type="button"
+        class="rs-ext-reload-banner-btn"
+        @click="emit('open-extension')"
+      >
+        {{ locale === "en" ? "Upgrade Guide" : "查看更新指引" }}
+      </button>
     </div>
     <div v-if="playbackFailed" class="rs-playback-error" role="alert">
       <span>{{ t(locale, "playbackFailed") }}</span
@@ -1000,6 +1041,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :selection="selection"
           @playback-error="updatePlaybackStatus($event, true)"
           @playback-loaded="updatePlaybackStatus($event, false)"
+          @duration-detected="handleDurationDetected"
           @mark-image-broken="markImageBroken"
           @open-quality-picker="openQualityPicker(false)"
           @open-yt-helper-modal="openYtHelperModal"
@@ -1076,6 +1118,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         :is-multi="Boolean(isMulti)"
         :is-extension-connected="isExtensionConnected"
         :bilibili-dash-summary="bilibiliDashSummary"
+        :detected-duration-seconds="detectedDurationSeconds"
         @toggle-show-all-qualities="
           showAllQualityVariants = !showAllQualityVariants
         "
@@ -1681,5 +1724,45 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   font-size: 0.875rem;
   color: var(--c-fg-2);
   line-height: 1.6;
+}
+.rs-ext-reload-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--r-xl);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--c-fg);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.rs-ext-reload-banner-copy {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 220px;
+}
+.rs-ext-reload-banner-icon {
+  color: var(--c-warn);
+  flex-shrink: 0;
+}
+.rs-ext-reload-banner-btn {
+  padding: 0.375rem 0.85rem;
+  border-radius: var(--r-full);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  background-color: #d97706;
+  color: #ffffff;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.rs-ext-reload-banner-btn:hover {
+  background-color: #b45309;
 }
 </style>

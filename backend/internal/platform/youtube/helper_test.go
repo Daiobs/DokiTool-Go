@@ -1201,3 +1201,126 @@ func TestYouTubeHelperMultiAudio120EntriesAndV131Compatibility(t *testing.T) {
 		}
 	})
 }
+
+func TestYouTubeHelperSpecB1PrewarmSWRAndChallengeLRU(t *testing.T) {
+	sb := newTestSandbox(t)
+	playerJS, err := os.ReadFile(filepath.Join("testdata", "player_base_fixture.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Bounded challenge LRU capacity & eviction semantics.
+	lru := newChallengeLRU(3)
+	lru.Put("a5c2aafe", "n", "k1", "v1")
+	lru.Put("a5c2aafe", "n", "k2", "v2")
+	lru.Put("a5c2aafe", "n", "k3", "v3")
+	if v, ok := lru.Get("a5c2aafe", "n", "k1"); !ok || v != "v1" {
+		t.Fatalf("expected k1 hit=v1, got ok=%v v=%q", ok, v)
+	}
+	// k2 is now least recently used; inserting k4 must evict k2 and keep Len() == 3.
+	lru.Put("a5c2aafe", "n", "k4", "v4")
+	if lru.Len() != 3 {
+		t.Fatalf("expected bounded len 3, got %d", lru.Len())
+	}
+	if _, ok := lru.Get("a5c2aafe", "n", "k2"); ok {
+		t.Fatal("expected LRU k2 to be evicted")
+	}
+	if v, ok := lru.Get("a5c2aafe", "n", "k1"); !ok || v != "v1" {
+		t.Fatalf("expected recently touched k1 to remain cached, got ok=%v v=%q", ok, v)
+	}
+
+	// 2. Startup background prewarm (with retry backoff) + SWR proactive refresh before ExpiresAt.
+	execMock := &mockYouTubeFetchExecutor{
+		playerID:     "a5c2aafe",
+		playerBaseJS: playerJS,
+		fetchDelay:   10 * time.Millisecond,
+	}
+	execMock.failRefresh.Store(true)
+
+	var nowMu sync.Mutex
+	currentNow := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	helper, err := NewHelper(execMock, sb, func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return currentNow
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper.prewarmBackoffs = []time.Duration{15 * time.Millisecond, 25 * time.Millisecond}
+	helper.bgRefreshInterval = time.Hour
+
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	stopBg := helper.StartBackgroundRefresh(bgCtx)
+	defer func() {
+		bgCancel()
+		stopBg()
+	}()
+
+	// Allow first attempt to fail, then allow retry to warm cache asynchronously.
+	time.Sleep(20 * time.Millisecond)
+	execMock.failRefresh.Store(false)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !helper.HasCachedContext() {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !helper.HasCachedContext() {
+		t.Fatal("expected StartBackgroundRefresh retry to warm player context")
+	}
+	initialPlayerJSHits := execMock.playerJSHits.Load()
+	if initialPlayerJSHits != 1 {
+		t.Fatalf("expected exactly 1 base.js fetch during prewarm, got %d", initialPlayerJSHits)
+	}
+
+	// 3. Advance into [ExpiresAt - SoftRefreshBefore, ExpiresAt) window (5h30m of 6h):
+	// Context() must return immediately AND renew ExpiresAt asynchronously without re-downloading base.js when player_id is unchanged.
+	nowMu.Lock()
+	currentNow = currentNow.Add(DefaultPlayerCacheTTL - 30*time.Minute)
+	nowMu.Unlock()
+	beforeIframeHits := execMock.iframeHits.Load()
+	payload, status := helper.Context(context.Background())
+	if status != http.StatusOK {
+		t.Fatalf("SWR context status = %d, want 200 (%#v)", status, payload)
+	}
+	helper.bgWG.Wait()
+	if execMock.iframeHits.Load() <= beforeIframeHits {
+		t.Fatalf("expected SWR background refresh to probe iframe_api (before=%d after=%d)", beforeIframeHits, execMock.iframeHits.Load())
+	}
+	if execMock.playerJSHits.Load() != initialPlayerJSHits {
+		t.Fatalf("unchanged player_id SWR must not re-fetch base.js (got %d, want %d)", execMock.playerJSHits.Load(), initialPlayerJSHits)
+	}
+	// Verify renewed TTL extends beyond the original 6h deadline.
+	renewedPayload, renewedStatus := helper.Context(context.Background())
+	if renewedStatus != http.StatusOK {
+		t.Fatalf("renewed context status = %d, want 200", renewedStatus)
+	}
+	renewedExp, err := time.Parse(time.RFC3339, unified.Str(unified.Map(renewedPayload["data"])["expires_at"]))
+	if err != nil {
+		t.Fatalf("invalid renewed expires_at: %v", err)
+	}
+	expectedMinExp := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC).Add(DefaultPlayerCacheTTL + 5*time.Hour)
+	if renewedExp.Before(expectedMinExp) {
+		t.Fatalf("expected SWR-renewed expires_at >= %s, got %s", expectedMinExp, renewedExp)
+	}
+
+	// 4. Finalize challenge LRU cache hit skips Deno solver on repeat challenges.
+	sampleJSON, err := os.ReadFile(filepath.Join("testdata", "finalize_sample_46.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRes, firstStatus := helper.Finalize(context.Background(), sampleJSON, false)
+	if firstStatus != http.StatusOK {
+		t.Fatalf("first Finalize status = %d, want 200 (%#v)", firstStatus, firstRes)
+	}
+	if helper.challengeCache.Len() == 0 {
+		t.Fatal("expected Finalize to populate challengeCache LRU")
+	}
+	// Replace sandbox with an unconfigured empty sandbox (would fail if invoked) to prove 100% cache hit skips Deno!
+	savedSandbox := helper.sandbox
+	helper.sandbox = &EJSSandbox{}
+	secondRes, secondStatus := helper.Finalize(context.Background(), sampleJSON, false)
+	helper.sandbox = savedSandbox
+	if secondStatus != http.StatusOK {
+		t.Fatalf("second Finalize with warm challenge LRU must succeed without invoking Deno, got %d (%#v)", secondStatus, secondRes)
+	}
+}

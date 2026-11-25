@@ -700,6 +700,7 @@ test("storage & protocol: token isolation, autoFollowTab transition, LRU 200 cap
     batchSaveMode: "subfolder",
     qualityPreference: "best",
     autoFollowTab: false,
+    useSaveFilePicker: false,
     theme: "system",
   });
   const anonHeaders = storage.buildApiAuthHeaders(initial, {
@@ -3195,4 +3196,205 @@ test("PR-2 Blob URL File wrapper: extensionDownload.ts and youtubeExtensionBridg
   assert.ok(ytBlobsCreated[0] instanceof File, "youtubeExtensionBridge must wrap Blob in File");
   assert.equal(ytBlobsCreated[0].name, "Demo Clip.webm");
   assert.equal(ytBlobsCreated[0].type, "video/webm");
+});
+
+test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloadCoordinator + webExternalBridge emit sanitized filenameWarning, and saveFilePicker streams directly", async () => {
+  const [filenameAudit, saveFilePicker] = await Promise.all([
+    bundleTsModule("../src/extension/bg/filenameAudit.ts"),
+    bundleTsModule("../src/downloads/saveFilePicker.ts"),
+  ]);
+
+  // 1) Pure filename tamper audit cases
+  assert.equal(
+    filenameAudit.detectFilenameTampering("DokiClips/测试作品_1080p.mp4", "/Users/u/Downloads/DokiClips/测试作品_1080p.mp4").tampered,
+    false,
+  );
+  assert.equal(
+    filenameAudit.detectFilenameTampering("测试作品_1080p.mp4", "/Users/u/Downloads/测试作品_1080p (1).mp4").tampered,
+    false,
+    "Chrome (1) uniquify suffix must be tolerated",
+  );
+  const uuidHit = filenameAudit.detectFilenameTampering(
+    "DokiClips/测试作品_1080p.mp4",
+    "/Users/u/Downloads/550e8400-e29b-41d4-a716-446655440000.mp4",
+  );
+  assert.equal(uuidHit.tampered, true);
+  assert.equal(uuidHit.reason, "uuid_overwrite");
+  assert.match(uuidHit.warning || "", /其他下载类扩展改写了保存文件名/);
+
+  const stemHit = filenameAudit.detectFilenameTampering(
+    "测试作品_1080p.mp4",
+    "C:\\Users\\alice\\Downloads\\videoplayback.mp4",
+  );
+  assert.equal(stemHit.tampered, true);
+  assert.equal(stemHit.reason, "stem_mismatch");
+
+  // 2) End-to-end downloadCoordinator + webExternalBridge filenameWarning propagation (sanitized, zero path/token leaks)
+  const changedListeners = [];
+  const externalListeners = [];
+  let nextDlId = 700;
+  const mockChrome = {
+    runtime: {
+      id: DOKITOOL_EXTENSION_ID,
+      getManifest: () => ({
+        version: "4.3.0",
+        host_permissions: ["https://snap.dokitool.com/*"],
+        optional_host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
+      }),
+      onMessage: { addListener() {}, removeListener() {} },
+      onMessageExternal: {
+        addListener(fn) { externalListeners.push(fn); },
+        removeListener(fn) {
+          const i = externalListeners.indexOf(fn);
+          if (i >= 0) externalListeners.splice(i, 1);
+        },
+      },
+      onConnect: { addListener() {}, removeListener() {} },
+      async getContexts() { return [{ contextType: "OFFSCREEN_DOCUMENT" }]; },
+      async sendMessage() { return { ok: true }; },
+    },
+    downloads: {
+      async download() { return ++nextDlId; },
+      async search({ id }) {
+        return [{ id, filename: "/Users/secret-home/Downloads/550e8400-e29b-41d4-a716-446655440000.mp4" }];
+      },
+      async cancel() {},
+      onChanged: {
+        addListener(fn) { changedListeners.push(fn); },
+        removeListener(fn) {
+          const i = changedListeners.indexOf(fn);
+          if (i >= 0) changedListeners.splice(i, 1);
+        },
+      },
+      onDeterminingFilename: { addListener() {}, removeListener() {} },
+    },
+    action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    declarativeNetRequest: { updateDynamicRules: async () => {}, getDynamicRules: async () => [] },
+    contextMenus: { create() {}, removeAll(cb) { cb?.(); }, onClicked: { addListener() {}, removeListener() {} } },
+    commands: { onCommand: { addListener() {}, removeListener() {} } },
+    tabs: { onActivated: { addListener() {}, removeListener() {} }, onUpdated: { addListener() {}, removeListener() {} }, query: async () => [] },
+    offscreen: { createDocument: async () => {}, closeDocument: async () => {} },
+    sidePanel: { setPanelBehavior: async () => {}, open: async () => {} },
+  };
+
+  const extStorage = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  await extStorage.updateSettings({ bearerToken: "secret_token_must_not_leak" });
+  const bg = backgroundMod.createBackgroundController({
+    chrome: mockChrome,
+    storage: extStorage,
+    fetchImpl: async () => new Response("{}", { status: 200 }),
+  });
+  await bg.init();
+
+  const sendExternal = (msg) =>
+    new Promise((resolveResp) => {
+      externalListeners[0](msg, { origin: "https://snap.dokitool.com" }, resolveResp);
+    });
+
+  try {
+    const enq = await sendExternal({
+      type: "WEB_EXT_ENQUEUE_MEDIA",
+      payload: {
+        kind: "direct_download",
+        platform: "bilibili",
+        title: "防篡改审计测试",
+        filename: "防篡改审计测试_1080p.mp4",
+        routes: ["https://upos-sz-mirrorcos.bilivideo.com/audit.mp4"],
+      },
+    });
+    assert.equal(enq.ok, true);
+    const taskId = enq.data.taskId;
+
+    // Trigger offscreen handoff -> chrome.downloads.download -> onChanged complete (with UUID rewrite in downloads.search)
+    const handoffResp = await new Promise((resolveHandoff) => {
+      bg.handleRuntimeMessage(
+        {
+          type: "HANDOFF_BLOB_DOWNLOAD",
+          taskId,
+          blobUrl: "blob:chrome-extension://test/audit-uuid",
+          filename: "防篡改审计测试_1080p.mp4",
+        },
+        { id: DOKITOOL_EXTENSION_ID },
+        resolveHandoff,
+      );
+    });
+    assert.equal(handoffResp.ok, true);
+    const dlId = handoffResp.data.chromeDownloadId;
+
+    for (const fn of changedListeners) {
+      fn({ id: dlId, state: { current: "complete" } });
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    const statusResp = await sendExternal({ type: "WEB_EXT_GET_TASK_STATUS", taskId });
+    assert.equal(statusResp.ok, true);
+    assert.equal(statusResp.data.status, "completed");
+    assert.match(statusResp.data.filenameWarning || "", /其他下载类扩展改写了保存文件名/);
+    assert.equal(JSON.stringify(statusResp).includes("secret-home"), false, "must never leak local filesystem path");
+    assert.equal(JSON.stringify(statusResp).includes("secret_token_must_not_leak"), false);
+  } finally {
+    bg.dispose();
+  }
+
+  // 3) saveFilePicker helper: promptSaveFileHandle + streamRoutesToFileHandle
+  const prevPicker = globalThis.showSaveFilePicker;
+  try {
+    delete globalThis.showSaveFilePicker;
+    assert.equal(saveFilePicker.isSaveFilePickerSupported(), false);
+    assert.deepEqual(await saveFilePicker.promptSaveFileHandle("demo.mp4", "video/mp4"), {
+      status: "unsupported",
+    });
+
+    const writtenChunks = [];
+    let closed = false;
+    let pickerOpts = null;
+    globalThis.showSaveFilePicker = async (opts) => {
+      pickerOpts = opts;
+      return {
+        name: opts.suggestedName,
+        async createWritable() {
+          return {
+            async write(data) { writtenChunks.push(new Uint8Array(data)); },
+            async close() { closed = true; },
+            async abort() {},
+          };
+        },
+      };
+    };
+    assert.equal(saveFilePicker.isSaveFilePickerSupported(), true);
+    const picked = await saveFilePicker.promptSaveFileHandle("DokiTool/Sub/演示_1080p.mp4", "video/mp4");
+    assert.equal(picked.status, "granted");
+    assert.equal(pickerOpts.suggestedName, "演示_1080p.mp4");
+
+    const fetchInits = [];
+    const streamed = await saveFilePicker.streamRoutesToFileHandle({
+      handle: picked.handle,
+      routes: ["https://cdn1.example/fail.mp4", "https://cdn2.example/ok.mp4"],
+      fetchImpl: async (url, init) => {
+        fetchInits.push({ url, credentials: init.credentials, referrerPolicy: init.referrerPolicy });
+        if (url.includes("fail")) return new Response("err", { status: 502 });
+        return new Response(new Uint8Array([1, 2, 3, 4, 5]), {
+          status: 200,
+          headers: { "content-length": "5" },
+        });
+      },
+    });
+    assert.equal(streamed.loaded, 5);
+    assert.equal(closed, true);
+    assert.deepEqual(Array.from(writtenChunks[0]), [1, 2, 3, 4, 5]);
+    assert.equal(fetchInits[1].credentials, "omit");
+    assert.equal(fetchInits[1].referrerPolicy, "no-referrer");
+
+    // User cancellation maps to { status: "cancelled" }
+    globalThis.showSaveFilePicker = async () => {
+      throw new DOMException("The user aborted a request.", "AbortError");
+    };
+    assert.deepEqual(await saveFilePicker.promptSaveFileHandle("demo.mp4"), { status: "cancelled" });
+  } finally {
+    if (prevPicker === undefined) delete globalThis.showSaveFilePicker;
+    else globalThis.showSaveFilePicker = prevPicker;
+  }
 });

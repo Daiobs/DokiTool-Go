@@ -197,6 +197,9 @@ test('all fourteen online catalog platforms are visible in Supported_Platforms w
     assert.ok(!heroHtml.includes(name));
     assert.ok(!gridHtml.includes(name));
   }
+  // Issue #48 [P2-2]: English PlatformGrid renders zero CJK characters (uses platformEnName)
+  const enGridHtml = await renderToString(createSSRApp({ render: () => h(PlatformGrid, { locale: 'en' }) }));
+  assert.equal(/[\u4e00-\u9fff]/.test(enGridHtml), false, `EN PlatformGrid must contain zero CJK characters, found: ${enGridHtml.match(/[\u4e00-\u9fff]+/g)}`);
 });
 
 test('mixed live results retain the complete image gallery and honest metadata', async () => {
@@ -5260,6 +5263,136 @@ test('Issue #48 Batch 1: [P1-3] M2 YouTube 360p delegates to extension before at
     await waitUntil(() => hGeneric.store.downloads[0]?.status === 'completed');
     assert.equal(enqueued.length, 4, 'unwhitelisted generic domain must NEVER leak to extension on SW fallback');
     assert.equal(blobFallbackCalls, 1, 'unwhitelisted generic domain must fall back to Web Blob');
+  } finally {
+    if (prevManager === undefined) delete globalThis.__uiDownloadManager;
+    else globalThis.__uiDownloadManager = prevManager;
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+});
+
+test('Issue #48 [B2-Polish-1] & [P2-5f]: extension bridge preserves refreshAvailable and placeholder filename infers extension by item.type', async () => {
+  const prevChrome = globalThis.chrome;
+  const prevManager = globalThis.__uiDownloadManager;
+  try {
+    let pollStage = 0;
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg?.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version: '4.3.0',
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+              },
+            });
+            return;
+          }
+          if (msg?.type === 'WEB_EXT_ENQUEUE_MEDIA') {
+            cb({ ok: true, data: { taskId: 'ext-polish-1', filename: msg.payload.filename } });
+            return;
+          }
+          if (msg?.type === 'WEB_EXT_GET_TASK_STATUS') {
+            pollStage++;
+            if (pollStage === 1) {
+              cb({
+                ok: true,
+                data: {
+                  taskId: 'ext-polish-1',
+                  status: 'failed',
+                  phase: 'failed',
+                  progress: 0,
+                  loadedBytes: 0,
+                  totalBytes: 0,
+                  speedBytesPerSec: 0,
+                  filename: '保留刷新状态测试.mp4',
+                  statusText: 'CDN 403',
+                },
+              });
+              return;
+            }
+          }
+          cb({ ok: true, data: {} });
+        },
+      },
+    };
+
+    const biliData = {
+      platform: 'bilibili',
+      title: '保留刷新状态测试',
+      source_url: 'https://www.bilibili.com/video/BV1Refresh01',
+      default_item_id: 'v1',
+      items: [
+        {
+          id: 'v1',
+          type: 'video',
+          state: 'ready',
+          resolve_url: '/api/resolve?id=v1',
+          default: { variant_id: 'hd', source_id: 's1', url: 'https://upos-sz-mirrorcos.bilivideo.com/v1.mp4' },
+          variants: [
+            {
+              id: 'hd',
+              label: '1080p',
+              metadata: { width: 1920, height: 1080, has_audio: true, container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+              delivery: { kind: 'file', sources: [{ id: 's1', url: 'https://upos-sz-mirrorcos.bilivideo.com/v1.mp4', size_bytes: 2_000_000 }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hBili = harness(biliData, async () => biliData.items[0]);
+    await hBili.instance.downloadMainVideo();
+    await waitUntil(() => hBili.store.downloads[0]?.status === 'failed');
+    assert.equal(hBili.store.downloads[0]?.refreshAvailable, true, 'extension bridge task failure must preserve refreshAvailable when canRefresh');
+
+    // [P2-5f] Initial placeholder filename uses .jpg for image and .m4a for audio when title/filename missing
+    let seenPlaceholderFilenames = [];
+    delete globalThis.chrome;
+    globalThis.__uiDownloadManager = {
+      async run(req, _signal, observe) {
+        seenPlaceholderFilenames.push(req.filename);
+        const snap = {
+          id: req.id,
+          transport: 'browser_streaming',
+          status: 'completed',
+          filename: req.filename,
+          url: req.url,
+          loaded: 100,
+          total: 100,
+          speed: 0,
+          elapsed: 0.1,
+          averageSpeed: 1000,
+        };
+        observe(snap);
+        return snap;
+      },
+    };
+    const imgOnly = {
+      platform: 'instagram',
+      title: '',
+      default_item_id: 'img-1',
+      items: [
+        {
+          id: 'img-1',
+          type: 'image',
+          state: 'ready',
+          default: { variant_id: 'orig', source_id: 's1', url: 'https://cdn.example.test/no-ext-image' },
+          variants: [
+            {
+              id: 'orig',
+              metadata: { mime_type: 'image/jpeg' },
+              delivery: { kind: 'file', sources: [{ id: 's1', url: 'https://cdn.example.test/no-ext-image' }] },
+            },
+          ],
+        },
+      ],
+    };
+    const hImg = harness(imgOnly);
+    await hImg.instance.downloadImage(imgOnly.items[0]);
+    await waitUntil(() => hImg.store.downloads[0]?.status === 'completed');
+    assert.ok(seenPlaceholderFilenames[0].endsWith('.jpg'), `expected image download filename to end with .jpg, got ${seenPlaceholderFilenames[0]}`);
   } finally {
     if (prevManager === undefined) delete globalThis.__uiDownloadManager;
     else globalThis.__uiDownloadManager = prevManager;

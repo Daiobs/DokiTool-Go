@@ -1,9 +1,20 @@
 <script setup>
 import AppIcon from './AppIcon.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import {
+  isSaveFilePickerSupported,
+  readWebSaveFilePickerPreference,
+  writeWebSaveFilePickerPreference,
+} from '../downloads/saveFilePicker'
 
 const props = defineProps({ downloads: { type: Array, default: () => [] } })
 const emit = defineEmits(['cancel', 'retry', 'refresh', 'query', 'handoff', 'clear-completed'])
+const savePickerSupported = ref(false)
+const useSaveFilePicker = ref(false)
+const toggleSaveFilePicker = () => {
+  useSaveFilePicker.value = !useSaveFilePicker.value
+  writeWebSaveFilePickerPreference(useSaveFilePicker.value)
+}
 const isDebug = () => {
   try { if (new URLSearchParams(window.location?.search).get('debug') === '1') return true } catch {}
   try { return window.localStorage?.getItem('dokitool:debug') === '1' } catch { return false }
@@ -84,6 +95,8 @@ const togglePanel = () => {
   try { window.localStorage.setItem(preferenceKey, expanded.value ? 'expanded' : 'collapsed') } catch { /* Storage is optional. */ }
 }
 onMounted(() => {
+  savePickerSupported.value = isSaveFilePickerSupported()
+  useSaveFilePicker.value = readWebSaveFilePickerPreference()
   try {
     const saved = window.localStorage.getItem(preferenceKey)
     manuallyCollapsed.value = saved === 'collapsed'
@@ -202,6 +215,15 @@ onBeforeUnmount(stopCollapseTimer)
             {{ item.fallbackReason }}
           </div>
 
+          <div
+            v-if="item.filenameWarning"
+            data-download-filename-warning
+            role="alert"
+            class="mt-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200/80 dark:border-amber-800/60 rounded-lg px-2.5 py-1.5 leading-snug"
+          >
+            {{ item.filenameWarning }}
+          </div>
+
           <div v-if="item.recoveryExpired" class="mt-2 text-xs text-slate-500 dark:text-slate-400">
             无法确认下载结果，请查看浏览器下载列表。
             <button type="button" @click="emit('query', item.id)" class="block mt-2 text-indigo-600 dark:text-indigo-400 hover:underline">重新查询状态</button>
@@ -263,6 +285,21 @@ onBeforeUnmount(stopCollapseTimer)
             </div>
           </details>
         </div>
+      </div>
+      <div
+        v-if="savePickerSupported"
+        class="px-4 py-2 border-t border-slate-100 dark:border-slate-700 flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400"
+      >
+        <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            data-testid="web-save-file-picker-toggle"
+            :checked="useSaveFilePicker"
+            @change="toggleSaveFilePicker"
+            class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+          />
+          <span>系统另存为流式直写（防其他插件改名）</span>
+        </label>
       </div>
     </section>
 

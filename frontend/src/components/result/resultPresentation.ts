@@ -287,7 +287,15 @@ export function buildPlayerQualityTagText(
   for (const part of outside.split(/\s*[·•]\s*/)) addToken(part);
   for (const part of parenParts) addToken(part);
   const highTier = resolveYouTubeHighResTier(activeVariant);
-  if (highTier) addToken(highTier);
+  if (highTier) {
+    // Deduplicate stale/conflicting resolution tier badges (e.g. `4K` + `8K` on 4320p60).
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      if (/^[248]k$/i.test(tokens[i]) && tokens[i].toUpperCase() !== highTier) {
+        tokens.splice(i, 1);
+      }
+    }
+    addToken(highTier);
+  }
   const specPrefix = tokens.join(" · ") || baseLabel;
   return locale === "en"
     ? `${specPrefix} (Silent preview · Audio included on download)`

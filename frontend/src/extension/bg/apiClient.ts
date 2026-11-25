@@ -175,6 +175,7 @@ export interface ApiClientDeps {
     req: Extract<BackgroundToOffscreenRequest, { type: T }>,
     options?: { skipEnsure?: boolean },
   ) => Promise<OffscreenResponseMap[T]>;
+  onParseProgress?: (stage: 1 | 2 | 3, statusText: string) => void;
 }
 
 export interface BackgroundApiClient {
@@ -218,7 +219,48 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
     nowFn,
     syncDynamicDnrRules,
     sendToOffscreen,
+    onParseProgress,
   } = deps;
+
+  const CONTEXT_CACHE_SAFETY_MARGIN_MS = 5 * 60_000;
+  const youtubeContextCache = new Map<
+    string,
+    { data: YouTubeHelperContextResponse; usableUntilMs: number }
+  >();
+
+  const readCachedYouTubeContext = (
+    originKey: string,
+  ): YouTubeHelperContextResponse | null => {
+    const hit = youtubeContextCache.get(originKey);
+    if (!hit) return null;
+    if (nowFn() >= hit.usableUntilMs) {
+      youtubeContextCache.delete(originKey);
+      return null;
+    }
+    return hit.data;
+  };
+
+  const writeCachedYouTubeContext = (
+    originKey: string,
+    data: YouTubeHelperContextResponse,
+  ): void => {
+    const parsedExp = Date.parse(data.expires_at || "");
+    if (!Number.isFinite(parsedExp)) return;
+    const usableUntilMs = parsedExp - CONTEXT_CACHE_SAFETY_MARGIN_MS;
+    if (usableUntilMs > nowFn()) {
+      youtubeContextCache.set(originKey, { data, usableUntilMs });
+    }
+  };
+
+  const isPlayerIdInvalidError = (err: unknown): boolean => {
+    if (err instanceof HttpStatusError) {
+      return (
+        err.status === 400 &&
+        (err.code === "INVALID_INPUT" || /player_id/i.test(err.message))
+      );
+    }
+    return err instanceof Error && /player_id/i.test(err.message);
+  };
 
   let lastConnectionCheck: ConnectionCheckResult | null = null;
 
@@ -469,8 +511,7 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
 
     await syncDynamicDnrRules();
 
-    let contextData: YouTubeHelperContextResponse;
-    try {
+    const fetchFreshContext = async (): Promise<YouTubeHelperContextResponse> => {
       const contextPayload = (await withRateLimitRetry(
         () =>
           fetchApiJson(
@@ -493,96 +534,148 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
       ) {
         throw new Error("获取 YouTube 解析上下文失败");
       }
-      contextData = contextPayload.data;
-    } catch (err) {
-      if (err instanceof HttpStatusError && err.status === 404 && onContextNotFound) {
-        return onContextNotFound();
+      writeCachedYouTubeContext(apiOrigin, contextPayload.data);
+      return contextPayload.data;
+    };
+
+    const runAttempt = async (allowCachedContext: boolean): Promise<UnifiedMedia> => {
+      onParseProgress?.(1, "正在准备解析上下文 (1/3)…");
+      const cachedContext = allowCachedContext
+        ? readCachedYouTubeContext(apiOrigin)
+        : null;
+      const usedCachedContext = cachedContext !== null;
+
+      // Spec B.1 Tier-1: 3-way parallel prefetch (`GET /api/youtube/context` +
+      // Offscreen `sw.js_data` visitorData + `www.youtube.com/oembed`).
+      let contextData: YouTubeHelperContextResponse;
+      let prefetchData: {
+        visitorData?: string;
+        oembed?: { title?: string; author?: string; thumbnail?: string } | null;
+      } | null = null;
+      try {
+        const [ctxRes, prefetchRes] = await Promise.all([
+          cachedContext ? Promise.resolve(cachedContext) : fetchFreshContext(),
+          sendToOffscreen({
+            type: "OFFSCREEN_YOUTUBE_PREFETCH",
+            payload: { video_id: videoId },
+            timeoutMs: 8_000,
+          })
+            .then((res) => res?.prefetch ?? null)
+            .catch(() => null),
+        ]);
+        contextData = ctxRes;
+        prefetchData = prefetchRes;
+      } catch (err) {
+        if (
+          err instanceof HttpStatusError &&
+          err.status === 404 &&
+          onContextNotFound
+        ) {
+          return onContextNotFound();
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    const { player: playerResult } = await sendToOffscreen({
-      type: "OFFSCREEN_YOUTUBE_PLAYER",
-      payload: {
+      onParseProgress?.(2, "正在获取视频流清单 (2/3)…");
+      const { player: playerResult } = await sendToOffscreen({
+        type: "OFFSCREEN_YOUTUBE_PLAYER",
+        payload: {
+          video_id: videoId,
+          signature_timestamp: contextData.signature_timestamp,
+          client: contextData.client,
+          ...(prefetchData?.visitorData
+            ? { visitor_data: prefetchData.visitorData }
+            : {}),
+          ...(prefetchData?.oembed ? { oembed: prefetchData.oembed } : {}),
+        },
+        timeoutMs: 20_000,
+      });
+
+      const playStatus = playerResult?.playabilityStatus?.status || "ERROR";
+      if (playStatus === "LOGIN_REQUIRED") {
+        const err = new Error(
+          "当前网络出口被 YouTube 要求验证，请更换节点后重试",
+        ) as Error & { code?: string };
+        err.code = "LOGIN_REQUIRED";
+        throw err;
+      }
+      if (playStatus !== "OK") {
+        throw new Error(
+          playerResult?.playabilityStatus?.reason ||
+            `YouTube 返回不可播放状态（${playStatus}）`,
+        );
+      }
+
+      const vd = playerResult.videoDetails;
+      const finalizeBody: Record<string, unknown> = {
         video_id: videoId,
-        signature_timestamp: contextData.signature_timestamp,
-        client: contextData.client,
-      },
-      timeoutMs: 20_000,
-    });
+        player_id: contextData.player_id,
+        formats: playerResult.streamingData?.formats || [],
+        adaptiveFormats: playerResult.streamingData?.adaptiveFormats || [],
+      };
+      if (typeof vd?.title === "string" && vd.title.trim()) {
+        finalizeBody.title = vd.title.trim();
+      }
+      if (typeof vd?.author === "string" && vd.author.trim()) {
+        finalizeBody.author = vd.author.trim();
+      }
+      if (
+        typeof vd?.lengthSeconds === "number" &&
+        Number.isInteger(vd.lengthSeconds) &&
+        vd.lengthSeconds > 0
+      ) {
+        finalizeBody.duration_seconds = vd.lengthSeconds;
+      }
+      if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
+        finalizeBody.thumbnail = vd.thumbnail.trim();
+      }
 
-    const playStatus = playerResult?.playabilityStatus?.status || "ERROR";
-    if (playStatus === "LOGIN_REQUIRED") {
-      const err = new Error(
-        "当前网络出口被 YouTube 要求验证，请更换节点后重试",
-      ) as Error & { code?: string };
-      err.code = "LOGIN_REQUIRED";
-      throw err;
-    }
-    if (playStatus !== "OK") {
-      throw new Error(
-        playerResult?.playabilityStatus?.reason ||
-          `YouTube 返回不可播放状态（${playStatus}）`,
-      );
-    }
-
-    const vd = playerResult.videoDetails;
-    const finalizeBody: Record<string, unknown> = {
-      video_id: videoId,
-      player_id: contextData.player_id,
-      formats: playerResult.streamingData?.formats || [],
-      adaptiveFormats: playerResult.streamingData?.adaptiveFormats || [],
-    };
-    if (typeof vd?.title === "string" && vd.title.trim()) {
-      finalizeBody.title = vd.title.trim();
-    }
-    if (typeof vd?.author === "string" && vd.author.trim()) {
-      finalizeBody.author = vd.author.trim();
-    }
-    if (
-      typeof vd?.lengthSeconds === "number" &&
-      Number.isInteger(vd.lengthSeconds) &&
-      vd.lengthSeconds > 0
-    ) {
-      finalizeBody.duration_seconds = vd.lengthSeconds;
-    }
-    if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
-      finalizeBody.thumbnail = vd.thumbnail.trim();
-    }
-
-    const finalizePayload = await withRateLimitRetry(
-      () =>
-        fetchApiJson(
-          `${apiOrigin}/api/youtube/finalize?schema_version=1.0`,
-          authSettings,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(finalizeBody),
-          },
+      onParseProgress?.(3, "正在解密高画质签名 (3/3)…");
+      let finalizePayload: unknown;
+      try {
+        finalizePayload = await withRateLimitRetry(
+          () =>
+            fetchApiJson(
+              `${apiOrigin}/api/youtube/finalize?schema_version=1.0`,
+              authSettings,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(finalizeBody),
+              },
+              signal,
+            ),
           signal,
-        ),
-      signal,
-    );
+        );
+      } catch (err) {
+        if (usedCachedContext && isPlayerIdInvalidError(err)) {
+          youtubeContextCache.delete(apiOrigin);
+          return runAttempt(false);
+        }
+        throw err;
+      }
 
-    const finalized = withTbvideoItems(
-      validateMediaEnvelope(finalizePayload, { apiOrigin }),
-    );
-    const readyState: YouTubeHelperState = {
-      status: "ready",
-      provider: "extension",
-      version: helperVersion,
-      ...(extensionVersion ? { extensionVersion } : {}),
-      min_version: MIN_YOUTUBE_HELPER_VERSION,
-      script_url: YOUTUBE_HELPER_SCRIPT_URL,
+      const finalized = withTbvideoItems(
+        validateMediaEnvelope(finalizePayload, { apiOrigin }),
+      );
+      const readyState: YouTubeHelperState = {
+        status: "ready",
+        provider: "extension",
+        version: helperVersion,
+        ...(extensionVersion ? { extensionVersion } : {}),
+        min_version: MIN_YOUTUBE_HELPER_VERSION,
+        script_url: YOUTUBE_HELPER_SCRIPT_URL,
+      };
+      return {
+        ...finalized,
+        extra: {
+          ...(finalized.extra || {}),
+          youtube_helper: readyState,
+        },
+      };
     };
-    return {
-      ...finalized,
-      extra: {
-        ...(finalized.extra || {}),
-        youtube_helper: readyState,
-      },
-    };
+
+    return runAttempt(true);
   };
 
   const parseSupportedUrlInternal = async (

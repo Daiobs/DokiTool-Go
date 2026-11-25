@@ -6,6 +6,7 @@ import {
   h,
   inject,
   markRaw,
+  nextTick,
   ref,
   shallowRef,
   onMounted,
@@ -109,6 +110,7 @@ const locale = ref(initialState.locale);
 const {
   inputUrl,
   parseError,
+  parseStatusText,
   currentPlatform,
   needsManualHelperRefresh,
   parseButton,
@@ -257,6 +259,14 @@ watch(
     if (videoStore.resultData) {
       void loadDownloadCard().catch(() => {});
       void ensureMediaDownload().catch(() => {});
+      if (typeof window !== "undefined") {
+        void nextTick(() => {
+          const el = resultAnchorRef.value;
+          if (el && typeof el.scrollIntoView === "function") {
+            el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        });
+      }
     }
   },
   { flush: "sync" },
@@ -295,9 +305,35 @@ const promptSelectQuality = () => {
   );
 };
 
+const extensionConnected = ref(false);
+const extensionVersion = ref("");
+const resultAnchorRef = ref(null);
+
+const handleExtensionStateChange = (state) => {
+  extensionConnected.value = Boolean(state?.connected);
+  extensionVersion.value = state?.version || "";
+};
+
+const probeHeaderExtension = async () => {
+  try {
+    const { pingInstalledExtension } = await import("./services/extensionBridge");
+    const state = await pingInstalledExtension();
+    handleExtensionStateChange(state);
+  } catch {
+    handleExtensionStateChange({ connected: false, version: "" });
+  }
+};
+
 const formatNumber = (num) => {
   if (!num && num !== 0) return "0";
   const n = Number(num);
+  if (!Number.isFinite(n)) return "0";
+  if (locale.value === "en") {
+    if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+    return String(n);
+  }
   if (n >= 1e8) return (n / 1e8).toFixed(1) + "亿";
   if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
   return String(n);
@@ -306,11 +342,14 @@ const formatNumber = (num) => {
 const formatDuration = (seconds) => {
   const duration = Number(seconds);
   if (!Number.isFinite(duration) || duration <= 0) return "0:00";
-  const tenths = Math.round(duration * 10);
-  const m = Math.floor(tenths / 600);
-  const s = Math.floor((tenths % 600) / 10);
-  const fraction = tenths % 10;
-  return `${m}:${String(s).padStart(2, "0")}${fraction ? `.${fraction}` : ""}`;
+  const totalSec = Math.round(duration);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  return `${m}:${String(s).padStart(2, "0")}`;
 };
 
 const toggleTheme = () => {
@@ -334,6 +373,7 @@ const onVisibilityOrFocus = () => {
     return;
   }
   void handleYouTubeHelperTabReturn();
+  void probeHeaderExtension();
 };
 
 const handleExtensionYouTubeReady = () => {
@@ -387,6 +427,7 @@ onMounted(() => {
   isReady.value = true;
   document.addEventListener("visibilitychange", onVisibilityOrFocus);
   window.addEventListener("focus", onVisibilityOrFocus);
+  void probeHeaderExtension();
   void resumePendingYouTubeHelperInstall();
 });
 
@@ -435,6 +476,8 @@ onUnmounted(() => {
     <HeaderNav
       :is-dark="isDark"
       :locale="locale"
+      :extension-connected="extensionConnected"
+      :extension-version="extensionVersion"
       @toggle-theme="toggleTheme"
       @set-locale="setLocale"
       @open-extension="showExtensionModal = true"
@@ -447,6 +490,7 @@ onUnmounted(() => {
         :is-loading="parseButton.isLoading.value"
         :is-error="!!parseError || parseButton.state.value === 'error'"
         :parse-error="parseError"
+        :parse-status-text="parseStatusText"
         :locale="locale"
         :current-platform="currentPlatform"
         @parse="parseVideo"
@@ -454,20 +498,25 @@ onUnmounted(() => {
         @select-platform="selectPlatform"
       />
 
-      <ResultSection
+      <div
         v-if="videoStore.resultData && selectionRef"
-        :result-data="videoStore.resultData"
-        :result-version="videoStore.resultVersion"
-        :is-downloading="isDownloading"
-        :needs-manual-helper-refresh="needsManualHelperRefresh"
-        :locale="locale"
-        :selection="selectionRef"
-        :format-number="formatNumber"
-        :format-duration="formatDuration"
-        :resolving-ids="videoStore.resolvingItems"
-        @refresh-item="resolveSelectedItem"
-        @open-extension="showExtensionModal = true"
-        @extension-youtube-ready="handleExtensionYouTubeReady"
+        ref="resultAnchorRef"
+        class="scroll-mt-20"
+      >
+        <ResultSection
+          :result-data="videoStore.resultData"
+          :result-version="videoStore.resultVersion"
+          :is-downloading="isDownloading"
+          :needs-manual-helper-refresh="needsManualHelperRefresh"
+          :locale="locale"
+          :selection="selectionRef"
+          :format-number="formatNumber"
+          :format-duration="formatDuration"
+          :resolving-ids="videoStore.resolvingItems"
+          @refresh-item="resolveSelectedItem"
+          @open-extension="showExtensionModal = true"
+          @extension-youtube-ready="handleExtensionYouTubeReady"
+          @extension-state-change="handleExtensionStateChange"
         @install-youtube-helper="markWaitingForYouTubeHelperInstall"
         @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"
@@ -492,11 +541,12 @@ onUnmounted(() => {
         @download-index="downloadVideoByIndex"
         @download-selected="downloadSelected"
         @download-all-videos="downloadAllVideos"
-        @download-selected-zip="
-          (videos) => downloadVideosAsZip(videos, undefined)
-        "
-        @download-all-zip="(videos) => downloadVideosAsZip(videos, undefined)"
-      />
+          @download-selected-zip="
+            (videos) => downloadVideosAsZip(videos, undefined)
+          "
+          @download-all-zip="(videos) => downloadVideosAsZip(videos, undefined)"
+        />
+      </div>
 
       <PlatformGrid :locale="locale" />
       <TutorialSection :locale="locale" />

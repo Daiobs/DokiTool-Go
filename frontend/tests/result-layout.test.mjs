@@ -1451,7 +1451,7 @@ test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero bo
   }
 });
 
-test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 < 4.2.0, opens extension modal on click, and hides on 4.2.0', async () => {
+test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-banner render when connected version 4.1.0 < 4.3.0, open extension modal on click, and hide on 4.3.0', async () => {
   const prevChrome = globalThis.chrome;
   const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
 
@@ -1474,7 +1474,7 @@ test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 
     };
   };
 
-  // Case 1: Outdated installed extension (4.1.0 < 4.2.0) -> shows clickable extension-update-badge
+  // Case 1: Outdated installed extension (4.1.0 < 4.3.0) -> shows clickable extension-update-badge + reload banner
   mockChromeVersion('4.1.0');
   const outdatedView = await mount(video);
   let openExtensionCalls = 0;
@@ -1493,8 +1493,12 @@ test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 
     );
     const updateBadge = () =>
       outdatedView.findAll(n => n.props['data-testid'] === 'extension-update-badge')[0];
-    assert.ok(updateBadge(), 'expected extension-update-badge when installed 4.1.0 < 4.2.0');
-    assert.equal(textOf(updateBadge()), '有新版 v4.2.0');
+    assert.ok(updateBadge(), 'expected extension-update-badge when installed 4.1.0 < 4.3.0');
+    assert.equal(textOf(updateBadge()), '有新版 v4.3.0');
+    const reloadBanner = () =>
+      outdatedView.findAll(n => n.props['data-testid'] === 'extension-reload-banner')[0];
+    assert.ok(reloadBanner(), 'expected extension-reload-banner when installed 4.1.0 < 4.3.0');
+    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.3\.0/);
 
     updateBadge().props.onClick();
     await outdatedView.flush();
@@ -1502,13 +1506,14 @@ test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 
 
     outdatedView.state.value = { ...outdatedView.state.value, locale: 'en' };
     await outdatedView.flush();
-    assert.equal(textOf(updateBadge()), 'Update v4.2.0');
+    assert.equal(textOf(updateBadge()), 'Update v4.3.0');
+    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.3\.0/);
   } finally {
     outdatedView.app.unmount();
   }
 
-  // Case 2: Up-to-date installed extension (4.2.0) -> hides extension-update-badge
-  mockChromeVersion('4.2.0');
+  // Case 2: Up-to-date installed extension (4.3.0) -> hides extension-update-badge & extension-reload-banner
+  mockChromeVersion('4.3.0');
   const currentView = await mount(video);
   await currentView.flush();
   await new Promise(r => setTimeout(r, 15));
@@ -1522,7 +1527,12 @@ test('P1 PR-2: extension-update-badge pill renders when connected version 4.1.0 
     assert.equal(
       currentView.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
       0,
-      'extension-update-badge must be hidden when installed extension is already 4.2.0',
+      'extension-update-badge must be hidden when installed extension is already 4.3.0',
+    );
+    assert.equal(
+      currentView.findAll(n => n.props['data-testid'] === 'extension-reload-banner').length,
+      0,
+      'extension-reload-banner must be hidden when installed extension is already 4.3.0',
     );
   } finally {
     currentView.app.unmount();
@@ -1654,7 +1664,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
   await nextTick();
   try {
     const zhText = textOf(portal);
-    assert.ok(zhText.includes('v4.2.0'), `expected v4.2.0 badge in zh-CN modal, got: ${zhText}`);
+    assert.ok(zhText.includes('v4.3.0'), `expected v4.3.0 badge in zh-CN modal, got: ${zhText}`);
     assert.ok(zhText.includes('14 核心平台 + 1000+ 长尾站点'));
     assert.ok(zhText.includes('B 站 1080P & YouTube 4K60 免油猴本地无损合流'));
     assert.ok(zhText.includes('网页端自动联动'));
@@ -1664,7 +1674,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
     locale.value = 'en';
     await nextTick();
     const enText = textOf(portal);
-    assert.ok(enText.includes('v4.2.0'), `expected v4.2.0 badge in en modal, got: ${enText}`);
+    assert.ok(enText.includes('v4.3.0'), `expected v4.3.0 badge in en modal, got: ${enText}`);
     assert.ok(enText.includes('14 core platforms + 1,000+ long-tail sites'));
     assert.ok(enText.includes('Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey'));
     assert.ok(enText.includes('automatic Web page handshake'));
@@ -1716,8 +1726,8 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
         provider: 'extension',
         version: '4.1.0',
         extensionVersion: '4.1.0',
-        min_version: '4.2.0',
-        message: '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.2.0+ 即可免油猴解析下载 YouTube',
+        min_version: '4.3.0',
+        message: '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.3.0+ 即可免油猴解析下载 YouTube',
       },
     },
   };
@@ -1742,7 +1752,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     assert.equal(notice().props['data-upgrade-reason'], 'outdated_extension');
     const zhNoticeText = textOf(notice());
     assert.match(zhNoticeText, /v4\.1\.0/);
-    assert.match(zhNoticeText, /v4\.2\.0\+/);
+    assert.match(zhNoticeText, /v4\.3\.0\+/);
     assert.doesNotMatch(zhNoticeText, /检测到旧版 YouTube 下载助手脚本需要更新/);
     assert.equal(readyEmits, 0);
 
@@ -1751,16 +1761,16 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     await view.flush();
     const enNoticeText = textOf(notice());
     assert.match(enNoticeText, /v4\.1\.0/);
-    assert.match(enNoticeText, /v4\.2\.0\+/);
+    assert.match(enNoticeText, /v4\.3\.0\+/);
     assert.doesNotMatch(enNoticeText, /Your legacy userscript needs an update/);
     view.state.value = { ...view.state.value, locale: 'zh-CN' };
     await view.flush();
 
-    // 2. User upgrades extension to v4.2.0 and returns to tab -> handleWindowReturnForBridge re-probes even though already connected!
+    // 2. User upgrades extension to v4.3.0 and returns to tab -> handleWindowReturnForBridge re-probes even though already connected!
     const callsBeforeFocus = pingCalls;
     mockState = {
       connected: true,
-      version: '4.2.0',
+      version: '4.3.0',
       extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
       capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
     };
@@ -1772,7 +1782,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     assert.equal(
       view.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
       0,
-      '有新版 v4.2.0 pill must disappear immediately after upgrading to 4.2.0',
+      '有新版 v4.3.0 pill must disappear immediately after upgrading to 4.3.0',
     );
     assert.equal(notice(), undefined, 'CapabilityUpgradeNotice must auto-dismiss once youtube_parse becomes available');
     assert.equal(readyEmits, 1, 'must emit extension-youtube-ready once to trigger in-place parseVideo()');
@@ -1786,7 +1796,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     view.app.unmount();
   }
 
-  // 3. Disconnected YouTube missing state -> user installs v4.2.0 extension & returns to tab -> closes notice & emits extension-youtube-ready
+  // 3. Disconnected YouTube missing state -> user installs v4.3.0 extension & returns to tab -> closes notice & emits extension-youtube-ready
   mockState = { connected: false, version: '', extensionId: '', capabilities: [] };
   const ytMissingData = {
     platform: 'youtube',
@@ -1817,7 +1827,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     assert.equal(freshView.portalFindAll(n => n.props['data-capability-upgrade-notice'] !== undefined).length, 1);
     mockState = {
       connected: true,
-      version: '4.2.0',
+      version: '4.3.0',
       extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
       capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
     };
@@ -2084,4 +2094,153 @@ test('Issue #48 [P1-2] & [P1-5]: M2 YouTube auto-upgrades default to 4K60 while 
   } finally {
     biliView.app.unmount();
   }
+});
+
+test('Issue #48 [P2-1, P2-2, P2-5a, P2-5b, P2-5e]: 8K badge dedup, EN PlatformGrid zero-CJK, single merged extension badge, HeaderNav connected dot, and duration backfill', async () => {
+  const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  // 1) [P2-1] 8K variant pill deduplicates conflicting 4K/8K tier badges
+  const yt8kData = {
+    platform: 'youtube',
+    content_id: 'YT8KTest01',
+    title: '8K UHD Dedup Sample',
+    source_url: 'https://www.youtube.com/watch?v=YT8KTest01',
+    default_item_id: 'v-8k',
+    items: [
+      {
+        id: 'v-8k',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'v-4320', source_id: 's1', url: 'https://media.test/8k.mp4' },
+        variants: [
+          {
+            id: 'v-4320',
+            label: '4320p60 (8K)',
+            metadata: { width: 7680, height: 4320, fps: 60, has_audio: true, video_codec: 'av01.0.16M.08', container: 'mp4', extension: 'mp4', mime_type: 'video/mp4' },
+            delivery: { kind: 'file', sources: [{ id: 's1', url: 'https://media.test/8k.mp4', size_bytes: 95_000_000 }] },
+          },
+        ],
+      },
+    ],
+  };
+  validateMediaEnvelope({ schema_version: '1.0', code: 'OK', data: yt8kData });
+  const v8k = await mount(yt8kData);
+  try {
+    const allText = textOf(v8k.root);
+    assert.match(allText, /8K/);
+    assert.doesNotMatch(allText, /4K\s*·\s*8K|8K\s*·\s*8K|8K\s*·\s*4K/);
+  } finally {
+    v8k.app.unmount();
+  }
+
+  // 2) [P2-5a] Connected extension on YouTube ready renders strictly ONE green ready badge
+  const prevChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(_extId, msg, cb) {
+        if (msg?.type === 'WEB_EXT_PING') {
+          cb({
+            ok: true,
+            data: {
+              version: '4.3.0',
+              extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+              capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+            },
+          });
+        }
+      },
+    },
+  };
+  const ytReady = {
+    ...yt8kData,
+    extra: { youtube_helper: { status: 'ready', provider: 'extension', version: '4.3.0', extensionVersion: '4.3.0' } },
+  };
+  const vMerged = await mount(ytReady);
+  await vMerged.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await vMerged.flush();
+  try {
+    assert.equal(vMerged.elements('rs-header-hint--ready').length, 1, 'must merge into a single green header pill');
+    assert.equal(vMerged.findAll(n => n.props['data-testid'] === 'extension-connected-badge').length, 1);
+  } finally {
+    vMerged.app.unmount();
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
+
+  // 3) [P2-5e] & [P2-2] ResultDetailsSidebar hides duration for images, shows "—" (never 0:00) for unknown video duration, localizes type in EN, and backfills duration on video loadedmetadata
+  const vZeroDur = await mount({
+    platform: 'weibo',
+    title: 'Zero Duration Test',
+    default_item_id: 'v0',
+    items: [
+      {
+        id: 'v0',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'm', url: 'https://media.test/v0.mp4' },
+        variants: [fileVariant('m', 'https://media.test/v0.mp4', { width: 1280, height: 720, duration_ms: 0 })],
+      },
+    ],
+  });
+  try {
+    assert.doesNotMatch(textOf(vZeroDur.root), /0:00/, 'must never display misleading 0:00 for missing/zero duration');
+    vZeroDur.state.value = { ...vZeroDur.state.value, locale: 'en' };
+    await vZeroDur.flush();
+    const enVals = vZeroDur.elements('rs-info-val').map(textOf);
+    assert.ok(enVals.includes('Video'), `expected localized English media type "Video", got ${JSON.stringify(enVals)}`);
+    const videoEl = vZeroDur.findAll(n => n.type === 'video')[0];
+    assert.ok(videoEl?.props?.onLoadedmetadata, 'video element should listen to loadedmetadata for duration backfill');
+    videoEl.props.onLoadedmetadata({ currentTarget: { duration: 125.6 } });
+    await vZeroDur.flush();
+    assert.ok(
+      vZeroDur.elements('rs-info-val').map(textOf).some(val => val.includes('125.6') || val.includes('2:06')),
+      'loadedmetadata must backfill detected video duration into Details card',
+    );
+  } finally {
+    vZeroDur.app.unmount();
+  }
+
+  // Image item omits duration row completely
+  const vImg = await mount({
+    platform: 'xiaohongshu',
+    title: 'Image Item Duration Hidden',
+    default_item_id: 'image-1',
+    items: [imageItem],
+  });
+  try {
+    const infoLabels = vImg.elements('rs-info-lbl').map(textOf);
+    assert.equal(infoLabels.includes('时长'), false, 'image item must not render 时长 row');
+  } finally {
+    vImg.app.unmount();
+  }
+
+  // 4) [P2-5b] HeaderNav renders emerald connected dot in zh-CN & en when connected and hides when disconnected
+  const HeaderNav = await loadSfc(
+    new URL('../src/components/HeaderNav.vue', import.meta.url),
+    {
+      modules: {
+        './AppIcon.vue': { default: { render: () => h('i') } },
+        './BrandWordmark.vue': { default: { render: () => h('span', 'DokiTool') } },
+      },
+    },
+  );
+  const { renderToString } = await import('@vue/server-renderer');
+  const { createSSRApp } = await import('vue');
+
+  const headerConnectedHtml = await renderToString(
+    createSSRApp({ render: () => h(HeaderNav, { locale: 'zh-CN', isDark: false, extensionConnected: true, extensionVersion: '4.3.0' }) }),
+  );
+  assert.match(headerConnectedHtml, /header-ext-connected-dot/);
+  assert.match(headerConnectedHtml, /扩展已连接/);
+  const headerConnectedEnHtml = await renderToString(
+    createSSRApp({ render: () => h(HeaderNav, { locale: 'en', isDark: false, extensionConnected: true, extensionVersion: '4.3.0' }) }),
+  );
+  assert.match(headerConnectedEnHtml, /header-ext-connected-dot/);
+  assert.match(headerConnectedEnHtml, /Ext Connected/);
+  const headerDisconnectedHtml = await renderToString(
+    createSSRApp({ render: () => h(HeaderNav, { locale: 'zh-CN', isDark: false, extensionConnected: false }) }),
+  );
+  assert.doesNotMatch(headerDisconnectedHtml, /header-ext-connected-dot/);
+  assert.match(headerDisconnectedHtml, /Chrome 扩展/);
 });

@@ -1436,6 +1436,71 @@ export function createUserscriptController(options = {}) {
     return token;
   }
 
+  async function fetchYouTubeOembed(videoId) {
+    if (!isValidYouTubeVideoId(videoId)) return null;
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId.trim()}`)}&format=json`;
+      const oembedResp = await gmRequest({
+        method: "GET",
+        url: oembedUrl,
+        timeout: 8000,
+        headers: {
+          Accept: "application/json",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+      if (
+        !oembedResp ||
+        oembedResp.status < 200 ||
+        oembedResp.status >= 300 ||
+        !oembedResp.responseText
+      ) {
+        return null;
+      }
+      const oembed = JSON.parse(oembedResp.responseText);
+      if (!oembed || typeof oembed !== "object") return null;
+      const out = {};
+      if (typeof oembed.title === "string" && oembed.title.trim()) {
+        out.title = oembed.title.trim();
+      }
+      if (typeof oembed.author_name === "string" && oembed.author_name.trim()) {
+        out.author = oembed.author_name.trim();
+      }
+      if (
+        typeof oembed.thumbnail_url === "string" &&
+        oembed.thumbnail_url.trim()
+      ) {
+        out.thumbnail = oembed.thumbnail_url.trim();
+      }
+      return Object.keys(out).length > 0 ? out : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function handlePrefetchAction(payload) {
+    if (!payload || typeof payload !== "object") {
+      throw new Error("预取请求参数无效");
+    }
+    const videoId = typeof payload.video_id === "string" ? payload.video_id.trim() : "";
+    if (!isValidYouTubeVideoId(videoId)) {
+      throw new Error("非法的 video_id");
+    }
+    const [visitorSettled, oembedSettled] = await Promise.allSettled([
+      getVisitorData(),
+      fetchYouTubeOembed(videoId),
+    ]);
+    return {
+      visitorData:
+        visitorSettled.status === "fulfilled" &&
+        typeof visitorSettled.value === "string"
+          ? visitorSettled.value
+          : "",
+      oembed:
+        oembedSettled.status === "fulfilled" ? oembedSettled.value : null,
+    };
+  }
+
   async function handlePlayerAction(payload) {
     if (!payload || typeof payload !== "object") {
       throw new Error("播放器请求参数无效");
@@ -1451,11 +1516,20 @@ export function createUserscriptController(options = {}) {
       throw new Error("非法的客户端参数：仅允许 TVHTML5");
     }
 
-    let visitorData = "";
-    try {
-      visitorData = await getVisitorData();
-    } catch {
-      visitorData = "";
+    const prefetchedOembed =
+      payload.oembed && typeof payload.oembed === "object"
+        ? payload.oembed
+        : null;
+
+    let visitorData = isValidVisitorDataToken(payload.visitor_data)
+      ? payload.visitor_data.trim()
+      : "";
+    if (!visitorData) {
+      try {
+        visitorData = await getVisitorData();
+      } catch {
+        visitorData = "";
+      }
     }
 
     const requestBody = buildTVHTML5PlayerPayload({
@@ -1505,43 +1579,31 @@ export function createUserscriptController(options = {}) {
         !parsed.videoDetails.title.trim())
     ) {
       try {
-        const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${video_id.trim()}`)}&format=json`;
-        const oembedResp = await gmRequest({
-          method: "GET",
-          url: oembedUrl,
-          timeout: 8000,
-          headers: {
-            Accept: "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
-        });
-        if (
-          oembedResp &&
-          oembedResp.status >= 200 &&
-          oembedResp.status < 300 &&
-          oembedResp.responseText
-        ) {
-          const oembed = JSON.parse(oembedResp.responseText);
-          if (oembed && typeof oembed === "object") {
-            const vd =
-              parsed.videoDetails && typeof parsed.videoDetails === "object"
-                ? { ...parsed.videoDetails }
-                : {};
-            if (!vd.title && typeof oembed.title === "string") {
-              vd.title = oembed.title;
-            }
-            if (!vd.author && typeof oembed.author_name === "string") {
-              vd.author = oembed.author_name;
-            }
-            if (
-              !vd.thumbnail &&
-              typeof oembed.thumbnail_url === "string" &&
-              oembed.thumbnail_url.trim()
-            ) {
-              vd.thumbnail = { thumbnails: [{ url: oembed.thumbnail_url }] };
-            }
-            parsed.videoDetails = vd;
+        const oembed =
+          prefetchedOembed || (await fetchYouTubeOembed(video_id));
+        if (oembed && typeof oembed === "object") {
+          const vd =
+            parsed.videoDetails && typeof parsed.videoDetails === "object"
+              ? { ...parsed.videoDetails }
+              : {};
+          if (!vd.title && typeof oembed.title === "string") {
+            vd.title = oembed.title;
           }
+          if (
+            !vd.author &&
+            typeof (oembed.author || oembed.author_name) === "string"
+          ) {
+            vd.author = oembed.author || oembed.author_name;
+          }
+          const thumbUrl = oembed.thumbnail || oembed.thumbnail_url;
+          if (
+            !vd.thumbnail &&
+            typeof thumbUrl === "string" &&
+            thumbUrl.trim()
+          ) {
+            vd.thumbnail = { thumbnails: [{ url: thumbUrl.trim() }] };
+          }
+          parsed.videoDetails = vd;
         }
       } catch {
         // Best-effort oEmbed metadata enrichment on www.youtube.com
@@ -2741,6 +2803,10 @@ export function createUserscriptController(options = {}) {
               name: "DokiTool YouTube Helper",
             },
           };
+        case "prefetch": {
+          const data = await handlePrefetchAction(payload);
+          return { requestId, ok: true, data };
+        }
         case "player": {
           const data = await handlePlayerAction(payload);
           return { requestId, ok: true, data };
@@ -2979,6 +3045,13 @@ export async function pingYouTubeHelper(options = {}) {
   } catch {
     return missing;
   }
+}
+
+export async function requestYouTubePrefetchViaHelper(payload, options = {}) {
+  return sendHelperRequest("prefetch", payload, {
+    timeoutMs: 8000,
+    ...options,
+  });
 }
 
 export async function requestYouTubePlayerViaHelper(payload, options = {}) {

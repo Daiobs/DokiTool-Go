@@ -10,7 +10,7 @@ import weiboArtwork from "../assets/platforms/weibo.svg";
 import pipixiaArtwork from "../assets/platforms/pipixia.png";
 import pipigxArtwork from "../assets/platforms/pipigx.ico";
 import zuiyouArtwork from "../assets/platforms/zuiyou.png";
-import { supportedPlatforms } from "../utils/platforms";
+import { supportedPlatforms, platformEnName } from "../utils/platforms";
 import { iconForClass } from "../utils/iconPaths";
 
 const brandSvg = (cls, fill) => {
@@ -101,12 +101,14 @@ const allPlatforms = computed(() =>
     ...platform,
     key: platform.id,
     url: platform.site_url,
-    english: platform.id,
+    english: platformEnName(platform.id, platform.name),
     desc: `解析${platform.name}媒体`,
     color: "#8854d0",
     ...platformArtwork[platform.icon],
   })),
 );
+const getPlatformDisplayName = (locale, platform) =>
+  locale === "en" ? platform.english : platform.name;
 const getDesc = (locale, idx) =>
   locale === "en"
     ? `Parse ${allPlatforms.value[idx].english} media`
@@ -148,14 +150,14 @@ const duplicatedPlatforms = computed(() => [
             class="platform-card"
             :aria-hidden="idx >= allPlatforms.length ? true : undefined"
             :tabindex="idx >= allPlatforms.length ? -1 : undefined"
-            :aria-label="`${platform.name}: ${getDesc(locale, idx % allPlatforms.length)}`"
+            :aria-label="`${getPlatformDisplayName(locale, platform)}: ${getDesc(locale, idx % allPlatforms.length)}`"
           >
             <div class="platform-icon-container">
               <div class="platform-icon-wrapper">
                 <img
                   v-if="platform.img && !failedArtwork[platform.key]"
                   :src="platform.img"
-                  :alt="platform.name"
+                  :alt="getPlatformDisplayName(locale, platform)"
                   class="platform-icon-img"
                   loading="lazy"
                   decoding="async"
@@ -166,7 +168,7 @@ const duplicatedPlatforms = computed(() => [
                   class="font-bold text-xl"
                   :style="{ color: platform.color }"
                   aria-hidden="true"
-                  >{{ platform.name.slice(0, 1) }}</span
+                  >{{ getPlatformDisplayName(locale, platform).slice(0, 1) }}</span
                 >
               </div>
               <div
@@ -175,7 +177,7 @@ const duplicatedPlatforms = computed(() => [
               ></div>
             </div>
 
-            <h4 class="platform-name">{{ platform.name }}</h4>
+            <h4 class="platform-name">{{ getPlatformDisplayName(locale, platform) }}</h4>
             <p class="platform-desc">
               {{ getDesc(locale, idx % allPlatforms.length) }}
             </p>

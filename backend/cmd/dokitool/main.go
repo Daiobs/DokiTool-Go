@@ -216,7 +216,7 @@ func run(args []string) error {
 	if sw, ok := shanghai.(interface{ BilibiliEnabled() bool }); ok {
 		shanghaiBilibili = sw.BilibiliEnabled()
 	}
-	youtubeHelperEnabled, err := configureYouTubeHelperWithState(c, handler, executor, os.Getenv)
+	ytHelper, youtubeHelperEnabled, err := configureYouTubeHelperWithState(c, handler, executor, os.Getenv)
 	if err != nil {
 		return err
 	}
@@ -263,6 +263,10 @@ func run(args []string) error {
 	defer stopStatsLog()
 	stopStatsSnap := handler.Stats().StartPeriodicSnapshot(ctx, statsSnapshotPath, api.DefaultStatsSnapshotInterval, log.Printf)
 	defer stopStatsSnap()
+	if ytHelper != nil {
+		stopYouTubeRefresh := ytHelper.StartBackgroundRefresh(ctx)
+		defer stopYouTubeRefresh()
+	}
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	log.Printf("DokiTool Go API %s listening on %s; admission=%+v", version, *listen, limits)
@@ -811,35 +815,35 @@ func newXEngine(baseEngine *ytengine.Engine) *ytengine.Engine {
 // Deno + yt-dlp/ejs runtime assets pass SHA-256 verification.
 // Verification failure disables only the YouTube helper without affecting other platforms.
 func configureYouTubeHelper(c *catalog.Catalog, handler *api.Handler, executor fetch.Executor, getenv func(string) string) error {
-	_, err := configureYouTubeHelperWithState(c, handler, executor, getenv)
+	_, _, err := configureYouTubeHelperWithState(c, handler, executor, getenv)
 	return err
 }
 
-func configureYouTubeHelperWithState(c *catalog.Catalog, handler *api.Handler, executor fetch.Executor, getenv func(string) string) (bool, error) {
+func configureYouTubeHelperWithState(c *catalog.Catalog, handler *api.Handler, executor fetch.Executor, getenv func(string) string) (*youtube.Helper, bool, error) {
 	raw := getenv("DOKITOOL_YOUTUBE_HELPER")
 	if raw == "" {
-		return false, nil
+		return nil, false, nil
 	}
 	enabled, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, fmt.Errorf("DOKITOOL_YOUTUBE_HELPER must be a boolean")
+		return nil, false, fmt.Errorf("DOKITOOL_YOUTUBE_HELPER must be a boolean")
 	}
 	if !enabled {
-		return false, nil
+		return nil, false, nil
 	}
 	helper, err := youtube.NewHelperFromEnv(executor, getenv, time.Now)
 	if err != nil {
 		log.Printf("dokitool: youtube helper runtime preflight failed (youtube helper disabled): %v", err)
-		return false, nil
+		return nil, false, nil
 	}
 	if c != nil && !c.Has("youtube") {
 		if err := c.Register(catalog.YouTubePlatform()); err != nil {
-			return false, err
+			return nil, false, err
 		}
 	}
 	sb := helper.Sandbox()
 	log.Printf("dokitool: youtube helper runtime verified (deno_version=%s, deno_asset=%s, deno_sha256=%s, ejs_version=%s, lib_sha256=%s, core_sha256=%s)",
 		youtube.PinnedDenoVersion, sb.DenoAsset(), sb.DenoSHA256(), youtube.PinnedEJSVersion, sb.LibSHA256(), sb.CoreSHA256())
 	handler.SetYouTubeHelper(helper)
-	return true, nil
+	return helper, true, nil
 }

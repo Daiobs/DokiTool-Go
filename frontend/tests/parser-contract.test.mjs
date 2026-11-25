@@ -622,10 +622,10 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
     assert.equal(zhHelper?.provider, 'extension');
     assert.equal(zhHelper?.version, '4.1.0');
     assert.equal(zhHelper?.extensionVersion, '4.1.0');
-    assert.equal(zhHelper?.min_version, '4.2.0');
+    assert.equal(zhHelper?.min_version, '4.3.0');
     assert.equal(
       zhHelper?.message,
-      '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.2.0+ 即可免油猴解析下载 YouTube',
+      '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.3.0+ 即可免油猴解析下载 YouTube',
     );
     assert.doesNotMatch(JSON.stringify(zhStore.resultData), /googlevideo\.com/);
 
@@ -653,7 +653,7 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
     const enHelper = enStore.resultData?.extra?.youtube_helper;
     assert.equal(enHelper?.status, 'outdated');
     assert.equal(enHelper?.provider, 'extension');
-    assert.match(enHelper?.message || '', /v4\.1\.0.*v4\.2\.0\+/);
+    assert.match(enHelper?.message || '', /v4\.1\.0.*v4\.3\.0\+/);
     assert.equal(
       outdatedParseCalls,
       0,
@@ -722,6 +722,147 @@ test('Post-#37: runYouTubeHelperParse calls requestStandardParse 0 times when ex
   t.mock.timers.tick(1);
   assert.equal(capturedSignal.aborted, true, 'fetchJSON must time out at 75000ms');
   await assert.rejects(pending, /解析请求超时/);
+});
+
+test('Issue #48 [P1-6]: Web context short-TTL cache, 1x player_id 400 retry, and 3-stage parseStatusText in zh-CN & en', async () => {
+  parseHelpers.clearCachedYouTubeContext();
+  assert.match(parseHelpers.formatYouTubeParseStageText(1, 'zh-CN'), /1\/3/);
+  assert.match(parseHelpers.formatYouTubeParseStageText(2, 'zh-CN'), /2\/3/);
+  assert.match(parseHelpers.formatYouTubeParseStageText(3, 'zh-CN'), /3\/3/);
+  assert.match(parseHelpers.formatYouTubeParseStageText(1, 'en'), /1\/3/);
+  assert.match(parseHelpers.formatYouTubeParseStageText(3, 'en'), /3\/3/);
+
+  const prevWin = globalThis.window;
+  const listeners = new Map();
+  globalThis.window = {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      listeners.get(type)?.delete(fn);
+    },
+    dispatchEvent(ev) {
+      const detail = typeof ev.detail === 'string' ? JSON.parse(ev.detail) : ev.detail;
+      if (ev.type === 'dokitool:youtube-helper:request') {
+        const respond = (payload) => {
+          const resEv = new CustomEvent('dokitool:youtube-helper:response', {
+            detail: JSON.stringify({ requestId: detail.requestId, ...payload }),
+          });
+          for (const fn of listeners.get('dokitool:youtube-helper:response') || []) fn(resEv);
+        };
+        if (detail.action === 'prefetch') {
+          queueMicrotask(() => respond({ ok: true, data: { visitorData: 'CgtnVmlzaXRvckRhdGE%3D', oembed: { title: 'Web Prefetch' } } }));
+        } else if (detail.action === 'player') {
+          queueMicrotask(() =>
+            respond({
+              ok: true,
+              data: {
+                playabilityStatus: { status: 'OK' },
+                videoDetails: { title: 'Web Prefetch' },
+                streamingData: { formats: [], adaptiveFormats: [] },
+              },
+            }),
+          );
+        }
+      }
+      return true;
+    },
+  };
+
+  let contextFetches = 0;
+  let failFinalizeOnce = false;
+  const stages = [];
+  const makeFetchJson = () => async (url) => {
+    if (url.includes('/api/youtube/context')) {
+      contextFetches++;
+      return {
+        schema_version: '1.0',
+        code: 'OK',
+        data: {
+          player_id: `web-pl-${contextFetches}`,
+          signature_timestamp: 20200 + contextFetches,
+          client: { name: 'TVHTML5', version: '7.20260101.00.00' },
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+        },
+      };
+    }
+    if (url.includes('/api/youtube/finalize')) {
+      if (failFinalizeOnce) {
+        failFinalizeOnce = false;
+        const err = new Error('player_id 已失效');
+        err.status = 400;
+        err.code = 'INVALID_INPUT';
+        throw err;
+      }
+      return {
+        schema_version: '1.0',
+        code: 'OK',
+        data: {
+          platform: 'youtube',
+          content_id: 'I9JvDaciaFk',
+          title: 'Web Prefetch',
+          items: [
+            {
+              id: 'yt-1',
+              type: 'video',
+              variants: [
+                {
+                  id: 'v360',
+                  label: '360p',
+                  metadata: { width: 640, height: 360, extension: 'mp4', has_audio: true },
+                  delivery: { kind: 'file', sources: [{ id: 's1', url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18' }] },
+                },
+              ],
+              default: { variant_id: 'v360', source_id: 's1', url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18' },
+            },
+          ],
+        },
+      };
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  try {
+    const runOnce = () => {
+      let result = null;
+      return parseHelpers
+        .runYouTubeHelperParse({
+          videoId: 'I9JvDaciaFk',
+          locale: 'zh-CN',
+          signal: new AbortController().signal,
+          isCurrent: () => true,
+          pingExtension: async () => ({ connected: false, version: '', extensionId: '', capabilities: [] }),
+          pingHelper: async () => ({ installed: true, version: '1.3.2', supported: true }),
+          requestStandardParse: async () => { throw new Error('must not call standard parse'); },
+          fetchJSON: makeFetchJson(),
+          baseUrl: 'https://snap.dokitool.com',
+          onHelperReady: () => {},
+          onStageChange: (stage, text) => stages.push({ stage, text }),
+          setResult: (m) => { result = m; },
+          setError: (e) => { throw new Error(`unexpected setError: ${e}`); },
+        })
+        .then(() => result);
+    };
+
+    const r1 = await runOnce();
+    assert.equal(r1?.title, 'Web Prefetch');
+    assert.equal(contextFetches, 1);
+    assert.deepEqual(stages.map((s) => s.stage), [1, 2, 3]);
+
+    // Second run hits Web short-TTL context cache
+    await runOnce();
+    assert.equal(contextFetches, 1, 'second Web YouTube parse must hit cached context');
+
+    // Third run gets 400 player_id invalid on finalize -> clears cache, re-fetches context once, retries & succeeds
+    failFinalizeOnce = true;
+    const r3 = await runOnce();
+    assert.equal(r3?.title, 'Web Prefetch');
+    assert.equal(contextFetches, 2, '400 player_id must invalidate Web context cache and retry once');
+  } finally {
+    parseHelpers.clearCachedYouTubeContext();
+    globalThis.window = prevWin;
+  }
 });
 
 });

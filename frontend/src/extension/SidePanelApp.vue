@@ -40,6 +40,11 @@ import {
   sendSidePanelRequest,
 } from "./uiTargetHelpers";
 import {
+  isSaveFilePickerSupported,
+  promptSaveFileHandle,
+  streamRoutesToFileHandle,
+} from "../downloads/saveFilePicker";
+import {
   extractActiveParseUrlsFromText,
   extractSupportedUrlsFromText,
   matchActiveParseUrl,
@@ -66,6 +71,7 @@ const savedWorkFingerprints = ref<string[]>([]);
 // Single-link parse state
 const urlInput = ref<string>("");
 const isParsing = ref<boolean>(false);
+const parseStageText = ref<string>("");
 const parseError = ref<string>("");
 const parseErrorStatus = ref<number | undefined>(undefined);
 const activeMedia = ref<UnifiedMedia | null>(null);
@@ -299,6 +305,23 @@ function extractFirstActiveParseUrl(
   return extracted.items[0] ?? null;
 }
 
+function hasActiveDownloadTasks(): boolean {
+  return tasks.value.some(
+    (t) =>
+      t.status === "queued" ||
+      t.status === "parsing" ||
+      t.status === "downloading" ||
+      t.status === "muxing" ||
+      t.status === "saving",
+  );
+}
+
+function collapseDownloadsIfIdle() {
+  if (downloadsExpanded.value && !hasActiveDownloadTasks()) {
+    downloadsExpanded.value = false;
+  }
+}
+
 async function runParseUrl(
   rawCandidate: string,
   origin: "tab" | "manual",
@@ -311,6 +334,7 @@ async function runParseUrl(
   if (!matched) {
     parseGeneration += 1;
     isParsing.value = false;
+    parseStageText.value = "";
     parseErrorStatus.value = undefined;
     parseError.value =
       origin === "tab"
@@ -319,8 +343,10 @@ async function runParseUrl(
     return;
   }
 
+  collapseDownloadsIfIdle();
   const myGen = ++parseGeneration;
   isParsing.value = true;
+  parseStageText.value = "";
   parseError.value = "";
   parseErrorStatus.value = undefined;
   urlInput.value = matched.url;
@@ -338,6 +364,7 @@ async function runParseUrl(
 
   if (myGen !== parseGeneration) return;
   isParsing.value = false;
+  parseStageText.value = "";
 
   if (!rpc.ok) {
     parseError.value = rpc.error || "解析失败，请稍后重试";
@@ -345,6 +372,7 @@ async function runParseUrl(
     return;
   }
 
+  collapseDownloadsIfIdle();
   activeMedia.value = rpc.data.media;
   activeWorkFingerprint.value =
     rpc.data.workFingerprint || buildWorkFingerprint(rpc.data.media);
@@ -538,6 +566,11 @@ function handleBackgroundBroadcast(msg: BackgroundToSidePanelBroadcast) {
     case "PANEL_INTENT":
       void handlePendingIntent(msg.intent);
       break;
+    case "PARSE_PROGRESS":
+      if (isParsing.value) {
+        parseStageText.value = msg.statusText;
+      }
+      break;
   }
 }
 
@@ -680,6 +713,39 @@ async function handleEnqueueDownloads(payload: {
   groupBatchId?: string;
 }) {
   if (!payload.items.length) return;
+  // Spec B.3 §4: Optional system Save-As streaming direct write for single direct files.
+  // Must prompt synchronously under the click gesture before any unrelated await.
+  if (
+    settings.value.useSaveFilePicker &&
+    !payload.groupBatchId &&
+    payload.items.length === 1 &&
+    payload.items[0].spec.kind === "direct_file" &&
+    payload.items[0].spec.routes.length > 0 &&
+    isSaveFilePickerSupported()
+  ) {
+    const single = payload.items[0];
+    const promptRes = await promptSaveFileHandle(
+      single.spec.filename,
+      single.spec.mimeType,
+    );
+    if (promptRes.status === "cancelled") {
+      showToast("已取消另存为", "info");
+      return;
+    }
+    if (promptRes.status === "granted") {
+      showToast("正在通过系统另存为流式直写...", "info");
+      try {
+        await streamRoutesToFileHandle({
+          handle: promptRes.handle,
+          routes: single.spec.routes,
+        });
+        showToast(`已直写保存：${promptRes.suggestedName}`, "success");
+        return;
+      } catch {
+        showToast("流式直写受限，已自动回退后台队列保存", "info");
+      }
+    }
+  }
   const rpc = await sendSidePanelRequest({
     type: "ENQUEUE_DOWNLOADS",
     items: payload.items,
@@ -964,7 +1030,7 @@ onUnmounted(() => {
               spellcheck="false"
               autocomplete="off"
               class="sp-input sp-url-bar__input"
-              placeholder="粘贴作品链接或分享口令（支持 14 核心平台及 TikTok/Vimeo/Reddit/SoundCloud 等长尾站点）..."
+              placeholder="粘贴作品链接或分享口令（支持 14 核心及长尾站点）"
             />
             <button
               v-if="urlInput"
@@ -1002,7 +1068,7 @@ onUnmounted(() => {
         <div v-if="isParsing && !activeMedia" class="sp-loading-card">
           <div class="sp-loading-card__spinner sp-spin" />
           <div class="sp-loading-card__text">
-            <strong>正在无痕解析媒体直链...</strong>
+            <strong>{{ parseStageText || "正在无痕解析媒体直链..." }}</strong>
             <span>不携带任何浏览器站点 Cookie</span>
           </div>
         </div>

@@ -197,6 +197,7 @@ export function useVideoParser(options: {
 
   const inputUrl = shallowRef(""),
     parseError = shallowRef(""),
+    parseStatusText = shallowRef(""),
     currentPlatform = shallowRef("all"),
     needsManualHelperRefresh = shallowRef(false);
   let checkingHelperInstall = false;
@@ -277,6 +278,7 @@ export function useVideoParser(options: {
     active = null;
     parseButton.reset();
     parseError.value = "";
+    parseStatusText.value = "";
     videoStore.clearResult();
   };
   watch([inputUrl, currentPlatform], invalidate, { flush: "sync" });
@@ -334,6 +336,11 @@ export function useVideoParser(options: {
         clearHelperWaitState();
         needsManualHelperRefresh.value = false;
       },
+      onStageChange: (_stage, statusText) => {
+        if (run === generation && !controller.signal.aborted) {
+          parseStatusText.value = statusText;
+        }
+      },
       setResult: (media) => videoStore.setResult(media),
       setError: (msg, duration) => {
         parseError.value = msg;
@@ -374,6 +381,7 @@ export function useVideoParser(options: {
     active = controller;
     videoStore.clearResult();
     parseError.value = "";
+    parseStatusText.value = "";
     parseButton.setLoading(true);
     try {
       if (currentPlatform.value !== "all") {
@@ -422,6 +430,7 @@ export function useVideoParser(options: {
     } finally {
       if (run === generation) {
         active = null;
+        parseStatusText.value = "";
         parseButton.reset();
       }
     }
@@ -594,6 +603,7 @@ export function useVideoParser(options: {
   return {
     inputUrl,
     parseError,
+    parseStatusText,
     currentPlatform,
     needsManualHelperRefresh,
     parseButton,

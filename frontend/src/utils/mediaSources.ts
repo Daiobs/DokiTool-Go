@@ -139,16 +139,52 @@ function normalizeRawVariantLabel(raw: string, locale: string): string {
   return raw;
 }
 
+const GENERIC_TIER_LABELS = new Set<string>([
+  "mp4_hd",
+  "mp4_hd_mp4",
+  "mp4_hd_url",
+  "hevc_mp4_hd",
+  "h265_mp4_hd",
+  "inch_4_mp4_hd",
+  "inch_5_mp4_hd",
+  "inch_5_5_mp4_hd",
+  "stream_url_hd",
+  "mp4_sd",
+  "mp4_sd_mp4",
+  "mp4_sd_url",
+  "stream_url",
+  "mp4_ld",
+  "mp4_ld_mp4",
+  "hevc_mp4_ld",
+  "h265_mp4_ld",
+  "高清",
+  "hd",
+  "标清",
+  "sd",
+  "流畅",
+  "ld",
+]);
+
+function formatResolutionFromDimensions(width: number, height: number): string {
+  return `${Math.min(width, height)}p`;
+}
+
 /** Display backend metadata without ranking or changing the selected version. */
 export function variantLabel(
   variant: Variant | undefined,
   locale = "zh-CN",
 ): string {
   if (!variant) return locale === "en" ? "Unknown quality" : "画质未知";
-  if (variant.label) return normalizeRawVariantLabel(variant.label, locale);
   const { width, height } =
     variant.state === "deferred" ? {} : variant.metadata || {};
-  if (width && height) return `${Math.min(width, height)}p`;
+  if (variant.label) {
+    const trimmedKey = variant.label.trim().toLowerCase();
+    if (width && height && GENERIC_TIER_LABELS.has(trimmedKey)) {
+      return formatResolutionFromDimensions(width, height);
+    }
+    return normalizeRawVariantLabel(variant.label, locale);
+  }
+  if (width && height) return formatResolutionFromDimensions(width, height);
   if (width) return `${width}w`;
   return locale === "en" ? "Unknown quality" : "画质未知";
 }

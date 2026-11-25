@@ -17,6 +17,7 @@ import {
   type PrepareSpecForDispatchParams,
   type PrepareSpecForDispatchResult,
 } from "./specRefresher";
+import { auditCompletedDownloadFilename } from "./filenameAudit";
 import {
   FINISHED_TASK_STATUSES,
   sanitizeRelativeDownloadPath,
@@ -82,34 +83,23 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
   let offscreenMutex: Promise<void> = Promise.resolve();
 
   const earlyDownloadDeltas = new Map<number, ChromeDownloadDelta>();
+  const observedDownloadFilenames = new Map<number, string>();
   const authoritativeFilenamesByUrl = new Map<string, string>();
   const authoritativeFilenamesByDownloadId = new Map<number, string>();
   const authoritativeUrlByDownloadId = new Map<number, string>();
 
-  // ==========================================================================
   // 1. Authoritative Filename Gatekeeper (`onDeterminingFilename`)
-  // ==========================================================================
-
-  const cleanupAuthoritativeFilenameByUrl = (
-    url: string | undefined,
-    excludeDownloadId?: number,
-  ): void => {
+  const cleanupAuthoritativeFilenameByUrl = (url: string | undefined, excludeDownloadId?: number): void => {
     if (!url) return;
     for (const [id, rec] of pendingBlobDownloads.entries()) {
-      if (id !== excludeDownloadId && (rec.downloadUrl === url || rec.blobUrl === url)) {
-        return;
-      }
+      if (id !== excludeDownloadId && (rec.downloadUrl === url || rec.blobUrl === url)) return;
     }
     for (const [id, mappedUrl] of authoritativeUrlByDownloadId.entries()) {
       if (id !== excludeDownloadId && mappedUrl === url) return;
     }
     authoritativeFilenamesByUrl.delete(url);
   };
-
-  const cleanupAuthoritativeFilenameByDownloadId = (
-    downloadId: number,
-    fallbackUrl?: string,
-  ): void => {
+  const cleanupAuthoritativeFilenameByDownloadId = (downloadId: number, fallbackUrl?: string): void => {
     const mappedUrl = authoritativeUrlByDownloadId.get(downloadId) || fallbackUrl;
     authoritativeFilenamesByDownloadId.delete(downloadId);
     authoritativeUrlByDownloadId.delete(downloadId);
@@ -327,6 +317,13 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     let outcome: "completed" | "failed" | undefined;
 
     if (state === "complete") {
+      const filenameWarning = await auditCompletedDownloadFilename({
+        downloadId: record.downloadId,
+        expectedFilename: record.filename,
+        deltaFilename: delta.filename?.current,
+        observedFilenames: observedDownloadFilenames,
+        searchDownloads: chromeApi.downloads?.search,
+      });
       if (task) {
         tasks.set(record.taskId, {
           ...task,
@@ -336,6 +333,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
           loaded: task.total > 0 ? task.total : task.loaded,
           speed: 0,
           chromeDownloadId: record.downloadId,
+          ...(filenameWarning ? { filenameWarning } : {}),
           error: undefined,
           updatedAt: nowFn(),
         });
@@ -352,6 +350,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       }
       outcome = "completed";
     } else {
+      observedDownloadFilenames.delete(record.downloadId);
       const errReason = delta.error?.current || "DOWNLOAD_INTERRUPTED";
       const userCancelled =
         task?.status === "cancelled" || /USER_CANCELED|USER_SHUTDOWN/i.test(errReason);
@@ -387,6 +386,9 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
   };
 
   const onChromeDownloadChanged = (delta: ChromeDownloadDelta): void => {
+    if (typeof delta?.id === "number" && typeof delta.filename?.current === "string" && delta.filename.current.trim()) {
+      observedDownloadFilenames.set(delta.id, delta.filename.current.trim());
+    }
     const state = delta?.state?.current;
     if (state !== "complete" && state !== "interrupted") return;
     const record = pendingBlobDownloads.get(delta.id);
@@ -623,7 +625,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       status: enrichedSpec.kind === "youtube_mux" ? "muxing" : "downloading",
       statusText:
         enrichedSpec.kind === "youtube_mux"
-          ? "正在准备 4K 无损合流..."
+          ? "正在准备 YouTube 无损合流..."
           : enrichedSpec.kind === "dash_mux"
             ? "正在准备音视频无损合流..."
             : "正在准备下载...",
@@ -883,6 +885,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       authoritativeFilenamesByDownloadId.clear();
       authoritativeUrlByDownloadId.clear();
       earlyDownloadDeltas.clear();
+      observedDownloadFilenames.clear();
     },
   };
 }

@@ -256,6 +256,13 @@ export function createBackgroundController(
     syncDynamicDnrRules: dnrManager.syncDynamicDnrRules,
     sendToOffscreen: (req, options) =>
       downloadCoordinator.sendToOffscreen(req, options),
+    onParseProgress: (stage, statusText) => {
+      broadcastToSidePanels({
+        type: "PARSE_PROGRESS",
+        stage,
+        statusText,
+      });
+    },
   });
 
   const specRefresher = createSpecRefresher({

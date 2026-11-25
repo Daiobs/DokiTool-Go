@@ -200,3 +200,40 @@ export function resolveAdaptiveQualityFilenameTag(params: {
   }
   return undefined;
 }
+
+/**
+ * Appends an adaptive quality/audio suffix (`_1080p`, `_2160p`, `_audio`) onto
+ * a base filename stem idempotently so Web (M2) and Extension (M3) produce
+ * identical stems for the same work & quality choice.
+ */
+export function appendCanonicalQualitySuffix(
+  baseStem: string,
+  qualityTag: string | null | undefined,
+): string {
+  const stem = (baseStem || "").trim();
+  const tag = (qualityTag || "").trim().replace(/\s+/g, "_");
+  if (!stem || !tag) return stem;
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`(?:^|[\\s_-])${escaped}$`, "i").test(stem)) {
+    return stem;
+  }
+  return `${stem}_${tag}`;
+}
+
+/**
+ * Canonical archive stem shared by Web (M2) and Extension (M3): appends `_<N>P`
+ * idempotently (e.g. `作品标题_9P` -> `作品标题_9P.zip`).
+ */
+export function buildCanonicalArchiveStem(
+  baseStem: string,
+  count: number,
+): string {
+  const stem = (baseStem || "").trim();
+  const safeCount = Math.max(1, Math.trunc(Number(count) || 1));
+  const suffix = `${safeCount}P`;
+  if (!stem) return suffix;
+  if (new RegExp(`(?:^|[\\s_-])${safeCount}P$`, "i").test(stem)) {
+    return stem;
+  }
+  return `${stem}_${suffix}`;
+}

@@ -1221,3 +1221,15 @@ func TestAdaptInfoAllowAudioOnlyAndProgressiveWebM(t *testing.T) {
 		}
 	})
 }
+
+func TestFormatSilentVideoSuffix8K(t *testing.T) {
+	if got := formatSilentVideoSuffix(Format{Width: goldenInt64Ptr(7680), Height: goldenInt64Ptr(4320)}); got != "8K · 仅视频无声" {
+		t.Fatalf("8K suffix = %q, want %q", got, "8K · 仅视频无声")
+	}
+	if got := formatSilentVideoSuffix(Format{Width: goldenInt64Ptr(7680), Height: goldenInt64Ptr(4320), DynamicRange: "HDR10"}); got != "8K · HDR · 仅视频无声" {
+		t.Fatalf("8K HDR suffix = %q, want %q", got, "8K · HDR · 仅视频无声")
+	}
+	if got := formatSilentVideoSuffix(Format{Width: goldenInt64Ptr(3840), Height: goldenInt64Ptr(2160)}); got != "4K · 仅视频无声" {
+		t.Fatalf("4K suffix = %q, want %q", got, "4K · 仅视频无声")
+	}
+}

@@ -9,6 +9,7 @@ const props = defineProps({
   isLoading: Boolean,
   isError: Boolean,
   parseError: String,
+  parseStatusText: { type: String, default: '' },
   locale: String,
   currentPlatform: String
 })
@@ -180,6 +181,17 @@ const selectPlatform = (tab) => {
             </button>
           </div>
         </div>
+
+        <p
+          v-if="isLoading && parseStatusText"
+          data-testid="parse-stage-status"
+          role="status"
+          aria-live="polite"
+          class="theme-colors mt-3 px-2 text-xs sm:text-sm font-medium text-indigo-600 dark:text-indigo-400 flex items-center justify-center gap-2"
+        >
+          <AppIcon class="fas fa-spinner fa-spin text-xs"></AppIcon>
+          <span>{{ parseStatusText }}</span>
+        </p>
 
         <Transition name="parse-error">
           <div

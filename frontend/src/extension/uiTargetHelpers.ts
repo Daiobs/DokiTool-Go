@@ -48,12 +48,15 @@ import {
   extractVariantEarliestExpiresAtMs,
 } from "./dashMuxSpec";
 import {
+  appendCanonicalQualitySuffix,
+  buildCanonicalArchiveStem,
   buildCanonicalVariantDescriptor,
   compareCanonicalVariantDesc,
   hasMultiCollectionGroups,
   inferDirectVideoExtension,
   isPlaceholderPartTitle,
   isTbvideoVideoItem,
+  resolveAdaptiveQualityFilenameTag,
   resolvePreferredMediaTitle,
   sortVariantsCanonical,
 } from "../core/media";
@@ -2347,10 +2350,25 @@ export function buildSingleDownloadEnqueueItem(params: {
   const { media, item, option, settings, workFingerprint } = params;
   const apiOrigin = resolveSafeApiOrigin(settings.apiBaseUrl);
   const baseName = resolveItemBaseName(media, item);
+  const qualitySuffix =
+    option.kind === "variant" && option.variant
+      ? resolveAdaptiveQualityFilenameTag({
+          enabled: Boolean(
+            media.extra?.youtube_helper ||
+              option.muxPair ||
+              option.variant.metadata?.has_audio === false ||
+              (item.type === "video" &&
+                isStandaloneAudioMetadata(option.variant.metadata, item.type)),
+          ),
+          itemType: item.type,
+          extension: option.resolvedExt,
+          variant: option.variant,
+        })
+      : undefined;
   const stem =
     option.kind === "attachment" && option.attachment?.title?.trim()
       ? `${baseName}_${option.attachment.title.trim()}`
-      : baseName;
+      : appendCanonicalQualitySuffix(baseName, qualitySuffix);
 
   const filename = buildSafeDownloadPath({
     prefix: settings.subfolderPrefix,
@@ -2764,7 +2782,7 @@ export function buildChecklistZipEnqueueItem(params: {
   const workTitle = resolveWorkBaseTitle(media);
   const zipFilename = buildSafeDownloadPath({
     prefix: settings.subfolderPrefix,
-    stem: workTitle,
+    stem: buildCanonicalArchiveStem(workTitle, zipEntries.length),
     ext: "zip",
   });
 

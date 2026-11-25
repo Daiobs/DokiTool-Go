@@ -1168,3 +1168,40 @@ test('Issue #48 [P0-1]: unresponsive waiting worker self-heals via single unregi
   assert.equal(unregisterCalls2, 1, 'must unregister at most once');
   assert.equal(registerCalls2, 1, 'must re-register at most once');
 });
+
+test('Issue #48 [B2-Polish-2]: activated() hands off to non-redundant replacement worker when tracked worker turns redundant', async t => {
+  const h = await harness(t, message =>
+    message.action === 'ping' ? { protocol: 1, workerBuild: build }
+      : { snapshot: state(), downloadUrl: `/downloads/file/${request.id}/${message.token}` });
+  const replacementListeners = new Set();
+  const replacement = {
+    scriptURL: origin + '/downloads/worker.js',
+    state: 'activating',
+    addEventListener(type, fn) { if (type === 'statechange') replacementListeners.add(fn); },
+    removeEventListener(type, fn) { if (type === 'statechange') replacementListeners.delete(fn); },
+    postMessage: (...args) => h.worker.postMessage(...args),
+  };
+  h.worker.state = 'activating';
+  h.registration.active = null;
+  h.registration.installing = h.worker;
+  h.registration.waiting = replacement;
+
+  const task = h.api.downloadStreaming(request, new AbortController().signal, () => {});
+  await flush();
+  assert.equal(h.messages.length, 0);
+
+  // Tracked worker turns redundant while replacement is non-redundant on reg -> must hand off without failing!
+  h.transition('redundant');
+  await flush();
+  assert.equal(replacementListeners.size, 1, 'must attach statechange to replacement worker');
+
+  replacement.state = 'activated';
+  h.registration.waiting = null;
+  h.registration.active = replacement;
+  for (const fn of [...replacementListeners]) fn();
+  await flush();
+
+  assert.equal(h.messages.filter(m => m.action === 'start').length, 1);
+  h.update(state('completed'), replacement);
+  assert.equal((await task).status, 'completed');
+});

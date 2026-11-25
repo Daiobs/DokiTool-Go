@@ -173,3 +173,28 @@ test('Issue #48 [P0-1]: onStreamingUnavailable delegates to extension when handl
   assert.equal(res2.transport, 'browser_blob');
   assert.deepEqual(c2, ['probe', 'blob'], 'must fall back to downloadBlob when external delegation declined');
 });
+
+test('Issue #48 [B2-Polish-2]: tbvideo StreamingUnavailableError delegates to onStreamingUnavailable before falling back to manual', async () => {
+  let delegated = 0;
+  const { manager: m1, calls: c1 } = harness({
+    downloadStreaming: async () => { throw new StreamingUnavailableError('下载服务激活超时'); },
+  });
+  const tbReq = { ...request('tb-1'), tbvideo: { fallbackUrl: 'https://tbvideo.ixiaochuan.cn/clip.mp4' } };
+  const res1 = await m1.run(tbReq, new AbortController().signal, () => {}, {
+    async onStreamingUnavailable() {
+      delegated++;
+      return true;
+    },
+  });
+  assert.equal(delegated, 1);
+  assert.equal(res1.status, 'handed-off');
+  assert.deepEqual(c1, [], 'tbvideo must not probe native or run Blob when delegated to extension');
+
+  const { manager: m2 } = harness({
+    downloadStreaming: async () => { throw new StreamingUnavailableError('下载服务激活超时'); },
+  });
+  const res2 = await m2.run(tbReq, new AbortController().signal, () => {}, {
+    async onStreamingUnavailable() { return false; },
+  });
+  assert.equal(res2.status, 'manual', 'declined tbvideo delegation must preserve manual fallback');
+});

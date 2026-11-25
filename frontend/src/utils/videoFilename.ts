@@ -113,9 +113,13 @@ export function buildArchiveFilename(input: {
   fallback: string;
 }): string {
   const label = cleanBase(input.title ?? "") || cleanBase(input.author ?? "");
+  const safeCount = Math.max(1, Math.trunc(input.count));
+  const hasCountSuffix =
+    Boolean(label) &&
+    new RegExp(`(?:^|[\\s_-])${safeCount}P$`, "i").test(label);
   return buildMediaFilename({
     title: label,
-    suffix: `${Math.max(1, Math.trunc(input.count))}P`,
+    suffix: hasCountSuffix ? undefined : `${safeCount}P`,
     fallback: input.fallback || "archive",
     extension: "zip",
   });

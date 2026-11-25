@@ -82,19 +82,36 @@ function activated(
   if (worker.state === "activated") return Promise.resolve(worker);
   if (reg?.active?.state === "activated") return Promise.resolve(reg.active);
   return new Promise((resolve, reject) => {
+    let tracked = worker;
     let nudged = false;
-    const finish = () => { clearTimeout(timer); worker.removeEventListener("statechange", changed); };
+    const detach = () => tracked.removeEventListener("statechange", changed);
+    const finish = () => { clearTimeout(timer); detach(); };
     const changed = () => {
-      if (worker.state === "activated") { finish(); resolve(worker); }
+      if (tracked.state === "activated") { finish(); resolve(tracked); }
       else if (reg?.active?.state === "activated") { finish(); resolve(reg.active); }
-      else if (worker.state === "redundant") { finish(); reject(new Error("下载服务安装失败")); }
-      else if (worker.state === "installed" && !nudged) { nudged = true; nudgeWaitingWorker(reg); }
+      else if (tracked.state === "redundant") {
+        const replacement = [reg?.active, reg?.waiting, reg?.installing].find(
+          (candidate): candidate is ServiceWorker =>
+            Boolean(candidate && candidate !== tracked && candidate.state !== "redundant"),
+        );
+        if (replacement) {
+          detach();
+          tracked = replacement;
+          nudged = false;
+          tracked.addEventListener("statechange", changed);
+          changed();
+          return;
+        }
+        finish();
+        reject(new Error("下载服务安装失败"));
+      }
+      else if (tracked.state === "installed" && !nudged) { nudged = true; nudgeWaitingWorker(reg); }
     };
     const timer = setTimeout(() => {
       finish();
       reject(new StreamingUnavailableError("下载服务激活超时"));
     }, timeoutMs);
-    worker.addEventListener("statechange", changed);
+    tracked.addEventListener("statechange", changed);
     changed();
   });
 }
