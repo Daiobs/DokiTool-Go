@@ -4,15 +4,6 @@ on:
   pull_request:
     branches:
       - main
-      - codex/go-backend-migration
-      - codex/fix-public-media-projection
-      - codex/bilibili-go-migration
-      - codex/remaining-platforms-go-migration
-      - codex/xhs-page-transport
-      - codex/download-delivery-closeout
-      - codex/renewal-selection-stability
-      - chat/product-refresh-closeout
-      - dot/same-host-credential-recovery-product
 
 permissions:
   contents: read
@@ -31,19 +22,26 @@ jobs:
       run_frontend: ${{ steps.classify.outputs.run_frontend }}
       run_l2_e2e: ${{ steps.classify.outputs.run_l2_e2e }}
     steps:
-      - name: Check out repository history for path classification
+      - name: Check out trusted base commit for path classification
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Classify changed paths (fail-closed)
+      - name: Fetch PR head commit and classify changed paths (fail-closed)
         id: classify
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          if ! git rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null \
+            || ! git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$PR_HEAD_SHA" \
+              || git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head" \
+              || true
+          fi
           python3 -B scripts/classify-ci-changes.py \
             --base="$PR_BASE_SHA" \
             --head="$PR_HEAD_SHA" \
@@ -82,6 +80,9 @@ jobs:
           python3 -B scripts/go-migration/test-public-projection.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/test-unified-schema.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/check-openapi.py --require-jsonschema
+
+      - name: Verify Go single-file line budgets
+        run: python3 -B scripts/check-go-file-budgets.py
 
   offline-contract:
     needs: changes
@@ -333,3 +334,100 @@ jobs:
           path: ${{ runner.temp }}/xhs-review
           retention-days: 7
           if-no-files-found: error
+
+  ci-summary:
+    needs:
+      - changes
+      - repo-contracts
+      - offline-contract
+      - frontend-and-browser
+      - xhs-dependency-review
+    if: always() && github.repository == 'Daiobs/DokiTool-Go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce path-gated CI job results
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          REPO_CONTRACTS_RESULT: ${{ needs.repo-contracts.result }}
+          OFFLINE_CONTRACT_RESULT: ${{ needs.offline-contract.result }}
+          FRONTEND_AND_BROWSER_RESULT: ${{ needs.frontend-and-browser.result }}
+          XHS_DEPENDENCY_REVIEW_RESULT: ${{ needs.xhs-dependency-review.result }}
+          RUN_GO: ${{ needs.changes.outputs.run_go }}
+          RUN_FRONTEND: ${{ needs.changes.outputs.run_frontend }}
+          RUN_L2_E2E: ${{ needs.changes.outputs.run_l2_e2e }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          changes_result="${CHANGES_RESULT:-}"
+          repo_contracts_result="${REPO_CONTRACTS_RESULT:-}"
+          offline_contract_result="${OFFLINE_CONTRACT_RESULT:-}"
+          frontend_and_browser_result="${FRONTEND_AND_BROWSER_RESULT:-}"
+          xhs_dependency_review_result="${XHS_DEPENDENCY_REVIEW_RESULT:-}"
+          run_go="${RUN_GO:-}"
+          run_frontend="${RUN_FRONTEND:-}"
+          run_l2_e2e="${RUN_L2_E2E:-}"
+
+          echo "CI summary:"
+          echo "  changes=${changes_result}"
+          echo "  repo-contracts=${repo_contracts_result}"
+          echo "  offline-contract=${offline_contract_result} (run_go=${run_go})"
+          echo "  xhs-dependency-review=${xhs_dependency_review_result} (run_go=${run_go})"
+          echo "  frontend-and-browser=${frontend_and_browser_result} (run_frontend=${run_frontend}, run_l2_e2e=${run_l2_e2e})"
+
+          assert_eq() {
+            local label="$1"
+            local actual="$2"
+            local expected="$3"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::${label}: expected '${expected}', got '${actual}'"
+              failed=1
+            fi
+          }
+
+          assert_eq "changes" "$changes_result" "success"
+          assert_eq "repo-contracts" "$repo_contracts_result" "success"
+
+          case "$run_go" in
+            true)
+              assert_eq "offline-contract (run_go=true)" "$offline_contract_result" "success"
+              assert_eq "xhs-dependency-review (run_go=true)" "$xhs_dependency_review_result" "success"
+              ;;
+            false)
+              assert_eq "offline-contract (run_go=false)" "$offline_contract_result" "skipped"
+              assert_eq "xhs-dependency-review (run_go=false)" "$xhs_dependency_review_result" "skipped"
+              ;;
+            *)
+              echo "::error::unexpected or missing changes.outputs.run_go='${run_go}' (expected 'true' or 'false')"
+              failed=1
+              ;;
+          esac
+
+          case "$run_frontend" in
+            true)
+              assert_eq "frontend-and-browser (run_frontend=true)" "$frontend_and_browser_result" "success"
+              ;;
+            false)
+              assert_eq "frontend-and-browser (run_frontend=false)" "$frontend_and_browser_result" "skipped"
+              ;;
+            *)
+              echo "::error::unexpected or missing changes.outputs.run_frontend='${run_frontend}' (expected 'true' or 'false')"
+              failed=1
+              ;;
+          esac
+
+          case "$run_l2_e2e" in
+            true|false)
+              if [ "$run_l2_e2e" = "true" ] && [ "$run_frontend" != "true" ]; then
+                echo "::error::invalid classifier outputs: run_l2_e2e=true requires run_frontend=true (got run_frontend='${run_frontend}')"
+                failed=1
+              fi
+              ;;
+            *)
+              echo "::error::unexpected or missing changes.outputs.run_l2_e2e='${run_l2_e2e}' (expected 'true' or 'false')"
+              failed=1
+              ;;
+          esac
+
+          exit "$failed"

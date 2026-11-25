@@ -131,6 +131,37 @@ test('public/llms.txt exists and accurately documents DokiTool, all 14 core plat
   );
 });
 
+test('public/llms.txt Chrome extension version matches extensionReleaseMeta.json SSOT', async () => {
+  const [llms, releaseMetaRaw] = await Promise.all([
+    readFile(new URL('../public/llms.txt', import.meta.url), 'utf8'),
+    readFile(new URL('../src/core/extensionReleaseMeta.json', import.meta.url), 'utf8'),
+  ]);
+  const releaseMeta = JSON.parse(releaseMetaRaw);
+  assert.equal(
+    typeof releaseMeta.version,
+    'string',
+    'extensionReleaseMeta.json must declare a string version',
+  );
+  assert.match(
+    releaseMeta.version,
+    /^\d+\.\d+\.\d+$/,
+    `extensionReleaseMeta.json version must be semver: ${releaseMeta.version}`,
+  );
+  const expectedVersionTag = `v${releaseMeta.version}`;
+  assert.ok(
+    llms.includes(expectedVersionTag),
+    `public/llms.txt must contain exact extension version ${expectedVersionTag} from src/core/extensionReleaseMeta.json`,
+  );
+  const extLine = llms
+    .split('\n')
+    .find((line) => /chrome\s+mv3\s+extension/i.test(line));
+  assert.ok(extLine, 'public/llms.txt must contain the Chrome MV3 Extension line');
+  assert.ok(
+    extLine.includes(`\`${expectedVersionTag}\``),
+    `public/llms.txt Chrome MV3 Extension line must reference \`${expectedVersionTag}\`, got: ${extLine}`,
+  );
+});
+
 test('public favicon.ico exists with a valid ICO header and non-empty icon directory', async () => {
   const ico = await readFile(new URL('../public/favicon.ico', import.meta.url));
   assert.ok(ico.byteLength >= 70, 'favicon.ico must contain header, directory entry, and image payload');

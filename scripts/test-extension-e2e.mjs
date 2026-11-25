@@ -612,17 +612,135 @@ async function createIsolatedMockInfrastructure({ runDir, distDir }) {
   };
 }
 
-class HeadlessChromeManager {
-  constructor({ chromeBin, proxyPort, spkiHash }) {
+function isPidAlive(pid) {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+function killProcessTree(pid, signal) {
+  if (!pid || pid <= 0) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // already dead
+      }
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // fallback to single pid
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // already dead
+  }
+}
+
+async function settleWithin(promise, timeoutMs) {
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve(promise).catch(() => {}),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export class HeadlessChromeManager {
+  constructor({
+    chromeBin,
+    proxyPort,
+    spkiHash,
+    tempDirs = [],
+    onBeforeExit = null,
+  }) {
     this.chromeBin = chromeBin;
     this.proxyPort = proxyPort;
     this.spkiHash = spkiHash;
     this.instances = [];
+    this.tempDirs = new Set();
+    for (const dir of tempDirs) {
+      this.registerTempDir(dir);
+    }
+    this.onBeforeExit = typeof onBeforeExit === "function" ? onBeforeExit : null;
+    this.closing = false;
+    this._closePromise = null;
+    this._inflightLaunches = new Set();
+    this._signalHandlersInstalled = false;
+    this._signalTriggered = false;
+    this._onSignal = (signal) => {
+      if (this._signalTriggered) return;
+      this._signalTriggered = true;
+      void (async () => {
+        try {
+          await this.closeAll();
+          if (this.onBeforeExit) {
+            await this.onBeforeExit().catch(() => {});
+          }
+        } finally {
+          process.exit(signal === "SIGTERM" ? 143 : 130);
+        }
+      })();
+    };
   }
 
-  async launch({ profileDir, downloadDir, extensionDirs = [] }) {
+  registerTempDir(dir) {
+    if (typeof dir === "string" && dir.trim()) {
+      this.tempDirs.add(path.resolve(dir));
+    }
+  }
+
+  installSignalHandlers() {
+    if (this._signalHandlersInstalled) return;
+    this._signalHandlersInstalled = true;
+    process.once("SIGINT", this._onSignal);
+    process.once("SIGTERM", this._onSignal);
+  }
+
+  disposeSignalHandlers() {
+    if (!this._signalHandlersInstalled) return;
+    this._signalHandlersInstalled = false;
+    process.off("SIGINT", this._onSignal);
+    process.off("SIGTERM", this._onSignal);
+  }
+
+  async launch(opts) {
+    if (this.closing) {
+      throw new Error("HeadlessChromeManager is shutting down");
+    }
+    this.installSignalHandlers();
+    const pending = this.#launchInternal(opts);
+    this._inflightLaunches.add(pending);
+    try {
+      return await pending;
+    } finally {
+      this._inflightLaunches.delete(pending);
+    }
+  }
+
+  async #launchInternal({ profileDir, downloadDir, extensionDirs = [] }) {
+    this.registerTempDir(profileDir);
     await fsp.mkdir(path.join(profileDir, "Default"), { recursive: true });
     if (downloadDir) {
+      this.registerTempDir(downloadDir);
       await fsp.mkdir(downloadDir, { recursive: true });
       const prefs = {
         download: {
@@ -641,6 +759,10 @@ class HeadlessChromeManager {
         JSON.stringify(prefs),
         "utf8",
       );
+    }
+
+    if (this.closing) {
+      throw new Error("HeadlessChromeManager is shutting down");
     }
 
     const args = [
@@ -682,107 +804,172 @@ class HeadlessChromeManager {
       if (stderrBuf.length < 32) stderrBuf.push(chunk.toString("utf8"));
     });
 
-    const record = { child, pid: child.pid, browser: null, profileDir };
+    const record = {
+      child,
+      pid: child.pid,
+      browser: null,
+      profileDir,
+      downloadDir: downloadDir || null,
+      exited: false,
+      _killPromise: null,
+    };
+    let spawnError = null;
+    child.once("error", (err) => {
+      spawnError = err;
+      record.exited = true;
+    });
+    child.once("exit", () => {
+      record.exited = true;
+    });
     this.instances.push(record);
 
-    const activePortFile = path.join(profileDir, "DevToolsActivePort");
-    await until(
-      async () => {
-        if (child.exitCode !== null) {
-          throw new Error(
-            `Chrome exited prematurely (${child.exitCode}): ${stderrBuf.join("").slice(0, 400)}`,
-          );
-        }
-        try {
-          const text = await fsp.readFile(activePortFile, "utf8");
-          return text.trim().split(/\r?\n/).length >= 2;
-        } catch {
-          return false;
-        }
-      },
-      "Chrome DevToolsActivePort",
-      20_000,
-    );
-
-    const browser = await connect(profileDir);
-    record.browser = browser;
-    // NOTE: Never call `Browser.setDownloadBehavior({ behavior: "allow" })` when testing
-    // `chrome.downloads` extensions because CDP's `allow` mode short-circuits
-    // `ChromeDownloadManagerDelegate` and replaces filenames with random GUIDs (bypassing
-    // both `filename` subdirectories and `onDeterminingFilename` listeners).
-    // `Default/Preferences` (`download.default_directory`) configures Chrome's real download
-    // manager natively in `--headless=new` for both extension and page/SW downloads.
-
-    // Ensure every requested extension is loaded in exact order (needed on branded Chrome 137+).
-    if (extensionDirs.length > 0 && !supportsCliLoadExtension) {
-      for (const extDir of extensionDirs) {
-        await browser.send("Extensions.loadUnpacked", { path: extDir });
-        await delay(150);
-      }
+    if (this.closing) {
+      await this.killInstance(record);
+      throw new Error("HeadlessChromeManager is shutting down");
     }
 
-    const attach = async (targetId) =>
-      (await browser.send("Target.attachToTarget", { targetId, flatten: true }))
-        .sessionId;
-    const evaluate = async (sessionId, expression, userGesture = false) => {
-      const reply = await browser.send(
-        "Runtime.evaluate",
-        { expression, awaitPromise: true, returnByValue: true, userGesture },
-        sessionId,
+    try {
+      const activePortFile = path.join(profileDir, "DevToolsActivePort");
+      await until(
+        async () => {
+          if (this.closing) {
+            throw new Error("HeadlessChromeManager is shutting down");
+          }
+          if (spawnError) {
+            throw new Error(`Chrome failed to spawn: ${spawnError.message}`);
+          }
+          if (record.exited || child.exitCode !== null) {
+            throw new Error(
+              `Chrome exited prematurely (${child.exitCode}): ${stderrBuf.join("").slice(0, 400)}`,
+            );
+          }
+          try {
+            const text = await fsp.readFile(activePortFile, "utf8");
+            return text.trim().split(/\r?\n/).length >= 2;
+          } catch {
+            return false;
+          }
+        },
+        "Chrome DevToolsActivePort",
+        20_000,
       );
-      if (reply.exceptionDetails) {
-        throw new Error(
-          reply.exceptionDetails.exception?.description ||
-            reply.exceptionDetails.text ||
-            "Runtime.evaluate exception",
-        );
-      }
-      return reply.result?.value;
-    };
 
-    return { record, browser, attach, evaluate };
+      const browser = await connect(profileDir);
+      record.browser = browser;
+      if (this.closing) {
+        throw new Error("HeadlessChromeManager is shutting down");
+      }
+      // NOTE: Never call `Browser.setDownloadBehavior({ behavior: "allow" })` when testing
+      // `chrome.downloads` extensions because CDP's `allow` mode short-circuits
+      // `ChromeDownloadManagerDelegate` and replaces filenames with random GUIDs (bypassing
+      // both `filename` subdirectories and `onDeterminingFilename` listeners).
+      // `Default/Preferences` (`download.default_directory`) configures Chrome's real download
+      // manager natively in `--headless=new` for both extension and page/SW downloads.
+
+      // Ensure every requested extension is loaded in exact order (needed on branded Chrome 137+).
+      if (extensionDirs.length > 0 && !supportsCliLoadExtension) {
+        for (const extDir of extensionDirs) {
+          await browser.send("Extensions.loadUnpacked", { path: extDir });
+          await delay(150);
+        }
+      }
+
+      if (this.closing) {
+        throw new Error("HeadlessChromeManager is shutting down");
+      }
+
+      const attach = async (targetId) =>
+        (await browser.send("Target.attachToTarget", { targetId, flatten: true }))
+          .sessionId;
+      const evaluate = async (sessionId, expression, userGesture = false) => {
+        const reply = await browser.send(
+          "Runtime.evaluate",
+          { expression, awaitPromise: true, returnByValue: true, userGesture },
+          sessionId,
+        );
+        if (reply.exceptionDetails) {
+          throw new Error(
+            reply.exceptionDetails.exception?.description ||
+              reply.exceptionDetails.text ||
+              "Runtime.evaluate exception",
+          );
+        }
+        return reply.result?.value;
+      };
+
+      return { record, browser, attach, evaluate };
+    } catch (err) {
+      await this.killInstance(record);
+      throw err;
+    }
   }
 
-  async killInstance(record) {
-    if (!record || record.killed) return;
-    record.killed = true;
+  killInstance(record) {
+    if (!record) return Promise.resolve();
+    return (record._killPromise ??= this.#doKillInstance(record));
+  }
+
+  async #doKillInstance(record) {
     try {
-      record.browser?.close?.();
+      if (record.browser) {
+        await settleWithin(record.browser.send("Browser.close"), 1200);
+        try {
+          record.browser.close?.();
+        } catch {}
+        record.browser = null;
+      }
     } catch {}
     const pid = record.pid;
     if (!pid) return;
-    const killGroup = (sig) => {
-      try {
-        if (process.platform !== "win32") process.kill(-pid, sig);
-        else process.kill(pid, sig);
-      } catch {}
-    };
-    killGroup("SIGTERM");
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline && record.child.exitCode === null) {
-      await delay(50);
-    }
-    if (record.child.exitCode === null) {
-      killGroup("SIGKILL");
-      await delay(150);
+    if (!record.exited || isPidAlive(pid)) {
+      killProcessTree(pid, "SIGTERM");
+      const deadline = Date.now() + 2500;
+      while (!record.exited && isPidAlive(pid) && Date.now() < deadline) {
+        await delay(50);
+      }
+      if (!record.exited || isPidAlive(pid)) {
+        killProcessTree(pid, "SIGKILL");
+        const killDeadline = Date.now() + 1500;
+        while (isPidAlive(pid) && Date.now() < killDeadline) {
+          await delay(50);
+        }
+      }
     }
   }
 
-  async closeAll() {
-    for (const inst of this.instances) {
-      await this.killInstance(inst);
+  closeAll() {
+    this.closing = true;
+    this.disposeSignalHandlers();
+    return (this._closePromise ??= this.#doCloseAll());
+  }
+
+  async #doCloseAll() {
+    await Promise.all(this.instances.map((inst) => this.killInstance(inst)));
+
+    if (this._inflightLaunches.size > 0) {
+      await settleWithin(Promise.allSettled([...this._inflightLaunches]), 3000);
     }
-    let residual = 0;
-    for (const inst of this.instances) {
-      if (!inst.pid) continue;
-      try {
-        process.kill(inst.pid, 0);
-        residual += 1;
-      } catch {
-        // Process gone (ESRCH)
+
+    // Re-terminate defensively in case an in-flight launch pushed an instance before settling.
+    await Promise.all(this.instances.map((inst) => this.killInstance(inst)));
+
+    let residualPids = this.instances
+      .map((inst) => inst.pid)
+      .filter((pid) => isPidAlive(pid));
+
+    if (residualPids.length > 0) {
+      for (const pid of residualPids) {
+        killProcessTree(pid, "SIGKILL");
       }
+      await delay(300);
+      residualPids = residualPids.filter((pid) => isPidAlive(pid));
     }
-    return residual;
+
+    for (const dir of this.tempDirs) {
+      await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+
+    return residualPids.length;
   }
 }
 
@@ -856,7 +1043,13 @@ export async function runExtensionE2E({
     chromeBin: discovered.path,
     proxyPort: infra.proxyPort,
     spkiHash: infra.spkiHash,
+    tempDirs: [
+      path.join(resolvedRunDir, "tls"),
+      path.join(resolvedRunDir, "conflict-ext"),
+    ],
+    onBeforeExit: () => infra.close(),
   });
+  chromeMgr.installSignalHandlers();
 
   const report = {
     startedAt: new Date().toISOString(),

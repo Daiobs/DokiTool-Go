@@ -128,6 +128,9 @@ func (h *Helper) startAsyncRefreshLocked(now time.Time) {
 	}()
 }
 
+// runSingleflightRefresh joins or starts a singleflight refresh without checking
+// cooldown; intended only for startup prewarm (which applies its own backoff) and
+// internal callers that have already checked cooldown state.
 func (h *Helper) runSingleflightRefresh(ctx context.Context) (*playerCacheEntry, error) {
 	if !h.isUpstreamAllowed() {
 		return nil, errYouTubeHelperDisabled
@@ -194,8 +197,11 @@ func (h *Helper) executeRefreshCall(ctx context.Context, call *playerRefreshCall
 	} else {
 		h.refreshFailures.Add(1)
 		h.mu.Lock()
-		// Record failure cooldown unless the caller explicitly canceled before refresh finished.
-		if ctx.Err() == nil {
+		// Record failure cooldown whenever the detached refresh base stayed active
+		// (i.e. not server shutdown, pre-canceled entry, or deliberate kill-switch
+		// disablement). A caller canceling mid-flight while refreshBase stays alive
+		// still completed a real upstream failure/timeout and must feed cooldown.
+		if refreshBase.Err() == nil && !errors.Is(err, errYouTubeHelperDisabled) {
 			h.consecutiveFailures++
 			if cooldown := h.failureCooldownDurationLocked(h.consecutiveFailures); cooldown > 0 {
 				h.nextRetryAfter = now.Add(cooldown)

@@ -27,7 +27,7 @@ Optional Tier-2 long-tail public sites: when an instance enables `DOKITOOL_YTDLP
 
 - Browser-direct downloads: media bytes are fetched directly from upstream platform CDNs by the user's browser; the backend performs link parsing and contract normalization only, with zero server media proxying (except the HMAC-signed same-origin `/api/media/weibo` relay for anonymous web visitors).
 - Zero user cookies or login (无 Cookie、免登录): requests do not read, collect, or forward browser site cookies, and no user account login is required.
-- Chrome MV3 Extension (`v4.2.0`): downloadable at https://snap.dokitool.com/helper/dokitool-chrome-extension.zip. Built with zero `<all_urls>` host wildcards and zero content script injection (`sidePanel` + `offscreen` OPFS + Mediabunny lossless muxing). Supports Bilibili 1080p login-free DASH muxing and zero-userscript YouTube HD / 4K60 parsing and lossless muxing.
+- Chrome MV3 Extension (`v4.3.0`): downloadable at https://snap.dokitool.com/helper/dokitool-chrome-extension.zip. Built with zero `<all_urls>` host wildcards and zero content script injection (`sidePanel` + `offscreen` OPFS + Mediabunny lossless muxing). Supports Bilibili 1080p login-free DASH muxing and zero-userscript YouTube HD / 4K60 parsing and lossless muxing.
 
 ## Unified JSON Contract v1 API
 

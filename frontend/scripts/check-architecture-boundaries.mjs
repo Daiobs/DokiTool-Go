@@ -6,7 +6,9 @@
  * 1. Zero platform-name / CDN-host hardcoding in Web business layers
  *    (`src/components/**`, `src/composables/**`, `src/downloads/**`, `src/services/**`).
  * 2. Single-file line-count complexity caps for refactored modular directories
- *    (`src/core/**` <= 600 lines, `src/extension/bg/**` <= 900 lines).
+ *    (`src/core/**` <= 600 lines, `src/extension/bg/**` <= 900 lines,
+ *    `src/extension/background.ts` <= 900 lines) AND repo-wide ratchet budget
+ *    for all `.ts`, `.js`, and `.vue` files under `src/**` (excluding `*.generated.ts`, default <= 900 lines).
  * 3. Solid `background-color` fallback + `forced-colors` gate for all white-text
  *    `linear-gradient` / `bg-gradient-to-*` CSS rules and Vue templates.
  */
@@ -65,6 +67,54 @@ const FILE_LINE_LIMITS = [
 const SINGLE_FILE_LINE_LIMITS = [
   { relFile: path.join("extension", "background.ts"), maxLines: 900 },
 ];
+
+export const DEFAULT_SRC_FILE_LINE_LIMIT = 900;
+
+/**
+ * Repo-wide single-file line ratchet ceilings for legacy `frontend/src/**` files
+ * currently above DEFAULT_SRC_FILE_LINE_LIMIT (900 lines).
+ *
+ * Policy:
+ * - Every new `.ts`, `.js`, or `.vue` file under `frontend/src/**` (excluding `*.generated.ts`)
+ *   must stay <= 900 lines.
+ * - Legacy oversized files are locked at `ceil_to_10(actual_lines + 50)` (+50 to +59 lines
+ *   breathing buffer for routine hotfixes, defensive nil/boundary guards, i18n copy, and
+ *   comments, while still hard-blocking 60+ line feature bloat).
+ * - Cohesive Split Policy (anti-fragmentation):
+ *   * Use the +50-line breathing buffer for routine small fixes and defensive guards.
+ *   * NEVER carve out < 60-line non-domain grab-bag files (e.g. `*_helpers2` / `*_misc`)
+ *     or delete useful comments / compress multiline guards solely to dodge a line cap.
+ *   * Split only when a complete protocol or subsystem responsibility crosses its ceiling,
+ *     creating cohesive domain-scoped modules.
+ * - When a ratcheted file shrinks to <= 900 lines it PASSES cleanly (with an
+ *   informational notice). Deleting a ratcheted file without removing its entry
+ *   from this table fails loudly.
+ */
+export const LEGACY_FILE_LINE_RATCHETS = Object.freeze({
+  "src/components/ResultSection.vue": 1840,
+  "src/components/result/ResultDetailsSidebar.vue": 1240,
+  "src/composables/useMediaDownload.ts": 1680,
+  "src/extension/SidePanelApp.vue": 1690,
+  "src/extension/components/SidePanelResult.vue": 2850,
+  "src/extension/components/SidePanelSettings.vue": 990,
+  "src/extension/extensionDownload.ts": 3180,
+  "src/extension/opfsStreamTransfer.ts": 1790,
+  "src/extension/uiTargetHelpers.ts": 2860,
+  "src/extension/urlMatcher.ts": 1160,
+  "src/monitor/MonitorApp.vue": 2580,
+  "src/monitor/statsTypes.ts": 1260,
+  "src/utils/youtubeHelperCore.js": 3160,
+});
+
+function countSourceLines(raw) {
+  if (raw.length === 0) return 0;
+  const normalized = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  return normalized.split("\n").length;
+}
+
+function toPosixRel(baseDir, absPath) {
+  return path.relative(baseDir, absPath).split(path.sep).join("/");
+}
 
 function walkFiles(dir, exts) {
   if (!fs.existsSync(dir)) return [];
@@ -194,20 +244,35 @@ function checkTailwindGradientWhiteText(filePath, rawSource, violations) {
 
 export function runArchitectureBoundaryCheck(options = {}) {
   const checkDist = Boolean(options.checkDist);
+  const targetFrontendRoot = options.frontendRoot
+    ? path.resolve(options.frontendRoot)
+    : frontendRoot;
+  const targetSrcRoot = path.join(targetFrontendRoot, "src");
+  const defaultLineLimit =
+    typeof options.defaultLineLimit === "number"
+      ? options.defaultLineLimit
+      : DEFAULT_SRC_FILE_LINE_LIMIT;
+  const legacyRatchets =
+    options.legacyRatchets !== undefined
+      ? options.legacyRatchets
+      : LEGACY_FILE_LINE_RATCHETS;
+
   const violations = [];
+  const ratchetNotices = [];
   let businessFilesChecked = 0;
   let lineCapFilesChecked = 0;
+  let ratchetFilesChecked = 0;
   let cssFilesChecked = 0;
 
   // 1. Zero platform/CDN-host hardcoding in Web business layers
   for (const relDir of BUSINESS_SCAN_DIRS) {
-    const dir = path.join(srcRoot, relDir);
+    const dir = path.join(targetSrcRoot, relDir);
     for (const filePath of walkFiles(dir, [".ts", ".js", ".vue"])) {
       businessFilesChecked++;
       const raw = fs.readFileSync(filePath, "utf8");
       const stripped = stripCommentsPreserveLines(raw);
       const lines = stripped.split("\n");
-      const rel = path.relative(frontendRoot, filePath);
+      const rel = toPosixRel(targetFrontendRoot, filePath);
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         for (const rule of PLATFORM_HARDCODE_PATTERNS) {
@@ -221,14 +286,14 @@ export function runArchitectureBoundaryCheck(options = {}) {
     }
   }
 
-  // 2. Single-file line-count complexity caps for refactored core/bg modules
+  // 2a. Single-file line-count complexity caps for refactored core/bg modules
   for (const { relDir, maxLines } of FILE_LINE_LIMITS) {
-    const dir = path.join(srcRoot, relDir);
+    const dir = path.join(targetSrcRoot, relDir);
     for (const filePath of walkFiles(dir, [".ts", ".js"])) {
       lineCapFilesChecked++;
-      const lineCount = fs.readFileSync(filePath, "utf8").split("\n").length;
+      const lineCount = countSourceLines(fs.readFileSync(filePath, "utf8"));
       if (lineCount > maxLines) {
-        const rel = path.relative(frontendRoot, filePath);
+        const rel = toPosixRel(targetFrontendRoot, filePath);
         violations.push(
           `[file-line-cap] ${rel}: ${lineCount} lines exceeds limit of ${maxLines}`,
         );
@@ -236,36 +301,68 @@ export function runArchitectureBoundaryCheck(options = {}) {
     }
   }
   for (const { relFile, maxLines } of SINGLE_FILE_LINE_LIMITS) {
-    const filePath = path.join(srcRoot, relFile);
+    const filePath = path.join(targetSrcRoot, relFile);
     if (!fs.existsSync(filePath)) continue;
     lineCapFilesChecked++;
-    const lineCount = fs.readFileSync(filePath, "utf8").split("\n").length;
+    const lineCount = countSourceLines(fs.readFileSync(filePath, "utf8"));
     if (lineCount > maxLines) {
-      const rel = path.relative(frontendRoot, filePath);
+      const rel = toPosixRel(targetFrontendRoot, filePath);
       violations.push(
         `[file-line-cap] ${rel}: ${lineCount} lines exceeds limit of ${maxLines}`,
       );
     }
   }
 
+  // 2b. Repo-wide single-file ratchet budget across all src/**/*.{ts,js,vue} (excluding *.generated.ts)
+  const seenRatchets = new Set();
+  for (const filePath of walkFiles(targetSrcRoot, [".ts", ".js", ".vue"])) {
+    if (filePath.endsWith(".generated.ts")) continue;
+    ratchetFilesChecked++;
+    const rel = toPosixRel(targetFrontendRoot, filePath);
+    const lineCount = countSourceLines(fs.readFileSync(filePath, "utf8"));
+    if (Object.prototype.hasOwnProperty.call(legacyRatchets, rel)) {
+      seenRatchets.add(rel);
+      const ceiling = legacyRatchets[rel];
+      if (lineCount > ceiling) {
+        violations.push(
+          `[file-line-ratchet] ${rel}: ${lineCount} lines exceeds legacy ratchet ceiling of ${ceiling} (default max ${defaultLineLimit}; refactor instead of growing)`,
+        );
+      } else if (lineCount <= defaultLineLimit) {
+        ratchetNotices.push(
+          `${rel}: shrunk to ${lineCount} lines (<= ${defaultLineLimit}); eligible to remove from LEGACY_FILE_LINE_RATCHETS`,
+        );
+      }
+    } else if (lineCount > defaultLineLimit) {
+      violations.push(
+        `[file-line-ratchet] ${rel}: ${lineCount} lines exceeds default max of ${defaultLineLimit} lines`,
+      );
+    }
+  }
+  for (const rel of Object.keys(legacyRatchets).sort()) {
+    if (!seenRatchets.has(rel)) {
+      violations.push(
+        `[file-line-ratchet-stale] ${rel}: entry in LEGACY_FILE_LINE_RATCHETS no longer exists on disk (remove stale entry)`,
+      );
+    }
+  }
+
   // 3. CSS solid-fallback + forced-colors gate across src/** and dist/assets/*.css
-  for (const filePath of walkFiles(srcRoot, [".css", ".vue"])) {
+  for (const filePath of walkFiles(targetSrcRoot, [".css", ".vue"])) {
     cssFilesChecked++;
     const raw = fs.readFileSync(filePath, "utf8");
     checkWhiteGradientCssRules(filePath, raw, violations);
     checkTailwindGradientWhiteText(filePath, raw, violations);
   }
 
-  const styleCss = fs.readFileSync(path.join(srcRoot, "style.css"), "utf8");
+  const styleCssPath = path.join(targetSrcRoot, "style.css");
+  const styleCss = fs.readFileSync(styleCssPath, "utf8");
   if (!/@media\s*\(\s*forced-colors\s*:\s*active\s*\)/i.test(styleCss)) {
     violations.push(
       "[css-forced-colors] src/style.css: missing `@media (forced-colors: active)` adaptation for primary buttons",
     );
   }
-  const designCss = fs.readFileSync(
-    path.join(srcRoot, "assets", "design-system.css"),
-    "utf8",
-  );
+  const designCssPath = path.join(targetSrcRoot, "assets", "design-system.css");
+  const designCss = fs.readFileSync(designCssPath, "utf8");
   if (!/@media\s*\(\s*forced-colors\s*:\s*active\s*\)/i.test(designCss)) {
     violations.push(
       "[css-forced-colors] src/assets/design-system.css: missing `@media (forced-colors: active)` adaptation for .ux-btn-primary",
@@ -273,7 +370,7 @@ export function runArchitectureBoundaryCheck(options = {}) {
   }
 
   // Optionally scan built dist/assets/*.css when --check-dist is requested (post-build gate)
-  const distAssetsDir = path.join(frontendRoot, "dist", "assets");
+  const distAssetsDir = path.join(targetFrontendRoot, "dist", "assets");
   let distCssFilesChecked = 0;
   if (checkDist) {
     for (const filePath of walkFiles(distAssetsDir, [".css"])) {
@@ -287,6 +384,8 @@ export function runArchitectureBoundaryCheck(options = {}) {
     passed: violations.length === 0,
     businessFilesChecked,
     lineCapFilesChecked,
+    ratchetFilesChecked,
+    ratchetNotices,
     cssFilesChecked,
     distCssFilesChecked,
     violations,
@@ -300,6 +399,9 @@ const isMain =
 if (isMain) {
   const checkDist = process.argv.includes("--check-dist");
   const result = runArchitectureBoundaryCheck({ checkDist });
+  for (const note of result.ratchetNotices) {
+    console.log(`NOTICE: ${note}`);
+  }
   if (!result.passed) {
     console.error(
       `Architecture boundary check FAILED (${result.violations.length} violation(s)):`,
@@ -310,6 +412,6 @@ if (isMain) {
     process.exit(1);
   }
   console.log(
-    `Architecture boundary check PASSED (business=${result.businessFilesChecked}, lineCap=${result.lineCapFilesChecked}, css=${result.cssFilesChecked}, distCss=${result.distCssFilesChecked})`,
+    `Architecture boundary check PASSED (business=${result.businessFilesChecked}, lineCap=${result.lineCapFilesChecked}, ratchet=${result.ratchetFilesChecked}, css=${result.cssFilesChecked}, distCss=${result.distCssFilesChecked})`,
   );
 }

@@ -521,8 +521,9 @@ func AllowedOutboundHost(host string) bool {
 }
 
 // AllowedExtractors returns the Twitter-family yt-dlp extractor names verified
-// from pinned yt-dlp 2026.10.26 (--list-extractors), excluding generic and
-// twitter:shortener (t.co) so embedded external links never fall back to generic.
+// from pinned yt-dlp (--list-extractors), excluding generic, twitter:event, and
+// twitter:shortener so embedded external links never fall back to generic.
+// Kept in lockstep with ExcludedExtractors() via scripts/check-ytdlp-extractors.py.
 func AllowedExtractors() []string {
 	return []string{
 		"twitter",
@@ -530,6 +531,21 @@ func AllowedExtractors() []string {
 		"twitter:broadcast",
 		"twitter:card",
 		"twitter:spaces",
+	}
+}
+
+// ExcludedExtractors returns the Twitter-family yt-dlp extractor names that are
+// intentionally omitted from AllowedExtractors and audited against
+// `yt-dlp --list-extractors` by scripts/check-ytdlp-extractors.py:
+//   - twitter:event: curated event/broadcast pages (/i/events/<id>) fall outside
+//     DokiTool's single-tweet /status/<id> contract enforced by ExtractTweetTarget.
+//   - twitter:shortener: t.co redirector links are expanded directly via
+//     expandTCoURL under SSRF-safe fetch policy so embedded external links never
+//     cause yt-dlp to follow off-domain redirects or fall back to generic.
+func ExcludedExtractors() []string {
+	return []string{
+		"twitter:event",
+		"twitter:shortener",
 	}
 }
 

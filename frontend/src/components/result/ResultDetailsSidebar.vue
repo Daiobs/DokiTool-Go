@@ -102,6 +102,11 @@ const isProtectedDashAudio = (attachment) => {
 
 const isBilibiliDashAudio = isProtectedDashAudio;
 
+const localizeAttachment = (att) =>
+  props.locale === "en" && typeof att?.title === "string" && att.title.trim() === "原声音频 (M4A)"
+    ? { ...att, title: "Original Audio (M4A)" }
+    : att;
+
 const visibleAttachments = computed(() => {
   const currentId = props.currentItem?.id;
   const list = props.attachments.filter((att) => {
@@ -116,7 +121,7 @@ const visibleAttachments = computed(() => {
       return false;
     }
     return true;
-  });
+  }).map(localizeAttachment);
 
   if (
     currentId &&

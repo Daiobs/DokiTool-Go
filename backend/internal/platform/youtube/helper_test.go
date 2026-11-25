@@ -1688,4 +1688,95 @@ func TestYouTubeHelperGovernanceWave1Hardening(t *testing.T) {
 		t.Fatalf("expected MaxPlayerRenewalAge (24h) to force fresh player JS fetch (initial=%d, final=%d)",
 			initialPlayerFetches, coolExec.playerJSHits.Load())
 	}
+
+	// 4. Mid-flight client disconnect must still record global failure cooldown
+	// whenever the detached singleflight refresh (bgCtx or context.WithoutCancel)
+	// actually ran to upstream failure.
+	verifyDisconnectRecordsCooldown := func(t *testing.T, withBgCtx bool) {
+		t.Helper()
+		slowFailExec := &mockYouTubeFetchExecutor{
+			playerID:     "a5c2aafe",
+			playerBaseJS: playerJS,
+			fetchDelay:   60 * time.Millisecond,
+		}
+		fixedNow := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		h, err := NewHelper(slowFailExec, sb, func() time.Time { return fixedNow })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if withBgCtx {
+			h.prewarmBackoffs = nil
+			h.bgRefreshInterval = time.Hour
+			stopBg := h.StartBackgroundRefresh(context.Background())
+			defer stopBg()
+			// Wait for initial prewarm to complete cleanly so h.bgCtx is active and
+			// refreshCall is idle before arming the slow-failure case.
+			waitWarm := time.Now().Add(3 * time.Second)
+			for time.Now().Before(waitWarm) {
+				h.mu.Lock()
+				idle := h.refreshCall == nil && h.activeID != ""
+				h.mu.Unlock()
+				if idle {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			h.mu.Lock()
+			ready := h.refreshCall == nil && h.activeID != ""
+			h.mu.Unlock()
+			if !ready {
+				t.Fatal("expected StartBackgroundRefresh prewarm to settle before test")
+			}
+			h.InvalidateCache()
+		}
+		slowFailExec.failRefresh.Store(true)
+		startedBefore := slowFailExec.startedHits.Load()
+		iframeBefore := slowFailExec.iframeHits.Load()
+
+		reqCtx, reqCancel := context.WithCancel(context.Background())
+		done := make(chan int, 1)
+		go func() {
+			_, status := h.Context(reqCtx)
+			done <- status
+		}()
+
+		waitStart := time.Now().Add(2 * time.Second)
+		for time.Now().Before(waitStart) && slowFailExec.startedHits.Load() <= startedBefore {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if slowFailExec.startedHits.Load() <= startedBefore {
+			reqCancel()
+			t.Fatal("expected cold refresh to enter executor.Do before client cancel")
+		}
+		// Client disconnects mid-flight while upstream refresh continues on refreshBase.
+		reqCancel()
+		if st := <-done; st != http.StatusBadGateway {
+			t.Fatalf("canceled cold Context status = %d, want 502", st)
+		}
+
+		stats := h.HelperStatsSnapshot()
+		if !stats.InCooldown || stats.ConsecutiveFailures != 1 {
+			t.Fatalf("expected cooldown active after mid-flight client disconnect (withBgCtx=%v), got %+v", withBgCtx, stats)
+		}
+		if gotHits := slowFailExec.iframeHits.Load(); gotHits != iframeBefore+1 {
+			t.Fatalf("expected exactly 1 failed iframe_api attempt (withBgCtx=%v), got %d (before=%d)", withBgCtx, gotHits, iframeBefore)
+		}
+
+		// Immediate follow-up request must hit cooldown skip without touching upstream.
+		if _, st := h.Context(context.Background()); st != http.StatusBadGateway {
+			t.Fatalf("follow-up cooldown Context status = %d, want 502", st)
+		}
+		if gotHits := slowFailExec.iframeHits.Load(); gotHits != iframeBefore+1 {
+			t.Fatalf("follow-up request bypassed cooldown and hit upstream (withBgCtx=%v): got %d, want %d", withBgCtx, gotHits, iframeBefore+1)
+		}
+		if after := h.HelperStatsSnapshot(); after.CooldownSkips != 1 {
+			t.Fatalf("expected CooldownSkips=1 after follow-up (withBgCtx=%v), got %+v", withBgCtx, after)
+		}
+	}
+	t.Run("midflight-disconnect-records-cooldown-without-bgCtx", func(t *testing.T) {
+		verifyDisconnectRecordsCooldown(t, false)
+	})
+	t.Run("midflight-disconnect-records-cooldown-with-bgCtx", func(t *testing.T) {
+		verifyDisconnectRecordsCooldown(t, true)
+	})
 }
