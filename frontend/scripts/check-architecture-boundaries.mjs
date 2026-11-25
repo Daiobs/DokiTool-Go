@@ -101,8 +101,7 @@ export const LEGACY_FILE_LINE_RATCHETS = Object.freeze({
   "src/extension/opfsStreamTransfer.ts": 1790,
   "src/extension/uiTargetHelpers.ts": 2860,
   "src/extension/urlMatcher.ts": 1160,
-  "src/monitor/MonitorApp.vue": 2580,
-  "src/monitor/statsTypes.ts": 1260,
+  "src/monitor/MonitorApp.vue": 2340,
   "src/utils/youtubeHelperCore.js": 3160,
 });
 
