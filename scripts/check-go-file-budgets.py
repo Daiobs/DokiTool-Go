@@ -5,9 +5,19 @@ Scans all non-test Go source files under `backend/internal/**/*.go` and
 `backend/cmd/**/*.go` (excluding `*_test.go`) and enforces:
   - Default max for any new non-test Go file: 800 lines.
   - Explicit `LEGACY_FILE_LINE_RATCHETS` locking every currently > 800-line
-    file at its measured line count rounded up by at most +10 lines.
+    file at `ceil_to_10(actual_lines + 50)` (+50 to +59 lines of breathing room
+    for routine hotfixes, defensive nil/boundary checks, and comments, while
+    still hard-blocking 60+ line feature bloat).
+  - Cohesive Split Policy (anti-fragmentation):
+    * Use the +50-line breathing buffer for routine small fixes and defensive
+      guards.
+    * NEVER carve out < 60-line non-domain grab-bag files (e.g. `*_helpers2.go`
+      or `*_misc.go`) or delete useful comments / compress multiline guards
+      solely to dodge a line cap.
+    * Only split when a complete protocol or subsystem responsibility crosses
+      its ceiling, creating cohesive domain-scoped files.
   - Shrinking a ratcheted file to <= 800 lines PASSES cleanly (emitting an
-    informational notice so Wave 1/future refactors never break this gate).
+    informational notice so future refactors never break this gate).
   - Exceeding a ceiling OR leaving a deleted file in `LEGACY_FILE_LINE_RATCHETS`
     fails loudly with exit code 1.
 
@@ -25,19 +35,20 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS: Tuple[str, ...] = ("backend/internal", "backend/cmd")
 DEFAULT_MAX_LINES = 800
 
-# Measured exact `wc -l` line counts rounded up by at most +10 lines.
+# Ceilings set to ceil_to_10(actual_lines + 50) (+50..+59 lines breathing buffer
+# for routine fixes/guards/comments; split cohesively by domain once exceeded).
 LEGACY_FILE_LINE_RATCHETS: Dict[str, int] = {
-    "backend/cmd/dokitool/main.go": 850,
-    "backend/cmd/loadtest/main.go": 1310,
-    "backend/internal/api/admission.go": 1150,
-    "backend/internal/api/apikeys.go": 970,
-    "backend/internal/api/handler.go": 1020,
-    "backend/internal/fetch/fetch.go": 840,
-    "backend/internal/platform/bilibili/shanghai.go": 870,
-    "backend/internal/platform/x/parser.go": 1020,
-    "backend/internal/platform/x/syndication.go": 1090,
-    "backend/internal/ytengine/engine.go": 900,
-    "backend/internal/ytengine/variants.go": 1360,
+    "backend/cmd/dokitool/main.go": 900,
+    "backend/cmd/loadtest/main.go": 1360,
+    "backend/internal/api/admission.go": 1200,
+    "backend/internal/api/apikeys.go": 1020,
+    "backend/internal/api/handler.go": 1070,
+    "backend/internal/fetch/fetch.go": 890,
+    "backend/internal/platform/bilibili/shanghai.go": 920,
+    "backend/internal/platform/x/parser.go": 1070,
+    "backend/internal/platform/x/syndication.go": 1140,
+    "backend/internal/ytengine/engine.go": 950,
+    "backend/internal/ytengine/variants.go": 1410,
 }
 
 

@@ -77,26 +77,33 @@ export const DEFAULT_SRC_FILE_LINE_LIMIT = 900;
  * Policy:
  * - Every new `.ts`, `.js`, or `.vue` file under `frontend/src/**` (excluding `*.generated.ts`)
  *   must stay <= 900 lines.
- * - Legacy oversized files are locked at their current line count rounded up by
- *   at most +10 lines so they cannot silently grow further.
+ * - Legacy oversized files are locked at `ceil_to_10(actual_lines + 50)` (+50 to +59 lines
+ *   breathing buffer for routine hotfixes, defensive nil/boundary guards, i18n copy, and
+ *   comments, while still hard-blocking 60+ line feature bloat).
+ * - Cohesive Split Policy (anti-fragmentation):
+ *   * Use the +50-line breathing buffer for routine small fixes and defensive guards.
+ *   * NEVER carve out < 60-line non-domain grab-bag files (e.g. `*_helpers2` / `*_misc`)
+ *     or delete useful comments / compress multiline guards solely to dodge a line cap.
+ *   * Split only when a complete protocol or subsystem responsibility crosses its ceiling,
+ *     creating cohesive domain-scoped modules.
  * - When a ratcheted file shrinks to <= 900 lines it PASSES cleanly (with an
  *   informational notice). Deleting a ratcheted file without removing its entry
  *   from this table fails loudly.
  */
 export const LEGACY_FILE_LINE_RATCHETS = Object.freeze({
-  "src/components/ResultSection.vue": 1800,
-  "src/components/result/ResultDetailsSidebar.vue": 1190,
-  "src/composables/useMediaDownload.ts": 1630,
-  "src/extension/SidePanelApp.vue": 1640,
-  "src/extension/components/SidePanelResult.vue": 2800,
-  "src/extension/components/SidePanelSettings.vue": 940,
-  "src/extension/extensionDownload.ts": 3130,
-  "src/extension/opfsStreamTransfer.ts": 1740,
-  "src/extension/uiTargetHelpers.ts": 2810,
-  "src/extension/urlMatcher.ts": 1110,
-  "src/monitor/MonitorApp.vue": 2530,
-  "src/monitor/statsTypes.ts": 1210,
-  "src/utils/youtubeHelperCore.js": 3110,
+  "src/components/ResultSection.vue": 1840,
+  "src/components/result/ResultDetailsSidebar.vue": 1240,
+  "src/composables/useMediaDownload.ts": 1680,
+  "src/extension/SidePanelApp.vue": 1690,
+  "src/extension/components/SidePanelResult.vue": 2850,
+  "src/extension/components/SidePanelSettings.vue": 990,
+  "src/extension/extensionDownload.ts": 3180,
+  "src/extension/opfsStreamTransfer.ts": 1790,
+  "src/extension/uiTargetHelpers.ts": 2860,
+  "src/extension/urlMatcher.ts": 1160,
+  "src/monitor/MonitorApp.vue": 2580,
+  "src/monitor/statsTypes.ts": 1260,
+  "src/utils/youtubeHelperCore.js": 3160,
 });
 
 function countSourceLines(raw) {
