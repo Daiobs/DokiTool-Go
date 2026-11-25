@@ -41,6 +41,7 @@ const props = defineProps({
   isMulti: Boolean,
   isExtensionConnected: Boolean,
   bilibiliDashSummary: { type: Object, default: null },
+  detectedDurationSeconds: { type: Number, default: 0 },
 });
 
 const emit = defineEmits([
@@ -183,6 +184,49 @@ const playCountNote = computed(() =>
     : "平台未提供可确认的统计值，未将缺失值当作 0。",
 );
 
+const formatItemTypeLabel = (rawType, locale) => {
+  const normalized = String(rawType || "").trim().toLowerCase();
+  const isEn = locale === "en";
+  if (normalized === "video") return isEn ? "Video" : "视频";
+  if (normalized === "image") return isEn ? "Image" : "图片";
+  if (normalized === "audio") return isEn ? "Audio" : "音频";
+  if (normalized === "album") return isEn ? "Album" : "图集";
+  if (normalized === "live_photo" || normalized === "live") {
+    return isEn ? "Live Photo" : "实况";
+  }
+  if (!normalized) {
+    const items = props.resultData?.items || [];
+    if (items.length > 0 && items.every((i) => i.type === "image")) {
+      return items.length > 1
+        ? isEn
+          ? "Album"
+          : "图集"
+        : isEn
+          ? "Image"
+          : "图片";
+    }
+    return t(locale, "unknownType");
+  }
+  return rawType;
+};
+
+const showDurationCard = computed(() => {
+  const itemType = String(props.currentItem?.type || "").toLowerCase();
+  if (!itemType || itemType === "image" || itemType === "album") {
+    return false;
+  }
+  return true;
+});
+
+const effectiveDurationSeconds = computed(() => {
+  const metaSec =
+    (Number(props.metadata?.duration_ms || props.currentItem?.duration_ms || 0) ||
+      0) / 1000;
+  if (Number.isFinite(metaSec) && metaSec > 0) return metaSec;
+  const detected = Number(props.detectedDurationSeconds || 0);
+  return Number.isFinite(detected) && detected > 0 ? detected : 0;
+});
+
 const infoCards = computed(() => [
   {
     icon: "fa-pen",
@@ -205,22 +249,25 @@ const infoCards = computed(() => [
   {
     icon: "fa-cube",
     label: t(props.locale, "type"),
-    value: props.currentItem?.type || t(props.locale, "unknownType"),
+    value: formatItemTypeLabel(props.currentItem?.type, props.locale),
   },
   {
     icon: "fa-expand",
     label: t(props.locale, "quality"),
     value: props.displayVariantLabel(props.activeVariant),
   },
-  {
-    icon: "fa-clock",
-    label: t(props.locale, "duration"),
-    value:
-      props.formatDuration?.(
-        (props.metadata.duration_ms || props.currentItem?.duration_ms || 0) /
-          1000,
-      ) || "—",
-  },
+  ...(showDurationCard.value
+    ? [
+        {
+          icon: "fa-clock",
+          label: t(props.locale, "duration"),
+          value:
+            effectiveDurationSeconds.value > 0
+              ? props.formatDuration?.(effectiveDurationSeconds.value) || "—"
+              : "—",
+        },
+      ]
+    : []),
 ]);
 
 const tabs = computed(() => [

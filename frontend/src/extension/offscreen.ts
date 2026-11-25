@@ -204,6 +204,13 @@ export function createOffscreenController(
           helperVersion: executor.getHelperVersion(),
         });
 
+      case "OFFSCREEN_YOUTUBE_PREFETCH": {
+        const prefetch = await executor.requestYouTubePrefetch(req.payload, {
+          timeoutMs: req.timeoutMs,
+        });
+        return okRpc({ prefetch });
+      }
+
       case "OFFSCREEN_YOUTUBE_PLAYER": {
         const player = await executor.requestYouTubePlayer(req.payload, {
           timeoutMs: req.timeoutMs,

@@ -42,6 +42,7 @@ const draftSubfolderPrefix = ref<string>("");
 const draftBatchSaveMode = ref<BatchSaveMode>("subfolder");
 const draftQualityPreference = ref<QualityPreference>("best");
 const draftAutoFollowTab = ref<boolean>(false);
+const draftUseSaveFilePicker = ref<boolean>(false);
 const draftTheme = ref<ExtensionThemeMode>("system");
 const autoFollowExplicitlyTouched = ref<boolean>(false);
 let themePreviewActive = false;
@@ -62,6 +63,7 @@ function syncDraftFromProps() {
   draftBatchSaveMode.value = props.settings.batchSaveMode || "subfolder";
   draftQualityPreference.value = props.settings.qualityPreference || "best";
   draftAutoFollowTab.value = Boolean(props.settings.autoFollowTab);
+  draftUseSaveFilePicker.value = Boolean(props.settings.useSaveFilePicker);
   draftTheme.value = normalizeExtensionThemeMode(props.settings.theme);
   themePreviewActive = false;
   autoFollowExplicitlyTouched.value = false;
@@ -246,6 +248,7 @@ async function handleSaveSettingsClick() {
       batchSaveMode: draftBatchSaveMode.value,
       qualityPreference: draftQualityPreference.value,
       theme: draftTheme.value,
+      useSaveFilePicker: draftUseSaveFilePicker.value,
       ...(autoFollowExplicitlyTouched.value
         ? { autoFollowTab: draftAutoFollowTab.value }
         : {}),
@@ -562,6 +565,27 @@ onUnmounted(() => {
               class="sp-switch"
               :class="{ 'sp-switch--on': draftAutoFollowTab }"
               @click="handleToggleAutoFollow"
+            >
+              <span class="sp-switch__thumb" />
+            </button>
+          </div>
+
+          <!-- Optional System Save-As Streaming Direct Write (Spec B.3 §4) -->
+          <div class="sp-switch-row">
+            <div class="sp-switch-row__info">
+              <span class="sp-field__label">系统另存为流式直写（防其他插件改名）</span>
+              <span class="sp-field__hint">
+                单文件下载弹出系统保存框直接写盘，物理绕过冲突下载扩展的文件名劫持
+              </span>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              data-testid="save-file-picker-toggle"
+              :aria-checked="draftUseSaveFilePicker"
+              class="sp-switch"
+              :class="{ 'sp-switch--on': draftUseSaveFilePicker }"
+              @click="draftUseSaveFilePicker = !draftUseSaveFilePicker"
             >
               <span class="sp-switch__thumb" />
             </button>

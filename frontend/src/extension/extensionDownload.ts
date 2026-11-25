@@ -31,6 +31,8 @@ import {
   selectYouTubeMuxPair,
   type YouTubeHelperPlayerPayload,
   type YouTubeHelperPlayerResult,
+  type YouTubeHelperPrefetchPayload,
+  type YouTubeHelperPrefetchResult,
 } from "../utils/youtubeHelperCore";
 import {
   buildCanonicalVariantDescriptor,
@@ -1712,6 +1714,10 @@ export interface OffscreenDownloadExecutor {
     blobUrl: string;
     opfsTempName?: string;
   }): { released: boolean };
+  requestYouTubePrefetch(
+    payload: YouTubeHelperPrefetchPayload,
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<YouTubeHelperPrefetchResult>;
   requestYouTubePlayer(
     payload: YouTubeHelperPlayerPayload,
     options?: { timeoutMs?: number; signal?: AbortSignal },
@@ -2846,7 +2852,7 @@ export function createOffscreenDownloadExecutor(
               status: "muxing",
               statusText:
                 detail.statusText ||
-                `YouTube 4K 无损合流中（${detail.percent}%）...`,
+                `YouTube 无损合流中（${detail.percent}%）...`,
               loaded: detail.loaded,
               total: detail.total,
               percent: detail.percent,
@@ -3048,6 +3054,13 @@ export function createOffscreenDownloadExecutor(
       }
       notifyIfIdle();
       return { released };
+    },
+
+    requestYouTubePrefetch(
+      payload: YouTubeHelperPrefetchPayload,
+      reqOpts?: { timeoutMs?: number; signal?: AbortSignal },
+    ): Promise<YouTubeHelperPrefetchResult> {
+      return youtubeBridge.requestPrefetch(payload, reqOpts);
     },
 
     requestYouTubePlayer(

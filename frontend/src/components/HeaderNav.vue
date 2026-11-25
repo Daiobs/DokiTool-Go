@@ -6,7 +6,9 @@ import BrandWordmark from './BrandWordmark.vue'
 defineProps({
   isDark: Boolean,
   locale: String,
-  t: Function
+  t: Function,
+  extensionConnected: { type: Boolean, default: false },
+  extensionVersion: { type: String, default: '' },
 })
 
 const emit = defineEmits(['toggle-theme', 'set-locale', 'open-extension'])
@@ -38,8 +40,8 @@ const navLinks = [
 ]
 
 const labels = {
-  'zh-CN': { brand: '短视频解析', subtitle: '无水印 · 免费', home: '首页', course: '解析教程', platforms: '支持平台', faq: '常见问题', about: '关于我们', extShort: 'Chrome 扩展', extFull: 'Chrome 扩展下载', menu: '菜单', close: '关闭' },
-  'en': { brand: 'Video Parser', subtitle: 'No Watermark · Free', home: 'Home', course: 'Tutorial', platforms: 'Platforms', faq: 'FAQ', about: 'About', extShort: 'Chrome Ext', extFull: 'Chrome Extension', menu: 'Menu', close: 'Close' }
+  'zh-CN': { brand: '短视频解析', subtitle: '无水印 · 免费', home: '首页', course: '解析教程', platforms: '支持平台', faq: '常见问题', about: '关于我们', extShort: 'Chrome 扩展', extConnectedShort: '扩展已连接', extFull: 'Chrome 扩展下载', menu: '菜单', close: '关闭' },
+  'en': { brand: 'Video Parser', subtitle: 'No Watermark · Free', home: 'Home', course: 'Tutorial', platforms: 'Platforms', faq: 'FAQ', about: 'About', extShort: 'Chrome Ext', extConnectedShort: 'Ext Connected', extFull: 'Chrome Extension', menu: 'Menu', close: 'Close' }
 }
 
 const getLabel = (locale, key) => labels[locale]?.[key] || labels['zh-CN'][key]
@@ -126,10 +128,24 @@ const handleKeydown = (e) => {
           <button
             type="button"
             data-extension-modal-trigger="header"
+            :data-extension-connected="extensionConnected ? 'true' : undefined"
+            :title="extensionConnected && extensionVersion ? `DokiTool Extension v${extensionVersion}` : undefined"
             @click="emit('open-extension')"
-            class="theme-colors hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-400/30 dark:hover:bg-indigo-500/25 ux-focus"
+            :class="[
+              'theme-colors hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ux-focus',
+              extensionConnected
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-400/30 dark:hover:bg-emerald-500/25'
+                : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-400/30 dark:hover:bg-indigo-500/25',
+            ]"
           >
+            <span
+              v-if="extensionConnected"
+              data-testid="header-ext-connected-dot"
+              class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"
+              aria-hidden="true"
+            ></span>
             <svg
+              v-else
               class="w-3.5 h-3.5 shrink-0"
               viewBox="0 0 24 24"
               fill="none"
@@ -141,14 +157,14 @@ const handleKeydown = (e) => {
             >
               <path :d="EXT_ICON_PATH" />
             </svg>
-            <span>{{ getLabel(locale, 'extShort') }}</span>
+            <span>{{ getLabel(locale, extensionConnected ? 'extConnectedShort' : 'extShort') }}</span>
           </button>
 
           <div class="relative">
             <select
               :value="locale"
               @change="emit('set-locale', $event.target.value)"
-              class="theme-colors appearance-none text-sm pl-3 pr-8 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-0 cursor-pointer outline-none focus:ring-2 focus:ring-indigo-500 dark:focus:ring-indigo-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+              class="header-locale-select theme-colors appearance-none text-sm pl-3 pr-8 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-0 cursor-pointer outline-none focus:ring-2 focus:ring-indigo-500 dark:focus:ring-indigo-400 hover:bg-slate-200 dark:hover:bg-slate-700"
               aria-label="Select language"
             >
               <option value="zh-CN">中文</option>
@@ -235,5 +251,12 @@ const handleKeydown = (e) => {
 
 .nav-menu-leave-active {
   transition: var(--theme-color-transition), opacity 150ms ease-in, transform 150ms ease-in;
+}
+
+.header-locale-select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: none;
 }
 </style>

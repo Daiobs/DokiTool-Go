@@ -273,6 +273,8 @@ export interface DownloadTask {
   refreshAvailable?: boolean;
   /** Reason displayed on the card when in-browser muxing falls back to separate track downloads. */
   fallbackReason?: string | null;
+  /** Non-blocking warning when another browser extension overwrote the saved filename. */
+  filenameWarning?: string | null;
   /** Actual save path identifier and human-readable label displayed on the task card. */
   savePath?: string;
   savePathLabel?: string;

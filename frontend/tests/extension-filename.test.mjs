@@ -302,3 +302,122 @@ test("single-video resolveItemBaseName prioritizes media.title over raw mmexport
     "bilibili_BV1mmExport01",
   );
 });
+
+test("Issue #48 [P2-3]: M2 videoFilename and M3 uiTargetHelpers produce aligned quality suffixes and _<N>P.zip archive names", async () => {
+  const absVideoFilename = fileURLToPath(new URL("../src/utils/videoFilename.ts", import.meta.url));
+  const bundled = await build({
+    entryPoints: [absVideoFilename],
+    bundle: true,
+    write: false,
+    platform: "node",
+    format: "esm",
+  });
+  const videoFilename = await import(
+    `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
+  );
+
+  // 1) Archive naming parity: `<title>_<N>P.zip` on both M2 and M3
+  const m2Zip = videoFilename.buildArchiveFilename({
+    title: "东京樱花实况",
+    count: 5,
+    fallback: "https://example.test/album",
+  });
+  assert.equal(m2Zip, "东京樱花实况_5P.zip");
+
+  const galleryMedia = {
+    platform: "xiaohongshu",
+    content_id: "xhs5p",
+    title: "东京樱花实况",
+    items: Array.from({ length: 5 }, (_, idx) => ({
+      id: `img-${idx + 1}`,
+      index: idx + 1,
+      type: "image",
+      variants: [
+        {
+          id: "orig",
+          metadata: { extension: "jpg", mime_type: "image/jpeg" },
+          delivery: { kind: "file", sources: [{ url: `https://sns-webpic-qc.xhscdn.com/p${idx + 1}.jpg` }] },
+        },
+      ],
+      default: { variant_id: "orig", url: `https://sns-webpic-qc.xhscdn.com/p${idx + 1}.jpg` },
+    })),
+  };
+  const m3Zip = uiHelpers.buildChecklistZipEnqueueItem({
+    media: galleryMedia,
+    entries: galleryMedia.items.map((item, idx) => ({
+      item,
+      ordinalIndex: idx + 1,
+    })),
+    totalCount: galleryMedia.items.length,
+    livePhotoFilter: "both",
+    settings: {
+      apiBaseUrl: "https://snap.dokitool.com",
+      bearerToken: "",
+      qualityPreference: "best",
+      batchSaveMode: "zip",
+      subfolderPrefix: "",
+      themeMode: "system",
+    },
+  });
+  assert.equal(m3Zip.ok, true);
+  assert.equal(m3Zip.item.spec.filename, m2Zip, "M3 checklist ZIP filename must match M2 buildArchiveFilename");
+
+  // 2) Quality suffix parity on adaptive/multi-quality options (`_1080p`, `_2160p`, `_audio`)
+  const ytMultiMedia = {
+    platform: "youtube",
+    content_id: "ytParity01",
+    title: "多画质命名对齐测试",
+    items: [
+      {
+        id: "yt-1",
+        type: "video",
+        variants: [
+          {
+            id: "v-2160",
+            label: "2160p60 (4K)",
+            metadata: { width: 3840, height: 2160, fps: 60, has_audio: false, video_codec: "avc1.640033", container: "mp4", extension: "mp4" },
+            delivery: { kind: "file", sources: [{ id: "s1", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=313" }] },
+          },
+          {
+            id: "v-1080",
+            label: "1080p",
+            metadata: { width: 1920, height: 1080, fps: 30, has_audio: false, video_codec: "avc1.640028", container: "mp4", extension: "mp4" },
+            delivery: { kind: "file", sources: [{ id: "s2", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137" }] },
+          },
+          {
+            id: "a-140",
+            label: "仅音频 M4A",
+            metadata: { has_audio: true, audio_codec: "mp4a.40.2", container: "m4a", extension: "m4a", mime_type: "audio/mp4" },
+            delivery: { kind: "file", sources: [{ id: "s3", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140" }] },
+          },
+        ],
+        default: { variant_id: "v-1080", source_id: "s2", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=137" },
+      },
+    ],
+  };
+  const opts = uiHelpers.buildSidePanelQualityOptions(ytMultiMedia, ytMultiMedia.items[0], "https://snap.dokitool.com");
+  const baseSettings = {
+    apiBaseUrl: "https://snap.dokitool.com",
+    bearerToken: "",
+    qualityPreference: "best",
+    batchSaveMode: "subfolder",
+    subfolderPrefix: "",
+    themeMode: "system",
+  };
+  const opt4k = opts.find((o) => o.variant.id === "v-2160");
+  const opt1080 = opts.find((o) => o.variant.id === "v-1080");
+  const optAudio = opts.find((o) => o.variant.id === "a-140");
+  assert.ok(opt4k && opt1080 && optAudio);
+  assert.equal(
+    uiHelpers.buildSingleDownloadEnqueueItem({ media: ytMultiMedia, item: ytMultiMedia.items[0], option: opt4k, settings: baseSettings }).spec.filename,
+    "多画质命名对齐测试_2160p.mp4",
+  );
+  assert.equal(
+    uiHelpers.buildSingleDownloadEnqueueItem({ media: ytMultiMedia, item: ytMultiMedia.items[0], option: opt1080, settings: baseSettings }).spec.filename,
+    "多画质命名对齐测试_1080p.mp4",
+  );
+  assert.equal(
+    uiHelpers.buildSingleDownloadEnqueueItem({ media: ytMultiMedia, item: ytMultiMedia.items[0], option: optAudio, settings: baseSettings }).spec.filename,
+    "多画质命名对齐测试_audio.m4a",
+  );
+});

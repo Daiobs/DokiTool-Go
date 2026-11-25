@@ -12347,3 +12347,231 @@ test("Issue #48 [P0-2] Spec B.2: createFetchGmXhrAdapter streams ReadableStream 
   const resumed = est.update(3_000_000, 4000); // 1 MB in 500ms = 2 MB/s
   assert.equal(resumed, 2_000_000);
 });
+
+test("Issue #48 [P1-6] & [P2-5d]: 3-way parallel context+prefetch, short-TTL context cache + 1x player_id 400 retry, 3-stage PARSE_PROGRESS, and zero hardcoded 4K mux copy", async () => {
+  const opfs = createMockOpfs();
+  const urlApi = createTrackedUrlApi();
+  let contextCalls = 0;
+  let swDataCalls = 0;
+  let oembedCalls = 0;
+  let finalizeCalls = 0;
+  let failNextFinalizeStale = false;
+  let sawConcurrentContextAndPrefetch = false;
+  let inFlightContext = false;
+  let inFlightPrefetch = false;
+  let releaseContextBarrier = null;
+  let releaseSwBarrier = null;
+
+  const mockFetch = async (url) => {
+    if (url.startsWith("https://snap.dokitool.com/api/youtube/context")) {
+      contextCalls++;
+      inFlightContext = true;
+      if (inFlightPrefetch) sawConcurrentContextAndPrefetch = true;
+      if (contextCalls === 1) {
+        await new Promise((resolve) => {
+          releaseContextBarrier = resolve;
+          if (inFlightPrefetch && releaseSwBarrier) {
+            releaseSwBarrier();
+            resolve();
+          }
+        });
+      }
+      inFlightContext = false;
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: {
+            player_id: `pl-${contextCalls}`,
+            signature_timestamp: 20123 + contextCalls,
+            client: { name: "TVHTML5", version: "7.20260101.00.00" },
+            expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (url === "https://www.youtube.com/sw.js_data") {
+      swDataCalls++;
+      inFlightPrefetch = true;
+      if (inFlightContext) sawConcurrentContextAndPrefetch = true;
+      if (swDataCalls === 1) {
+        await new Promise((resolve) => {
+          releaseSwBarrier = resolve;
+          if (inFlightContext && releaseContextBarrier) {
+            releaseContextBarrier();
+            resolve();
+          }
+        });
+      }
+      inFlightPrefetch = false;
+      return new Response(`)]}'\n[[null,null,[null,null,null,null,null,null,"CgtnVmlzaXRvckRhdGE%3D"]]]`, {
+        status: 200,
+      });
+    }
+
+    if (url.startsWith("https://www.youtube.com/oembed")) {
+      oembedCalls++;
+      return new Response(
+        JSON.stringify({
+          title: "Parallel Prefetch Title",
+          author_name: "Parallel Author",
+          thumbnail_url: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (url.startsWith("https://www.youtube.com/youtubei/v1/player")) {
+      return new Response(
+        JSON.stringify({
+          playabilityStatus: { status: "OK" },
+          streamingData: {
+            formats: [
+              {
+                itag: 18,
+                url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18",
+                mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+                width: 640,
+                height: 360,
+              },
+            ],
+            adaptiveFormats: [],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (url.startsWith("https://snap.dokitool.com/api/youtube/finalize")) {
+      finalizeCalls++;
+      if (failNextFinalizeStale) {
+        failNextFinalizeStale = false;
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "INVALID_INPUT",
+            error: { code: "INVALID_INPUT", message: "player_id 已失效或不存在" },
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "OK",
+          data: {
+            platform: "youtube",
+            content_id: "dQw4w9WgXcQ",
+            source_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            title: "Parallel Prefetch Title",
+            items: [
+              {
+                id: "yt-1",
+                type: "video",
+                variants: [
+                  {
+                    id: "360p",
+                    label: "360p",
+                    metadata: { width: 640, height: 360, extension: "mp4", has_audio: true },
+                    delivery: {
+                      kind: "file",
+                      sources: [{ id: "s1", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18" }],
+                    },
+                  },
+                ],
+                default: { variant_id: "360p", source_id: "s1", url: "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18" },
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  let offscreenCtrl = null;
+  const env = createMockMv3Environment({
+    async spawnOffscreenHook() {
+      if (!offscreenCtrl) {
+        offscreenCtrl = offscreenMod.createOffscreenController({
+          chrome: env.chrome,
+          fetchImpl: mockFetch,
+          opfsStorage: opfs.storage,
+          webLocks: opfs.locks,
+          urlApi,
+        });
+      }
+    },
+  });
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: storage.createExtensionStorage(),
+    fetchImpl: mockFetch,
+  });
+  await bg.init();
+
+  const progressBroadcasts = [];
+  const port = env.chrome.runtime.connect({ name: protocol.SIDEPANEL_PORT_NAME });
+  port.onMessage.addListener((msg) => {
+    if (msg?.type === "PARSE_PROGRESS") {
+      progressBroadcasts.push(msg);
+    }
+  });
+
+  try {
+    // 1) First parse runs context + prefetch in parallel and broadcasts 3 stages
+    const r1 = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    });
+    assert.equal(r1.ok, true);
+    assert.equal(sawConcurrentContextAndPrefetch, true, "GET /api/youtube/context and OFFSCREEN_YOUTUBE_PREFETCH must overlap in parallel");
+    assert.equal(contextCalls, 1);
+    assert.ok(oembedCalls >= 1);
+    assert.deepEqual(
+      progressBroadcasts.map((m) => m.stage),
+      [1, 2, 3],
+      "must emit 3-stage PARSE_PROGRESS notifications",
+    );
+
+    // 2) Second parse hits short-TTL context cache (0 extra /api/youtube/context calls)
+    const r2 = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    });
+    assert.equal(r2.ok, true);
+    assert.equal(contextCalls, 1, "second YouTube parse within TTL must reuse cached context");
+
+    // 3) Third parse triggers 400 player_id expired on finalize -> invalidates cache, refreshes context once, retries & succeeds
+    failNextFinalizeStale = true;
+    const r3 = await env.chrome.runtime.sendMessage({
+      type: "PARSE_URL",
+      url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    });
+    assert.equal(r3.ok, true);
+    assert.equal(contextCalls, 2, "400 player_id failure must invalidate cache and re-fetch context once");
+    assert.equal(finalizeCalls, 4, "1 + 1 + (1 failed + 1 retried)");
+  } finally {
+    port.disconnect();
+    offscreenCtrl?.dispose();
+    bg.dispose();
+  }
+
+  // [P2-5d] Generic mux copy must not hardcode "4K" across extension download pipeline & SidePanel
+  for (const rel of [
+    "src/extension/extensionDownload.ts",
+    "src/extension/bg/downloadCoordinator.ts",
+    "src/extension/components/SidePanelDownloads.vue",
+  ]) {
+    const src = readFileSync(join(FRONTEND_DIR, rel), "utf8");
+    assert.equal(
+      /正在准备\s*4K|4K\s*无损合流/.test(src),
+      false,
+      `${rel} must not hardcode 4K in generic mux progress copy`,
+    );
+  }
+});

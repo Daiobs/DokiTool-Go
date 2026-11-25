@@ -11,6 +11,12 @@ const { createRenderer, createSSRApp, h, markRaw, nextTick, ref } = vue;
 const require = createRequire(import.meta.url);
 let DownloadCard;
 before(async () => {
+  const pickerSource = await readFile(new URL('../src/downloads/saveFilePicker.ts', import.meta.url), 'utf8');
+  const compiledPicker = await transformWithEsbuild(pickerSource, 'saveFilePicker.ts', { loader: 'ts', format: 'cjs' });
+  const pickerModule = { exports: {} };
+  new Function('require', 'module', 'exports', compiledPicker.code)(require, pickerModule, pickerModule.exports);
+  const saveFilePicker = pickerModule.exports;
+
   const source = await readFile(new URL('../src/components/DownloadCard.vue', import.meta.url), 'utf8');
   const { descriptor } = parse(source);
   const script = compileScript(descriptor, { id: 'download-panel-test', inlineTemplate: true,
@@ -22,6 +28,7 @@ before(async () => {
   const transition = { setup: (_, { slots }) => () => slots.default?.() };
   new Function('require', 'module', 'exports', compiled.code)(id => {
     if (id === './AppIcon.vue') return { __esModule: true, default: { render: () => h('i') } };
+    if (id === '../downloads/saveFilePicker') return saveFilePicker;
     if (id === 'vue') return { ...vue, Transition: transition, TransitionGroup: transition };
     return require(id);
   }, componentModule, componentModule.exports);
@@ -501,4 +508,40 @@ test('mounting DownloadCard with a single manual task respects saved collapsed p
   assert.equal(Boolean(list.props.hidden), false);
   assert.equal(view.expanded(), true);
   assert.ok(view.row('toutiao-saved-collapsed'));
+});
+
+test('Issue #48 [P1-1] Spec B.3: DownloadCard renders filenameWarning alert and toggles Web showSaveFilePicker preference when supported', async t => {
+  const prevPicker = globalThis.showSaveFilePicker;
+  try {
+    globalThis.showSaveFilePicker = async () => ({ createWritable: async () => ({ write() {}, close() {} }) });
+    const view = await mount(
+      t,
+      [
+        task('tamper-1', 'completed', {
+          filename: '作品_1080p.mp4',
+          filenameWarning: '检测到浏览器内其他下载类扩展改写了保存文件名，可停用冲突下载插件或开启系统另存为直写',
+        }),
+      ],
+      { preference: 'expanded' },
+    );
+    const row = view.row('tamper-1');
+    assert.ok(row);
+    const warnings = descendants(row, n => 'data-download-filename-warning' in (n.props || {}));
+    assert.equal(warnings.length, 1);
+    assert.match(textOf(warnings[0]), /其他下载类扩展改写了保存文件名/);
+
+    const toggle = descendants(view.root, n => n.props?.['data-testid'] === 'web-save-file-picker-toggle')[0];
+    assert.ok(toggle, 'expected Web showSaveFilePicker toggle when API is supported');
+    assert.equal(toggle.props.checked, false);
+    toggle.props.onChange({ target: { checked: true } });
+    await nextTick();
+    assert.equal(globalThis.window.localStorage.getItem('dokitool:save-file-picker'), '1');
+    toggle.props.onChange({ target: { checked: false } });
+    await nextTick();
+    assert.equal(globalThis.window.localStorage.getItem('dokitool:save-file-picker'), null);
+    view.stop();
+  } finally {
+    if (prevPicker === undefined) delete globalThis.showSaveFilePicker;
+    else globalThis.showSaveFilePicker = prevPicker;
+  }
 });

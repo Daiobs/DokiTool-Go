@@ -2,6 +2,7 @@ package youtube
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,12 +41,29 @@ const (
 	// DefaultPlayerCacheTTL is the default lifetime of a cached player_id entry.
 	DefaultPlayerCacheTTL = 6 * time.Hour
 
+	// SoftRefreshBefore triggers proactive singleflight SWR background refresh
+	// this duration before ExpiresAt so users never hit synchronous refresh waits.
+	SoftRefreshBefore = time.Hour
+
+	// BackgroundRefreshInterval is the periodic health-check cadence used by
+	// StartBackgroundRefresh to keep the active player warm.
+	BackgroundRefreshInterval = 30 * time.Minute
+
 	// StalePlayerFallbackWindow is the maximum age past ExpiresAt during which a
 	// cached player entry can still be served if refreshing the player fails.
 	StalePlayerFallbackWindow = time.Hour
 
+	// MaxChallengeCacheEntries caps the deterministic (player_id, input) solver LRU.
+	MaxChallengeCacheEntries = 4096
+
 	maxCachedPlayers = 8
 )
+
+var startupPrewarmBackoffs = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+}
 
 var (
 	playerIDPattern           = regexp.MustCompile(`^[0-9a-fA-F]{8}$`)
@@ -117,19 +135,103 @@ type playerRefreshCall struct {
 	err   error
 }
 
+type challengeCacheKey struct {
+	playerID string
+	kind     string
+	input    string
+}
+
+type challengeCacheEntry struct {
+	key   challengeCacheKey
+	value string
+}
+
+// challengeLRU is a concurrency-safe bounded LRU cache for deterministic
+// (player_id, n/sig input) -> solved challenge outputs.
+type challengeLRU struct {
+	mu       sync.Mutex
+	capacity int
+	ll       *list.List
+	items    map[challengeCacheKey]*list.Element
+}
+
+func newChallengeLRU(capacity int) *challengeLRU {
+	if capacity <= 0 {
+		capacity = MaxChallengeCacheEntries
+	}
+	return &challengeLRU{
+		capacity: capacity,
+		ll:       list.New(),
+		items:    make(map[challengeCacheKey]*list.Element),
+	}
+}
+
+func (c *challengeLRU) Get(playerID, kind, input string) (string, bool) {
+	if c == nil || playerID == "" || input == "" {
+		return "", false
+	}
+	key := challengeCacheKey{playerID: playerID, kind: kind, input: input}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[key]; ok {
+		c.ll.MoveToFront(elem)
+		return elem.Value.(*challengeCacheEntry).value, true
+	}
+	return "", false
+}
+
+func (c *challengeLRU) Put(playerID, kind, input, value string) {
+	if c == nil || playerID == "" || input == "" || value == "" {
+		return
+	}
+	key := challengeCacheKey{playerID: playerID, kind: kind, input: input}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[key]; ok {
+		elem.Value.(*challengeCacheEntry).value = value
+		c.ll.MoveToFront(elem)
+		return
+	}
+	elem := c.ll.PushFront(&challengeCacheEntry{key: key, value: value})
+	c.items[key] = elem
+	for c.ll.Len() > c.capacity {
+		back := c.ll.Back()
+		if back == nil {
+			break
+		}
+		c.ll.Remove(back)
+		delete(c.items, back.Value.(*challengeCacheEntry).key)
+	}
+}
+
+func (c *challengeLRU) Len() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ll.Len()
+}
+
 // Helper serves /api/youtube/context and /api/youtube/finalize using internal/fetch
 // (restricted to www.youtube.com) and the zero-permission Deno + ejs sandbox.
 type Helper struct {
-	executor fetch.Executor
-	sandbox  *EJSSandbox
-	now      func() time.Time
-	cacheTTL time.Duration
+	executor          fetch.Executor
+	sandbox           *EJSSandbox
+	now               func() time.Time
+	cacheTTL          time.Duration
+	softRefreshBefore time.Duration
+	bgRefreshInterval time.Duration
+	prewarmBackoffs   []time.Duration
+	challengeCache    *challengeLRU
 
 	mu          sync.Mutex
 	activeID    string
 	cache       map[string]*playerCacheEntry
 	order       []string
 	refreshCall *playerRefreshCall
+	bgCtx       context.Context
+	bgWG        sync.WaitGroup
 }
 
 // NewHelper creates a YouTube Helper backed by the given fetch.Executor and verified EJSSandbox.
@@ -144,11 +246,15 @@ func NewHelper(executor fetch.Executor, sandbox *EJSSandbox, now func() time.Tim
 		now = time.Now
 	}
 	return &Helper{
-		executor: executor,
-		sandbox:  sandbox,
-		now:      now,
-		cacheTTL: DefaultPlayerCacheTTL,
-		cache:    make(map[string]*playerCacheEntry),
+		executor:          executor,
+		sandbox:           sandbox,
+		now:               now,
+		cacheTTL:          DefaultPlayerCacheTTL,
+		softRefreshBefore: SoftRefreshBefore,
+		bgRefreshInterval: BackgroundRefreshInterval,
+		prewarmBackoffs:   append([]time.Duration(nil), startupPrewarmBackoffs...),
+		challengeCache:    newChallengeLRU(MaxChallengeCacheEntries),
+		cache:             make(map[string]*playerCacheEntry),
 	}, nil
 }
 
@@ -219,15 +325,128 @@ func (h *Helper) Context(ctx context.Context) (unified.Object, int) {
 	}, http.StatusOK
 }
 
-func (h *Helper) ensureActivePlayer(ctx context.Context) (*playerCacheEntry, error) {
+// StartBackgroundRefresh launches a non-blocking background goroutine that
+// prewarms the active YouTube player immediately on startup (retrying with
+// 5s / 15s / 30s backoff on startup failure without blocking server startup)
+// and periodically checks every 30m so user requests never hit cold waits.
+// The returned stop function cancels background work and waits for clean exit.
+func (h *Helper) StartBackgroundRefresh(parent context.Context) func() {
+	if h == nil {
+		return func() {}
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	bgCtx, cancel := context.WithCancel(parent)
+	h.mu.Lock()
+	h.bgCtx = bgCtx
+	interval := h.bgRefreshInterval
+	if interval <= 0 {
+		interval = BackgroundRefreshInterval
+	}
+	backoffs := append([]time.Duration(nil), h.prewarmBackoffs...)
+	h.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Initial startup prewarm with bounded backoff retries.
+		for attempt := 0; ; attempt++ {
+			if bgCtx.Err() != nil {
+				return
+			}
+			if _, err := h.runSingleflightRefresh(bgCtx); err == nil {
+				break
+			} else if attempt >= len(backoffs) {
+				log.Printf("WARN: youtube helper startup prewarm failed after retries: %v", err)
+				break
+			} else {
+				wait := backoffs[attempt]
+				log.Printf("WARN: youtube helper startup prewarm attempt %d failed (%v); retrying in %s", attempt+1, err, wait)
+				timer := time.NewTimer(wait)
+				select {
+				case <-bgCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bgCtx.Done():
+				return
+			case <-ticker.C:
+				if !h.needsProactiveRefresh() {
+					continue
+				}
+				if _, err := h.runSingleflightRefresh(bgCtx); err != nil && bgCtx.Err() == nil {
+					log.Printf("WARN: youtube helper periodic refresh failed: %v", err)
+				}
+			}
+		}
+	}()
+
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+			h.bgWG.Wait()
+		})
+	}
+}
+
+func (h *Helper) effectiveSoftRefreshBeforeLocked() time.Duration {
+	if h.softRefreshBefore <= 0 || h.cacheTTL <= 0 {
+		return 0
+	}
+	if h.softRefreshBefore >= h.cacheTTL {
+		return h.cacheTTL / 2
+	}
+	return h.softRefreshBefore
+}
+
+func (h *Helper) needsProactiveRefresh() bool {
+	if h == nil {
+		return false
+	}
 	now := h.now()
 	h.mu.Lock()
-	if h.activeID != "" {
-		if existing, ok := h.cache[h.activeID]; ok && now.Before(existing.ExpiresAt) {
-			h.mu.Unlock()
-			return existing, nil
-		}
+	defer h.mu.Unlock()
+	if h.activeID == "" {
+		return true
 	}
+	existing, ok := h.cache[h.activeID]
+	if !ok {
+		return true
+	}
+	softBefore := h.effectiveSoftRefreshBeforeLocked()
+	return !now.Before(existing.ExpiresAt.Add(-softBefore))
+}
+
+func (h *Helper) startAsyncRefreshLocked() {
+	if h.refreshCall != nil {
+		return
+	}
+	call := &playerRefreshCall{done: make(chan struct{})}
+	h.refreshCall = call
+	parentCtx := h.bgCtx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	h.bgWG.Add(1)
+	go func() {
+		defer h.bgWG.Done()
+		h.executeRefreshCall(parentCtx, call, false)
+	}()
+}
+
+func (h *Helper) runSingleflightRefresh(ctx context.Context) (*playerCacheEntry, error) {
+	h.mu.Lock()
 	if h.refreshCall != nil {
 		call := h.refreshCall
 		h.mu.Unlock()
@@ -241,7 +460,10 @@ func (h *Helper) ensureActivePlayer(ctx context.Context) (*playerCacheEntry, err
 	call := &playerRefreshCall{done: make(chan struct{})}
 	h.refreshCall = call
 	h.mu.Unlock()
+	return h.executeRefreshCall(ctx, call, true)
+}
 
+func (h *Helper) executeRefreshCall(ctx context.Context, call *playerRefreshCall, fallbackStaleOnErr bool) (*playerCacheEntry, error) {
 	var (
 		entry    *playerCacheEntry
 		err      error
@@ -261,24 +483,36 @@ func (h *Helper) ensureActivePlayer(ctx context.Context) (*playerCacheEntry, err
 		h.mu.Unlock()
 	}()
 
-	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 35*time.Second)
+	h.mu.Lock()
+	bgCtx := h.bgCtx
+	h.mu.Unlock()
+	refreshBase := bgCtx
+	if refreshBase == nil {
+		refreshBase = context.WithoutCancel(ctx)
+	}
+	if ctx.Err() != nil {
+		refreshBase = ctx
+	}
+	refreshCtx, cancel := context.WithTimeout(refreshBase, 35*time.Second)
 	defer cancel()
 
 	entry, err = h.refreshActivePlayer(refreshCtx)
-	if err != nil {
+	if err != nil && fallbackStaleOnErr {
 		h.mu.Lock()
-		now = h.now()
+		now := h.now()
 		if h.activeID != "" {
 			if stale, ok := h.cache[h.activeID]; ok && !now.After(stale.StaleUntil) {
+				served := *stale
 				graceExpiry := now.Add(5 * time.Minute)
 				if graceExpiry.After(stale.StaleUntil) {
 					graceExpiry = stale.StaleUntil
 				}
-				if graceExpiry.After(stale.ExpiresAt) {
-					stale.ExpiresAt = graceExpiry
+				if graceExpiry.After(served.ExpiresAt) {
+					served.ExpiresAt = graceExpiry
+					h.storeCacheEntryLocked(&served)
 				}
 				log.Printf("WARN: youtube player refresh failed (%v); continuing with stale player %s", err, stale.PlayerID)
-				entry = stale
+				entry = &served
 				err = nil
 			}
 		}
@@ -292,6 +526,52 @@ func (h *Helper) ensureActivePlayer(ctx context.Context) (*playerCacheEntry, err
 	return entry, err
 }
 
+func (h *Helper) ensureActivePlayer(ctx context.Context) (*playerCacheEntry, error) {
+	now := h.now()
+	h.mu.Lock()
+	if h.activeID != "" {
+		if existing, ok := h.cache[h.activeID]; ok {
+			softBefore := h.effectiveSoftRefreshBeforeLocked()
+			if now.Before(existing.ExpiresAt) {
+				if softBefore > 0 && !now.Before(existing.ExpiresAt.Add(-softBefore)) {
+					h.startAsyncRefreshLocked()
+				}
+				h.mu.Unlock()
+				return existing, nil
+			}
+			if !now.After(existing.StaleUntil) {
+				h.startAsyncRefreshLocked()
+				served := *existing
+				graceExpiry := now.Add(5 * time.Minute)
+				if graceExpiry.After(existing.StaleUntil) {
+					graceExpiry = existing.StaleUntil
+				}
+				if graceExpiry.After(served.ExpiresAt) {
+					served.ExpiresAt = graceExpiry
+					h.storeCacheEntryLocked(&served)
+				}
+				h.mu.Unlock()
+				return &served, nil
+			}
+		}
+	}
+	if h.refreshCall != nil {
+		call := h.refreshCall
+		h.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.entry, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &playerRefreshCall{done: make(chan struct{})}
+	h.refreshCall = call
+	h.mu.Unlock()
+
+	return h.executeRefreshCall(ctx, call, true)
+}
+
 func (h *Helper) refreshActivePlayer(ctx context.Context) (*playerCacheEntry, error) {
 	playerID, err := h.fetchCurrentPlayerID(ctx)
 	if err != nil {
@@ -300,10 +580,16 @@ func (h *Helper) refreshActivePlayer(ctx context.Context) (*playerCacheEntry, er
 
 	now := h.now()
 	h.mu.Lock()
-	if existing, ok := h.cache[playerID]; ok && now.Before(existing.ExpiresAt) {
+	if existing, ok := h.cache[playerID]; ok && !now.After(existing.StaleUntil) {
+		expiresAt := now.Add(h.cacheTTL)
+		renewed := *existing
+		renewed.FetchedAt = now
+		renewed.ExpiresAt = expiresAt
+		renewed.StaleUntil = expiresAt.Add(StalePlayerFallbackWindow)
+		h.storeCacheEntryLocked(&renewed)
 		h.activeID = playerID
 		h.mu.Unlock()
-		return existing, nil
+		return &renewed, nil
 	}
 	h.mu.Unlock()
 
@@ -714,7 +1000,7 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 
 	entries := filterMultiAudioStreamEntries(validatedEntries)
 	nChallenges, sigChallenges := collectFinalizeChallenges(entries)
-	nSolved, sigSolved, err := h.sandbox.Solve(ctx, cachedPlayer.PreprocessedPlayerJS, nChallenges, sigChallenges)
+	nSolved, sigSolved, err := h.solveFinalizeChallenges(ctx, cachedPlayer, nChallenges, sigChallenges)
 	if err != nil {
 		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube 媒体签名挑战解密失败", false), http.StatusBadGateway
 	}
@@ -744,6 +1030,50 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		EnableHLS:       false,
 	}
 	return buildFinalizeEnvelope(info, opts, nowTime.Unix(), debug)
+}
+
+func (h *Helper) solveFinalizeChallenges(
+	ctx context.Context,
+	player *playerCacheEntry,
+	nChallenges, sigChallenges []string,
+) (map[string]string, map[string]string, error) {
+	nSolved := make(map[string]string, len(nChallenges))
+	sigSolved := make(map[string]string, len(sigChallenges))
+	var missingN []string
+	var missingSig []string
+
+	for _, c := range nChallenges {
+		if val, ok := h.challengeCache.Get(player.PlayerID, "n", c); ok {
+			nSolved[c] = val
+		} else {
+			missingN = append(missingN, c)
+		}
+	}
+	for _, c := range sigChallenges {
+		if val, ok := h.challengeCache.Get(player.PlayerID, "sig", c); ok {
+			sigSolved[c] = val
+		} else {
+			missingSig = append(missingSig, c)
+		}
+	}
+
+	if len(missingN) == 0 && len(missingSig) == 0 {
+		return nSolved, sigSolved, nil
+	}
+
+	freshN, freshSig, err := h.sandbox.Solve(ctx, player.PreprocessedPlayerJS, missingN, missingSig)
+	if err != nil {
+		return nil, nil, err
+	}
+	for k, v := range freshN {
+		nSolved[k] = v
+		h.challengeCache.Put(player.PlayerID, "n", k, v)
+	}
+	for k, v := range freshSig {
+		sigSolved[k] = v
+		h.challengeCache.Put(player.PlayerID, "sig", k, v)
+	}
+	return nSolved, sigSolved, nil
 }
 
 func decodeFinalizeRequest(body []byte) (*decodedFinalizeRequest, unified.Object, int) {

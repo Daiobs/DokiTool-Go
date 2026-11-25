@@ -48,10 +48,27 @@ export interface YouTubeHelperPingResult {
   supported: boolean;
 }
 
+export interface YouTubeHelperPrefetchOembed {
+  title?: string;
+  author?: string;
+  thumbnail?: string;
+}
+
+export interface YouTubeHelperPrefetchPayload {
+  video_id: string;
+}
+
+export interface YouTubeHelperPrefetchResult {
+  visitorData: string;
+  oembed: YouTubeHelperPrefetchOembed | null;
+}
+
 export interface YouTubeHelperPlayerPayload {
   video_id: string;
   signature_timestamp: number;
   client: YouTubeHelperClientInfo;
+  visitor_data?: string;
+  oembed?: YouTubeHelperPrefetchOembed | null;
 }
 
 export interface YouTubeHelperVideoDetails {
@@ -232,6 +249,15 @@ export function pingYouTubeHelper(options?: {
   timeoutMs?: number;
   eventTarget?: EventTarget;
 }): Promise<YouTubeHelperPingResult>;
+export function requestYouTubePrefetchViaHelper(
+  payload: YouTubeHelperPrefetchPayload,
+  options?: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    eventTarget?: EventTarget;
+  },
+): Promise<YouTubeHelperPrefetchResult>;
+
 export function requestYouTubePlayerViaHelper(
   payload: YouTubeHelperPlayerPayload,
   options?: {

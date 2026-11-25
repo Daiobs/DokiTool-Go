@@ -18,6 +18,7 @@ import {
   MIN_YOUTUBE_HELPER_VERSION,
   YOUTUBE_HELPER_SCRIPT_URL,
   requestYouTubePlayerViaHelper,
+  requestYouTubePrefetchViaHelper,
   type pingYouTubeHelper,
   type YouTubeHelperContextResponse,
 } from "./youtubeHelperCore";
@@ -210,6 +211,78 @@ export function buildFallbackYouTubeMedia(
   };
 }
 
+const YOUTUBE_CONTEXT_CACHE_SAFETY_MARGIN_MS = 5 * 60_000;
+const webYouTubeContextCache = new Map<
+  string,
+  { data: YouTubeHelperContextResponse; usableUntilMs: number }
+>();
+
+export function clearCachedYouTubeContext(baseUrl?: string): void {
+  if (typeof baseUrl === "string") {
+    webYouTubeContextCache.delete(baseUrl);
+    return;
+  }
+  webYouTubeContextCache.clear();
+}
+
+function readCachedWebYouTubeContext(
+  baseUrl: string,
+  nowMs = Date.now(),
+): YouTubeHelperContextResponse | null {
+  const hit = webYouTubeContextCache.get(baseUrl);
+  if (!hit) return null;
+  if (nowMs >= hit.usableUntilMs) {
+    webYouTubeContextCache.delete(baseUrl);
+    return null;
+  }
+  return hit.data;
+}
+
+function writeCachedWebYouTubeContext(
+  baseUrl: string,
+  data: YouTubeHelperContextResponse,
+  nowMs = Date.now(),
+): void {
+  const parsedExp = Date.parse(data.expires_at || "");
+  if (!Number.isFinite(parsedExp)) return;
+  const usableUntilMs = parsedExp - YOUTUBE_CONTEXT_CACHE_SAFETY_MARGIN_MS;
+  if (usableUntilMs > nowMs) {
+    webYouTubeContextCache.set(baseUrl, { data, usableUntilMs });
+  }
+}
+
+export function formatYouTubeParseStageText(
+  stage: 1 | 2 | 3,
+  locale = "zh-CN",
+): string {
+  const isEn = locale === "en";
+  if (stage === 1) {
+    return isEn
+      ? "Preparing parse context (1/3)…"
+      : "正在准备解析上下文 (1/3)…";
+  }
+  if (stage === 2) {
+    return isEn
+      ? "Fetching video stream manifest (2/3)…"
+      : "正在获取视频流清单 (2/3)…";
+  }
+  return isEn
+    ? "Decrypting high-quality streams (3/3)…"
+    : "正在解密高画质签名 (3/3)…";
+}
+
+function isPlayerIdExpiredError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const rec = err as { status?: number; code?: string; message?: string };
+  if (
+    rec.status === 400 &&
+    (rec.code === "INVALID_INPUT" || /player_id/i.test(String(rec.message || "")))
+  ) {
+    return true;
+  }
+  return /player_id/i.test(String(rec.message || ""));
+}
+
 export async function runYouTubeHelperParse(ctx: {
   videoId: string;
   locale: string;
@@ -226,10 +299,14 @@ export async function runYouTubeHelperParse(ctx: {
   ) => Promise<unknown>;
   baseUrl: string;
   onHelperReady: () => void;
+  onStageChange?: (stage: 1 | 2 | 3, statusText: string) => void;
   setResult: (media: UnifiedMedia) => void;
   setError: (message: string, duration?: number) => void;
 }): Promise<void> {
   const { videoId, signal, isCurrent } = ctx;
+  const emitStage = (stage: 1 | 2 | 3) => {
+    ctx.onStageChange?.(stage, formatYouTubeParseStageText(stage, ctx.locale));
+  };
 
   let bridgeMod: typeof import("../services/extensionBridge") | null = null;
   const loadBridge = async () => {
@@ -263,9 +340,22 @@ export async function runYouTubeHelperParse(ctx: {
   };
   const parseRoute = resolveClientParseRoute(true, extEnv);
   if (parseRoute.channel === "extension_client_parse") {
-    const resp = await parseViaExt(videoId, {
-      locale: ctx.locale === "en" ? "en" : "zh-CN",
-    });
+    emitStage(1);
+    const stage2Timer = setTimeout(() => {
+      if (isCurrent()) emitStage(2);
+    }, 350);
+    const stage3Timer = setTimeout(() => {
+      if (isCurrent()) emitStage(3);
+    }, 1100);
+    let resp: Awaited<ReturnType<typeof parseViaExt>>;
+    try {
+      resp = await parseViaExt(videoId, {
+        locale: ctx.locale === "en" ? "en" : "zh-CN",
+      });
+    } finally {
+      clearTimeout(stage2Timer);
+      clearTimeout(stage3Timer);
+    }
     if (!isCurrent()) return;
 
     if (resp.ok && resp.data?.media) {
@@ -378,8 +468,7 @@ export async function runYouTubeHelperParse(ctx: {
 
   ctx.onHelperReady();
 
-  let contextData: YouTubeHelperContextResponse;
-  try {
+  const fetchFreshWebContext = async (): Promise<YouTubeHelperContextResponse> => {
     const contextEnvelope = (await ctx.fetchJSON(
       `${ctx.baseUrl}/api/youtube/context?schema_version=1.0`,
       signal,
@@ -396,103 +485,146 @@ export async function runYouTubeHelperParse(ctx: {
     ) {
       throw new Error("获取 YouTube 解析上下文失败");
     }
-    contextData = contextEnvelope.data;
-  } catch (error: any) {
-    if (error?.status === 404) {
-      const data = await ctx.requestStandardParse();
-      if (isCurrent()) {
-        ctx.setResult(data);
+    writeCachedWebYouTubeContext(ctx.baseUrl, contextEnvelope.data);
+    return contextEnvelope.data;
+  };
+
+  const runUserscriptAttempt = async (allowCachedContext: boolean): Promise<void> => {
+    emitStage(1);
+    const cachedContext = allowCachedContext
+      ? readCachedWebYouTubeContext(ctx.baseUrl)
+      : null;
+    const usedCachedContext = cachedContext !== null;
+
+    let contextData: YouTubeHelperContextResponse;
+    let prefetchData: {
+      visitorData?: string;
+      oembed?: { title?: string; author?: string; thumbnail?: string } | null;
+    } | null = null;
+    try {
+      const [ctxRes, prefetchRes] = await Promise.all([
+        cachedContext ? Promise.resolve(cachedContext) : fetchFreshWebContext(),
+        requestYouTubePrefetchViaHelper(
+          { video_id: videoId },
+          { signal, timeoutMs: 8000 },
+        ).catch(() => null),
+      ]);
+      contextData = ctxRes;
+      prefetchData = prefetchRes;
+    } catch (error: any) {
+      if (error?.status === 404) {
+        const data = await ctx.requestStandardParse();
+        if (isCurrent()) {
+          ctx.setResult(data);
+        }
+        return;
       }
+      throw error;
+    }
+
+    if (!isCurrent()) return;
+
+    emitStage(2);
+    const playerResult = await requestYouTubePlayerViaHelper(
+      {
+        video_id: videoId,
+        signature_timestamp: contextData.signature_timestamp,
+        client: contextData.client,
+        ...(prefetchData?.visitorData
+          ? { visitor_data: prefetchData.visitorData }
+          : {}),
+        ...(prefetchData?.oembed ? { oembed: prefetchData.oembed } : {}),
+      },
+      { signal },
+    );
+
+    if (!isCurrent()) return;
+
+    const playStatus = playerResult?.playabilityStatus?.status || "ERROR";
+    if (playStatus === "LOGIN_REQUIRED") {
+      const loginMsg = "当前网络出口被 YouTube 要求验证，请更换节点后重试";
+      const helperState: YouTubeHelperState = {
+        status: "login_required",
+        provider: "userscript",
+        version: ping.version,
+        min_version: MIN_YOUTUBE_HELPER_VERSION,
+        script_url: YOUTUBE_HELPER_SCRIPT_URL,
+        message: loginMsg,
+      };
+      ctx.setResult(buildFallbackYouTubeMedia(videoId, helperState));
+      ctx.setError(loginMsg, 5000);
       return;
     }
-    throw error;
-  }
+    if (playStatus !== "OK") {
+      throw new Error(
+        playerResult?.playabilityStatus?.reason ||
+          `YouTube 返回不可播放状态（${playStatus}）`,
+      );
+    }
 
-  if (!isCurrent()) return;
-
-  const playerResult = await requestYouTubePlayerViaHelper(
-    {
+    const vd = playerResult.videoDetails;
+    const finalizeBody: Record<string, unknown> = {
       video_id: videoId,
-      signature_timestamp: contextData.signature_timestamp,
-      client: contextData.client,
-    },
-    { signal },
-  );
+      player_id: contextData.player_id,
+      formats: playerResult.streamingData?.formats || [],
+      adaptiveFormats: playerResult.streamingData?.adaptiveFormats || [],
+    };
+    if (typeof vd?.title === "string" && vd.title.trim()) {
+      finalizeBody.title = vd.title.trim();
+    }
+    if (typeof vd?.author === "string" && vd.author.trim()) {
+      finalizeBody.author = vd.author.trim();
+    }
+    if (
+      typeof vd?.lengthSeconds === "number" &&
+      Number.isInteger(vd.lengthSeconds) &&
+      vd.lengthSeconds > 0
+    ) {
+      finalizeBody.duration_seconds = vd.lengthSeconds;
+    }
+    if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
+      finalizeBody.thumbnail = vd.thumbnail.trim();
+    }
 
-  if (!isCurrent()) return;
+    emitStage(3);
+    let finalizePayload: unknown;
+    try {
+      finalizePayload = await ctx.fetchJSON(
+        `${ctx.baseUrl}/api/youtube/finalize?schema_version=1.0`,
+        signal,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(finalizeBody),
+        },
+      );
+    } catch (err) {
+      if (usedCachedContext && isPlayerIdExpiredError(err)) {
+        clearCachedYouTubeContext(ctx.baseUrl);
+        return runUserscriptAttempt(false);
+      }
+      throw err;
+    }
 
-  const playStatus = playerResult?.playabilityStatus?.status || "ERROR";
-  if (playStatus === "LOGIN_REQUIRED") {
-    const loginMsg = "当前网络出口被 YouTube 要求验证，请更换节点后重试";
-    const helperState: YouTubeHelperState = {
-      status: "login_required",
+    const finalized = withTbvideoItems(validateMediaEnvelope(finalizePayload));
+    const readyState: YouTubeHelperState = {
+      status: "ready",
       provider: "userscript",
       version: ping.version,
       min_version: MIN_YOUTUBE_HELPER_VERSION,
       script_url: YOUTUBE_HELPER_SCRIPT_URL,
-      message: loginMsg,
     };
-    ctx.setResult(buildFallbackYouTubeMedia(videoId, helperState));
-    ctx.setError(loginMsg, 5000);
-    return;
-  }
-  if (playStatus !== "OK") {
-    throw new Error(
-      playerResult?.playabilityStatus?.reason ||
-        `YouTube 返回不可播放状态（${playStatus}）`,
-    );
-  }
-
-  const vd = playerResult.videoDetails;
-  const finalizeBody: Record<string, unknown> = {
-    video_id: videoId,
-    player_id: contextData.player_id,
-    formats: playerResult.streamingData?.formats || [],
-    adaptiveFormats: playerResult.streamingData?.adaptiveFormats || [],
+    const data: UnifiedMedia = {
+      ...finalized,
+      extra: {
+        ...(finalized.extra || {}),
+        youtube_helper: readyState,
+      },
+    };
+    if (isCurrent()) {
+      ctx.setResult(data);
+    }
   };
-  if (typeof vd?.title === "string" && vd.title.trim()) {
-    finalizeBody.title = vd.title.trim();
-  }
-  if (typeof vd?.author === "string" && vd.author.trim()) {
-    finalizeBody.author = vd.author.trim();
-  }
-  if (
-    typeof vd?.lengthSeconds === "number" &&
-    Number.isInteger(vd.lengthSeconds) &&
-    vd.lengthSeconds > 0
-  ) {
-    finalizeBody.duration_seconds = vd.lengthSeconds;
-  }
-  if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
-    finalizeBody.thumbnail = vd.thumbnail.trim();
-  }
 
-  const finalizePayload = await ctx.fetchJSON(
-    `${ctx.baseUrl}/api/youtube/finalize?schema_version=1.0`,
-    signal,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(finalizeBody),
-    },
-  );
-
-  const finalized = withTbvideoItems(validateMediaEnvelope(finalizePayload));
-  const readyState: YouTubeHelperState = {
-    status: "ready",
-    provider: "userscript",
-    version: ping.version,
-    min_version: MIN_YOUTUBE_HELPER_VERSION,
-    script_url: YOUTUBE_HELPER_SCRIPT_URL,
-  };
-  const data: UnifiedMedia = {
-    ...finalized,
-    extra: {
-      ...(finalized.extra || {}),
-      youtube_helper: readyState,
-    },
-  };
-  if (isCurrent()) {
-    ctx.setResult(data);
-  }
+  await runUserscriptAttempt(true);
 }

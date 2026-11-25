@@ -94,7 +94,7 @@ function formatStatusChip(task: ExtensionDownloadTask): {
       return { label: "下载中", tone: "active" };
     case "muxing":
       return {
-        label: task.platform === "youtube" ? "4K合流中" : "无损合流中",
+        label: "无损合流中",
         tone: "mux",
       };
     case "saving":
@@ -260,6 +260,16 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
                   : `${Math.max(4, Math.min(100, Math.round(task.percent || 0)))}%`,
             }"
           />
+        </div>
+
+        <!-- Non-blocking Filename Tampering Warning (Spec B.3 §3) -->
+        <div
+          v-if="task.filenameWarning"
+          data-testid="task-filename-warning"
+          role="alert"
+          class="sp-task__warning"
+        >
+          {{ task.filenameWarning }}
         </div>
 
         <!-- Meta & Speed & Actions Row -->
@@ -623,6 +633,17 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
 .sp-task__err-text {
   color: var(--sp-danger-text);
   white-space: normal;
+  word-break: break-word;
+}
+
+.sp-task__warning {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--sp-warning-text, #b45309);
   word-break: break-word;
 }
 

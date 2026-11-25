@@ -558,7 +558,9 @@ func buildMuxTrackResourceWithContext(f Format, role string, opts AdaptOptions, 
 
 func formatSilentVideoSuffix(vf Format) string {
 	var parts []string
-	if shortEdge(vf) >= 2160 || longEdge(vf) >= 3840 {
+	if shortEdge(vf) >= 4320 || longEdge(vf) >= 7680 {
+		parts = append(parts, "8K")
+	} else if shortEdge(vf) >= 2160 || longEdge(vf) >= 3840 {
 		parts = append(parts, "4K")
 	} else if shortEdge(vf) >= 1440 || longEdge(vf) >= 2560 {
 		parts = append(parts, "2K")

@@ -2,6 +2,8 @@ import type { UnifiedMedia } from "../types/media";
 import type {
   YouTubeHelperPlayerPayload,
   YouTubeHelperPlayerResult,
+  YouTubeHelperPrefetchPayload,
+  YouTubeHelperPrefetchResult,
 } from "../utils/youtubeHelperCore";
 import type {
   BatchSaveMode,
@@ -182,6 +184,7 @@ export interface ExtensionDownloadTask {
   unwhitelistedHost?: string;
   fallbackUrl?: string;
   chromeDownloadId?: number;
+  filenameWarning?: string;
   createdAt: number;
   updatedAt: number;
   retryPayload?: ExtensionTaskRetryPayload;
@@ -305,7 +308,8 @@ export type BackgroundToSidePanelBroadcast =
       savedWorkFingerprints?: string[];
     }
   | { type: "TAB_SYNC_UPDATED"; tabSync: TabSyncState }
-  | { type: "PANEL_INTENT"; intent: PendingPanelIntent };
+  | { type: "PANEL_INTENT"; intent: PendingPanelIntent }
+  | { type: "PARSE_PROGRESS"; stage: 1 | 2 | 3; statusText: string };
 
 export type SidePanelChannelMessage =
   | SidePanelToBackgroundRequest
@@ -317,6 +321,11 @@ export type SidePanelChannelMessage =
 
 export type BackgroundToOffscreenRequest =
   | { type: "OFFSCREEN_PING" }
+  | {
+      type: "OFFSCREEN_YOUTUBE_PREFETCH";
+      payload: YouTubeHelperPrefetchPayload;
+      timeoutMs?: number;
+    }
   | {
       type: "OFFSCREEN_YOUTUBE_PLAYER";
       payload: YouTubeHelperPlayerPayload;
@@ -342,6 +351,7 @@ export interface OffscreenResponseMap {
     pendingBlobCount: number;
     helperVersion?: string;
   };
+  OFFSCREEN_YOUTUBE_PREFETCH: { prefetch: YouTubeHelperPrefetchResult };
   OFFSCREEN_YOUTUBE_PLAYER: { player: YouTubeHelperPlayerResult };
   OFFSCREEN_START_TASK: { accepted: boolean };
   OFFSCREEN_CANCEL_TASK: { cancelled: boolean };
@@ -516,6 +526,7 @@ export interface WebExtTaskStatusData {
   totalBytes: number;
   speedBytesPerSec: number;
   filename: string;
+  filenameWarning?: string;
   error?: string;
 }
 
@@ -557,10 +568,17 @@ const SIDEPANEL_REQUEST_TYPES = new Set<SidePanelToBackgroundRequest["type"]>([
 
 const BACKGROUND_BROADCAST_TYPES = new Set<
   BackgroundToSidePanelBroadcast["type"]
->(["STATE_SNAPSHOT", "TASKS_UPDATED", "TAB_SYNC_UPDATED", "PANEL_INTENT"]);
+>([
+  "STATE_SNAPSHOT",
+  "TASKS_UPDATED",
+  "TAB_SYNC_UPDATED",
+  "PANEL_INTENT",
+  "PARSE_PROGRESS",
+]);
 
 const BG_TO_OFFSCREEN_TYPES = new Set<BackgroundToOffscreenRequest["type"]>([
   "OFFSCREEN_PING",
+  "OFFSCREEN_YOUTUBE_PREFETCH",
   "OFFSCREEN_YOUTUBE_PLAYER",
   "OFFSCREEN_START_TASK",
   "OFFSCREEN_CANCEL_TASK",

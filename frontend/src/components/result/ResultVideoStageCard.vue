@@ -44,6 +44,7 @@ defineProps({
 const emit = defineEmits([
   "playback-error",
   "playback-loaded",
+  "duration-detected",
   "mark-image-broken",
   "open-quality-picker",
   "open-yt-helper-modal",
@@ -88,6 +89,12 @@ const emit = defineEmits([
         class="rs-music-player"
         @error="emit('playback-error', $event)"
         @loadeddata="emit('playback-loaded', $event)"
+        @loadedmetadata="
+          emit(
+            'duration-detected',
+            $event?.currentTarget?.duration ?? $event?.target?.duration,
+          )
+        "
       />
       <video
         v-else
@@ -101,6 +108,12 @@ const emit = defineEmits([
         :poster="mainPosterUrl || undefined"
         @error="emit('playback-error', $event)"
         @loadeddata="emit('playback-loaded', $event)"
+        @loadedmetadata="
+          emit(
+            'duration-detected',
+            $event?.currentTarget?.duration ?? $event?.target?.duration,
+          )
+        "
       >
         <track kind="captions" :src="undefined" />
       </video>

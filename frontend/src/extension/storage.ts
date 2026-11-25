@@ -14,6 +14,7 @@ export interface ExtensionSettings {
   qualityPreference: QualityPreference;
   autoFollowTab: boolean;
   theme: ExtensionThemeMode;
+  useSaveFilePicker: boolean;
 }
 
 export type ExtensionSettingsPatch = Partial<ExtensionSettings>;
@@ -42,6 +43,7 @@ export const DEFAULT_EXTENSION_SETTINGS: Readonly<ExtensionSettings> =
     qualityPreference: "best",
     autoFollowTab: false,
     theme: "system",
+    useSaveFilePicker: false,
   });
 
 export const SAVED_WORK_LRU_LIMIT = 200 as const;
@@ -219,6 +221,7 @@ function normalizeStoredSettings(raw: unknown): StoredSettingsInternal {
   }
 
   const theme = normalizeExtensionThemeMode(obj.theme);
+  const useSaveFilePicker = obj.useSaveFilePicker === true;
 
   return {
     apiBaseUrl,
@@ -228,6 +231,7 @@ function normalizeStoredSettings(raw: unknown): StoredSettingsInternal {
     qualityPreference,
     autoFollowTab,
     theme,
+    useSaveFilePicker,
     autoFollowExplicitlySet,
   };
 }
@@ -241,6 +245,7 @@ function toPublicSettings(internal: StoredSettingsInternal): ExtensionSettings {
     qualityPreference: internal.qualityPreference,
     autoFollowTab: internal.autoFollowTab,
     theme: internal.theme,
+    useSaveFilePicker: internal.useSaveFilePicker,
   };
 }
 
@@ -465,6 +470,11 @@ export function createExtensionStorage(
               ? normalizeExtensionThemeMode(patch.theme)
               : current.theme;
 
+          const nextUseSaveFilePicker =
+            typeof patch.useSaveFilePicker === "boolean"
+              ? patch.useSaveFilePicker
+              : current.useSaveFilePicker;
+
           const updated: StoredSettingsInternal = {
             apiBaseUrl: nextApiBaseUrl,
             bearerToken: nextToken,
@@ -473,6 +483,7 @@ export function createExtensionStorage(
             qualityPreference: nextQuality,
             autoFollowTab: nextAutoFollow,
             theme: nextTheme,
+            useSaveFilePicker: nextUseSaveFilePicker,
             autoFollowExplicitlySet: nextExplicit,
           };
 

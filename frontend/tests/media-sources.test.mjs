@@ -479,6 +479,21 @@ test('Weibo internal quality keys map to readable labels and Instagram width-onl
   assert.equal(labels.variantLabel({ ...variant('wb-2k'), label: 'mp4_2k_mp4' }, 'zh-CN'), '2K');
   assert.equal(labels.variantLabel({ ...variant('wb-4k'), label: 'mp4_4k_mp4' }, 'zh-CN'), '4K');
 
+  // [P2-5g] Weibo mp4_hd_url with actual 854x480 dimensions renders 480p instead of misleading 高清/HD
+  const weibo480Variant = {
+    ...variant('wb-480-hd', ['wb480'], { width: 854, height: 480 }),
+    label: 'mp4_hd_url',
+  };
+  assert.equal(labels.variantLabel(weibo480Variant, 'zh-CN'), '480p');
+  assert.equal(labels.variantLabel(weibo480Variant, 'en'), '480p');
+  assert.equal(
+    labels.variantLabel(
+      { ...variant('wb-480-zh', ['wb480z'], { width: 854, height: 480 }), label: '高清' },
+      'zh-CN',
+    ),
+    '480p',
+  );
+
   const igVariant = variant('image-1080w', ['ig-img'], { width: 1080 });
   assert.equal(labels.variantLabel(igVariant, 'zh-CN'), '1080w');
   assert.equal(labels.variantLabel(igVariant, 'en'), '1080w');
@@ -500,9 +515,9 @@ test('Weibo internal quality keys map to readable labels and Instagram width-onl
 });
 
 test('failed cover, video poster, avatar, and gallery images hide broken visuals without server relay', async () => {
-  const brokenCover = 'https://wx1.sinaimg.cn/large/broken-cover.jpg';
-  const brokenAvatar = 'https://wx3.sinaimg.cn/large/broken-avatar.jpg';
-  const brokenGallery = 'https://wx2.sinaimg.cn/large/broken-gallery.jpg';
+  const brokenCover = 'https://cdn.example.test/large/broken-cover.jpg';
+  const brokenAvatar = 'https://cdn.example.test/large/broken-avatar.jpg';
+  const brokenGallery = 'https://cdn.example.test/large/broken-gallery.jpg';
   const vidItem = {
     ...item([variant('hd', ['v1'])]),
     cover: { url: brokenCover },
@@ -532,6 +547,37 @@ test('failed cover, video poster, avatar, and gallery images hide broken visuals
     await nextTick();
 
     assert.equal(view.player().props.poster, undefined);
+    assert.equal(view.elements('rs-author-avatar').length, 0);
+    assert.equal(view.elements('rs-author-avatar-fb').length, 1);
+    assert.equal(view.elements('rs-gallery-img').length, 0);
+  } finally {
+    view.app.unmount();
+  }
+});
+
+test('[P2-5g] referer-blocked Weibo CDN cover/avatar/gallery images are proactively suppressed on Web to avoid ERR_BLOCKED_BY_ORB without server relay', async () => {
+  const orbCover = 'https://wx1.sinaimg.cn/large/orb-cover.jpg';
+  const orbAvatar = 'https://tvax3.sinaimg.cn/crop.0.0.100.100/orb-avatar.jpg';
+  const orbGallery = 'https://f.video.weibocdn.com/orb-gallery.jpg';
+  const vidItem = {
+    ...item([variant('hd', ['v1'])]),
+    cover: { url: orbCover },
+  };
+  const imgItem = {
+    id: 'img-orb',
+    type: 'image',
+    variants: [{ id: 'v-img', delivery: { kind: 'file', sources: [{ id: 's-img', url: orbGallery }] } }],
+    default: { variant_id: 'v-img', source_id: 's-img', url: orbGallery },
+  };
+  const view = await mount({
+    platform: 'weibo',
+    author: { name: '测试博主', avatar: { url: orbAvatar } },
+    default_item_id: vidItem.id,
+    items: [vidItem, imgItem],
+  });
+  try {
+    assert.equal(view.player().props.poster, undefined, 'sinaimg poster must not be mounted on Web');
+    assert.equal(view.elements('rs-poster-probe').length, 0);
     assert.equal(view.elements('rs-author-avatar').length, 0);
     assert.equal(view.elements('rs-author-avatar-fb').length, 1);
     assert.equal(view.elements('rs-gallery-img').length, 0);

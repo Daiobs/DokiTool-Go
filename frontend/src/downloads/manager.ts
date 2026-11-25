@@ -61,6 +61,13 @@ export function createDownloadManager(implementations: Transports = transports) 
           if (request.url) return await implementations.downloadStreaming(request, signal, publish);
         } catch (error) {
           if (signal.aborted || error instanceof Error && ["AbortError", "StreamingStateUnknownError"].includes(error.name)) throw error;
+          if (error instanceof StreamingUnavailableError && options?.onStreamingUnavailable) {
+            const delegated = await options.onStreamingUnavailable();
+            if (delegated) {
+              return { ...snapshot, status: "handed-off" };
+            }
+            signal.throwIfAborted();
+          }
         }
         const manual: DownloadSnapshot = { ...snapshot, status: "manual", speed: 0, error: undefined };
         publish(manual);

@@ -1,4 +1,10 @@
 import type { DownloadSnapshot, SourceProbe } from "../downloads/types";
+import {
+  isSaveFilePickerSupported,
+  promptSaveFileHandle,
+  readWebSaveFilePickerPreference,
+  streamRoutesToFileHandle,
+} from "../downloads/saveFilePicker";
 import type { DownloadTask, YouTubeHelperState } from "../types/media";
 import {
   availableSources,
@@ -587,6 +593,108 @@ export function useMediaDownload({
       );
       return;
     }
+    const savePickerCtx = sourceContexts.get(downloadId);
+    if (
+      !savePickerCtx?.tbvideo &&
+      !isCorsBlockedDirectCdn(url) &&
+      readWebSaveFilePickerPreference() &&
+      isSaveFilePickerSupported()
+    ) {
+      const promptRes = await promptSaveFileHandle(
+        filename,
+        savePickerCtx?.formatMime,
+      );
+      if (!ownsTask(downloadId, controller)) return;
+      if (promptRes.status === "cancelled") {
+        deliveryTasks.delete(deliveryId);
+        videoStore.updateDownload(downloadId, {
+          status: "cancelled",
+          statusText: "已取消",
+          error: null,
+          speed: 0,
+          abortController: null,
+        });
+        return;
+      }
+      if (promptRes.status === "granted") {
+        const directRoutes = Array.from(
+          new Set([url, ...(savePickerCtx?.routes ?? [])]),
+        ).slice(0, 3);
+        const startedAt = Date.now();
+        videoStore.updateDownload(downloadId, {
+          filename: promptRes.suggestedName,
+          status: "downloading",
+          statusText: "系统另存为直写中...",
+          savePath: "save_picker",
+          savePathLabel: "保存路径：系统另存为流式直写",
+          progressKind: "bytes",
+          percent: 0,
+          loaded: 0,
+          total: savePickerCtx?.sources?.[0]?.size_bytes ?? 0,
+        });
+        try {
+          const result = await streamRoutesToFileHandle({
+            handle: promptRes.handle,
+            routes: directRoutes,
+            signal: controller.signal,
+            onProgress: ({ loaded, total, percent }) => {
+              if (!ownsTask(downloadId, controller)) return;
+              const elapsed = Math.max(0.05, (Date.now() - startedAt) / 1000);
+              videoStore.updateDownload(downloadId, {
+                status: "downloading",
+                statusText: "系统另存为直写中...",
+                loaded,
+                total,
+                transferred: loaded,
+                percent,
+                elapsed,
+                speed: loaded / elapsed,
+                averageSpeed: loaded / elapsed,
+              });
+            },
+          });
+          if (!ownsTask(downloadId, controller)) return;
+          const elapsed = Math.max(0.05, (Date.now() - startedAt) / 1000);
+          deliveryTasks.delete(deliveryId);
+          videoStore.updateDownload(downloadId, {
+            filename: promptRes.suggestedName,
+            status: "completed",
+            statusText: "已通过系统另存为直写保存",
+            percent: 100,
+            loaded: result.loaded,
+            total: result.total,
+            transferred: result.loaded,
+            speed: 0,
+            elapsed,
+            averageSpeed: result.loaded / elapsed,
+            abortController: null,
+          });
+          showToast(`已直写保存：${promptRes.suggestedName}`);
+          return;
+        } catch (err) {
+          if (!ownsTask(downloadId, controller)) return;
+          if (
+            controller.signal.aborted ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            deliveryTasks.delete(deliveryId);
+            videoStore.updateDownload(downloadId, {
+              status: "cancelled",
+              statusText: "已取消",
+              error: null,
+              speed: 0,
+              abortController: null,
+            });
+            return;
+          }
+          // Fall back cleanly to standard SW/Blob download if direct fetch is CORS-blocked.
+          videoStore.updateDownload(downloadId, {
+            savePath: undefined,
+            savePathLabel: undefined,
+          });
+        }
+      }
+    }
     videoStore.updateDownload(downloadId, {
       deliveryId,
       abortController: controller,
@@ -867,7 +975,10 @@ export function useMediaDownload({
       savePathLabel,
       error: null,
       nativeAvailable: false,
-      refreshAvailable: snapshot ? refreshable(snapshot) : false,
+      refreshAvailable: snapshot
+        ? refreshable(snapshot)
+        : Boolean(taskFor(id)?.refreshAvailable),
+      filenameWarning: null,
       loaded: 0,
       total: payload.sizeBytes ?? 0,
       transferred: 0,
@@ -992,6 +1103,7 @@ export function useMediaDownload({
               filename: displayName,
               status: "completed",
               statusText: "已通过扩展保存",
+              ...(st.filenameWarning ? { filenameWarning: st.filenameWarning } : {}),
               percent: 100,
               loaded: st.loadedBytes || st.totalBytes,
               total: st.totalBytes || st.loadedBytes,
@@ -1200,10 +1312,16 @@ export function useMediaDownload({
       selectionBusyNotice();
       return Promise.resolve(false);
     }
+    const placeholderExt =
+      snapshot.item.type === "image"
+        ? "jpg"
+        : snapshot.item.type === "audio"
+          ? "m4a"
+          : "mp4";
     const id =
       retryId ??
       videoStore.addDownload({
-        filename: filenameFor(snapshot, "bin"),
+        filename: filenameFor(snapshot, placeholderExt),
         statusText: "准备下载...",
       });
     if (selected) fileTaskSelections.set(id, selected);

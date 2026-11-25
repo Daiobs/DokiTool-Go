@@ -28,6 +28,12 @@ const SLOW_PROGRESSIVE_DIRECT_HOST_SUFFIXES = [
   ".bilivideo.cn",
 ] as const;
 
+const REFERER_BLOCKED_WEB_IMAGE_HOST_SUFFIXES = [
+  ".sinaimg.cn",
+  ".weibocdn.com",
+] as const;
+const REFERER_BLOCKED_WEB_IMAGE_EXACT_HOSTS = new Set(["sinaimg.cn"]);
+
 const AKAMAI_HOST_SUFFIXES = [".akamaized.net"] as const;
 
 const TBVIDEO_FALLBACK_EXACT_HOSTS = new Set([
@@ -266,6 +272,26 @@ export function prefersExtensionDirectAcceleration(
     return (
       matchesHostSuffix(host, SLOW_PROGRESSIVE_DIRECT_HOST_SUFFIXES) ||
       isBilibiliAkamaiMediaUrl(host, parsed.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Identifies cross-origin image CDNs that reject anonymous/no-referrer web
+ * `<img>` and `<video poster>` requests with HTTP 403 HTML (triggering Chrome
+ * `ERR_BLOCKED_BY_ORB`), so Web SPA hides broken posters cleanly without
+ * introducing a server-side image proxy.
+ */
+export function isRefererBlockedWebImageUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = normalizeHost(parsed);
+    return matchesHostSuffix(
+      host,
+      REFERER_BLOCKED_WEB_IMAGE_HOST_SUFFIXES,
+      REFERER_BLOCKED_WEB_IMAGE_EXACT_HOSTS,
     );
   } catch {
     return false;

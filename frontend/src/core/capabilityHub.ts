@@ -12,7 +12,7 @@ import extensionReleaseMeta from "./extensionReleaseMeta.json";
  */
 
 export const LATEST_EXTENSION_VERSION: string = String(
-  extensionReleaseMeta.version || "4.2.0",
+  extensionReleaseMeta.version || "4.3.0",
 );
 
 export type KnownExtensionCapability =
