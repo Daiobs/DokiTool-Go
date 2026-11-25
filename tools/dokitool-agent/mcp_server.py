@@ -117,6 +117,24 @@ def _tool_error(message: str, *, code: str = "ERROR") -> dict[str, Any]:
     }
 
 
+def _opt_str(arguments: dict[str, Any], key: str) -> str | None:
+    val = arguments.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise ValueError(f"Argument '{key}' must be a string")
+    return val
+
+
+def _opt_bool(arguments: dict[str, Any], key: str, default: bool = False) -> bool:
+    val = arguments.get(key)
+    if val is None:
+        return default
+    if not isinstance(val, bool):
+        raise ValueError(f"Argument '{key}' must be a boolean")
+    return val
+
+
 class DokiToolMCPServer:
     """Stdio MCP server exposing read-only DokiTool tools by default, with explicit opt-in write."""
 
@@ -155,17 +173,16 @@ class DokiToolMCPServer:
             return _tool_ok(summarize_platforms(self.client.list_platforms()))
 
         if name == "dokitool_parse_media":
-            raw_url = arguments.get("url")
-            if not isinstance(raw_url, str) or not raw_url.strip():
+            raw_url = _opt_str(arguments, "url")
+            if not raw_url or not raw_url.strip():
                 return _tool_error("Missing required string argument: url", code="INVALID_INPUT")
-            url = raw_url.strip()
             env = self.client.parse(
-                url,
-                platform=arguments.get("platform") if isinstance(arguments.get("platform"), str) else None,
-                debug=bool(arguments.get("debug", False)),
+                raw_url.strip(),
+                platform=_opt_str(arguments, "platform"),
+                debug=_opt_bool(arguments, "debug", False),
             )
-            resolve_item_id = arguments.get("resolve_item_id")
-            if isinstance(resolve_item_id, str) and resolve_item_id.strip():
+            resolve_item_id = _opt_str(arguments, "resolve_item_id")
+            if resolve_item_id and resolve_item_id.strip():
                 items = env.get("data", {}).get("items") or []
                 target = next((it for it in items if isinstance(it, dict) and it.get("id") == resolve_item_id), None)
                 if target and target.get("state") == "deferred" and target.get("resolve_url"):
@@ -173,32 +190,27 @@ class DokiToolMCPServer:
             return _tool_ok(summarize_parse_result(env))
 
         if name == "dokitool_extract_subtitles":
-            raw_url = arguments.get("url")
-            if not isinstance(raw_url, str) or not raw_url.strip():
+            raw_url = _opt_str(arguments, "url")
+            if not raw_url or not raw_url.strip():
                 return _tool_error("Missing required string argument: url", code="INVALID_INPUT")
-            url = raw_url.strip()
-            env = self.client.parse(
-                url,
-                platform=arguments.get("platform") if isinstance(arguments.get("platform"), str) else None,
-            )
+            env = self.client.parse(raw_url.strip(), platform=_opt_str(arguments, "platform"))
             res = extract_subtitles_from_data(
                 env["data"],
                 self.fetcher,
-                lang=arguments.get("lang") if isinstance(arguments.get("lang"), str) else None,
-                track_kind=str(arguments.get("track_kind") or "all"),
-                output_format=str(arguments.get("format") or "text"),
-                select_all=bool(arguments.get("all_tracks", False)),
-                list_only=bool(arguments.get("list_only", False)),
+                lang=_opt_str(arguments, "lang"),
+                track_kind=_opt_str(arguments, "track_kind") or "all",
+                output_format=_opt_str(arguments, "format") or "text",
+                select_all=_opt_bool(arguments, "all_tracks", False),
+                list_only=_opt_bool(arguments, "list_only", False),
                 max_bytes=MAX_SUBTITLE_BYTES,
             )
             return _tool_ok(res)
 
         if name == "dokitool_download_media":
-            raw_url = arguments.get("url")
-            if not isinstance(raw_url, str) or not raw_url.strip():
+            raw_url = _opt_str(arguments, "url")
+            if not raw_url or not raw_url.strip():
                 return _tool_error("Missing required string argument: url", code="INVALID_INPUT")
-            url = raw_url.strip()
-            want_ffmpeg = bool(arguments.get("mux_with_ffmpeg", False))
+            want_ffmpeg = _opt_bool(arguments, "mux_with_ffmpeg", False)
             if want_ffmpeg and not self.allow_ffmpeg:
                 return _tool_error(
                     "ffmpeg muxing is disabled; restart MCP server with --allow-ffmpeg",
@@ -207,18 +219,18 @@ class DokiToolMCPServer:
             assert self.output_dir is not None
             res = download_media(
                 self.client,
-                url,
+                raw_url.strip(),
                 self.output_dir,
                 allow_write=self.allow_write,
-                allow_ffmpeg=self.allow_ffmpeg,
-                platform=arguments.get("platform"),
-                item_id=arguments.get("item_id"),
-                variant_id=arguments.get("variant_id"),
-                filename=arguments.get("filename"),
-                include_subtitles=bool(arguments.get("include_subtitles", False)),
-                subtitle_lang=arguments.get("subtitle_lang"),
-                subtitle_kind=str(arguments.get("subtitle_kind") or "all"),
-                subtitle_format=str(arguments.get("subtitle_format") or "vtt"),
+                allow_ffmpeg=(self.allow_ffmpeg and want_ffmpeg),
+                platform=_opt_str(arguments, "platform"),
+                item_id=_opt_str(arguments, "item_id"),
+                variant_id=_opt_str(arguments, "variant_id"),
+                filename=_opt_str(arguments, "filename"),
+                include_subtitles=_opt_bool(arguments, "include_subtitles", False),
+                subtitle_lang=_opt_str(arguments, "subtitle_lang"),
+                subtitle_kind=_opt_str(arguments, "subtitle_kind") or "all",
+                subtitle_format=_opt_str(arguments, "subtitle_format") or "vtt",
                 subprocess_runner=self._subprocess_runner,
             )
             return _tool_ok(res)
@@ -280,7 +292,9 @@ class DokiToolMCPServer:
                 result = _tool_error(str(exc), code="SECURITY_ERROR")
             except DokiToolAPIError as exc:
                 result = _tool_error(str(exc), code=exc.code)
-            except (DownloadError, ValueError, RuntimeError) as exc:
+            except ValueError as exc:
+                result = _tool_error(str(exc), code="INVALID_INPUT")
+            except (DownloadError, OSError, RuntimeError) as exc:
                 result = _tool_error(str(exc), code="TOOL_ERROR")
             return _jsonrpc_result(req_id, result)
 

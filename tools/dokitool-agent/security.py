@@ -28,17 +28,18 @@ BLOCKED_HOST_SUFFIXES = (
 )
 _FORBIDDEN_IPV4_NETS = tuple(ipaddress.ip_network(c) for c in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
     "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
 ))
 _FORBIDDEN_IPV6_NETS = tuple(ipaddress.ip_network(c) for c in (
     "::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
-    "2001::/32", "2001:2::/48", "2001:db8::/32", "2002::/16", "fc00::/7", "fe80::/10", "ff00::/8",
+    "2001::/32", "2001:2::/48", "2001:db8::/32", "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 ))
 _WINDOWS_RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10)),
 })
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
+_URL_USERINFO_RE = re.compile(r"(https?://)[^\s/@#\"'<>]+@")
 _URL_QUERY_RE = re.compile(r"(https?://[^\s?#\"'<>]+)\?[^\s#\"'<>]+")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PUBLIC_TLD_RE = re.compile(r"^(?:[a-z]{2,}|xn--[a-z0-9-]{2,})$")
@@ -56,10 +57,8 @@ class HTTPStatusError(RuntimeError):
     """Raised on HTTP >= 400 with bounded response body and sanitized message."""
 
     def __init__(self, status: int, url: str, headers: Mapping[str, str], body: bytes) -> None:
-        self.status = status
-        self.url = url
+        self.status, self.url, self.body = status, url, body
         self.headers = {k.lower(): v for k, v in headers.items()}
-        self.body = body
         super().__init__(f"HTTP {status} for {redact_sensitive(url)}")
 
 
@@ -72,13 +71,12 @@ class FetchResponse:
 
 
 def redact_sensitive(text: str, extra_secrets: Sequence[str] = ()) -> str:
-    """Strip Bearer headers, env tokens, and URL query strings from logs and errors."""
+    """Strip Bearer headers, env tokens, URL userinfo, and URL query strings from logs/errors."""
     out = _BEARER_RE.sub("Bearer [REDACTED]", str(text or ""))
     env_vals = [(os.environ.get(k) or "").strip() for k in ("DOKITOOL_API_TOKEN", "DOKITOOL_OWNER_TOKEN")]
-    secrets = [s for s in (*extra_secrets, *env_vals) if s and len(s) >= 8]
-    for secret in sorted(set(secrets), key=len, reverse=True):
+    for secret in sorted({s for s in (*extra_secrets, *env_vals) if s and len(s) >= 8}, key=len, reverse=True):
         out = out.replace(secret, "[REDACTED_TOKEN]")
-    return _URL_QUERY_RE.sub(r"\1?[REDACTED]", out)
+    return _URL_QUERY_RE.sub(r"\1?[REDACTED]", _URL_USERINFO_RE.sub(r"\1[REDACTED]@", out))
 
 
 def validate_token(raw: str) -> str:
@@ -121,7 +119,8 @@ def is_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Return True strictly for globally routable public unicast IPv4/IPv6 addresses."""
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         return is_public_ip(addr.ipv4_mapped)
-    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified or not addr.is_global:
+    if (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast
+            or addr.is_reserved or addr.is_unspecified or getattr(addr, "is_site_local", False) or not addr.is_global):
         return False
     nets = _FORBIDDEN_IPV4_NETS if isinstance(addr, ipaddress.IPv4Address) else _FORBIDDEN_IPV6_NETS
     return not any(addr in net for net in nets)
@@ -253,8 +252,8 @@ def resolve_jailed_path(output_dir: Path, relative_target: str | Path, *, allow_
     """Canonicalize and strictly jail a relative filename inside output_dir (reject .. and symlinks)."""
     root = validate_output_dir(output_dir, create=False)
     raw = str(relative_target or "")
-    if not raw or "\x00" in raw or "\\" in raw or raw.startswith(("~", "/")) or re.match(r"^[A-Za-z]:", raw):
-        raise SecurityError("Invalid target filename: absolute, empty, drive, or backslash path rejected")
+    if not raw or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw) or "\\" in raw or raw.startswith(("~", "/")) or re.match(r"^[A-Za-z]:", raw):
+        raise SecurityError("Invalid target filename: control char, absolute, empty, drive, or backslash path rejected")
     rel = Path(raw)
     if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
         raise SecurityError("Path traversal segments are forbidden")
@@ -278,14 +277,13 @@ def resolve_jailed_path(output_dir: Path, relative_target: str | Path, *, allow_
 def _build_safe_opener(*, bypass_proxy: bool) -> urllib.request.OpenerDirector:
     """Build OpenerDirector with NO cookies, NO auto-redirects, NO file/ftp handlers."""
     opener = urllib.request.OpenerDirector()
-    for handler in (
+    handlers = (
         urllib.request.ProxyHandler({}) if bypass_proxy else urllib.request.ProxyHandler(),
-        urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        urllib.request.HTTPDefaultErrorHandler(),
-        urllib.request.HTTPErrorProcessor(),
-    ):
-        opener.add_handler(handler)
+        urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor(),
+    )
+    for h in handlers:
+        opener.add_handler(h)
     return opener
 
 
@@ -335,8 +333,9 @@ class SafeHTTPFetcher:
                 current, allow_loopback=(allow_loopback if hops == 0 else False),
                 resolve_dns=True, resolver=self._resolver,
             )
+            stripped = ("cookie", "authorization", "proxy-authorization") if hops > 0 else ("cookie",)
             req_headers = build_media_headers(current, extra_headers=headers) if media_mode else {
-                k: v for k, v in (headers or {}).items() if k.lower().strip() != "cookie"
+                k: v for k, v in (headers or {}).items() if k.lower().strip() not in stripped
             }
             opener = self._opener_factory(is_loopback_host(parsed.hostname or ""))
             try:

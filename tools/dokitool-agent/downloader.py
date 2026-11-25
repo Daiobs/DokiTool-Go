@@ -31,7 +31,7 @@ _MIME_EXTS = {
     "audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/aac": "aac", "audio/webm": "webm", "audio/ogg": "ogg",
     "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
 }
-_SAFE_MUX_CONTAINERS = frozenset({"mp4", "mkv", "webm", "mov"})
+_SAFE_MUX_FORMATS = {"mp4": "mp4", "mkv": "matroska", "matroska": "matroska", "webm": "webm", "mov": "mov"}
 _EXT_RE = re.compile(r"^[a-z0-9]{2,5}$")
 
 
@@ -175,18 +175,19 @@ def _mux_with_ffmpeg(
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         raise DownloadError("ffmpeg binary was not found on PATH")
-    safe_container = container if container in _SAFE_MUX_CONTAINERS else "mp4"
+    mux_fmt = _SAFE_MUX_FORMATS.get((container or "").strip().lower(), "mp4")
     v_safe = resolve_jailed_path(output_dir, video_path.name, allow_subdirs=False)
     a_safe = resolve_jailed_path(output_dir, audio_path.name, allow_subdirs=False)
     f_safe = resolve_jailed_path(output_dir, final_path.name, allow_subdirs=False)
     tmp_out = resolve_jailed_path(output_dir, f".mux.{os.getpid()}.{f_safe.name}", allow_subdirs=False)
-    for p in (v_safe, a_safe, tmp_out):
-        if str(p).startswith("-") or ":" in p.name:
+    for p in (v_safe, a_safe, f_safe, tmp_out):
+        if str(p).startswith("-") or p.name.startswith("-") or ":" in p.name:
             raise SecurityError("Unsafe path rejected before ffmpeg invocation")
     cmd = [
         ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-protocol_whitelist", "file", "-i", str(v_safe), "-i", str(a_safe),
-        "-c", "copy", "-f", safe_container, str(tmp_out),
+        "-protocol_whitelist", "file", "-i", str(v_safe),
+        "-protocol_whitelist", "file", "-i", str(a_safe),
+        "-c", "copy", "-f", mux_fmt, str(tmp_out),
     ]
     try:
         proc = subprocess_runner(cmd, shell=False, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
@@ -209,13 +210,20 @@ def write_subtitle_files(
         raise SecurityError("Local file write is disabled; pass --allow-write --output-dir <dir>")
     root = validate_output_dir(output_dir, create=True)
     saved: list[dict[str, Any]] = []
+    used_names: set[str] = set()
     safe_prefix = sanitize_filename_stem(stem_prefix, 48)
     for idx, track in enumerate(extracted_tracks, start=1):
         lang = sanitize_filename_stem(str(track.get("language") or f"track{idx}"), 20)
         kind = sanitize_filename_stem(str(track.get("track_kind") or "sub"), 12)
         out_fmt = str(track.get("output_format") or "txt").lower()
         raw_ext = "txt" if out_fmt == "text" else (track.get("source_format") or "vtt" if out_fmt == "raw" else out_fmt)
-        filename = f"{safe_prefix}.{lang}.{kind}.{sanitize_filename_stem(str(raw_ext), 8)}"
+        ext = sanitize_filename_stem(str(raw_ext), 8)
+        filename = f"{safe_prefix}.{lang}.{kind}.{ext}"
+        dup_n = 2
+        while filename in used_names:
+            filename = f"{safe_prefix}.{lang}.{kind}.{dup_n}.{ext}"
+            dup_n += 1
+        used_names.add(filename)
         target = resolve_jailed_path(root, filename, allow_subdirs=False)
         tmp = resolve_jailed_path(root, f".{filename}.{os.getpid()}.part", allow_subdirs=False)
         content_bytes = str(track.get("content") or "").encode("utf-8")

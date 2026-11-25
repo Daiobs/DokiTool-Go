@@ -274,6 +274,14 @@ class MCPServerTests(unittest.TestCase):
                 fetcher=self.local_fetcher,
                 subprocess_runner=_fake_ffmpeg,
             )
+            # Even when server started with --allow-ffmpeg, per-call mux_with_ffmpeg=False/omitted MUST refuse mux!
+            mux_per_call_blocked = ff_srv.handle_request({
+                "jsonrpc": "2.0", "id": 125, "method": "tools/call",
+                "params": {"name": "dokitool_download_media", "arguments": {"url": "https://example.com/v/mux", "filename": "no_mux.mp4"}},
+            })
+            self.assertTrue(mux_per_call_blocked["result"]["isError"])
+            self.assertFalse((out_dir / "no_mux.mp4").exists())
+
             with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
                 mux_ok = ff_srv.handle_request({
                     "jsonrpc": "2.0", "id": 13, "method": "tools/call",
@@ -281,6 +289,29 @@ class MCPServerTests(unittest.TestCase):
                 })
             self.assertFalse(mux_ok["result"]["isError"])
             self.assertEqual((out_dir / "m.mp4").read_bytes(), b"MUXED")
+
+            # Non-string optional args return clean INVALID_INPUT tool error without crashing MCP
+            for bad_args in (
+                {"url": "https://example.com/v/1", "platform": 123},
+                {"url": "https://example.com/v/1", "filename": 123},
+                {"url": "https://example.com/v/1", "subtitle_lang": 42},
+            ):
+                bad_type_resp = rw_srv.handle_request({
+                    "jsonrpc": "2.0", "id": 135, "method": "tools/call",
+                    "params": {"name": "dokitool_download_media", "arguments": bad_args},
+                })
+                self.assertTrue(bad_type_resp["result"]["isError"])
+                self.assertEqual(bad_type_resp["result"]["structuredContent"]["error"]["code"], "INVALID_INPUT")
+
+            # OSError inside tool execution returns redacted TOOL_ERROR without crashing
+            with mock.patch("mcp_server.download_media", side_effect=PermissionError("denied https://cdn.test/v?sig=OS_SECRET")):
+                os_err_resp = rw_srv.handle_request({
+                    "jsonrpc": "2.0", "id": 136, "method": "tools/call",
+                    "params": {"name": "dokitool_download_media", "arguments": {"url": "https://example.com/v/1"}},
+                })
+            self.assertTrue(os_err_resp["result"]["isError"])
+            self.assertEqual(os_err_resp["result"]["structuredContent"]["error"]["code"], "TOOL_ERROR")
+            self.assertNotIn("OS_SECRET", json.dumps(os_err_resp))
 
             # Error redaction: signed query params & env token never leaked
             secret = "MCPSecretToken1234567890ABCDEFGHIJKLM"

@@ -34,6 +34,7 @@ def _make_private_resolver(ip_str: str):
 class _CookieAndRedirectHandler(BaseHTTPRequestHandler):
     recorded_cookies: list[str | None] = []
     recorded_referers: list[str | None] = []
+    recorded_auths: list[str | None] = []
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         return
@@ -41,6 +42,7 @@ class _CookieAndRedirectHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         self.__class__.recorded_cookies.append(self.headers.get("Cookie"))
         self.__class__.recorded_referers.append(self.headers.get("Referer"))
+        self.__class__.recorded_auths.append(self.headers.get("Authorization"))
         if self.path == "/set-cookie-redirect":
             self.send_response(302)
             self.send_header("Set-Cookie", "sid=secret-cookie-value; Path=/; HttpOnly")
@@ -131,9 +133,11 @@ class SecurityTests(unittest.TestCase):
             "https://192.168.1.5/sub.vtt",
             "http://169.254.169.254/latest/meta-data/",
             "http://[fe80::1]/sub.vtt",
+            "http://[fec0::1]/sub.vtt",
             "http://[fc00::1]/sub.vtt",
             "http://[fd12:3456::1]/sub.vtt",
             "http://100.64.0.1/sub.vtt",
+            "http://192.88.99.1/sub.vtt",
             "http://0.0.0.0/sub.vtt",
             "http://[::]/sub.vtt",
             "https://localhost/sub.vtt",
@@ -153,7 +157,7 @@ class SecurityTests(unittest.TestCase):
                     security.validate_remote_url(url, allow_loopback=False, resolver=_fake_public_resolver)
 
     def test_ssrf_rejects_dns_resolved_non_public_ips(self) -> None:
-        for ip_str in ("127.0.0.1", "10.0.0.5", "169.254.169.254", "100.64.1.2", "::1", "fc00::1", "fe80::1"):
+        for ip_str in ("127.0.0.1", "10.0.0.5", "169.254.169.254", "100.64.1.2", "192.88.99.1", "::1", "fc00::1", "fe80::1", "fec0::1"):
             with self.subTest(resolved_ip=ip_str):
                 with self.assertRaises(security.SecurityError):
                     security.validate_remote_url(
@@ -233,6 +237,15 @@ class SecurityTests(unittest.TestCase):
             self.assertTrue(len(_CookieAndRedirectHandler.recorded_cookies) >= 3)
             self.assertTrue(all(c is None for c in _CookieAndRedirectHandler.recorded_cookies))
 
+            # 3b) Defense-in-depth: Authorization stripped on redirect hops even if media_mode=False.
+            _CookieAndRedirectHandler.recorded_auths = []
+            local_fetcher.fetch_bytes(
+                f"{base}/set-cookie-redirect", max_bytes=4096,
+                headers={"Authorization": "Bearer TestHeaderToken"},
+                allow_redirects=True, media_mode=False,
+            )
+            self.assertEqual(_CookieAndRedirectHandler.recorded_auths, ["Bearer TestHeaderToken", None])
+
             # 4) Size cap enforcement (Content-Length and streaming body).
             with self.assertRaises(security.SizeLimitExceededError):
                 local_fetcher.fetch_bytes(f"{base}/oversize-cl", max_bytes=security.MAX_SUBTITLE_BYTES)
@@ -254,7 +267,7 @@ class SecurityTests(unittest.TestCase):
             good = security.resolve_jailed_path(out_dir, "video_1.mp4")
             self.assertEqual(good, out_dir / "video_1.mp4")
 
-            for bad_name in ("../outside.txt", "/etc/passwd", "sub/file.mp4", "..", ".", "a\\b.mp4", ""):
+            for bad_name in ("../outside.txt", "/etc/passwd", "sub/file.mp4", "..", ".", "a\\b.mp4", "", "bad\nname.mp4", "bad\rname.mp4", "bad\x7f.mp4"):
                 with self.subTest(bad_name=bad_name):
                     with self.assertRaises(security.SecurityError):
                         security.resolve_jailed_path(out_dir, bad_name)
@@ -282,12 +295,13 @@ class SecurityTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"DOKITOOL_API_TOKEN": secret}, clear=False):
             raw = (
                 f"Failed Authorization: Bearer {secret} fetching "
-                "https://cdn.example.com/video.mp4?sig=deadbeef&expires=1700000000&ip=1.2.3.4"
+                "https://user:supersecret@cdn.example.com/video.mp4?sig=deadbeef&expires=1700000000"
             )
             cleaned = security.redact_sensitive(raw)
         self.assertNotIn(secret, cleaned)
         self.assertNotIn("deadbeef", cleaned)
-        self.assertIn("https://cdn.example.com/video.mp4?[REDACTED]", cleaned)
+        self.assertNotIn("supersecret", cleaned)
+        self.assertIn("https://[REDACTED]@cdn.example.com/video.mp4?[REDACTED]", cleaned)
         self.assertIn("Bearer [REDACTED]", cleaned)
 
 

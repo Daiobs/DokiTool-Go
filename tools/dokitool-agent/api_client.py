@@ -25,7 +25,7 @@ from security import (
 )
 
 SCHEMA_VERSION = "1.0"
-_VALID_API_PATH_PREFIXES = ("/api/platforms", "/api/parse", "/api/resolve")
+_VALID_API_PATHS = frozenset({"/api/platforms", "/api/parse", "/api/resolve"})
 
 
 class DokiToolAPIError(RuntimeError):
@@ -53,17 +53,30 @@ class DokiToolAuthError(DokiToolAPIError):
     """Raised immediately on HTTP 401 so callers stop without exhausting IP burst limits."""
 
 
-def _validate_api_relative_path(path_and_query: str, *, required_prefix: str | None = None) -> str:
+def _validate_api_relative_path(
+    path_and_query: str,
+    *,
+    required_path: str | None = None,
+    require_query: bool = False,
+) -> str:
     cleaned = (path_and_query or "").strip()
     if not cleaned or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in ("\\", "#") for ch in cleaned):
         raise SecurityError("Invalid API relative path")
-    if "://" in cleaned or cleaned.startswith("//") or "/../" in cleaned or cleaned.endswith("/.."):
+    if cleaned.startswith("//"):
         raise SecurityError("API path must be a clean same-origin relative /api/ path")
-    if required_prefix is not None:
-        if not cleaned.startswith(required_prefix):
-            raise SecurityError(f"Expected API path starting with {required_prefix}")
-    elif not cleaned.startswith(_VALID_API_PATH_PREFIXES):
-        raise SecurityError("Unsupported API path")
+    parsed = urllib.parse.urlsplit(cleaned)
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        raise SecurityError("API path must not contain scheme, host, or fragment")
+    decoded_path = urllib.parse.unquote(parsed.path)
+    if ".." in parsed.path.split("/") or ".." in decoded_path.split("/") or "//" in parsed.path:
+        raise SecurityError("Path traversal segments are forbidden in API path")
+    if required_path is not None:
+        if parsed.path != required_path:
+            raise SecurityError(f"Expected exact API path {required_path}")
+    elif parsed.path not in _VALID_API_PATHS:
+        raise SecurityError(f"Unsupported API path: {parsed.path}")
+    if require_query and not parsed.query:
+        raise SecurityError(f"API path {parsed.path} requires query parameters")
     return cleaned
 
 
@@ -237,7 +250,7 @@ class DokiToolClient:
         return self.api_get(f"/api/parse?{qs}")
 
     def resolve(self, resolve_url: str) -> dict[str, Any]:
-        rel = _validate_api_relative_path(resolve_url, required_prefix="/api/resolve?")
+        rel = _validate_api_relative_path(resolve_url, required_path="/api/resolve", require_query=True)
         return self.api_get(rel)
 
     def refresh(
@@ -248,11 +261,12 @@ class DokiToolClient:
         item_resolve_url: str | None = None,
     ) -> dict[str, Any]:
         """Refresh expired URLs via resolve_url -> data.refresh_url -> re-parse fallback."""
-        if isinstance(item_resolve_url, str) and item_resolve_url.strip().startswith("/api/resolve?"):
+        if isinstance(item_resolve_url, str) and item_resolve_url.strip():
             return self.resolve(item_resolve_url)
         refresh_url = data.get("refresh_url")
-        if isinstance(refresh_url, str) and refresh_url.strip().startswith("/api/parse?"):
-            return self.api_get(refresh_url)
+        if isinstance(refresh_url, str) and refresh_url.strip():
+            rel = _validate_api_relative_path(refresh_url, required_path="/api/parse", require_query=True)
+            return self.api_get(rel)
         target_url = fallback_url or (data.get("source_url") if isinstance(data.get("source_url"), str) else None)
         if target_url:
             return self.parse(target_url)

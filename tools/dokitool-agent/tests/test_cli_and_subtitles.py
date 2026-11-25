@@ -265,6 +265,33 @@ class CLIAndSubtitlesTests(unittest.TestCase):
         with self.assertRaises(security.SecurityError):
             subtitles.parse_cues("<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><tt/>", "ttml")
 
+        # Malformed / NaN / Inf XML timing attributes are safely ignored without crashing
+        bad_xml = '<timedtext><body><p t="NaN" d="Inf">bad1</p><p t="abc" d="100">bad2</p><p t="1000" d="500">good</p></body></timedtext>'
+        self.assertEqual(subtitles.render_subtitles(bad_xml, "srv3", "text"), ("good\n", 1))
+        bad_legacy = '<transcript><text start="inf" dur="1">skip</text><text start="2.0" dur="bad">ok</text></transcript>'
+        self.assertEqual(subtitles.render_subtitles(bad_legacy, "xml", "text"), ("ok\n", 1))
+
+    def test_api_relative_path_validation_and_cli_oserror_handling(self) -> None:
+        self.assertEqual(
+            api_client._validate_api_relative_path("/api/parse?schema_version=1.0&url=https://example.com/v"),
+            "/api/parse?schema_version=1.0&url=https://example.com/v",
+        )
+        for bad in (
+            "/api/parse-evil?x=1", "/api/parse/extra?x=1", "/api/parse/%2e%2e/monitor",
+            "//evil.example.com/api/parse?x=1", "https://evil.example.com/api/parse?x=1", "/api/stats",
+        ):
+            with self.assertRaises(security.SecurityError, msg=bad):
+                api_client._validate_api_relative_path(bad)
+        with self.assertRaises(security.SecurityError):
+            api_client._validate_api_relative_path("/api/resolve", required_path="/api/resolve", require_query=True)
+
+        err = io.StringIO()
+        with mock.patch.object(api_client.DokiToolClient, "list_platforms", side_effect=PermissionError("denied https://x.test/a?sig=SECRET")):
+            with mock.patch("sys.stderr", err):
+                rc = cli.main(["platforms", "--api-base", self.state.base_url])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("SECRET", err.getvalue())
+
     def test_opt_in_download_refresh_retry_and_ffmpeg_gate(self) -> None:
         client = api_client.DokiToolClient(self.state.base_url, fetcher=self.local_fetcher)
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,9 +327,41 @@ class CLIAndSubtitlesTests(unittest.TestCase):
                     allow_ffmpeg=True, filename="muxed_out.mp4", subprocess_runner=_fake_ffmpeg,
                 )
             self.assertEqual(len(captured_cmds), 1)
-            self.assertFalse(captured_cmds[0][1])
+            cmd, used_shell = captured_cmds[0]
+            self.assertFalse(used_shell)
+            # -protocol_whitelist file must precede BOTH -i inputs
+            self.assertEqual(cmd.count("-protocol_whitelist"), 2)
             self.assertEqual(mux_res["files"][0]["file"], "muxed_out.mp4")
             self.assertEqual((out_dir / "muxed_out.mp4").read_bytes(), b"MUXED_MP4_DATA")
+
+            # mkv container maps to ffmpeg muxer name 'matroska', and leading '-' filename is rejected
+            v_tmp, a_tmp = out_dir / "v_in.mp4", out_dir / "a_in.m4a"
+            v_tmp.write_bytes(b"V")
+            a_tmp.write_bytes(b"A")
+            mkv_cmds: list[list[str]] = []
+
+            def _fake_mkv(c, **kw):
+                mkv_cmds.append(list(c))
+                Path(c[-1]).write_bytes(b"MKV")
+                return subprocess.CompletedProcess(c, 0, b"", b"")
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                downloader._mux_with_ffmpeg(v_tmp, a_tmp, out_dir / "out.mkv", out_dir, "mkv", _fake_mkv)
+                with self.assertRaises(security.SecurityError):
+                    downloader._mux_with_ffmpeg(v_tmp, a_tmp, out_dir / "-evil.mp4", out_dir, "mp4", _fake_mkv)
+            self.assertEqual(mkv_cmds[0][mkv_cmds[0].index("-f") + 1], "matroska")
+
+            # Duplicate subtitle filenames are disambiguated rather than overwritten
+            dup_saved = downloader.write_subtitle_files(
+                [
+                    {"language": "en", "track_kind": "manual", "output_format": "vtt", "content": "one"},
+                    {"language": "en", "track_kind": "manual", "output_format": "vtt", "content": "two"},
+                ],
+                out_dir, allow_write=True, stem_prefix="dup",
+            )
+            self.assertEqual(len({f["file"] for f in dup_saved}), 2)
+            self.assertEqual((out_dir / dup_saved[0]["file"]).read_text(encoding="utf-8"), "one")
+            self.assertEqual((out_dir / dup_saved[1]["file"]).read_text(encoding="utf-8"), "two")
 
 
 if __name__ == "__main__":

@@ -269,7 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SecurityError as exc:
         sys.stderr.write(f"security error: {redact_sensitive(str(exc))}\n")
         return 2
-    except (DokiToolAPIError, DownloadError, ValueError, RuntimeError) as exc:
+    except (DokiToolAPIError, DownloadError, ValueError, OSError, RuntimeError) as exc:
         sys.stderr.write(f"error: {redact_sensitive(str(exc))}\n")
         return 1
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html
+import math
 import re
 from typing import Any, Sequence
 import urllib.parse
@@ -190,6 +191,16 @@ def _hms_to_ms(hours: str | None, minutes: str, seconds: str, frac: str | None) 
     return ((int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)) * 1000) + int(ms_str)
 
 
+def _safe_ms(raw: str | None, *, scale: float = 1.0) -> int | None:
+    try:
+        val = float((raw or "").strip()) * scale
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if not math.isfinite(val) or val < 0 or val > 86_400_000_000:
+        return None
+    return int(round(val))
+
+
 def _parse_xml_time_ms(raw: str | None) -> int:
     text = (raw or "").strip()
     if not text:
@@ -200,11 +211,10 @@ def _parse_xml_time_ms(raw: str | None) -> int:
     m = _OFFSET_RE.match(text)
     if m:
         mult = {"h": 3600000.0, "m": 60000.0, "s": 1000.0, "ms": 1.0}[m.group(2).lower()]
-        return int(round(float(m.group(1)) * mult))
-    try:
-        return int(round(float(text) * 1000.0))
-    except ValueError:
-        return 0
+        parsed = _safe_ms(m.group(1), scale=mult)
+        return 0 if parsed is None else parsed
+    parsed = _safe_ms(text, scale=1000.0)
+    return 0 if parsed is None else parsed
 
 
 def _clean_cue_text(raw: str) -> str:
@@ -259,8 +269,11 @@ def _parse_xml_subtitles(raw_text: str) -> list[SubtitleCue]:
         tag = elem.tag.rsplit("}", 1)[-1].lower()
         if tag == "p":
             if "t" in elem.attrib:
-                start_ms = int(float(elem.attrib.get("t", "0")))
-                end_ms = start_ms + max(0, int(float(elem.attrib.get("d", "0"))))
+                start_opt = _safe_ms(elem.attrib.get("t"), scale=1.0)
+                if start_opt is None:
+                    continue
+                dur_opt = _safe_ms(elem.attrib.get("d", "0"), scale=1.0) or 0
+                start_ms, end_ms = start_opt, start_opt + dur_opt
             elif "begin" in elem.attrib:
                 start_ms = _parse_xml_time_ms(elem.attrib.get("begin"))
                 end_ms = (
@@ -274,11 +287,13 @@ def _parse_xml_subtitles(raw_text: str) -> list[SubtitleCue]:
             if text:
                 cues.append(SubtitleCue(start_ms=start_ms, end_ms=max(end_ms, start_ms), text=text))
         elif tag == "text" and "start" in elem.attrib:
-            start_ms = int(round(float(elem.attrib.get("start", "0")) * 1000.0))
-            dur_ms = int(round(float(elem.attrib.get("dur", "0")) * 1000.0))
+            start_opt = _safe_ms(elem.attrib.get("start"), scale=1000.0)
+            if start_opt is None:
+                continue
+            dur_ms = _safe_ms(elem.attrib.get("dur", "0"), scale=1000.0) or 0
             text = _clean_cue_text(_extract_xml_element_text(elem))
             if text:
-                cues.append(SubtitleCue(start_ms=start_ms, end_ms=start_ms + max(0, dur_ms), text=text))
+                cues.append(SubtitleCue(start_ms=start_opt, end_ms=start_opt + dur_ms, text=text))
     return cues
 
 
