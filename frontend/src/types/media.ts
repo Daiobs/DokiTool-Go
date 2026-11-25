@@ -173,12 +173,15 @@ export interface MediaGroup {
   total_count?: number;
   complete?: boolean;
 }
+export type SubtitleTrackKind = "manual" | "auto";
 export interface Attachment {
   id: string;
   role: "background_audio" | "subtitle";
   resource: Resource;
   title?: string;
   language?: string;
+  /** Subtitle track provenance; valid only when role === "subtitle". */
+  track_kind?: SubtitleTrackKind;
   author?: Author;
   cover?: Source;
 }

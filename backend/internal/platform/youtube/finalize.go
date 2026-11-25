@@ -26,6 +26,7 @@ type finalizeRequest struct {
 	Thumbnail       json.RawMessage       `json:"thumbnail"`
 	Formats         []finalizeFormatInput `json:"formats"`
 	AdaptiveFormats []finalizeFormatInput `json:"adaptiveFormats"`
+	Captions        json.RawMessage       `json:"captions"`
 }
 
 func parseOptionalJSONString(raw json.RawMessage) (string, bool) {
@@ -247,6 +248,7 @@ type decodedFinalizeRequest struct {
 	thumbnail       string
 	formats         []finalizeFormatInput
 	adaptiveFormats []finalizeFormatInput
+	captions        json.RawMessage
 }
 
 // Finalize implements POST /api/youtube/finalize?schema_version=1.0.
@@ -313,7 +315,8 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		EnableDASHMux:   true,
 		EnableHLS:       false,
 	}
-	return buildFinalizeEnvelope(info, opts, nowTime.Unix(), debug)
+	subtitleAttachments := extractFinalizeSubtitles(decoded.captions, decoded.videoID)
+	return buildFinalizeEnvelope(info, opts, subtitleAttachments, nowTime.Unix(), debug)
 }
 
 func (h *Helper) solveFinalizeChallenges(
@@ -412,6 +415,7 @@ func decodeFinalizeRequest(body []byte) (*decodedFinalizeRequest, unified.Object
 		thumbnail:       resolvedThumbnail,
 		formats:         req.Formats,
 		adaptiveFormats: req.AdaptiveFormats,
+		captions:        req.Captions,
 	}, nil, 0
 }
 
@@ -573,8 +577,33 @@ func applySolvedChallengesToFormats(entries []parsedStreamEntry, nSolved, sigSol
 	return ytFormats, nil, 0
 }
 
-func buildFinalizeEnvelope(info *ytengine.Info, opts ytengine.AdaptOptions, nowUnix int64, debug bool) (unified.Object, int) {
+func buildFinalizeEnvelope(info *ytengine.Info, opts ytengine.AdaptOptions, subtitleAttachments unified.Array, nowUnix int64, debug bool) (unified.Object, int) {
 	payload := ytengine.AdaptInfo(info, opts, nowUnix)
+	if unified.Str(payload["code"]) == "OK" && len(subtitleAttachments) > 0 {
+		if data := unified.Map(payload["data"]); data != nil {
+			existing := unified.Slice(data["attachments"])
+			seen := make(map[string]bool, len(existing)+len(subtitleAttachments))
+			merged := make(unified.Array, 0, len(existing)+len(subtitleAttachments))
+			for _, raw := range existing {
+				id := unified.Str(unified.Map(raw)["id"])
+				if id != "" {
+					seen[id] = true
+				}
+				merged = append(merged, raw)
+			}
+			for _, raw := range subtitleAttachments {
+				id := unified.Str(unified.Map(raw)["id"])
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				merged = append(merged, raw)
+			}
+			if len(merged) > 0 {
+				data["attachments"] = merged
+			}
+		}
+	}
 	if err := unified.ValidateEnvelopeAt(payload, nowUnix); err != nil {
 		return unified.ContractError("INTERNAL_ERROR", "解析接口合同校验失败", false), http.StatusBadGateway
 	}

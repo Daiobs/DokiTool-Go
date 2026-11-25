@@ -1268,3 +1268,82 @@ test('PR-A R2 M1: SidePanel copy direct link preserves signed relay URL for anon
     }
   }
 });
+
+test('Attachment.track_kind preserves valid manual/auto only for subtitle attachments and strips invalid values', () => {
+  const makeSubtitleAtt = (overrides = {}) => ({
+    id: 'sub-en',
+    role: 'subtitle',
+    language: 'en',
+    title: 'English',
+    resource: {
+      id: 'res-sub-en',
+      role: 'subtitle',
+      metadata: {
+        container: 'vtt',
+        extension: 'vtt',
+        mime_type: 'text/vtt',
+        evidence: 'upstream',
+      },
+      delivery: {
+        kind: 'file',
+        sources: [
+          {
+            id: 's-sub-en',
+            url: 'https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt',
+            access: 'direct',
+          },
+        ],
+      },
+    },
+    ...overrides,
+  });
+
+  const makeAudioAtt = (overrides = {}) => ({
+    id: 'bgm-1',
+    role: 'background_audio',
+    title: 'BGM',
+    resource: {
+      id: 'res-bgm-1',
+      role: 'audio',
+      delivery: {
+        kind: 'file',
+        sources: [{ id: 's-bgm-1', url: 'https://media.example.test/bgm.m4a', access: 'direct' }],
+      },
+    },
+    ...overrides,
+  });
+
+  // 1. Valid manual / auto / omitted track_kind on subtitle preserves object identity without mutation.
+  for (const kind of ['manual', 'auto', undefined]) {
+    const sub = kind === undefined ? makeSubtitleAtt() : makeSubtitleAtt({ track_kind: kind });
+    const env = { schema_version: '1.0', code: 'OK', data: data(item(), { attachments: [sub] }) };
+    const snap = JSON.stringify(env);
+    const out = contract.validateMediaEnvelope(env);
+    assert.equal(out, env.data);
+    assert.equal(JSON.stringify(env), snap);
+    assert.equal(out.attachments[0].track_kind, kind);
+    assert.equal(contract.getSubtitleTrackKind(out.attachments[0]), kind);
+  }
+
+  // 2. Invalid track_kind on subtitle is stripped without mutating original input.
+  for (const bad of ['translated', 'asr', '', null, 123]) {
+    const sub = makeSubtitleAtt({ track_kind: bad });
+    const env = { schema_version: '1.0', code: 'OK', data: data(item(), { attachments: [sub] }) };
+    const snap = JSON.stringify(env);
+    const out = contract.validateMediaEnvelope(env);
+    assert.equal(JSON.stringify(env), snap);
+    assert.equal('track_kind' in out.attachments[0], false);
+    assert.equal(contract.getSubtitleTrackKind(sub), undefined);
+  }
+
+  // 3. track_kind on background_audio is stripped even when set to "manual" or "auto".
+  for (const kind of ['manual', 'auto']) {
+    const bgm = makeAudioAtt({ track_kind: kind });
+    const env = { schema_version: '1.0', code: 'OK', data: data(item(), { attachments: [bgm] }) };
+    const snap = JSON.stringify(env);
+    const out = contract.validateMediaEnvelope(env);
+    assert.equal(JSON.stringify(env), snap);
+    assert.equal('track_kind' in out.attachments[0], false);
+    assert.equal(contract.getSubtitleTrackKind(bgm), undefined);
+  }
+});

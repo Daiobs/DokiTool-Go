@@ -642,6 +642,67 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'default does not identify an eligible complete file'):
             contract.validate(ig_coexist_wrong)
 
+    def test_attachment_track_kind_contract(self):
+        def make_subtitle_attachment(track_kind=None):
+            att = {
+                'id': 'sub-en-manual',
+                'role': 'subtitle',
+                'title': 'English',
+                'language': 'en',
+                'resource': {
+                    'id': 'res-sub-en-manual',
+                    'role': 'subtitle',
+                    'metadata': {
+                        'container': 'vtt',
+                        'extension': 'vtt',
+                        'mime_type': 'text/vtt',
+                        'evidence': 'upstream',
+                    },
+                    'delivery': {
+                        'kind': 'file',
+                        'sources': [
+                            {
+                                'id': 's-sub-en',
+                                'url': 'https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt',
+                                'access': 'direct',
+                            }
+                        ],
+                    },
+                },
+            }
+            if track_kind is not None:
+                att['track_kind'] = track_kind
+            return att
+
+        # Positive: subtitle attachment accepts manual, auto, or omitted track_kind.
+        for kind in ('manual', 'auto', None):
+            with self.subTest(valid_track_kind=kind):
+                r = example(2)
+                r['data']['attachments'] = [make_subtitle_attachment(kind)]
+                contract.validate(r)
+
+        # Positive: background_audio without track_kind remains valid.
+        bgm_ok = example(10)
+        contract.validate(bgm_ok)
+
+        # Negative: background_audio MUST NOT carry track_kind.
+        for kind in ('manual', 'auto'):
+            with self.subTest(bgm_track_kind=kind):
+                bgm_bad = example(10)
+                bgm_bad['data']['attachments'][0]['track_kind'] = kind
+                with self.assertRaisesRegex(ValueError, 'track_kind is only allowed on subtitle attachments'):
+                    contract.validate(bgm_bad)
+
+        # Negative: unknown enum / non-string track_kind values on subtitle are rejected.
+        for bad_kind in ('translated', 'asr', '', None, 123, True):
+            with self.subTest(bad_track_kind=bad_kind):
+                r = example(2)
+                att = make_subtitle_attachment()
+                att['track_kind'] = bad_kind
+                r['data']['attachments'] = [att]
+                with self.assertRaises(ValueError):
+                    contract.validate(r)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

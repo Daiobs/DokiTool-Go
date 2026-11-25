@@ -459,6 +459,15 @@ func ValidateEnvelopeAt(payload Object, fallbackNow int64) error {
 			return fmt.Errorf("duplicate attachment")
 		}
 		attachmentIDs[id] = true
+		if rawTrackKind, exists := attachment["track_kind"]; exists {
+			if Str(attachment["role"]) != "subtitle" {
+				return fmt.Errorf("track_kind is only allowed on subtitle attachments")
+			}
+			trackKind, ok := rawTrackKind.(string)
+			if !ok || (trackKind != "manual" && trackKind != "auto") {
+				return fmt.Errorf("invalid attachment track_kind")
+			}
+		}
 		resource := Map(attachment["resource"])
 		if err := ValidateMetadata(Map(resource["metadata"]), Str(resource["role"])); err != nil {
 			return err

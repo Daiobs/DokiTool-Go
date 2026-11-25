@@ -163,6 +163,24 @@ func AdaptInfo(info *Info, opts AdaptOptions, now int64) unified.Object {
 		selectedItemID = unified.Str(unified.Map(items[0])["id"])
 	}
 
+	var primarySubEntry *Info
+	for idx := range entries {
+		if opts.SelectedIndex > 0 && idx+1 == opts.SelectedIndex {
+			primarySubEntry = &entries[idx]
+			break
+		}
+	}
+	if primarySubEntry == nil && len(entries) > 0 {
+		primarySubEntry = &entries[0]
+	}
+	for _, rawSub := range buildSubtitleAttachments(primarySubEntry, info, opts) {
+		subID := unified.Str(unified.Map(rawSub)["id"])
+		if subID != "" && !seenAttachmentIDs[subID] {
+			seenAttachmentIDs[subID] = true
+			attachments = append(attachments, rawSub)
+		}
+	}
+
 	data := unified.Object{
 		"platform":        opts.PlatformID,
 		"content_id":      opts.ContentID,

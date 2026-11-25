@@ -389,7 +389,8 @@ func (h *Helper) Context(ctx context.Context) (unified.Object, int) {
 				"name":    TVHTML5ClientName,
 				"version": TVHTML5ClientVersion,
 			},
-			"expires_at": entry.ExpiresAt.UTC().Format(time.RFC3339),
+			"expires_at":        entry.ExpiresAt.UTC().Format(time.RFC3339),
+			"supports_captions": true,
 		},
 	}, http.StatusOK
 }

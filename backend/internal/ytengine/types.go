@@ -66,6 +66,17 @@ type Thumbnail struct {
 	Height int64  `json:"height"`
 }
 
+// SubtitleTrack models a single subtitle entry in yt-dlp -J subtitles and
+// automatic_captions maps. HTTPHeaders are retained only for safety filtering
+// and must never be emitted to public JSON.
+type SubtitleTrack struct {
+	Ext         string            `json:"ext"`
+	URL         string            `json:"url"`
+	Name        string            `json:"name"`
+	Protocol    string            `json:"protocol"`
+	HTTPHeaders map[string]string `json:"http_headers"`
+}
+
 // Format models the subset of yt-dlp -J format fields needed for quality mapping.
 //
 // Filesize and FilesizeApprox are strictly separated: FilesizeApprox must never
@@ -103,32 +114,34 @@ type Format struct {
 
 // Info models the subset of yt-dlp -J top-level and playlist entry fields.
 type Info struct {
-	ID           string      `json:"id"`
-	DisplayID    string      `json:"display_id"`
-	Type         string      `json:"_type"`
-	Title        string      `json:"title"`
-	Fulltitle    string      `json:"fulltitle"`
-	Description  string      `json:"description"`
-	Uploader     string      `json:"uploader"`
-	UploaderID   string      `json:"uploader_id"`
-	UploaderURL  string      `json:"uploader_url"`
-	Channel      string      `json:"channel"`
-	ChannelID    string      `json:"channel_id"`
-	Width        *int64      `json:"width"`
-	Height       *int64      `json:"height"`
-	IsLive       *bool       `json:"is_live"`
-	Timestamp    *float64    `json:"timestamp"`
-	Duration     *float64    `json:"duration"`
-	ViewCount    *int64      `json:"view_count"`
-	LikeCount    *int64      `json:"like_count"`
-	RepostCount  *int64      `json:"repost_count"`
-	CommentCount *int64      `json:"comment_count"`
-	Tags         []string    `json:"tags"`
-	Thumbnail    string      `json:"thumbnail"`
-	Thumbnails   []Thumbnail `json:"thumbnails"`
-	Formats      []Format    `json:"formats"`
-	Entries      []Info      `json:"entries"`
-	WebpageURL   string      `json:"webpage_url"`
-	Extractor    string      `json:"extractor"`
-	ExtractorKey string      `json:"extractor_key"`
+	ID                string                     `json:"id"`
+	DisplayID         string                     `json:"display_id"`
+	Type              string                     `json:"_type"`
+	Title             string                     `json:"title"`
+	Fulltitle         string                     `json:"fulltitle"`
+	Description       string                     `json:"description"`
+	Uploader          string                     `json:"uploader"`
+	UploaderID        string                     `json:"uploader_id"`
+	UploaderURL       string                     `json:"uploader_url"`
+	Channel           string                     `json:"channel"`
+	ChannelID         string                     `json:"channel_id"`
+	Width             *int64                     `json:"width"`
+	Height            *int64                     `json:"height"`
+	IsLive            *bool                      `json:"is_live"`
+	Timestamp         *float64                   `json:"timestamp"`
+	Duration          *float64                   `json:"duration"`
+	ViewCount         *int64                     `json:"view_count"`
+	LikeCount         *int64                     `json:"like_count"`
+	RepostCount       *int64                     `json:"repost_count"`
+	CommentCount      *int64                     `json:"comment_count"`
+	Tags              []string                   `json:"tags"`
+	Thumbnail         string                     `json:"thumbnail"`
+	Thumbnails        []Thumbnail                `json:"thumbnails"`
+	Formats           []Format                   `json:"formats"`
+	Subtitles         map[string][]SubtitleTrack `json:"subtitles"`
+	AutomaticCaptions map[string][]SubtitleTrack `json:"automatic_captions"`
+	Entries           []Info                     `json:"entries"`
+	WebpageURL        string                     `json:"webpage_url"`
+	Extractor         string                     `json:"extractor"`
+	ExtractorKey      string                     `json:"extractor_key"`
 }

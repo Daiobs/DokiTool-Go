@@ -255,6 +255,9 @@ func TestYouTubeHelperContextAndFinalizeSample46(t *testing.T) {
 	if unified.Str(data["expires_at"]) != "2026-11-09T18:00:00Z" {
 		t.Fatalf("expires_at = %q, want 2026-11-09T18:00:00Z", unified.Str(data["expires_at"]))
 	}
+	if data["supports_captions"] != true {
+		t.Fatalf("supports_captions = %v, want true", data["supports_captions"])
+	}
 
 	// 2. Second Context call within TTL uses cached player without re-fetching.
 	_, status2 := helper.Context(context.Background())

@@ -1,4 +1,5 @@
 import type {
+  Attachment,
   Capability,
   Delivery,
   MediaItem,
@@ -6,6 +7,7 @@ import type {
   ReadyItem,
   Resource,
   Source,
+  SubtitleTrackKind,
   UnifiedMedia,
   Variant,
   ReadyVariant,
@@ -664,6 +666,17 @@ export function resourceSource(
       )
     : undefined;
 }
+function isSubtitleTrackKind(value: unknown): value is SubtitleTrackKind {
+  return value === "manual" || value === "auto";
+}
+export function getSubtitleTrackKind(
+  attachment?: Attachment | null,
+): SubtitleTrackKind | undefined {
+  if (!attachment || attachment.role !== "subtitle") return undefined;
+  return isSubtitleTrackKind(attachment.track_kind)
+    ? attachment.track_kind
+    : undefined;
+}
 export function validateMediaEnvelope(
   value: unknown,
   context: TargetContext = {},
@@ -813,11 +826,23 @@ export function validateMediaEnvelope(
       !group.item_ids.every((id) => media.items.some((item) => item.id === id))
     )
       fail("分组引用无效");
-  for (const attachment of media.attachments || []) {
+  let sanitizedAttachments: Attachment[] | null = null;
+  const rawAttachments = media.attachments || [];
+  rawAttachments.forEach((attachment, index) => {
     validateDelivery(attachment.resource.delivery, validationContext);
     validateCapabilityMetadata(attachment.resource.metadata, attachment.resource.role);
-  }
+    if (
+      "track_kind" in attachment &&
+      !(attachment.role === "subtitle" && isSubtitleTrackKind(attachment.track_kind))
+    ) {
+      if (!sanitizedAttachments) sanitizedAttachments = [...rawAttachments];
+      const { track_kind: _dropped, ...rest } = attachment;
+      sanitizedAttachments[index] = rest;
+    }
+  });
   if (media.cover) validateSources([media.cover], validationContext);
   if (media.author?.avatar) validateSources([media.author.avatar], validationContext);
-  return media;
+  return sanitizedAttachments
+    ? { ...media, attachments: sanitizedAttachments }
+    : media;
 }
