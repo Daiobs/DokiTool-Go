@@ -15,6 +15,7 @@ AGENT_DIR = Path(__file__).resolve().parents[1]
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
+import http_transport  # noqa: E402
 import security  # noqa: E402
 
 
@@ -35,6 +36,7 @@ class _CookieAndRedirectHandler(BaseHTTPRequestHandler):
     recorded_cookies: list[str | None] = []
     recorded_referers: list[str | None] = []
     recorded_auths: list[str | None] = []
+    recorded_hosts: list[str | None] = []
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         return
@@ -43,6 +45,13 @@ class _CookieAndRedirectHandler(BaseHTTPRequestHandler):
         self.__class__.recorded_cookies.append(self.headers.get("Cookie"))
         self.__class__.recorded_referers.append(self.headers.get("Referer"))
         self.__class__.recorded_auths.append(self.headers.get("Authorization"))
+        self.__class__.recorded_hosts.append(self.headers.get("Host"))
+        if self.path == "/redirect-hop2":
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header("Location", f"http://hop2.example.com:{port}/after-redirect")
+            self.end_headers()
+            return
         if self.path == "/set-cookie-redirect":
             self.send_response(302)
             self.send_header("Set-Cookie", "sid=secret-cookie-value; Path=/; HttpOnly")
@@ -303,6 +312,57 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn("supersecret", cleaned)
         self.assertIn("https://[REDACTED]@cdn.example.com/video.mp4?[REDACTED]", cleaned)
         self.assertIn("Bearer [REDACTED]", cleaned)
+
+    def test_direct_ip_pinning_blocks_dns_rebinding_preserves_host_sni_and_no_proxy(self) -> None:
+        _CookieAndRedirectHandler.recorded_hosts = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CookieAndRedirectHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # 1) DNS flips from public IP on call 1 to 127.0.0.1 on call 2; transport must dial call-1 IP only.
+            rebind_calls = {"n": 0}
+
+            def _rebinding_resolver(host: str, p: int, family: int = 0, socktype: int = 0):
+                rebind_calls["n"] += 1
+                if host == "hop2.example.com":
+                    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", p))]
+                ip = "93.184.216.34" if rebind_calls["n"] == 1 else "127.0.0.1"
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, p))]
+
+            dialed: list[tuple[str, int]] = []
+            real_connect = http_transport._connect_pinned_ip
+
+            def _intercept_dial(ip_str: str, p: int, timeout, source_address=None):
+                dialed.append((ip_str, p))
+                return real_connect("127.0.0.1", port, timeout, source_address)
+
+            # Also set HTTP_PROXY in env to prove --no-proxy bypasses env proxy and enforces IP pinning.
+            with mock.patch.dict("os.environ", {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9"}), \
+                 mock.patch.object(http_transport, "_connect_pinned_ip", side_effect=_intercept_dial), \
+                 mock.patch("socket.getaddrinfo", side_effect=AssertionError("connect must not re-query DNS")):
+                self.assertTrue(http_transport.has_env_proxy_for("http", "rebind.example.com", port))
+                fetcher = http_transport.SafeHTTPFetcher(timeout=5.0, no_proxy=True, resolver=_rebinding_resolver)
+                resp = fetcher.fetch_bytes(f"http://rebind.example.com:{port}/redirect-hop2", max_bytes=4096)
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(dialed, [("93.184.216.34", port), ("1.1.1.1", port)])
+            self.assertEqual(_CookieAndRedirectHandler.recorded_hosts, [f"rebind.example.com:{port}", f"hop2.example.com:{port}"])
+
+            # 2) HTTPS pinned connection dials validated numeric IP while preserving original SNI server_hostname.
+            fake_ctx = mock.MagicMock()
+            fake_sock = mock.MagicMock()
+            fake_tls = mock.MagicMock()
+            fake_ctx.wrap_socket.return_value = fake_tls
+            with mock.patch.object(http_transport, "_connect_pinned_ip", return_value=fake_sock) as mock_dial:
+                conn = http_transport._PinnedHTTPSConnection("sni.example.com", 443, context=fake_ctx, pinned_ips=("93.184.216.34",))
+                conn.connect()
+            mock_dial.assert_called_once_with("93.184.216.34", 443, conn.timeout, conn.source_address)
+            fake_ctx.wrap_socket.assert_called_once_with(fake_sock, server_hostname="sni.example.com")
+            self.assertIs(conn.sock, fake_tls)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":

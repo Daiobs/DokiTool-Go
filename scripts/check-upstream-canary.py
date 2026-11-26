@@ -641,14 +641,27 @@ def find_managed_issue(api: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dic
     issue = matches[0]
     if type(issue.get('number')) is not int or issue['number'] <= 0:
         raise CanaryError('Invalid managed canary Issue number')
-    state = extract_state(issue.get('body'))
     comments = api.items(f'/repos/{TARGET}/issues/{issue["number"]}/comments?per_page=100')
     for comment in comments:
         if not isinstance(comment, dict) or type(comment.get('id')) is not int or comment['id'] <= 0:
             raise CanaryError('Invalid Issue comment metadata')
-    for comment in sorted(comments, key=lambda c: c['id']):
-        if is_bot(comment) and MARKER in (comment.get('body') or ''):
-            state = extract_state(comment['body'])
+    state: Optional[Dict[str, Any]] = None
+    for comment in sorted(comments, key=lambda c: c['id'], reverse=True):
+        if not is_bot(comment):
+            continue
+        body = comment.get('body') or ''
+        if MARKER not in body:
+            continue
+        try:
+            state = extract_state(body)
+            break
+        except CanaryError:
+            continue
+    if state is None:
+        try:
+            state = extract_state(issue.get('body'))
+        except CanaryError:
+            state = None
     return issue, state
 
 
@@ -919,11 +932,17 @@ def evaluate_and_apply(
         if dry_run:
             result['action'] = 'dry_run_would_create_issue'
             return result
-        created, _ = api.request(
-            'POST',
-            '/repos/' + TARGET + '/issues',
-            {'title': TITLE, 'body': body, 'assignees': [OWNER]},
-        )
+        base_payload = {'title': TITLE, 'body': body, 'assignees': [OWNER]}
+        try:
+            created, _ = api.request(
+                'POST',
+                '/repos/' + TARGET + '/issues',
+                {**base_payload, 'labels': ['blocked']},
+            )
+        except CanaryError as exc:
+            if isinstance(exc, DesensitizationError) or 'HTTP 422' not in str(exc):
+                raise
+            created, _ = api.request('POST', '/repos/' + TARGET + '/issues', base_payload)
         if type(created.get('number')) is not int or created['number'] <= 0:
             raise CanaryError('Issue creation outcome is unknown')
         result['action'] = 'issue_created'

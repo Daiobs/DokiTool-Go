@@ -159,10 +159,11 @@ def make_workflow_run(
 class FakeGitHub:
     """In-memory mock of GitHub API with strict desensitization and endpoint checks."""
 
-    def __init__(self, *, issues=None, comments=None, workflow_runs=None) -> None:
+    def __init__(self, *, issues=None, comments=None, workflow_runs=None, fail_422_on_labels=False) -> None:
         self.issues = copy.deepcopy(issues or [])
         self.comments = copy.deepcopy(comments or {})
         self.workflow_runs = copy.deepcopy(workflow_runs or [])
+        self.fail_422_on_labels = fail_422_on_labels
         self.writes = []
         self._next_issue_number = 100
         self._next_comment_id = 500
@@ -191,12 +192,15 @@ class FakeGitHub:
                 canary.assert_desensitized(data['body'], description='Issue body/comment')
         self.writes.append((method, path, copy.deepcopy(data)))
         if method == 'POST' and path == '/repos/' + canary.TARGET + '/issues':
+            if self.fail_422_on_labels and data.get('labels'):
+                raise canary.CanaryError('GitHub API POST failed with HTTP 422')
             num = self._next_issue_number
             self._next_issue_number += 1
             issue = {
                 'number': num,
                 'title': data['title'],
                 'body': data['body'],
+                'labels': list(data.get('labels') or []),
                 'user': copy.deepcopy(BOT),
                 'state': 'open',
             }
@@ -850,6 +854,86 @@ class UpstreamCanaryTests(unittest.TestCase):
             canary.assert_desensitized('[Bad](https://github.com/Daiobs/DokiTool-Go/issues/61?token=abc)')
         with self.assertRaises(canary.DesensitizationError):
             canary.assert_desensitized('[Bad](https://github.com/Other/Repo/issues/61)')
+
+    def test_reverse_comment_scan_corrupted_state_self_healing_and_blocked_label(self) -> None:
+        valid_state = {
+            'schema': 1,
+            'status': 'failing',
+            'fingerprint': 'abcdef0123456789',
+            'consecutive_failures': 2,
+            'observed_at': '2026-11-25T01:30:00+00:00',
+            'player_id': 'b485e332',
+            'deno_status': 'degraded_main_only',
+            'smoke_ok': True,
+        }
+        # 1) Corrupted issue body + corrupted older bot comment + valid newest bot comment -> recovers newest valid state!
+        corrupted_issue = {
+            'number': 77,
+            'title': canary.TITLE,
+            'body': 'Edited body\n' + canary.MARKER + 'CORRUPTED_NOT_BASE64!!! -->',
+            'user': copy.deepcopy(BOT),
+            'state': 'open',
+        }
+        comments_with_valid_newest = {
+            77: [
+                {'id': 601, 'body': 'Old bad\n' + canary.MARKER + 'e30= -->', 'user': copy.deepcopy(BOT)},
+                {'id': 602, 'body': 'Newest valid\n' + canary.state_marker(valid_state), 'user': copy.deepcopy(BOT)},
+                {'id': 603, 'body': 'Human reply without marker', 'user': copy.deepcopy(HUMAN)},
+            ]
+        }
+        api_rec = FakeGitHub(issues=[corrupted_issue], comments=comments_with_valid_newest)
+        found_issue, found_state = canary.find_managed_issue(api_rec)
+        self.assertIsNotNone(found_issue)
+        self.assertEqual(found_state, valid_state)
+
+        # 2) All comments and issue body corrupted -> degrades to prev_state=None and self-heals on next evaluate_and_apply
+        comments_all_corrupted = {
+            77: [
+                {'id': 601, 'body': 'Bad\n' + canary.MARKER + '!!! -->', 'user': copy.deepcopy(BOT)},
+            ]
+        }
+        api_heal = FakeGitHub(issues=[corrupted_issue], comments=comments_all_corrupted)
+        healed_issue, healed_state = canary.find_managed_issue(api_heal)
+        self.assertIsNotNone(healed_issue)
+        self.assertIsNone(healed_state)
+
+        with tempfile.TemporaryDirectory() as td:
+            deno_p, smoke_p = self._write_reports(
+                Path(td),
+                make_deno_report(tv_ok=True, main_ok=False, main_error_code='EJS_N_PROBE_FAILED'),
+                make_smoke_report(),
+            )
+            deno = canary.load_deno_report(deno_p, exit_code=1)
+            smoke = canary.load_smoke_report(smoke_p, exit_code=0)
+            res_heal = canary.evaluate_and_apply(
+                deno=deno, smoke=smoke, api=api_heal, now=NOW, previous_conclusions=['failure']
+            )
+            self.assertEqual(res_heal['action'], 'issue_updated')
+            # Self-healed comment now carries a valid, strictly desensitized state marker
+            self.assertEqual(len(api_heal.comments[77]), 2)
+            self.assertEqual(
+                canary.extract_state(api_heal.comments[77][-1]['body'])['fingerprint'],
+                res_heal['fingerprint'],
+            )
+
+            # 3) Creating a brand-new alert Issue attaches labels=['blocked']
+            api_new = FakeGitHub()
+            res_new = canary.evaluate_and_apply(
+                deno=deno, smoke=smoke, api=api_new, now=NOW, previous_conclusions=['failure']
+            )
+            self.assertEqual(res_new['action'], 'issue_created')
+            self.assertEqual(api_new.writes[0][2].get('labels'), ['blocked'])
+            self.assertEqual(api_new.issues[0]['labels'], ['blocked'])
+
+            # 4) If GitHub rejects labels with HTTP 422, falls back once cleanly without labels
+            api_422 = FakeGitHub(fail_422_on_labels=True)
+            res_422 = canary.evaluate_and_apply(
+                deno=deno, smoke=smoke, api=api_422, now=NOW, previous_conclusions=['failure']
+            )
+            self.assertEqual(res_422['action'], 'issue_created')
+            self.assertEqual(len(api_422.writes), 2)
+            self.assertEqual(api_422.writes[0][2].get('labels'), ['blocked'])
+            self.assertNotIn('labels', api_422.writes[1][2])
 
 
 if __name__ == '__main__':

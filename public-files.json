@@ -843,6 +843,7 @@
     "tools/dokitool-agent/cli.py",
     "tools/dokitool-agent/dokitool_agent.py",
     "tools/dokitool-agent/downloader.py",
+    "tools/dokitool-agent/http_transport.py",
     "tools/dokitool-agent/mcp_server.py",
     "tools/dokitool-agent/security.py",
     "tools/dokitool-agent/subtitles.py",

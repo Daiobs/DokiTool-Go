@@ -642,7 +642,8 @@ func classifyStderr(stderrText string, runErr error) *Error {
 			Cause:     runErr,
 		}
 	case strings.Contains(lower, "not available in your country") ||
-		strings.Contains(lower, "available in your country") ||
+		strings.Contains(lower, "not made this video available in your country") ||
+		strings.Contains(lower, "unavailable in your country") ||
 		strings.Contains(lower, "geo-restricted") ||
 		strings.Contains(lower, "geo restricted") ||
 		strings.Contains(lower, "geo-blocked") ||
@@ -659,11 +660,19 @@ func classifyStderr(stderrText string, runErr error) *Error {
 		}
 	case strings.Contains(lower, "this live event will begin") ||
 		strings.Contains(lower, "premieres in") ||
-		strings.Contains(lower, "live stream is offline") ||
+		strings.Contains(lower, "stream is offline") ||
+		strings.Contains(lower, "channel is offline") ||
+		strings.Contains(lower, "user is offline") ||
+		strings.Contains(lower, "live event is offline") ||
+		strings.Contains(lower, "this live stream recording is not available") ||
 		strings.Contains(lower, "live streams are not supported") ||
 		strings.Contains(lower, "currently live") ||
 		strings.Contains(lower, "broadcast has ended") ||
-		strings.Contains(lower, "is offline"):
+		(strings.Contains(lower, "[twitch:stream]") &&
+			strings.HasSuffix(strings.TrimSpace(lower), " is offline") &&
+			!strings.Contains(lower, "unable to download") &&
+			!strings.Contains(lower, "proxy is offline") &&
+			!strings.Contains(lower, "network is offline")):
 		return &Error{
 			Code:      CodeContentUnavailable,
 			Message:   "暂不支持直播中、已下播或尚未开播的内容解析",

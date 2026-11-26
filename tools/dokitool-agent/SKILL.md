@@ -17,9 +17,10 @@ Use this skill whenever an AI agent or automation script needs to inspect suppor
    - CLI `platforms`, `parse`, and `subtitles` (without `--allow-write`) and MCP server `mcp` perform zero local file writes and zero subprocess executions.
    - Local file writing ALWAYS requires BOTH `--allow-write` and `--output-dir <dir>` (all writes are canonicalized and strictly jailed inside `--output-dir`; `..`, absolute paths, and symlinks are rejected).
    - Local `ffmpeg` muxing for `mux` delivery variants requires explicit `--allow-ffmpeg` in addition to `--allow-write --output-dir <dir>`.
-3. **Zero-Cookie, zero server media proxying, secondary anti-SSRF**:
+3. **Zero-Cookie, zero server media proxying, secondary anti-SSRF & proxy boundary**:
    - Subtitles and media are fetched directly from CDN/timedtext URLs with zero `Cookie` storage/transmission and a hard `5 MiB` cap per subtitle track.
-   - Every media, subtitle, and HTTP redirect hop URL is validated client-side against private/loopback/link-local/CGNAT/internal targets and DNS resolution.
+   - Every media, subtitle, and HTTP redirect hop URL is validated client-side against private/loopback/link-local/CGNAT/internal targets and DNS resolution. In direct mode (or with `--no-proxy`), the transport pins the connection to the validated public IP while preserving `Host` and TLS SNI (`server_hostname`) to prevent DNS rebinding TOCTOU.
+   - **Proxy trust boundary**: when `HTTP_PROXY` / `HTTPS_PROXY` is configured in the environment and `--no-proxy` is NOT passed, outbound routing and remote DNS resolution are trusted to the user-configured proxy server. Pass `--no-proxy` on any subcommand (`platforms`, `parse`, `subtitles`, `download`, `mcp`) to force direct IP-pinned connections.
    - `Referer: https://www.bilibili.com/` is sent only to narrow Bilibili CDN hosts (`bilivideo.com`, `bilivideo.cn`, `upos-*.akamaized.net`, `*bili*.akamaized.net`, `/upgcxcode/`); zero `Referer` is sent elsewhere.
 
 ## Platform Notes

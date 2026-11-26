@@ -10,11 +10,8 @@ import os
 from pathlib import Path
 import re
 import socket
-import ssl
 from typing import Any, Callable, Mapping, Sequence
-import urllib.error
 import urllib.parse
-import urllib.request
 
 DEFAULT_API_BASE = "https://snap.dokitool.com"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; DokiToolAgent/1.0)"
@@ -168,28 +165,30 @@ def validate_api_base(api_base: str) -> str:
     return cleaned
 
 
-def validate_remote_url(
+def validate_and_resolve_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
-) -> urllib.parse.SplitResult:
-    """Enforce secondary anti-SSRF validation (scheme, userinfo, suffix, IP literal, DNS)."""
+) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
+    """Enforce secondary anti-SSRF validation and return (parsed_url, validated_pinned_ips)."""
     parsed = _validate_url_syntax(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if "%" in host:
         raise SecurityError("Scoped IPv6 addresses are forbidden")
     if is_loopback_host(host):
         if allow_loopback:
-            return parsed
+            ip = _parse_ip(host)
+            return parsed, ((str(ip),) if ip is not None else ())
         raise SecurityError("Loopback address is forbidden for media/subtitle fetch")
     _check_blocked_suffix(host)
     ip = _parse_ip(host)
     if ip is not None:
         if not is_public_ip(ip):
             raise SecurityError("Non-public IP literal is forbidden")
-        return parsed
+        return parsed, (str(ip),)
     labels = host.split(".")
     if len(labels) < 2 or not _PUBLIC_TLD_RE.match(labels[-1]) or not all(_DNS_LABEL_RE.match(lbl) for lbl in labels):
         raise SecurityError(f"Invalid public DNS hostname: {host}")
+    pinned: list[str] = []
     if resolve_dns:
         port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
         try:
@@ -202,6 +201,20 @@ def validate_remote_url(
             resolved_ip = _parse_ip(str(entry[4][0]))
             if resolved_ip is None or not is_public_ip(resolved_ip):
                 raise SecurityError(f"Host {host} resolved to non-public IP address")
+            ip_text = str(resolved_ip)
+            if ip_text not in pinned:
+                pinned.append(ip_text)
+    return parsed, tuple(pinned)
+
+
+def validate_remote_url(
+    url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
+    resolver: Callable[..., list[Any]] | None = None,
+) -> urllib.parse.SplitResult:
+    """Enforce secondary anti-SSRF validation (scheme, userinfo, suffix, IP literal, DNS)."""
+    parsed, _ = validate_and_resolve_remote_url(
+        url, allow_loopback=allow_loopback, resolve_dns=resolve_dns, resolver=resolver,
+    )
     return parsed
 
 
@@ -274,124 +287,11 @@ def resolve_jailed_path(output_dir: Path, relative_target: str | Path, *, allow_
     return candidate
 
 
-def _build_safe_opener(*, bypass_proxy: bool) -> urllib.request.OpenerDirector:
-    """Build OpenerDirector with NO cookies, NO auto-redirects, NO file/ftp handlers."""
-    opener = urllib.request.OpenerDirector()
-    handlers = (
-        urllib.request.ProxyHandler({}) if bypass_proxy else urllib.request.ProxyHandler(),
-        urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor(),
-    )
-    for h in handlers:
-        opener.add_handler(h)
-    return opener
-
-
-def _lower_headers(raw_headers: Any) -> dict[str, str]:
-    return {k.lower(): v for k, v in (raw_headers.items() if raw_headers else [])}
-
-
-def _stream_bounded(resp: Any, max_bytes: int, sink: Callable[[bytes], Any], *, check_complete: bool = False) -> tuple[int, dict[str, str]]:
-    hdrs = _lower_headers(resp.headers)
-    cl_raw = hdrs.get("content-length", "").strip()
-    if cl_raw.isdigit() and int(cl_raw) > max_bytes:
-        raise SizeLimitExceededError(f"Response Content-Length exceeds {max_bytes} byte limit")
-    total = 0
-    while True:
-        chunk = resp.read(min(STREAM_CHUNK_BYTES, max_bytes - total + 1))
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise SizeLimitExceededError(f"Response body exceeded {max_bytes} byte limit")
-        sink(chunk)
-    if check_complete and cl_raw.isdigit() and total != int(cl_raw):
-        raise IOError(f"Truncated download ({total} bytes vs Content-Length {cl_raw})")
-    return total, hdrs
-
-
-class SafeHTTPFetcher:
-    """Zero-Cookie, anti-SSRF, redirect-validating, size-bounded HTTP fetcher."""
-
-    def __init__(
-        self, *, timeout: float = 30.0, max_redirects: int = MAX_REDIRECTS,
-        resolver: Callable[..., list[Any]] | None = None,
-        url_validator: Callable[..., urllib.parse.SplitResult] | None = None,
-        opener_factory: Callable[[bool], urllib.request.OpenerDirector] | None = None,
-    ) -> None:
-        self.timeout, self.max_redirects, self._resolver = timeout, max_redirects, resolver
-        self._url_validator = url_validator or validate_remote_url
-        self._opener_factory = opener_factory or (lambda bypass: _build_safe_opener(bypass_proxy=bypass))
-
-    def _open_with_redirects(
-        self, url: str, *, headers: Mapping[str, str] | None, allow_loopback: bool,
-        allow_redirects: bool, media_mode: bool, timeout: float | None,
-    ) -> tuple[Any, str]:
-        current, hops, req_timeout = url, 0, (self.timeout if timeout is None else timeout)
-        while True:
-            parsed = self._url_validator(
-                current, allow_loopback=(allow_loopback if hops == 0 else False),
-                resolve_dns=True, resolver=self._resolver,
-            )
-            stripped = ("cookie", "authorization", "proxy-authorization") if hops > 0 else ("cookie",)
-            req_headers = build_media_headers(current, extra_headers=headers) if media_mode else {
-                k: v for k, v in (headers or {}).items() if k.lower().strip() not in stripped
-            }
-            opener = self._opener_factory(is_loopback_host(parsed.hostname or ""))
-            try:
-                return opener.open(urllib.request.Request(current, headers=req_headers, method="GET"), timeout=req_timeout), current
-            except urllib.error.HTTPError as exc:
-                hdrs = _lower_headers(exc.headers)
-                if exc.code in (301, 302, 303, 307, 308):
-                    location = hdrs.get("location", "").strip()
-                    exc.close()
-                    if not allow_redirects:
-                        raise SecurityError(f"Redirects are forbidden for this request (HTTP {exc.code})") from exc
-                    if not location or hops >= self.max_redirects:
-                        raise SecurityError(f"Redirect rejected or exceeded limit ({self.max_redirects})") from exc
-                    current, hops = urllib.parse.urljoin(current, location), hops + 1
-                    continue
-                try:
-                    err_body = exc.read(MAX_ERROR_BODY_BYTES)
-                except Exception:
-                    err_body = b""
-                finally:
-                    exc.close()
-                raise HTTPStatusError(exc.code, current, hdrs, err_body) from exc
-
-    def fetch_bytes(
-        self, url: str, *, max_bytes: int, headers: Mapping[str, str] | None = None,
-        allow_loopback: bool = False, allow_redirects: bool = True,
-        media_mode: bool = True, timeout: float | None = None,
-    ) -> FetchResponse:
-        resp, final_url = self._open_with_redirects(
-            url, headers=headers, allow_loopback=allow_loopback,
-            allow_redirects=allow_redirects, media_mode=media_mode, timeout=timeout,
-        )
-        try:
-            chunks: list[bytes] = []
-            _, hdrs = _stream_bounded(resp, max_bytes, chunks.append)
-            return FetchResponse(int(getattr(resp, "status", 200)), final_url, hdrs, b"".join(chunks))
-        finally:
-            resp.close()
-
-    def download_to_file(
-        self, url: str, dest_part_path: Path, output_dir: Path, *,
-        max_bytes: int = MAX_MEDIA_BYTES, headers: Mapping[str, str] | None = None,
-        timeout: float | None = None,
-    ) -> tuple[int, dict[str, str], str]:
-        safe_part = resolve_jailed_path(output_dir, dest_part_path.name, allow_subdirs=False)
-        resp, final_url = self._open_with_redirects(
-            url, headers=headers, allow_loopback=False, allow_redirects=True, media_mode=True, timeout=timeout,
-        )
-        try:
-            with open(safe_part, "wb") as handle:
-                written, hdrs = _stream_bounded(resp, max_bytes, handle.write, check_complete=True)
-                handle.flush()
-            return written, hdrs, final_url
-        except Exception:
-            if safe_part.exists() and not safe_part.is_symlink():
-                safe_part.unlink()
-            raise
-        finally:
-            resp.close()
+def __getattr__(name: str) -> Any:
+    if name in ("SafeHTTPFetcher", "build_safe_opener", "has_env_proxy_for", "SafeRedirectHandler"):
+        import http_transport
+        return getattr(http_transport, name)
+    if name == "_build_safe_opener":
+        import http_transport
+        return http_transport.build_safe_opener
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

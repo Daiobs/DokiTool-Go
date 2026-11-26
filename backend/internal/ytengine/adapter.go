@@ -173,7 +173,11 @@ func AdaptInfo(info *Info, opts AdaptOptions, now int64) unified.Object {
 	if primarySubEntry == nil && len(entries) > 0 {
 		primarySubEntry = &entries[0]
 	}
-	for _, rawSub := range buildSubtitleAttachments(primarySubEntry, info, opts) {
+	var subNow time.Time
+	if now > 0 {
+		subNow = time.Unix(now, 0).UTC()
+	}
+	for _, rawSub := range buildSubtitleAttachments(primarySubEntry, info, opts, subNow) {
 		subID := unified.Str(unified.Map(rawSub)["id"])
 		if subID != "" && !seenAttachmentIDs[subID] {
 			seenAttachmentIDs[subID] = true

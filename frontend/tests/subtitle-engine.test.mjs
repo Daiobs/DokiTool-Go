@@ -801,3 +801,115 @@ test("ResultSubtitlePanel.vue & ResultDetailsSidebar.vue render manual/auto badg
   assert.equal(spacedCues[0].text, "First line");
   assert.equal(spacedCues[1].text, "Second line");
 });
+
+test("mergeBilingualCues matches naive O(N*M) tie-breaks exactly and scales to 10k x 10k cues in < 250ms", () => {
+  const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const naiveMerge = (primary, secondary) => {
+    if (!primary.length) return secondary.map((c) => ({ ...c }));
+    if (!secondary.length) return primary.map((c) => ({ ...c }));
+    return primary.map((p) => {
+      const pStart = Math.max(0, p.startMs);
+      const pEnd = Math.max(pStart, p.endMs);
+      const pMid = (pStart + pEnd) / 2;
+      let bestOverlap = null;
+      let nearest = null;
+      for (const s of secondary) {
+        const sStart = Math.max(0, s.startMs);
+        const sEnd = Math.max(sStart, s.endMs);
+        const overlap = Math.min(Math.max(pEnd, pStart + 1), Math.max(sEnd, sStart + 1)) - Math.max(pStart, sStart);
+        if (overlap > 0) {
+          const midDiff = Math.abs(pMid - (sStart + sEnd) / 2);
+          if (!bestOverlap || overlap > bestOverlap.overlap || (overlap === bestOverlap.overlap && midDiff < bestOverlap.midDiff)) {
+            bestOverlap = { cue: s, overlap, midDiff };
+          }
+          continue;
+        }
+        const gap = Math.max(0, Math.max(pStart, sStart) - Math.min(pEnd, sEnd));
+        if (gap <= 1500) {
+          const startDiff = Math.abs(pStart - sStart);
+          if (!nearest || gap < nearest.gap || (gap === nearest.gap && startDiff < nearest.startDiff)) {
+            nearest = { cue: s, gap, startDiff };
+          }
+        }
+      }
+      const pText = p.text.trim();
+      const sText = (bestOverlap?.cue ?? nearest?.cue)?.text.trim() || "";
+      if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
+      const normS = norm(sText);
+      const lines = new Set(pText.split("\n").map(norm));
+      return { startMs: pStart, endMs: pEnd, text: norm(pText) === normS || lines.has(normS) ? pText : `${pText}\n${sText}` };
+    });
+  };
+
+  // Unsorted primary & secondary with exact overlap ties, midDiff ties, gap ties, startDiff ties, zero-duration, long spans, and dedup.
+  const primary = [
+    { startMs: 10_000, endMs: 12_000, text: "Late overlap tie" },
+    { startMs: 2_000, endMs: 4_000, text: "Overlap midDiff & origIdx tie" },
+    { startMs: 6_000, endMs: 6_000, text: "Zero duration gap tie" },
+    { startMs: 20_000, endMs: 21_000, text: "Same text" },
+    { startMs: 30_000, endMs: 31_000, text: "No nearby match" },
+    { startMs: 5_000, endMs: 5_200, text: "Covered by long span" },
+  ];
+  const secondary = [
+    // Exact same overlap=1000 and midDiff=500 as the entry below, but earlier origIdx (0) with larger sStart
+    { startMs: 3_000, endMs: 4_000, text: "Sec right-half (origIdx 0)" },
+    { startMs: 2_000, endMs: 3_000, text: "Sec left-half (origIdx 1)" },
+    // Long span starting early and covering 5000..5200
+    { startMs: 0, endMs: 5_500, text: "Long spanning cue" },
+    // Gap tie for 6000..6000: gap=500 both ways, startDiff=500 vs 500 -> origIdx 3 beats origIdx 4 even though sStart is larger!
+    { startMs: 6_500, endMs: 7_000, text: "Gap right (origIdx 3)" },
+    { startMs: 5_000, endMs: 5_500, text: "Gap left (origIdx 4)" },
+    // Overlap ties for 10000..12000: overlap=1000 both, midDiff=0 wins over midDiff=500
+    { startMs: 10_000, endMs: 11_000, text: "Off-center" },
+    { startMs: 10_500, endMs: 11_500, text: "Centered" },
+    // Dedup test
+    { startMs: 20_000, endMs: 21_000, text: "  same   text " },
+    // Just outside 1500ms tolerance for 30000..31000
+    { startMs: 32_501, endMs: 33_000, text: "Too far" },
+  ];
+  assert.deepEqual(subtitleEngine.mergeBilingualCues(primary, secondary), naiveMerge(primary, secondary));
+
+  // Performance regression: 10,000 x 10,000 cues must finish in < 250ms
+  const bigPrimary = Array.from({ length: 10_000 }, (_, i) => ({
+    startMs: i * 2_000,
+    endMs: i * 2_000 + 1_600,
+    text: `P-${i}`,
+  }));
+  const bigSecondary = Array.from({ length: 10_000 }, (_, i) => ({
+    startMs: i * 2_000 + 100,
+    endMs: i * 2_000 + 1_700,
+    text: `S-${i}`,
+  }));
+  const t0 = performance.now();
+  const bigMerged = subtitleEngine.mergeBilingualCues(bigPrimary, bigSecondary);
+  const elapsedMs = performance.now() - t0;
+  assert.equal(bigMerged.length, 10_000);
+  assert.equal(bigMerged[0].text, "P-0\nS-0");
+  assert.equal(bigMerged[9_999].text, "P-9999\nS-9999");
+  assert.ok(elapsedMs < 250, `Expected 10k x 10k mergeBilingualCues < 250ms, took ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("safeFiniteMs rejects malformed json3 and XML timing strings with trailing garbage or whitespace", () => {
+  const malformedJson3 = JSON.stringify({
+    events: [
+      { tStartMs: "12garbage", dDurationMs: 1000, segs: [{ utf8: "drop-garbage-start" }] },
+      { tStartMs: "", dDurationMs: 1000, segs: [{ utf8: "drop-empty-start" }] },
+      { tStartMs: "   ", dDurationMs: 1000, segs: [{ utf8: "drop-blank-start" }] },
+      { tStartMs: "0x10", dDurationMs: 1000, segs: [{ utf8: "drop-hex-start" }] },
+      { tStartMs: true, dDurationMs: 1000, segs: [{ utf8: "drop-bool-start" }] },
+      { tStartMs: -5, dDurationMs: 1000, segs: [{ utf8: "drop-negative" }] },
+      { tStartMs: "1.5e3", dDurationMs: "250garbage", segs: [{ utf8: "keep-sci-zero-dur" }] },
+      { tStartMs: 4000, dDurationMs: "1500", segs: [{ utf8: "keep-valid" }] },
+    ],
+  });
+  const cues = subtitleEngine.parseSubtitleCues(malformedJson3, "json3");
+  assert.deepEqual(cues, [
+    { startMs: 1500, endMs: 1500, text: "keep-sci-zero-dur" },
+    { startMs: 4000, endMs: 5500, text: "keep-valid" },
+  ]);
+
+  const malformedXml =
+    '<timedtext><body><p t="100px" d="500">bad1</p><p t="  " d="500">bad2</p><p t="2000" d="300bad">ok-zero-dur</p></body></timedtext>';
+  const xmlCues = subtitleEngine.parseSubtitleCues(malformedXml, "srv3");
+  assert.deepEqual(xmlCues, [{ startMs: 2000, endMs: 2000, text: "ok-zero-dur" }]);
+});

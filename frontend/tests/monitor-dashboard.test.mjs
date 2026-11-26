@@ -2706,3 +2706,45 @@ test("PR A2 MonitorApp.vue: youtube_helper.disabled_by_config danger banner and 
     mounted.unmount();
   }
 });
+
+test("T6: YouTubeHelperCard.vue explicitly consumes and renders every field of YouTubeHelperStatsSnapshot", () => {
+  const generatedSrc = readFileSync(
+    join(FRONTEND_DIR, "src/monitor/statsTypes.generated.ts"),
+    "utf8",
+  );
+  const ifaceMatch = generatedSrc.match(
+    /export interface YouTubeHelperStatsSnapshot\s*\{([\s\S]*?)\n\}/,
+  );
+  assert.ok(ifaceMatch, "YouTubeHelperStatsSnapshot interface must exist in statsTypes.generated.ts");
+
+  const fields = [];
+  for (const line of ifaceMatch[1].split("\n")) {
+    const m = line.match(/^\s*([a-zA-Z0-9_]+)\??\s*:/);
+    if (m) fields.push(m[1]);
+  }
+  assert.ok(
+    fields.length >= 13,
+    `Expected at least 13 fields in YouTubeHelperStatsSnapshot, found ${fields.length}`,
+  );
+
+  const cardSrc = readFileSync(
+    join(FRONTEND_DIR, "src/monitor/components/YouTubeHelperCard.vue"),
+    "utf8",
+  );
+  for (const field of fields) {
+    const accessRe = new RegExp(`(?:props\\.helper|helper|h)\\.${field}\\b`);
+    const renderMarkerRe = new RegExp(
+      `(?:data-yt-helper-field=["']${field}["']|field:\\s*["']${field}["'])`,
+    );
+    assert.match(
+      cardSrc,
+      accessRe,
+      `YouTubeHelperCard.vue must read YouTubeHelperStatsSnapshot.${field}`,
+    );
+    assert.match(
+      cardSrc,
+      renderMarkerRe,
+      `YouTubeHelperCard.vue must explicitly render field marker for ${field}`,
+    );
+  }
+});
