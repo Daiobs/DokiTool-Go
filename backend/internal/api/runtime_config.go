@@ -600,13 +600,93 @@ func ApplyRuntimeConfigToAdmissionConfig(adm *AdmissionConfig, cfg RuntimeConfig
 	adm.FastPerPlatformMaxConcurrency = cfg.FastPool.PerPlatformMaxConcurrency
 }
 
+// RuntimePolicySnapshot is an immutable point-in-time view of hot-path request
+// policies published via atomic.Pointer on every committed ApplyRuntimeConfig.
+// Request handlers load one snapshot lock-free so all policy checks within a
+// single request observe a single consistent generation without tearing.
+type RuntimePolicySnapshot struct {
+	Generation            uint64
+	Cache                 RuntimeCachePolicy
+	CircuitBreakerEnabled bool
+	disabledPlatforms     []string
+	disabledSet           map[string]struct{}
+}
+
+var defaultRuntimePolicySnapshot = newRuntimePolicySnapshot(DefaultRuntimeConfig(), 0)
+
+func newRuntimePolicySnapshot(cfg RuntimeConfig, generation uint64) *RuntimePolicySnapshot {
+	disabled := make([]string, len(cfg.CircuitBreaker.DisabledPlatforms))
+	copy(disabled, cfg.CircuitBreaker.DisabledPlatforms)
+	var disabledSet map[string]struct{}
+	if len(disabled) > 0 {
+		disabledSet = make(map[string]struct{}, len(disabled))
+		for _, p := range disabled {
+			disabledSet[p] = struct{}{}
+		}
+	}
+	return &RuntimePolicySnapshot{
+		Generation:            generation,
+		Cache:                 cfg.Cache,
+		CircuitBreakerEnabled: cfg.CircuitBreaker.Enabled,
+		disabledPlatforms:     disabled,
+		disabledSet:           disabledSet,
+	}
+}
+
+// IsPlatformDisabled reports whether platform is manually disabled in this snapshot.
+func (s *RuntimePolicySnapshot) IsPlatformDisabled(platform string) bool {
+	if s == nil || platform == "" || len(s.disabledSet) == 0 {
+		return false
+	}
+	_, disabled := s.disabledSet[platform]
+	return disabled
+}
+
+// DisabledPlatforms returns a defensive copy of disabled platform IDs in this snapshot.
+func (s *RuntimePolicySnapshot) DisabledPlatforms() []string {
+	if s == nil || len(s.disabledPlatforms) == 0 {
+		return make([]string, 0)
+	}
+	return slices.Clone(s.disabledPlatforms)
+}
+
+// RuntimeConfigCommitHook executes an external compartment-resize step (such as
+// ytengine compartment SetConcurrencyLimit) inside the serialized reload critical
+// section after validation and snapshot preparation, and before mutating admission
+// pools, circuit breakers, cache entries, or publishing the next policy snapshot.
+// Returning a non-nil error aborts the reload before admission/handler state is mutated
+// (the hook itself is responsible for best-effort compartment rollback on partial failure).
+type RuntimeConfigCommitHook func(next RuntimeConfig) error
+
 // ApplyRuntimeConfig applies a validated RuntimeConfig in-place to the live admission
-// pools, handler circuit breakers, handler cache policy, and stats RuntimePolicySummary.
+// pools, handler circuit breakers, immutable RuntimePolicySnapshot, and stats summary.
 // Admission *pool structs are never replaced: active leases and FIFO waiters are preserved.
 func ApplyRuntimeConfig(entry http.Handler, handler *Handler, cfg RuntimeConfig, fromFile bool, isReload bool) bool {
+	return ApplyRuntimeConfigWithHook(entry, handler, cfg, fromFile, isReload, nil) == nil
+}
+
+// ApplyRuntimeConfigWithHook executes a serialized validate -> prepare -> commit
+// runtime config reload. Concurrent reloads are serialized under reloadMu:
+//   - atomic.Pointer[RuntimePolicySnapshot] provides lock-free single-generation
+//     consistency for request-path policy reads;
+//   - external ytengine compartments and each admission *pool are updated sequentially
+//     in-place (thread-safe per pool without dropping active leases or FIFO waiters)
+//     rather than as a single cross-subsystem instant transaction.
+//
+// Validation errors or non-nil hook errors abort before admission pools, circuit breakers,
+// cache entries, RuntimePolicySnapshot, stats, or generation are modified.
+func ApplyRuntimeConfigWithHook(
+	entry http.Handler,
+	handler *Handler,
+	cfg RuntimeConfig,
+	fromFile bool,
+	isReload bool,
+	hook RuntimeConfigCommitHook,
+) error {
+	// Phase 1: Validate and normalize before taking any lock or mutating live state.
 	norm, err := normalizeAndValidateRuntimeConfig(cfg)
 	if err != nil {
-		return false
+		return err
 	}
 	var adm *admission
 	if entry != nil {
@@ -620,7 +700,28 @@ func ApplyRuntimeConfig(entry http.Handler, handler *Handler, cfg RuntimeConfig,
 		}
 	}
 	if adm == nil && handler == nil {
-		return false
+		return errors.New("missing admission and handler targets for runtime config apply")
+	}
+
+	// Phase 2: Prepare immutable policy snapshot allocations outside commit locks.
+	preparedSnap := newRuntimePolicySnapshot(norm, 0)
+
+	// Phase 3: Serialized commit in deterministic lock order (handler -> admission).
+	if handler != nil {
+		handler.reloadMu.Lock()
+		defer handler.reloadMu.Unlock()
+	}
+	if adm != nil {
+		adm.runtimeReloadMu.Lock()
+		defer adm.runtimeReloadMu.Unlock()
+	}
+
+	// Execute external compartment hook first while serialized so any partial failure
+	// rolls back compartments without waking admission waiters or mutating policy.
+	if hook != nil {
+		if err := hook(norm); err != nil {
+			return err
+		}
 	}
 
 	if adm != nil {
@@ -634,14 +735,15 @@ func ApplyRuntimeConfig(entry http.Handler, handler *Handler, cfg RuntimeConfig,
 		if handler.cb != nil {
 			handler.cb.UpdateConfig(norm.CircuitBreaker)
 		}
+		preparedSnap.Generation = handler.currentPolicySnapshot().Generation + 1
+		handler.policy.Store(preparedSnap)
 		if handler.cache != nil && len(norm.CircuitBreaker.DisabledPlatforms) > 0 {
 			handler.cache.purgePlatforms(norm.CircuitBreaker.DisabledPlatforms)
 		}
-		handler.setCachePolicy(norm.Cache)
 		handler.notifyRuntimeConfigObservers(norm)
 		handler.stats.applyRuntimePolicy(norm, fromFile, isReload)
 	} else if adm != nil && adm.stats != nil {
 		adm.stats.applyRuntimePolicy(norm, fromFile, isReload)
 	}
-	return true
+	return nil
 }

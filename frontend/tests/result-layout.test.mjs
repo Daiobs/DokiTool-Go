@@ -30,6 +30,7 @@ before(async () => {
     '../extension/dashMuxSpec',
     '../core/media/extensionRoutes',
     '../core/media/muxSpec',
+    '../core/media/bilingualCueMerger',
     '../core/media/subtitleEngine',
     '../core/media/subtitleController',
     '../core/media/index',
@@ -48,6 +49,7 @@ before(async () => {
         if (reqId === './variantDefaultUpgrade') return modules['../core/media/variantDefaultUpgrade'];
         if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
         if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
+        if (reqId === './bilingualCueMerger') return modules['../core/media/bilingualCueMerger'];
         if (reqId === './subtitleEngine') return modules['../core/media/subtitleEngine'];
         if (reqId === './subtitleController') return modules['../core/media/subtitleController'];
         if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];

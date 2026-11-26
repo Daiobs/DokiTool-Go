@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
 func TestAllowYouTubeTimedtextURL(t *testing.T) {
@@ -500,6 +501,200 @@ func TestFinalizeSubtitlesRankDedupAndSafeExpiresAt(t *testing.T) {
 		src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Map(rawAtt)["resource"])["delivery"])["sources"])[0])
 		if _, exists := src["expires_at"]; exists {
 			t.Fatalf("zero now must not set expires_at, got %#v", src["expires_at"])
+		}
+	}
+}
+
+// TestSubtitleFormatRankParityWithYTEngine locks cross-package contract parity
+// (ARCH-11) between ytengine/subtitles.go and platform/youtube/finalize_subtitles.go:
+//
+//  1. Shared format ranks {vtt: 1, srt: 2, ttml: 3, srv3: 4, json3: 5} MUST have
+//     identical relative precedence and normalized (extension, mime_type) metadata
+//     across both packages.
+//  2. Rank 6 in finalize_subtitles.go (explicit fmt=xml|srv1|srv2 and immutable
+//     signed URLs whose sparams lists "fmt") is an INTENTIONAL browser-helper
+//     timedtext compatibility fallback—not accidental drift—because raw YouTube
+//     playerResponse.captions timedtext URLs may carry legacy XML formats or
+//     signature-locked fmt parameters that cannot be rewritten to &fmt=vtt,
+//     whereas yt-dlp (ytengine) exposes structured Tracks in Ranks 1..5 only.
+func TestSubtitleFormatRankParityWithYTEngine(t *testing.T) {
+	const videoID = "I9JvDaciaFk"
+	nowTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	w, h := int64(640), int64(360)
+
+	sharedFormats := []struct {
+		fmtName  string
+		wantRank int
+		wantExt  string
+		wantMime string
+	}{
+		{fmtName: "vtt", wantRank: 1, wantExt: "vtt", wantMime: "text/vtt"},
+		{fmtName: "srt", wantRank: 2, wantExt: "srt", wantMime: "application/x-subrip"},
+		{fmtName: "ttml", wantRank: 3, wantExt: "ttml", wantMime: "application/ttml+xml"},
+		{fmtName: "srv3", wantRank: 4, wantExt: "srv3", wantMime: "application/xml"},
+		{fmtName: "json3", wantRank: 5, wantExt: "json3", wantMime: "application/json"},
+	}
+
+	pickYTEngineFormat := func(formats []string) (ext, mime, chosenURL string, ok bool) {
+		tracks := make([]ytengine.SubtitleTrack, 0, len(formats))
+		for _, f := range formats {
+			tracks = append(tracks, ytengine.SubtitleTrack{
+				Ext:  f,
+				URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=%s", videoID, f),
+				Name: "English",
+			})
+		}
+		info := &ytengine.Info{
+			ID:    videoID,
+			Title: "Rank Parity Video",
+			Formats: []ytengine.Format{
+				{
+					FormatID: "18",
+					URL:      "https://rr1---sn-parity.googlevideo.com/videoplayback?itag=18",
+					Ext:      "mp4",
+					Protocol: "https",
+					Width:    &w,
+					Height:   &h,
+					VCodec:   "avc1.42001E",
+					ACodec:   "mp4a.40.2",
+				},
+			},
+			Subtitles: map[string][]ytengine.SubtitleTrack{"en": tracks},
+		}
+		env := ytengine.AdaptInfo(info, ytengine.AdaptOptions{
+			PlatformID: "youtube",
+			ContentID:  videoID,
+			SourceURL:  "https://www.youtube.com/watch?v=" + videoID,
+			MaxEntries: 1,
+			AllowedMediaURL: func(raw string) bool {
+				return strings.Contains(raw, ".googlevideo.com/") || strings.Contains(raw, "www.youtube.com/")
+			},
+		}, nowTime.Unix())
+		for _, rawAtt := range unified.Slice(unified.Map(env["data"])["attachments"]) {
+			att := unified.Map(rawAtt)
+			if unified.Str(att["role"]) != "subtitle" {
+				continue
+			}
+			res := unified.Map(att["resource"])
+			meta := unified.Map(res["metadata"])
+			src := unified.Map(unified.Slice(unified.Map(res["delivery"])["sources"])[0])
+			return unified.Str(meta["extension"]), unified.Str(meta["mime_type"]), unified.Str(src["url"]), true
+		}
+		return "", "", "", false
+	}
+
+	pickFinalizeFormat := func(urls []string) (ext, mime, chosenURL string, ok bool) {
+		captionTracks := make([]map[string]any, 0, len(urls))
+		for _, u := range urls {
+			captionTracks = append(captionTracks, map[string]any{
+				"baseUrl":      u,
+				"languageCode": "en",
+				"name":         map[string]any{"simpleText": "English"},
+			})
+		}
+		rawCaps, err := json.Marshal(map[string]any{
+			"playerCaptionsTracklistRenderer": map[string]any{
+				"captionTracks": captionTracks,
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal captions: %v", err)
+		}
+		atts := extractFinalizeSubtitles(rawCaps, videoID, nowTime)
+		if len(atts) == 0 {
+			return "", "", "", false
+		}
+		att := unified.Map(atts[0])
+		res := unified.Map(att["resource"])
+		meta := unified.Map(res["metadata"])
+		src := unified.Map(unified.Slice(unified.Map(res["delivery"])["sources"])[0])
+		return unified.Str(meta["extension"]), unified.Str(meta["mime_type"]), unified.Str(src["url"]), true
+	}
+
+	// 1. Exact single-format metadata & numeric rank lock on {vtt:1, srt:2, ttml:3, srv3:4, json3:5}.
+	for _, tc := range sharedFormats {
+		ext, mime, rank, ok := mapTimedtextFormatMetadata(tc.fmtName)
+		if !ok || ext != tc.wantExt || mime != tc.wantMime || rank != tc.wantRank {
+			t.Fatalf("mapTimedtextFormatMetadata(%q) = (%q, %q, %d, %v), want (%q, %q, %d, true)",
+				tc.fmtName, ext, mime, rank, ok, tc.wantExt, tc.wantMime, tc.wantRank)
+		}
+		ytExt, ytMime, _, ytOK := pickYTEngineFormat([]string{tc.fmtName})
+		finURL := fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=%s", videoID, tc.fmtName)
+		finExt, finMime, _, finOK := pickFinalizeFormat([]string{finURL})
+		if !ytOK || !finOK {
+			t.Fatalf("format %q admission mismatch: ytengine=%v finalize=%v", tc.fmtName, ytOK, finOK)
+		}
+		if ytExt != tc.wantExt || ytMime != tc.wantMime || finExt != ytExt || finMime != ytMime {
+			t.Fatalf("format %q metadata drift: ytengine=(%q,%q) finalize=(%q,%q) want=(%q,%q)",
+				tc.fmtName, ytExt, ytMime, finExt, finMime, tc.wantExt, tc.wantMime)
+		}
+	}
+
+	// 2. Pairwise total-order parity across all 10 pairs (i < j) in both input orders.
+	for i := 0; i < len(sharedFormats); i++ {
+		for j := i + 1; j < len(sharedFormats); j++ {
+			higher, lower := sharedFormats[i], sharedFormats[j]
+			hiURL := fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=%s", videoID, higher.fmtName)
+			loURL := fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=%s", videoID, lower.fmtName)
+
+			for _, order := range []struct {
+				label string
+				yt    []string
+				fin   []string
+			}{
+				{label: "higher-first", yt: []string{higher.fmtName, lower.fmtName}, fin: []string{hiURL, loURL}},
+				{label: "lower-first", yt: []string{lower.fmtName, higher.fmtName}, fin: []string{loURL, hiURL}},
+			} {
+				ytExt, ytMime, _, ytOK := pickYTEngineFormat(order.yt)
+				finExt, finMime, _, finOK := pickFinalizeFormat(order.fin)
+				if !ytOK || !finOK || ytExt != higher.wantExt || finExt != higher.wantExt || ytMime != finMime {
+					t.Fatalf("pair (%s vs %s, %s): ytengine=(%q,%q,%v) finalize=(%q,%q,%v), want %q (%q)",
+						higher.fmtName, lower.fmtName, order.label,
+						ytExt, ytMime, ytOK, finExt, finMime, finOK, higher.wantExt, higher.wantMime)
+				}
+			}
+		}
+	}
+
+	// 3. Intentional Rank 6 browser-helper fallback:
+	//    - ytengine does NOT admit xml/srv1/srv2 (Ranks 1..5 only);
+	//    - finalize_subtitles.go intentionally assigns Rank 6 (ext="xml", mime="application/xml")
+	//      to xml, srv1, srv2, and signed sparams=fmt immutable URLs, strictly below json3 (Rank 5).
+	for _, legacyFmt := range []string{"xml", "srv1", "srv2"} {
+		if _, _, _, ytOK := pickYTEngineFormat([]string{legacyFmt}); ytOK {
+			t.Fatalf("ytengine unexpectedly admitted legacy browser-helper format %q", legacyFmt)
+		}
+		ext, mime, rank, ok := mapTimedtextFormatMetadata(legacyFmt)
+		if !ok || ext != "xml" || mime != "application/xml" || rank != 6 {
+			t.Fatalf("mapTimedtextFormatMetadata(%q) = (%q, %q, %d, %v), want (xml, application/xml, 6, true)",
+				legacyFmt, ext, mime, rank, ok)
+		}
+	}
+
+	rank6URLs := []struct {
+		label string
+		url   string
+	}{
+		{"fmt=xml", fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=xml&signature=S1", videoID)},
+		{"fmt=srv1", fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=srv1&signature=S2", videoID)},
+		{"fmt=srv2", fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=srv2&signature=S3", videoID)},
+		{"signed-sparams-fmt", fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&sparams=v,lang,fmt&signature=S4", videoID)},
+	}
+	json3URL := fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=json3&signature=SJ", videoID)
+	for _, tc := range rank6URLs {
+		// Alone: admitted cleanly at Rank 6 without mutating the signed URL.
+		finExt, finMime, gotURL, ok := pickFinalizeFormat([]string{tc.url})
+		if !ok || finExt != "xml" || finMime != "application/xml" || gotURL != tc.url {
+			t.Fatalf("Rank 6 fallback %s alone = (%q, %q, %q, %v), want (xml, application/xml, %q, true)",
+				tc.label, finExt, finMime, gotURL, ok, tc.url)
+		}
+		// Paired with Rank 5 (json3) in either order: Rank 5 strictly outranks Rank 6.
+		for _, pair := range [][]string{{tc.url, json3URL}, {json3URL, tc.url}} {
+			winExt, winMime, winURL, winOK := pickFinalizeFormat(pair)
+			if !winOK || winExt != "json3" || winMime != "application/json" || winURL != json3URL {
+				t.Fatalf("Rank 5 (json3) must beat Rank 6 (%s): got (%q, %q, %q, %v)",
+					tc.label, winExt, winMime, winURL, winOK)
+			}
 		}
 	}
 }

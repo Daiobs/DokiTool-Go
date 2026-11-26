@@ -18,115 +18,31 @@ import {
   type OwnerTokenSource,
 } from "./monitorStorage";
 import {
-  aggregatePlatformHealth,
-  buildDailyChartPoints,
-  buildHourlyChartPoints,
-  computeTodayVsYesterday,
   formatBytesCompact,
-  formatMonitorVersionBadge,
   formatPercent,
-  formatUptimeDuration,
-  resolveYtdlpQueuedCount,
-  type AdmissionPoolSnapshot,
-  type DailyChartPoint,
-  type HourlyChartPoint,
-  type MonitorVersionBadge,
   type PlatformHealthRange,
-  type PlatformHealthRow,
   type StatsSnapshot,
-  type YTDLPCompartmentPoolSnapshot,
-  type YTDLPStatsSnapshot,
 } from "./statsTypes";
+import {
+  buildConcurrencyPoolRows,
+  buildMonitorDailyChartView,
+  buildMonitorHourlyChartView,
+  buildMonitorKpiViewModel,
+  buildRuntimeSwitchRows,
+  buildSortedPlatformHealthRows,
+  buildYtdlpCompartmentPoolRows,
+  computeNextPlatformSort,
+  formatRateValue,
+  getPlatformSortIndicator,
+  HEALTH_RANGE_OPTIONS,
+  rateToneClass,
+  roleBadgeClass,
+  type PlatformSortKey,
+} from "./monitorViewModel";
 import ProtectionPolicySection from "./components/ProtectionPolicySection.vue";
 import YouTubeHelperCard from "./components/YouTubeHelperCard.vue";
 
-// ============================================================================
-// Constants & Types
-// ============================================================================
-
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
-
-type PlatformSortKey =
-  | "platform"
-  | "total"
-  | "ok"
-  | "failed"
-  | "successRate"
-  | "effectiveSuccessRate"
-  | "p95Ms";
-
-interface RuntimeSwitchRow {
-  key: string;
-  label: string;
-  valueText: string;
-  fullValue?: string;
-  copyable?: boolean;
-  tone: "on" | "off" | "accent";
-}
-
-interface PoolWatermarkRow {
-  id: string;
-  label: string;
-  kind: "admission" | "slot";
-  kindLabel: string;
-  active: number;
-  limit: number;
-  queued: number;
-  queueLimit: number | null;
-  ratioPct: number;
-  tone: "normal" | "warn" | "danger";
-  footSummary: string;
-}
-
-interface CompartmentPoolRow {
-  id: "youtube" | "social" | "generic" | "youtube_ejs";
-  label: string;
-  enabled: boolean;
-  active: number;
-  limit: number;
-  queued: number;
-  queueLimit: number;
-  ratioPct: number;
-  tone: "normal" | "warn" | "danger";
-  footSummary: string;
-}
-
-const HEALTH_RANGE_OPTIONS: ReadonlyArray<{
-  key: PlatformHealthRange;
-  label: string;
-}> = [
-  { key: "today", label: "今日" },
-  { key: "yesterday", label: "昨日" },
-  { key: "7d", label: "近 7 天" },
-  { key: "30d", label: "近 30 天" },
-  { key: "since_start", label: "启动以来" },
-];
-
-const ZERO_ADMISSION_POOL: AdmissionPoolSnapshot = {
-  active: 0,
-  queued: 0,
-  concurrency_limit: 0,
-  queue_limit: 0,
-  waited: 0,
-  granted: 0,
-  timeout: 0,
-  full: 0,
-  canceled: 0,
-  wait_ms_total: 0,
-  wait_ms_max: 0,
-};
-
-const ZERO_YTDLP_POOL: Pick<
-  YTDLPStatsSnapshot,
-  "active" | "concurrency_limit" | "waiting" | "queued"
-> & {
-  total?: { acquired_count?: number; wait_count?: number; wait_ms_max?: number };
-} = {
-  active: 0,
-  concurrency_limit: 0,
-  waiting: 0,
-  total: { acquired_count: 0, wait_count: 0, wait_ms_max: 0 },
-};
 
 // ============================================================================
 // Core Auth, Theme & Snapshot State
@@ -169,388 +85,38 @@ const sortKey = ref<PlatformSortKey>("total");
 const sortDir = ref<"asc" | "desc">("desc");
 
 // ============================================================================
-// Derived Metrics & View Models
+// Derived Metrics & Pure View Models (delegated to monitorViewModel.ts)
 // ============================================================================
 
-const currentOrigin = computed<string>(() => {
-  if (
-    typeof window !== "undefined" &&
-    window.location?.origin &&
-    window.location.origin !== "null"
-  ) {
-    return window.location.origin;
-  }
-  return "同源站点";
-});
-
-const themeButtonLabel = computed<string>(() => {
-  if (currentTheme.value === "light") return "浅色";
-  if (currentTheme.value === "dark") return "深色";
-  return "跟随系统";
-});
-
-const credentialSourceLabel = computed<string>(() =>
-  tokenSource.value === "local" ? "本机已记住" : "会话级凭据",
+const currentOrigin = computed<string>(() =>
+  typeof window !== "undefined" &&
+  window.location?.origin &&
+  window.location.origin !== "null"
+    ? window.location.origin
+    : "同源站点",
 );
 
-const formattedFetchedTime = computed<string>(() => {
-  if (!lastFetchedAt.value) return "尚未同步";
-  const d = new Date(lastFetchedAt.value + 8 * 3_600_000);
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mm = String(d.getUTCMinutes()).padStart(2, "0");
-  const ss = String(d.getUTCSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss} (UTC+8)`;
-});
-
-const todaySummary = computed(() =>
-  stats.value ? computeTodayVsYesterday(stats.value) : null,
+const kpiVm = computed(() =>
+  buildMonitorKpiViewModel(stats.value, lastFetchedAt.value, tokenSource.value, currentTheme.value),
 );
-
-const effectiveSuccessRateText = computed<string>(() => {
-  const s = todaySummary.value;
-  if (!s || s.effectiveSuccessRate === null) return "—";
-  return `${s.effectiveSuccessRate.toFixed(1)}%`;
-});
-
-const todayDeltaTotalText = computed<string>(() => {
-  const s = todaySummary.value;
-  if (!s || !s.yesterdayDate) return "较昨日 —";
-  if (s.deltaTotal > 0) return `较昨日 +${s.deltaTotal}`;
-  if (s.deltaTotal < 0) return `较昨日 ${s.deltaTotal}`;
-  return "较昨日持平";
-});
-
-const todayDeltaTotalTone = computed<"up" | "down" | "flat">(() => {
-  const s = todaySummary.value;
-  if (!s || !s.yesterdayDate || s.deltaTotal === 0) return "flat";
-  return s.deltaTotal > 0 ? "up" : "down";
-});
-
-const todayDeltaRateText = computed<string>(() => {
-  const s = todaySummary.value;
-  if (!s || s.deltaRatePct === null) return "成功率变化 —";
-  const sign = s.deltaRatePct > 0 ? "+" : "";
-  return `较昨日 ${sign}${s.deltaRatePct.toFixed(1)}pp`;
-});
-
-const todayDeltaRateTone = computed<"up" | "down" | "flat">(() => {
-  const s = todaySummary.value;
-  if (!s || s.deltaRatePct === null || s.deltaRatePct === 0) return "flat";
-  return s.deltaRatePct > 0 ? "up" : "down";
-});
-
-const cacheHitRateText = computed<string>(() => {
-  const c = stats.value?.cache?.total;
-  if (!c) return "—";
-  return formatPercent(c.hits, c.hits + c.misses, 1);
-});
-
-const cacheStaleHits = computed<number>(() => {
-  const raw = stats.value?.cache?.total?.stale_hits;
-  return typeof raw === "number" && Number.isFinite(raw) && raw > 0
-    ? Math.floor(raw)
-    : 0;
-});
-
-const shanghaiHitRateText = computed<string>(() => {
-  const sh = stats.value?.shanghai?.total;
-  if (!sh) return "—";
-  return formatPercent(sh.hits, sh.hits + sh.fallbacks, 1);
-});
-
-const shanghaiModeLabel = computed<string>(() => {
-  const mode =
-    stats.value?.shanghai?.mode || stats.value?.runtime?.shanghai_mode || "off";
-  if (mode === "pull") return "Pull 拉取模式";
-  if (mode === "direct") return "Direct 直连模式";
-  return "未启用 (off)";
-});
-
-const shanghaiPlatformBreakdown = computed(() => {
-  const byPlat = stats.value?.shanghai?.by_platform;
-  const safeCount = (v: unknown) =>
-    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
-  return {
-    douyinHits: safeCount(byPlat?.douyin?.hits),
-    douyinFallbacks: safeCount(byPlat?.douyin?.fallbacks),
-    bilibiliHits: safeCount(byPlat?.bilibili?.hits),
-    bilibiliFallbacks: safeCount(byPlat?.bilibili?.fallbacks),
-  };
-});
-
-const versionInfo = computed<MonitorVersionBadge>(() =>
-  formatMonitorVersionBadge(stats.value?.runtime?.version),
+const todaySummary = computed(() => kpiVm.value.todaySummary);
+const runtimeSwitches = computed(() => buildRuntimeSwitchRows(stats.value));
+const concurrencyPools = computed(() => buildConcurrencyPoolRows(stats.value));
+const ytdlpCompartmentPools = computed(() => buildYtdlpCompartmentPoolRows(stats.value));
+const dailyChartVm = computed(() =>
+  buildMonitorDailyChartView(stats.value, dailyChartDays.value, hoveredDailyIndex.value),
 );
-
-const uptimeText = computed<string>(() =>
-  stats.value ? formatUptimeDuration(stats.value.uptime_seconds) : "—",
+const dailyChart = computed(() => dailyChartVm.value.chart);
+const dailyRatePoints = computed(() => dailyChartVm.value.ratePoints);
+const activeDailyPoint = computed(() => dailyChartVm.value.activePoint);
+const hourlyChartVm = computed(() =>
+  buildMonitorHourlyChartView(stats.value, hoveredHourlyIndex.value),
 );
-
-const runtimeSwitches = computed<RuntimeSwitchRow[]>(() => {
-  const rt = stats.value?.runtime;
-  if (!rt) return [];
-  const ver = versionInfo.value;
-  return [
-    {
-      key: "version",
-      label: "后端版本",
-      valueText: ver.display,
-      fullValue: ver.full,
-      copyable: true,
-      tone: "accent",
-    },
-    {
-      key: "shanghai_mode",
-      label: "上海出口模式",
-      valueText: rt.shanghai_mode || "off",
-      tone: rt.shanghai_mode && rt.shanghai_mode !== "off" ? "on" : "off",
-    },
-    {
-      key: "shanghai_bilibili",
-      label: "上海 B 站代理",
-      valueText: rt.shanghai_bilibili ? "ON" : "OFF",
-      tone: rt.shanghai_bilibili ? "on" : "off",
-    },
-    {
-      key: "bilibili_dash",
-      label: "B 站 DASH 合流",
-      valueText: rt.bilibili_dash ? "ON" : "OFF",
-      tone: rt.bilibili_dash ? "on" : "off",
-    },
-    {
-      key: "youtube_helper",
-      label: "YouTube 客户端助手",
-      valueText: rt.youtube_helper ? "ON" : "OFF",
-      tone: rt.youtube_helper ? "on" : "off",
-    },
-    {
-      key: "xhs_transport",
-      label: "小红书传输栈",
-      valueText: rt.xhs_transport || "standard",
-      tone: rt.xhs_transport === "chrome131" ? "accent" : "off",
-    },
-    {
-      key: "ytdlp_enabled",
-      label: "yt-dlp 引擎",
-      valueText: rt.ytdlp_enabled ? "ON" : "OFF",
-      tone: rt.ytdlp_enabled ? "on" : "off",
-    },
-    {
-      key: "ytdlp_generic_enabled",
-      label: "yt-dlp 通用长尾",
-      valueText: rt.ytdlp_generic_enabled ? "ON" : "OFF",
-      tone: rt.ytdlp_generic_enabled ? "on" : "off",
-    },
-    {
-      key: "tbvideo_pipigx",
-      label: "皮皮搞笑省流直链",
-      valueText: rt.tbvideo_pipigx ? "ON" : "OFF",
-      tone: rt.tbvideo_pipigx ? "on" : "off",
-    },
-    {
-      key: "tbvideo_zuiyou",
-      label: "最右省流直链",
-      valueText: rt.tbvideo_zuiyou ? "ON" : "OFF",
-      tone: rt.tbvideo_zuiyou ? "on" : "off",
-    },
-    {
-      key: "stats_persistence_enabled",
-      label: "统计原子落盘",
-      valueText: rt.stats_persistence_enabled ? "ON" : "OFF",
-      tone: rt.stats_persistence_enabled ? "on" : "off",
-    },
-  ];
-});
-
-function buildPoolWatermarkTone(ratioPct: number): "normal" | "warn" | "danger" {
-  if (ratioPct >= 90) return "danger";
-  if (ratioPct >= 70) return "warn";
-  return "normal";
-}
-
-const concurrencyPools = computed<PoolWatermarkRow[]>(() => {
-  const s = stats.value;
-  if (!s) return [];
-
-  const makeAdmissionRow = (
-    id: string,
-    label: string,
-    pool?: AdmissionPoolSnapshot,
-  ): PoolWatermarkRow => {
-    const safePool = pool ?? ZERO_ADMISSION_POOL;
-    const limit = Math.max(0, safePool.concurrency_limit || 0);
-    const active = Math.max(0, safePool.active || 0);
-    const ratioPct =
-      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
-    return {
-      id,
-      label,
-      kind: "admission",
-      kindLabel: "排队放行",
-      active,
-      limit,
-      queued: Math.max(0, safePool.queued || 0),
-      queueLimit: Math.max(0, safePool.queue_limit || 0),
-      ratioPct,
-      tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `排队放行 · 本次启动等待 ${safePool.waited ?? 0} · 放行 ${safePool.granted ?? 0} · 超时 ${safePool.timeout ?? 0} · 满载 ${safePool.full ?? 0}`,
-    };
-  };
-
-  const makeYtdlpRow = (
-    id: string,
-    label: string,
-    slot?: YTDLPStatsSnapshot,
-  ): PoolWatermarkRow => {
-    const safeSlot = slot ?? ZERO_YTDLP_POOL;
-    const limit = Math.max(0, safeSlot.concurrency_limit || 0);
-    const active = Math.max(0, safeSlot.active || 0);
-    const queued = resolveYtdlpQueuedCount(slot ?? (ZERO_YTDLP_POOL as YTDLPStatsSnapshot));
-    const ratioPct =
-      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
-    return {
-      id,
-      label,
-      kind: "slot",
-      kindLabel: "共享总网关槽位",
-      active,
-      limit,
-      queued,
-      queueLimit: null,
-      ratioPct,
-      tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `共享总网关槽位 · 本次启动获取 ${safeSlot.total?.acquired_count ?? 0} · 等待 ${safeSlot.total?.wait_count ?? 0} · 最大等待 ${safeSlot.total?.wait_ms_max ?? 0} ms`,
-    };
-  };
-
-  return [
-    makeAdmissionRow("fast", "快速池 (fast)", s.admission.fast),
-    makeAdmissionRow("slow", "慢速池 (slow)", s.admission.slow),
-    makeAdmissionRow(
-      "generic_slow",
-      "通用长尾慢池 (generic_slow)",
-      s.admission.generic_slow,
-    ),
-    makeAdmissionRow("owner", "Owner 专属池 (owner)", s.admission.owner),
-    makeYtdlpRow("ytdlp", "yt-dlp 并发槽位 (ytdlp)", s.ytdlp),
-    makeYtdlpRow(
-      "ytdlp_generic",
-      "yt-dlp 通用长尾槽位 (ytdlp_generic)",
-      s.ytdlp_generic,
-    ),
-  ];
-});
-
-const ytdlpCompartmentPools = computed<CompartmentPoolRow[]>(() => {
-  const pools = stats.value?.ytdlp_pools;
-  if (!pools) return [];
-
-  const makeRow = (
-    id: CompartmentPoolRow["id"],
-    label: string,
-    pool: YTDLPCompartmentPoolSnapshot,
-  ): CompartmentPoolRow => {
-    const limit = Math.max(0, pool.concurrency_limit || 0);
-    const active = Math.max(0, pool.active || 0);
-    const queued = Math.max(0, pool.queued || 0);
-    const queueLimit = Math.max(0, pool.queue_limit || 0);
-    const ratioPct =
-      limit > 0 ? Math.min(100, Math.round((active / limit) * 100)) : 0;
-    return {
-      id,
-      label,
-      enabled: Boolean(pool.enabled),
-      active,
-      limit,
-      queued,
-      queueLimit,
-      ratioPct,
-      tone: buildPoolWatermarkTone(ratioPct),
-      footSummary: `本次启动等待 ${pool.waited ?? 0} · 放行 ${pool.granted ?? 0} · 超时 ${pool.timeout ?? 0} · 满载 ${pool.full ?? 0} · 最大等待 ${pool.wait_ms_max ?? 0} ms`,
-    };
-  };
-
-  return [
-    makeRow("youtube", "YouTube 舱", pools.youtube),
-    makeRow("social", "社交慢链舱", pools.social),
-    makeRow("generic", "长尾 Generic 舱", pools.generic),
-    makeRow("youtube_ejs", "YouTube EJS 池", pools.youtube_ejs),
-  ];
-});
-
-// Charts
-const dailyChart = computed(() =>
-  buildDailyChartPoints(stats.value?.daily ?? [], dailyChartDays.value),
+const hourlyChart = computed(() => hourlyChartVm.value.chart);
+const activeHourlyPoint = computed(() => hourlyChartVm.value.activePoint);
+const platformHealthRows = computed(() =>
+  buildSortedPlatformHealthRows(stats.value, healthRange.value, sortKey.value, sortDir.value),
 );
-
-const dailyRatePoints = computed(() =>
-  dailyChart.value.points.filter(
-    (pt): pt is DailyChartPoint & { rateY: number } => pt.rateY !== null,
-  ),
-);
-
-const activeDailyPoint = computed<DailyChartPoint | null>(() => {
-  const pts = dailyChart.value.points;
-  if (pts.length === 0) return null;
-  if (
-    hoveredDailyIndex.value !== null &&
-    hoveredDailyIndex.value >= 0 &&
-    hoveredDailyIndex.value < pts.length
-  ) {
-    return pts[hoveredDailyIndex.value];
-  }
-  return pts[pts.length - 1];
-});
-
-const hourlyChart = computed(() =>
-  buildHourlyChartPoints(stats.value?.hourly ?? []),
-);
-
-const activeHourlyPoint = computed<HourlyChartPoint | null>(() => {
-  const pts = hourlyChart.value.points;
-  if (pts.length === 0) return null;
-  if (
-    hoveredHourlyIndex.value !== null &&
-    hoveredHourlyIndex.value >= 0 &&
-    hoveredHourlyIndex.value < pts.length
-  ) {
-    return pts[hoveredHourlyIndex.value];
-  }
-  return pts[pts.length - 1];
-});
-
-// Platform health table with sorting (includes effectiveSuccessRate)
-const platformHealthRows = computed<PlatformHealthRow[]>(() => {
-  if (!stats.value) return [];
-  const base = aggregatePlatformHealth(stats.value, healthRange.value);
-  const dir = sortDir.value === "asc" ? 1 : -1;
-  const key = sortKey.value;
-  return [...base].sort((a, b) => {
-    if (key === "platform") {
-      return a.label.localeCompare(b.label, "zh-CN") * dir;
-    }
-    if (key === "successRate") {
-      const av = a.successRate ?? -1;
-      const bv = b.successRate ?? -1;
-      return (av - bv) * dir || b.total - a.total;
-    }
-    if (key === "effectiveSuccessRate") {
-      const av = a.effectiveSuccessRate ?? -1;
-      const bv = b.effectiveSuccessRate ?? -1;
-      return (av - bv) * dir || b.effectiveTotal - a.effectiveTotal;
-    }
-    if (key === "p95Ms") {
-      const av = a.p95Ms ?? -1;
-      const bv = b.p95Ms ?? -1;
-      return (av - bv) * dir || b.total - a.total;
-    }
-    return (
-      ((a[key] as number) - (b[key] as number)) * dir ||
-      a.platform.localeCompare(b.platform)
-    );
-  });
-});
-
 const apiKeyRows = computed(() => stats.value?.api_keys ?? []);
 
 // ============================================================================
@@ -565,7 +131,7 @@ function clearCopiedVersionTimer() {
 }
 
 async function handleCopyVersion(source: "kpi" | "matrix") {
-  const full = versionInfo.value.full;
+  const full = kpiVm.value.versionInfo.full;
   if (!full) return;
   const copied = await copyTextToClipboard(full);
   if (!copied) return;
@@ -611,6 +177,27 @@ function handleLockClick() {
   lockDashboard("");
 }
 
+function applyUnlockedSnapshot(
+  token: string,
+  source: OwnerTokenSource,
+  loadedStats: StatsSnapshot,
+  fetchedAt: number,
+  clearInput = false,
+) {
+  activeToken = token;
+  tokenSource.value = source;
+  stats.value = loadedStats;
+  lastFetchedAt.value = fetchedAt;
+  staleError.value = "";
+  authError.value = "";
+  if (clearInput) {
+    tokenInput.value = "";
+    showToken.value = false;
+  }
+  autoRefreshEnabled.value = readMonitorAutoRefresh();
+  syncAutoRefreshTimer();
+}
+
 async function handleUnlock() {
   if (submitting.value) return;
   const validated = validateOwnerBearerToken(tokenInput.value);
@@ -629,16 +216,7 @@ async function handleUnlock() {
 
     if (res.ok) {
       const savedSource = saveOwnerToken(validated.token, rememberDevice.value);
-      activeToken = validated.token;
-      tokenSource.value = savedSource;
-      stats.value = res.stats;
-      lastFetchedAt.value = res.fetchedAt;
-      staleError.value = "";
-      authError.value = "";
-      tokenInput.value = "";
-      showToken.value = false;
-      autoRefreshEnabled.value = readMonitorAutoRefresh();
-      syncAutoRefreshTimer();
+      applyUnlockedSnapshot(validated.token, savedSource, res.stats, res.fetchedAt, true);
       return;
     }
 
@@ -646,18 +224,12 @@ async function handleUnlock() {
       clearStoredOwnerToken();
       activeToken = "";
       tokenSource.value = null;
-      stats.value = null;
       lastFetchedAt.value = null;
-      authError.value = res.message;
-      return;
     }
-
     stats.value = null;
     authError.value = res.message;
   } finally {
-    if (myGen === fetchGeneration) {
-      submitting.value = false;
-    }
+    if (myGen === fetchGeneration) submitting.value = false;
   }
 }
 
@@ -764,37 +336,13 @@ function handleDailyRangeChange(days: 7 | 30) {
 }
 
 function handleToggleSort(key: PlatformSortKey) {
-  if (sortKey.value === key) {
-    sortDir.value = sortDir.value === "desc" ? "asc" : "desc";
-  } else {
-    sortKey.value = key;
-    sortDir.value = key === "platform" ? "asc" : "desc";
-  }
+  const next = computeNextPlatformSort(sortKey.value, sortDir.value, key);
+  sortKey.value = next.sortKey;
+  sortDir.value = next.sortDir;
 }
 
 function sortIndicator(key: PlatformSortKey): string {
-  if (sortKey.value !== key) return "";
-  return sortDir.value === "asc" ? "▲" : "▼";
-}
-
-function rateToneClass(rate: number | null): string {
-  if (rate === null) return "ok";
-  if (rate >= 95) return "ok";
-  if (rate >= 80) return "warn";
-  return "danger";
-}
-
-function formatRateValue(rate: number | null): string {
-  if (rate === null || !Number.isFinite(rate)) return "—";
-  return `${Math.max(0, Math.min(100, rate)).toFixed(1)}%`;
-}
-
-function roleBadgeClass(role: string): string {
-  const r = (role || "").trim().toLowerCase();
-  if (r === "owner") return "mon-role-badge--owner";
-  if (r === "friend") return "mon-role-badge--friend";
-  if (r === "agent") return "mon-role-badge--agent";
-  return "mon-role-badge--other";
+  return getPlatformSortIndicator(sortKey.value, sortDir.value, key);
 }
 
 // ============================================================================
@@ -829,30 +377,17 @@ onMounted(async () => {
     if (myGen !== fetchGeneration) return;
 
     if (res.ok) {
-      activeToken = validated.token;
-      tokenSource.value = stored.source;
-      stats.value = res.stats;
-      lastFetchedAt.value = res.fetchedAt;
-      staleError.value = "";
-      authError.value = "";
-      autoRefreshEnabled.value = readMonitorAutoRefresh();
-      syncAutoRefreshTimer();
+      applyUnlockedSnapshot(validated.token, stored.source, res.stats, res.fetchedAt);
       return;
     }
 
     if (res.kind === "unauthorized") {
       clearStoredOwnerToken();
-      stats.value = null;
-      authError.value = res.message;
-      return;
     }
-
     stats.value = null;
     authError.value = res.message;
   } finally {
-    if (myGen === fetchGeneration) {
-      initialLoading.value = false;
-    }
+    if (myGen === fetchGeneration) initialLoading.value = false;
   }
 });
 
@@ -912,7 +447,7 @@ onUnmounted(() => {
                 "
                 data-testid="monitor-credential-source"
               >
-                {{ credentialSourceLabel }}
+                {{ kpiVm.credentialSourceLabel }}
               </span>
             </div>
             <div class="mon-brand__meta">
@@ -924,7 +459,7 @@ onUnmounted(() => {
               >
                 {{ currentOrigin }}
               </a>
-              <span v-if="stats">最后刷新：{{ formattedFetchedTime }}</span>
+              <span v-if="stats">最后刷新：{{ kpiVm.formattedFetchedTime }}</span>
               <span>统计时区：Asia/Shanghai (UTC+8)</span>
             </div>
           </div>
@@ -973,7 +508,7 @@ onUnmounted(() => {
             type="button"
             class="mon-theme-btn"
             data-testid="monitor-theme-toggle"
-            :title="`切换界面主题（当前：${themeButtonLabel}）`"
+            :title="`切换界面主题（当前：${kpiVm.themeButtonLabel}）`"
             @click="handleCycleTheme"
           >
             <svg
@@ -1028,7 +563,7 @@ onUnmounted(() => {
               <line x1="8" y1="20.5" x2="16" y2="20.5" />
               <line x1="12" y1="16.5" x2="12" y2="20.5" />
             </svg>
-            <span>{{ themeButtonLabel }}</span>
+            <span>{{ kpiVm.themeButtonLabel }}</span>
           </button>
 
           <button
@@ -1182,9 +717,9 @@ onUnmounted(() => {
               <span class="mon-kpi__value">{{ todaySummary.total }}</span>
               <span
                 class="mon-delta-pill"
-                :class="`mon-delta-pill--${todayDeltaTotalTone}`"
+                :class="`mon-delta-pill--${kpiVm.todayDeltaTotalTone}`"
               >
-                {{ todayDeltaTotalText }}
+                {{ kpiVm.todayDeltaTotalText }}
               </span>
             </div>
             <div class="mon-kpi__meta">
@@ -1210,16 +745,16 @@ onUnmounted(() => {
               </span>
               <span
                 class="mon-delta-pill"
-                :class="`mon-delta-pill--${todayDeltaRateTone}`"
+                :class="`mon-delta-pill--${kpiVm.todayDeltaRateTone}`"
               >
-                {{ todayDeltaRateText }}
+                {{ kpiVm.todayDeltaRateText }}
               </span>
             </div>
             <div
               class="mon-kpi__effective"
               data-testid="kpi-effective-success-rate"
             >
-              有效解析成功率 <strong>{{ effectiveSuccessRateText }}</strong>（已剔除限流/无效输入
+              有效解析成功率 <strong>{{ kpiVm.effectiveSuccessRateText }}</strong>（已剔除限流/无效输入
               {{ todaySummary.excludedCount }} 次）
             </div>
             <div class="mon-kpi__meta">
@@ -1245,7 +780,7 @@ onUnmounted(() => {
                 class="mon-kpi__value"
                 title="按本次启动以来的内存缓存命中与未命中计算"
               >
-                {{ cacheHitRateText }}
+                {{ kpiVm.cacheHitRateText }}
               </span>
               <span class="mon-text-muted mon-mono">
                 {{ formatBytesCompact(stats.cache.bytes) }} /
@@ -1261,7 +796,7 @@ onUnmounted(() => {
               <span>合流复用 {{ stats.cache.total.singleflight_shared }}</span>
             </div>
             <div class="mon-kpi__meta" data-testid="kpi-cache-stale-hits">
-              <span>过期兜底命中 {{ cacheStaleHits }}</span>
+              <span>过期兜底命中 {{ kpiVm.cacheStaleHits }}</span>
               <span>不可缓存 {{ stats.cache.total.uncacheable }}</span>
             </div>
           </article>
@@ -1270,7 +805,7 @@ onUnmounted(() => {
           <article class="mon-kpi mon-kpi--warn" data-testid="kpi-shanghai">
             <div class="mon-kpi__label">
               <span>上海出口节点 &amp; 命中率</span>
-              <span class="sp-badge sp-badge--muted">{{ shanghaiModeLabel }}</span>
+              <span class="sp-badge sp-badge--muted">{{ kpiVm.shanghaiModeLabel }}</span>
             </div>
             <div class="mon-kpi__main">
               <span class="mon-kpi__value">
@@ -1288,7 +823,7 @@ onUnmounted(() => {
                 class="sp-badge sp-badge--accent"
                 title="按本次启动以来的上海出口命中与回退计算"
               >
-                本次启动命中率 {{ shanghaiHitRateText }}
+                本次启动命中率 {{ kpiVm.shanghaiHitRateText }}
               </span>
             </div>
             <div class="mon-kpi__meta">
@@ -1300,10 +835,10 @@ onUnmounted(() => {
               data-testid="kpi-shanghai-platforms"
             >
               <span class="mon-shanghai-chip">
-                <strong>抖音</strong> 命中 {{ shanghaiPlatformBreakdown.douyinHits }} / 回退 {{ shanghaiPlatformBreakdown.douyinFallbacks }}
+                <strong>抖音</strong> 命中 {{ kpiVm.shanghaiPlatformBreakdown.douyinHits }} / 回退 {{ kpiVm.shanghaiPlatformBreakdown.douyinFallbacks }}
               </span>
               <span class="mon-shanghai-chip">
-                <strong>B 站</strong> 命中 {{ shanghaiPlatformBreakdown.bilibiliHits }} / 回退 {{ shanghaiPlatformBreakdown.bilibiliFallbacks }}
+                <strong>B 站</strong> 命中 {{ kpiVm.shanghaiPlatformBreakdown.bilibiliHits }} / 回退 {{ kpiVm.shanghaiPlatformBreakdown.bilibiliFallbacks }}
               </span>
             </div>
             <div class="mon-kpi__meta">
@@ -1322,17 +857,17 @@ onUnmounted(() => {
                 :class="{
                   'mon-version-btn--copied': copiedVersionSource === 'kpi',
                 }"
-                :title="`点击复制完整版本: ${versionInfo.full}`"
-                :aria-label="`复制完整后端版本 ${versionInfo.full}`"
+                :title="`点击复制完整版本: ${kpiVm.versionInfo.full}`"
+                :aria-label="`复制完整后端版本 ${kpiVm.versionInfo.full}`"
                 data-testid="kpi-version-badge"
                 @click="handleCopyVersion('kpi')"
               >
-                {{ copiedVersionSource === "kpi" ? "已复制" : versionInfo.display }}
+                {{ copiedVersionSource === "kpi" ? "已复制" : kpiVm.versionInfo.display }}
               </button>
             </div>
             <div class="mon-kpi__main">
               <span class="mon-kpi__value mon-kpi__value--compact">
-                {{ uptimeText }}
+                {{ kpiVm.uptimeText }}
               </span>
             </div>
             <div class="mon-kpi__meta">

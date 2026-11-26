@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -323,50 +322,6 @@ func collectSubtitleCandidatesFromMap(
 	return out
 }
 
-// extractSubtitleExpiresAt parses Unix-second expire/expires query params and returns
-// RFC3339 UTC only when strictly inside (now, now+30d]; returns "" otherwise.
-func extractSubtitleExpiresAt(rawURL string, now time.Time) string {
-	if now.IsZero() {
-		return ""
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil || u.RawQuery == "" {
-		return ""
-	}
-	maxExp := now.Add(maxSubtitleExpiresWindow)
-	var earliest time.Time
-	forEachSubtitleQueryParam(u.RawQuery, func(rawKey, decodedKey, rawVal string, err error) bool {
-		k := decodedKey
-		if err != nil {
-			k = rawKey
-		}
-		keyLower := strings.ToLower(strings.TrimSpace(k))
-		if keyLower != "expire" && keyLower != "expires" {
-			return true
-		}
-		val := rawVal
-		if decodedV, vErr := url.QueryUnescape(rawVal); vErr == nil {
-			val = decodedV
-		}
-		sec, parseErr := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
-		if parseErr != nil || sec <= 0 {
-			return true
-		}
-		expTime := time.Unix(sec, 0).UTC()
-		if !expTime.After(now) || expTime.After(maxExp) {
-			return true
-		}
-		if earliest.IsZero() || expTime.Before(earliest) {
-			earliest = expTime
-		}
-		return true
-	})
-	if earliest.IsZero() {
-		return ""
-	}
-	return earliest.Format(time.RFC3339)
-}
-
 func buildSubtitleAttachments(entry, parent *Info, opts AdaptOptions, now time.Time) unified.Array {
 	var manualMap, autoMap map[string][]SubtitleTrack
 	if entry != nil {
@@ -411,7 +366,7 @@ func buildSubtitleAttachments(entry, parent *Info, opts AdaptOptions, now time.T
 		srcID := "s-" + shortDigest(opts.PlatformID+":sub-src:"+opts.ContentID+":"+c.langLower+":"+c.trackKind)
 		meta := unified.Object{"container": c.spec.container, "extension": c.spec.ext, "mime_type": c.spec.mimeType, "evidence": "upstream"}
 		src := unified.Object{"id": srcID, "url": c.url, "access": "direct"}
-		if exp := extractSubtitleExpiresAt(c.url, now); exp != "" {
+		if exp := urlpolicy.ExtractSubtitleExpiresAt(c.url, now, maxSubtitleExpiresWindow); exp != "" {
 			src["expires_at"] = exp
 		}
 		res := unified.Object{"id": "res-" + attID, "role": "subtitle", "metadata": meta, "delivery": unified.Object{"kind": "file", "sources": unified.Array{src}}}

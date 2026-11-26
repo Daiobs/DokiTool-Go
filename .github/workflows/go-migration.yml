@@ -84,6 +84,9 @@ jobs:
       - name: Verify Go single-file line budgets
         run: python3 -B scripts/check-go-file-budgets.py
 
+      - name: Verify offline supply-chain integrity (lockfiles, pinned actions, exceptions)
+        run: python3 -B scripts/check-supply-chain.py --offline
+
   offline-contract:
     needs: changes
     if: github.repository == 'Daiobs/DokiTool-Go' && needs.changes.outputs.run_go == 'true'
@@ -335,6 +338,43 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  supply-chain-vuln:
+    needs: changes
+    if: github.repository == 'Daiobs/DokiTool-Go' && (needs.changes.outputs.run_go == 'true' || needs.changes.outputs.run_frontend == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the proposed commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up the pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+          cache-dependency-path: |
+            backend/go.mod
+            backend/go.sum
+
+      - name: Set up Node for npm audit
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+
+      - name: Install pinned govulncheck (v1.10.0)
+        run: |
+          mkdir -p "$RUNNER_TEMP/vuln-bin"
+          GOBIN="$RUNNER_TEMP/vuln-bin" go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          "$RUNNER_TEMP/vuln-bin/govulncheck" -version
+
+      - name: Run fail-closed online vulnerability scan (npm audit + govulncheck)
+        run: |
+          python3 -B scripts/check-supply-chain.py --online-vuln \
+            --govulncheck-bin "$RUNNER_TEMP/vuln-bin/govulncheck"
+
   ci-summary:
     needs:
       - changes
@@ -342,6 +382,7 @@ jobs:
       - offline-contract
       - frontend-and-browser
       - xhs-dependency-review
+      - supply-chain-vuln
     if: always() && github.repository == 'Daiobs/DokiTool-Go'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -353,6 +394,7 @@ jobs:
           OFFLINE_CONTRACT_RESULT: ${{ needs.offline-contract.result }}
           FRONTEND_AND_BROWSER_RESULT: ${{ needs.frontend-and-browser.result }}
           XHS_DEPENDENCY_REVIEW_RESULT: ${{ needs.xhs-dependency-review.result }}
+          SUPPLY_CHAIN_VULN_RESULT: ${{ needs.supply-chain-vuln.result }}
           RUN_GO: ${{ needs.changes.outputs.run_go }}
           RUN_FRONTEND: ${{ needs.changes.outputs.run_frontend }}
           RUN_L2_E2E: ${{ needs.changes.outputs.run_l2_e2e }}
@@ -365,6 +407,7 @@ jobs:
           offline_contract_result="${OFFLINE_CONTRACT_RESULT:-}"
           frontend_and_browser_result="${FRONTEND_AND_BROWSER_RESULT:-}"
           xhs_dependency_review_result="${XHS_DEPENDENCY_REVIEW_RESULT:-}"
+          supply_chain_vuln_result="${SUPPLY_CHAIN_VULN_RESULT:-}"
           run_go="${RUN_GO:-}"
           run_frontend="${RUN_FRONTEND:-}"
           run_l2_e2e="${RUN_L2_E2E:-}"
@@ -375,6 +418,7 @@ jobs:
           echo "  offline-contract=${offline_contract_result} (run_go=${run_go})"
           echo "  xhs-dependency-review=${xhs_dependency_review_result} (run_go=${run_go})"
           echo "  frontend-and-browser=${frontend_and_browser_result} (run_frontend=${run_frontend}, run_l2_e2e=${run_l2_e2e})"
+          echo "  supply-chain-vuln=${supply_chain_vuln_result} (run_go=${run_go}, run_frontend=${run_frontend})"
 
           assert_eq() {
             local label="$1"
@@ -416,6 +460,12 @@ jobs:
               failed=1
               ;;
           esac
+
+          if [ "$run_go" = "true" ] || [ "$run_frontend" = "true" ]; then
+            assert_eq "supply-chain-vuln (run_go=${run_go}, run_frontend=${run_frontend})" "$supply_chain_vuln_result" "success"
+          elif [ "$run_go" = "false" ] && [ "$run_frontend" = "false" ]; then
+            assert_eq "supply-chain-vuln (run_go=false, run_frontend=false)" "$supply_chain_vuln_result" "skipped"
+          fi
 
           case "$run_l2_e2e" in
             true|false)

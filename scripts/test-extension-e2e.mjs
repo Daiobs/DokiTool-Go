@@ -1124,7 +1124,11 @@ export async function runExtensionE2E({
     });
     const spSession1 = await instA.attach(spTargetId1);
     await until(
-      () => instA.evaluate(spSession1, "document.readyState === 'complete'"),
+      () =>
+        instA.evaluate(
+          spSession1,
+          "document.readyState === 'complete' && location.protocol === 'chrome-extension:' && Boolean(globalThis.chrome?.runtime?.sendMessage)",
+        ),
       "sidepanel.html loaded",
     );
 
@@ -1252,7 +1256,11 @@ export async function runExtensionE2E({
     });
     const spSession2 = await instA.attach(spTargetId2);
     await until(
-      () => instA.evaluate(spSession2, "document.readyState === 'complete'"),
+      () =>
+        instA.evaluate(
+          spSession2,
+          "document.readyState === 'complete' && location.protocol === 'chrome-extension:' && Boolean(globalThis.chrome?.runtime?.sendMessage)",
+        ),
       "reopened sidepanel.html loaded",
     );
     const sidePanelRpc = (req) =>
@@ -1899,7 +1907,11 @@ export async function runExtensionE2E({
     );
     const conflictSpSession = await instC.attach(conflictSpTarget);
     await until(
-      () => instC.evaluate(conflictSpSession, "document.readyState === 'complete'"),
+      () =>
+        instC.evaluate(
+          conflictSpSession,
+          "document.readyState === 'complete' && location.protocol === 'chrome-extension:' && Boolean(globalThis.chrome?.runtime?.sendMessage)",
+        ),
       "conflict SidePanel loaded",
     );
     const spState = await instC.evaluate(

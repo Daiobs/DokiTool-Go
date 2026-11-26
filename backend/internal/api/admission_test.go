@@ -1368,3 +1368,114 @@ func TestFastPoolPerPlatformConcurrencyBulkhead(t *testing.T) {
 		t.Fatalf("douyin did not recover after bulkhead release: %d %s", wRecovered.Code, wRecovered.Body.String())
 	}
 }
+
+func TestAdmissionInPlaceHotReloadWaiterAndBulkheadConservation(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Unix(1793448000, 0).UTC()
+	h, err := NewWithCacheConfig(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("douyin", src, ts, ""), nil
+		}),
+	}, func() time.Time { return now }, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse.GlobalConcurrency = 6
+	cfg.Parse.QueueSize = 16
+	cfg.Parse.QueueWait = 40 * time.Millisecond
+	cfg.Parse.ClientBurst = 100
+	cfg.Parse.ClientRPS = 100
+	cfg.Parse.GlobalBurst = 500
+	cfg.Parse.GlobalRPS = 500
+	cfg.FastPerPlatformMaxConcurrency = 3
+	cfg.SlowParse.GlobalConcurrency = 3
+	cfg.SlowParse.QueueSize = 16
+	cfg.SlowParse.QueueWait = 40 * time.Millisecond
+	cfg.SlowParse.ClientBurst = 100
+	cfg.SlowParse.ClientRPS = 100
+	cfg.SlowParse.GlobalBurst = 500
+	cfg.SlowParse.GlobalRPS = 500
+
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	origPublic := adm.public
+	origSlow := adm.slow
+	origYTSlow := adm.youtubeSlow
+	origGeneric := adm.genericSlow
+	origEJS := adm.youtubeEJS
+
+	var wg sync.WaitGroup
+	// 20 concurrent workers acquiring/releasing slots across fast bulkhead and slow pool
+	// while a reloader continuously resizes limits in-place.
+	for g := 0; g < 20; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ip := netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", id+1))
+			for i := 0; i < 40; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+				if (id+i)%2 == 0 {
+					rel, retry, canceled := adm.public.acquireContextForPlatform(ctx, ip, time.Now(), "douyin")
+					if !canceled && retry == 0 && rel != nil {
+						time.Sleep(time.Millisecond)
+						rel()
+					}
+				} else {
+					rel, retry, canceled := adm.slow.acquireContext(ctx, ip, time.Now())
+					if !canceled && retry == 0 && rel != nil {
+						time.Sleep(time.Millisecond)
+						rel()
+					}
+				}
+				cancel()
+			}
+		}(g)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 40; i++ {
+			rt := DefaultRuntimeConfig()
+			rt.YTDLP.SocialSlots = 1 + (i % 6)
+			rt.YTDLP.SocialQueueSize = 4 + (i % 12)
+			rt.YTDLP.SocialQueueWait = time.Duration(10+(i%5)*5) * time.Millisecond
+			rt.FastPool.PerPlatformMaxConcurrency = 2 + (i % 5)
+			if !ApplyRuntimeConfig(entry, h, rt, true, true) {
+				t.Errorf("valid in-place reload #%d failed", i)
+			}
+		}
+	}()
+	wg.Wait()
+
+	// All 5 pool pointers must remain identical (never replaced).
+	if adm.public != origPublic || adm.slow != origSlow || adm.youtubeSlow != origYTSlow || adm.genericSlow != origGeneric || adm.youtubeEJS != origEJS {
+		t.Fatal("in-place reload replaced one or more *pool pointers")
+	}
+
+	// Exact pool conservation across both stressed pools.
+	for name, p := range map[string]*pool{"public": adm.public, "slow": adm.slow} {
+		p.mu.Lock()
+		active := p.active
+		waiters := p.waiters.Len()
+		idleLen := p.idle.Len()
+		clientsLen := len(p.clients)
+		platActiveLen := len(p.platformActive)
+		var leakedClientActive int
+		for _, st := range p.clients {
+			if st.active != 0 || st.idleElem == nil {
+				leakedClientActive++
+			}
+		}
+		p.mu.Unlock()
+		if active != 0 || waiters != 0 || idleLen != clientsLen || leakedClientActive != 0 || platActiveLen != 0 {
+			t.Fatalf("pool %s conservation failed: active=%d waiters=%d idle=%d clients=%d leakedClients=%d platformActive=%d",
+				name, active, waiters, idleLen, clientsLen, leakedClientActive, platActiveLen)
+		}
+	}
+}

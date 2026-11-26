@@ -2,15 +2,22 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
 func TestRuntimeConfigExampleMatchesDefaults(t *testing.T) {
@@ -328,5 +335,321 @@ func TestApplyRuntimeConfigInPlacePreservesLeasesAndWakesWaiters(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/platforms?schema_version=1.0", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("platforms after reload status=%d", rec.Code)
+	}
+}
+
+func TestApplyRuntimeConfigHookFailureAndInvalidReloadRollback(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("douyin", src, ts, ""), nil
+		}),
+	}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen := h.RuntimeConfigGeneration(); gen != 0 {
+		t.Fatalf("initial RuntimeConfigGeneration = %d, want 0", gen)
+	}
+
+	var observerCalls atomic.Int32
+	h.RegisterRuntimeConfigObserver(RuntimeConfigObserverFunc(func(RuntimeConfig) {
+		observerCalls.Add(1)
+	}))
+
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, DefaultAdmissionConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+
+	// Commit baseline config (generation 0 -> 1).
+	baseCfg := DefaultRuntimeConfig()
+	baseCfg.YTDLP.YouTubeSlots = 5
+	baseCfg.YTDLP.SocialSlots = 6
+	baseCfg.YTDLP.GenericSlots = 3
+	baseCfg.YTDLP.YouTubeEJSConcurrency = 7
+	baseCfg.FastPool.PerPlatformMaxConcurrency = 20
+	baseCfg.CircuitBreaker.ConsecutiveFailures = 4
+	baseCfg.CircuitBreaker.WindowSize = 8
+	baseCfg.CircuitBreaker.DisabledPlatforms = []string{"tumblr"}
+	baseCfg.Cache.YouTubeParseTTL = 90 * time.Second
+	baseCfg.Cache.StaleIfErrorTTL = 420 * time.Second
+	baseCfg.Cache.UpstreamBlockedNegTTL = 6 * time.Second
+	if err := ApplyRuntimeConfigWithHook(entry, h, baseCfg, true, false, nil); err != nil {
+		t.Fatalf("baseline ApplyRuntimeConfigWithHook failed: %v", err)
+	}
+	if h.RuntimeConfigGeneration() != 1 {
+		t.Fatalf("generation after baseline = %d, want 1", h.RuntimeConfigGeneration())
+	}
+	if observerCalls.Load() != 1 {
+		t.Fatalf("observerCalls = %d, want 1", observerCalls.Load())
+	}
+
+	// Prime parse cache for douyin so we can assert a failed reload never purges cached entries.
+	dyReq := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.douyin.com/video/7400000000000000123")
+	recPrime := httptest.NewRecorder()
+	h.ServeHTTP(recPrime, httptest.NewRequest(http.MethodGet, dyReq, nil))
+	if recPrime.Code != http.StatusOK {
+		t.Fatalf("prime douyin parse failed: %d", recPrime.Code)
+	}
+	if entries, _ := h.cache.stats(); entries != 1 {
+		t.Fatalf("expected 1 cached entry after prime, got %d", entries)
+	}
+
+	// Verify immutable RuntimePolicySnapshot defensive copy behavior.
+	baseSnap := h.RuntimePolicySnapshot()
+	if baseSnap.Generation != 1 || baseSnap.Cache != baseCfg.Cache || !baseSnap.IsPlatformDisabled("tumblr") || baseSnap.IsPlatformDisabled("douyin") {
+		t.Fatalf("unexpected baseline RuntimePolicySnapshot: %+v", baseSnap)
+	}
+	clonedDisabled := baseSnap.DisabledPlatforms()
+	clonedDisabled[0] = "douyin"
+	if !baseSnap.IsPlatformDisabled("tumblr") || baseSnap.IsPlatformDisabled("douyin") || !slices.Equal(baseSnap.DisabledPlatforms(), []string{"tumblr"}) {
+		t.Fatal("mutating DisabledPlatforms() slice corrupted RuntimePolicySnapshot")
+	}
+
+	// 1. Out-of-range invalid config fails before invoking hook and leaves all state + generation untouched.
+	badCfg := baseCfg
+	badCfg.YTDLP.YouTubeSlots = 99
+	hookCalled := false
+	if err := ApplyRuntimeConfigWithHook(entry, h, badCfg, true, true, func(RuntimeConfig) error {
+		hookCalled = true
+		return nil
+	}); err == nil {
+		t.Fatal("expected out-of-range config to fail")
+	}
+	if hookCalled {
+		t.Fatal("commit hook must not run when validation fails")
+	}
+
+	// 2. Valid config whose compartment commit hook fails must leave admission pools,
+	//    circuit breakers, parse cache, RuntimePolicySnapshot, observers, stats, and generation 100% untouched!
+	candidateCfg := baseCfg
+	candidateCfg.YTDLP.YouTubeSlots = 10
+	candidateCfg.YTDLP.SocialSlots = 11
+	candidateCfg.YTDLP.GenericSlots = 4
+	candidateCfg.YTDLP.YouTubeEJSConcurrency = 12
+	candidateCfg.FastPool.PerPlatformMaxConcurrency = 48
+	candidateCfg.CircuitBreaker.Enabled = false
+	candidateCfg.CircuitBreaker.DisabledPlatforms = []string{"douyin"}
+	candidateCfg.Cache.YouTubeParseTTL = 15 * time.Second
+	candidateCfg.Cache.StaleIfErrorTTL = 30 * time.Second
+
+	injectedErr := errors.New("injected compartment #2 failure")
+	if err := ApplyRuntimeConfigWithHook(entry, h, candidateCfg, true, true, func(RuntimeConfig) error {
+		return injectedErr
+	}); !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected hook error, got %v", err)
+	}
+
+	// Assert zero contamination across every subsystem.
+	if h.RuntimeConfigGeneration() != 1 {
+		t.Fatalf("generation mutated on failed reload: got %d, want 1", h.RuntimeConfigGeneration())
+	}
+	if curSnap := h.RuntimePolicySnapshot(); curSnap != baseSnap {
+		t.Fatalf("RuntimePolicySnapshot pointer changed on failed reload: got gen=%d, want gen=1", curSnap.Generation)
+	}
+	if observerCalls.Load() != 1 {
+		t.Fatalf("observers invoked despite failed hook: got %d, want 1", observerCalls.Load())
+	}
+	if adm.youtubeSlow.statsSnapshot().ConcurrencyLimit != 5 ||
+		adm.slow.statsSnapshot().ConcurrencyLimit != 6 ||
+		adm.genericSlow.statsSnapshot().ConcurrencyLimit != 3 ||
+		adm.youtubeEJS.statsSnapshot().ConcurrencyLimit != 7 ||
+		adm.public.currentPerPlatformLimit() != 20 {
+		t.Fatalf("admission pool limits mutated despite failed hook: yt=%d social=%d generic=%d ejs=%d fastPerPlat=%d",
+			adm.youtubeSlow.statsSnapshot().ConcurrencyLimit,
+			adm.slow.statsSnapshot().ConcurrencyLimit,
+			adm.genericSlow.statsSnapshot().ConcurrencyLimit,
+			adm.youtubeEJS.statsSnapshot().ConcurrencyLimit,
+			adm.public.currentPerPlatformLimit())
+	}
+	if h.cb.IsDisabled("douyin") || !h.cb.IsDisabled("tumblr") {
+		t.Fatalf("circuit breaker disabled platforms mutated on failed hook: douyin=%v tumblr=%v",
+			h.cb.IsDisabled("douyin"), h.cb.IsDisabled("tumblr"))
+	}
+	if entries, _ := h.cache.stats(); entries != 1 {
+		t.Fatalf("parse cache purged on failed hook: entries=%d, want 1", entries)
+	}
+	rp := h.Stats().Snapshot().RuntimePolicy
+	if rp.ReloadCount != 0 || rp.YouTubeSlots != 5 || rp.SocialSlots != 6 || rp.GenericSlots != 3 ||
+		rp.YouTubeParseTTLSeconds != 90 || !rp.CircuitBreakerEnabled || !slices.Equal(rp.DisabledPlatforms, []string{"tumblr"}) {
+		t.Fatalf("stats RuntimePolicySummary mutated on failed hook: %+v", rp)
+	}
+}
+
+func TestApplyRuntimeConfigHighConcurrencyRaceStress(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	now := time.Date(2026, 11, 26, 11, 0, 0, 0, time.UTC)
+	h, err := New(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("douyin", src, ts, ""), nil
+		}),
+		"youtube": AdapterFunc(func(_ context.Context, src string, ts int64) (unified.Object, error) {
+			return makeSyntheticEnvelope("youtube", src, ts, ""), nil
+		}),
+	}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admCfg := DefaultAdmissionConfig()
+	for _, p := range []*PoolConfig{&admCfg.Parse, &admCfg.YouTubeSlowParse, &admCfg.SlowParse, &admCfg.GenericSlowParse, &admCfg.YouTubeEJS} {
+		p.ClientBurst = 1000
+		p.ClientRPS = 1000
+		p.GlobalBurst = 5000
+		p.GlobalRPS = 5000
+		p.QueueWait = 25 * time.Millisecond
+		p.QueueSize = 32
+	}
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, admCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	origPools := [5]*pool{adm.youtubeSlow, adm.slow, adm.genericSlow, adm.youtubeEJS, adm.public}
+
+	const workerCount = 24
+	const reloadIterations = 50
+
+	stopWorkers := make(chan struct{})
+	var workerWG sync.WaitGroup
+	var monotonicityViolations atomic.Int64
+	var panicCount atomic.Int64
+
+	pools := []*pool{adm.youtubeSlow, adm.slow, adm.genericSlow, adm.youtubeEJS, adm.public}
+	for w := 0; w < workerCount; w++ {
+		workerWG.Add(1)
+		go func(id int) {
+			defer workerWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCount.Add(1)
+					t.Errorf("worker %d panicked: %v", id, r)
+				}
+			}()
+			var lastGen uint64
+			ip := netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", (id%200)+1))
+			for iter := 0; ; iter++ {
+				select {
+				case <-stopWorkers:
+					return
+				default:
+				}
+				snap := h.RuntimePolicySnapshot()
+				if snap.Generation < lastGen {
+					monotonicityViolations.Add(1)
+				}
+				lastGen = snap.Generation
+				_ = snap.IsPlatformDisabled("youtube")
+				_ = snap.Cache.YouTubeParseTTL
+
+				targetPool := pools[(id+iter)%len(pools)]
+				plat := ""
+				if targetPool == adm.public {
+					plat = "douyin"
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+				rel, retry, canceled := targetPool.acquireContextForPlatform(ctx, ip, time.Now(), plat)
+				if !canceled && retry == 0 && rel != nil {
+					if iter%5 == 0 {
+						_ = h.HasFreshCachedParse("/api/parse", "schema_version=1.0&url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ")
+					}
+					rel()
+				}
+				cancel()
+			}
+		}(w)
+	}
+
+	// Background reload loop firing 50 alternating valid/invalid reloads across two concurrent reloaders
+	// to stress reloadMu serialization, atomic snapshot publication, and rollback invariants.
+	var validCommitted atomic.Uint64
+	var reloadWG sync.WaitGroup
+	for r := 0; r < 2; r++ {
+		reloadWG.Add(1)
+		go func(reloaderID int) {
+			defer reloadWG.Done()
+			for i := 0; i < reloadIterations/2; i++ {
+				step := reloaderID*(reloadIterations/2) + i
+				rt := DefaultRuntimeConfig()
+				switch step % 3 {
+				case 0: // Valid config A
+					rt.YTDLP.YouTubeSlots = 2 + (step % 6)
+					rt.YTDLP.SocialSlots = 2 + (step % 5)
+					rt.YTDLP.GenericSlots = 1 + (step % 4)
+					rt.YTDLP.YouTubeEJSConcurrency = 2 + (step % 6)
+					rt.FastPool.PerPlatformMaxConcurrency = 4 + (step % 12)
+					rt.Cache.YouTubeParseTTL = time.Duration((step%5)*30) * time.Second
+					if step%2 == 0 {
+						rt.CircuitBreaker.DisabledPlatforms = []string{"youtube"}
+					}
+					if ok := ApplyRuntimeConfig(entry, h, rt, true, true); !ok {
+						t.Errorf("valid reload step=%d unexpectedly failed", step)
+					} else {
+						validCommitted.Add(1)
+					}
+				case 1: // Invalid out-of-range config -> must fail without touching generation
+					rt.YTDLP.YouTubeSlots = 999
+					if ApplyRuntimeConfig(entry, h, rt, true, true) {
+						t.Errorf("invalid reload step=%d unexpectedly succeeded", step)
+					}
+				case 2: // Valid config with failing compartment hook -> must roll back without touching generation
+					rt.YTDLP.SocialSlots = 9
+					if err := ApplyRuntimeConfigWithHook(entry, h, rt, true, true, func(RuntimeConfig) error {
+						return errors.New("synthetic compartment resize error")
+					}); err == nil {
+						t.Errorf("failing-hook reload step=%d unexpectedly succeeded", step)
+					}
+				}
+			}
+		}(r)
+	}
+
+	reloadWG.Wait()
+	close(stopWorkers)
+	workerWG.Wait()
+
+	if panicCount.Load() != 0 {
+		t.Fatalf("observed %d panics during concurrent stress", panicCount.Load())
+	}
+	if monotonicityViolations.Load() != 0 {
+		t.Fatalf("observed %d generation monotonicity regressions", monotonicityViolations.Load())
+	}
+	if gotGen, wantGen := h.RuntimeConfigGeneration(), validCommitted.Load(); gotGen != wantGen {
+		t.Fatalf("RuntimeConfigGeneration = %d, want exact valid commit count %d", gotGen, wantGen)
+	}
+	if rp := h.Stats().Snapshot().RuntimePolicy; rp.ReloadCount != validCommitted.Load() {
+		t.Fatalf("stats ReloadCount = %d, want %d", rp.ReloadCount, validCommitted.Load())
+	}
+
+	// Verify all 5 *pool pointers remained strictly in-place (never replaced).
+	curPools := [5]*pool{adm.youtubeSlow, adm.slow, adm.genericSlow, adm.youtubeEJS, adm.public}
+	for i := range origPools {
+		if curPools[i] != origPools[i] {
+			t.Fatalf("pool[%d] pointer replaced during reload stress", i)
+		}
+	}
+
+	// Verify exact pool conservation across all 5 pools.
+	for i, p := range curPools {
+		p.mu.Lock()
+		active := p.active
+		waiters := p.waiters.Len()
+		idleLen := p.idle.Len()
+		clientsLen := len(p.clients)
+		platActiveLen := len(p.platformActive)
+		var leakedClients int
+		for _, st := range p.clients {
+			if st.active != 0 || st.idleElem == nil {
+				leakedClients++
+			}
+		}
+		p.mu.Unlock()
+		if active != 0 || waiters != 0 || idleLen != clientsLen || leakedClients != 0 || platActiveLen != 0 {
+			t.Fatalf("pool[%d] conservation violated: active=%d waiters=%d idle=%d clients=%d leakedClients=%d platformActive=%d",
+				i, active, waiters, idleLen, clientsLen, leakedClients, platActiveLen)
+		}
 	}
 }

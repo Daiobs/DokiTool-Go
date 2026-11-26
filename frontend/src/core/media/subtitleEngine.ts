@@ -1,12 +1,18 @@
 import type { Attachment, UnifiedMedia } from "../../types/media";
 import { deliveryRoutes, getSubtitleTrackKind } from "../../utils/mediaContract";
+import {
+  MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE,
+  mergeBilingualCues,
+  type SubtitleCue,
+} from "./bilingualCueMerger";
+
+export { MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE, mergeBilingualCues, type SubtitleCue };
 
 /** Hard client-side byte cap per subtitle track fetch (5 MiB, Guardrail G5). */
 export const MAX_SUBTITLE_TRACK_BYTES = 5 * 1024 * 1024;
 
 const MAX_PROJECTED_TRACKS = 64;
 const MAX_CUE_TIME_MS = 86_400_000_000;
-const BILINGUAL_TOLERANCE_MS = 1500;
 const MAX_STEM_CODEPOINTS = 64;
 
 const FORMAT_RANK: Record<string, number> = { vtt: 0, srt: 1, ttml: 2, srv3: 3, json3: 4, xml: 5 };
@@ -29,7 +35,6 @@ export interface SubtitleTrackOption {
   id: string; attachment: Attachment; label: string; language: string;
   trackKind: "manual" | "auto" | "unknown"; format: string; url: string; routes: string[];
 }
-export interface SubtitleCue { startMs: number; endMs: number; text: string; }
 export interface SubtitleDownloadResult {
   content: string; filename: string; mimeType: string; extension: "vtt" | "srt"; cueCount: number;
 }
@@ -314,113 +319,6 @@ export const formatCuesAsSrt = (cues: SubtitleCue[]): string => {
   const blocks = formatCueBlocks(cues, ",", true);
   return blocks.length ? `${blocks.join("\n\n")}\n` : "";
 };
-
-const normCue = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
-
-interface IndexedSecondaryCue {
-  cue: SubtitleCue;
-  origIdx: number;
-  sStart: number;
-  sEnd: number;
-  sEndEff: number;
-  sMid: number;
-}
-
-function lowerBoundPrefixMaxEnd(prefixMaxEnd: number[], minEnd: number): number {
-  let lo = 0;
-  let hi = prefixMaxEnd.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (prefixMaxEnd[mid] < minEnd) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-export function mergeBilingualCues(primary: SubtitleCue[], secondary: SubtitleCue[]): SubtitleCue[] {
-  if (!primary.length) return secondary.map((c) => ({ ...c }));
-  if (!secondary.length) return primary.map((c) => ({ ...c }));
-
-  const sec: IndexedSecondaryCue[] = [];
-  for (let i = 0; i < secondary.length; i++) {
-    const cue = secondary[i];
-    if (!Number.isFinite(cue.startMs) || !Number.isFinite(cue.endMs)) continue;
-    const sStart = Math.max(0, cue.startMs);
-    const sEnd = Math.max(sStart, cue.endMs);
-    sec.push({ cue, origIdx: i, sStart, sEnd, sEndEff: Math.max(sEnd, sStart + 1), sMid: (sStart + sEnd) / 2 });
-  }
-  sec.sort((a, b) => a.sStart - b.sStart || a.origIdx - b.origIdx);
-
-  const prefixMaxEnd = new Array<number>(sec.length);
-  let runningMaxEnd = -1;
-  for (let i = 0; i < sec.length; i++) {
-    if (sec[i].sEnd > runningMaxEnd) runningMaxEnd = sec[i].sEnd;
-    prefixMaxEnd[i] = runningMaxEnd;
-  }
-
-  let left = 0;
-  let prevPStart = -Infinity;
-
-  return primary.map((p) => {
-    const pStart = Math.max(0, p.startMs);
-    const pEnd = Math.max(pStart, p.endMs);
-    const pEndEff = Math.max(pEnd, pStart + 1);
-    const pMid = (pStart + pEnd) / 2;
-    let bestOverlap: { cue: SubtitleCue; overlap: number; midDiff: number; origIdx: number } | null = null;
-    let nearest: { cue: SubtitleCue; gap: number; startDiff: number; origIdx: number } | null = null;
-
-    if (Number.isFinite(pStart) && Number.isFinite(pEnd) && sec.length > 0) {
-      const minEnd = pStart - BILINGUAL_TOLERANCE_MS;
-      const maxStart = pEnd + BILINGUAL_TOLERANCE_MS;
-      if (pStart < prevPStart) {
-        left = lowerBoundPrefixMaxEnd(prefixMaxEnd, minEnd);
-      } else {
-        while (left < sec.length && prefixMaxEnd[left] < minEnd) left++;
-      }
-      prevPStart = pStart;
-
-      for (let j = left; j < sec.length; j++) {
-        const s = sec[j];
-        if (s.sStart > maxStart) break;
-        if (s.sEnd < minEnd) continue;
-        const overlap = Math.min(pEndEff, s.sEndEff) - Math.max(pStart, s.sStart);
-        if (overlap > 0) {
-          const midDiff = Math.abs(pMid - s.sMid);
-          if (
-            !bestOverlap ||
-            overlap > bestOverlap.overlap ||
-            (overlap === bestOverlap.overlap &&
-              (midDiff < bestOverlap.midDiff ||
-                (midDiff === bestOverlap.midDiff && s.origIdx < bestOverlap.origIdx)))
-          ) {
-            bestOverlap = { cue: s.cue, overlap, midDiff, origIdx: s.origIdx };
-          }
-          continue;
-        }
-        if (bestOverlap) continue;
-        const gap = Math.max(0, Math.max(pStart, s.sStart) - Math.min(pEnd, s.sEnd));
-        if (gap <= BILINGUAL_TOLERANCE_MS) {
-          const startDiff = Math.abs(pStart - s.sStart);
-          if (
-            !nearest ||
-            gap < nearest.gap ||
-            (gap === nearest.gap &&
-              (startDiff < nearest.startDiff ||
-                (startDiff === nearest.startDiff && s.origIdx < nearest.origIdx)))
-          ) {
-            nearest = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
-          }
-        }
-      }
-    }
-    const pText = p.text.trim();
-    const sText = (bestOverlap?.cue ?? nearest?.cue)?.text.trim() || "";
-    if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
-    const normS = normCue(sText);
-    const lines = new Set(pText.split("\n").map(normCue));
-    return { startMs: pStart, endMs: pEnd, text: normCue(pText) === normS || lines.has(normS) ? pText : `${pText}\n${sText}` };
-  });
-}
 
 async function readResponseUtf8Bounded(resp: Response, maxBytes: number): Promise<string> {
   const lenHeader = resp.headers?.get?.("content-length")?.trim();

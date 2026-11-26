@@ -3840,29 +3840,75 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   assert.ok(versionCheckLines <= 90, `versionCheck.ts must stay <= 90 lines, got ${versionCheckLines}`);
   assert.equal(/\bsetInterval\b/.test(versionCheckSrc), false, "versionCheck.ts must have ZERO setInterval polling");
 
-  // Disallowed origins make ZERO fetch calls
-  let disallowedFetches = 0;
-  for (const badOrigin of [
+  // R69-C: Non-loopback origins (default, custom HTTPS self-hosted, empty, or invalid) ALWAYS resolve to PROD_API_ORIGIN
+  // and NEVER issue requests to untrusted/custom origins.
+  const customObserved = [];
+  const customUpdate = await versionCheck.checkForExtensionUpdate({
+    installedVersion: "4.4.0",
+    apiBaseUrl: "https://custom-node.example.com",
+    fetchImpl: async (url, init) => {
+      customObserved.push({ url: String(url), init });
+      return new Response(
+        JSON.stringify({ version: "4.4.1", download_url: "/helper/dokitool-chrome-extension.zip" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+  assert.deepEqual(customUpdate, {
+    latestVersion: "4.4.1",
+    downloadUrl: "https://snap.dokitool.com/helper/dokitool-chrome-extension.zip",
+  });
+  assert.equal(customObserved.length, 1);
+  assert.equal(customObserved[0].url, "https://snap.dokitool.com/helper/extension-version.json");
+  assert.equal(customObserved[0].init.credentials, "omit");
+  assert.equal(customObserved[0].init.cache, "no-cache");
+  assert.equal(customObserved[0].init.headers, undefined);
+  assert.ok(customObserved[0].init.signal instanceof AbortSignal);
+
+  for (const nonLoopbackOrigin of [
+    undefined,
     "",
+    "   ",
+    "https://custom-node.example.com",
+    "https://custom-node.example.com:8443/",
     "https://evil.example.com",
     "https://www.youtube.com",
     "https://upos-sz-mirrorcos.bilivideo.com",
     "http://snap.dokitool.com",
     "http://192.168.1.1:8080",
     "https://snap.dokitool.com/subpath",
+    "http://127.0.0.1:18080/subpath",
+    "https://127.0.0.1:8443",
   ]) {
-    assert.equal(versionCheck.resolveAllowedVersionCheckOrigin(badOrigin), null);
+    assert.equal(
+      versionCheck.resolveAllowedVersionCheckOrigin(nonLoopbackOrigin),
+      "https://snap.dokitool.com",
+      `expected PROD_API_ORIGIN for ${String(nonLoopbackOrigin)}`,
+    );
+    const fetchedUrls = [];
     const res = await versionCheck.checkForExtensionUpdate({
       installedVersion: "4.4.0",
-      apiBaseUrl: badOrigin,
-      fetchImpl: async () => {
-        disallowedFetches += 1;
-        return new Response("{}", { status: 200 });
+      apiBaseUrl: nonLoopbackOrigin,
+      fetchImpl: async (url, init) => {
+        fetchedUrls.push({ url: String(url), credentials: init?.credentials, cache: init?.cache });
+        return new Response(
+          JSON.stringify({ version: "4.4.1", download_url: "/helper/dokitool-chrome-extension.zip" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
       },
     });
-    assert.equal(res, null);
+    assert.deepEqual(res, {
+      latestVersion: "4.4.1",
+      downloadUrl: "https://snap.dokitool.com/helper/dokitool-chrome-extension.zip",
+    });
+    assert.deepEqual(fetchedUrls, [
+      {
+        url: "https://snap.dokitool.com/helper/extension-version.json",
+        credentials: "omit",
+        cache: "no-cache",
+      },
+    ]);
   }
-  assert.equal(disallowedFetches, 0, "disallowed origins must trigger zero fetch calls");
 
   // Allowed official + loopback origins enforce credentials:omit, cache:no-cache, AbortSignal
   const observed = [];
@@ -3887,19 +3933,37 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   assert.equal(observed[0].init.cache, "no-cache");
   assert.ok(observed[0].init.signal instanceof AbortSignal);
 
+  const loopbackObserved = [];
+  assert.equal(
+    versionCheck.resolveAllowedVersionCheckOrigin("http://127.0.0.1:18080"),
+    "http://127.0.0.1:18080",
+  );
+  assert.equal(
+    versionCheck.resolveAllowedVersionCheckOrigin("http://localhost:8787/"),
+    "http://localhost:8787",
+  );
   const validLoopback = await versionCheck.checkForExtensionUpdate({
     installedVersion: "4.4.0",
     apiBaseUrl: "http://127.0.0.1:18080",
-    fetchImpl: async () =>
-      new Response(
+    fetchImpl: async (url, init) => {
+      loopbackObserved.push({ url: String(url), credentials: init?.credentials, cache: init?.cache });
+      return new Response(
         JSON.stringify({ version: "4.5.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
         { status: 200 },
-      ),
+      );
+    },
   });
   assert.deepEqual(validLoopback, {
     latestVersion: "4.5.0",
     downloadUrl: "http://127.0.0.1:18080/helper/dokitool-chrome-extension.zip",
   });
+  assert.deepEqual(loopbackObserved, [
+    {
+      url: "http://127.0.0.1:18080/helper/extension-version.json",
+      credentials: "omit",
+      cache: "no-cache",
+    },
+  ]);
 
   // Non-same-origin / unexpected-path download_url in remote JSON MUST be rejected
   for (const badDownloadUrl of [
@@ -4155,4 +4219,217 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_ZH.includes("检测到浏览器内其他下载类扩展改写了保存文件名"));
   assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_ZH.includes("下载时询问保存位置"));
   assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_EN.includes("Ask where to save each file"));
+});
+
+test("R69-B: WEB_EXT_PING isolates storage.getSettings() faults and slowness within <= 200ms without unhandled rejections or dangling timers", async () => {
+  const webExternalBridge = await bundleTsModule("../src/extension/bg/webExternalBridge.ts");
+  assert.equal(webExternalBridge.WEB_EXT_PING_SETTINGS_TIMEOUT_MS, 200);
+
+  const unhandledRejections = [];
+  const onUnhandled = (reason) => {
+    unhandledRejections.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+
+  const pendingMockTimers = new Set();
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const activeTimers = new Set();
+  globalThis.setTimeout = (...args) => {
+    const id = realSetTimeout(...args);
+    activeTimers.add(id);
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    activeTimers.delete(id);
+    return realClearTimeout(id);
+  };
+
+  const makePingHarness = (getSettingsImpl) => {
+    const extListeners = [];
+    const baseStore = storage.createExtensionStorage({
+      local: storage.createMemoryStorageArea(),
+      session: storage.createMemoryStorageArea(),
+    });
+    const faultyStore = {
+      ...baseStore,
+      getSettings: getSettingsImpl,
+    };
+    const mockChrome = {
+      runtime: {
+        id: DOKITOOL_EXTENSION_ID,
+        getManifest: () => ({
+          version: "4.4.1",
+          externally_connectable: { matches: PROD_EXTERNALLY_CONNECTABLE_MATCHES },
+        }),
+        onMessage: { addListener() {}, removeListener() {} },
+        onMessageExternal: {
+          addListener(fn) { extListeners.push(fn); },
+          removeListener(fn) {
+            const i = extListeners.indexOf(fn);
+            if (i >= 0) extListeners.splice(i, 1);
+          },
+        },
+        onConnect: { addListener() {}, removeListener() {} },
+        sendMessage: async () => ({ ok: true }),
+        getContexts: async () => [],
+      },
+      declarativeNetRequest: { getDynamicRules: async () => [], updateDynamicRules: async () => {} },
+      downloads: { download: async () => 1, onChanged: { addListener() {}, removeListener() {} } },
+      offscreen: { createDocument: async () => {}, closeDocument: async () => {} },
+      action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    };
+    const bg = backgroundMod.createBackgroundController({
+      chrome: mockChrome,
+      storage: faultyStore,
+    });
+    const sendPing = () =>
+      new Promise((resolveResp) => {
+        extListeners[0](
+          { type: "WEB_EXT_PING" },
+          { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+          resolveResp,
+        );
+      });
+    return { bg, sendPing };
+  };
+
+  const assertCleanPingFallback = (resp, elapsedMs, label) => {
+    assert.equal(resp.ok, true, `${label}: WEB_EXT_PING must succeed`);
+    assert.equal(resp.data.useSaveFilePicker, false, `${label}: must safely fall back to false`);
+    assert.deepEqual(Object.keys(resp.data).sort(), [
+      "capabilities",
+      "extensionId",
+      "useSaveFilePicker",
+      "version",
+    ]);
+    assert.equal(resp.data.version, "4.4.1");
+    assert.equal(resp.data.extensionId, DOKITOOL_EXTENSION_ID);
+    assert.ok(
+      elapsedMs < 250,
+      `${label}: WEB_EXT_PING must resolve in < 250ms, took ${elapsedMs.toFixed(1)}ms`,
+    );
+    const serialized = JSON.stringify(resp);
+    assert.equal(serialized.includes("apiBaseUrl"), false);
+    assert.equal(serialized.includes("bearerToken"), false);
+    assert.equal(serialized.includes("apiBearerToken"), false);
+    assert.equal(serialized.includes("secret_r69b_token"), false);
+    assert.equal(serialized.includes("custom-r69b.example.com"), false);
+  };
+
+  try {
+    // Direct helper checks: fast true, non-boolean fallback, sync throw, late rejection after timeout
+    assert.equal(
+      await webExternalBridge.readSaveFilePickerPrefBounded({
+        getSettings: async () => ({ useSaveFilePicker: true }),
+      }),
+      true,
+    );
+    assert.equal(activeTimers.size, 0, "fast resolve must clear timeout timer immediately");
+
+    for (const badVal of [null, undefined, "true", 1, {}, { useSaveFilePicker: "true" }, { useSaveFilePicker: 1 }]) {
+      assert.equal(
+        await webExternalBridge.readSaveFilePickerPrefBounded({
+          getSettings: async () => badVal,
+        }),
+        false,
+        `non-boolean ${JSON.stringify(badVal)} must fall back to false`,
+      );
+      assert.equal(activeTimers.size, 0);
+    }
+
+    assert.equal(
+      await webExternalBridge.readSaveFilePickerPrefBounded({
+        getSettings: () => {
+          throw new Error("synchronous storage failure");
+        },
+      }),
+      false,
+    );
+    assert.equal(activeTimers.size, 0, "synchronous throw must clear timeout timer immediately");
+
+    // Late rejection AFTER bounded timeout must never surface an unhandledRejection
+    let lateRejectTimer;
+    const lateRejectVal = await webExternalBridge.readSaveFilePickerPrefBounded(
+      {
+        getSettings: () =>
+          new Promise((_resolve, reject) => {
+            lateRejectTimer = realSetTimeout(() => reject(new Error("late storage rejection")), 60);
+            pendingMockTimers.add(lateRejectTimer);
+          }),
+      },
+      25,
+    );
+    assert.equal(lateRejectVal, false);
+    assert.equal(activeTimers.size, 0, "timeout branch must clear bounded timer");
+    await new Promise((r) => realSetTimeout(r, 90));
+    pendingMockTimers.delete(lateRejectTimer);
+    assert.equal(unhandledRejections.length, 0, "late rejection after timeout must be cleanly absorbed");
+
+    // (a) WEB_EXT_PING when storage.getSettings() immediately rejects
+    {
+      const { bg, sendPing } = makePingHarness(() => Promise.reject(new Error("chrome.storage unavailable")));
+      try {
+        const t0 = performance.now();
+        const resp = await sendPing();
+        const elapsed = performance.now() - t0;
+        assertCleanPingFallback(resp, elapsed, "case (a) immediate reject");
+        assert.equal(activeTimers.size, 0, "case (a) must leave zero dangling timers");
+      } finally {
+        bg.dispose();
+      }
+    }
+
+    // (b) WEB_EXT_PING when storage.getSettings() never resolves (pending promise)
+    {
+      const { bg, sendPing } = makePingHarness(() => new Promise(() => {}));
+      try {
+        const t0 = performance.now();
+        const resp = await sendPing();
+        const elapsed = performance.now() - t0;
+        assertCleanPingFallback(resp, elapsed, "case (b) never resolves");
+        assert.equal(activeTimers.size, 0, "case (b) must leave zero dangling timers");
+      } finally {
+        bg.dispose();
+      }
+    }
+
+    // (c) WEB_EXT_PING when storage.getSettings() resolves after 1500ms with useSaveFilePicker: true
+    {
+      const { bg, sendPing } = makePingHarness(
+        () =>
+          new Promise((resolve) => {
+            const slowTimer = realSetTimeout(() => {
+              pendingMockTimers.delete(slowTimer);
+              resolve({
+                useSaveFilePicker: true,
+                apiBaseUrl: "https://custom-r69b.example.com",
+                bearerToken: "secret_r69b_token",
+              });
+            }, 1500);
+            pendingMockTimers.add(slowTimer);
+          }),
+      );
+      try {
+        const t0 = performance.now();
+        const resp = await sendPing();
+        const elapsed = performance.now() - t0;
+        assertCleanPingFallback(resp, elapsed, "case (c) 1500ms slow resolve");
+        assert.equal(activeTimers.size, 0, "case (c) must leave zero dangling timers");
+      } finally {
+        bg.dispose();
+      }
+    }
+
+    await new Promise((r) => realSetTimeout(r, 10));
+    assert.equal(unhandledRejections.length, 0, "R69-B must emit zero unhandled rejections");
+  } finally {
+    for (const id of pendingMockTimers) {
+      realClearTimeout(id);
+    }
+    pendingMockTimers.clear();
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    process.off("unhandledRejection", onUnhandled);
+  }
 });

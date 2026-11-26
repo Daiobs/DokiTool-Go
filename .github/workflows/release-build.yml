@@ -79,10 +79,10 @@ jobs:
             echo "release_tag=${RELEASE_TAG}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up pinned Go 1.27.3 toolchain
+      - name: Set up pinned Go 1.27.4 toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: false
 
       - name: Set up Node for frontend build and tests
@@ -123,7 +123,7 @@ jobs:
           GOTOOLCHAIN: local
         run: |
           set -euo pipefail
-          go version | grep -F 'go1.27.3'
+          go version | grep -F 'go1.27.4'
           go test -v ./cmd/dokitool
 
       - name: Run pre-build frontend tests

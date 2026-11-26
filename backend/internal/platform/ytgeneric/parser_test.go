@@ -583,6 +583,7 @@ func TestBareMobileDomainNormalizationAndShortLinks(t *testing.T) {
 		"https://fb.watch:8080/abc123",
 		"https://fb.watch:8443/abc123",
 		"https://web.facebook.com/watch/?v=1",
+		"https://developers.facebook.com/docs/video",
 		"https://www.dailymotion.com/video/xbvrf7u",
 		"https://dai.ly/xbvrf7u",
 	} {
@@ -1241,4 +1242,54 @@ func TestSizeProberRealWiringMatchMediaURLAndSSRF(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestBuiltinSitesCatalogExtraParity(t *testing.T) {
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range KnownSiteIDs() {
+		spec, ok := LookupSite(id)
+		if !ok {
+			t.Fatalf("LookupSite(%q) returned ok=false", id)
+		}
+		extra, ok := catalog.ExtraPlatform(id)
+		if !ok {
+			t.Fatalf("catalog.ExtraPlatform(%q) returned ok=false", id)
+		}
+		if !unified.Equal(spec.CatalogEntry(), extra) {
+			t.Fatalf("site %q CatalogEntry() drifted from catalog.ExtraPlatform(%q):\n  got:  %#v\n  want: %#v", id, id, spec.CatalogEntry(), extra)
+		}
+		if err := c.Register(spec.CatalogEntry()); err != nil {
+			t.Fatalf("catalog.Register(%q) failed: %v", id, err)
+		}
+	}
+
+	fbSpec, _ := LookupSite("facebook")
+	fbParser := New(fbSpec, nil, nil)
+	if len(fbSpec.CatalogDomains) != 0 {
+		t.Fatalf("facebook must NOT register suffix CatalogDomains (got %v); exact hosts only", fbSpec.CatalogDomains)
+	}
+	wantExact := []string{"www.facebook.com", "facebook.com", "m.facebook.com", "fb.watch"}
+	if !reflect.DeepEqual(fbSpec.CatalogExactDomains, wantExact) {
+		t.Fatalf("facebook CatalogExactDomains = %v, want %v", fbSpec.CatalogExactDomains, wantExact)
+	}
+
+	for _, rejected := range []string{
+		"https://developers.facebook.com/docs/video",
+		"https://business.facebook.com/watch/?v=1",
+		"https://graph.facebook.com/v18.0/video",
+		"https://l.facebook.com/l.php?u=https%3A%2F%2Fexample.com",
+		"https://web.facebook.com/watch/?v=647537299265662",
+		"https://sub.fb.watch/abc123/",
+	} {
+		if got := c.PlatformForURL(rejected); got != "" {
+			t.Fatalf("catalog.PlatformForURL(%q) = %q, want empty (exact-host facebook routing)", rejected, got)
+		}
+		if fbParser.AllowedInputURL(rejected) {
+			t.Fatalf("facebook AllowedInputURL(%q) = true, want false", rejected)
+		}
+	}
 }

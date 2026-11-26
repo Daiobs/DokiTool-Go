@@ -3,33 +3,57 @@ package ytgeneric
 import (
 	"fmt"
 	"strings"
+
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
+func unifiedStrings(raw any) []string {
+	items := unified.Slice(raw)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s := unified.Str(item); s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mustSiteFromCatalog(id string, policy SiteSpec) SiteSpec {
+	entry, ok := catalog.ExtraPlatform(id)
+	if !ok {
+		panic(fmt.Sprintf("ytgeneric: missing static catalog metadata for site %q", id))
+	}
+	policy.PlatformID = id
+	policy.Name = unified.Str(entry["name"])
+	policy.SiteURL = unified.Str(entry["site_url"])
+	policy.Icon = unified.Str(entry["icon"])
+	policy.CatalogDomains = unifiedStrings(entry["domains"])
+	policy.CatalogExactDomains = unifiedStrings(entry["exact_domains"])
+	return policy
+}
+
 var builtinSites = []SiteSpec{
-	{
-		PlatformID:                   "facebook",
-		Name:                         "Facebook",
-		SiteURL:                      "https://www.facebook.com/",
-		Icon:                         "facebook",
-		CatalogExactDomains:          []string{"www.facebook.com", "facebook.com", "m.facebook.com", "fb.watch"},
+	mustSiteFromCatalog("facebook", SiteSpec{
 		InputHosts:                   []string{"www.facebook.com"},
 		MediaHostSuffix:              []string{".fbcdn.net"},
 		Extractors:                   []string{"facebook", "facebook:reel"},
 		MaxEntries:                   4,
 		AllowCodecLessProgressiveMP4: true,
-	},
-	{
-		PlatformID:                   "tumblr",
-		Name:                         "Tumblr",
-		SiteURL:                      "https://www.tumblr.com/",
-		Icon:                         "tumblr",
-		CatalogDomains:               []string{"tumblr.com"},
+	}),
+	mustSiteFromCatalog("tumblr", SiteSpec{
 		InputHosts:                   []string{".tumblr.com"},
 		MediaHostSuffix:              []string{".media.tumblr.com"},
 		Extractors:                   []string{"Tumblr"},
 		MaxEntries:                   4,
 		AllowCodecLessProgressiveMP4: true,
-	},
+	}),
 }
 
 // retiredSiteIDs lists formerly supported ytgeneric site IDs that ParseSitesEnv

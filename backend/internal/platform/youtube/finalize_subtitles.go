@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 const (
@@ -233,58 +233,6 @@ func mapTimedtextFormatMetadata(rawFmt string) (ext, mimeType string, rank int, 
 	}
 }
 
-// extractFinalizeSubtitleExpiresAt parses Unix-second expire/expires query params and
-// returns RFC3339 UTC only when strictly inside (now, now+30d]; returns "" otherwise.
-func extractFinalizeSubtitleExpiresAt(rawURL string, now time.Time) string {
-	if now.IsZero() {
-		return ""
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil || u.RawQuery == "" {
-		return ""
-	}
-	maxExp := now.Add(maxFinalizeSubtitleExpiresWindow)
-	var earliest time.Time
-	for _, ampPart := range strings.Split(u.RawQuery, "&") {
-		for _, part := range strings.Split(ampPart, ";") {
-			if part == "" {
-				continue
-			}
-			rawK, rawV, hasVal := strings.Cut(part, "=")
-			if !hasVal {
-				continue
-			}
-			decodedK, kErr := url.QueryUnescape(rawK)
-			if kErr != nil {
-				decodedK = rawK
-			}
-			keyLower := strings.ToLower(strings.TrimSpace(decodedK))
-			if keyLower != "expire" && keyLower != "expires" {
-				continue
-			}
-			val := rawV
-			if decodedV, vErr := url.QueryUnescape(rawV); vErr == nil {
-				val = decodedV
-			}
-			sec, parseErr := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
-			if parseErr != nil || sec <= 0 {
-				continue
-			}
-			expTime := time.Unix(sec, 0).UTC()
-			if !expTime.After(now) || expTime.After(maxExp) {
-				continue
-			}
-			if earliest.IsZero() || expTime.Before(earliest) {
-				earliest = expTime
-			}
-		}
-	}
-	if earliest.IsZero() {
-		return ""
-	}
-	return earliest.Format(time.RFC3339)
-}
-
 // ensureTimedtextFormatURL returns a validated timedtext URL without mutating any
 // existing signed query parameter. It appends fmt=vtt only when fmt is absent AND
 // fmt is not listed in sparams. Unknown explicit fmt values are rejected (ok=false).
@@ -458,7 +406,7 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string, now t
 			ext:       ext,
 			mimeType:  mimeType,
 			rank:      rank,
-			expiresAt: extractFinalizeSubtitleExpiresAt(finalURL, now),
+			expiresAt: urlpolicy.ExtractSubtitleExpiresAt(finalURL, now, maxFinalizeSubtitleExpiresWindow),
 		}
 		if prevIdx, exists := bestByLangKind[dedupKey]; exists {
 			candidates[prevIdx] = cand

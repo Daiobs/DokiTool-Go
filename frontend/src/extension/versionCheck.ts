@@ -20,15 +20,15 @@ export interface CheckExtensionUpdateOptions {
   fetchImpl?: typeof fetch;
 }
 
-export function resolveAllowedVersionCheckOrigin(
-  rawOrigin: string = PROD_API_ORIGIN,
-): string | null {
-  const validated = validateApiBaseUrl(rawOrigin);
-  if (!validated.ok) return null;
-  if (!validated.isLoopback && validated.origin !== PROD_API_ORIGIN) return null;
-  const probeUrl = `${validated.origin}${EXTENSION_VERSION_PATH}`;
-  const extra = validated.isLoopback ? [validated.origin] : undefined;
-  return isWhitelistedMediaUrl(probeUrl, extra).allowed ? validated.origin : null;
+export function resolveAllowedVersionCheckOrigin(rawApiBaseUrl?: string): string | null {
+  const v = typeof rawApiBaseUrl === "string" && rawApiBaseUrl.trim()
+    ? validateApiBaseUrl(rawApiBaseUrl)
+    : null;
+  const loopback = v?.ok && v.isLoopback ? v.origin : null;
+  const origin = loopback ?? PROD_API_ORIGIN;
+  return isWhitelistedMediaUrl(`${origin}${EXTENSION_VERSION_PATH}`, loopback ? [loopback] : undefined).allowed
+    ? origin
+    : null;
 }
 
 function isValidSameOriginDownloadUrl(raw: unknown, origin: string): boolean {

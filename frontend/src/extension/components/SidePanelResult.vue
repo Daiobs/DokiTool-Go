@@ -1,20 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import type {
-  MediaGroup,
-  MediaItem,
-  ReadyVariant,
-  Source,
-  UnifiedMedia,
-} from "../../types/media";
-import {
-  getDownloadTarget,
-  readyItem,
-  readyVariant,
-  resourceSource,
-  sourceRoutes,
-  sourceUrl,
-} from "../../utils/mediaContract";
+import type { MediaItem, UnifiedMedia } from "../../types/media";
+import { readyItem } from "../../utils/mediaContract";
 import type {
   BatchSaveMode,
   EnqueueDownloadItem,
@@ -42,6 +29,39 @@ import {
   type LivePhotoSaveFilter,
   type SidePanelQualityOption,
 } from "../uiTargetHelpers";
+import {
+  advancePreviewVideoRouteOnError,
+  buildAllCheckedIdSet,
+  buildMediaWorkWatchKey,
+  buildPreferredOptionKeyMap,
+  buildSelectedChecklistEntries,
+  deriveSidePanelCollections,
+  filterDeferredResolvableEntries,
+  formatQualityPreferenceLabel,
+  invertChecklistIdSet,
+  LIVE_PHOTO_FILTER_OPTIONS,
+  markPreviewUrlBroken,
+  mergeResolvedChecklistEntries,
+  pickActivePreviewVideoUrl,
+  preserveOriginalResolveUrl,
+  resolveActiveMediaItem,
+  resolveActiveQualitySelection,
+  resolveAlbumThumbnailUrl,
+  resolveChecklistPool,
+  resolveDirectCopyButtonTitle,
+  resolveDirectCopyCandidateUrl,
+  resolveEffectiveBatchSaveMode,
+  resolveInitialActiveSelection,
+  resolveMixedItemDisplayTitle,
+  resolveMixedItemTypeBadge,
+  resolvePreviewCoverUrl,
+  resolvePreviewVideoCandidates,
+  resolveSafeLivePhotoResourceUrl,
+  resolveZipModeTooltip,
+  shouldStreamBatchViaMultiPart,
+  summarizeChecklistSelection,
+  toggleChecklistItemId,
+} from "../sidePanelResultModel";
 
 const props = defineProps<{
   media: UnifiedMedia;
@@ -75,79 +95,18 @@ const emit = defineEmits<{
 const apiOrigin = computed(() => resolveSafeApiOrigin(props.settings.apiBaseUrl));
 const targetContext = computed(() => buildExtensionTargetContext(apiOrigin.value));
 const copyTargetContext = computed(() => ({ apiOrigin: apiOrigin.value }));
-
 const layoutKind = computed(() => classifyMediaLayout(props.media));
 
-// Track broken image/video preview URLs so UI gracefully falls back without ugly broken icons
 const brokenUrls = ref<Record<string, boolean>>({});
 const previewVideoRouteIndex = ref(0);
-function markUrlBroken(url: string) {
-  if (url && !brokenUrls.value[url]) {
-    brokenUrls.value = { ...brokenUrls.value, [url]: true };
-  }
-}
-function safeAssetUrl(raw: string): string {
-  return raw && !brokenUrls.value[raw] ? raw : "";
-}
-function safeSourceUrl(src?: Source | null): string {
-  if (!src) return "";
-  try {
-    const routes = sourceRoutes(src, targetContext.value);
-    for (const candidate of routes) {
-      const safe = safeAssetUrl(candidate);
-      if (safe) return safe;
-    }
-    return safeAssetUrl(sourceUrl(src, targetContext.value));
-  } catch {
-    return "";
-  }
-}
-
-// Collections & episodes for multi_video (e.g. Bilibili multi-P / seasons)
-const collections = computed<MediaGroup[]>(() =>
-  (props.media.groups ?? []).filter((g) => g.kind !== "album"),
-);
 const activeCollectionIdx = ref(0);
-
-const allVideoOrAudioItems = computed<MediaItem[]>(() =>
-  props.media.items.filter(
-    (it) => it.type === "video" || it.type === "audio",
-  ),
-);
-
-const visibleEpisodes = computed<MediaItem[]>(() => {
-  const group = collections.value[activeCollectionIdx.value];
-  if (!group) return allVideoOrAudioItems.value;
-  const byId = new Map(allVideoOrAudioItems.value.map((it) => [it.id, it]));
-  return group.item_ids
-    .map((id) => byId.get(id))
-    .filter((it): it is MediaItem => Boolean(it));
-});
-
-const albumItems = computed<MediaItem[]>(() =>
-  props.media.items.filter(
-    (it) => it.type === "image" || it.type === "live_photo",
-  ),
-);
-
-const hasLivePhotos = computed(() =>
-  albumItems.value.some((it) => it.type === "live_photo"),
-);
-
 const livePhotoFilter = ref<LivePhotoSaveFilter>("both");
 const saveMode = ref<BatchSaveMode>(props.settings.batchSaveMode || "subfolder");
-
-// Active item for single view or multi_video active player
 const activeItemId = ref<string>("");
-// Per-item selected quality option key (`variant:...` or `attachment:...`)
 const selectedOptionKeyByItem = ref<Record<string, string>>({});
-// Checklist selected item IDs (for album or multi_video)
 const checkedIds = ref<Set<string>>(new Set());
-
-// Lightbox modal for album/LivePhoto preview
 const previewModalItem = ref<MediaItem | null>(null);
 const previewLiveMode = ref<"motion" | "image">("motion");
-
 const batchPreparingProgress = ref<{ current: number; total: number } | null>(
   null,
 );
@@ -156,110 +115,84 @@ let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 const copiedOptionKey = ref("");
 let copyOptionResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-function isItemCheckable(item: MediaItem): boolean {
-  return item.state !== "unavailable";
+function markUrlBroken(url: string) {
+  brokenUrls.value = markPreviewUrlBroken(brokenUrls.value, url);
 }
 
-const checklistPool = computed<MediaItem[]>(() => {
-  if (layoutKind.value === "mixed") return props.media.items;
-  if (layoutKind.value === "album") return albumItems.value;
-  if (layoutKind.value === "multi_video") return visibleEpisodes.value;
-  return [];
-});
+const collectionsState = computed(() =>
+  deriveSidePanelCollections(props.media, activeCollectionIdx.value),
+);
+const collections = computed(() => collectionsState.value.collections);
+const visibleEpisodes = computed(() => collectionsState.value.visibleEpisodes);
+const albumItems = computed(() => collectionsState.value.albumItems);
+const hasLivePhotos = computed(() => collectionsState.value.hasLivePhotos);
+
+const checklistPool = computed<MediaItem[]>(() =>
+  resolveChecklistPool(
+    layoutKind.value,
+    props.media.items,
+    albumItems.value,
+    visibleEpisodes.value,
+  ),
+);
+
+function buildQualityOptionsFor(item: MediaItem): SidePanelQualityOption[] {
+  return buildSidePanelQualityOptions(props.media, item, apiOrigin.value);
+}
+
+function selectPreferredFor(
+  opts: SidePanelQualityOption[],
+  item: MediaItem | null | undefined,
+  pref = props.settings.qualityPreference,
+): SidePanelQualityOption | null {
+  return selectPreferredQualityOption(
+    opts,
+    item,
+    pref,
+    props.media,
+    apiOrigin.value,
+  );
+}
+
+function resetChecklistToAllChecked() {
+  checkedIds.value = buildAllCheckedIdSet(checklistPool.value);
+}
 
 function initSelectionForMedia() {
   brokenUrls.value = {};
   previewVideoRouteIndex.value = 0;
-  activeCollectionIdx.value = 0;
   previewModalItem.value = null;
   livePhotoFilter.value = "both";
   saveMode.value = props.settings.batchSaveMode || "subfolder";
   batchPreparingProgress.value = null;
 
-  const defaultId =
-    props.media.default_item_id || props.media.items[0]?.id || "";
-  if (collections.value.length > 0 && defaultId) {
-    const foundGroup = collections.value.findIndex((g) =>
-      g.item_ids.includes(defaultId),
-    );
-    if (foundGroup >= 0) {
-      activeCollectionIdx.value = foundGroup;
-    }
-  }
-  activeItemId.value = defaultId;
+  const initial = resolveInitialActiveSelection(props.media, collections.value);
+  activeCollectionIdx.value = initial.activeCollectionIdx;
+  activeItemId.value = initial.activeItemId;
 
-  // Pre-select preferred quality option for every ready item according to settings.qualityPreference
-  const nextOptionMap: Record<string, string> = {};
-  for (const item of props.media.items) {
-    if (readyItem(item)) {
-      const opts = buildSidePanelQualityOptions(
-        props.media,
-        item,
-        apiOrigin.value,
-      );
-      const preferred = selectPreferredQualityOption(
-        opts,
-        item,
-        props.settings.qualityPreference,
-        props.media,
-        apiOrigin.value,
-      );
-      if (preferred) {
-        nextOptionMap[item.id] = preferred.key;
-      }
-    }
-  }
-  selectedOptionKeyByItem.value = nextOptionMap;
-
-  // Default all checkable items to checked so 1-click saves the entire album / multi-P!
+  selectedOptionKeyByItem.value = buildPreferredOptionKeyMap({
+    items: props.media.items,
+    resolveOptions: buildQualityOptionsFor,
+    selectPreferred: (opts, item) => selectPreferredFor(opts, item),
+  });
   resetChecklistToAllChecked();
 }
 
-function resetChecklistToAllChecked() {
-  const next = new Set<string>();
-  for (const item of checklistPool.value) {
-    if (isItemCheckable(item)) {
-      next.add(item.id);
-    }
-  }
-  checkedIds.value = next;
-}
-
-// Re-initialize only when the logical work changes (not when lazy resolve mutates an episode in place)
 watch(
-  () =>
-    `${props.media.platform}:${props.media.content_id || ""}:${props.media.source_url || ""}:${props.media.generated_at || ""}`,
-  () => {
-    initSelectionForMedia();
-  },
+  () => buildMediaWorkWatchKey(props.media),
+  () => initSelectionForMedia(),
   { immediate: true },
 );
 
-// Re-apply quality preference when user updates default quality preference in Settings
 watch(
   () => props.settings.qualityPreference,
   (newPref) => {
-    const nextMap = { ...selectedOptionKeyByItem.value };
-    for (const item of props.media.items) {
-      if (readyItem(item)) {
-        const opts = buildSidePanelQualityOptions(
-          props.media,
-          item,
-          apiOrigin.value,
-        );
-        const preferred = selectPreferredQualityOption(
-          opts,
-          item,
-          newPref,
-          props.media,
-          apiOrigin.value,
-        );
-        if (preferred) {
-          nextMap[item.id] = preferred.key;
-        }
-      }
-    }
-    selectedOptionKeyByItem.value = nextMap;
+    selectedOptionKeyByItem.value = buildPreferredOptionKeyMap({
+      items: props.media.items,
+      resolveOptions: buildQualityOptionsFor,
+      selectPreferred: (opts, item) => selectPreferredFor(opts, item, newPref),
+      baseMap: selectedOptionKeyByItem.value,
+    });
   },
 );
 
@@ -274,38 +207,27 @@ function selectCollection(index: number) {
   if (activeCollectionIdx.value === index) return;
   activeCollectionIdx.value = index;
   const firstEp = visibleEpisodes.value[0];
-  if (firstEp) {
-    activeItemId.value = firstEp.id;
-  }
+  if (firstEp) activeItemId.value = firstEp.id;
   resetChecklistToAllChecked();
 }
 
-const activeItem = computed<MediaItem | null>(() => {
-  const found = props.media.items.find((it) => it.id === activeItemId.value);
-  return found ?? props.media.items[0] ?? null;
-});
+const activeItem = computed<MediaItem | null>(() =>
+  resolveActiveMediaItem(props.media.items, activeItemId.value),
+);
 
 const activeQualityOptions = computed<SidePanelQualityOption[]>(() =>
   buildSidePanelQualityOptions(props.media, activeItem.value, apiOrigin.value),
 );
 
-const activeSelectedOption = computed<SidePanelQualityOption | null>(() => {
-  const opts = activeQualityOptions.value;
-  if (!opts.length) return null;
-  const item = activeItem.value;
-  const savedKey = item ? selectedOptionKeyByItem.value[item.id] : undefined;
-  if (savedKey) {
-    const matched = opts.find((o) => o.key === savedKey);
-    if (matched) return matched;
-  }
-  return selectPreferredQualityOption(
-    opts,
-    item,
-    props.settings.qualityPreference,
-    props.media,
-    apiOrigin.value,
-  );
-});
+const activeSelectedOption = computed<SidePanelQualityOption | null>(() =>
+  resolveActiveQualitySelection({
+    options: activeQualityOptions.value,
+    item: activeItem.value,
+    selectedOptionKeyByItem: selectedOptionKeyByItem.value,
+    preference: props.settings.qualityPreference,
+    fallbackSelect: (opts, item, pref) => selectPreferredFor(opts, item, pref),
+  }),
+);
 
 function chooseQualityOption(opt: SidePanelQualityOption) {
   if (!activeItem.value || !opt.downloadable) return;
@@ -315,95 +237,25 @@ function chooseQualityOption(opt: SidePanelQualityOption) {
   };
 }
 
-// Inline preview URL resolution (prefers muxed playable preview stream for YouTube split 4K variants)
-const previewCoverUrl = computed<string>(() => {
-  const itemCover = safeSourceUrl(activeItem.value?.cover);
-  if (itemCover) return itemCover;
-  if (activeItem.value?.type === "image") {
-    const optRoutes = activeSelectedOption.value?.routes ?? [];
-    for (const candidate of optRoutes) {
-      const safe = safeAssetUrl(candidate);
-      if (safe) return safe;
-    }
-    const directImg = safeAssetUrl(activeSelectedOption.value?.directUrl || "");
-    if (directImg) return directImg;
-  }
-  if (activeItem.value?.type === "live_photo") {
-    for (const candidate of resolveLiveResourceRoutes(activeItem.value, "image")) {
-      const safe = safeAssetUrl(candidate);
-      if (safe) return safe;
-    }
-  }
-  const mediaCover = safeSourceUrl(props.media.cover);
-  if (mediaCover) return mediaCover;
-  return "";
-});
+const previewCoverUrl = computed<string>(() =>
+  resolvePreviewCoverUrl({
+    media: props.media,
+    activeItem: activeItem.value,
+    activeOption: activeSelectedOption.value,
+    ctx: targetContext.value,
+    brokenUrls: brokenUrls.value,
+  }),
+);
 
-const previewVideoCandidates = computed<string[]>(() => {
-  const item = activeItem.value;
-  if (!item) return [];
-  const collectUnique = (urls: string[]): string[] => {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const raw of urls) {
-      if (raw && !seen.has(raw)) {
-        seen.add(raw);
-        out.push(raw);
-      }
-    }
-    return out;
-  };
-
-  if (item.type === "live_photo") {
-    return collectUnique(resolveLiveResourceRoutes(item, "motion"));
-  }
-  if (item.type !== "video" && item.type !== "audio") return [];
-
-  const chosen = activeSelectedOption.value;
-  if (!chosen) return [];
-
-  // If the user selected a split adaptive/DASH mux option (YouTube muxPair or generic DASH dashMux),
-  // keep the top <video> stage bound to the best inline-playable `kind: "file"` stream (e.g. Bilibili durl or YouTube muxed)
-  if ((props.media.platform === "youtube" && chosen.muxPair) || chosen.isDashMux) {
-    const defaultVarId = readyItem(item) ? item.default?.variant_id : undefined;
-    const playableFileCandidates = activeQualityOptions.value.filter(
-      (o) =>
-        !o.isAudioOnly &&
-        !o.muxPair &&
-        !o.isDashMux &&
-        (props.media.platform === "youtube"
-          ? o.variant.metadata?.has_audio === true
-          : o.variant.metadata?.has_audio !== false) &&
-        o.downloadTarget.kind === "file" &&
-        (o.routes.length > 0 || Boolean(o.directUrl)),
-    );
-    const preferredDefault = defaultVarId
-      ? playableFileCandidates.find((o) => o.variant.id === defaultVarId)
-      : undefined;
-    const muxedPlayable = preferredDefault ?? playableFileCandidates[0];
-    if (muxedPlayable) {
-      return collectUnique(
-        muxedPlayable.routes.length > 0
-          ? muxedPlayable.routes
-          : muxedPlayable.directUrl
-            ? [muxedPlayable.directUrl]
-            : [],
-      );
-    }
-    return [];
-  }
-
-  if (chosen.downloadTarget.kind === "file") {
-    return collectUnique(
-      chosen.routes.length > 0
-        ? chosen.routes
-        : chosen.directUrl
-          ? [chosen.directUrl]
-          : [],
-    );
-  }
-  return [];
-});
+const previewVideoCandidates = computed<string[]>(() =>
+  resolvePreviewVideoCandidates({
+    platform: props.media.platform,
+    activeItem: activeItem.value,
+    activeOption: activeSelectedOption.value,
+    allOptions: activeQualityOptions.value,
+    ctx: targetContext.value,
+  }),
+);
 
 watch(
   [
@@ -416,14 +268,13 @@ watch(
   },
 );
 
-const previewVideoUrl = computed<string>(() => {
-  const candidates = previewVideoCandidates.value;
-  for (let i = previewVideoRouteIndex.value; i < candidates.length; i++) {
-    const candidate = safeAssetUrl(candidates[i]);
-    if (candidate) return candidate;
-  }
-  return "";
-});
+const previewVideoUrl = computed<string>(() =>
+  pickActivePreviewVideoUrl(
+    previewVideoCandidates.value,
+    previewVideoRouteIndex.value,
+    brokenUrls.value,
+  ),
+);
 
 function handlePreviewVideoError(event?: Event) {
   const target = event?.currentTarget as
@@ -432,18 +283,15 @@ function handlePreviewVideoError(event?: Event) {
     | undefined;
   const failedUrl =
     target?.getAttribute?.("src") || target?.src || previewVideoUrl.value;
-  if (!failedUrl) return;
-  markUrlBroken(failedUrl);
-  const candidates = previewVideoCandidates.value;
-  const currentIdx = candidates.indexOf(failedUrl);
-  if (currentIdx >= 0) {
-    previewVideoRouteIndex.value = Math.max(
-      previewVideoRouteIndex.value,
-      currentIdx + 1,
-    );
-  } else if (failedUrl === previewVideoUrl.value) {
-    previewVideoRouteIndex.value += 1;
-  }
+  const next = advancePreviewVideoRouteOnError({
+    failedUrl,
+    currentPreviewUrl: previewVideoUrl.value,
+    candidates: previewVideoCandidates.value,
+    routeIndex: previewVideoRouteIndex.value,
+    brokenUrls: brokenUrls.value,
+  });
+  brokenUrls.value = next.brokenUrls;
+  previewVideoRouteIndex.value = next.nextRouteIndex;
 }
 
 const durationLabel = computed(() =>
@@ -452,46 +300,28 @@ const durationLabel = computed(() =>
       activeSelectedOption.value?.variant.metadata?.duration_ms,
   ),
 );
-
 const platformBadgeText = computed(() =>
   formatPlatformDisplayName(props.media.platform),
 );
-
 const singlePrimaryCtaText = computed(() =>
   buildPrimarySingleCtaLabel({
     item: activeItem.value,
     option: activeSelectedOption.value,
   }),
 );
-
 const isDashMuxSelected = computed<boolean>(() =>
   Boolean(activeSelectedOption.value?.isDashMux),
 );
-
-const directCopyCandidateUrl = computed<string>(() => {
-  if (isDashMuxSelected.value) {
-    return "";
-  }
-  const opt = activeSelectedOption.value;
-  if (opt?.copyUrl) {
-    return opt.copyUrl;
-  }
-  if (opt?.directUrl) {
-    return opt.directUrl;
-  }
-  if (activeItem.value?.type === "live_photo") {
-    return (
-      resolveLiveResourceUrl(activeItem.value, "motion", copyTargetContext.value) ||
-      resolveLiveResourceUrl(activeItem.value, "image", copyTargetContext.value)
-    );
-  }
-  return props.media.source_url || "";
-});
-
+const directCopyCandidateUrl = computed<string>(() =>
+  resolveDirectCopyCandidateUrl({
+    media: props.media,
+    activeItem: activeItem.value,
+    activeOption: activeSelectedOption.value,
+    copyCtx: copyTargetContext.value,
+  }),
+);
 const directCopyButtonTitle = computed<string>(() =>
-  isDashMuxSelected.value
-    ? "音视频分离流需经扩展无损合流"
-    : "复制当前选中画质直链到剪贴板",
+  resolveDirectCopyButtonTitle(isDashMuxSelected.value),
 );
 
 async function handleCopyDirectLink() {
@@ -518,9 +348,7 @@ async function handleCopyExternalOptionUrl(opt: SidePanelQualityOption) {
     copiedOptionKey.value = opt.key;
     if (copyOptionResetTimer) clearTimeout(copyOptionResetTimer);
     copyOptionResetTimer = setTimeout(() => {
-      if (copiedOptionKey.value === opt.key) {
-        copiedOptionKey.value = "";
-      }
+      if (copiedOptionKey.value === opt.key) copiedOptionKey.value = "";
     }, 1800);
     emit("notify", { message: "直链已复制到剪贴板", tone: "success" });
   } else {
@@ -542,9 +370,7 @@ function handleSinglePrimaryDownload() {
         livePhotoFilter: livePhotoFilter.value,
         workFingerprint: props.workFingerprint,
       });
-      if (items.length > 0) {
-        emit("enqueue-downloads", { items });
-      }
+      if (items.length > 0) emit("enqueue-downloads", { items });
     } catch (err) {
       emit("notify", {
         message: err instanceof Error ? err.message : "构建下载任务失败",
@@ -572,108 +398,24 @@ function handleSinglePrimaryDownload() {
   }
 }
 
-// ============================================================================
-// Album / LivePhoto / Multi-P / Mixed Helpers
-// ============================================================================
-
-function resolveLiveResourceRoutes(
-  item: MediaItem,
-  role: "image" | "motion",
-  ctx = targetContext.value,
-): string[] {
-  if (!readyItem(item)) return [];
-  const pairVar = item.variants.find(
-    (v): v is ReadyVariant => readyVariant(v) && v.delivery.kind === "pair",
-  );
-  if (!pairVar || pairVar.delivery.kind !== "pair") return [];
-  const res = pairVar.delivery.resources.find((r) =>
-    role === "motion" ? r.role === "motion" || r.role === "video" : r.role === "image",
-  );
-  const src = res ? resourceSource(res, ctx) : undefined;
-  if (!src) return [];
-  try {
-    return sourceRoutes(src, ctx);
-  } catch {
-    return [];
-  }
+function resolveSafeLiveResourceUrl(item: MediaItem, role: "image" | "motion"): string {
+  return resolveSafeLivePhotoResourceUrl(item, role, targetContext.value, brokenUrls.value);
 }
 
-function resolveLiveResourceUrl(
-  item: MediaItem,
-  role: "image" | "motion",
-  ctx = targetContext.value,
-): string {
-  const routes = resolveLiveResourceRoutes(item, role, ctx);
-  if (routes.length > 0) return routes[0];
-  return "";
-}
-
-function resolveSafeLiveResourceUrl(
-  item: MediaItem,
-  role: "image" | "motion",
-): string {
-  for (const candidate of resolveLiveResourceRoutes(item, role)) {
-    const safe = safeAssetUrl(candidate);
-    if (safe) return safe;
-  }
-  return "";
-}
-
-function mixedItemTypeBadge(item: MediaItem): {
-  text: string;
-  tone: "video" | "image" | "live" | "audio";
-} {
-  if (item.type === "live_photo") {
-    return { text: "LIVE", tone: "live" };
-  }
-  if (item.type === "image") {
-    return { text: "图片", tone: "image" };
-  }
-  if (item.type === "audio") {
-    return { text: "音频", tone: "audio" };
-  }
-  return { text: "视频", tone: "video" };
+function mixedItemTypeBadge(item: MediaItem) {
+  return resolveMixedItemTypeBadge(item);
 }
 
 function mixedItemDisplayTitle(item: MediaItem, idx: number): string {
-  const rawTitle = item.title?.trim();
-  if (rawTitle && rawTitle !== props.media.title?.trim()) {
-    return rawTitle;
-  }
-  if (item.type === "live_photo") return `实况照片 #${idx + 1}`;
-  if (item.type === "image") return `高清图片 #${idx + 1}`;
-  if (item.type === "audio") return `独立音频 #${idx + 1}`;
-  return `视频片段 #${idx + 1}`;
+  return resolveMixedItemDisplayTitle(item, idx, props.media.title);
 }
 
 function resolveAlbumThumbUrl(item: MediaItem): string {
-  const cover = safeSourceUrl(item.cover);
-  if (cover) return cover;
-  if (item.type === "live_photo") {
-    return resolveSafeLiveResourceUrl(item, "image");
-  }
-  if (readyItem(item)) {
-    const target = getDownloadTarget(item, null, targetContext.value);
-    if (target.kind === "file") {
-      for (const candidate of target.routes) {
-        const safe = safeAssetUrl(candidate);
-        if (safe) return safe;
-      }
-      return safeAssetUrl(target.url);
-    }
-  }
-  return "";
+  return resolveAlbumThumbnailUrl(item, targetContext.value, brokenUrls.value);
 }
 
 function toggleCheckItem(item: MediaItem) {
-  if (!isItemCheckable(item)) return;
-  const next = new Set(checkedIds.value);
-  if (next.has(item.id)) {
-    next.delete(item.id);
-  } else {
-    next.add(item.id);
-  }
-  checkedIds.value = next;
+  checkedIds.value = toggleChecklistItemId(checkedIds.value, item);
 }
 
 function selectAllChecklist() {
@@ -681,32 +423,20 @@ function selectAllChecklist() {
 }
 
 function invertChecklist() {
-  const next = new Set<string>();
-  for (const item of checklistPool.value) {
-    if (isItemCheckable(item) && !checkedIds.value.has(item.id)) {
-      next.add(item.id);
-    }
-  }
-  checkedIds.value = next;
+  checkedIds.value = invertChecklistIdSet(checklistPool.value, checkedIds.value);
 }
 
-const checkedCount = computed(() => {
-  let count = 0;
-  for (const item of checklistPool.value) {
-    if (checkedIds.value.has(item.id)) count++;
-  }
-  return count;
-});
-
+const checklistSummary = computed(() =>
+  summarizeChecklistSelection(checklistPool.value, checkedIds.value),
+);
+const checkedCount = computed(() => checklistSummary.value.checkedCount);
 const checkableTotalCount = computed(
-  () => checklistPool.value.filter((it) => isItemCheckable(it)).length,
+  () => checklistSummary.value.checkableTotalCount,
 );
 
 function requestLazyResolvePromise(item: MediaItem): Promise<MediaItem | null> {
   return new Promise((resolve) => {
-    emit("request-resolve-item", item, (resolved) => {
-      resolve(resolved);
-    });
+    emit("request-resolve-item", item, (resolved) => resolve(resolved));
   });
 }
 
@@ -715,18 +445,7 @@ async function handleSelectEpisode(item: MediaItem) {
   if (item.state === "deferred" && item.resolve_url) {
     const resolved = await requestLazyResolvePromise(item);
     if (resolved && readyItem(resolved)) {
-      const opts = buildSidePanelQualityOptions(
-        props.media,
-        resolved,
-        apiOrigin.value,
-      );
-      const preferred = selectPreferredQualityOption(
-        opts,
-        resolved,
-        props.settings.qualityPreference,
-        props.media,
-        apiOrigin.value,
-      );
+      const preferred = selectPreferredFor(buildQualityOptionsFor(resolved), resolved);
       if (preferred) {
         selectedOptionKeyByItem.value = {
           ...selectedOptionKeyByItem.value,
@@ -742,31 +461,14 @@ function openAlbumPreview(item: MediaItem) {
   previewLiveMode.value = item.type === "live_photo" ? "motion" : "image";
 }
 
-const selectedChecklistEntries = computed<ChecklistItemSelectionEntry[]>(() => {
-  const list = checklistPool.value;
-  const out: ChecklistItemSelectionEntry[] = [];
-  for (let i = 0; i < list.length; i++) {
-    const item = list[i];
-    if (!checkedIds.value.has(item.id)) continue;
-    let explicitOption: SidePanelQualityOption | null = null;
-    if (readyItem(item) && selectedOptionKeyByItem.value[item.id]) {
-      const opts = buildSidePanelQualityOptions(
-        props.media,
-        item,
-        apiOrigin.value,
-      );
-      explicitOption =
-        opts.find((o) => o.key === selectedOptionKeyByItem.value[item.id]) ??
-        null;
-    }
-    out.push({
-      item,
-      ordinalIndex: i + 1,
-      explicitOption,
-    });
-  }
-  return out;
-});
+const selectedChecklistEntries = computed<ChecklistItemSelectionEntry[]>(() =>
+  buildSelectedChecklistEntries(
+    checklistPool.value,
+    checkedIds.value,
+    selectedOptionKeyByItem.value,
+    buildQualityOptionsFor,
+  ),
+);
 
 const batchPrimaryCtaLabel = computed(() =>
   buildBatchPrimaryCtaLabel({
@@ -780,9 +482,7 @@ const zipPreviewDecision = computed(() => {
   const readyEntries = selectedChecklistEntries.value.filter((e) =>
     readyItem(e.item),
   );
-  if (!readyEntries.length) {
-    return { ok: true as const, reason: "" };
-  }
+  if (!readyEntries.length) return { ok: true as const, reason: "" };
   const res = buildChecklistZipEnqueueItem({
     media: props.media,
     entries: readyEntries,
@@ -795,7 +495,11 @@ const zipPreviewDecision = computed(() => {
 });
 
 const effectiveSaveMode = computed<BatchSaveMode>(() =>
-  saveMode.value === "zip" && zipPreviewDecision.value.ok ? "zip" : "subfolder",
+  resolveEffectiveBatchSaveMode(saveMode.value, zipPreviewDecision.value),
+);
+
+const zipModeTooltip = computed<string>(() =>
+  resolveZipModeTooltip(layoutKind.value, zipPreviewDecision.value),
 );
 
 async function handleBatchPrimaryDownload() {
@@ -815,31 +519,19 @@ async function prepareResolvedChecklistEntries(): Promise<
     return null;
   }
 
-  const deferredList = rawEntries.filter(
-    (e) => e.item.state === "deferred" && Boolean(e.item.resolve_url),
-  );
-
+  const deferredList = filterDeferredResolvableEntries(rawEntries);
   const resolvedById = new Map<string, MediaItem>();
   if (deferredList.length > 0) {
     batchPreparingProgress.value = { current: 0, total: deferredList.length };
     try {
       for (let i = 0; i < deferredList.length; i++) {
-        batchPreparingProgress.value = {
-          current: i + 1,
-          total: deferredList.length,
-        };
+        batchPreparingProgress.value = { current: i + 1, total: deferredList.length };
         const deferredItem = deferredList[i].item;
         const resolved = await requestLazyResolvePromise(deferredItem);
         if (resolved && readyItem(resolved)) {
-          const originalResolveUrl =
-            deferredItem.state !== "unavailable"
-              ? deferredItem.resolve_url
-              : undefined;
           resolvedById.set(
             resolved.id,
-            !resolved.resolve_url && originalResolveUrl
-              ? { ...resolved, resolve_url: originalResolveUrl }
-              : resolved,
+            preserveOriginalResolveUrl(deferredItem, resolved),
           );
         }
       }
@@ -847,16 +539,7 @@ async function prepareResolvedChecklistEntries(): Promise<
       batchPreparingProgress.value = null;
     }
   }
-
-  return rawEntries
-    .map((entry) => {
-      const updatedItem = resolvedById.get(entry.item.id) ?? entry.item;
-      return {
-        ...entry,
-        item: updatedItem,
-      };
-    })
-    .filter((entry) => readyItem(entry.item));
+  return mergeResolvedChecklistEntries(rawEntries, resolvedById);
 }
 
 async function handleBatchSubfolderSave() {
@@ -867,8 +550,7 @@ async function handleBatchSubfolderSave() {
     return;
   }
 
-  // Stream multi-P or deferred checklists in background via ENQUEUE_MULTIPART_ITEMS without blocking SidePanel
-  if (layoutKind.value === "multi_video" || rawEntries.some((e) => e.item.state === "deferred")) {
+  if (shouldStreamBatchViaMultiPart(layoutKind.value, rawEntries)) {
     try {
       const req = buildChecklistMultiPartRequest({
         media: props.media, entries: rawEntries, totalCount: checklistPool.value.length,
@@ -1093,137 +775,238 @@ async function handleBatchZipSave() {
       </div>
     </div>
 
-    <!-- Pixiv-Style Album / LivePhoto Checklist Grid -->
-    <div v-if="layoutKind === 'album'" class="sp-panel-card">
-      <!-- 3-Way Live Photo Mode Pill Selector -->
-      <div v-if="hasLivePhotos" class="sp-live-bar">
+    <!-- Unified Multi-Item Checklist Card (Album / Multi-Video / Mixed Carousel) -->
+    <div v-if="layoutKind !== 'single'" class="sp-panel-card">
+      <!-- 3-Way Live Photo Mode Pill Selector (Album & Mixed) -->
+      <div v-if="(layoutKind === 'album' || layoutKind === 'mixed') && hasLivePhotos" class="sp-live-bar">
         <span class="sp-live-bar__label">实况保存：</span>
         <div class="sp-live-pills" role="radiogroup" aria-label="实况照片保存模式">
           <button
+            v-for="opt in LIVE_PHOTO_FILTER_OPTIONS"
+            :key="opt.value"
             type="button"
             class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'both' }"
-            @click="livePhotoFilter = 'both'"
+            :class="{ 'sp-live-pill--on': livePhotoFilter === opt.value }"
+            @click="livePhotoFilter = opt.value"
           >
-            实况视频+封面全下
-          </button>
-          <button
-            type="button"
-            class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'motion' }"
-            @click="livePhotoFilter = 'motion'"
-          >
-            仅实况视频
-          </button>
-          <button
-            type="button"
-            class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'image' }"
-            @click="livePhotoFilter = 'image'"
-          >
-            仅静态图
+            {{ opt.label }}
           </button>
         </div>
       </div>
 
-      <!-- Checklist Header -->
-      <div class="sp-checklist-hd">
-        <div class="sp-checklist-hd__title">
-          <span>勾选要保存的条目</span>
-          <span class="sp-checklist-hd__count">
-            {{ checkedCount }} / {{ checkableTotalCount }}
-          </span>
-        </div>
-        <div class="sp-checklist-hd__btns">
-          <button type="button" class="sp-mini-link" @click="selectAllChecklist">
-            全选
-          </button>
-          <button type="button" class="sp-mini-link" @click="invertChecklist">
-            反选
-          </button>
-        </div>
-      </div>
-
-      <!-- Thumbnail Grid -->
-      <div
-        class="sp-thumb-grid"
-        :class="{
-          'sp-thumb-grid--single': albumItems.length === 1,
-          'sp-thumb-grid--two': albumItems.length === 2,
-        }"
-      >
-        <div
-          v-for="(item, idx) in albumItems"
-          :key="item.id"
-          class="sp-thumb-cell"
-          :class="{ 'sp-thumb-cell--checked': checkedIds.has(item.id) }"
-          @click="toggleCheckItem(item)"
-        >
-          <img
-            v-if="resolveAlbumThumbUrl(item)"
-            :src="resolveAlbumThumbUrl(item)"
-            :alt="`图集第 ${idx + 1} 项`"
-            referrerpolicy="no-referrer"
-            loading="lazy"
-            class="sp-thumb-cell__img"
-            @error="markUrlBroken(resolveAlbumThumbUrl(item))"
-          />
-          <div v-else class="sp-thumb-cell__fallback">
-            #{{ String(idx + 1).padStart(2, "0") }}
+      <!-- Pixiv-Style Album / LivePhoto Checklist Grid -->
+      <template v-if="layoutKind === 'album'">
+        <div class="sp-checklist-hd">
+          <div class="sp-checklist-hd__title">
+            <span>勾选要保存的条目</span>
+            <span class="sp-checklist-hd__count">
+              {{ checkedCount }} / {{ checkableTotalCount }}
+            </span>
           </div>
+          <div class="sp-checklist-hd__btns">
+            <button type="button" class="sp-mini-link" @click="selectAllChecklist">全选</button>
+            <button type="button" class="sp-mini-link" @click="invertChecklist">反选</button>
+          </div>
+        </div>
 
-          <span class="sp-thumb-cell__idx">
-            {{ String(idx + 1).padStart(2, "0") }}
-          </span>
-
-          <span v-if="item.type === 'live_photo'" class="sp-thumb-cell__live">
-            LIVE
-          </span>
-
-          <span
-            class="sp-thumb-cell__check"
-            :class="{ 'sp-thumb-cell__check--on': checkedIds.has(item.id) }"
-            role="checkbox"
-            :aria-checked="checkedIds.has(item.id)"
+        <div
+          class="sp-thumb-grid"
+          :class="{
+            'sp-thumb-grid--single': albumItems.length === 1,
+            'sp-thumb-grid--two': albumItems.length === 2,
+          }"
+        >
+          <div
+            v-for="(item, idx) in albumItems"
+            :key="item.id"
+            class="sp-thumb-cell"
+            :class="{ 'sp-thumb-cell--checked': checkedIds.has(item.id) }"
+            @click="toggleCheckItem(item)"
           >
-            <svg
-              v-if="checkedIds.has(item.id)"
-              viewBox="0 0 16 16"
-              width="11"
-              height="11"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
+            <img
+              v-if="resolveAlbumThumbUrl(item)"
+              :src="resolveAlbumThumbUrl(item)"
+              :alt="`图集第 ${idx + 1} 项`"
+              referrerpolicy="no-referrer"
+              loading="lazy"
+              class="sp-thumb-cell__img"
+              @error="markUrlBroken(resolveAlbumThumbUrl(item))"
+            />
+            <div v-else class="sp-thumb-cell__fallback">
+              #{{ String(idx + 1).padStart(2, "0") }}
+            </div>
+
+            <span class="sp-thumb-cell__idx">{{ String(idx + 1).padStart(2, "0") }}</span>
+            <span v-if="item.type === 'live_photo'" class="sp-thumb-cell__live">LIVE</span>
+            <span
+              class="sp-thumb-cell__check"
+              :class="{ 'sp-thumb-cell__check--on': checkedIds.has(item.id) }"
+              role="checkbox"
+              :aria-checked="checkedIds.has(item.id)"
             >
-              <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
-            </svg>
-          </span>
+              <svg v-if="checkedIds.has(item.id)" viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
+              </svg>
+            </span>
 
+            <button
+              type="button"
+              class="sp-thumb-cell__zoom"
+              title="放大预览"
+              aria-label="放大预览"
+              @click.stop="openAlbumPreview(item)"
+            >
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="7" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- Bilibili Multi-P / Collection Episode Checklist -->
+      <template v-else-if="layoutKind === 'multi_video'">
+        <div v-if="collections.length > 1" class="sp-collection-tabs">
           <button
+            v-for="(col, idx) in collections"
+            :key="col.id"
             type="button"
-            class="sp-thumb-cell__zoom"
-            title="放大预览"
-            aria-label="放大预览"
-            @click.stop="openAlbumPreview(item)"
+            class="sp-collection-tab"
+            :class="{ 'sp-collection-tab--on': activeCollectionIdx === idx }"
+            @click="selectCollection(idx)"
           >
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="11" cy="11" r="7" />
-              <line x1="21" y1="21" x2="16.65" y2="16.65" />
-            </svg>
+            {{ col.title || `合集 ${idx + 1}` }}
           </button>
         </div>
-      </div>
+
+        <div class="sp-checklist-hd">
+          <div class="sp-checklist-hd__title">
+            <span>分P / 剧集列表</span>
+            <span class="sp-checklist-hd__count">已选 {{ checkedCount }} / {{ checkableTotalCount }}</span>
+          </div>
+          <div class="sp-checklist-hd__btns">
+            <button type="button" class="sp-mini-link" @click="selectAllChecklist">全选</button>
+            <button type="button" class="sp-mini-link" @click="invertChecklist">反选</button>
+          </div>
+        </div>
+
+        <div class="sp-ep-list">
+          <div
+            v-for="(ep, idx) in visibleEpisodes"
+            :key="ep.id"
+            class="sp-ep-row"
+            :class="{
+              'sp-ep-row--active': activeItem?.id === ep.id,
+              'sp-ep-row--disabled': ep.state === 'unavailable',
+            }"
+          >
+            <button
+              type="button"
+              class="sp-ep-row__check"
+              :class="{ 'sp-ep-row__check--on': checkedIds.has(ep.id) }"
+              :disabled="ep.state === 'unavailable'"
+              role="checkbox"
+              :aria-checked="checkedIds.has(ep.id)"
+              @click.stop="toggleCheckItem(ep)"
+            >
+              <svg v-if="checkedIds.has(ep.id)" viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
+              </svg>
+            </button>
+
+            <button
+              type="button"
+              class="sp-ep-row__body"
+              :disabled="ep.state === 'unavailable'"
+              @click="handleSelectEpisode(ep)"
+            >
+              <span class="sp-ep-row__p">P{{ ep.index ?? idx + 1 }}</span>
+              <span class="sp-ep-row__title sp-truncate-1">{{ ep.title || `第 ${idx + 1} 集` }}</span>
+              <span v-if="resolvingItemIds.has(ep.id)" class="sp-ep-row__tag sp-ep-row__tag--loading">解析中...</span>
+              <span v-else-if="ep.state === 'deferred'" class="sp-ep-row__tag sp-ep-row__tag--lazy" title="点击预览或直接批量下载时自动按需解析">按需解析</span>
+              <span v-else-if="ep.state === 'unavailable'" class="sp-ep-row__tag sp-ep-row__tag--err">不可用</span>
+              <span v-else-if="ep.duration_ms" class="sp-ep-row__dur">{{ formatDurationMs(ep.duration_ms) }}</span>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- Mixed Image + Video Carousel Checklist (e.g. Instagram Carousels & X Mixed Tweets) -->
+      <template v-else-if="layoutKind === 'mixed'">
+        <div class="sp-checklist-hd">
+          <div class="sp-checklist-hd__title">
+            <span>混排条目列表</span>
+            <span class="sp-checklist-hd__count">已选 {{ checkedCount }} / {{ checkableTotalCount }}</span>
+          </div>
+          <div class="sp-checklist-hd__btns">
+            <button type="button" class="sp-mini-link" @click="selectAllChecklist">全选</button>
+            <button type="button" class="sp-mini-link" @click="invertChecklist">反选</button>
+          </div>
+        </div>
+
+        <div class="sp-ep-list sp-mixed-list">
+          <div
+            v-for="(item, idx) in checklistPool"
+            :key="item.id"
+            class="sp-ep-row sp-mixed-row"
+            :class="{
+              'sp-ep-row--active': activeItem?.id === item.id,
+              'sp-ep-row--disabled': item.state === 'unavailable',
+            }"
+          >
+            <button
+              type="button"
+              class="sp-ep-row__check"
+              :class="{ 'sp-ep-row__check--on': checkedIds.has(item.id) }"
+              :disabled="item.state === 'unavailable'"
+              role="checkbox"
+              :aria-checked="checkedIds.has(item.id)"
+              @click.stop="toggleCheckItem(item)"
+            >
+              <svg v-if="checkedIds.has(item.id)" viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
+              </svg>
+            </button>
+
+            <button
+              type="button"
+              class="sp-ep-row__body sp-mixed-row__body"
+              :disabled="item.state === 'unavailable'"
+              @click="handleSelectEpisode(item)"
+            >
+              <span class="sp-mixed-row__thumb">
+                <img
+                  v-if="resolveAlbumThumbUrl(item)"
+                  :src="resolveAlbumThumbUrl(item)"
+                  :alt="`第 ${idx + 1} 项缩略图`"
+                  referrerpolicy="no-referrer"
+                  loading="lazy"
+                  class="sp-mixed-row__thumb-img"
+                  @error="markUrlBroken(resolveAlbumThumbUrl(item))"
+                />
+                <span v-else class="sp-mixed-row__thumb-idx">{{ String(idx + 1).padStart(2, "0") }}</span>
+              </span>
+
+              <span class="sp-ep-row__p">{{ String(idx + 1).padStart(2, "0") }}</span>
+              <span class="sp-mixed-type" :class="`sp-mixed-type--${mixedItemTypeBadge(item).tone}`">
+                {{ mixedItemTypeBadge(item).text }}
+              </span>
+              <span class="sp-ep-row__title sp-truncate-1">{{ mixedItemDisplayTitle(item, idx) }}</span>
+
+              <span v-if="resolvingItemIds.has(item.id)" class="sp-ep-row__tag sp-ep-row__tag--loading">解析中...</span>
+              <span v-else-if="item.state === 'deferred'" class="sp-ep-row__tag sp-ep-row__tag--lazy">按需解析</span>
+              <span v-else-if="item.state === 'unavailable'" class="sp-ep-row__tag sp-ep-row__tag--err">不可用</span>
+              <span v-else-if="item.duration_ms" class="sp-ep-row__dur">{{ formatDurationMs(item.duration_ms) }}</span>
+            </button>
+          </div>
+        </div>
+      </template>
 
       <!-- Compact Save-Mode Toggle + Unified Primary Download Action -->
       <div class="sp-batch-actions">
         <div class="sp-save-mode-row">
-          <div
-            class="sp-save-mode-pills"
-            role="radiogroup"
-            aria-label="批量保存方式"
-          >
+          <div class="sp-save-mode-pills" role="radiogroup" aria-label="批量保存方式">
             <button
               type="button"
               role="radio"
@@ -1244,383 +1027,7 @@ async function handleBatchZipSave() {
               :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
               data-save-mode="zip"
               :disabled="!zipPreviewDecision.ok"
-              :title="
-                zipPreviewDecision.ok
-                  ? '将已选条目无压缩打包为单个 ZIP 文件保存'
-                  : zipPreviewDecision.reason
-              "
-              @click="saveMode = 'zip'"
-            >
-              打包 ZIP
-            </button>
-          </div>
-
-          <button
-            type="button"
-            class="sp-btn sp-btn--ghost sp-btn--xs sp-save-mode-row__copy"
-            :disabled="!directCopyCandidateUrl"
-            :title="directCopyButtonTitle"
-            @click="handleCopyDirectLink"
-          >
-            {{ copiedDirectLink ? "已复制" : "复制直链" }}
-          </button>
-        </div>
-
-        <button
-          type="button"
-          class="sp-btn sp-btn--primary sp-batch-actions__primary"
-          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
-          @click="handleBatchPrimaryDownload"
-        >
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-            <polyline points="7 10 12 15 17 10" />
-            <line x1="12" y1="15" x2="12" y2="3" />
-          </svg>
-          <span class="sp-truncate-1">{{ batchPrimaryCtaLabel }}</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- Bilibili Multi-P / Collection Episode Checklist -->
-    <div v-if="layoutKind === 'multi_video'" class="sp-panel-card">
-      <!-- Collection Switcher Tabs -->
-      <div v-if="collections.length > 1" class="sp-collection-tabs">
-        <button
-          v-for="(col, idx) in collections"
-          :key="col.id"
-          type="button"
-          class="sp-collection-tab"
-          :class="{ 'sp-collection-tab--on': activeCollectionIdx === idx }"
-          @click="selectCollection(idx)"
-        >
-          {{ col.title || `合集 ${idx + 1}` }}
-        </button>
-      </div>
-
-      <div class="sp-checklist-hd">
-        <div class="sp-checklist-hd__title">
-          <span>分P / 剧集列表</span>
-          <span class="sp-checklist-hd__count">
-            已选 {{ checkedCount }} / {{ checkableTotalCount }}
-          </span>
-        </div>
-        <div class="sp-checklist-hd__btns">
-          <button type="button" class="sp-mini-link" @click="selectAllChecklist">
-            全选
-          </button>
-          <button type="button" class="sp-mini-link" @click="invertChecklist">
-            反选
-          </button>
-        </div>
-      </div>
-
-      <div class="sp-ep-list">
-        <div
-          v-for="(ep, idx) in visibleEpisodes"
-          :key="ep.id"
-          class="sp-ep-row"
-          :class="{
-            'sp-ep-row--active': activeItem?.id === ep.id,
-            'sp-ep-row--disabled': ep.state === 'unavailable',
-          }"
-        >
-          <button
-            type="button"
-            class="sp-ep-row__check"
-            :class="{ 'sp-ep-row__check--on': checkedIds.has(ep.id) }"
-            :disabled="ep.state === 'unavailable'"
-            role="checkbox"
-            :aria-checked="checkedIds.has(ep.id)"
-            @click.stop="toggleCheckItem(ep)"
-          >
-            <svg
-              v-if="checkedIds.has(ep.id)"
-              viewBox="0 0 16 16"
-              width="10"
-              height="10"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
-            </svg>
-          </button>
-
-          <button
-            type="button"
-            class="sp-ep-row__body"
-            :disabled="ep.state === 'unavailable'"
-            @click="handleSelectEpisode(ep)"
-          >
-            <span class="sp-ep-row__p">P{{ ep.index ?? idx + 1 }}</span>
-            <span class="sp-ep-row__title sp-truncate-1">
-              {{ ep.title || `第 ${idx + 1} 集` }}
-            </span>
-            <span v-if="resolvingItemIds.has(ep.id)" class="sp-ep-row__tag sp-ep-row__tag--loading">
-              解析中...
-            </span>
-            <span
-              v-else-if="ep.state === 'deferred'"
-              class="sp-ep-row__tag sp-ep-row__tag--lazy"
-              title="点击预览或直接批量下载时自动按需解析"
-            >
-              按需解析
-            </span>
-            <span
-              v-else-if="ep.state === 'unavailable'"
-              class="sp-ep-row__tag sp-ep-row__tag--err"
-            >
-              不可用
-            </span>
-            <span v-else-if="ep.duration_ms" class="sp-ep-row__dur">
-              {{ formatDurationMs(ep.duration_ms) }}
-            </span>
-          </button>
-        </div>
-      </div>
-
-      <!-- Compact Save-Mode Toggle + Unified Primary Download Action for Multi-Video -->
-      <div class="sp-batch-actions">
-        <div class="sp-save-mode-row">
-          <div
-            class="sp-save-mode-pills"
-            role="radiogroup"
-            aria-label="批量保存方式"
-          >
-            <button
-              type="button"
-              role="radio"
-              :aria-checked="effectiveSaveMode === 'subfolder'"
-              class="sp-save-mode-pill"
-              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'subfolder' }"
-              data-save-mode="subfolder"
-              title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
-              @click="saveMode = 'subfolder'"
-            >
-              存子文件夹
-            </button>
-            <button
-              type="button"
-              role="radio"
-              :aria-checked="effectiveSaveMode === 'zip'"
-              class="sp-save-mode-pill"
-              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
-              data-save-mode="zip"
-              :disabled="!zipPreviewDecision.ok"
-              :title="
-                zipPreviewDecision.ok
-                  ? '将已选分P打包为单个 ZIP 文件（500 MB 以内）'
-                  : zipPreviewDecision.reason
-              "
-              @click="saveMode = 'zip'"
-            >
-              打包 ZIP
-            </button>
-          </div>
-
-          <button
-            type="button"
-            class="sp-btn sp-btn--ghost sp-btn--xs sp-save-mode-row__copy"
-            :disabled="!directCopyCandidateUrl"
-            :title="directCopyButtonTitle"
-            @click="handleCopyDirectLink"
-          >
-            {{ copiedDirectLink ? "已复制" : "复制直链" }}
-          </button>
-        </div>
-
-        <button
-          type="button"
-          class="sp-btn sp-btn--primary sp-batch-actions__primary"
-          :disabled="checkedCount === 0 || Boolean(batchPreparingProgress)"
-          @click="handleBatchPrimaryDownload"
-        >
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-            <polyline points="7 10 12 15 17 10" />
-            <line x1="12" y1="15" x2="12" y2="3" />
-          </svg>
-          <span class="sp-truncate-1">{{ batchPrimaryCtaLabel }}</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- Mixed Image + Video Carousel Checklist (e.g. Instagram Carousels & X Mixed Tweets) -->
-    <div v-if="layoutKind === 'mixed'" class="sp-panel-card">
-      <div v-if="hasLivePhotos" class="sp-live-bar">
-        <span class="sp-live-bar__label">实况保存：</span>
-        <div class="sp-live-pills" role="radiogroup" aria-label="实况照片保存模式">
-          <button
-            type="button"
-            class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'both' }"
-            @click="livePhotoFilter = 'both'"
-          >
-            实况视频+封面全下
-          </button>
-          <button
-            type="button"
-            class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'motion' }"
-            @click="livePhotoFilter = 'motion'"
-          >
-            仅实况视频
-          </button>
-          <button
-            type="button"
-            class="sp-live-pill"
-            :class="{ 'sp-live-pill--on': livePhotoFilter === 'image' }"
-            @click="livePhotoFilter = 'image'"
-          >
-            仅静态图
-          </button>
-        </div>
-      </div>
-
-      <div class="sp-checklist-hd">
-        <div class="sp-checklist-hd__title">
-          <span>混排条目列表</span>
-          <span class="sp-checklist-hd__count">
-            已选 {{ checkedCount }} / {{ checkableTotalCount }}
-          </span>
-        </div>
-        <div class="sp-checklist-hd__btns">
-          <button type="button" class="sp-mini-link" @click="selectAllChecklist">
-            全选
-          </button>
-          <button type="button" class="sp-mini-link" @click="invertChecklist">
-            反选
-          </button>
-        </div>
-      </div>
-
-      <div class="sp-ep-list sp-mixed-list">
-        <div
-          v-for="(item, idx) in checklistPool"
-          :key="item.id"
-          class="sp-ep-row sp-mixed-row"
-          :class="{
-            'sp-ep-row--active': activeItem?.id === item.id,
-            'sp-ep-row--disabled': item.state === 'unavailable',
-          }"
-        >
-          <button
-            type="button"
-            class="sp-ep-row__check"
-            :class="{ 'sp-ep-row__check--on': checkedIds.has(item.id) }"
-            :disabled="item.state === 'unavailable'"
-            role="checkbox"
-            :aria-checked="checkedIds.has(item.id)"
-            @click.stop="toggleCheckItem(item)"
-          >
-            <svg
-              v-if="checkedIds.has(item.id)"
-              viewBox="0 0 16 16"
-              width="10"
-              height="10"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.4"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            >
-              <polyline points="3.5 8.5 6.5 11.5 12.5 4.5" />
-            </svg>
-          </button>
-
-          <button
-            type="button"
-            class="sp-ep-row__body sp-mixed-row__body"
-            :disabled="item.state === 'unavailable'"
-            @click="handleSelectEpisode(item)"
-          >
-            <span class="sp-mixed-row__thumb">
-              <img
-                v-if="resolveAlbumThumbUrl(item)"
-                :src="resolveAlbumThumbUrl(item)"
-                :alt="`第 ${idx + 1} 项缩略图`"
-                referrerpolicy="no-referrer"
-                loading="lazy"
-                class="sp-mixed-row__thumb-img"
-                @error="markUrlBroken(resolveAlbumThumbUrl(item))"
-              />
-              <span v-else class="sp-mixed-row__thumb-idx">
-                {{ String(idx + 1).padStart(2, "0") }}
-              </span>
-            </span>
-
-            <span class="sp-ep-row__p">
-              {{ String(idx + 1).padStart(2, "0") }}
-            </span>
-
-            <span
-              class="sp-mixed-type"
-              :class="`sp-mixed-type--${mixedItemTypeBadge(item).tone}`"
-            >
-              {{ mixedItemTypeBadge(item).text }}
-            </span>
-
-            <span class="sp-ep-row__title sp-truncate-1">
-              {{ mixedItemDisplayTitle(item, idx) }}
-            </span>
-
-            <span v-if="resolvingItemIds.has(item.id)" class="sp-ep-row__tag sp-ep-row__tag--loading">
-              解析中...
-            </span>
-            <span
-              v-else-if="item.state === 'deferred'"
-              class="sp-ep-row__tag sp-ep-row__tag--lazy"
-            >
-              按需解析
-            </span>
-            <span
-              v-else-if="item.state === 'unavailable'"
-              class="sp-ep-row__tag sp-ep-row__tag--err"
-            >
-              不可用
-            </span>
-            <span v-else-if="item.duration_ms" class="sp-ep-row__dur">
-              {{ formatDurationMs(item.duration_ms) }}
-            </span>
-          </button>
-        </div>
-      </div>
-
-      <div class="sp-batch-actions">
-        <div class="sp-save-mode-row">
-          <div
-            class="sp-save-mode-pills"
-            role="radiogroup"
-            aria-label="批量保存方式"
-          >
-            <button
-              type="button"
-              role="radio"
-              :aria-checked="effectiveSaveMode === 'subfolder'"
-              class="sp-save-mode-pill"
-              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'subfolder' }"
-              data-save-mode="subfolder"
-              title="逐个流式保存到下载目录的标题子文件夹，零 500 MB 内存打包上限"
-              @click="saveMode = 'subfolder'"
-            >
-              存子文件夹
-            </button>
-            <button
-              type="button"
-              role="radio"
-              :aria-checked="effectiveSaveMode === 'zip'"
-              class="sp-save-mode-pill"
-              :class="{ 'sp-save-mode-pill--on': effectiveSaveMode === 'zip' }"
-              data-save-mode="zip"
-              :disabled="!zipPreviewDecision.ok"
-              :title="
-                zipPreviewDecision.ok
-                  ? '将已选混排条目无压缩打包为单个 ZIP 文件保存'
-                  : zipPreviewDecision.reason
-              "
+              :title="zipModeTooltip"
               @click="saveMode = 'zip'"
             >
               打包 ZIP
@@ -1668,13 +1075,7 @@ async function handleBatchZipSave() {
       <div class="sp-section-hd">
         <span class="sp-section-hd__title">画质与音轨选择</span>
         <span class="sp-section-hd__hint">
-          记忆偏好：{{
-            settings.qualityPreference === "best"
-              ? "最高画质"
-              : settings.qualityPreference === "1080p"
-                ? "1080p 优先"
-                : "仅音频 M4A"
-          }}
+          记忆偏好：{{ formatQualityPreferenceLabel(settings.qualityPreference) }}
         </span>
       </div>
 

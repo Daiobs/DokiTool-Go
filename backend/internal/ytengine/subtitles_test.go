@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 func TestAllowPublicSubtitleURL(t *testing.T) {
@@ -387,7 +388,7 @@ func TestAdaptInfoSubtitleJson3AndSafeExpiresAt(t *testing.T) {
 		}
 	}
 
-	if got := extractSubtitleExpiresAt(fmt.Sprintf("https://www.youtube.com/api/timedtext?v=x&expire=%d", futureExp), time.Time{}); got != "" {
+	if got := urlpolicy.ExtractSubtitleExpiresAt(fmt.Sprintf("https://www.youtube.com/api/timedtext?v=x&expire=%d", futureExp), time.Time{}, maxSubtitleExpiresWindow); got != "" {
 		t.Fatalf("zero now must return empty expires_at, got %q", got)
 	}
 }

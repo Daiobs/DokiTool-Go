@@ -49,8 +49,10 @@ before(async () => {
   const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {
     './variantSort': variantSort,
   });
+  const bilingualCueMerger = await load('../src/core/media/bilingualCueMerger.ts');
   const subtitleEngine = await load('../src/core/media/subtitleEngine.ts', {
     '../../utils/mediaContract': contract,
+    './bilingualCueMerger': bilingualCueMerger,
   });
   const subtitleController = await load('../src/core/media/subtitleController.ts', {
     './subtitleEngine': subtitleEngine,
