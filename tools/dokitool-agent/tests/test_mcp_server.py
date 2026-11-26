@@ -313,6 +313,53 @@ class MCPServerTests(unittest.TestCase):
             self.assertEqual(os_err_resp["result"]["structuredContent"]["error"]["code"], "TOOL_ERROR")
             self.assertNotIn("OS_SECRET", json.dumps(os_err_resp))
 
+            # Unknown arguments (additionalProperties: false), invalid enum, and no-clobber default
+            unknown_arg_resp = rw_srv.handle_request({
+                "jsonrpc": "2.0", "id": 137, "method": "tools/call",
+                "params": {"name": "dokitool_parse_media", "arguments": {"url": "https://example.com/v/1", "evil": 1}},
+            })
+            self.assertTrue(unknown_arg_resp["result"]["isError"])
+            self.assertEqual(unknown_arg_resp["result"]["structuredContent"]["error"]["code"], "INVALID_INPUT")
+
+            bad_enum_resp = rw_srv.handle_request({
+                "jsonrpc": "2.0", "id": 138, "method": "tools/call",
+                "params": {"name": "dokitool_extract_subtitles", "arguments": {"url": "https://example.com/v/1", "format": "exe"}},
+            })
+            self.assertTrue(bad_enum_resp["result"]["isError"])
+            self.assertEqual(bad_enum_resp["result"]["structuredContent"]["error"]["code"], "INVALID_INPUT")
+
+            # Notification tools/call (missing id) must not execute side effects
+            notif_resp = rw_srv.handle_request({
+                "jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "dokitool_download_media", "arguments": {"url": "https://example.com/v/1", "filename": "notif.mp4"}},
+            })
+            self.assertIsNone(notif_resp)
+            self.assertFalse((out_dir / "notif.mp4").exists())
+
+            # No-clobber default in MCP download tool unless overwrite=True
+            no_clobber_resp = rw_srv.handle_request({
+                "jsonrpc": "2.0", "id": 139, "method": "tools/call",
+                "params": {"name": "dokitool_download_media", "arguments": {"url": "https://example.com/v/1", "filename": "ok.mp4"}},
+            })
+            self.assertTrue(no_clobber_resp["result"]["isError"])
+            self.assertEqual(no_clobber_resp["result"]["structuredContent"]["error"]["code"], "TOOL_ERROR")
+            overwrite_resp = rw_srv.handle_request({
+                "jsonrpc": "2.0", "id": 140, "method": "tools/call",
+                "params": {"name": "dokitool_download_media", "arguments": {"url": "https://example.com/v/1", "filename": "ok.mp4", "overwrite": True}},
+            })
+            self.assertFalse(overwrite_resp["result"]["isError"])
+
+            # Oversized stdin line returns -32600 without OOM
+            oversized = io.StringIO("x" * (mcp_server.MAX_MCP_LINE_BYTES + 128) + "\n")
+            ov_out = io.StringIO()
+            rw_srv.serve_forever(stdin=oversized, stdout=ov_out, stderr=io.StringIO())
+            self.assertEqual(json.loads(ov_out.getvalue().strip())["error"]["code"], -32600)
+
+            # Tool annotations present
+            dl_def = next(t for t in rw_srv.tool_definitions() if t["name"] == "dokitool_download_media")
+            self.assertTrue(dl_def["annotations"]["destructiveHint"])
+            self.assertFalse(dl_def["annotations"]["readOnlyHint"])
+
             # Error redaction: signed query params & env token never leaked
             secret = "MCPSecretToken1234567890ABCDEFGHIJKLM"
             with mock.patch.dict("os.environ", {"DOKITOOL_API_TOKEN": secret}, clear=False):

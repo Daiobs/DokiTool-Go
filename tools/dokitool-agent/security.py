@@ -13,11 +13,13 @@ import socket
 from typing import Any, Callable, Mapping, Sequence
 import urllib.parse
 
+AGENT_VERSION = "1.0.0"
 DEFAULT_API_BASE = "https://snap.dokitool.com"
-DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; DokiToolAgent/1.0)"
+DEFAULT_USER_AGENT = f"Mozilla/5.0 (compatible; DokiToolAgent/{AGENT_VERSION})"
 MAX_URL_LENGTH, MAX_REDIRECTS = 8192, 5
 MAX_JSON_BYTES, MAX_SUBTITLE_BYTES = 8 * 1024 * 1024, 5 * 1024 * 1024
 MAX_MEDIA_BYTES, MAX_ERROR_BODY_BYTES, STREAM_CHUNK_BYTES = 2 * 1024 * 1024 * 1024, 64 * 1024, 64 * 1024
+STANDARD_HTTP_PORTS = frozenset({80, 443})
 
 BLOCKED_HOST_SUFFIXES = (
     "localhost", "local", "internal", "localdomain", "home.arpa",
@@ -36,8 +38,8 @@ _WINDOWS_RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10)),
 })
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
-_URL_USERINFO_RE = re.compile(r"(https?://)[^\s/@#\"'<>]+@")
-_URL_QUERY_RE = re.compile(r"(https?://[^\s?#\"'<>]+)\?[^\s#\"'<>]+")
+_URL_USERINFO_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://)[^\s/@#\"'<>]+@")
+_URL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://[^\s?#\"'<>]+)\?[^\s#\"'<>]+")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PUBLIC_TLD_RE = re.compile(r"^(?:[a-z]{2,}|xn--[a-z0-9-]{2,})$")
 
@@ -194,12 +196,14 @@ def _resolve_and_pin(
 def validate_and_resolve_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
+    allowed_ports: frozenset[int] | None = None,
 ) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
     """Enforce secondary anti-SSRF validation and return (parsed_url, validated_pinned_ips)."""
     parsed = _validate_url_syntax(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     if "%" in host:
         raise SecurityError("Scoped IPv6 addresses are forbidden")
+    effective_port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     if is_loopback_host(host):
         if not allow_loopback:
             raise SecurityError("Loopback address is forbidden for media/subtitle fetch")
@@ -209,6 +213,8 @@ def validate_and_resolve_remote_url(
         if not resolve_dns:
             return parsed, ("127.0.0.1", "::1")
         return parsed, _resolve_and_pin(host, parsed, resolver, _is_loopback_ip, "non-loopback")
+    if allowed_ports is not None and effective_port not in allowed_ports:
+        raise SecurityError(f"Non-standard remote port {effective_port} is forbidden")
     _check_blocked_suffix(host)
     ip = _parse_ip(host)
     if ip is not None:
@@ -225,19 +231,21 @@ def validate_and_resolve_remote_url(
 def validate_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
+    allowed_ports: frozenset[int] | None = None,
 ) -> urllib.parse.SplitResult:
     """Enforce secondary anti-SSRF validation (scheme, userinfo, suffix, IP literal, DNS)."""
     parsed, _ = validate_and_resolve_remote_url(
-        url, allow_loopback=allow_loopback, resolve_dns=resolve_dns, resolver=resolver,
+        url, allow_loopback=allow_loopback, resolve_dns=resolve_dns,
+        resolver=resolver, allowed_ports=allowed_ports,
     )
     return parsed
 
 
 def is_bilibili_media_host(url: str) -> bool:
-    """Narrow Bilibili CDN matcher (bilivideo.com/.cn and Bilibili Akamai UPOS/upgcxcode only)."""
+    """Narrow Bilibili CDN matcher (bilivideo.com/.cn, hdslb.com, and Bilibili Akamai UPOS/upgcxcode only)."""
     parsed = urllib.parse.urlsplit(url)
     host = (parsed.hostname or "").lower().rstrip(".")
-    if host in ("bilivideo.com", "bilivideo.cn") or host.endswith((".bilivideo.com", ".bilivideo.cn")):
+    if host in ("bilivideo.com", "bilivideo.cn", "hdslb.com") or host.endswith((".bilivideo.com", ".bilivideo.cn", ".hdslb.com")):
         return True
     if host.endswith(".akamaized.net"):
         first = host.split(".", 1)[0]
@@ -280,13 +288,19 @@ def resolve_jailed_path(output_dir: Path, relative_target: str | Path, *, allow_
     """Canonicalize and strictly jail a relative filename inside output_dir (reject .. and symlinks)."""
     root = validate_output_dir(output_dir, create=False)
     raw = str(relative_target or "")
-    if not raw or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw) or "\\" in raw or raw.startswith(("~", "/")) or re.match(r"^[A-Za-z]:", raw):
-        raise SecurityError("Invalid target filename: control char, absolute, empty, drive, or backslash path rejected")
+    if not raw or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw) or "\\" in raw or ":" in raw or raw.startswith(("~", "/")):
+        raise SecurityError("Invalid target filename: control char, colon, absolute, empty, or backslash path rejected")
     rel = Path(raw)
     if rel.is_absolute() or not rel.parts or any(p in ("", ".", "..") for p in rel.parts):
         raise SecurityError("Path traversal segments are forbidden")
     if not allow_subdirs and len(rel.parts) != 1:
         raise SecurityError("Subdirectory paths are not permitted for target filename")
+    for part in rel.parts:
+        if part.endswith((".", " ")):
+            raise SecurityError("Target filename must not end with a trailing dot or space")
+        stem = part.split(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED:
+            raise SecurityError(f"Target filename uses Windows reserved device name: {part}")
     cursor = root
     for part in rel.parts:
         cursor = cursor / part

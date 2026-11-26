@@ -19,7 +19,9 @@ if str(AGENT_DIR) not in sys.path:
 
 import api_client  # noqa: E402
 import cli  # noqa: E402
+import dokitool_agent  # noqa: E402
 import downloader  # noqa: E402
+import mcp_server  # noqa: E402
 import security  # noqa: E402
 import subtitles  # noqa: E402
 
@@ -374,15 +376,94 @@ class CLIAndSubtitlesTests(unittest.TestCase):
             self.assertEqual(downloader._infer_ext({"extension": "jpeg"}, {}, "https://cdn.test/a", raw_part), "jpg")
             self.assertEqual(downloader._infer_ext({"extension": "flac"}, {}, "https://cdn.test/a", raw_part), "flac")
 
-            # Explicit --filename rejects dangerous executable/script suffixes and path separators
-            for bad_fn in ("payload.exe", "run.sh", "script.ps1", "drop.bat", "index.html", "sub/ok.mp4", "a\\b.mp4"):
+            # Explicit --filename enforces strict passive allowlist (rejects scripts, dotfiles, extensionless)
+            for bad_fn in (
+                "payload.exe", "run.sh", "script.ps1", "drop.bat", "index.html",
+                "sub/ok.mp4", "a\\b.mp4", ".bashrc", ".hidden.mp4", "script.py",
+                "script.rb", "noext", "CON.mp4", "video.mp4:ads", "trail.mp4.",
+            ):
                 with self.assertRaises(security.SecurityError, msg=bad_fn):
                     downloader.download_media(client, "https://example.com/video/1", out_dir, allow_write=True, filename=bad_fn)
 
-            # CLI --no-proxy flag parses cleanly across subcommands
+            # NV-16: default no-clobber refuses overwriting existing file unless overwrite=True
+            no_clobber = out_dir / "keep.mp4"
+            no_clobber.write_bytes(b"ORIGINAL_BYTES")
+            with self.assertRaises(downloader.DownloadError):
+                downloader.download_media(client, "https://example.com/video/1", out_dir, allow_write=True, filename="keep.mp4")
+            self.assertEqual(no_clobber.read_bytes(), b"ORIGINAL_BYTES")
+            downloader.download_media(
+                client, "https://example.com/video/1", out_dir, allow_write=True, filename="keep.mp4", overwrite=True
+            )
+            self.assertNotEqual(no_clobber.read_bytes(), b"ORIGINAL_BYTES")
+
+            # Subtitle writes disambiguate against existing files on disk when overwrite=False
+            existing_sub = downloader.write_subtitle_files(
+                [{"language": "en", "track_kind": "manual", "output_format": "vtt", "content": "three"}],
+                out_dir, allow_write=True, stem_prefix="dup",
+            )
+            self.assertNotIn(existing_sub[0]["file"], {f["file"] for f in dup_saved})
+
+            # CLI --no-proxy and --overwrite flags parse cleanly across subcommands
             args_parse = cli.build_parser().parse_args(["parse", "--no-proxy", "https://example.com/v/1"])
             args_mcp = cli.build_parser().parse_args(["mcp", "--no-proxy"])
-            self.assertTrue(args_parse.no_proxy and args_mcp.no_proxy)
+            args_dl = cli.build_parser().parse_args(["download", "--allow-write", "--output-dir", str(out_dir), "--overwrite", "https://example.com/v/1"])
+            self.assertTrue(args_parse.no_proxy and args_mcp.no_proxy and args_dl.overwrite)
+
+    def test_p1_5_json3_nv17_budgets_nv18_bounds_and_p2_2_version_ssot(self) -> None:
+        # P2-2: Single AGENT_VERSION SSOT across facade and MCP server
+        self.assertEqual(dokitool_agent.__version__, security.AGENT_VERSION)
+        self.assertEqual(mcp_server.SERVER_INFO["version"], security.AGENT_VERSION)
+
+        # P1-5: json3 subtitle discovery & rendering
+        json3_payload = json.dumps({
+            "events": [
+                {"tStartMs": 500, "dDurationMs": 1500, "segs": [{"utf8": "Hello "}, {"utf8": "JSON3"}]},
+                {"tStartMs": 2500, "dDurationMs": 1000, "segs": [{"utf8": "Second line"}]},
+            ]
+        })
+        txt, cnt = subtitles.render_subtitles(json3_payload, "json3", "text")
+        self.assertEqual(cnt, 2)
+        self.assertEqual(txt, "Hello JSON3\nSecond line\n")
+
+        # NV-13: raw subtitle output rejects non-subtitle HTML/arbitrary text
+        with self.assertRaises(security.SecurityError):
+            subtitles.render_subtitles("<html><body>not subtitles</body></html>", "vtt", "raw")
+        raw_ok, raw_cnt = subtitles.render_subtitles("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nOk\n", "vtt", "raw")
+        self.assertEqual(raw_cnt, 1)
+        self.assertIn("WEBVTT", raw_ok)
+
+        # NV-18: linear _INLINE_TAG_RE, XML nesting depth cap, no nested <p> amplification, output cap
+        self.assertEqual(subtitles._clean_cue_text("<" * 50_000 + "ok"), "<" * 50_000 + "ok")
+        deep_xml = "<tt>" + "<div>" * 40 + "<p begin='00:00:01.000' end='00:00:02.000'>x</p>" + "</div>" * 40 + "</tt>"
+        with self.assertRaises(security.SecurityError):
+            subtitles.parse_cues(deep_xml, "ttml")
+        nested_p = "<tt><body><p begin='00:00:01.000' end='00:00:02.000'>outer<p begin='00:00:01.000' end='00:00:02.000'>inner</p></p></body></tt>"
+        nested_cues = subtitles.parse_cues(nested_p, "ttml")
+        self.assertEqual(len(nested_cues), 1)
+        self.assertEqual(nested_cues[0].text, "outer")
+        with self.assertRaises(security.SizeLimitExceededError):
+            subtitles.render_subtitles("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n" + ("A" * 500), "vtt", "text", max_output_bytes=128)
+
+        # NV-17: track fan-out cap, URL dedup, and total byte budget
+        many_atts = [
+            _sub_att(f"sub-{i}", "en", f"Track {i}", "manual", "vtt", "text/vtt", f"{self.state.base_url}/sub/zh_auto.vtt")
+            for i in range(25)
+        ]
+        data = {"platform": "youtube", "content_id": "fanout", "title": "Fanout", "attachments": many_atts}
+        fetch_calls = {"n": 0}
+        orig_fetch = self.local_fetcher.fetch_bytes
+
+        def _counting_fetch(*args, **kwargs):
+            fetch_calls["n"] += 1
+            return orig_fetch(*args, **kwargs)
+
+        with mock.patch.object(self.local_fetcher, "fetch_bytes", side_effect=_counting_fetch):
+            res = subtitles.extract_subtitles_from_data(data, self.local_fetcher, select_all=True, max_tracks=4)
+        self.assertEqual(res["selected_count"], 4)
+        self.assertTrue(res.get("truncated_tracks"))
+        self.assertEqual(fetch_calls["n"], 1)
+        with self.assertRaises(security.SizeLimitExceededError):
+            subtitles.extract_subtitles_from_data(data, self.local_fetcher, select_all=True, max_tracks=4, max_total_bytes=60)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,13 @@ const FIXTURES_DIR = path.join(
   "fixtures",
   "download",
 );
-const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo";
+const EXTENSION_META = JSON.parse(
+  fs.readFileSync(
+    path.join(REPO_ROOT, "frontend", "src", "core", "extensionReleaseMeta.json"),
+    "utf8",
+  ),
+);
+const DOKITOOL_EXTENSION_ID = EXTENSION_META.extensionId;
 const EXPECTED_TAMPER_WARNING_FRAGMENT = "检测到浏览器内其他下载类扩展改写了保存文件名";
 
 const MOCK_ALLOWED_HOSTS = new Set([
@@ -604,6 +610,8 @@ async function createIsolatedMockInfrastructure({ runDir, distDir }) {
     proxyPort,
     state,
     async close() {
+      proxyServer.closeAllConnections?.();
+      httpsServer.closeAllConnections?.();
       await Promise.all([
         new Promise((r) => proxyServer.close(() => r())),
         new Promise((r) => httpsServer.close(() => r())),
@@ -935,6 +943,10 @@ export class HeadlessChromeManager {
         }
       }
     }
+    try {
+      record.child?.stderr?.destroy();
+      record.child?.unref?.();
+    } catch {}
   }
 
   closeAll() {

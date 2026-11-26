@@ -184,6 +184,7 @@ class SecurityTests(unittest.TestCase):
         bili_urls = [
             "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/video.m4s",
             "https://cn-sh-cm-01.bilivideo.cn/video.m4s",
+            "https://i0.hdslb.com/bfs/archive/cover.jpg",
             "https://upos-hz-mirrorakam.akamaized.net/video.m4s",
             "https://bili-overseas.akamaized.net/video.m4s",
             "https://edge-node.akamaized.net/upgcxcode/99/88/audio.m4s",
@@ -275,7 +276,12 @@ class SecurityTests(unittest.TestCase):
             good = security.resolve_jailed_path(out_dir, "video_1.mp4")
             self.assertEqual(good, out_dir / "video_1.mp4")
 
-            for bad_name in ("../outside.txt", "/etc/passwd", "sub/file.mp4", "..", ".", "a\\b.mp4", "", "bad\nname.mp4", "bad\rname.mp4", "bad\x7f.mp4"):
+            for bad_name in (
+                "../outside.txt", "/etc/passwd", "sub/file.mp4", "..", ".", "a\\b.mp4", "",
+                "bad\nname.mp4", "bad\rname.mp4", "bad\x7f.mp4",
+                "video.mp4:stream", "C:drive.mp4", "trailing.", "trailing ",
+                "CON.mp4", "NUL.txt", "COM1.vtt", "lpt9.mkv",
+            ):
                 with self.subTest(bad_name=bad_name):
                     with self.assertRaises(security.SecurityError):
                         security.resolve_jailed_path(out_dir, bad_name)
@@ -342,7 +348,10 @@ class SecurityTests(unittest.TestCase):
                  mock.patch.object(http_transport, "_connect_pinned_ip", side_effect=_intercept_dial), \
                  mock.patch("socket.getaddrinfo", side_effect=AssertionError("connect must not re-query DNS")):
                 self.assertTrue(http_transport.has_env_proxy_for("http", "rebind.example.com", port))
-                fetcher = http_transport.SafeHTTPFetcher(timeout=5.0, no_proxy=True, resolver=_rebinding_resolver)
+                fetcher = http_transport.SafeHTTPFetcher(
+                    timeout=5.0, no_proxy=True, resolver=_rebinding_resolver,
+                    allowed_media_ports=frozenset({80, 443, port}),
+                )
                 resp = fetcher.fetch_bytes(f"http://rebind.example.com:{port}/redirect-hop2", max_bytes=4096)
             self.assertEqual(resp.status, 200)
             self.assertEqual(dialed, [("93.184.216.34", port), ("1.1.1.1", port)])
@@ -392,6 +401,75 @@ class SecurityTests(unittest.TestCase):
         for bad_ip in ("93.184.216.34", "10.0.0.1", "169.254.169.254"):
             with self.assertRaises(security.SecurityError):
                 security.validate_and_resolve_remote_url("http://localhost:8080/x", allow_loopback=True, resolver=_make_private_resolver(bad_ip))
+
+    def test_nv13_env_only_proxy_standard_ports_and_https_downgrade_protection(self) -> None:
+        # 1) OS-level proxies must NEVER override empty process env proxies (IP pinning preserved).
+        with mock.patch.dict("os.environ", _clean_proxy_env(), clear=True), \
+             mock.patch("urllib.request.getproxies", return_value={"https": "http://os-proxy.internal:8080"}):
+            self.assertFalse(http_transport.has_env_proxy_for("https", "cdn.example.com", 443))
+            opener = http_transport.build_safe_opener(bypass_proxy=False, pinned_ips=("93.184.216.34",))
+            proxy_handlers = [h for h in opener.handlers if isinstance(h, http_transport.urllib.request.ProxyHandler)]
+            self.assertTrue(all(h.proxies == {} for h in proxy_handlers))
+
+        # 2) Non-standard remote ports are rejected by default in media_mode.
+        strict_fetcher = http_transport.SafeHTTPFetcher(timeout=5.0, resolver=_fake_public_resolver)
+        with self.assertRaises(security.SecurityError):
+            strict_fetcher.fetch_bytes("https://cdn.example.com:8443/track.vtt", max_bytes=1024)
+        with self.assertRaises(security.SecurityError):
+            strict_fetcher.fetch_bytes("http://cdn.example.com:6379/", max_bytes=1024)
+
+        # 3) HTTPS -> HTTP redirect downgrade is rejected.
+        import io
+        def _fake_downgrade_opener(_bypass: bool):
+            class _DowngradeOpener:
+                def open(self, req, timeout=None):
+                    raise http_transport.urllib.error.HTTPError(
+                        req.full_url, 302, "Found", {"Location": "http://cdn.example.com/plain.vtt"}, io.BytesIO(b"")
+                    )
+            return _DowngradeOpener()
+
+        dg_fetcher = http_transport.SafeHTTPFetcher(
+            timeout=5.0, resolver=_fake_public_resolver, opener_factory=_fake_downgrade_opener,
+        )
+        with self.assertRaises(security.SecurityError) as ctx:
+            dg_fetcher.fetch_bytes("https://cdn.example.com/start.vtt", max_bytes=1024)
+        self.assertIn("downgrade", str(ctx.exception).lower())
+
+    def test_nv14_batch_example_anti_ssrf_and_strict_extension_allowlist(self) -> None:
+        import importlib.util
+        batch_path = AGENT_DIR.parent.parent / "examples" / "agent_batch_download.py"
+        spec = importlib.util.spec_from_file_location("agent_batch_download_sec", batch_path)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Rejects non-media executable extensions in API metadata
+        for bad_ext in ("exe", "sh", "bat", "ps1", "html"):
+            self.assertIsNone(mod.infer_extension_from_result({"extension": bad_ext}, "", ""))
+            self.assertIsNone(mod.infer_extension_from_result({"container": bad_ext}, "", ""))
+        self.assertEqual(mod.infer_extension_from_result({"extension": "mp4"}, "", ""), "mp4")
+
+        # Blocks loopback/private/metadata/file/non-standard port media URLs in production mode
+        for bad_url in (
+            "http://127.0.0.1:8080/secret",
+            "http://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.1/video.mp4",
+            "file:///etc/passwd",
+            "https://cdn.example.com:8443/video.mp4",
+        ):
+            with self.assertRaises(ValueError, msg=bad_url):
+                mod.validate_remote_url_and_pin(bad_url)
+
+        # Rejects remote HTTP or userinfo in --api-base
+        with self.assertRaises(ValueError):
+            mod.validate_api_base("http://snap.dokitool.com")
+        with self.assertRaises(ValueError):
+            mod.validate_api_base("https://user:pass@snap.dokitool.com")
+
+        # Redacts query strings and tokens in error records
+        scrubbed = mod.redact_sensitive("failed https://cdn.example.com/a.mp4?sig=SECRET123 Bearer AbCdEf123456")
+        self.assertNotIn("SECRET123", scrubbed)
+        self.assertNotIn("AbCdEf123456", scrubbed)
 
 
 if __name__ == "__main__":

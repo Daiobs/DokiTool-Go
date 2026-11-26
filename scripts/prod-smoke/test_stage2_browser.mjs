@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -55,6 +55,21 @@ const MINI_PNG = Buffer.from(
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(THIS_DIR, "..", "..");
+const EXTENSION_RELEASE_META = JSON.parse(
+  fs.readFileSync(
+    path.join(REPO_ROOT, "frontend", "src", "core", "extensionReleaseMeta.json"),
+    "utf8",
+  ),
+);
+const REPO_EXT_VERSION = String(EXTENSION_RELEASE_META.version);
+const REPO_WORKER_BUILD = (() => {
+  const src = fs.readFileSync(
+    path.join(REPO_ROOT, "frontend", "public", "downloads", "worker.js"),
+    "utf8",
+  );
+  const m = /const\s+BUILD\s*=\s*"([^"]+)"/.exec(src);
+  return m ? m[1] : "downloads-20261124.2";
+})();
 
 function buildTestZip(entries, { useDeflate = true } = {}) {
   const localParts = [];
@@ -112,7 +127,7 @@ function buildValidExtensionManifest(overrides = {}) {
     manifest_version: 3,
     key: TEST_MANIFEST_PUBLIC_KEY,
     name: "DokiTool Test Extension",
-    version: "4.2.0",
+    version: REPO_EXT_VERSION,
     permissions: [
       "sidePanel",
       "offscreen",
@@ -355,8 +370,8 @@ describe("Fail-closed redaction scanner & receipt rendering", () => {
       "target_host: snap.dokitool.com",
       "generated_at_utc: 2026-11-24T08:09:48Z",
       "browser_version: HeadlessChrome/149.0.7827.55",
-      "extension_version: 4.2.0",
-      "workerBuild=downloads-20261124.2",
+      `extension_version: ${REPO_EXT_VERSION}`,
+      `workerBuild=${REPO_WORKER_BUILD}`,
       "media_hostnames: upos-sz-mirrorcosov.bilivideo.com, rr4---sn-ajoguc-5t.googlevideo.com",
     ].join("\n");
     assert.deepEqual(scanSensitiveOutput(clean, { homeDir: "/Users/fakeuser" }), []);
@@ -383,7 +398,7 @@ describe("Fail-closed redaction scanner & receipt rendering", () => {
         browser_version: "HeadlessChrome/149.0.7827.55",
         headless_flags: [...MANDATORY_HEADLESS_FLAGS],
         proxy_mode: "direct",
-        extension_version: "4.2.0",
+        extension_version: REPO_EXT_VERSION,
         extension_id: DOKITOOL_EXTENSION_ID,
         residual_chrome: 0,
       },
@@ -396,7 +411,7 @@ describe("Fail-closed redaction scanner & receipt rendering", () => {
           status: "PASS",
           elapsed_ms: 320,
           media_hostnames: [],
-          note: "size=471581B, files=13, v4.2.0",
+          note: `size=471581B, files=13, v${REPO_EXT_VERSION}`,
         },
         {
           id: "ext_bridge_handshake",
@@ -404,7 +419,7 @@ describe("Fail-closed redaction scanner & receipt rendering", () => {
           status: "PASS",
           elapsed_ms: 1900,
           media_hostnames: ["snap.dokitool.com"],
-          note: "WEB_EXT_PING ok (v4.2.0), csp=0",
+          note: `WEB_EXT_PING ok (v${REPO_EXT_VERSION}), csp=0`,
         },
       ],
     };
@@ -497,13 +512,19 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
     const info = validateExtensionArchive(validZip, {
       target: prodTarget,
       manifestData,
-      expectedExtVersion: "4.2.0",
+      expectedExtVersion: REPO_EXT_VERSION,
       expectedExtFiles: 8,
     });
     assert.equal(info.extensionId, DOKITOOL_EXTENSION_ID);
-    assert.equal(info.version, "4.2.0");
+    assert.equal(info.version, REPO_EXT_VERSION);
     assert.equal(info.fileCount, 8);
     assert.equal(info.manifestVerifiedAgainstRelease, true);
+
+    // NV-11: release-manifest missing digest keys fails closed instead of silently passing.
+    assert.throws(
+      () => validateExtensionArchive(validZip, { target: prodTarget, manifestData: {} }),
+      /missing valid artifacts/,
+    );
 
     // Rejects SHA mismatch vs release manifest.
     assert.throws(
@@ -522,11 +543,27 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
       /SHA-256 mismatch/,
     );
 
-    // Rejects forbidden permissions / content_scripts / wildcards / monitor.html.
+    // Rejects forbidden & unallowlisted permissions (including optional_permissions), content_scripts, wildcards, monitor.html.
     assert.throws(
       () =>
         validateExtensionArchive(
           buildValidExtensionZip({ permissions: ["cookies", "storage"] }),
+          { target: prodTarget },
+        ),
+      /forbidden permission.*cookies/,
+    );
+    assert.throws(
+      () =>
+        validateExtensionArchive(
+          buildValidExtensionZip({ permissions: ["storage", "nativeMessaging"] }),
+          { target: prodTarget },
+        ),
+      /unallowlisted permission.*nativeMessaging/,
+    );
+    assert.throws(
+      () =>
+        validateExtensionArchive(
+          buildValidExtensionZip({ optional_permissions: ["cookies"] }),
           { target: prodTarget },
         ),
       /forbidden permission.*cookies/,
@@ -562,20 +599,28 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
     assert.throws(
       () =>
         validateExtensionArchive(
-          buildValidExtensionZip({}, [{ name: "monitor.html", data: "<html></html>" }]),
+          buildValidExtensionZip({}, [{ name: "MONITOR.HTML", data: "<html></html>" }]),
           { target: prodTarget },
         ),
       /monitor bundle/,
     );
 
-    // Rejects corrupt CRC, zip-slip entry paths, and truncated CD variable fields.
+    // NV-10: Rejects case-colliding ZIP entries, trailing dots/spaces, colons, corrupt CRC, zip-slip, truncated CD.
+    const caseCollideZip = buildTestZip([
+      { name: "manifest.json", data: "{}" },
+      { name: "Manifest.json", data: "{}" },
+    ]);
+    assert.throws(() => parseZipBuffer(caseCollideZip), /duplicate or case-colliding ZIP entry/);
+
+    for (const badZipPath of ["../escape.txt", "bad:ads.js", "trail.", "trail ", "ctrl\x07.js"]) {
+      const badPathZip = buildTestZip([{ name: badZipPath, data: "bad" }]);
+      assert.throws(() => parseZipBuffer(badPathZip), /unsafe ZIP entry/);
+    }
+
     const badCrcZip = buildTestZip([
       { name: "manifest.json", data: "{}", crcOverride: 0xdeadbeef },
     ]);
     assert.throws(() => parseZipBuffer(badCrcZip), /CRC32 mismatch/);
-
-    const zipSlip = buildTestZip([{ name: "../escape.txt", data: "bad" }]);
-    assert.throws(() => parseZipBuffer(zipSlip), /unsafe ZIP entry/);
 
     const truncatedCdZip = Buffer.from(
       buildTestZip([{ name: "manifest.json", data: "{}" }]),
@@ -700,8 +745,38 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
       });
       execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir, stdio: "ignore" });
 
-      const archiveInfo = validateExtensionArchive(buildValidExtensionZip(), {
+      const validZipBuf = buildValidExtensionZip();
+      const validZipSha = crypto.createHash("sha256").update(validZipBuf).digest("hex");
+      const unverifiedArchive = validateExtensionArchive(validZipBuf, {
         target: validateBaseUrl("https://snap.dokitool.com"),
+      });
+      // NV-11: syncExtensionAtomic refuses unverified archive without --manifest digest proof.
+      await assert.rejects(
+        () => syncExtensionAtomic(unverifiedArchive, path.join(repoDir, "dist-ext")),
+        /not verified against --manifest/,
+      );
+      await assert.rejects(
+        () =>
+          runStage2({
+            baseUrl: "http://127.0.0.1:9",
+            syncLocalExtension: path.join(repoDir, "dist-ext"),
+          }),
+        /--sync-local-extension requires --manifest/,
+      );
+
+      const archiveInfo = validateExtensionArchive(validZipBuf, {
+        target: validateBaseUrl("https://snap.dokitool.com"),
+        manifestData: {
+          artifacts: {
+            "dokitool-chrome-extension.zip": {
+              sha256: validZipSha,
+              size_bytes: validZipBuf.length,
+            },
+          },
+          frontend_dist_files: {
+            "helper/dokitool-chrome-extension.zip": validZipSha,
+          },
+        },
       });
 
       // Must reject Git-tracked dir, tracked file, repo root, and .git.
@@ -729,7 +804,23 @@ describe("Chrome auto-discovery, ZIP validation, and --sync-local-extension safe
       assert.equal(first.fileCount, 8);
       assert.equal(
         JSON.parse(await fsp.readFile(path.join(untrackedTarget, "manifest.json"), "utf8")).version,
-        "4.2.0",
+        REPO_EXT_VERSION,
+      );
+
+      // NV-11: monotonic anti-downgrade refuses older extension version over newer installed directory.
+      const olderZip = buildValidExtensionZip({ version: "4.0.0" });
+      const olderSha = crypto.createHash("sha256").update(olderZip).digest("hex");
+      const olderInfo = validateExtensionArchive(olderZip, {
+        target: validateBaseUrl("https://snap.dokitool.com"),
+        manifestData: {
+          artifacts: {
+            "dokitool-chrome-extension.zip": { sha256: olderSha, size_bytes: olderZip.length },
+          },
+        },
+      });
+      await assert.rejects(
+        () => syncExtensionAtomic(olderInfo, untrackedTarget),
+        /refusing extension downgrade/,
       );
 
       // Add a stale file and verify atomic sync replaces directory cleanly with zero leftover staging dirs.
@@ -823,6 +914,15 @@ self.addEventListener("message", (event) => {
       matches: ["http://127.0.0.1/*"],
     },
   });
+  const sha256 = (b) => crypto.createHash("sha256").update(b).digest("hex");
+  const extVersionJson = Buffer.from(
+    JSON.stringify({
+      version: REPO_EXT_VERSION,
+      download_url: "/helper/dokitool-chrome-extension.zip",
+      sha256: sha256(extZip),
+    }),
+    "utf8",
+  );
 
   const extraInlineViolation = injectHomeCspViolation
     ? "<script>window.__INLINE_VIOLATION__ = 1;</script>"
@@ -861,8 +961,6 @@ self.addEventListener("message", (event) => {
     "utf8",
   );
 
-  const sha256 = (b) => crypto.createHash("sha256").update(b).digest("hex");
-
   const manifestObj = {
     schema_version: "1.0",
     release_tag: "build-mock123",
@@ -878,6 +976,7 @@ self.addEventListener("message", (event) => {
       "assets/main-Mock1234.js.br": sha256(mainJsBr),
       "downloads/worker.js": sha256(workerJsRaw),
       "helper/dokitool-chrome-extension.zip": sha256(extZip),
+      "helper/extension-version.json": sha256(extVersionJson),
       "llms.txt": sha256(llmsTxt),
     },
   };
@@ -1016,6 +1115,17 @@ self.addEventListener("message", (event) => {
       return;
     }
 
+    if (pathname === "/helper/extension-version.json") {
+      res.writeHead(200, {
+        ...baseHeaders,
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Frame-Options": "DENY",
+      });
+      res.end(extVersionJson);
+      return;
+    }
+
     if (pathname === "/api/stats") {
       res.writeHead(401, {
         ...baseHeaders,
@@ -1048,7 +1158,10 @@ self.addEventListener("message", (event) => {
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     manifestObj,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () => {
+      server.closeAllConnections?.();
+      return new Promise((resolve) => server.close(() => resolve()));
+    },
   };
 }
 
@@ -1083,7 +1196,7 @@ describe("Loopback mock end-to-end headless Chrome verification", () => {
         manifestPath,
         syncLocalExtension: syncDir,
         expectedExtFiles: 8,
-        expectedExtVersion: "4.2.0",
+        expectedExtVersion: REPO_EXT_VERSION,
         timeoutSeconds: 20,
       });
 
@@ -1096,7 +1209,7 @@ describe("Loopback mock end-to-end headless Chrome verification", () => {
       assert.equal(report.summary.skip, 0);
       assert.equal(report.environment.residual_chrome, 0);
       assert.equal(report.environment.extension_id, DOKITOOL_EXTENSION_ID);
-      assert.equal(report.environment.extension_version, "4.2.0");
+      assert.equal(report.environment.extension_version, REPO_EXT_VERSION);
       assert.equal(report.target_host, "<ip-redacted>");
 
       const byId = new Map(report.checks.map((c) => [c.id, c]));
@@ -1108,6 +1221,7 @@ describe("Loopback mock end-to-end headless Chrome verification", () => {
         "http_monitor_headers",
         "http_precompressed_br",
         "http_llms_txt",
+        "http_extension_version_json",
         "http_true_404",
         "http_api_stats_unauth",
         "web_home_hydration",
@@ -1170,12 +1284,93 @@ describe("Loopback mock end-to-end headless Chrome verification", () => {
     }
   });
 
-  test("relies on Default/Preferences rather than CDP Browser.setDownloadBehavior allow mode", async () => {
+  test("relies on Default/Preferences rather than CDP Browser.setDownloadBehavior allow mode and uses pipe transport on POSIX", async () => {
     const src = await fsp.readFile(
       new URL("./stage2_browser.mjs", import.meta.url),
       "utf8",
     );
     assert.match(src, /default_directory:\s*downloadDir/);
     assert.doesNotMatch(src, /browser\.send\(\s*["']Browser\.setDownloadBehavior["']/);
+    assert.match(src, /--remote-debugging-pipe/);
+  });
+
+  test("P0-2: direct CLI subprocess exits cleanly without hanging after emitting reports", async (t) => {
+    if (skipBrowser) {
+      t.skip("browser tests disabled via DOKITOOL_STAGE2_SKIP_BROWSER=1");
+      return;
+    }
+    if (!discoveredChrome) {
+      if (requireBrowser) {
+        assert.fail("Chrome binary required (DOKITOOL_STAGE2_REQUIRE_BROWSER=1) but not found");
+      }
+      t.skip("Chrome binary not available in local environment");
+      return;
+    }
+
+    const mock = await startMockSiteServer();
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "stage2-cli-exit-"));
+    try {
+      const jsonOut = path.join(tmpDir, "report.json");
+      const mdOut = path.join(tmpDir, "report.md");
+      const child = spawn(
+        process.execPath,
+        [
+          fileURLToPath(new URL("./stage2_browser.mjs", import.meta.url)),
+          "--base-url",
+          mock.baseUrl,
+          "--profile",
+          "lite",
+          "--format",
+          "json",
+          "--json-out",
+          jsonOut,
+          "--md-out",
+          mdOut,
+          "--timeout",
+          "20",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stdout = "";
+      let stderr = "";
+      let firstOutputAt = 0;
+      child.stdout.on("data", (d) => {
+        if (!firstOutputAt) firstOutputAt = Date.now();
+        stdout += d.toString("utf8");
+      });
+      child.stderr.on("data", (d) => {
+        stderr += d.toString("utf8");
+      });
+
+      const exitCode = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`stage2_browser.mjs hung after writing output (stderr=${stderr})`));
+        }, 30_000);
+        child.once("exit", (code) => {
+          clearTimeout(timer);
+          resolve(code);
+        });
+        child.once("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const exitedAfterOutputMs = firstOutputAt ? Date.now() - firstOutputAt : 0;
+      assert.equal(exitCode, 0, `expected CLI exit 0, got ${exitCode}: ${stderr}`);
+      assert.ok(
+        exitedAfterOutputMs < 2000,
+        `expected CLI process to exit within 2000ms after output, took ${exitedAfterOutputMs}ms`,
+      );
+      const parsed = JSON.parse(stdout);
+      assert.equal(parsed.passed, true);
+      assert.equal(parsed.environment.residual_chrome, 0);
+      assert.equal(fs.existsSync(jsonOut), true);
+      assert.equal(fs.existsSync(mdOut), true);
+    } finally {
+      await mock.close();
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

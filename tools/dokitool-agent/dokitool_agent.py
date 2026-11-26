@@ -22,10 +22,10 @@ if _AGENT_DIR not in sys.path:
 from api_client import DokiToolClient, summarize_parse_result, summarize_platforms
 from cli import main as cli_main
 from mcp_server import DokiToolMCPServer, MCP_PROTOCOL_VERSION
-from security import DEFAULT_API_BASE, MAX_SUBTITLE_BYTES, SafeHTTPFetcher
+from security import AGENT_VERSION, DEFAULT_API_BASE, MAX_SUBTITLE_BYTES, SafeHTTPFetcher
 from subtitles import extract_subtitles_from_data
 
-__version__ = "1.0.0"
+__version__ = AGENT_VERSION
 __all__ = (
     "__version__",
     "DEFAULT_API_BASE",

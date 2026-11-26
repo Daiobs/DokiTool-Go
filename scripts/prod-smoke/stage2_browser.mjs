@@ -27,7 +27,29 @@ import tls from "node:tls";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
-import { connect, until } from "../download-browser-session.mjs";
+import { connect, connectPipe, until } from "../download-browser-session.mjs";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const EXTENSION_META_PATH = path.resolve(
+  SCRIPT_DIR,
+  "..",
+  "..",
+  "frontend",
+  "src",
+  "core",
+  "extensionReleaseMeta.json",
+);
+let REPO_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo";
+try {
+  if (fs.existsSync(EXTENSION_META_PATH)) {
+    const meta = JSON.parse(fs.readFileSync(EXTENSION_META_PATH, "utf8"));
+    if (typeof meta?.extensionId === "string" && /^[a-p]{32}$/.test(meta.extensionId)) {
+      REPO_EXTENSION_ID = meta.extensionId;
+    }
+  }
+} catch {
+  // fallback to pinned ID when run outside repo checkout
+}
 
 export const SCHEMA_VERSION = "1.0";
 export const DEFAULT_BASE_URL = "https://snap.dokitool.com";
@@ -35,7 +57,7 @@ export const DEFAULT_PROFILE = "lite";
 export const VALID_PROFILES = Object.freeze(["lite", "full"]);
 export const DEFAULT_TIMEOUT_SECONDS = 30;
 export const DEFAULT_PARSE_PACING_MS = 8500;
-export const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo";
+export const DOKITOOL_EXTENSION_ID = REPO_EXTENSION_ID;
 export const EXPECTED_BRIDGE_CAPABILITIES = Object.freeze([
   "dash_mux",
   "direct_download",
@@ -49,6 +71,16 @@ export const MANDATORY_HEADLESS_FLAGS = Object.freeze([
   "--no-default-browser-check",
   "--use-mock-keychain",
   "--password-store=basic",
+]);
+
+export const ALLOWED_EXTENSION_PERMISSIONS = Object.freeze([
+  "sidePanel",
+  "offscreen",
+  "downloads",
+  "storage",
+  "contextMenus",
+  "tabs",
+  "declarativeNetRequestWithHostAccess",
 ]);
 
 export const FORBIDDEN_EXTENSION_PERMISSIONS = Object.freeze([
@@ -95,7 +127,6 @@ const MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_ZIP_ENTRY_BYTES = 32 * 1024 * 1024;
 const MAX_ZIP_TOTAL_BYTES = 64 * 1024 * 1024;
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_SAMPLES_PATH = path.join(SCRIPT_DIR, "samples.json");
 
 const URL_RE = /\b(?:https?|wss?|file|ftp):\/\/[^\s"'<>`|]+/gi;
@@ -687,6 +718,23 @@ export class OriginHttpClient {
     this.target = target;
     this.proxyConfig = proxyConfig;
     this.timeoutMs = Math.max(1000, Number(timeoutMs) || 30_000);
+    // Dedicated non-keepAlive agents prevent idle sockets from pinning Node's event loop after runStage2 returns.
+    this._httpAgent = new http.Agent({ keepAlive: false });
+    this._httpsAgent = new https.Agent({ keepAlive: false });
+    this._activeSockets = new Set();
+  }
+
+  close() {
+    this._httpAgent.destroy();
+    this._httpsAgent.destroy();
+    for (const sock of this._activeSockets) {
+      try {
+        sock.destroy();
+      } catch {
+        // ignore
+      }
+    }
+    this._activeSockets.clear();
   }
 
   async get(pathAndQuery, options = {}) {
@@ -713,6 +761,7 @@ export class OriginHttpClient {
       Accept: options.accept || "*/*",
       "Accept-Encoding": options.acceptEncoding || "identity",
       "Cache-Control": "no-cache",
+      Connection: "close",
       "User-Agent": "DokiTool-Stage2BrowserSmoke/1.0",
       ...(options.headers || {}),
     };
@@ -736,7 +785,8 @@ export class OriginHttpClient {
   }
 
   #directRequest(pathAndQuery, headers, startedAt) {
-    const mod = this.target.protocol === "https:" ? https : http;
+    const isHttps = this.target.protocol === "https:";
+    const mod = isHttps ? https : http;
     return new Promise((resolve, reject) => {
       const req = mod.request(
         {
@@ -746,8 +796,9 @@ export class OriginHttpClient {
           method: "GET",
           path: pathAndQuery,
           headers,
+          agent: isHttps ? this._httpsAgent : this._httpAgent,
           timeout: this.timeoutMs,
-          ...(this.target.protocol === "https:"
+          ...(isHttps
             ? { servername: this.target.hostname, rejectUnauthorized: true }
             : {}),
         },
@@ -762,7 +813,8 @@ export class OriginHttpClient {
   }
 
   #httpViaProxy(fullHref, headers, proxy, startedAt) {
-    const mod = proxy.protocol === "https:" ? https : http;
+    const isHttpsProxy = proxy.protocol === "https:";
+    const mod = isHttpsProxy ? https : http;
     return new Promise((resolve, reject) => {
       const req = mod.request(
         {
@@ -772,6 +824,7 @@ export class OriginHttpClient {
           method: "GET",
           path: fullHref,
           headers: { ...headers, Host: new URL(this.target.origin).host },
+          agent: isHttpsProxy ? this._httpsAgent : this._httpAgent,
           timeout: this.timeoutMs,
         },
         (res) => this.#collectResponse(res, startedAt, resolve, reject),
@@ -786,17 +839,42 @@ export class OriginHttpClient {
 
   #httpsViaProxy(pathAndQuery, headers, proxy, startedAt) {
     return new Promise((resolve, reject) => {
-      const proxyMod = proxy.protocol === "https:" ? https : http;
+      const isHttpsProxy = proxy.protocol === "https:";
+      const proxyMod = isHttpsProxy ? https : http;
       const authority = `${this.target.hostname}:${this.target.port}`;
       let settled = false;
+      let rawSocket = null;
+      let tlsSocket = null;
+      const teardownSockets = () => {
+        if (tlsSocket) {
+          this._activeSockets.delete(tlsSocket);
+          try {
+            tlsSocket.destroy();
+          } catch {
+            // ignore
+          }
+          tlsSocket = null;
+        }
+        if (rawSocket) {
+          this._activeSockets.delete(rawSocket);
+          try {
+            rawSocket.destroy();
+          } catch {
+            // ignore
+          }
+          rawSocket = null;
+        }
+      };
       const fail = (err) => {
         if (settled) return;
         settled = true;
+        teardownSockets();
         reject(err);
       };
       const done = (val) => {
         if (settled) return;
         settled = true;
+        teardownSockets();
         resolve(val);
       };
 
@@ -807,6 +885,7 @@ export class OriginHttpClient {
         method: "CONNECT",
         path: authority,
         headers: { Host: authority },
+        agent: isHttpsProxy ? this._httpsAgent : this._httpAgent,
         timeout: this.timeoutMs,
       });
 
@@ -815,19 +894,21 @@ export class OriginHttpClient {
       });
       connectReq.on("error", fail);
       connectReq.on("connect", (proxyRes, socket, head) => {
+        rawSocket = socket;
+        this._activeSockets.add(socket);
         if (proxyRes.statusCode !== 200) {
-          socket.destroy();
           fail(new Error(`Proxy CONNECT rejected with HTTP ${proxyRes.statusCode}`));
           return;
         }
         if (head && head.length > 0) {
           socket.unshift(head);
         }
-        const tlsSocket = tls.connect({
+        tlsSocket = tls.connect({
           socket,
           servername: this.target.hostname,
           rejectUnauthorized: true,
         });
+        this._activeSockets.add(tlsSocket);
         tlsSocket.on("error", fail);
         const req = https.request(
           {
@@ -913,21 +994,34 @@ export function deriveExtensionIdFromManifestKey(keyBase64) {
   ).join("");
 }
 
+function compareSemver(a, b) {
+  const pa = String(a || "").split(".").map((n) => Number.parseInt(n, 10));
+  const pb = String(b || "").split(".").map((n) => Number.parseInt(n, 10));
+  if (pa.length !== 3 || pb.length !== 3 || pa.some(Number.isNaN) || pb.some(Number.isNaN)) {
+    return 0;
+  }
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
 function normalizeZipEntryPath(rawPath) {
   if (typeof rawPath !== "string" || !rawPath) {
     throw new Stage2Error("ZIP entry path must be non-empty");
   }
   if (
     rawPath.includes("\\") ||
+    rawPath.includes(":") ||
     rawPath.startsWith("/") ||
     rawPath.endsWith("/") ||
-    rawPath.includes("\0") ||
+    /[\x00-\x1f\x7f]/.test(rawPath) ||
     rawPath.includes("//")
   ) {
     throw new Stage2Error(`unsafe ZIP entry path: ${sanitizeText(rawPath)}`);
   }
   for (const seg of rawPath.split("/")) {
-    if (!seg || seg === "." || seg === "..") {
+    if (!seg || seg === "." || seg === ".." || seg.endsWith(".") || seg.endsWith(" ")) {
       throw new Stage2Error(`unsafe ZIP entry segment: ${sanitizeText(rawPath)}`);
     }
   }
@@ -970,6 +1064,7 @@ export function parseZipBuffer(zipBuffer) {
   }
 
   const entries = new Map();
+  const seenNormalizedNames = new Set();
   let cursor = cdOffset;
   let totalUncompressed = 0;
 
@@ -1004,9 +1099,11 @@ export function parseZipBuffer(zipBuffer) {
       .subarray(cursor + 46, cursor + 46 + nameLen)
       .toString("utf8");
     const entryName = normalizeZipEntryPath(rawName);
-    if (entries.has(entryName)) {
-      throw new Stage2Error(`duplicate ZIP entry: ${entryName}`);
+    const canonicalName = entryName.normalize("NFC").toLowerCase();
+    if (entries.has(entryName) || seenNormalizedNames.has(canonicalName)) {
+      throw new Stage2Error(`duplicate or case-colliding ZIP entry: ${entryName}`);
     }
+    seenNormalizedNames.add(canonicalName);
 
     if (uncompSize > MAX_ZIP_ENTRY_BYTES) {
       throw new Stage2Error(`ZIP entry exceeds size limit: ${entryName}`);
@@ -1074,28 +1171,42 @@ export function validateExtensionArchive(zipBuffer, options = {}) {
     .digest("hex");
   const actualSize = zipBuffer.length;
 
+  let manifestVerifiedAgainstRelease = false;
   if (manifestData) {
     const artifactMeta = manifestData.artifacts?.["dokitool-chrome-extension.zip"];
-    if (artifactMeta?.sha256 && artifactMeta.sha256 !== actualSha256) {
+    const expectedArtifactSha =
+      typeof artifactMeta?.sha256 === "string" ? artifactMeta.sha256.trim().toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(expectedArtifactSha)) {
+      throw new Stage2Error(
+        "release-manifest missing valid artifacts['dokitool-chrome-extension.zip'].sha256",
+      );
+    }
+    if (typeof artifactMeta?.size_bytes !== "number" || artifactMeta.size_bytes <= 0) {
+      throw new Stage2Error(
+        "release-manifest missing valid artifacts['dokitool-chrome-extension.zip'].size_bytes",
+      );
+    }
+    if (expectedArtifactSha !== actualSha256) {
       throw new Stage2Error(
         `extension zip SHA-256 mismatch vs release-manifest artifacts (actual=${actualSha256.slice(0, 12)})`,
       );
     }
-    if (
-      typeof artifactMeta?.size_bytes === "number" &&
-      artifactMeta.size_bytes !== actualSize
-    ) {
+    if (artifactMeta.size_bytes !== actualSize) {
       throw new Stage2Error(
         `extension zip size mismatch vs release-manifest (expected=${artifactMeta.size_bytes}, actual=${actualSize})`,
       );
     }
-    const distSha =
-      manifestData.frontend_dist_files?.["helper/dokitool-chrome-extension.zip"];
-    if (distSha && distSha !== actualSha256) {
-      throw new Stage2Error(
-        `extension zip SHA-256 mismatch vs frontend_dist_files (actual=${actualSha256.slice(0, 12)})`,
-      );
+    if (manifestData.frontend_dist_files && typeof manifestData.frontend_dist_files === "object") {
+      const distShaRaw =
+        manifestData.frontend_dist_files["helper/dokitool-chrome-extension.zip"];
+      const distSha = typeof distShaRaw === "string" ? distShaRaw.trim().toLowerCase() : "";
+      if (!/^[0-9a-f]{64}$/.test(distSha) || distSha !== actualSha256) {
+        throw new Stage2Error(
+          `extension zip SHA-256 mismatch vs frontend_dist_files (actual=${actualSha256.slice(0, 12)})`,
+        );
+      }
     }
+    manifestVerifiedAgainstRelease = true;
   }
 
   const parsed = parseZipBuffer(zipBuffer);
@@ -1119,8 +1230,11 @@ export function validateExtensionArchive(zipBuffer, options = {}) {
   }
 
   if (
-    entries.has("monitor.html") ||
-    entryNames.some((n) => /^assets\/monitor-[^/]+\.js$/i.test(n))
+    entryNames.some(
+      (n) =>
+        n.toLowerCase() === "monitor.html" ||
+        /^assets\/monitor-[^/]+\.js$/i.test(n),
+    )
   ) {
     throw new Stage2Error("extension zip contains forbidden monitor bundle");
   }
@@ -1163,10 +1277,21 @@ export function validateExtensionArchive(zipBuffer, options = {}) {
   if (!Array.isArray(extManifest.permissions)) {
     throw new Stage2Error("extension manifest.permissions must be an array");
   }
-  for (const forbidden of FORBIDDEN_EXTENSION_PERMISSIONS) {
-    if (extManifest.permissions.includes(forbidden)) {
+  const allDeclaredPerms = [
+    ...extManifest.permissions,
+    ...(Array.isArray(extManifest.optional_permissions)
+      ? extManifest.optional_permissions
+      : []),
+  ];
+  for (const perm of allDeclaredPerms) {
+    if (FORBIDDEN_EXTENSION_PERMISSIONS.includes(perm)) {
       throw new Stage2Error(
-        `forbidden permission in extension manifest: ${forbidden}`,
+        `forbidden permission in extension manifest: ${perm}`,
+      );
+    }
+    if (!ALLOWED_EXTENSION_PERMISSIONS.includes(perm)) {
+      throw new Stage2Error(
+        `unallowlisted permission in extension manifest: ${sanitizeText(perm)}`,
       );
     }
   }
@@ -1250,7 +1375,7 @@ export function validateExtensionArchive(zipBuffer, options = {}) {
     version,
     extensionId: derivedId,
     externallyConnectableCount: extConn.matches.length,
-    manifestVerifiedAgainstRelease: Boolean(manifestData),
+    manifestVerifiedAgainstRelease,
     entries,
   };
 }
@@ -1267,7 +1392,7 @@ export async function extractZipEntriesToDir(entries, destDir) {
       throw new Stage2Error(`zip extraction path escape blocked: ${relPosix}`);
     }
     await fsp.mkdir(path.dirname(absDest), { recursive: true });
-    await fsp.writeFile(absDest, data);
+    await fsp.writeFile(absDest, data, { flag: "wx" });
   }
 }
 
@@ -1290,8 +1415,9 @@ export function assertPathNotGitTracked(targetDir) {
     throw new Stage2Error("refusing to sync extension into filesystem root");
   }
 
+  const realpathFn = fs.realpathSync.native || fs.realpathSync;
   const existingAncestor = findNearestExistingAncestor(absTarget);
-  const realAncestor = fs.realpathSync(existingAncestor);
+  const realAncestor = realpathFn(existingAncestor);
   const relFromAncestor = path.relative(existingAncestor, absTarget);
   const resolvedTarget = relFromAncestor
     ? path.resolve(realAncestor, relFromAncestor)
@@ -1317,7 +1443,7 @@ export function assertPathNotGitTracked(targetDir) {
     throw new Stage2Error("failed to verify Git tracking status for sync target");
   }
 
-  const gitRoot = fs.realpathSync(gitTopRaw);
+  const gitRoot = realpathFn(gitTopRaw);
   const relToRepo = path.relative(gitRoot, resolvedTarget);
   if (!relToRepo || relToRepo === ".") {
     throw new Stage2Error("refusing to sync extension into Git repository root");
@@ -1326,7 +1452,8 @@ export function assertPathNotGitTracked(targetDir) {
     return { absTarget: resolvedTarget, inGitRepo: false };
   }
   const relPosix = relToRepo.split(path.sep).join("/");
-  if (relPosix === ".git" || relPosix.startsWith(".git/")) {
+  const relPosixLower = relPosix.toLowerCase();
+  if (relPosixLower === ".git" || relPosixLower.startsWith(".git/")) {
     throw new Stage2Error("refusing to sync extension inside .git directory");
   }
 
@@ -1367,8 +1494,36 @@ export function assertPathNotGitTracked(targetDir) {
 }
 
 export async function syncExtensionAtomic(archiveInfo, targetDir) {
+  if (!archiveInfo?.manifestVerifiedAgainstRelease) {
+    throw new Stage2Error(
+      "refusing --sync-local-extension: archive digest was not verified against --manifest",
+    );
+  }
   const checked = assertPathNotGitTracked(targetDir);
   const finalDir = checked.absTarget;
+
+  // Monotonic anti-downgrade check when overwriting an existing local extension installation.
+  const existingManifestPath = path.join(finalDir, "manifest.json");
+  if (fs.existsSync(existingManifestPath)) {
+    let existingVersion = "";
+    try {
+      const existingManifest = JSON.parse(
+        await fsp.readFile(existingManifestPath, "utf8"),
+      );
+      existingVersion = String(existingManifest?.version || "").trim();
+    } catch {
+      existingVersion = "";
+    }
+    if (
+      /^\d+\.\d+\.\d+$/.test(existingVersion) &&
+      compareSemver(archiveInfo.version, existingVersion) < 0
+    ) {
+      throw new Stage2Error(
+        `refusing extension downgrade (installed=${existingVersion}, candidate=${archiveInfo.version})`,
+      );
+    }
+  }
+
   const parentDir = path.dirname(finalDir);
   await fsp.mkdir(parentDir, { recursive: true });
 
@@ -1446,17 +1601,20 @@ function killProcessTree(pid, signal) {
 
 function listResidualPidsByRunTag(runTag) {
   if (!runTag || process.platform === "win32") return [];
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
   try {
-    const output = execFileSync("ps", ["-ax", "-o", "pid=,command="], {
+    const output = execFileSync("ps", ["-ax", "-o", "uid=,pid=,command="], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
     const pids = [];
     for (const line of output.split(/\r?\n/)) {
       if (!line.includes(runTag)) continue;
-      const m = /^\s*(\d+)\s+/.exec(line);
+      const m = /^\s*(\d+)\s+(\d+)\s+/.exec(line);
       if (!m) continue;
-      const pid = Number(m[1]);
+      const uid = Number(m[1]);
+      const pid = Number(m[2]);
+      if (currentUid !== null && uid !== currentUid) continue;
       if (pid && pid !== process.pid) {
         pids.push(pid);
       }
@@ -1564,9 +1722,10 @@ export class ChromeProcessPool {
       );
     }
 
+    const usePipeTransport = process.platform !== "win32";
     const args = [
       ...MANDATORY_HEADLESS_FLAGS,
-      "--remote-debugging-port=0",
+      usePipeTransport ? "--remote-debugging-pipe" : "--remote-debugging-port=0",
       `--user-data-dir=${profileDir}`,
       "--window-size=1440,900",
       "--disable-sync",
@@ -1595,8 +1754,9 @@ export class ChromeProcessPool {
           `--disable-extensions-except=${extensionDir}`,
           `--load-extension=${extensionDir}`,
         );
+      } else {
+        args.push("--enable-unsafe-extension-debugging");
       }
-      args.push("--enable-unsafe-extension-debugging");
     }
 
     args.push("about:blank");
@@ -1612,7 +1772,9 @@ export class ChromeProcessPool {
     let stderrBytes = 0;
     const child = spawn(this.chromeBin, args, {
       detached: process.platform !== "win32",
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: usePipeTransport
+        ? ["ignore", "ignore", "pipe", "pipe", "pipe"]
+        : ["ignore", "ignore", "pipe"],
     });
     child.stderr?.on("data", (chunk) => {
       if (stderrBytes < 8192) {
@@ -1656,33 +1818,60 @@ export class ChromeProcessPool {
     };
 
     try {
-      const browser = await until(
-        async () => {
-          if (this.closing) {
-            throw new Stage2Error("ChromeProcessPool is shutting down");
-          }
-          if (spawnError) {
-            throw new Stage2Error(
-              `Chrome (${name}) failed to spawn: ${sanitizeText(spawnError.message)}`,
-            );
-          }
-          if (instance.exited) {
-            const tail = Buffer.concat(stderrChunks).toString("utf8").slice(-400);
-            throw new Stage2Error(
-              `Chrome (${name}) exited prematurely: ${sanitizeText(tail)}`,
-            );
-          }
-          return connect(profileDir, onEvent).catch(() => null);
-        },
-        `Chrome (${name}) DevTools connection`,
-        15_000,
-      );
-      instance.browser = browser;
+      let browser;
+      let versionInfo;
+      if (usePipeTransport) {
+        browser = connectPipe(child, onEvent);
+        instance.browser = browser;
+        versionInfo = await until(
+          async () => {
+            if (this.closing) {
+              throw new Stage2Error("ChromeProcessPool is shutting down");
+            }
+            if (spawnError) {
+              throw new Stage2Error(
+                `Chrome (${name}) failed to spawn: ${sanitizeText(spawnError.message)}`,
+              );
+            }
+            if (instance.exited) {
+              const tail = Buffer.concat(stderrChunks).toString("utf8").slice(-400);
+              throw new Stage2Error(
+                `Chrome (${name}) exited prematurely: ${sanitizeText(tail)}`,
+              );
+            }
+            return browser.send("Browser.getVersion").catch(() => null);
+          },
+          `Chrome (${name}) DevTools pipe connection`,
+          15_000,
+        );
+      } else {
+        browser = await until(
+          async () => {
+            if (this.closing) {
+              throw new Stage2Error("ChromeProcessPool is shutting down");
+            }
+            if (spawnError) {
+              throw new Stage2Error(
+                `Chrome (${name}) failed to spawn: ${sanitizeText(spawnError.message)}`,
+              );
+            }
+            if (instance.exited) {
+              const tail = Buffer.concat(stderrChunks).toString("utf8").slice(-400);
+              throw new Stage2Error(
+                `Chrome (${name}) exited prematurely: ${sanitizeText(tail)}`,
+              );
+            }
+            return connect(profileDir, onEvent).catch(() => null);
+          },
+          `Chrome (${name}) DevTools connection`,
+          15_000,
+        );
+        instance.browser = browser;
+        versionInfo = await browser.send("Browser.getVersion");
+      }
       if (this.closing) {
         throw new Stage2Error("ChromeProcessPool is shutting down");
       }
-
-      const versionInfo = await browser.send("Browser.getVersion");
       // NOTE: Do NOT call `Browser.setDownloadBehavior({ behavior: "allow" })` when
       // testing `chrome.downloads` extensions: CDP's `allow` mode installs
       // `DevToolsDownloadManagerDelegate`, which bypasses `ChromeDownloadManagerDelegate`
@@ -1765,6 +1954,15 @@ export class ChromeProcessPool {
           await delay(50);
         }
       }
+    }
+
+    try {
+      instance.child?.stderr?.destroy();
+      instance.child?.stdio?.[3]?.destroy();
+      instance.child?.stdio?.[4]?.destroy();
+      instance.child?.unref?.();
+    } catch {
+      // ignore
     }
   }
 
@@ -2002,6 +2200,7 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
     "http_monitor_headers",
     "http_precompressed_br",
     "http_llms_txt",
+    "http_extension_version_json",
     "http_true_404",
     "http_api_stats_unauth",
   ];
@@ -2016,6 +2215,7 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
         }),
       ),
       workerBuild: "",
+      extensionVersionMeta: null,
     };
   }
 
@@ -2032,6 +2232,7 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
     bridgeRes,
     monitorRes,
     llmsRes,
+    extVerRes,
     missingRootRes,
     missingAssetRes,
     statsRes,
@@ -2041,6 +2242,7 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
     client.get("/downloads/bridge.html", { accept: "text/html" }).catch((e) => ({ error: e })),
     client.get("/monitor", { accept: "text/html" }).catch((e) => ({ error: e })),
     client.get("/llms.txt", { accept: "text/plain" }).catch((e) => ({ error: e })),
+    client.get("/helper/extension-version.json", { accept: "application/json" }).catch((e) => ({ error: e })),
     client.get(`/__stage2_missing_${nonce}`).catch((e) => ({ error: e })),
     client.get(`/assets/__stage2_missing_${nonce}.js`).catch((e) => ({ error: e })),
     client
@@ -2245,7 +2447,9 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
         let rawSize = 0;
         if (encList[0] === "br") {
           try {
-            const inflated = zlib.brotliDecompressSync(brRes.body);
+            const inflated = zlib.brotliDecompressSync(brRes.body, {
+              maxOutputLength: MAX_HTTP_BODY_BYTES,
+            });
             rawSize = inflated.length;
             const relKey = discoveredMainJs.replace(/^\//, "");
             const expectedBrSha = manifestData?.frontend_dist_files?.[`${relKey}.br`];
@@ -2300,6 +2504,63 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
         group: "http_security",
         status: fails.length === 0 ? "PASS" : "FAIL",
         elapsedMs: llmsRes.elapsedMs || 0,
+        note: fails.length === 0 ? note : fails.join("; "),
+      }),
+    );
+  }
+
+  // 5b. /helper/extension-version.json runtime SSOT contract
+  let discoveredExtVersionMeta = null;
+  {
+    const fails = [];
+    let note = "";
+    if (extVerRes.error) {
+      fails.push(sanitizeText(extVerRes.error.message));
+    } else {
+      if (extVerRes.status !== 200) fails.push(`HTTP ${extVerRes.status}`);
+      const xfo = (extVerRes.headers["x-frame-options"] || "").toUpperCase();
+      if (xfo !== "DENY") fails.push(`X-Frame-Options=${xfo || "missing"}`);
+      const cc = (extVerRes.headers["cache-control"] || "").toLowerCase();
+      if (!cc.includes("no-cache")) fails.push(`Cache-Control=${cc || "missing"}`);
+      const ct = (extVerRes.headers["content-type"] || "").toLowerCase();
+      if (!ct.includes("application/json")) fails.push(`Content-Type=${ct || "missing"}`);
+      const bodySha = crypto.createHash("sha256").update(extVerRes.body).digest("hex");
+      const expectedJsonSha =
+        manifestData?.frontend_dist_files?.["helper/extension-version.json"];
+      if (expectedJsonSha && bodySha !== expectedJsonSha) {
+        fails.push(`json sha256 mismatch (${bodySha.slice(0, 12)})`);
+      }
+      try {
+        const obj = JSON.parse(extVerRes.body.toString("utf8"));
+        const ver = typeof obj?.version === "string" ? obj.version.trim() : "";
+        const dlUrl = typeof obj?.download_url === "string" ? obj.download_url.trim() : "";
+        const zipSha = typeof obj?.sha256 === "string" ? obj.sha256.trim().toLowerCase() : "";
+        if (!/^\d+\.\d+\.\d+$/.test(ver)) {
+          fails.push(`invalid version=${sanitizeText(ver)}`);
+        }
+        if (dlUrl !== "/helper/dokitool-chrome-extension.zip") {
+          fails.push("unexpected download_url");
+        }
+        if (zipSha && !/^[0-9a-f]{64}$/.test(zipSha)) {
+          fails.push("invalid sha256 format");
+        }
+        const manifestZipSha =
+          manifestData?.artifacts?.["dokitool-chrome-extension.zip"]?.sha256?.toLowerCase() || "";
+        if (zipSha && manifestZipSha && zipSha !== manifestZipSha) {
+          fails.push("extension-version.json sha256 mismatch vs release-manifest");
+        }
+        discoveredExtVersionMeta = { version: ver, sha256: zipSha };
+        note = `v${ver || "-"}, no-cache, XFO=${xfo}${zipSha ? `, zipSha[:12]=${zipSha.slice(0, 12)}` : ""}`;
+      } catch {
+        fails.push("invalid JSON body");
+      }
+    }
+    checks.push(
+      makeCheck({
+        id: "http_extension_version_json",
+        group: "http_security",
+        status: fails.length === 0 ? "PASS" : "FAIL",
+        elapsedMs: extVerRes.elapsedMs || 0,
         note: fails.length === 0 ? note : fails.join("; "),
       }),
     );
@@ -2372,7 +2633,11 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
     );
   }
 
-  return { checks, workerBuild: discoveredWorkerBuild };
+  return {
+    checks,
+    workerBuild: discoveredWorkerBuild,
+    extensionVersionMeta: discoveredExtVersionMeta,
+  };
 }
 
 async function runPureWebChromeChecks({ pool, target, expectedWorkerBuild, timeoutMs }) {
@@ -3175,6 +3440,11 @@ export async function runStage2(options = {}) {
 
   // Validate --sync-local-extension up front (fail-closed before launching Chrome).
   if (options.syncLocalExtension) {
+    if (!options.manifestPath) {
+      throw new Stage2Error(
+        "--sync-local-extension requires --manifest for release digest verification",
+      );
+    }
     assertPathNotGitTracked(options.syncLocalExtension);
   }
 
@@ -3317,36 +3587,8 @@ async function _executeTracks({
         throw new Stage2Error("ChromeProcessPool is shutting down");
       }
 
-      // Run optional atomic sync & Extension Chrome concurrently!
-      const syncPromise = options.syncLocalExtension
-        ? (async () => {
-            if (pool.closing) return null;
-            const syncStart = Date.now();
-            try {
-              const res = await syncExtensionAtomic(
-                archiveInfo,
-                options.syncLocalExtension,
-              );
-              return makeCheck({
-                id: "sync_local_extension",
-                group: "artifact_verify",
-                status: "PASS",
-                elapsedMs: Date.now() - syncStart,
-                note: `atomic sync ok (files=${res.fileCount}, v${res.version}, sha256[:12]=${res.sha256.slice(0, 12)})`,
-              });
-            } catch (err) {
-              return makeCheck({
-                id: "sync_local_extension",
-                group: "artifact_verify",
-                status: "FAIL",
-                elapsedMs: Date.now() - syncStart,
-                note: sanitizeText(err.message),
-              });
-            }
-          })()
-        : Promise.resolve(null);
-
-      const chromePromise = runExtensionChromeChecks({
+      // Run Extension Chrome verification FIRST, then sync locally ONLY if all Chrome checks pass.
+      const chromeRes = await runExtensionChromeChecks({
         pool,
         target,
         extDir,
@@ -3358,21 +3600,54 @@ async function _executeTracks({
         parsePacingMs,
       });
 
-      const [syncSettled, chromeSettled] = await Promise.allSettled([
-        syncPromise,
-        chromePromise,
-      ]);
-      if (syncSettled.status === "rejected") {
-        throw syncSettled.reason;
+      if (options.syncLocalExtension && !pool.closing) {
+        const syncStart = Date.now();
+        const chromePassed = chromeRes.checks.every((c) => c.status !== "FAIL");
+        if (!chromePassed) {
+          extChecks.push(
+            makeCheck({
+              id: "sync_local_extension",
+              group: "artifact_verify",
+              status: "FAIL",
+              elapsedMs: Date.now() - syncStart,
+              note: "aborted: official extension Chrome verification failed",
+            }),
+          );
+        } else {
+          try {
+            const res = await syncExtensionAtomic(
+              archiveInfo,
+              options.syncLocalExtension,
+            );
+            extChecks.push(
+              makeCheck({
+                id: "sync_local_extension",
+                group: "artifact_verify",
+                status: "PASS",
+                elapsedMs: Date.now() - syncStart,
+                note: `atomic sync ok (files=${res.fileCount}, v${res.version}, sha256[:12]=${res.sha256.slice(0, 12)})`,
+              }),
+            );
+          } catch (err) {
+            extChecks.push(
+              makeCheck({
+                id: "sync_local_extension",
+                group: "artifact_verify",
+                status: "FAIL",
+                elapsedMs: Date.now() - syncStart,
+                note: sanitizeText(err.message),
+              }),
+            );
+          }
+        }
       }
-      if (chromeSettled.status === "rejected") {
-        throw chromeSettled.reason;
-      }
-      const syncCheck = syncSettled.value;
-      const chromeRes = chromeSettled.value;
-      if (syncCheck) extChecks.push(syncCheck);
+
       extChecks.push(...chromeRes.checks);
-      return { checks: extChecks, browserVersion: chromeRes.browserVersion };
+      return {
+        checks: extChecks,
+        browserVersion: chromeRes.browserVersion,
+        archiveInfo,
+      };
     })();
 
     const [httpSettled, pureWebSettled, extSettled] = await Promise.allSettled([
@@ -3405,11 +3680,35 @@ async function _executeTracks({
       }
     }
 
+    // Cross-verify /helper/extension-version.json against downloaded extension archive when both ran.
+    if (httpRes.extensionVersionMeta && extRes.archiveInfo) {
+      const verCheck = httpRes.checks.find((c) => c.id === "http_extension_version_json");
+      if (verCheck && verCheck.status === "PASS") {
+        const mismatches = [];
+        if (httpRes.extensionVersionMeta.version !== extRes.archiveInfo.version) {
+          mismatches.push(
+            `version mismatch (json=${httpRes.extensionVersionMeta.version}, zip=${extRes.archiveInfo.version})`,
+          );
+        }
+        if (
+          httpRes.extensionVersionMeta.sha256 &&
+          httpRes.extensionVersionMeta.sha256 !== extRes.archiveInfo.sha256
+        ) {
+          mismatches.push("sha256 mismatch vs downloaded extension zip");
+        }
+        if (mismatches.length > 0) {
+          verCheck.status = "FAIL";
+          verCheck.note = sanitizeText(`${verCheck.note}; ${mismatches.join("; ")}`);
+        }
+      }
+    }
+
     browserVersion = pureWebRes.browserVersion || extRes.browserVersion || "";
     checks = [...extRes.checks.slice(0, 1), ...httpRes.checks, ...pureWebRes.checks, ...extRes.checks.slice(1)];
   } finally {
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
+    client.close();
     const cleanRes = await pool.cleanupAll();
     residualChrome = cleanRes.residualChrome;
   }
@@ -3671,6 +3970,30 @@ const isDirectExecution =
   Boolean(process.argv[1]) &&
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
+function flushStream(stream) {
+  return new Promise((resolve) => {
+    if (!stream || stream.destroyed || stream.writableEnded) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+    const timer = setTimeout(done, 500);
+    timer.unref?.();
+    stream.write("", () => {
+      clearTimeout(timer);
+      done();
+    });
+  });
+}
+
 if (isDirectExecution) {
-  process.exitCode = await main();
+  const code = await main();
+  await Promise.all([flushStream(process.stdout), flushStream(process.stderr)]);
+  process.exit(code);
 }

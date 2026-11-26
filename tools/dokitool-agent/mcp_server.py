@@ -13,16 +13,31 @@ from typing import Any, Callable, TextIO
 
 from api_client import DokiToolAPIError, DokiToolClient, summarize_parse_result, summarize_platforms
 from downloader import DownloadError, download_media
-from security import MAX_SUBTITLE_BYTES, SafeHTTPFetcher, SecurityError, redact_sensitive, validate_output_dir
+from security import AGENT_VERSION, MAX_SUBTITLE_BYTES, SafeHTTPFetcher, SecurityError, redact_sensitive, validate_output_dir
 from subtitles import extract_subtitles_from_data
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "dokitool-agent", "version": "1.0.0"}
+SERVER_INFO = {"name": "dokitool-agent", "version": AGENT_VERSION}
+MAX_MCP_LINE_BYTES = 1024 * 1024
+
+_READ_ONLY_ANNOTATIONS: dict[str, bool] = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+_WRITE_ANNOTATIONS: dict[str, bool] = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
 
 _READ_ONLY_TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "dokitool_list_platforms",
         "description": "List enabled media platforms and capabilities on the configured DokiTool API instance (read-only).",
+        "annotations": dict(_READ_ONLY_ANNOTATIONS),
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -32,6 +47,7 @@ _READ_ONLY_TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "dokitool_parse_media",
         "description": "Parse a single share URL or share text into normalized Unified-v1 media items, variants, and subtitle track metadata (read-only).",
+        "annotations": dict(_READ_ONLY_ANNOTATIONS),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -46,7 +62,8 @@ _READ_ONLY_TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "dokitool_extract_subtitles",
-        "description": "Discover and directly fetch public subtitle tracks (<= 5 MiB cap, zero-Cookie, anti-SSRF) rendered as plain text, VTT, SRT, or raw (read-only).",
+        "description": "Discover and directly fetch public subtitle tracks (<= 5 MiB per track / <= 10 MiB total cap, zero-Cookie, anti-SSRF) rendered as plain text, VTT, SRT, or raw (read-only).",
+        "annotations": dict(_READ_ONLY_ANNOTATIONS),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -66,7 +83,8 @@ _READ_ONLY_TOOLS: tuple[dict[str, Any], ...] = (
 
 _DOWNLOAD_TOOL: dict[str, Any] = {
     "name": "dokitool_download_media",
-    "description": "Download media (and optional subtitles) directly from CDN into the server's configured jailed --output-dir (explicit opt-in only).",
+    "description": "Download media (and optional subtitles) directly from CDN into the server's configured jailed --output-dir (explicit opt-in only; no-clobber by default unless overwrite=true).",
+    "annotations": dict(_WRITE_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -74,7 +92,8 @@ _DOWNLOAD_TOOL: dict[str, Any] = {
             "platform": {"type": "string", "description": "Optional platform ID."},
             "item_id": {"type": "string", "description": "Optional item ID to download."},
             "variant_id": {"type": "string", "description": "Optional variant ID to download."},
-            "filename": {"type": "string", "description": "Optional target basename strictly inside --output-dir (no slashes or '..')."},
+            "filename": {"type": "string", "description": "Optional target basename strictly inside --output-dir (passive media/subtitle extension, no slashes or '..')."},
+            "overwrite": {"type": "boolean", "default": False, "description": "Allow replacing an existing target file inside --output-dir (default: false, no-clobber)."},
             "include_subtitles": {"type": "boolean", "default": False},
             "subtitle_lang": {"type": "string"},
             "subtitle_kind": {"type": "string", "enum": ["all", "manual", "auto"], "default": "all"},
@@ -168,7 +187,35 @@ class DokiToolMCPServer:
             tools.append(dict(_DOWNLOAD_TOOL))
         return tools
 
+    def _validate_tool_arguments(self, tool_def: dict[str, Any], arguments: dict[str, Any]) -> None:
+        schema = tool_def.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            extra = sorted(k for k in arguments if k not in props)
+            if extra:
+                raise ValueError(f"Unknown argument(s): {', '.join(extra)}")
+        for req_key in schema.get("required") or ():
+            if req_key not in arguments or arguments[req_key] is None:
+                raise ValueError(f"Missing required argument: {req_key}")
+        for key, val in arguments.items():
+            if val is None:
+                continue
+            spec = props.get(key) or {}
+            expected_type = spec.get("type")
+            if expected_type == "string" and not isinstance(val, str):
+                raise ValueError(f"Argument '{key}' must be a string")
+            if expected_type == "boolean" and not isinstance(val, bool):
+                raise ValueError(f"Argument '{key}' must be a boolean")
+            allowed_enum = spec.get("enum")
+            if allowed_enum is not None and val not in allowed_enum:
+                raise ValueError(f"Argument '{key}' must be one of {', '.join(str(x) for x in allowed_enum)}")
+
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        tool_def = next((t for t in self.tool_definitions() if t["name"] == name), None)
+        if tool_def is None:
+            return _tool_error(f"Unknown tool: {name}", code="UNKNOWN_TOOL")
+        self._validate_tool_arguments(tool_def, arguments)
+
         if name == "dokitool_list_platforms":
             return _tool_ok(summarize_platforms(self.client.list_platforms()))
 
@@ -223,6 +270,7 @@ class DokiToolMCPServer:
                 self.output_dir,
                 allow_write=self.allow_write,
                 allow_ffmpeg=(self.allow_ffmpeg and want_ffmpeg),
+                overwrite=_opt_bool(arguments, "overwrite", False),
                 platform=_opt_str(arguments, "platform"),
                 item_id=_opt_str(arguments, "item_id"),
                 variant_id=_opt_str(arguments, "variant_id"),
@@ -243,12 +291,19 @@ class DokiToolMCPServer:
         req_id = request.get("id")
         is_notification = "id" not in request
         method = request.get("method")
-        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        raw_params = request.get("params")
+        if raw_params is not None and not isinstance(raw_params, dict):
+            return None if is_notification else _jsonrpc_error(req_id, -32602, "Invalid params: expected object")
+        params = raw_params if isinstance(raw_params, dict) else {}
 
         if not isinstance(method, str) or not method:
             return None if is_notification else _jsonrpc_error(req_id, -32600, "Invalid Request: missing method")
 
         if method.startswith("notifications/"):
+            return None
+
+        if is_notification:
+            # Never execute RPC requests (especially tools/call with side effects) as notifications without an id.
             return None
 
         if method == "initialize":
@@ -298,9 +353,11 @@ class DokiToolMCPServer:
                 result = _tool_error(str(exc), code="TOOL_ERROR")
             return _jsonrpc_result(req_id, result)
 
-        return None if is_notification else _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
 
     def handle_message(self, raw_line: str) -> dict[str, Any] | None:
+        if len(raw_line.encode("utf-8", errors="ignore")) > MAX_MCP_LINE_BYTES:
+            return _jsonrpc_error(None, -32600, f"Request exceeds maximum line size ({MAX_MCP_LINE_BYTES} bytes)")
         text = raw_line.strip()
         if not text:
             return None
@@ -326,8 +383,20 @@ class DokiToolMCPServer:
         )
         err_stream.flush()
 
-        for line in in_stream:
-            response = self.handle_message(line)
+        while True:
+            chunk = in_stream.readline(MAX_MCP_LINE_BYTES + 1)
+            if not chunk:
+                break
+            if len(chunk) > MAX_MCP_LINE_BYTES and not chunk.endswith("\n"):
+                while True:
+                    discard = in_stream.readline(MAX_MCP_LINE_BYTES)
+                    if not discard or discard.endswith("\n"):
+                        break
+                response: dict[str, Any] | None = _jsonrpc_error(
+                    None, -32600, f"Request exceeds maximum line size ({MAX_MCP_LINE_BYTES} bytes)"
+                )
+            else:
+                response = self.handle_message(chunk)
             if response is not None:
                 out_stream.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
                 out_stream.flush()
