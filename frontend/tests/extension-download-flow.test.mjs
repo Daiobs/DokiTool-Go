@@ -1637,10 +1637,14 @@ test("Background SW: synchronous sidePanel.open before await, silent quick-downl
   });
   await bg.init();
 
-  // Verify dual context menus registered
+  // Verify 3 context menus registered (inspect, quick-download, selection link parse)
   assert.deepEqual(
     env.createdMenus.map((m) => m.id),
-    [protocol.CONTEXT_MENU_INSPECT_ID, protocol.CONTEXT_MENU_QUICK_DOWNLOAD_ID],
+    [
+      protocol.CONTEXT_MENU_INSPECT_ID,
+      protocol.CONTEXT_MENU_QUICK_DOWNLOAD_ID,
+      protocol.CONTEXT_MENU_PARSE_SELECTION_ID,
+    ],
   );
 
   // 1) Anonymous TEST_CONNECTION omits Authorization header completely; bad token returns 401 认证凭据无效

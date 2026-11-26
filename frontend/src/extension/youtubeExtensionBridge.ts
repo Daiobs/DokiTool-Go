@@ -1,4 +1,5 @@
 import * as mediabunny from "mediabunny";
+import { projectYouTubeCaptionsForFinalize } from "../core/media/subtitleEngine";
 import {
   YOUTUBE_HELPER_VERSION,
   YOUTUBE_OPFS_TEMP_PREFIX,
@@ -666,15 +667,26 @@ export function createYouTubeExtensionBridge(
       });
     },
 
-    requestPlayer(
+    async requestPlayer(
       payload: YouTubeHelperPlayerPayload,
       reqOptions?: { timeoutMs?: number; signal?: AbortSignal },
     ): Promise<YouTubeHelperPlayerResult> {
-      return requestYouTubePlayerViaHelper(payload, {
+      const result = await requestYouTubePlayerViaHelper(payload, {
         eventTarget,
         timeoutMs: reqOptions?.timeoutMs ?? 20_000,
         signal: reqOptions?.signal,
       });
+      const projectedCaptions = projectYouTubeCaptionsForFinalize(
+        result?.captions,
+      );
+      if (projectedCaptions) {
+        return { ...result, captions: projectedCaptions };
+      }
+      if ("captions" in result) {
+        const { captions: _dropped, ...rest } = result;
+        return rest;
+      }
+      return result;
     },
 
     async downloadDirect(params): Promise<{

@@ -54,6 +54,8 @@ export const YOUTUBE_TAB_SYNC_DEBOUNCE_MS = 750 as const;
 export const CONTEXT_MENU_INSPECT_ID = "dokitool-ext-inspect-link" as const;
 export const CONTEXT_MENU_QUICK_DOWNLOAD_ID =
   "dokitool-ext-quick-download" as const;
+export const CONTEXT_MENU_PARSE_SELECTION_ID =
+  "dokitool-parse-selection" as const;
 export const COMMAND_OPEN_SIDEPANEL = "open-dokitool-sidepanel" as const;
 
 export interface TabSyncState {
@@ -164,10 +166,42 @@ export type ExtensionTaskRetryPayload =
   | {
       kind: "url";
       url: string;
+      itemId?: string;
+      variantId?: string;
       qualityPreference?: QualityPreference;
       batchSaveMode?: BatchSaveMode;
       subfolderPrefix?: string;
     };
+
+export type PersistedTaskHistoryStatus = "completed" | "failed" | "cancelled";
+
+/**
+ * Guardrail G6 sanitized task history record persisted in `chrome.storage.local`.
+ * Strictly excludes signed CDN routes, mux specs, headers, and credentials;
+ * SW-wake retries re-parse from canonical `sourcePageUrl`.
+ */
+export interface PersistedTaskHistoryRecord {
+  taskId: string;
+  title: string;
+  platform: string;
+  filename: string;
+  status: PersistedTaskHistoryStatus;
+  statusText: string;
+  total?: number;
+  error?: string;
+  lastErrorCode?: string;
+  createdAt: number;
+  updatedAt: number;
+  chromeDownloadId?: number;
+  groupBatchId?: string;
+  workFingerprint?: string;
+  sourcePageUrl?: string;
+  itemId?: string;
+  variantId?: string;
+  qualityPreference?: QualityPreference;
+  batchSaveMode?: BatchSaveMode;
+  subfolderPrefix?: string;
+}
 
 export interface ExtensionDownloadTask {
   taskId: string;
@@ -176,6 +210,8 @@ export interface ExtensionDownloadTask {
   filename: string;
   platform: string;
   workFingerprint?: string;
+  sourcePageUrl?: string;
+  persistedFromHistory?: boolean;
   status: ExtensionTaskStatus;
   statusText: string;
   percent: number;
@@ -202,6 +238,38 @@ export interface EnqueueDownloadItem {
   fallbackUrl?: string;
   refreshContext?: MediaRefreshContext;
   spec: OffscreenDownloadSpec;
+}
+
+export interface MultiPartEnqueueMediaMeta {
+  platform: string;
+  title?: string;
+  authorName?: string;
+  contentId?: string;
+  sourceUrl?: string;
+  refreshUrl?: string;
+  workFingerprint?: string;
+  totalItemCount?: number;
+}
+
+export interface MultiPartEnqueueItemInput {
+  itemId: string;
+  index: number;
+  title: string;
+  state: "ready" | "deferred";
+  resolveUrl?: string;
+  sourceUrl?: string;
+  spec?: OffscreenDownloadSpec;
+  fallbackUrl?: string;
+  filenameHint?: string;
+}
+
+export interface EnqueueMultiPartItemsRequest {
+  type: "ENQUEUE_MULTIPART_ITEMS";
+  media: MultiPartEnqueueMediaMeta;
+  items: MultiPartEnqueueItemInput[];
+  qualityPreference?: QualityPreference;
+  subfolderPrefix?: string;
+  groupBatchId?: string;
 }
 
 export interface ExtensionStateSnapshot {
@@ -270,6 +338,7 @@ export type SidePanelToBackgroundRequest =
       batchSaveMode?: BatchSaveMode;
       subfolderPrefix?: string;
     }
+  | EnqueueMultiPartItemsRequest
   | { type: "CANCEL_TASK"; taskId: string }
   | { type: "RETRY_TASK"; taskId: string }
   | { type: "CLEAR_FINISHED_TASKS" }
@@ -294,6 +363,11 @@ export interface SidePanelResponseMap {
   RESOLVE_LAZY_ITEM: { media: UnifiedMedia };
   ENQUEUE_DOWNLOADS: { taskIds: string[]; tasks: ExtensionDownloadTask[] };
   ENQUEUE_BATCH_URLS: {
+    groupBatchId: string;
+    taskIds: string[];
+    tasks: ExtensionDownloadTask[];
+  };
+  ENQUEUE_MULTIPART_ITEMS: {
     groupBatchId: string;
     taskIds: string[];
     tasks: ExtensionDownloadTask[];
@@ -564,6 +638,7 @@ const SIDEPANEL_REQUEST_TYPES = new Set<SidePanelToBackgroundRequest["type"]>([
   "RESOLVE_LAZY_ITEM",
   "ENQUEUE_DOWNLOADS",
   "ENQUEUE_BATCH_URLS",
+  "ENQUEUE_MULTIPART_ITEMS",
   "CANCEL_TASK",
   "RETRY_TASK",
   "CLEAR_FINISHED_TASKS",
@@ -613,6 +688,20 @@ export function isSidePanelRequest(
     SIDEPANEL_REQUEST_TYPES.has(
       msg.type as SidePanelToBackgroundRequest["type"],
     )
+  );
+}
+
+export function isEnqueueMultiPartItemsRequest(
+  msg: unknown,
+): msg is EnqueueMultiPartItemsRequest {
+  if (!hasMessageType(msg) || msg.type !== "ENQUEUE_MULTIPART_ITEMS") {
+    return false;
+  }
+  const rec = msg as Record<string, unknown>;
+  const media = rec.media as Record<string, unknown> | null | undefined;
+  return (
+    Boolean(media && typeof media === "object" && typeof media.platform === "string") &&
+    Array.isArray(rec.items)
   );
 }
 

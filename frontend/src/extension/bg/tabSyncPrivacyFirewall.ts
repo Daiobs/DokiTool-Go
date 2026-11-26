@@ -1,8 +1,10 @@
 import type { UnifiedMedia } from "../../types/media";
+import { readyItem, readyVariant } from "../../utils/mediaContract";
 import { buildEnqueueItemsForMedia } from "../extensionDownload";
 import {
   COMMAND_OPEN_SIDEPANEL,
   CONTEXT_MENU_INSPECT_ID,
+  CONTEXT_MENU_PARSE_SELECTION_ID,
   CONTEXT_MENU_QUICK_DOWNLOAD_ID,
   type BackgroundToSidePanelBroadcast,
   type BatchSaveMode,
@@ -26,6 +28,49 @@ import type {
   ChromeTabLike,
 } from "./types";
 
+const SELECTION_URL_TOKEN_RE =
+  /https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/gi;
+const SELECTION_TRAILING_PUNCT_RE = /[.,;:!?'"\]}>]+$/;
+
+function trimSelectionUrlCandidate(rawToken: string): string {
+  let candidate = rawToken.replace(SELECTION_TRAILING_PUNCT_RE, "");
+  while (candidate.endsWith(")")) {
+    const opens = (candidate.match(/\(/g) ?? []).length;
+    const closes = (candidate.match(/\)/g) ?? []).length;
+    if (closes > opens) {
+      candidate = candidate
+        .slice(0, -1)
+        .replace(SELECTION_TRAILING_PUNCT_RE, "");
+    } else {
+      break;
+    }
+  }
+  return candidate;
+}
+
+/**
+ * Extracts the first valid public HTTP(S) link from right-clicked selected text,
+ * stripping trailing punctuation and fragments while rejecting non-http(s) schemes
+ * (`javascript:`, `file:`, `chrome:`) and private/internal hosts.
+ */
+export function extractFirstValidSelectionUrl(
+  selectionText: unknown,
+): string | null {
+  if (typeof selectionText !== "string") return null;
+  const bounded = selectionText.slice(0, 8_192);
+  if (!bounded.trim()) return null;
+  const tokens = bounded.match(SELECTION_URL_TOKEN_RE);
+  if (!tokens || tokens.length === 0) return null;
+  for (const rawToken of tokens) {
+    const candidate = trimSelectionUrlCandidate(rawToken);
+    const matched = matchActiveParseUrl(candidate);
+    if (matched?.url) {
+      return matched.url;
+    }
+  }
+  return null;
+}
+
 export interface TabSyncPrivacyFirewallDeps {
   chromeApi: ChromeBackgroundApi;
   storage: ExtensionStorageController;
@@ -44,6 +89,7 @@ export interface TabSyncPrivacyFirewallDeps {
   trackBackgroundJob: <T>(promise: Promise<T>) => Promise<T>;
   broadcastToSidePanels: (msg: BackgroundToSidePanelBroadcast) => void;
   broadcastTasksUpdated: (includeSavedFingerprints?: boolean) => Promise<void>;
+  onTaskHistoryChange?: (options?: { immediate?: boolean }) => Promise<void> | void;
   updateBadge: (
     terminalOutcome?: "completed" | "failed" | "clear",
     options?: { progressOnly?: boolean },
@@ -54,6 +100,11 @@ export interface TabSyncPrivacyFirewallDeps {
   ) => Promise<string[]>;
   parseSupportedUrlInternal: (
     matched: MatchedPlatformUrl,
+    settings: ExtensionSettings,
+    signal?: AbortSignal,
+  ) => Promise<UnifiedMedia>;
+  resolveLazyItemInternal?: (
+    rawResolveUrl: string,
     settings: ExtensionSettings,
     signal?: AbortSignal,
   ) => Promise<UnifiedMedia>;
@@ -84,7 +135,7 @@ export interface TabSyncPrivacyFirewall {
   ensureInitialTabSync(): Promise<void>;
   registerContextMenus(): Promise<void>;
   onContextMenuClicked(
-    info: ChromeContextMenuClickInfo,
+    info: ChromeContextMenuClickInfo & { selectionText?: string },
     tab?: ChromeTabLike,
   ): void;
   onCommandTriggered(command: string, tab?: ChromeTabLike): void;
@@ -96,6 +147,8 @@ export interface TabSyncPrivacyFirewall {
     subfolderPrefix: string;
     forceSubfolder: boolean;
     groupBatchId?: string;
+    itemId?: string;
+    variantId?: string;
   }): Promise<string[]>;
   enqueueBatchUrls(req: {
     urls: string[];
@@ -131,10 +184,12 @@ export function createTabSyncPrivacyFirewall(
     trackBackgroundJob,
     broadcastToSidePanels,
     broadcastTasksUpdated,
+    onTaskHistoryChange,
     updateBadge,
     scheduleOffscreenIdleCloseIfIdle,
     resolveExtraAllowedMediaOrigins,
     parseSupportedUrlInternal,
+    resolveLazyItemInternal,
     hydrateDeferredMediaItems,
     enrichSpecAllowedOrigins,
     dispatchSpecTaskToOffscreen,
@@ -277,6 +332,8 @@ export function createTabSyncPrivacyFirewall(
     subfolderPrefix: string;
     forceSubfolder: boolean;
     groupBatchId?: string;
+    itemId?: string;
+    variantId?: string;
   }): Promise<string[]> => {
     const {
       placeholderTaskId,
@@ -286,6 +343,8 @@ export function createTabSyncPrivacyFirewall(
       subfolderPrefix,
       forceSubfolder,
       groupBatchId,
+      itemId,
+      variantId,
     } = params;
 
     const existing = tasks.get(placeholderTaskId);
@@ -298,6 +357,7 @@ export function createTabSyncPrivacyFirewall(
 
     tasks.set(placeholderTaskId, {
       ...existing,
+      persistedFromHistory: undefined,
       status: "parsing",
       statusText: "正在解析链接...",
       error: undefined,
@@ -305,6 +365,7 @@ export function createTabSyncPrivacyFirewall(
       updatedAt: nowFn(),
     });
     updateBadge();
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated();
 
     try {
@@ -314,27 +375,61 @@ export function createTabSyncPrivacyFirewall(
         settings,
         parseController.signal,
       );
-      const hydratedMedia = await hydrateDeferredMediaItems(
-        rawMedia,
-        settings,
-        parseController.signal,
-      );
 
-      if (tasks.get(placeholderTaskId)?.status === "cancelled") {
-        return [];
+      let hydratedMedia: UnifiedMedia = rawMedia;
+      const requestedItem = itemId
+        ? rawMedia.items.find((it) => it.id === itemId)
+        : undefined;
+      if (requestedItem) {
+        if (requestedItem.state === "deferred" && requestedItem.resolve_url && resolveLazyItemInternal) {
+          const part = await resolveLazyItemInternal(requestedItem.resolve_url, settings, parseController.signal);
+          const match = part.items.find((it) => it.id === itemId);
+          if (match && readyItem(match)) {
+            hydratedMedia = {
+              ...rawMedia,
+              items: rawMedia.items.map((it) =>
+                it.id === itemId
+                  ? match.resolve_url ? match : { ...match, resolve_url: requestedItem.resolve_url }
+                  : it,
+              ),
+              attachments: [...(rawMedia.attachments ?? []), ...(part.attachments ?? [])],
+            };
+          }
+        }
+      } else {
+        hydratedMedia = await hydrateDeferredMediaItems(rawMedia, settings, parseController.signal);
       }
 
+      if (tasks.get(placeholderTaskId)?.status === "cancelled") return [];
+
       const extraAllowedOrigins = await resolveExtraAllowedMediaOrigins(settings);
-      const enqueueItems = buildEnqueueItemsForMedia(hydratedMedia, {
-        apiOrigin: settings.apiBaseUrl,
-        qualityPreference,
-        batchSaveMode,
-        subfolderPrefix,
-        forceSubfolder,
-        extraAllowedOrigins,
-        sourceUrl: matched.url,
-        now: nowFn(),
-      });
+      const targetReady = itemId
+        ? hydratedMedia.items.find((it) => it.id === itemId && readyItem(it))
+        : undefined;
+      const matchedVariant =
+        targetReady && readyItem(targetReady) && variantId
+          ? targetReady.variants.find((v) => readyVariant(v) && v.id === variantId)
+          : undefined;
+      const baseOpts = {
+        apiOrigin: settings.apiBaseUrl, qualityPreference, batchSaveMode,
+        subfolderPrefix, forceSubfolder, extraAllowedOrigins, sourceUrl: matched.url, now: nowFn(),
+      };
+      let enqueueItems;
+      if (targetReady && matchedVariant) {
+        try {
+          enqueueItems = buildEnqueueItemsForMedia(hydratedMedia, {
+            ...baseOpts, itemIds: [targetReady.id],
+            variantSelections: { [targetReady.id]: { variant_id: matchedVariant.id } },
+          });
+        } catch {
+          enqueueItems = buildEnqueueItemsForMedia(hydratedMedia, { ...baseOpts, itemIds: [targetReady.id] });
+        }
+      } else {
+        enqueueItems = buildEnqueueItemsForMedia(
+          hydratedMedia,
+          targetReady ? { ...baseOpts, itemIds: [targetReady.id] } : baseOpts,
+        );
+      }
 
       const spawnedIds: string[] = [];
       const first = enqueueItems[0];
@@ -445,6 +540,8 @@ export function createTabSyncPrivacyFirewall(
           retryPayload: {
             kind: "url",
             url: matched.url,
+            ...(itemId ? { itemId } : {}),
+            ...(variantId ? { variantId } : {}),
             qualityPreference,
             batchSaveMode,
             subfolderPrefix,
@@ -452,6 +549,7 @@ export function createTabSyncPrivacyFirewall(
         });
         updateBadge("failed");
       }
+      await onTaskHistoryChange?.({ immediate: true });
       await broadcastTasksUpdated();
       scheduleOffscreenIdleCloseIfIdle();
       return [];
@@ -529,6 +627,7 @@ export function createTabSyncPrivacyFirewall(
     }
 
     updateBadge();
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated();
 
     void trackBackgroundJob(
@@ -595,6 +694,11 @@ export function createTabSyncPrivacyFirewall(
       id: CONTEXT_MENU_QUICK_DOWNLOAD_ID,
       title: "用 DokiTool 极速下载（最高画质 / 全部图集）",
       contexts: ["link", "page", "video", "image"],
+    });
+    chromeApi.contextMenus.create({
+      id: CONTEXT_MENU_PARSE_SELECTION_ID,
+      title: "用 DokiTool 解析选中链接",
+      contexts: ["selection"],
     });
   };
 
@@ -665,6 +769,7 @@ export function createTabSyncPrivacyFirewall(
       },
     });
     updateBadge();
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated();
 
     await executeUrlToDownloadFlow({
@@ -677,23 +782,32 @@ export function createTabSyncPrivacyFirewall(
     });
   };
 
+  const openSidePanelSync = (tab?: ChromeTabLike): void => {
+    // STRICT LINE-1 USER-GESTURE COMPLIANCE: synchronous `sidePanel.open` BEFORE any `await`!
+    if (tab?.id !== undefined) {
+      void chromeApi.sidePanel?.open({ tabId: tab.id })?.catch?.(() => {});
+    } else if (tab?.windowId !== undefined) {
+      void chromeApi.sidePanel?.open({ windowId: tab.windowId })?.catch?.(() => {});
+    }
+  };
+
   const onContextMenuClicked = (
-    info: ChromeContextMenuClickInfo,
+    info: ChromeContextMenuClickInfo & { selectionText?: string },
     tab?: ChromeTabLike,
   ): void => {
     if (info.menuItemId === CONTEXT_MENU_INSPECT_ID) {
-      // STRICT LINE-1 USER-GESTURE COMPLIANCE: synchronous `sidePanel.open` BEFORE any `await`!
-      if (tab?.id !== undefined) {
-        void chromeApi.sidePanel?.open({ tabId: tab.id })?.catch?.(() => {});
-      } else if (tab?.windowId !== undefined) {
-        void chromeApi.sidePanel
-          ?.open({ windowId: tab.windowId })
-          ?.catch?.(() => {});
-      }
-
+      openSidePanelSync(tab);
       const rawTarget =
         info.linkUrl || info.srcUrl || info.pageUrl || tab?.url || "";
       void trackBackgroundJob(emitInspectIntent(rawTarget));
+      return;
+    }
+
+    if (info.menuItemId === CONTEXT_MENU_PARSE_SELECTION_ID) {
+      const extractedUrl = extractFirstValidSelectionUrl(info.selectionText);
+      if (!extractedUrl) return;
+      openSidePanelSync(tab);
+      void trackBackgroundJob(emitInspectIntent(extractedUrl));
       return;
     }
 
@@ -707,15 +821,7 @@ export function createTabSyncPrivacyFirewall(
 
   const onCommandTriggered = (command: string, tab?: ChromeTabLike): void => {
     if (command !== COMMAND_OPEN_SIDEPANEL) return;
-
-    // STRICT LINE-1 USER-GESTURE COMPLIANCE: synchronous `sidePanel.open` BEFORE any `await`!
-    if (tab?.id !== undefined) {
-      void chromeApi.sidePanel?.open({ tabId: tab.id })?.catch?.(() => {});
-    } else if (tab?.windowId !== undefined) {
-      void chromeApi.sidePanel
-        ?.open({ windowId: tab.windowId })
-        ?.catch?.(() => {});
-    }
+    openSidePanelSync(tab);
 
     void trackBackgroundJob(
       (async () => {

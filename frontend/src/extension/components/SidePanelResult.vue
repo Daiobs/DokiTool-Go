@@ -18,10 +18,13 @@ import {
 import type {
   BatchSaveMode,
   EnqueueDownloadItem,
+  EnqueueMultiPartItemsRequest,
   ExtensionSettings,
 } from "../protocol";
+import SidePanelSubtitlePanel from "./SidePanelSubtitlePanel.vue";
 import {
   buildBatchPrimaryCtaLabel,
+  buildChecklistMultiPartRequest,
   buildChecklistSubfolderEnqueueItems,
   buildChecklistZipEnqueueItem,
   buildExtensionTargetContext,
@@ -52,6 +55,10 @@ const emit = defineEmits<{
   (
     e: "enqueue-downloads",
     payload: { items: EnqueueDownloadItem[]; groupBatchId?: string },
+  ): void;
+  (
+    e: "enqueue-multipart",
+    payload: Omit<EnqueueMultiPartItemsRequest, "type">,
   ): void;
   (e: "refresh-parse"): void;
   (
@@ -854,37 +861,48 @@ async function prepareResolvedChecklistEntries(): Promise<
 
 async function handleBatchSubfolderSave() {
   if (batchPreparingProgress.value) return;
-  const prepared = await prepareResolvedChecklistEntries();
-  if (!prepared || !prepared.length) {
-    if (prepared && !prepared.length) {
-      emit("notify", {
-        message: "所选条目未能完成解析，请重试",
-        tone: "error",
+  const rawEntries = selectedChecklistEntries.value;
+  if (!rawEntries.length) {
+    emit("notify", { message: "请至少勾选一项要下载的内容", tone: "info" });
+    return;
+  }
+
+  // Stream multi-P or deferred checklists in background via ENQUEUE_MULTIPART_ITEMS without blocking SidePanel
+  if (layoutKind.value === "multi_video" || rawEntries.some((e) => e.item.state === "deferred")) {
+    try {
+      const req = buildChecklistMultiPartRequest({
+        media: props.media, entries: rawEntries, totalCount: checklistPool.value.length,
+        settings: props.settings, livePhotoFilter: livePhotoFilter.value, workFingerprint: props.workFingerprint,
       });
+      if (!req.items.length) {
+        emit("notify", { message: "未生成可下载的文件条目", tone: "error" });
+        return;
+      }
+      emit("enqueue-multipart", req);
+    } catch (err) {
+      emit("notify", { message: err instanceof Error ? err.message : "构建多P后台下载任务失败", tone: "error" });
     }
+    return;
+  }
+
+  const prepared = rawEntries.filter((entry) => readyItem(entry.item));
+  if (!prepared.length) {
+    emit("notify", { message: "所选条目未能完成解析，请重试", tone: "error" });
     return;
   }
 
   try {
     const items = buildChecklistSubfolderEnqueueItems({
-      media: props.media,
-      entries: prepared,
-      totalCount: checklistPool.value.length,
-      settings: props.settings,
-      livePhotoFilter: livePhotoFilter.value,
-      workFingerprint: props.workFingerprint,
+      media: props.media, entries: prepared, totalCount: checklistPool.value.length,
+      settings: props.settings, livePhotoFilter: livePhotoFilter.value, workFingerprint: props.workFingerprint,
     });
     if (!items.length) {
       emit("notify", { message: "未生成可下载的文件条目", tone: "error" });
       return;
     }
-    const groupBatchId = `subfolder-${Date.now()}`;
-    emit("enqueue-downloads", { items, groupBatchId });
+    emit("enqueue-downloads", { items, groupBatchId: `subfolder-${Date.now()}` });
   } catch (err) {
-    emit("notify", {
-      message: err instanceof Error ? err.message : "构建子文件夹下载任务失败",
-      tone: "error",
-    });
+    emit("notify", { message: err instanceof Error ? err.message : "构建子文件夹下载任务失败", tone: "error" });
   }
 }
 
@@ -1761,6 +1779,14 @@ async function handleBatchZipSave() {
         </div>
       </div>
     </div>
+
+    <!-- Pure-Client Subtitle Track Panel (VTT / SRT / Bilingual Merge, Whitelist Enforced) -->
+    <SidePanelSubtitlePanel
+      :media="media"
+      :api-origin="apiOrigin"
+      :base-title="media.title || activeItem?.title || ''"
+      @notify="emit('notify', $event)"
+    />
 
     <!-- Lightbox Preview Overlay inside SidePanel -->
     <div

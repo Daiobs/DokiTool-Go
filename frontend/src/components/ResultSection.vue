@@ -22,6 +22,7 @@ import {
   isRefererBlockedWebImageUrl,
   isSplitSilentVideoVariant,
   isTbvideoVideoItem,
+  listSubtitleTracks,
   resolveEffectiveDefaultVariant,
   resolveWhitelistedExtensionMuxSpec,
   shouldAutoUpgradeDefaultVariant,
@@ -288,6 +289,8 @@ const copyVideoUrl = computed(() => {
 });
 const metadata = computed(() => activeVariant.value?.metadata || {});
 const attachments = computed(() => props.resultData?.attachments || []);
+const subtitleTrackCount = computed(() => listSubtitleTracks(props.resultData, apiConfig.baseUrl).length);
+const openSubtitlesTab = () => { activeTab.value = "subtitles"; };
 
 const isYouTubeAudioOnlyVariant = (variant) =>
   Boolean(youtubeHelper.value) && isAudioOnlyVariant(variant);
@@ -941,7 +944,13 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
             ><AppIcon :class="['fas', mediaTypeBadge.icon]" />{{
               mediaTypeBadge.text
             }}</span
-          >
+          ><button
+            v-if="subtitleTrackCount > 0 && !isYouTubeHelperBlocked"
+            type="button"
+            data-testid="result-subtitle-badge"
+            class="rs-header-badge rs-header-badge--sub"
+            @click="openSubtitlesTab"
+          ><AppIcon class="fas fa-comment-dots" /><span>{{ locale === "en" ? `${subtitleTrackCount} Subtitles` : `${subtitleTrackCount} 字幕` }}</span></button>
         </div>
         <div class="rs-header-right">
           <span
@@ -1464,6 +1473,13 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
   );
   color: var(--c-danger);
   border: 1px solid rgba(239, 68, 68, 0.25);
+}
+.rs-header-badge--sub {
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--c-accent);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  cursor: pointer;
+  font-family: inherit;
 }
 :global(.dark) .rs-header-badge--platform {
   background: linear-gradient(

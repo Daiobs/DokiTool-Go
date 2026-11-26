@@ -2,9 +2,11 @@
 import { computed, ref, watch, onMounted, onUnmounted, nextTick } from "vue";
 import AppIcon from "../AppIcon.vue";
 import ResultVariantPicker from "./ResultVariantPicker.vue";
+import ResultSubtitlePanel from "./ResultSubtitlePanel.vue";
 import { resourceSource, sourceUrl } from "../../utils/mediaContract";
 import {
   hasRefererProtectedAudioSource,
+  listSubtitleTracks,
   resolvePreferredMediaTitle,
   resolveProtectedExtensionAudioRoutes,
   resolveWhitelistedExtensionMuxSpec,
@@ -111,6 +113,7 @@ const localizeAttachment = (att) =>
 const visibleAttachments = computed(() => {
   const currentId = props.currentItem?.id;
   const list = props.attachments.filter((att) => {
+    if (att?.role === "subtitle") return false;
     if (
       typeof att?.id === "string" &&
       (att.id.startsWith("bilibili-audio-") ||
@@ -185,6 +188,24 @@ const visibleAttachments = computed(() => {
 
 const allTags = computed(() => props.resultData?.tags || []);
 const hasMusic = computed(() => visibleAttachments.value.length > 0);
+const subtitleTracks = computed(() =>
+  listSubtitleTracks(
+    { ...(props.resultData || {}), attachments: props.attachments },
+    apiConfig.baseUrl,
+  ),
+);
+const hasSubtitles = computed(() => subtitleTracks.value.length > 0);
+const subtitleBaseTitle = computed(
+  () =>
+    resolvePreferredMediaTitle({
+      isSingleItem: !props.isMulti,
+      itemCount: props.resultData?.items?.length,
+      workTitle: props.resultData?.title,
+      itemTitle: props.currentItem?.title,
+    }) ||
+    props.resultData?.content_id ||
+    "subtitle",
+);
 const playCountNote = computed(() =>
   props.locale === "en"
     ? "The platform did not provide verified counts."
@@ -302,6 +323,15 @@ const tabs = computed(() => [
     : []),
   ...(hasMusic.value
     ? [{ key: "music", icon: "fa-music", label: t(props.locale, "tabMusic") }]
+    : []),
+  ...(hasSubtitles.value
+    ? [
+        {
+          key: "subtitles",
+          icon: "fa-comment-dots",
+          label: props.locale === "en" ? "Subtitles" : "字幕",
+        },
+      ]
     : []),
 ]);
 
@@ -441,6 +471,11 @@ watch(
 
 watch(hasMusic, (available) => {
   if (!available && props.activeTab === "music") {
+    emit("update:active-tab", "info");
+  }
+});
+watch(hasSubtitles, (available) => {
+  if (!available && props.activeTab === "subtitles") {
     emit("update:active-tab", "info");
   }
 });
@@ -701,6 +736,14 @@ onUnmounted(() => {
           </template>
         </div>
       </div>
+
+      <ResultSubtitlePanel
+        v-if="activeTab === 'subtitles' && hasSubtitles"
+        :tracks="subtitleTracks"
+        :base-title="subtitleBaseTitle"
+        :locale="locale"
+        :disabled="isYouTubeHelperBlocked"
+      />
     </div>
   </div>
 </template>

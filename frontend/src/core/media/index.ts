@@ -4,3 +4,4 @@ export * from "./muxSpec";
 export * from "./variantDefaultUpgrade";
 export * from "./variantSort";
 export * from "./layoutAndFilename";
+export * from "./subtitleEngine";

@@ -5283,7 +5283,7 @@ test('Issue #48 [B2-Polish-1] & [P2-5f]: extension bridge preserves refreshAvail
             cb({
               ok: true,
               data: {
-                version: '4.3.0',
+                version: '4.4.0',
                 extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
                 capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
               },

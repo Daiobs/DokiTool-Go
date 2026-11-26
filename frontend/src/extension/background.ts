@@ -16,7 +16,11 @@ import {
   type SidePanelResponseMap,
   type SidePanelToBackgroundRequest,
 } from "./protocol";
-import { buildWorkFingerprint, createExtensionStorage } from "./storage";
+import {
+  buildWorkFingerprint,
+  createExtensionStorage,
+  type StorageAreaLike,
+} from "./storage";
 import { formatPlatformDisplayName } from "./uiTargetHelpers";
 import { matchActiveParseUrl } from "./urlMatcher";
 import {
@@ -29,8 +33,10 @@ import {
   createDownloadCoordinator,
   type DownloadCoordinator,
 } from "./bg/downloadCoordinator";
+import { createMultiPartQueue } from "./bg/multiPartQueue";
 import { createSpecRefresher } from "./bg/specRefresher";
 import { createTabSyncPrivacyFirewall } from "./bg/tabSyncPrivacyFirewall";
+import { createTaskHistoryStore } from "./bg/taskHistoryStore";
 import {
   ACTIVE_TASK_STATUSES,
   DEFAULT_ACTION_TITLE,
@@ -87,7 +93,7 @@ export {
 };
 
 export function createBackgroundController(
-  deps?: BackgroundControllerDeps,
+  deps?: BackgroundControllerDeps & { historyStorage?: StorageAreaLike },
 ): BackgroundController {
   const chromeApi =
     deps?.chrome ??
@@ -246,6 +252,17 @@ export function createBackgroundController(
   // ==========================================================================
 
   const dnrManager = createDnrRulesManager({ chromeApi, storage });
+  const taskHistoryStore = createTaskHistoryStore({
+    chromeApi,
+    storageArea: deps?.historyStorage,
+    tasks,
+    taskOrder,
+    isDisposed: () => disposed,
+  });
+  const onTaskHistoryChange = (options?: { immediate?: boolean }) =>
+    options?.immediate
+      ? taskHistoryStore.syncNow()
+      : taskHistoryStore.scheduleSync();
 
   let downloadCoordinator!: DownloadCoordinator;
   const apiClient = createApiClient({
@@ -287,6 +304,7 @@ export function createBackgroundController(
     notifyIfCompletelyIdle,
     updateBadge: badgeController.updateBadge,
     broadcastTasksUpdated,
+    onTaskHistoryChange,
     syncDynamicDnrRules: dnrManager.syncDynamicDnrRules,
     resolveExtraAllowedMediaOrigins: dnrManager.resolveExtraAllowedMediaOrigins,
     prepareSpecForDispatch: specRefresher.prepareSpecForDispatch,
@@ -310,12 +328,37 @@ export function createBackgroundController(
     trackBackgroundJob,
     broadcastToSidePanels,
     broadcastTasksUpdated,
+    onTaskHistoryChange,
     updateBadge: badgeController.updateBadge,
     scheduleOffscreenIdleCloseIfIdle:
       downloadCoordinator.scheduleOffscreenIdleCloseIfIdle,
     resolveExtraAllowedMediaOrigins: dnrManager.resolveExtraAllowedMediaOrigins,
     parseSupportedUrlInternal: apiClient.parseSupportedUrlInternal,
+    resolveLazyItemInternal: apiClient.resolveLazyItemInternal,
     hydrateDeferredMediaItems: apiClient.hydrateDeferredMediaItems,
+    enrichSpecAllowedOrigins: downloadCoordinator.enrichSpecAllowedOrigins,
+    dispatchSpecTaskToOffscreen: downloadCoordinator.dispatchSpecTaskToOffscreen,
+  });
+
+  const multiPartQueue = createMultiPartQueue({
+    storage,
+    nowFn,
+    maxBatchDownloadConcurrency,
+    isDisposed: () => disposed,
+    nextId,
+    tasks,
+    parseAbortControllers,
+    insertOrUpdateTask,
+    waitTaskSettled,
+    trackBackgroundJob,
+    broadcastTasksUpdated,
+    onTaskHistoryChange,
+    updateBadge: badgeController.updateBadge,
+    scheduleOffscreenIdleCloseIfIdle:
+      downloadCoordinator.scheduleOffscreenIdleCloseIfIdle,
+    resolveExtraAllowedMediaOrigins: dnrManager.resolveExtraAllowedMediaOrigins,
+    parseSupportedUrlInternal: apiClient.parseSupportedUrlInternal,
+    resolveLazyItemInternal: apiClient.resolveLazyItemInternal,
     enrichSpecAllowedOrigins: downloadCoordinator.enrichSpecAllowedOrigins,
     dispatchSpecTaskToOffscreen: downloadCoordinator.dispatchSpecTaskToOffscreen,
   });
@@ -335,6 +378,7 @@ export function createBackgroundController(
   // ==========================================================================
 
   const getSnapshot = async (): Promise<ExtensionStateSnapshot> => {
+    await taskHistoryStore.ensureHydrated();
     if (tabSyncFirewall.getCurrentTabSync() === null) {
       await tabSyncFirewall.ensureInitialTabSync();
     }
@@ -422,6 +466,7 @@ export function createBackgroundController(
       }
 
       case "ENQUEUE_DOWNLOADS":
+        await taskHistoryStore.ensureHydrated();
         return okRpc(
           await downloadCoordinator.enqueueDownloadItems(
             req.items,
@@ -430,12 +475,19 @@ export function createBackgroundController(
         );
 
       case "ENQUEUE_BATCH_URLS":
+        await taskHistoryStore.ensureHydrated();
         return okRpc(await tabSyncFirewall.enqueueBatchUrls(req));
 
+      case "ENQUEUE_MULTIPART_ITEMS":
+        await taskHistoryStore.ensureHydrated();
+        return okRpc(await multiPartQueue.enqueueMultiPartItems(req));
+
       case "CANCEL_TASK":
+        await taskHistoryStore.ensureHydrated();
         return okRpc(await downloadCoordinator.cancelTaskById(req.taskId));
 
       case "RETRY_TASK": {
+        await taskHistoryStore.ensureHydrated();
         const task = tasks.get(req.taskId);
         if (!task || !task.retryPayload) {
           return errRpc("未找到可重试的任务记录", { code: "TASK_NOT_FOUND" });
@@ -452,6 +504,7 @@ export function createBackgroundController(
           );
           const resetTask: ExtensionDownloadTask = {
             ...task,
+            persistedFromHistory: undefined,
             status: needsManualRefresh ? "parsing" : "queued",
             statusText: needsManualRefresh
               ? "签名链接已过期，正在自动重新解析..."
@@ -489,6 +542,7 @@ export function createBackgroundController(
         const settings = await storage.getSettings();
         const resetUrlTask: ExtensionDownloadTask = {
           ...task,
+          persistedFromHistory: undefined,
           status: "parsing",
           statusText: "重新解析中...",
           percent: 0,
@@ -496,6 +550,8 @@ export function createBackgroundController(
           speed: 0,
           chromeDownloadId: undefined,
           error: undefined,
+          lastErrorCode: undefined,
+          lastErrorHttpStatus: undefined,
           unwhitelistedHost: undefined,
           updatedAt: nowFn(),
         };
@@ -514,12 +570,15 @@ export function createBackgroundController(
               retryPayload.subfolderPrefix ?? settings.subfolderPrefix,
             forceSubfolder: Boolean(task.groupBatchId),
             groupBatchId: task.groupBatchId,
+            ...(retryPayload.itemId ? { itemId: retryPayload.itemId } : {}),
+            ...(retryPayload.variantId ? { variantId: retryPayload.variantId } : {}),
           }),
         );
         return okRpc({ task: resetUrlTask });
       }
 
       case "CLEAR_FINISHED_TASKS": {
+        await taskHistoryStore.ensureHydrated();
         for (const [id, task] of Array.from(tasks.entries())) {
           if (FINISHED_TASK_STATUSES.has(task.status)) {
             tasks.delete(id);
@@ -528,6 +587,7 @@ export function createBackgroundController(
             if (idx >= 0) taskOrder.splice(idx, 1);
           }
         }
+        await taskHistoryStore.clearFinished();
         if (countActiveTasks() === 0) {
           badgeController.updateBadge("clear");
         }
@@ -536,6 +596,9 @@ export function createBackgroundController(
       }
 
       case "OPEN_DOWNLOAD_FOLDER": {
+        if (req.taskId && !tasks.has(req.taskId)) {
+          await taskHistoryStore.ensureHydrated();
+        }
         const downloadId =
           req.chromeDownloadId ??
           (req.taskId ? tasks.get(req.taskId)?.chromeDownloadId : undefined);
@@ -695,6 +758,7 @@ export function createBackgroundController(
     await Promise.all([
       dnrManager.syncDynamicDnrRules().catch(() => []),
       tabSyncFirewall.registerContextMenus().catch(() => {}),
+      taskHistoryStore.ensureHydrated().catch(() => []),
     ]);
     const first = await tabSyncFirewall.queryActiveTab();
     if (first?.id !== undefined) {
@@ -730,6 +794,7 @@ export function createBackgroundController(
       disposed = true;
       downloadCoordinator.dispose();
       tabSyncFirewall.dispose();
+      taskHistoryStore.dispose();
       badgeController.dispose();
       for (const [, ctrl] of Array.from(parseAbortControllers.entries())) {
         ctrl.abort();

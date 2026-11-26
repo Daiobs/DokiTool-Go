@@ -30,6 +30,7 @@ before(async () => {
     '../extension/dashMuxSpec',
     '../core/media/extensionRoutes',
     '../core/media/muxSpec',
+    '../core/media/subtitleEngine',
     '../core/media/index',
     '../composables/useVideoSelection',
   ]) {
@@ -46,6 +47,7 @@ before(async () => {
         if (reqId === './variantDefaultUpgrade') return modules['../core/media/variantDefaultUpgrade'];
         if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
         if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
+        if (reqId === './subtitleEngine') return modules['../core/media/subtitleEngine'];
         if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
         if (reqId === '../../utils/mediaSources') return modules['../utils/mediaSources'];
         if (reqId === '../../extension/hostWhitelist') return modules['../extension/hostWhitelist'];
@@ -1453,7 +1455,7 @@ test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero bo
   }
 });
 
-test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-banner render when connected version 4.1.0 < 4.3.0, open extension modal on click, and hide on 4.3.0', async () => {
+test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-banner render when connected version 4.1.0/4.3.0 < 4.4.0, open extension modal on click, and hide on 4.4.0', async () => {
   const prevChrome = globalThis.chrome;
   const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
 
@@ -1476,7 +1478,7 @@ test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-
     };
   };
 
-  // Case 1: Outdated installed extension (4.1.0 < 4.3.0) -> shows clickable extension-update-badge + reload banner
+  // Case 1: Outdated installed extension (4.1.0 < 4.4.0) -> shows clickable extension-update-badge + reload banner
   mockChromeVersion('4.1.0');
   const outdatedView = await mount(video);
   let openExtensionCalls = 0;
@@ -1495,12 +1497,12 @@ test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-
     );
     const updateBadge = () =>
       outdatedView.findAll(n => n.props['data-testid'] === 'extension-update-badge')[0];
-    assert.ok(updateBadge(), 'expected extension-update-badge when installed 4.1.0 < 4.3.0');
-    assert.equal(textOf(updateBadge()), '有新版 v4.3.0');
+    assert.ok(updateBadge(), 'expected extension-update-badge when installed 4.1.0 < 4.4.0');
+    assert.equal(textOf(updateBadge()), '有新版 v4.4.0');
     const reloadBanner = () =>
       outdatedView.findAll(n => n.props['data-testid'] === 'extension-reload-banner')[0];
-    assert.ok(reloadBanner(), 'expected extension-reload-banner when installed 4.1.0 < 4.3.0');
-    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.3\.0/);
+    assert.ok(reloadBanner(), 'expected extension-reload-banner when installed 4.1.0 < 4.4.0');
+    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.4\.0/);
 
     updateBadge().props.onClick();
     await outdatedView.flush();
@@ -1508,14 +1510,28 @@ test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-
 
     outdatedView.state.value = { ...outdatedView.state.value, locale: 'en' };
     await outdatedView.flush();
-    assert.equal(textOf(updateBadge()), 'Update v4.3.0');
-    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.3\.0/);
+    assert.equal(textOf(updateBadge()), 'Update v4.4.0');
+    assert.match(textOf(reloadBanner()), /v4\.1\.0.*v4\.4\.0/);
   } finally {
     outdatedView.app.unmount();
   }
 
-  // Case 2: Up-to-date installed extension (4.3.0) -> hides extension-update-badge & extension-reload-banner
+  // Case 1b: v4.3.0 installed extension -> receives friendly update prompt to v4.4.0
   mockChromeVersion('4.3.0');
+  const v43View = await mount(video);
+  await v43View.flush();
+  await new Promise(r => setTimeout(r, 15));
+  await v43View.flush();
+  try {
+    const v43Badge = v43View.findAll(n => n.props['data-testid'] === 'extension-update-badge')[0];
+    assert.ok(v43Badge, 'expected extension-update-badge when installed 4.3.0 < 4.4.0');
+    assert.equal(textOf(v43Badge), '有新版 v4.4.0');
+  } finally {
+    v43View.app.unmount();
+  }
+
+  // Case 2: Up-to-date installed extension (4.4.0) -> hides extension-update-badge & extension-reload-banner
+  mockChromeVersion('4.4.0');
   const currentView = await mount(video);
   await currentView.flush();
   await new Promise(r => setTimeout(r, 15));
@@ -1529,12 +1545,12 @@ test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-
     assert.equal(
       currentView.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
       0,
-      'extension-update-badge must be hidden when installed extension is already 4.3.0',
+      'extension-update-badge must be hidden when installed extension is already 4.4.0',
     );
     assert.equal(
       currentView.findAll(n => n.props['data-testid'] === 'extension-reload-banner').length,
       0,
-      'extension-reload-banner must be hidden when installed extension is already 4.3.0',
+      'extension-reload-banner must be hidden when installed extension is already 4.4.0',
     );
   } finally {
     currentView.app.unmount();
@@ -1666,7 +1682,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
   await nextTick();
   try {
     const zhText = textOf(portal);
-    assert.ok(zhText.includes('v4.3.0'), `expected v4.3.0 badge in zh-CN modal, got: ${zhText}`);
+    assert.ok(zhText.includes('v4.4.0'), `expected v4.4.0 badge in zh-CN modal, got: ${zhText}`);
     assert.ok(zhText.includes('14 核心平台 + 1000+ 长尾站点'));
     assert.ok(zhText.includes('B 站 1080P & YouTube 4K60 免油猴本地无损合流'));
     assert.ok(zhText.includes('网页端自动联动'));
@@ -1676,7 +1692,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
     locale.value = 'en';
     await nextTick();
     const enText = textOf(portal);
-    assert.ok(enText.includes('v4.3.0'), `expected v4.3.0 badge in en modal, got: ${enText}`);
+    assert.ok(enText.includes('v4.4.0'), `expected v4.4.0 badge in en modal, got: ${enText}`);
     assert.ok(enText.includes('14 core platforms + 1,000+ long-tail sites'));
     assert.ok(enText.includes('Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey'));
     assert.ok(enText.includes('automatic Web page handshake'));
@@ -1768,11 +1784,11 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     view.state.value = { ...view.state.value, locale: 'zh-CN' };
     await view.flush();
 
-    // 2. User upgrades extension to v4.3.0 and returns to tab -> handleWindowReturnForBridge re-probes even though already connected!
+    // 2. User upgrades extension to v4.4.0 and returns to tab -> handleWindowReturnForBridge re-probes even though already connected!
     const callsBeforeFocus = pingCalls;
     mockState = {
       connected: true,
-      version: '4.3.0',
+      version: '4.4.0',
       extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
       capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
     };
@@ -1784,7 +1800,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     assert.equal(
       view.findAll(n => n.props['data-testid'] === 'extension-update-badge').length,
       0,
-      '有新版 v4.3.0 pill must disappear immediately after upgrading to 4.3.0',
+      '有新版 v4.4.0 pill must disappear immediately after upgrading to 4.4.0',
     );
     assert.equal(notice(), undefined, 'CapabilityUpgradeNotice must auto-dismiss once youtube_parse becomes available');
     assert.equal(readyEmits, 1, 'must emit extension-youtube-ready once to trigger in-place parseVideo()');
@@ -1798,7 +1814,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     view.app.unmount();
   }
 
-  // 3. Disconnected YouTube missing state -> user installs v4.3.0 extension & returns to tab -> closes notice & emits extension-youtube-ready
+  // 3. Disconnected YouTube missing state -> user installs v4.4.0 extension & returns to tab -> closes notice & emits extension-youtube-ready
   mockState = { connected: false, version: '', extensionId: '', capabilities: [] };
   const ytMissingData = {
     platform: 'youtube',
@@ -1829,7 +1845,7 @@ test('P2: outdated v4.1.0 extension YouTube upgrade notice copy, window-return u
     assert.equal(freshView.portalFindAll(n => n.props['data-capability-upgrade-notice'] !== undefined).length, 1);
     mockState = {
       connected: true,
-      version: '4.3.0',
+      version: '4.4.0',
       extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
       capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
     };
@@ -2144,7 +2160,7 @@ test('Issue #48 [P2-1, P2-2, P2-5a, P2-5b, P2-5e]: 8K badge dedup, EN PlatformGr
           cb({
             ok: true,
             data: {
-              version: '4.3.0',
+              version: '4.4.0',
               extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
               capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
             },
@@ -2155,7 +2171,7 @@ test('Issue #48 [P2-1, P2-2, P2-5a, P2-5b, P2-5e]: 8K badge dedup, EN PlatformGr
   };
   const ytReady = {
     ...yt8kData,
-    extra: { youtube_helper: { status: 'ready', provider: 'extension', version: '4.3.0', extensionVersion: '4.3.0' } },
+    extra: { youtube_helper: { status: 'ready', provider: 'extension', version: '4.4.0', extensionVersion: '4.4.0' } },
   };
   const vMerged = await mount(ytReady);
   await vMerged.flush();
@@ -2231,12 +2247,12 @@ test('Issue #48 [P2-1, P2-2, P2-5a, P2-5b, P2-5e]: 8K badge dedup, EN PlatformGr
   const { createSSRApp } = await import('vue');
 
   const headerConnectedHtml = await renderToString(
-    createSSRApp({ render: () => h(HeaderNav, { locale: 'zh-CN', isDark: false, extensionConnected: true, extensionVersion: '4.3.0' }) }),
+    createSSRApp({ render: () => h(HeaderNav, { locale: 'zh-CN', isDark: false, extensionConnected: true, extensionVersion: '4.4.0' }) }),
   );
   assert.match(headerConnectedHtml, /header-ext-connected-dot/);
   assert.match(headerConnectedHtml, /扩展已连接/);
   const headerConnectedEnHtml = await renderToString(
-    createSSRApp({ render: () => h(HeaderNav, { locale: 'en', isDark: false, extensionConnected: true, extensionVersion: '4.3.0' }) }),
+    createSSRApp({ render: () => h(HeaderNav, { locale: 'en', isDark: false, extensionConnected: true, extensionVersion: '4.4.0' }) }),
   );
   assert.match(headerConnectedEnHtml, /header-ext-connected-dot/);
   assert.match(headerConnectedEnHtml, /Ext Connected/);

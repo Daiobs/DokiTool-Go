@@ -1,3 +1,4 @@
+import { projectYouTubeCaptionsForFinalize } from "../../core/media/subtitleEngine";
 import { isValidStatsSnapshot } from "../../monitor/statsTypes";
 import { withTbvideoItems } from "../../services/tbvideo";
 import type {
@@ -628,6 +629,14 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
       }
       if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
         finalizeBody.thumbnail = vd.thumbnail.trim();
+      }
+      if (contextData.supports_captions !== false && playerResult.captions) {
+        const projectedCaptions = projectYouTubeCaptionsForFinalize(
+          playerResult.captions,
+        );
+        if (projectedCaptions) {
+          finalizeBody.captions = projectedCaptions;
+        }
       }
 
       onParseProgress?.(3, "正在解密高画质签名 (3/3)…");

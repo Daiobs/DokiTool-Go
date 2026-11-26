@@ -30,8 +30,10 @@ import {
 import { buildSafeDownloadPath } from "./filenameSanitizer";
 import type {
   EnqueueDownloadItem,
+  EnqueueMultiPartItemsRequest,
   ExtensionSettings,
   MediaRefreshContext,
+  MultiPartEnqueueItemInput,
   OffscreenDownloadSpec,
   OffscreenSegmentSpec,
   OffscreenZipEntrySpec,
@@ -791,5 +793,95 @@ export function buildChecklistZipEnqueueItem(params: {
         zipEntries,
       },
     },
+  };
+}
+
+/**
+ * Builds an `ENQUEUE_MULTIPART_ITEMS` payload from checklist selections so ready
+ * episodes keep their prebuilt specs (including explicit user variant choices)
+ * while deferred episodes stream-resolve and download in the background.
+ */
+export function buildChecklistMultiPartRequest(params: {
+  media: UnifiedMedia;
+  entries: ChecklistItemSelectionEntry[];
+  totalCount: number;
+  settings: ExtensionSettings;
+  livePhotoFilter: LivePhotoSaveFilter;
+  workFingerprint?: string;
+  groupBatchId?: string;
+}): Omit<EnqueueMultiPartItemsRequest, "type"> {
+  const {
+    media,
+    entries,
+    totalCount,
+    settings,
+    livePhotoFilter,
+    workFingerprint,
+    groupBatchId,
+  } = params;
+  const workTitle = resolveWorkBaseTitle(media);
+  const items: MultiPartEnqueueItemInput[] = [];
+
+  for (const entry of entries) {
+    const { item, ordinalIndex } = entry;
+    if (item.state === "unavailable") continue;
+    if (readyItem(item)) {
+      const builtItems = buildChecklistSubfolderEnqueueItems({
+        media,
+        entries: [entry],
+        totalCount,
+        settings,
+        livePhotoFilter,
+        workFingerprint,
+      });
+      for (const built of builtItems) {
+        items.push({
+          itemId: item.id,
+          index: ordinalIndex,
+          title: built.title,
+          state: "ready",
+          ...(item.resolve_url?.trim() ? { resolveUrl: item.resolve_url.trim() } : {}),
+          ...(item.source_url?.trim() ? { sourceUrl: item.source_url.trim() } : {}),
+          spec: built.spec,
+          ...(built.fallbackUrl ? { fallbackUrl: built.fallbackUrl } : {}),
+          filenameHint: built.spec.filename,
+        });
+      }
+      continue;
+    }
+    const rawTitle = item.title?.trim();
+    const cleanStem =
+      rawTitle && !isPlaceholderPartTitle(rawTitle) && rawTitle !== workTitle
+        ? rawTitle
+        : undefined;
+    const itemSourceUrl = item.source_url?.trim() || undefined;
+    items.push({
+      itemId: item.id,
+      index: ordinalIndex,
+      title: cleanStem ? `${workTitle} - ${cleanStem}` : `${workTitle} #${ordinalIndex}`,
+      state: "deferred",
+      ...(item.resolve_url?.trim() ? { resolveUrl: item.resolve_url.trim() } : {}),
+      ...(itemSourceUrl ? { sourceUrl: itemSourceUrl } : {}),
+      ...(itemSourceUrl || media.source_url?.trim()
+        ? { fallbackUrl: itemSourceUrl || media.source_url?.trim() }
+        : {}),
+    });
+  }
+
+  return {
+    media: {
+      platform: media.platform,
+      ...(media.title?.trim() ? { title: media.title.trim() } : {}),
+      ...(media.author?.name?.trim() ? { authorName: media.author.name.trim() } : {}),
+      ...(media.content_id?.trim() ? { contentId: media.content_id.trim() } : {}),
+      ...(media.source_url?.trim() ? { sourceUrl: media.source_url.trim() } : {}),
+      ...(media.refresh_url?.trim() ? { refreshUrl: media.refresh_url.trim() } : {}),
+      ...(workFingerprint ? { workFingerprint } : {}),
+      totalItemCount: totalCount,
+    },
+    items,
+    qualityPreference: settings.qualityPreference,
+    subfolderPrefix: settings.subfolderPrefix,
+    groupBatchId: groupBatchId || `multipart-${Date.now()}`,
   };
 }

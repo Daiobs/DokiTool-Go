@@ -284,6 +284,7 @@
 !/frontend/tests/extension-download-flow.test.mjs
 !/frontend/tests/extension-filename.test.mjs
 !/frontend/tests/extension-security.test.mjs
+!/frontend/tests/extension-v44-bg.test.mjs
 !/frontend/tests/fixtures/
 !/frontend/tests/golden-fixtures-l1.test.mjs
 !/frontend/tests/helpers/
@@ -296,6 +297,7 @@
 !/frontend/tests/result-layout.test.mjs
 !/frontend/tests/route-probe.test.mjs
 !/frontend/tests/seo-contract.test.mjs
+!/frontend/tests/subtitle-engine.test.mjs
 !/frontend/tests/ui-download-contract.test.mjs
 !/frontend/tests/youtube-helper.test.mjs
 /ops/examples/*
@@ -371,6 +373,7 @@
 !/scripts/tests/test_check_go_file_budgets.py
 !/scripts/tests/test_check_ytdlp_extractors.py
 !/scripts/tests/test_classify_ci_changes.py
+!/scripts/tests/test_dokitool_agent_bridge.py
 !/scripts/tests/test_public_files.py
 !/scripts/tests/test_upstream_canary.py
 !/scripts/tests/test_upstream_updates.py
@@ -985,6 +988,7 @@
 !/frontend/src/components/result/ResultDetailsSidebar.vue
 !/frontend/src/components/result/ResultGalleryCard.vue
 !/frontend/src/components/result/ResultLivePhotoCard.vue
+!/frontend/src/components/result/ResultSubtitlePanel.vue
 !/frontend/src/components/result/ResultVariantPicker.vue
 !/frontend/src/components/result/ResultVideoStageCard.vue
 !/frontend/src/components/result/resultI18n.ts
@@ -1000,6 +1004,7 @@
 !/frontend/src/core/media/index.ts
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts
+!/frontend/src/core/media/subtitleEngine.ts
 !/frontend/src/core/media/variantDefaultUpgrade.ts
 !/frontend/src/core/media/variantSort.ts
 /frontend/src/extension/bg/*
@@ -1007,8 +1012,11 @@
 !/frontend/src/extension/bg/dnrRules.ts
 !/frontend/src/extension/bg/downloadCoordinator.ts
 !/frontend/src/extension/bg/filenameAudit.ts
+!/frontend/src/extension/bg/multiPartQueue.ts
+!/frontend/src/extension/bg/offscreenLifecycle.ts
 !/frontend/src/extension/bg/specRefresher.ts
 !/frontend/src/extension/bg/tabSyncPrivacyFirewall.ts
+!/frontend/src/extension/bg/taskHistoryStore.ts
 !/frontend/src/extension/bg/types.ts
 !/frontend/src/extension/bg/webExternalBridge.ts
 /frontend/src/extension/components/*
@@ -1017,6 +1025,7 @@
 !/frontend/src/extension/components/SidePanelHeader.vue
 !/frontend/src/extension/components/SidePanelResult.vue
 !/frontend/src/extension/components/SidePanelSettings.vue
+!/frontend/src/extension/components/SidePanelSubtitlePanel.vue
 /frontend/src/monitor/components/*
 !/frontend/src/monitor/components/ProtectionPolicySection.vue
 !/frontend/src/monitor/components/YouTubeHelperCard.vue
