@@ -299,6 +299,7 @@
 !/frontend/tests/result-layout.test.mjs
 !/frontend/tests/route-probe.test.mjs
 !/frontend/tests/seo-contract.test.mjs
+!/frontend/tests/subtitle-controller.test.mjs
 !/frontend/tests/subtitle-engine.test.mjs
 !/frontend/tests/ui-download-contract.test.mjs
 !/frontend/tests/youtube-helper.test.mjs
@@ -1014,6 +1015,7 @@
 !/frontend/src/core/media/index.ts
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts
+!/frontend/src/core/media/subtitleController.ts
 !/frontend/src/core/media/subtitleEngine.ts
 !/frontend/src/core/media/variantDefaultUpgrade.ts
 !/frontend/src/core/media/variantSort.ts

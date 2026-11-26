@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
 import {
+  createSubtitleDownloadController,
+  type SubtitleControllerState,
+} from "../../core/media/subtitleController";
+import {
   MAX_SUBTITLE_TRACK_BYTES,
-  buildSubtitleDownloadResult,
   fetchSubtitleTrackText,
   listSubtitleTracks,
   type SubtitleTrackOption,
@@ -30,14 +33,7 @@ const emit = defineEmits<{
   (e: "notify", payload: { message: string; tone?: "success" | "error" | "info" }): void;
 }>();
 
-const targetFormat = ref<"vtt" | "srt">("vtt");
-const primaryId = ref("");
-const secondaryId = ref("");
-const busyKey = ref("");
-const errorMessage = ref("");
-const statusMessage = ref("");
 const copiedTrackId = ref("");
-let activeController: AbortController | null = null;
 let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
 const tracks = computed<SubtitleTrackOption[]>(() => listSubtitleTracks(props.media, props.apiOrigin));
@@ -54,71 +50,7 @@ const isTrackWhitelisted = (track: SubtitleTrackOption): boolean =>
 
 const whitelistedTracks = computed<SubtitleTrackOption[]>(() => tracks.value.filter(isTrackWhitelisted));
 const hasNonWhitelistedTracks = computed(() => tracks.value.some((t) => !isTrackWhitelisted(t)));
-const canMergeBilingual = computed(() => whitelistedTracks.value.length >= 2);
-const primaryTrack = computed<SubtitleTrackOption | null>(
-  () => whitelistedTracks.value.find((t) => t.id === primaryId.value) || whitelistedTracks.value[0] || null,
-);
-const secondaryCandidates = computed<SubtitleTrackOption[]>(() =>
-  whitelistedTracks.value.filter((t) => t.id !== primaryTrack.value?.id),
-);
-const secondaryTrack = computed<SubtitleTrackOption | null>(
-  () => secondaryCandidates.value.find((t) => t.id === secondaryId.value) || null,
-);
 const resolvedBaseTitle = computed(() => props.baseTitle?.trim() || props.media.title?.trim() || "subtitle");
-
-watch(
-  whitelistedTracks,
-  (list) => {
-    if (!list.some((t) => t.id === primaryId.value)) primaryId.value = list[0]?.id || "";
-    if (secondaryId.value && (!list.some((t) => t.id === secondaryId.value) || secondaryId.value === primaryId.value)) {
-      secondaryId.value = "";
-    }
-    errorMessage.value = "";
-    statusMessage.value = "";
-  },
-  { immediate: true },
-);
-
-watch(primaryId, (nextPrimary) => {
-  if (secondaryId.value === nextPrimary) secondaryId.value = "";
-});
-
-onUnmounted(() => {
-  activeController?.abort();
-  activeController = null;
-  if (copyResetTimer) {
-    clearTimeout(copyResetTimer);
-    copyResetTimer = null;
-  }
-});
-
-const trackKindLabel = (kind: SubtitleTrackOption["trackKind"]): string =>
-  kind === "manual" ? "人工" : kind === "auto" ? "自动" : "";
-
-const formatOptionLabel = (track: SubtitleTrackOption): string => {
-  const kind = trackKindLabel(track.trackKind);
-  const lang = track.language && track.label.toLowerCase() !== track.language.toLowerCase() ? ` (${track.language})` : "";
-  return `${track.label}${lang}${kind ? ` · ${kind}` : ""}`;
-};
-
-function triggerBlobDownload(content: string, filename: string, mimeType: string): void {
-  if (typeof Blob === "undefined" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function" || typeof document === "undefined") {
-    return;
-  }
-  const blob = new Blob([content], { type: mimeType });
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
-  link.rel = "noopener";
-  link.style.display = "none";
-  document.body?.appendChild?.(link);
-  link.click?.();
-  link.remove?.();
-  setTimeout(() => {
-    try { URL.revokeObjectURL(objectUrl); } catch { /* ignore */ }
-  }, 1000);
-}
 
 function formatSubtitleError(err: unknown): string {
   const code = (err as { code?: string } | null)?.code;
@@ -134,63 +66,83 @@ function formatSubtitleError(err: unknown): string {
   return "字幕下载或转换失败，请稍后重试。";
 }
 
-async function runDownload(
-  primary: SubtitleTrackOption | null,
-  secondary: SubtitleTrackOption | null,
-  format: "vtt" | "srt",
-  key: string,
-): Promise<void> {
-  if (!primary || busyKey.value) return;
-  if (whitelistedRoutesFor(primary).length === 0 || (secondary && whitelistedRoutesFor(secondary).length === 0)) {
-    errorMessage.value = formatSubtitleError({ code: "SUBTITLE_UNWHITELISTED" });
-    statusMessage.value = "";
-    return;
-  }
-
-  activeController?.abort();
-  const controller = new AbortController();
-  activeController = controller;
-  busyKey.value = key;
-  errorMessage.value = "";
-  statusMessage.value = "";
-
-  try {
-    const result = await buildSubtitleDownloadResult({
-      primaryTrack: primary,
-      secondaryTrack: secondary,
-      targetFormat: format,
-      baseTitle: resolvedBaseTitle.value,
-      signal: controller.signal,
-      maxBytes: MAX_SUBTITLE_TRACK_BYTES,
-      fetchTrackText: async (track) => {
-        const allowed = whitelistedRoutesFor(track);
-        if (!allowed.length) {
-          throw Object.assign(new Error("Subtitle host not whitelisted"), { code: "SUBTITLE_UNWHITELISTED" });
-        }
-        return fetchSubtitleTrackText(allowed[0], {
-          fetchImpl: props.fetchImpl,
-          signal: controller.signal,
-          maxBytes: MAX_SUBTITLE_TRACK_BYTES,
-          routes: allowed,
-        });
-      },
-    });
-    if (controller.signal.aborted) return;
-    if (result.cueCount === 0) {
-      errorMessage.value = "未能从该字幕轨解析出有效时间轴内容。";
-      return;
+const controllerState = ref<SubtitleControllerState | null>(null);
+const controller = createSubtitleDownloadController({
+  getBaseTitle: () => resolvedBaseTitle.value,
+  maxBytes: MAX_SUBTITLE_TRACK_BYTES,
+  validateBeforeDownload: (primary, secondary) => {
+    if (whitelistedRoutesFor(primary).length === 0 || (secondary && whitelistedRoutesFor(secondary).length === 0)) {
+      throw Object.assign(new Error("Subtitle host not whitelisted"), { code: "SUBTITLE_UNWHITELISTED" });
     }
-    triggerBlobDownload(result.content, result.filename, result.mimeType);
-    statusMessage.value = `已保存 ${result.filename}（共 ${result.cueCount} 条字幕）`;
+  },
+  fetchTrackText: async (track, signal) => {
+    const allowed = whitelistedRoutesFor(track);
+    if (!allowed.length) {
+      throw Object.assign(new Error("Subtitle host not whitelisted"), { code: "SUBTITLE_UNWHITELISTED" });
+    }
+    return fetchSubtitleTrackText(allowed[0], {
+      fetchImpl: props.fetchImpl,
+      signal,
+      maxBytes: MAX_SUBTITLE_TRACK_BYTES,
+      routes: allowed,
+    });
+  },
+  formatError: formatSubtitleError,
+  formatEmptyCuesError: () => "未能从该字幕轨解析出有效时间轴内容。",
+  formatSuccessStatus: (result) => `已保存 ${result.filename}（共 ${result.cueCount} 条字幕）`,
+  onSuccess: (result) => {
     emit("notify", { message: `已保存字幕：${result.filename}`, tone: "success" });
-  } catch (err: unknown) {
-    if ((err as { name?: string } | null)?.name === "AbortError") return;
-    errorMessage.value = formatSubtitleError(err);
-  } finally {
-    if (activeController === controller) activeController = null;
-    if (busyKey.value === key) busyKey.value = "";
+  },
+  onStateChange: (next) => {
+    controllerState.value = next;
+  },
+});
+controllerState.value = controller.getState();
+
+watch(
+  whitelistedTracks,
+  (list) => controller.syncTracks(list),
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  controller.dispose();
+  if (copyResetTimer) {
+    clearTimeout(copyResetTimer);
+    copyResetTimer = null;
   }
-}
+});
+
+const snap = computed(() => controllerState.value ?? controller.getState());
+const targetFormat = computed({
+  get: () => snap.value.targetFormat,
+  set: (v) => controller.setTargetFormat(v),
+});
+const primaryId = computed({
+  get: () => snap.value.primaryId,
+  set: (v) => controller.setPrimaryId(v),
+});
+const secondaryId = computed({
+  get: () => snap.value.secondaryId,
+  set: (v) => controller.setSecondaryId(v),
+});
+const canMergeBilingual = computed(() => snap.value.canMergeBilingual);
+const primaryTrack = computed(() => snap.value.primaryTrack);
+const secondaryCandidates = computed(() => snap.value.secondaryCandidates);
+const secondaryTrack = computed(() => snap.value.secondaryTrack);
+const busyKey = computed(() => snap.value.busyKey);
+const errorMessage = computed(() => snap.value.errorMessage);
+const statusMessage = computed(() => snap.value.statusMessage);
+const runDownload = controller.runDownload;
+
+const trackKindLabel = (kind: SubtitleTrackOption["trackKind"]): string =>
+  kind === "manual" ? "人工" : kind === "auto" ? "自动" : "";
+
+const formatOptionLabel = (track: SubtitleTrackOption): string => {
+  const kind = trackKindLabel(track.trackKind);
+  const lang = track.language && track.label.toLowerCase() !== track.language.toLowerCase() ? ` (${track.language})` : "";
+  return `${track.label}${lang}${kind ? ` · ${kind}` : ""}`;
+};
 
 async function handleCopyTrackUrl(track: SubtitleTrackOption): Promise<void> {
   if (!track.url) return;
