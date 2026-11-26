@@ -10,6 +10,7 @@ import {
   LATEST_EXTENSION_VERSION,
   isExtensionVersionOutdated,
 } from "../core/capabilityHub";
+import { useExtensionRuntime } from "../composables/useExtensionRuntime";
 import {
   deliveryRoutes,
   readyItem,
@@ -56,6 +57,8 @@ const props = defineProps({
   resolvingIds: Object,
   formatNumber: Function,
   formatDuration: Function,
+  extensionState: { type: Object, default: null },
+  latestExtensionVersion: { type: String, default: "" },
 });
 
 const emit = defineEmits([
@@ -140,12 +143,21 @@ const ytHelperModalOpen = computed(
   () => isYouTubeHelperInstallRequired.value && !ytHelperModalDismissed.value,
 );
 
-const extensionBridgeState = ref({
-  connected: false,
-  version: "",
-  extensionId: "",
-  capabilities: [],
-});
+const fallbackRuntime = props.extensionState ? null : useExtensionRuntime();
+const extensionBridgeState = computed(
+  () =>
+    props.extensionState ||
+    fallbackRuntime?.extensionState.value || {
+      connected: false,
+      version: "",
+      extensionId: "",
+      capabilities: [],
+    },
+);
+const effectiveLatestExtensionVersion = computed(
+  () =>
+    (props.latestExtensionVersion || "").trim() || LATEST_EXTENSION_VERSION,
+);
 const isExtensionConnected = computed(() =>
   Boolean(extensionBridgeState.value.connected),
 );
@@ -154,17 +166,19 @@ const isExtensionOutdated = computed(
     isExtensionConnected.value &&
     isExtensionVersionOutdated(
       extensionBridgeState.value.version,
-      LATEST_EXTENSION_VERSION,
+      effectiveLatestExtensionVersion.value,
     ),
 );
 const canExtensionDashMux = computed(
   () =>
     isExtensionConnected.value &&
+    Array.isArray(extensionBridgeState.value.capabilities) &&
     extensionBridgeState.value.capabilities.includes("dash_mux"),
 );
 const canExtensionYouTubeParse = computed(
   () =>
     isExtensionConnected.value &&
+    Array.isArray(extensionBridgeState.value.capabilities) &&
     extensionBridgeState.value.capabilities.includes("youtube_parse"),
 );
 
@@ -757,13 +771,13 @@ const extConnectedTitleText = computed(() => {
 const extUpdateBadgeText = computed(() =>
   t(props.locale, "extUpdateBadge").replace(
     "{version}",
-    LATEST_EXTENSION_VERSION,
+    effectiveLatestExtensionVersion.value,
   ),
 );
 const extUpdateBadgeTitle = computed(() =>
   t(props.locale, "extUpdateBadgeTitle").replace(
     "{version}",
-    LATEST_EXTENSION_VERSION,
+    effectiveLatestExtensionVersion.value,
   ),
 );
 const extInstallHintText = computed(() => {
@@ -774,90 +788,75 @@ const extInstallHintText = computed(() => {
   return t(props.locale, "extInstallHintGeneric");
 });
 
-let bridgeDisposed = false;
-let bridgeProbeInFlight = false;
 let autoReparseTriggeredVersion = -1;
-const probeExtensionBridge = async (fromWindowReturn = false) => {
-  if (bridgeDisposed || bridgeProbeInFlight) return;
-  bridgeProbeInFlight = true;
-  const wasYouTubeParseReady = canExtensionYouTubeParse.value;
-  try {
-    const { pingInstalledExtension } = await import(
-      "../services/extensionBridge"
-    );
-    const state = await pingInstalledExtension();
-    if (!bridgeDisposed) {
-      extensionBridgeState.value = state;
-      emit("extension-state-change", {
-        connected: Boolean(state.connected),
-        version: state.version || "",
-      });
-      if (
-        fromWindowReturn &&
-        isYouTubeHelperInstallRequired.value &&
-        !wasYouTubeParseReady &&
-        state.connected &&
-        state.capabilities.includes("youtube_parse") &&
-        autoReparseTriggeredVersion !== props.resultVersion
-      ) {
-        autoReparseTriggeredVersion = props.resultVersion;
-        ytHelperModalDismissed.value = true;
-        emit("extension-youtube-ready");
-      }
-    }
-  } catch {
-    if (!bridgeDisposed) {
-      extensionBridgeState.value = {
-        connected: false,
-        version: "",
-        extensionId: "",
-        capabilities: [],
-      };
-    }
-  } finally {
-    bridgeProbeInFlight = false;
+let allowAutoReparse = false;
+const triggerAutoReparseIfReady = () => {
+  if (
+    allowAutoReparse &&
+    isYouTubeHelperInstallRequired.value &&
+    canExtensionYouTubeParse.value &&
+    autoReparseTriggeredVersion !== props.resultVersion
+  ) {
+    autoReparseTriggeredVersion = props.resultVersion;
+    ytHelperModalDismissed.value = true;
+    emit("extension-youtube-ready");
   }
 };
-const handleWindowReturnForBridge = () => {
+watch(canExtensionYouTubeParse, (ready, prevReady) => {
+  if (!prevReady && ready) {
+    triggerAutoReparseIfReady();
+  }
+});
+const handleStandaloneWindowReturn = () => {
   if (
-    typeof document !== "undefined" &&
-    document.visibilityState === "hidden"
+    !fallbackRuntime ||
+    (typeof document !== "undefined" && document.visibilityState === "hidden")
   ) {
     return;
   }
-  if (
-    !isExtensionConnected.value ||
-    isExtensionOutdated.value ||
-    (isYouTubeHelperInstallRequired.value && !canExtensionYouTubeParse.value)
-  ) {
-    void probeExtensionBridge(true);
-  }
+  allowAutoReparse = true;
+  void fallbackRuntime.probeExtension().then((state) => {
+    emit("extension-state-change", {
+      connected: Boolean(state.connected),
+      version: state.version || "",
+    });
+    triggerAutoReparseIfReady();
+  });
 };
 
 onMounted(() => {
   isClientMounted.value = true;
   syncBodyScrollLock();
-  void probeExtensionBridge();
-  if (typeof document !== "undefined") {
-    document.addEventListener?.("visibilitychange", handleWindowReturnForBridge);
-  }
-  if (typeof window !== "undefined") {
-    window.addEventListener?.("focus", handleWindowReturnForBridge);
+  if (fallbackRuntime) {
+    void fallbackRuntime.probeExtension().then((state) => {
+      emit("extension-state-change", {
+        connected: Boolean(state.connected),
+        version: state.version || "",
+      });
+      allowAutoReparse = true;
+    });
+    if (typeof document !== "undefined") {
+      document.addEventListener?.("visibilitychange", handleStandaloneWindowReturn);
+    }
+    if (typeof window !== "undefined") {
+      window.addEventListener?.("focus", handleStandaloneWindowReturn);
+    }
+  } else {
+    allowAutoReparse = true;
   }
 });
 onUnmounted(() => {
-  bridgeDisposed = true;
+  fallbackRuntime?.dispose();
   if (typeof document !== "undefined") {
-    document.removeEventListener?.(
-      "visibilitychange",
-      handleWindowReturnForBridge,
-    );
+    if (fallbackRuntime) {
+      document.removeEventListener?.("visibilitychange", handleStandaloneWindowReturn);
+    }
     if (document.body) {
       document.body.style.overflow = "";
     }
   }
-  if (typeof window !== "undefined") {
-    window.removeEventListener?.("focus", handleWindowReturnForBridge);
+  if (fallbackRuntime && typeof window !== "undefined") {
+    window.removeEventListener?.("focus", handleStandaloneWindowReturn);
   }
   clearTimeout(copyTimer);
 });
@@ -1006,8 +1005,8 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         <AppIcon class="fas fa-redo rs-ext-reload-banner-icon" />
         <span>{{
           locale === "en"
-            ? `Your loaded DokiTool extension (v${extensionBridgeState.version || "old"}) is behind v${LATEST_EXTENSION_VERSION}. Download the latest .zip, extract it over your original extension directory, then open chrome://extensions and click Reload.`
-            : `检测到当前已加载的 DokiTool 扩展（v${extensionBridgeState.version || "旧版"}）低于最新版 v${LATEST_EXTENSION_VERSION}，请先下载新版 .zip 解压覆盖原扩展目录，再在 chrome://extensions 点击「刷新」即可生效。`
+            ? `Your loaded DokiTool extension (v${extensionBridgeState.version || "old"}) is behind v${effectiveLatestExtensionVersion}. Download the latest .zip, extract it over your original extension directory, then open chrome://extensions and click Reload.`
+            : `检测到当前已加载的 DokiTool 扩展（v${extensionBridgeState.version || "旧版"}）低于最新版 v${effectiveLatestExtensionVersion}，请先下载新版 .zip 解压覆盖原扩展目录，再在 chrome://extensions 点击「刷新」即可生效。`
         }}</span>
       </div>
       <button
@@ -1219,6 +1218,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
       mode="client_session"
       :youtube-helper="youtubeHelper"
       :youtube-helper-script-url="youtubeHelperScriptUrl"
+      :latest-extension-version="effectiveLatestExtensionVersion"
       :needs-manual-helper-refresh="needsManualHelperRefresh"
       :locale="locale"
       @close="closeYtHelperModal"

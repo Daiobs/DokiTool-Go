@@ -40,7 +40,7 @@ const content = {
 
 const getContent = (locale) => content[locale] || content['zh-CN']
 
-const repositoryUrl = 'https://github.com/Brilliant666/DokiTool'
+const repositoryUrl = 'https://github.com/Daiobs/DokiTool-Go'
 const socialLinks = [{ icon: 'fab fa-github', url: repositoryUrl, label: 'DokiTool on GitHub' }]
 
 // Keep the project promotion controls available for a future display option.

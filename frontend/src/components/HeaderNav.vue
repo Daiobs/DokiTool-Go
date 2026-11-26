@@ -7,32 +7,36 @@ import { LATEST_EXTENSION_VERSION, isExtensionVersionOutdated } from '../core/ca
 const props = defineProps({
   isDark: Boolean,
   locale: String,
-  t: Function,
   extensionConnected: { type: Boolean, default: false },
   extensionVersion: { type: String, default: '' },
+  latestExtensionVersion: { type: String, default: '' },
 })
 
 const emit = defineEmits(['toggle-theme', 'set-locale', 'open-extension'])
 
+const effectiveLatestVersion = computed(
+  () => (props.latestExtensionVersion || '').trim() || LATEST_EXTENSION_VERSION,
+)
+
 const isExtensionOutdated = computed(
   () =>
     props.extensionConnected &&
-    isExtensionVersionOutdated(props.extensionVersion, LATEST_EXTENSION_VERSION),
+    isExtensionVersionOutdated(props.extensionVersion, effectiveLatestVersion.value),
 )
 
 const desktopExtLabel = computed(() => {
   if (isExtensionOutdated.value) {
     return props.locale === 'en'
-      ? `Ext v${props.extensionVersion} · Update v${LATEST_EXTENSION_VERSION}`
-      : `扩展 v${props.extensionVersion} · 有新版 v${LATEST_EXTENSION_VERSION}`
+      ? `Ext v${props.extensionVersion} · Update v${effectiveLatestVersion.value}`
+      : `扩展 v${props.extensionVersion} · 有新版 v${effectiveLatestVersion.value}`
   }
   return getLabel(props.locale, props.extensionConnected ? 'extConnectedShort' : 'extShort')
 })
 
 const mobileExtOutdatedBadge = computed(() =>
   props.locale === 'en'
-    ? `Update v${LATEST_EXTENSION_VERSION}`
-    : `有新版 v${LATEST_EXTENSION_VERSION}`,
+    ? `Update v${effectiveLatestVersion.value}`
+    : `有新版 v${effectiveLatestVersion.value}`,
 )
 
 const isMobileMenuOpen = ref(false)

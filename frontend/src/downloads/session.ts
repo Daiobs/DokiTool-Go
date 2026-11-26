@@ -17,7 +17,8 @@ export interface WorkerSession { worker: ServiceWorker; build: string; instance?
 /** An explicit refusal is distinct from a lost reply after START. */
 export class WorkerRequestError extends Error {}
 const sessions = new WeakMap<ServiceWorker, WorkerSession>();
-const checkedUpdates = new Set<string>();
+const UPDATE_CHECK_COOLDOWN_MS = 10 * 60_000;
+const checkedUpdates = new Map<string, number>();
 let connection: Promise<WorkerSession | null> | undefined;
 let discovery: Promise<ServiceWorkerRegistration | undefined> | undefined;
 
@@ -189,9 +190,11 @@ async function connect(create: boolean): Promise<WorkerSession | null> {
         session = { worker, build: reply.workerBuild || "legacy", instance: reply.workerInstance, admission: reply.capabilities?.admission === true, tbvideo: reply.capabilities?.tbvideo === true };
         sessions.set(worker, session);
       }
-      if (!checkedUpdates.has(reg.scope)) {
-        checkedUpdates.add(reg.scope);
-        // Check only once a controlled document protects existing transfers.
+      const now = Date.now();
+      const lastCheckedAt = checkedUpdates.get(reg.scope) ?? 0;
+      if (now - lastCheckedAt >= UPDATE_CHECK_COOLDOWN_MS) {
+        checkedUpdates.set(reg.scope, now);
+        // Check only once a controlled document protects existing transfers (throttled per scope).
         try { void reg.update?.().catch(() => {}); } catch { /* An offline update does not break a download. */ }
       }
       return session;

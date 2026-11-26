@@ -362,7 +362,13 @@ async function readResponseUtf8Bounded(resp: Response, maxBytes: number): Promis
 
 export async function fetchSubtitleTrackText(
   url: string,
-  options?: { fetchImpl?: typeof fetch; signal?: AbortSignal; maxBytes?: number; routes?: string[] },
+  options?: {
+    fetchImpl?: typeof fetch;
+    signal?: AbortSignal;
+    maxBytes?: number;
+    routes?: string[];
+    validateFinalUrl?: (finalUrl: string) => boolean;
+  },
 ): Promise<string> {
   const maxBytes =
     typeof options?.maxBytes === "number" && Number.isFinite(options.maxBytes) && options.maxBytes > 0
@@ -388,11 +394,15 @@ export async function fetchSubtitleTrackText(
         method: "GET", credentials: "omit", referrerPolicy: "no-referrer",
         ...(options?.signal ? { signal: options.signal } : {}),
       });
+      if (options?.validateFinalUrl && resp.url && !options.validateFinalUrl(resp.url)) {
+        await resp.body?.cancel?.().catch(() => {});
+        throw codedErr("SUBTITLE_UNWHITELISTED", "Subtitle redirect target is not whitelisted");
+      }
       if (!resp.ok) { lastErr = codedErr("SUBTITLE_HTTP_ERROR", `Subtitle HTTP ${resp.status}`); continue; }
       return await readResponseUtf8Bounded(resp, maxBytes);
     } catch (err: unknown) {
       const coded = err as { name?: string; code?: string } | null;
-      if (coded?.name === "AbortError" || coded?.code === "SUBTITLE_TOO_LARGE") throw err;
+      if (coded?.name === "AbortError" || coded?.code === "SUBTITLE_TOO_LARGE" || coded?.code === "SUBTITLE_UNWHITELISTED") throw err;
       lastErr = err;
     }
   }

@@ -63,16 +63,13 @@ export const YOUTUBE_PLAYER_API_URL =
 export const VISITOR_DATA_TTL_MS = 30 * 60 * 1000;
 
 function parseDetail(rawDetail) {
-  if (!rawDetail) return null;
-  if (typeof rawDetail === "string") {
-    try {
-      return JSON.parse(rawDetail);
-    } catch {
-      return null;
-    }
+  if (typeof rawDetail !== "string" || !rawDetail) return null;
+  try {
+    const parsed = JSON.parse(rawDetail);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
   }
-  if (typeof rawDetail === "object") return rawDetail;
-  return null;
 }
 
 function dispatchBridgeEvent(eventTarget, eventName, payloadObj) {

@@ -10,11 +10,13 @@ const props = withDefaults(
     locale?: string;
     extensionConnected?: boolean;
     extensionVersion?: string;
+    latestExtensionVersion?: string;
   }>(),
   {
     locale: "zh-CN",
     extensionConnected: false,
     extensionVersion: "",
+    latestExtensionVersion: "",
   },
 );
 
@@ -26,26 +28,34 @@ const CHROME_EXTENSIONS_URL = "chrome://extensions";
 const copied = ref(false);
 let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
+const effectiveLatestVersion = computed(
+  () => (props.latestExtensionVersion || "").trim() || LATEST_EXTENSION_VERSION,
+);
+
 const isUpgradeMode = computed(
   () =>
     Boolean(props.extensionConnected) &&
-    isExtensionVersionOutdated(props.extensionVersion, LATEST_EXTENSION_VERSION),
+    isExtensionVersionOutdated(
+      props.extensionVersion,
+      effectiveLatestVersion.value,
+    ),
 );
 
 const copy = computed(() => {
   const upgrade = isUpgradeMode.value;
+  const latestVer = effectiveLatestVersion.value;
   const currentVersion = props.extensionVersion || "";
   if (props.locale === "en") {
     return {
       badge: upgrade
-        ? `Upgrade v${currentVersion} → v${LATEST_EXTENSION_VERSION} (keeps history & settings)`
-        : `Chrome MV3 Native Side Panel v${LATEST_EXTENSION_VERSION} · Anonymous Ready`,
+        ? `Upgrade v${currentVersion} → v${latestVer} (keeps history & settings)`
+        : `Chrome MV3 Native Side Panel v${latestVer} · Anonymous Ready`,
       title: "DokiTool Chrome Extension",
       subtitle:
         "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
       closeLabel: "Close dialog",
       ctaLabel: upgrade
-        ? `Download Latest Extension v${LATEST_EXTENSION_VERSION} (.zip)`
+        ? `Download Latest Extension v${latestVer} (.zip)`
         : "Download Extension (.zip)",
       ctaHint:
         "Ready to use anonymously with no login or token (optional personal key in extension settings) · Desktop Chrome 116+ / Edge",
@@ -85,14 +95,14 @@ const copy = computed(() => {
   }
   return {
     badge: upgrade
-      ? `从 v${currentVersion} 升级至 v${LATEST_EXTENSION_VERSION}（保留任务历史与设置）`
-      : `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
+      ? `从 v${currentVersion} 升级至 v${latestVer}（保留任务历史与设置）`
+      : `Chrome MV3 侧边栏原生扩展 v${latestVer} · 匿名直用`,
     title: "DokiTool Chrome 扩展",
     subtitle:
       "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
     closeLabel: "关闭弹窗",
     ctaLabel: upgrade
-      ? `下载新版 Chrome 扩展包 v${LATEST_EXTENSION_VERSION}（.zip）`
+      ? `下载新版 Chrome 扩展包 v${latestVer}（.zip）`
       : "下载 Chrome 扩展包（.zip）",
     ctaHint:
       "匿名开箱即用，无需登录或配置 Token（可选在扩展设置中绑定专属 Key）· 支持桌面 Chrome 116+ / Edge",

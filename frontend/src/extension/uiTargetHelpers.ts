@@ -7,6 +7,7 @@ import {
 } from "../components/result/resultI18n";
 import { formatYouTubeMuxOptionSize } from "../components/result/resultPresentation";
 import { confirmedFormatMime, extensionsFor } from "../downloads/file";
+import { isSafeDownloadExtension } from "./filenameSanitizer";
 import type {
   Attachment,
   Chunk,
@@ -967,6 +968,9 @@ export function resolveVariantExtension(params: {
   const suffixes = extensionsFor(formatMime || "");
   let resolvedExt =
     suffixes.length && !suffixes.includes(baseExt) ? suffixes[0] : baseExt;
+  if (!isSafeDownloadExtension(resolvedExt)) {
+    resolvedExt = "bin";
+  }
 
   if (resolvedExt === "bin") {
     const fromUrl = inferVideoExtFromUrl(primaryUrl, platform, hasTbvideo);

@@ -487,12 +487,8 @@ export interface MediaWhitelistCheckResult {
 function matchesExtraOrigin(url: URL, rawExtra: string): boolean {
   const trimmed = rawExtra.trim();
   if (!trimmed) return false;
-  if (trimmed === "http://127.0.0.1/*") {
-    return url.protocol === "http:" && url.hostname === "127.0.0.1";
-  }
-  if (trimmed === "http://localhost/*") {
-    return url.protocol === "http:" && url.hostname.toLowerCase() === "localhost";
-  }
+  // Never honor port-wildcard patterns such as `http://127.0.0.1/*` or `http://localhost/*`;
+  // only an exact origin validated by `validateApiBaseUrl` (including explicit loopback port) is permitted.
   const validated = validateApiBaseUrl(trimmed);
   if (!validated.ok) return false;
   return url.origin.toLowerCase() === validated.origin.toLowerCase();

@@ -1322,6 +1322,22 @@ export function createOffscreenDownloadExecutor(
               void resp.body?.cancel?.().catch(() => {});
               throw new ExtensionDownloadError(`条目返回 HTTP ${resp.status}`);
             }
+            const contentType = String(
+              resp.headers?.get?.("content-type") || "",
+            )
+              .split(";")[0]
+              .trim()
+              .toLowerCase();
+            if (
+              contentType === "text/html" ||
+              contentType === "application/xhtml+xml" ||
+              contentType === "image/svg+xml"
+            ) {
+              void resp.body?.cancel?.().catch(() => {});
+              throw new ExtensionDownloadError(
+                `打包条目 #${i + 1} 返回非媒体内容类型（${contentType}）`,
+              );
+            }
             const parts: Uint8Array[] = [];
             let len = 0;
             await streamResponseBodyToWriter({

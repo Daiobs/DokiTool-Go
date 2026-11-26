@@ -898,12 +898,18 @@ async function handleOpenDownloadFolder(payload: {
 // Lifecycle
 // ============================================================================
 
+const initialStateReady = ref(false);
+
 onMounted(async () => {
   bridgeHandle = createSidePanelBroadcastBridge(handleBackgroundBroadcast);
 
-  const initialRes = await sendSidePanelRequest({ type: "GET_INITIAL_STATE" });
-  if (initialRes.ok) {
-    applySnapshot(initialRes.data);
+  try {
+    const initialRes = await sendSidePanelRequest({ type: "GET_INITIAL_STATE" });
+    if (initialRes.ok) {
+      applySnapshot(initialRes.data);
+    }
+  } finally {
+    initialStateReady.value = true;
   }
 
   // Cold-start safety net: check session pending intent directly if none consumed yet
@@ -935,6 +941,7 @@ onUnmounted(() => {
       :connection="connection"
       :batch-url-count="batchUrlPreviewCount"
       :owner-confirmed="showOwnerStatsPill"
+      :initial-state-ready="initialStateReady"
       @toggle-auto-follow="handleToggleAutoFollowHeader"
       @cycle-theme="handleCycleThemeHeader"
       @open-settings="settingsOpen = true"

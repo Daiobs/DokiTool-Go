@@ -137,7 +137,52 @@ export function formatBatchItemIndex(
   return String(safeIndex).padStart(width, "0");
 }
 
-function sanitizeFileExtension(rawExt?: string): string {
+/**
+ * Strict safe allowlist of passive media, subtitle, plain-text, archive, and binary
+ * fallback extensions permitted for Chrome extension downloads & ZIP entries.
+ * Blocks active/executable suffixes (e.g. html, svg, sh, command, bat, exe, ps1, hta).
+ */
+export const KNOWN_SAFE_DOWNLOAD_EXTENSIONS: ReadonlySet<string> = new Set([
+  "mp4",
+  "m4v",
+  "webm",
+  "mov",
+  "mkv",
+  "m4a",
+  "mp3",
+  "aac",
+  "ogg",
+  "opus",
+  "wav",
+  "flac",
+  "jpg",
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+  "avif",
+  "ts",
+  "vtt",
+  "srt",
+  "txt",
+  "zip",
+  "bin",
+]);
+
+export function isSafeDownloadExtension(rawExt?: string): boolean {
+  if (typeof rawExt !== "string") return false;
+  const cleaned = rawExt
+    .trim()
+    .replace(/^\.+/, "")
+    .replace(/[^A-Za-z0-9]/g, "")
+    .toLowerCase();
+  return Boolean(cleaned) && KNOWN_SAFE_DOWNLOAD_EXTENSIONS.has(cleaned);
+}
+
+export function sanitizeFileExtension(
+  rawExt?: string,
+  fallbackExt = "bin",
+): string {
   if (typeof rawExt !== "string") return "";
   const cleaned = rawExt
     .trim()
@@ -145,7 +190,16 @@ function sanitizeFileExtension(rawExt?: string): string {
     .replace(/[^A-Za-z0-9]/g, "")
     .toLowerCase()
     .slice(0, 16);
-  return cleaned;
+  if (!cleaned) return "";
+  if (KNOWN_SAFE_DOWNLOAD_EXTENSIONS.has(cleaned)) {
+    return cleaned;
+  }
+  const safeFallback =
+    typeof fallbackExt === "string" &&
+    KNOWN_SAFE_DOWNLOAD_EXTENSIONS.has(fallbackExt.toLowerCase())
+      ? fallbackExt.toLowerCase()
+      : "bin";
+  return safeFallback;
 }
 
 export interface BuildSafeDownloadPathParams {
@@ -178,12 +232,26 @@ export function buildSafeDownloadPath(
       })
     : "";
 
-  const cleanExt = sanitizeFileExtension(params.ext);
+  const cleanExt = sanitizeFileExtension(params.ext, "bin");
+  const rawExtLower =
+    typeof params.ext === "string"
+      ? params.ext
+          .trim()
+          .replace(/^\.+/, "")
+          .replace(/[^A-Za-z0-9]/g, "")
+          .toLowerCase()
+      : "";
   let rawStem = typeof params.stem === "string" ? params.stem : "";
 
   // If caller passed a filename with matching `.ext` already attached (e.g. `stem: "nul.mp4", ext: "mp4"`),
   // strip the redundant suffix before re-attaching `.${cleanExt}` so we don't emit `_nul.mp4.mp4`.
   if (
+    rawExtLower &&
+    rawStem.toLowerCase().endsWith(`.${rawExtLower}`) &&
+    rawStem.length > rawExtLower.length + 1
+  ) {
+    rawStem = rawStem.slice(0, -(rawExtLower.length + 1));
+  } else if (
     cleanExt &&
     rawStem.toLowerCase().endsWith(`.${cleanExt}`) &&
     rawStem.length > cleanExt.length + 1

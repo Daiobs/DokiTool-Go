@@ -1,8 +1,12 @@
-import { isExtensionVersionOutdated } from "../core/capabilityHub";
+import {
+  EXTENSION_VERSION_PATH,
+  EXTENSION_ZIP_PATH,
+  isExtensionVersionOutdated,
+  parseExtensionVersionPayload,
+} from "../core/capabilityHub";
 import { PROD_API_ORIGIN, isWhitelistedMediaUrl, validateApiBaseUrl } from "./hostWhitelist";
 
-export const EXTENSION_VERSION_PATH = "/helper/extension-version.json" as const;
-export const EXTENSION_ZIP_PATH = "/helper/dokitool-chrome-extension.zip" as const;
+export { EXTENSION_VERSION_PATH, EXTENSION_ZIP_PATH };
 export const VERSION_CHECK_TIMEOUT_MS = 3500 as const;
 
 const STRICT_SEMVER_RE = /^\d+\.\d+\.\d+$/;
@@ -31,23 +35,6 @@ export function resolveAllowedVersionCheckOrigin(rawApiBaseUrl?: string): string
     : null;
 }
 
-function isValidSameOriginDownloadUrl(raw: unknown, origin: string): boolean {
-  if (raw === undefined) return true;
-  if (typeof raw !== "string") return false;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.includes("@")) return false;
-  try {
-    const u = new URL(trimmed, origin);
-    return (
-      u.origin === origin &&
-      u.pathname === EXTENSION_ZIP_PATH &&
-      !u.search && !u.hash && !u.username && !u.password
-    );
-  } catch {
-    return false;
-  }
-}
-
 export async function checkForExtensionUpdate(
   options: CheckExtensionUpdateOptions,
 ): Promise<ExtensionUpdateInfo | null> {
@@ -74,12 +61,9 @@ export async function checkForExtensionUpdate(
       const finalUrl = new URL(resp.url);
       if (finalUrl.origin !== origin || finalUrl.pathname !== EXTENSION_VERSION_PATH) return null;
     }
-    const body = (await resp.json()) as Record<string, unknown> | null;
-    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-    const latest = typeof body.version === "string" ? body.version.trim() : "";
-    if (!STRICT_SEMVER_RE.test(latest) || !isExtensionVersionOutdated(installed, latest)) return null;
-    if (!isValidSameOriginDownloadUrl(body.download_url, origin)) return null;
-    return { latestVersion: latest, downloadUrl: `${origin}${EXTENSION_ZIP_PATH}` };
+    const parsed = parseExtensionVersionPayload(await resp.json(), origin);
+    if (!parsed || !isExtensionVersionOutdated(installed, parsed.version)) return null;
+    return { latestVersion: parsed.version, downloadUrl: parsed.downloadUrl };
   } catch {
     return null;
   } finally {

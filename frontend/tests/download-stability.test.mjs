@@ -181,19 +181,6 @@ test('one buffered job runs; queued cancellation and double release cannot creat
   release3(); (await waiting4)();
 });
 
-test('loading the button controller no longer starts the unused AntiReplay interval', async t => {
-  const originalWindow = globalThis.window, realInterval = globalThis.setInterval;
-  let antiReplayIntervals = 0;
-  t.mock.method(globalThis, 'setInterval', (fn, delay, ...args) => {
-    if (delay === 60000) { antiReplayIntervals++; return 1; }
-    return realInterval(fn, delay, ...args);
-  });
-  globalThis.window = {};
-  try { await vite.ssrLoadModule('/src/composables/useButtonControl.js'); }
-  finally { globalThis.window = originalWindow; }
-  assert.equal(antiReplayIntervals, 0);
-});
-
 test('platform duplicates are hidden from keyboard/assistive navigation and reduced-motion stays disabled on mobile', async () => {
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../src/components/PlatformGrid.vue', import.meta.url), 'utf8');

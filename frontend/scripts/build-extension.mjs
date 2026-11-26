@@ -28,7 +28,32 @@ const mediabunnyLicensePath = path.join(
 
 export const ICON_SIZES = Object.freeze([16, 32, 48, 128]);
 
-export const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo";
+const EXTENSION_RELEASE_META_PATH = path.join(
+  frontendRoot,
+  "src",
+  "core",
+  "extensionReleaseMeta.json",
+);
+
+export function loadExtensionReleaseMetaSync() {
+  const raw = fs.readFileSync(EXTENSION_RELEASE_META_PATH, "utf8");
+  const parsed = JSON.parse(raw);
+  const version = String(parsed?.version ?? "").trim();
+  const extensionId = String(parsed?.extensionId ?? "").trim();
+  if (!/^\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error(
+      `Invalid extensionReleaseMeta.json version: ${JSON.stringify(parsed?.version)}`,
+    );
+  }
+  if (!/^[a-p]{32}$/.test(extensionId)) {
+    throw new Error(
+      `Invalid extensionReleaseMeta.json extensionId: ${JSON.stringify(parsed?.extensionId)}`,
+    );
+  }
+  return { version, extensionId };
+}
+
+export const DOKITOOL_EXTENSION_ID = loadExtensionReleaseMetaSync().extensionId;
 
 export const DOKITOOL_EXTENSION_MANIFEST_KEY =
   "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1H7x6y1gizzFTJNvaVoImjO/bVzcAK2Yf2yVsV/8Cci1ODkiJbJkEm0B5BdLh8TCfvaIh2KvO170x8/xCkI1vGQwVqYTRfFUffTXAfPRPt0ih4IPmkfR4Onof0b1avZ8zD76WxRb0fv094afOItMzygdpHeCL50v1gCvIazVo6b+B5ZgX+WTtp2u/ULNvjiE9Cz0cPUepsgoNov0kRG3sK2e58YO0pRBxrd4dwZFxTNzWekYEmmxMDeZGqUaSRClSXeQVw+lSM3NsvXzxK2tlPbbt0DH2MXiR0SQcmvbvP40H0AamKLWYcJTEYCsMbVBRWuXMagJr9/kEtXA6sNYrQIDAQAB";
@@ -114,21 +139,7 @@ async function loadHostWhitelistModule() {
 }
 
 export async function createExtensionManifest({ devLoopback = false } = {}) {
-  const pkgRaw = await fsp.readFile(
-    path.join(frontendRoot, "package.json"),
-    "utf8",
-  );
-  const pkg = JSON.parse(pkgRaw);
-  let releaseMetaVersion = "";
-  try {
-    const metaRaw = await fsp.readFile(
-      path.join(frontendRoot, "src", "core", "extensionReleaseMeta.json"),
-      "utf8",
-    );
-    releaseMetaVersion = String(JSON.parse(metaRaw)?.version || "").trim();
-  } catch {
-    releaseMetaVersion = "";
-  }
+  const { version: releaseMetaVersion } = loadExtensionReleaseMetaSync();
   const hostWhitelist = await loadHostWhitelistModule();
   const { host_permissions, optional_host_permissions } =
     hostWhitelist.buildManifestHostPermissions({ devLoopback });
@@ -144,7 +155,7 @@ export async function createExtensionManifest({ devLoopback = false } = {}) {
     manifest_version: 3,
     key: DOKITOOL_EXTENSION_MANIFEST_KEY,
     name: "DokiTool 素材下载助手",
-    version: releaseMetaVersion || String(pkg.version || "1.0.0"),
+    version: releaseMetaVersion,
     description:
       "DokiTool 多平台无水印短视频、图集、实况照片与 YouTube 4K60 无损合流侧边栏下载扩展（零 Cookie、显式白名单、后台保活落盘）",
     permissions: [...EXPECTED_PERMISSIONS],
@@ -952,6 +963,7 @@ export async function buildExtension({
     const versionMeta = {
       version: verification.manifest.version,
       download_url: "/helper/dokitool-chrome-extension.zip",
+      sha256: packaged.sha256,
     };
     versionMetaPath = path.join(
       path.dirname(resolvedZipOut),

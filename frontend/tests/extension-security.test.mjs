@@ -1897,7 +1897,7 @@ test("PR-C hostWhitelist: PRODUCTION_HOST_PERMISSIONS stays unchanged & isSafeNa
     );
   }
 
-  // Extra allowed origin matches loopback / custom API origin
+  // Extra allowed origin matches exact single-port loopback / custom API origin (NV-08: reject port-wildcard patterns)
   assert.equal(
     hostWhitelist.isSafeNativeBrowserDownloadUrl(
       "http://127.0.0.1:18080/mock-media.mp4",
@@ -1910,7 +1910,14 @@ test("PR-C hostWhitelist: PRODUCTION_HOST_PERMISSIONS stays unchanged & isSafeNa
       "http://127.0.0.1:18080/mock-media.mp4",
       ["http://127.0.0.1/*"],
     ).safe,
-    true,
+    false,
+  );
+  assert.equal(
+    hostWhitelist.isSafeNativeBrowserDownloadUrl(
+      "http://127.0.0.1:19222/mock-media.mp4",
+      ["http://127.0.0.1:18080"],
+    ).safe,
+    false,
   );
 
   // Unsafe URLs rejected strictly
@@ -3793,10 +3800,12 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   const releaseMeta = JSON.parse(
     await readFile(new URL("../src/core/extensionReleaseMeta.json", import.meta.url), "utf8"),
   );
-  assert.equal(releaseMeta.version, "4.4.1");
-  assert.equal(capabilityHub.LATEST_EXTENSION_VERSION, "4.4.1");
+  assert.match(releaseMeta.version, /^\d+\.\d+\.\d+$/);
+  assert.match(releaseMeta.extensionId, /^[a-p]{32}$/);
+  assert.equal(capabilityHub.LATEST_EXTENSION_VERSION, releaseMeta.version);
+  assert.equal(capabilityHub.EXTENSION_RELEASE_ID, releaseMeta.extensionId);
 
-  // (a) build-extension.mjs --zip-out in isolated temp dir writes deterministic extension-version.json
+  // (a) build-extension.mjs --zip-out in isolated temp dir writes deterministic extension-version.json (with ZIP sha256)
   const tmpRoot = await mkdtemp(join(tmpdir(), "dokitool-batch1a-vermeta-"));
   const frontendDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
   try {
@@ -3819,14 +3828,17 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
     assert.equal(existsSync(zipOutPath), true);
     assert.equal(existsSync(versionJsonPath), true, "expected sibling extension-version.json");
 
+    const zipBytes = await readFile(zipOutPath);
+    const expectedZipSha256 = createHash("sha256").update(zipBytes).digest("hex");
     const rawVersionJson = await readFile(versionJsonPath, "utf8");
     assert.equal(
       rawVersionJson,
-      `${JSON.stringify({ version: releaseMeta.version, download_url: "/helper/dokitool-chrome-extension.zip" })}\n`,
+      `${JSON.stringify({ version: releaseMeta.version, download_url: "/helper/dokitool-chrome-extension.zip", sha256: expectedZipSha256 })}\n`,
     );
     const parsedVersionJson = JSON.parse(rawVersionJson);
     assert.equal(parsedVersionJson.version, releaseMeta.version);
     assert.equal(parsedVersionJson.download_url, "/helper/dokitool-chrome-extension.zip");
+    assert.equal(parsedVersionJson.sha256, expectedZipSha256);
   } finally {
     await rm(tmpRoot, { recursive: true, force: true });
   }
@@ -4432,4 +4444,306 @@ test("R69-B: WEB_EXT_PING isolates storage.getSettings() faults and slowness wit
     globalThis.clearTimeout = realClearTimeout;
     process.off("unhandledRejection", onUnhandled);
   }
+});
+
+test("Post-#71 PR-2 (NV-08, NV-09, P0-1, P1-5 & Hardening): single-port loopback scoping, external bridge isolation, safe download extension allowlist, sender URL isolation, task.error URL redaction, subtitle post-redirect check, and runtime version sync", async () => {
+  const [
+    dnrMod,
+    hostWhitelist,
+    sanitizer,
+    bgTypes,
+    bgMod,
+    uiHelpers,
+    variantSel,
+    subtitleEngine,
+    extRuntimeMod,
+    parseHelpers,
+  ] = await Promise.all([
+    bundleTsModule("../src/extension/bg/dnrRules.ts"),
+    bundleTsModule("../src/extension/hostWhitelist.ts"),
+    bundleTsModule("../src/extension/filenameSanitizer.ts"),
+    bundleTsModule("../src/extension/bg/types.ts"),
+    bundleTsModule("../src/extension/background.ts"),
+    bundleTsModule("../src/extension/uiTargetHelpers.ts"),
+    bundleTsModule("../src/extension/planning/variantSelection.ts"),
+    bundleTsModule("../src/core/media/subtitleEngine.ts"),
+    bundleTsModule("../src/composables/useExtensionRuntime.ts"),
+    (async () => {
+      const bundled = await build({
+        entryPoints: [fileURLToPath(new URL("../src/utils/parseHelpers.ts", import.meta.url))],
+        bundle: true,
+        write: false,
+        platform: "node",
+        format: "esm",
+        define: { "import.meta.env": "{}" },
+      });
+      return import(
+        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
+      );
+    })(),
+  ]);
+
+  // 1. NV-08: resolveExtraAllowedMediaOrigins never appends port-wildcard loopback patterns even if chrome.permissions.contains returns true
+  {
+    const dnr = dnrMod.createDnrRulesManager({
+      chromeApi: {
+        runtime: { id: DOKITOOL_EXTENSION_ID, getManifest: () => ({ host_permissions: [] }) },
+        permissions: { contains: async () => true },
+      },
+      storage: { getSettings: async () => ({ apiBaseUrl: "https://snap.dokitool.com" }) },
+    });
+    const prodOrigins = await dnr.resolveExtraAllowedMediaOrigins({
+      apiBaseUrl: "https://snap.dokitool.com",
+    });
+    assert.deepEqual(prodOrigins, ["https://snap.dokitool.com"]);
+    assert.equal(prodOrigins.includes("http://127.0.0.1/*"), false);
+    assert.equal(prodOrigins.includes("http://localhost/*"), false);
+
+    const loopbackOrigins = await dnr.resolveExtraAllowedMediaOrigins({
+      apiBaseUrl: "http://127.0.0.1:18080",
+    });
+    assert.deepEqual(loopbackOrigins, ["http://127.0.0.1:18080"]);
+    assert.equal(
+      hostWhitelist.isWhitelistedMediaUrl("http://127.0.0.1:18080/a.mp4", loopbackOrigins).allowed,
+      true,
+    );
+    assert.equal(
+      hostWhitelist.isWhitelistedMediaUrl("http://127.0.0.1:19222/secret.txt", loopbackOrigins).allowed,
+      false,
+    );
+    assert.equal(
+      hostWhitelist.isWhitelistedMediaUrl("http://127.0.0.1:19222/secret.txt", ["http://127.0.0.1/*"]).allowed,
+      false,
+    );
+  }
+
+  // 2. NV-08 + task.error redaction + background sender.url isolation
+  {
+    const dispatchedSpecs = [];
+    const chromeStub = {
+      runtime: {
+        id: DOKITOOL_EXTENSION_ID,
+        getManifest: () => ({
+          version: "4.5.0",
+          host_permissions: ["https://snap.dokitool.com/*"],
+          optional_host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
+          externally_connectable: { matches: ["https://snap.dokitool.com/*"] },
+        }),
+        onMessage: { addListener() {}, removeListener() {} },
+        onMessageExternal: { addListener() {}, removeListener() {} },
+        sendMessage: async (msg) => {
+          if (msg?.type === "OFFSCREEN_START_TASK") {
+            dispatchedSpecs.push(msg.spec);
+            return { ok: true, data: { accepted: true } };
+          }
+          return { ok: true, data: {} };
+        },
+      },
+      permissions: { contains: async () => true },
+      offscreen: { createDocument: async () => {} },
+      downloads: {
+        onChanged: { addListener() {}, removeListener() {} },
+        onDeterminingFilename: { addListener() {}, removeListener() {} },
+      },
+    };
+    const fakeStorage = {
+      getSettings: async () => ({
+        apiBaseUrl: "http://127.0.0.1:18080",
+        bearerToken: "",
+        subfolderPrefix: "",
+        batchSaveMode: "subfolder",
+        qualityPreference: "highest",
+        theme: "system",
+        autoFollowTab: false,
+        useSaveFilePicker: false,
+      }),
+      getSavedWorks: async () => [],
+      recordSavedWork: async () => {},
+      consumePendingIntent: async () => null,
+    };
+    const bg = bgMod.createBackgroundController({ chrome: chromeStub, storage: fakeStorage });
+    try {
+      // External WEB_EXT_ENQUEUE_MEDIA from production web must NOT inherit settings.apiBaseUrl loopback origin
+      const enqResp = await new Promise((resolve) => {
+        bg.handleExternalRuntimeMessage(
+          {
+            type: "WEB_EXT_ENQUEUE_MEDIA",
+            payload: {
+              kind: "direct_download",
+              platform: "bilibili",
+              title: "Bridge Isolation Check",
+              filename: "clip.mp4",
+              routes: ["https://upos-sz-mirrorcos.bilivideo.com/clip.mp4"],
+            },
+          },
+          { url: "https://snap.dokitool.com/" },
+          resolve,
+        );
+      });
+      assert.equal(enqResp.ok, true);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.equal(dispatchedSpecs.length, 1);
+      assert.deepEqual(dispatchedSpecs[0].extraAllowedOrigins ?? [], []);
+
+      // Emit task error containing a signed URL -> WEB_EXT_GET_TASK_STATUS must redact the URL
+      await new Promise((resolve) => {
+        bg.handleRuntimeMessage(
+          {
+            type: "OFFSCREEN_TASK_ERROR",
+            taskId: enqResp.data.taskId,
+            error: "fetch failed for https://upos-sz-mirrorcos.bilivideo.com/secret?token=abc123",
+          },
+          { id: DOKITOOL_EXTENSION_ID, url: `chrome-extension://${DOKITOOL_EXTENSION_ID}/offscreen.html` },
+          resolve,
+        );
+      });
+      const statusResp = await new Promise((resolve) => {
+        bg.handleExternalRuntimeMessage(
+          { type: "WEB_EXT_GET_TASK_STATUS", taskId: enqResp.data.taskId },
+          { url: "https://snap.dokitool.com/" },
+          resolve,
+        );
+      });
+      assert.equal(statusResp.ok, true);
+      assert.equal(statusResp.data.error.includes("token=abc123"), false);
+      assert.ok(statusResp.data.error.includes("[redacted-url]"));
+
+      // Sender isolation: offscreen.html MUST NOT call SidePanel requests; sidepanel.html MUST NOT call Offscreen requests; tab senders rejected
+      const offscreenCallingSidePanel = await new Promise((resolve) => {
+        bg.handleRuntimeMessage(
+          { type: "GET_INITIAL_STATE" },
+          { id: DOKITOOL_EXTENSION_ID, url: `chrome-extension://${DOKITOOL_EXTENSION_ID}/offscreen.html` },
+          resolve,
+        );
+      });
+      assert.equal(offscreenCallingSidePanel.ok, false);
+      assert.equal(offscreenCallingSidePanel.code, "FORBIDDEN_SENDER");
+
+      const sidePanelCallingOffscreen = await new Promise((resolve) => {
+        bg.handleRuntimeMessage(
+          { type: "OFFSCREEN_HEARTBEAT", activeTaskIds: [] },
+          { id: DOKITOOL_EXTENSION_ID, url: `chrome-extension://${DOKITOOL_EXTENSION_ID}/sidepanel.html` },
+          resolve,
+        );
+      });
+      assert.equal(sidePanelCallingOffscreen.ok, false);
+      assert.equal(sidePanelCallingOffscreen.code, "FORBIDDEN_SENDER");
+
+      const tabSender = await new Promise((resolve) => {
+        bg.handleRuntimeMessage(
+          { type: "GET_INITIAL_STATE" },
+          { id: DOKITOOL_EXTENSION_ID, tab: { id: 1 } },
+          resolve,
+        );
+      });
+      assert.equal(tabSender.ok, false);
+      assert.equal(tabSender.code, "FORBIDDEN_SENDER");
+    } finally {
+      bg.dispose();
+    }
+  }
+
+  // 3. NV-09: Safe extension allowlist blocks active/executable extensions across sanitizer, relative path, and variant resolvers
+  for (const badExt of ["html", "htm", "svg", "sh", "command", "bat", "exe", "ps1", "hta", "js"]) {
+    assert.equal(sanitizer.isSafeDownloadExtension(badExt), false, `${badExt} must be rejected`);
+    assert.equal(sanitizer.sanitizeFileExtension(badExt), "bin", `${badExt} must coerce to bin`);
+    assert.equal(
+      sanitizer.buildSafeDownloadPath({ stem: `demo.${badExt}`, ext: badExt }),
+      "demo.bin",
+    );
+    assert.equal(
+      bgTypes.sanitizeRelativeDownloadPath(`Folder/demo.${badExt}`),
+      "Folder/demo.bin",
+    );
+    const variant = {
+      id: "v1",
+      metadata: { extension: badExt },
+      delivery: { kind: "file", sources: [{ url: "https://cdn.example.com/payload" }] },
+    };
+    const resolvedUi = uiHelpers.resolveVariantExtension({
+      variant,
+      itemType: "video",
+      primaryUrl: "https://cdn.example.com/payload",
+    });
+    assert.equal(resolvedUi.ext, "mp4", `resolveVariantExtension must coerce ${badExt} -> mp4 for video`);
+    const resolvedTarget = variantSel.resolveExtensionForTarget(
+      { kind: "file", url: "https://cdn.example.com/payload", variant },
+      { id: "i1", type: "video", variants: [variant] },
+      "youtube",
+      false,
+    );
+    assert.equal(resolvedTarget.ext, "mp4", `resolveExtensionForTarget must coerce ${badExt} -> mp4`);
+  }
+
+  // 4. Subtitle post-redirect whitelist enforcement
+  await assert.rejects(
+    () =>
+      subtitleEngine.fetchSubtitleTrackText("https://www.youtube.com/api/timedtext?v=1", {
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          url: "http://127.0.0.1:19222/private.txt",
+          headers: new Headers(),
+          text: async () => "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nsecret",
+        }),
+        validateFinalUrl: (finalUrl) => hostWhitelist.isWhitelistedMediaUrl(finalUrl).allowed,
+      }),
+    (err) => err?.code === "SUBTITLE_UNWHITELISTED",
+  );
+
+  // 5. P0-1: useExtensionRuntime live /helper/extension-version.json sync + in-flight probe dedup
+  {
+    const prevWin = globalThis.window;
+    globalThis.window = { location: { origin: "https://snap.dokitool.com" } };
+    let pingCount = 0;
+    let fetchCount = 0;
+    let fakeNow = 100_000;
+    const runtime = extRuntimeMod.useExtensionRuntime({
+      now: () => fakeNow,
+      pingImpl: async () => {
+        pingCount++;
+        await new Promise((r) => setTimeout(r, 15));
+        return {
+          connected: true,
+          version: "4.5.0",
+          extensionId: DOKITOOL_EXTENSION_ID,
+          capabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux"],
+          useSaveFilePicker: false,
+        };
+      },
+      fetchImpl: async (url, init) => {
+        fetchCount++;
+        assert.equal(url, "/helper/extension-version.json");
+        assert.equal(init.credentials, "omit");
+        assert.equal(init.cache, "no-cache");
+        return new Response(
+          JSON.stringify({ version: "4.6.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    try {
+      // Concurrent pings coalesce into 1 IPC call
+      await Promise.all([runtime.probeExtension(), runtime.probeExtension()]);
+      assert.equal(pingCount, 1, "concurrent probeExtension calls must coalesce");
+      assert.equal(runtime.extensionState.value.connected, true);
+
+      // Remote version strictly higher monotonically raises latestExtensionVersion
+      const ver = await runtime.refreshLatestExtensionVersion({ cooldownMs: 60_000 });
+      assert.equal(ver, "4.6.0");
+      assert.equal(runtime.latestExtensionVersion.value, "4.6.0");
+      // Within cooldown -> no duplicate fetch
+      await runtime.refreshLatestExtensionVersion({ cooldownMs: 60_000 });
+      assert.equal(fetchCount, 1);
+    } finally {
+      runtime.dispose();
+      globalThis.window = prevWin;
+    }
+  }
+
+  // 6. P1-5: parseHelpers recognizes zuiyou shortlink share.xiaochuankeji.cn
+  assert.equal(
+    parseHelpers.detectUrlPlatform("https://share.xiaochuankeji.cn/hybrid/share/post?pid=12345"),
+    "zuiyou",
+  );
 });

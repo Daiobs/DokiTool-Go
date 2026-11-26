@@ -144,9 +144,10 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       }
     }
     if (!authoritativeFilename) return;
-    authoritativeFilenamesByDownloadId.set(item.id, authoritativeFilename);
+    const safeAuthoritative = sanitizeRelativeDownloadPath(authoritativeFilename);
+    authoritativeFilenamesByDownloadId.set(item.id, safeAuthoritative);
     if (matchedUrl) authoritativeUrlByDownloadId.set(item.id, matchedUrl);
-    suggest({ filename: authoritativeFilename, conflictAction: "uniquify" });
+    suggest({ filename: safeAuthoritative, conflictAction: "uniquify" });
   };
 
   // ==========================================================================
@@ -378,6 +379,14 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     spec: OffscreenDownloadSpec,
     settings: ExtensionSettings,
   ): Promise<OffscreenDownloadSpec> => {
+    if (spec.isolateExtraAllowedOrigins) {
+      return {
+        ...spec,
+        ...(spec.extraAllowedOrigins
+          ? { extraAllowedOrigins: Array.from(new Set(spec.extraAllowedOrigins)) }
+          : {}),
+      };
+    }
     const extra = await resolveExtraAllowedMediaOrigins(settings);
     return {
       ...spec,
@@ -411,8 +420,13 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       return;
     }
 
-    const { enrichedSpec, effectiveAllowedOrigins, latestTask: latestBeforeStart } =
-      prepared;
+    const { enrichedSpec, effectiveAllowedOrigins } = prepared;
+    const latestBeforeStart = tasks.get(taskId);
+    if (!latestBeforeStart || FINISHED_TASK_STATUSES.has(latestBeforeStart.status)) {
+      scheduleOffscreenIdleCloseIfIdle();
+      notifyIfCompletelyIdle();
+      return;
+    }
     const routeDecision = classifySpecDispatchRoute(
       enrichedSpec,
       effectiveAllowedOrigins,
@@ -557,12 +571,19 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       const item = items[i];
       const taskId = nextId("task");
       const mergedRefreshContext = item.spec.refreshContext ?? item.refreshContext;
+      const mergedExtraAllowedOrigins = item.spec.isolateExtraAllowedOrigins
+        ? item.spec.extraAllowedOrigins
+          ? Array.from(new Set(item.spec.extraAllowedOrigins))
+          : undefined
+        : Array.from(
+            new Set([...(item.spec.extraAllowedOrigins ?? []), ...extraOrigins]),
+          );
       const enrichedSpec: OffscreenDownloadSpec = {
         ...item.spec,
         ...(mergedRefreshContext ? { refreshContext: mergedRefreshContext } : {}),
-        extraAllowedOrigins: Array.from(
-          new Set([...(item.spec.extraAllowedOrigins ?? []), ...extraOrigins]),
-        ),
+        ...(mergedExtraAllowedOrigins !== undefined
+          ? { extraAllowedOrigins: mergedExtraAllowedOrigins }
+          : {}),
       };
       const ts = nowFn();
       const task: ExtensionDownloadTask = {

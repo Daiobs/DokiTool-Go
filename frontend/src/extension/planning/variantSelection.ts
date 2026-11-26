@@ -30,6 +30,7 @@ import {
   type CanonicalVariantDescriptor,
 } from "../../core/media";
 import { extractDashMuxSpec } from "../dashMuxSpec";
+import { isSafeDownloadExtension } from "../filenameSanitizer";
 import {
   isSafeNativeBrowserDownloadUrl,
   isWhitelistedMediaUrl,
@@ -567,6 +568,9 @@ export function resolveExtensionForTarget(
   const suffixes = extensionsFor(formatMime || "");
   let resolvedExt =
     suffixes.length && !suffixes.includes(baseExt) ? suffixes[0] : baseExt;
+  if (!isSafeDownloadExtension(resolvedExt)) {
+    resolvedExt = "bin";
+  }
 
   if (resolvedExt === "bin") {
     if (isAudioOnly || item.type === "audio") {
