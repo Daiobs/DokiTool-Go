@@ -119,7 +119,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 			CircuitBreakers:       (*circuitBreakerManager)(nil).Snapshot(nowRaw),
 			GenericCircuitBreaker: (*circuitBreakerManager)(nil).GenericSnapshot(nowRaw),
 			RuntimePolicy:         defaultRuntimePolicySummary(),
-			Shanghai:              shOff,
+			Shanghai:              toAPIShanghaiStats(shOff),
 			Runtime:               normalizeRuntimeConfig(RuntimeConfigSnapshot{}, shOff, false),
 			Daily:                 emptyDailyBuckets(nowRaw),
 			Hourly:                emptyHourlyBuckets(nowRaw),
@@ -216,7 +216,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 
 	var ytHelperSnap YouTubeHelperStatsSnapshot
 	if ytHelperSrc != nil {
-		ytHelperSnap = ytHelperSrc.HelperStatsSnapshot()
+		ytHelperSnap = toAPIYouTubeHelperStats(ytHelperSrc.HelperStatsSnapshot())
 	}
 
 	cbSnaps := cbSrc.Snapshot(nowRaw)
@@ -349,14 +349,14 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		Cache:                 cacheSnap,
 		Admission:             admSnap,
 		APIKeys:               apiKeys,
-		YTDLP:                 ytdlpSnap,
-		YTDLPGeneric:          ytdlpGenericSnap,
+		YTDLP:                 toAPIYTDLPSlotStats(ytdlpSnap),
+		YTDLPGeneric:          toAPIYTDLPSlotStats(ytdlpGenericSnap),
 		YTDLPPools:            ytdlpPools,
 		YouTubeHelper:         ytHelperSnap,
 		CircuitBreakers:       cbSnaps,
 		GenericCircuitBreaker: genericCBSnap,
 		RuntimePolicy:         runtimePolicy,
-		Shanghai:              shSnap,
+		Shanghai:              toAPIShanghaiStats(shSnap),
 		ParseLatencyMS: LatencyStatsSnapshot{
 			Total:     latTotal,
 			ByChannel: LatencyChannelBreakdown{Anonymous: latAnon, Owner: latOwner},

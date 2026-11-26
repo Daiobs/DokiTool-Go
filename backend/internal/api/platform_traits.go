@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/urlpolicy"
 )
 
 // platformTrait centralizes per-platform admission, parse-cache, TTL, and URL
@@ -53,7 +53,7 @@ type platformTrait struct {
 const PlatformGeneric = "ytdlp_generic"
 
 func normalizeInstagramCacheURL(source string) (string, string, string, bool) {
-	if _, canonical, ok := instagram.ExtractPostTarget(source); ok {
+	if _, canonical, ok := urlpolicy.ExtractInstagramPostTarget(source); ok {
 		if cu, parseErr := url.Parse(canonical); parseErr == nil {
 			return "https", "www.instagram.com", cu.EscapedPath(), true
 		}

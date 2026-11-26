@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/telemetry"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -80,23 +81,9 @@ var (
 	bcp47TagPattern           = regexp.MustCompile(`^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$`)
 )
 
-// HelperStatsSnapshot exposes strictly redacted, closed-vocabulary telemetry for
-// GET /api/stats (zero URLs, IPs, error messages, tokens, or local paths).
-type HelperStatsSnapshot struct {
-	Enabled             bool   `json:"enabled"`
-	DisabledByConfig    bool   `json:"disabled_by_config"`
-	ActivePlayerCached  bool   `json:"active_player_cached"`
-	ActiveVariant       string `json:"active_variant"`
-	RefreshAttempts     uint64 `json:"refresh_attempts"`
-	RefreshSuccesses    uint64 `json:"refresh_successes"`
-	RefreshFailures     uint64 `json:"refresh_failures"`
-	CooldownSkips       uint64 `json:"cooldown_skips"`
-	ConsecutiveFailures int    `json:"consecutive_failures"`
-	InCooldown          bool   `json:"in_cooldown"`
-	ChallengeLRUEntries int    `json:"challenge_lru_entries"`
-	ChallengeLRUHits    uint64 `json:"challenge_lru_hits"`
-	ChallengeLRUMisses  uint64 `json:"challenge_lru_misses"`
-}
+// HelperStatsSnapshot aliases telemetry.YouTubeHelperStats so *Helper implements
+// api.YouTubeHelperStatsSource without coupling internal/api to internal/platform/youtube.
+type HelperStatsSnapshot = telemetry.YouTubeHelperStats
 
 // AllowYouTubePlayerFetchURL restricts server-side player JS discovery and
 // download requests strictly to https://www.youtube.com.
