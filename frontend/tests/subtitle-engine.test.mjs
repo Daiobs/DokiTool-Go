@@ -1248,26 +1248,30 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   const maxDualScans = 2 * cap;
   assert.equal(maxDualScans, 1_024);
 
-  // 1. Window-1 & Window-2 independent boundary checks (cap - 1 inspected, cap skipped)
-  // Window 1: banner-pinned prefix of cap cues before nearIdx, with the best spanning cue at index (cap - 1) vs (cap)
+  // 1. Window-1 (head-256 + tail-256 alive-only) & Window-2 independent boundary checks
+  // Window 1: all 512 alive spanning cues are scanned (including tail index 511 and middle index 255);
+  // with 513 alive spanning cues, head 0..255 and tail 257..512 are scanned while middle index 256 is skipped.
+  const headCap = cap >>> 1;
   const w1Primary = [{ startMs: 100_000, endMs: 102_000, text: "W1-P" }];
   const w1Within = [
     ...Array.from({ length: cap - 1 }, (_, i) => ({ startMs: 0, endMs: 100_500, text: `w1-short-${i}` })),
     { startMs: 0, endMs: 102_000, text: "w1-best-at-511" },
-    { startMs: 0, endMs: 102_000, text: "w1-beyond-at-512" },
   ];
   assert.deepEqual(subtitleEngine.mergeBilingualCues(w1Primary, w1Within), [
     { startMs: 100_000, endMs: 102_000, text: "W1-P\nw1-best-at-511" },
   ]);
-  const w1Beyond = [
-    ...Array.from({ length: cap }, (_, i) => ({ startMs: 0, endMs: 100_500, text: `w1-short-${i}` })),
-    { startMs: 0, endMs: 102_000, text: "w1-beyond-at-512" },
+  const w1BeyondMiddle = [
+    ...Array.from({ length: headCap }, (_, i) => ({ startMs: 0, endMs: 100_500, text: `w1-head-${i}` })),
+    { startMs: 0, endMs: 102_000, text: "w1-skipped-middle-256" },
+    ...Array.from({ length: headCap }, (_, i) => ({ startMs: 0, endMs: 100_500, text: `w1-tail-${i}` })),
   ];
-  assert.deepEqual(subtitleEngine.mergeBilingualCues(w1Primary, w1Beyond), [
-    { startMs: 100_000, endMs: 102_000, text: "W1-P\nw1-short-0" },
+  const w1BeyondStats = { totalScans: 0, maxScansPerCue: 0 };
+  assert.deepEqual(subtitleEngine.mergeBilingualCues(w1Primary, w1BeyondMiddle, w1BeyondStats), [
+    { startMs: 100_000, endMs: 102_000, text: "W1-P\nw1-head-0" },
   ]);
+  assert.equal(w1BeyondStats.maxScansPerCue, cap);
 
-  // Window 2: banner + 700 expired noise (so left=0, nearIdx=701), then cap cues at nearIdx
+  // Window 2: banner + 700 expired noise (all 700 dead cues skipped by maxEnd segment tree -> only 1 alive pre-cue!), then cap cues at nearIdx
   const w2Prefix = [
     { startMs: 0, endMs: 500_000, text: "W2-BANNER" },
     ...Array.from({ length: 700 }, (_, i) => ({ startMs: 1_000 + i * 10, endMs: 1_005 + i * 10, text: `noise-${i}` })),
@@ -1282,7 +1286,7 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   assert.deepEqual(subtitleEngine.mergeBilingualCues(w2Primary, w2Within, w2Stats), [
     { startMs: 100_000, endMs: 102_000, text: "W2-P\nw2-best-at-511" },
   ]);
-  assert.equal(w2Stats.maxScansPerCue, maxDualScans);
+  assert.equal(w2Stats.maxScansPerCue, 1 + cap);
 
   const w2Beyond = [
     ...w2Prefix,
@@ -1293,7 +1297,7 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   assert.deepEqual(subtitleEngine.mergeBilingualCues(w2Primary, w2Beyond, w2BeyondStats), [
     { startMs: 100_000, endMs: 102_000, text: "W2-P\nw2-short-0" },
   ]);
-  assert.equal(w2BeyondStats.maxScansPerCue, maxDualScans);
+  assert.equal(w2BeyondStats.maxScansPerCue, 1 + cap);
 
   // 2. 10,000 x 10,000 full-overlap benchmark
   const fullPrimary = Array.from({ length: 10_000 }, (_, i) => ({
@@ -1348,15 +1352,14 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   assert.ok(pinnedStats.maxScansPerCue <= maxDualScans, `banner-pinned maxScans=${pinnedStats.maxScansPerCue} > 1024`);
   assert.ok(pinnedElapsedMs < 500, `banner-pinned 10k x 10k took ${pinnedElapsedMs.toFixed(1)}ms (>= 500ms)`);
 
-  // 4. 10,000 x 10,000 worst-case dual-window saturation (both windows hit 512 cap simultaneously)
+  // 4. 10,000 x 10,000 worst-case dual-window saturation (both windows hit 512 alive cap simultaneously)
   const satSecondary = [
-    { startMs: 0, endMs: 100_000_000, text: "SAT-BANNER" },
     ...Array.from({ length: 600 }, (_, i) => ({
-      startMs: 10 + i,
-      endMs: 20 + i,
-      text: `SAT-EARLY-${i}`,
+      startMs: i,
+      endMs: 100_000_000,
+      text: `SAT-BANNER-${i}`,
     })),
-    ...Array.from({ length: 9_399 }, (_, i) => ({
+    ...Array.from({ length: 9_400 }, (_, i) => ({
       startMs: 1_000_000,
       endMs: 1_002_000,
       text: `SAT-LOCAL-${i}`,
@@ -1447,4 +1450,257 @@ test("mergeBilingualCues still falls back to long-lived banner when no local dia
     { startMs: 10_000, endMs: 13_500, text: "P-WITH-LOCAL\nLOCAL-LINE-1" },
     { startMs: 600_000, endMs: 604_000, text: "P-ORPHAN-INSTRUMENTAL\nPERSISTENT-BANNER" },
   ]);
+});
+
+test("F70-R4-01: pre-roll translated cue must survive banner-pinned early prefix", () => {
+  const pStart = 3_600_000;
+  const primary = [{ startMs: pStart, endMs: pStart + 4_000, text: "PRIMARY" }];
+  const banner = { startMs: 0, endMs: 7_200_000, text: "BANNER" };
+  const expired = Array.from({ length: 700 }, (_, i) => ({
+    startMs: 1_000 + i * 1_000,
+    endMs: 1_000 + i * 1_000 + 500,
+    text: `EXPIRED-${i}`,
+  }));
+  // Pre-roll secondary cue starts 2000ms before pStart (< minEnd = pStart - 1500),
+  // so it lies strictly to the left of nearIdx while overlapping primary by 2000ms.
+  const preRollReal = { startMs: pStart - 2_000, endMs: pStart + 2_000, text: "REAL" };
+  const merged = subtitleEngine.mergeBilingualCues(primary, [banner, ...expired, preRollReal]);
+  assert.deepEqual(merged, [
+    { startMs: pStart, endMs: pStart + 4_000, text: "PRIMARY\nREAL" },
+  ]);
+});
+
+test("F70-R4-01: deterministic matrix across pre-roll offsets (-1200..-8000ms), multi-banners, 1600 expired cues & multi-hour timeline", () => {
+  const banners = [
+    { startMs: 0, endMs: 14_400_000, text: "MULTI-BANNER-1" },
+    { startMs: 200, endMs: 14_400_200, text: "MULTI-BANNER-2" },
+    { startMs: 400, endMs: 14_400_400, text: "MULTI-BANNER-3" },
+  ];
+  const expired = Array.from({ length: 1_600 }, (_, i) => ({
+    startMs: 1_000 + i * 2_000,
+    endMs: 1_000 + i * 2_000 + 900,
+    text: `OLD-EXPIRED-${i}`,
+  }));
+  const offsets = [-1_200, -1_500, -1_600, -2_000, -3_000, -8_000];
+  const primary = [];
+  const realSecondary = [];
+  for (let idx = 0; idx < offsets.length; idx++) {
+    const pStart = 7_200_000 + idx * 600_000; // across hours 2..3
+    const pEnd = pStart + 4_000;
+    const offset = offsets[idx];
+    primary.push({ startMs: pStart, endMs: pEnd, text: `H-PRI-${offset}` });
+    realSecondary.push({
+      startMs: pStart + offset,
+      endMs: pStart + 2_500,
+      text: `H-REAL-${offset}`,
+    });
+  }
+  // Orphan cue with no local translation must still fall back to earliest persistent banner
+  const orphanStart = 12_000_000;
+  primary.push({ startMs: orphanStart, endMs: orphanStart + 3_000, text: "H-PRI-ORPHAN" });
+
+  const stats = { totalScans: 0, maxScansPerCue: 0 };
+  const merged = subtitleEngine.mergeBilingualCues(
+    primary,
+    [...banners, ...expired, ...realSecondary],
+    stats,
+  );
+  assert.equal(merged.length, offsets.length + 1);
+  for (let idx = 0; idx < offsets.length; idx++) {
+    const offset = offsets[idx];
+    assert.equal(
+      merged[idx].text,
+      `H-PRI-${offset}\nH-REAL-${offset}`,
+      `Offset ${offset}ms mismatch: got ${JSON.stringify(merged[idx].text)}`,
+    );
+  }
+  // All 3 banners share duration 14_400_000ms; MULTI-BANNER-3 (midpoint 7_200_400) is closest to 12_001_500.
+  assert.equal(merged[offsets.length].text, "H-PRI-ORPHAN\nMULTI-BANNER-3");
+  // All 1,600 expired cues are skipped via segment tree without spending scan budget
+  assert.ok(stats.maxScansPerCue <= 16, `Expected <= 16 alive scans per cue, got ${stats.maxScansPerCue}`);
+});
+
+test("F70-R4-01: head-256 + tail-256 dual-end budget survives 3,000 alive banners + 3,000 expired cues and bounds >512 same-tier alive cues", () => {
+  const cap = subtitleEngine.MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE;
+  const headCap = cap >>> 1;
+  assert.equal(headCap, 256);
+
+  // 1. 3,000 simultaneously alive banners + 3,000 expired dead cues + 1 pre-roll REAL right before nearIdx
+  const pStart = 5_000_000;
+  const aliveBanners = Array.from({ length: 3_000 }, (_, i) => ({
+    startMs: i,
+    endMs: 9_000_000,
+    text: `MASSIVE-BANNER-${i}`,
+  }));
+  const deadNoise = Array.from({ length: 3_000 }, (_, i) => ({
+    startMs: 10_000 + i * 500,
+    endMs: 10_200 + i * 500,
+    text: `DEAD-NOISE-${i}`,
+  }));
+  const preRollReal = { startMs: pStart - 2_500, endMs: pStart + 2_500, text: "REAL-PREROLL" };
+  const stressStats = { totalScans: 0, maxScansPerCue: 0 };
+  const stressMerged = subtitleEngine.mergeBilingualCues(
+    [{ startMs: pStart, endMs: pStart + 4_000, text: "STRESS-PRI" }],
+    [...aliveBanners, ...deadNoise, preRollReal],
+    stressStats,
+  );
+  assert.deepEqual(stressMerged, [
+    { startMs: pStart, endMs: pStart + 4_000, text: "STRESS-PRI\nREAL-PREROLL" },
+  ]);
+  assert.equal(stressStats.maxScansPerCue, cap);
+
+  // 2. 513 same-tier alive pre-window cues: head (0..255) & tail (257..512) are scanned; middle (256) is skipped
+  const makeAlivePreRoll = (idx, endMs, text) => ({
+    startMs: pStart - 4_000 + idx,
+    endMs,
+    text,
+  });
+  const bestAtHead255 = Array.from({ length: cap + 1 }, (_, i) =>
+    makeAlivePreRoll(i, i === headCap - 1 ? pStart + 4_000 : pStart + 200, i === headCap - 1 ? "BEST-HEAD-255" : `S-${i}`),
+  );
+  assert.equal(
+    subtitleEngine.mergeBilingualCues([{ startMs: pStart, endMs: pStart + 4_000, text: "P" }], bestAtHead255)[0].text,
+    "P\nBEST-HEAD-255",
+  );
+  const bestAtTail257 = Array.from({ length: cap + 1 }, (_, i) =>
+    makeAlivePreRoll(i, i === headCap + 1 ? pStart + 4_000 : pStart + 200, i === headCap + 1 ? "BEST-TAIL-257" : `S-${i}`),
+  );
+  assert.equal(
+    subtitleEngine.mergeBilingualCues([{ startMs: pStart, endMs: pStart + 4_000, text: "P" }], bestAtTail257)[0].text,
+    "P\nBEST-TAIL-257",
+  );
+  const bestAtSkippedMiddle256 = Array.from({ length: cap + 1 }, (_, i) =>
+    makeAlivePreRoll(i, i === headCap ? pStart + 4_000 : pStart + 200, i === headCap ? "SKIPPED-MID-256" : `S-${i}`),
+  );
+  const midRes = subtitleEngine.mergeBilingualCues(
+    [{ startMs: pStart, endMs: pStart + 4_000, text: "P" }],
+    bestAtSkippedMiddle256,
+  )[0].text;
+  assert.ok(!midRes.includes("SKIPPED-MID-256"), `Middle index 256 beyond 512 budget should be skipped, got ${midRes}`);
+});
+
+test("F70-R4-01: high-density seeded Oracle (800..1,200 secondary cues with banners, expired prefix & pre-rolls) matches naive O(N*M) bit-for-bit", () => {
+  const BANNER_EXCESS_MS = 6000;
+  const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const isBetterOverlap = (cand, prev, pDurEff) => {
+    if (cand.bannerTier !== prev.bannerTier) return cand.bannerTier < prev.bannerTier;
+    if (cand.sDurEff === prev.sDurEff) {
+      if (cand.overlap !== prev.overlap) return cand.overlap > prev.overlap;
+    } else {
+      const lhs = cand.overlap * (pDurEff + prev.sDurEff);
+      const rhs = prev.overlap * (pDurEff + cand.sDurEff);
+      if (Number.isSafeInteger(lhs) && Number.isSafeInteger(rhs)) {
+        if (lhs !== rhs) return lhs > rhs;
+      } else {
+        const diff = cand.overlap / (pDurEff + cand.sDurEff) - prev.overlap / (pDurEff + prev.sDurEff);
+        if (Math.abs(diff) > 1e-12) return diff > 0;
+      }
+    }
+    return cand.midDiff < prev.midDiff;
+  };
+  const naiveOracle = (primary, secondary) =>
+    primary.map((p) => {
+      const pStart = Math.max(0, p.startMs);
+      const pEnd = Math.max(pStart, p.endMs);
+      const pEndEff = Math.max(pEnd, pStart + 1);
+      const pDurEff = pEndEff - pStart;
+      const pMid = (pStart + pEnd) / 2;
+      let bestOverlap = null;
+      let nearestLocal = null;
+      let nearestAny = null;
+      for (const s of secondary) {
+        const sStart = Math.max(0, s.startMs);
+        const sEnd = Math.max(sStart, s.endMs);
+        const sEndEff = Math.max(sEnd, sStart + 1);
+        const sDurEff = sEndEff - sStart;
+        const overlap = Math.min(pEndEff, sEndEff) - Math.max(pStart, sStart);
+        if (overlap > 0) {
+          const bannerTier = (sDurEff - overlap) > BANNER_EXCESS_MS && overlap * 4 < sDurEff ? 1 : 0;
+          const cand = { cue: s, bannerTier, overlap, sDurEff, midDiff: Math.abs(pMid - (sStart + sEnd) / 2) };
+          if (!bestOverlap || isBetterOverlap(cand, bestOverlap, pDurEff)) bestOverlap = cand;
+          continue;
+        }
+        if (bestOverlap?.bannerTier === 0) continue;
+        const gap = Math.max(0, Math.max(pStart, sStart) - Math.min(pEnd, sEnd));
+        if (gap <= 1500) {
+          const startDiff = Math.abs(pStart - sStart);
+          const isLocal = sDurEff <= BANNER_EXCESS_MS * 2;
+          const prev = isLocal ? nearestLocal : nearestAny;
+          if (!prev || gap < prev.gap || (gap === prev.gap && startDiff < prev.startDiff)) {
+            const next = { cue: s, gap, startDiff };
+            if (isLocal) nearestLocal = next;
+            else nearestAny = next;
+          }
+        }
+      }
+      const pText = p.text.trim();
+      const chosen =
+        (bestOverlap?.bannerTier === 0 ? bestOverlap.cue : null) ??
+        nearestLocal?.cue ??
+        bestOverlap?.cue ??
+        nearestAny?.cue;
+      const sText = chosen?.text.trim() || "";
+      if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
+      const normS = norm(sText);
+      const lines = new Set(pText.split("\n").map(norm));
+      return {
+        startMs: pStart,
+        endMs: pEnd,
+        text: norm(pText) === normS || lines.has(normS) ? pText : `${pText}\n${sText}`,
+      };
+    });
+
+  const mulberry32 = (seed) => {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  const randInt = (rng, lo, hi) => lo + Math.floor(rng() * (hi - lo + 1));
+  const shuffle = (rng, arr) => {
+    const copy = arr.slice();
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+
+  for (let seed = 101; seed <= 112; seed++) {
+    const rng = mulberry32(seed * 2246822519);
+    const bannerCount = randInt(rng, 2, 5);
+    const expiredCount = randInt(rng, 600, 900);
+    const dialogueCount = randInt(rng, 180, 295); // total secondary in [800, 1200]
+    const primary = [];
+    const secondary = [];
+
+    for (let b = 0; b < bannerCount; b++) {
+      secondary.push({ startMs: b * 100, endMs: 12_000_000 + b * 1_000, text: `HD-BANNER-${b}` });
+    }
+    for (let e = 0; e < expiredCount; e++) {
+      const s = 1_000 + e * 2_000 + randInt(rng, 0, 500);
+      secondary.push({ startMs: s, endMs: s + randInt(rng, 100, 1_200), text: `HD-EXP-${e}` });
+    }
+    for (let d = 0; d < dialogueCount; d++) {
+      const pStart = 3_600_000 + d * 6_000 + randInt(rng, 0, 1_000);
+      const pDur = rng() < 0.1 ? 0 : randInt(rng, 1_500, 4_500);
+      primary.push({ startMs: pStart, endMs: pStart + pDur, text: `HD-P-${d}` });
+      if (rng() < 0.92) {
+        const shift = randInt(rng, -3_000, 1_000); // covers pre-roll (-3000..-1501) and in-window (-1500..+1000)
+        const sStart = Math.max(0, pStart + shift);
+        const sDur = rng() < 0.12 ? 0 : randInt(rng, 1_500, 5_000);
+        secondary.push({ startMs: sStart, endMs: sStart + sDur, text: `HD-S-${d}` });
+      }
+    }
+    assert.ok(secondary.length >= 800 && secondary.length <= 1_200, `secondary.length=${secondary.length}`);
+    const pInput = seed % 3 === 0 ? shuffle(rng, primary) : seed % 3 === 1 ? primary.slice().reverse() : primary;
+    const sInput = shuffle(rng, secondary);
+
+    const actual = subtitleEngine.mergeBilingualCues(pInput, sInput);
+    const expected = naiveOracle(pInput, sInput);
+    assert.deepEqual(actual, expected, `High-density Oracle mismatch on seed=${seed} (sec=${secondary.length})`);
+  }
 });
