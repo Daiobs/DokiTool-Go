@@ -92,6 +92,8 @@ function makeSubtitleAttachment({
 
 test("core/media barrel exports subtitleEngine API surface cleanly", () => {
   assert.equal(coreMediaBarrel.MAX_SUBTITLE_TRACK_BYTES, 5 * 1024 * 1024);
+  assert.equal(coreMediaBarrel.MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE, 512);
+  assert.equal(subtitleEngine.MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE, 512);
   for (const fn of [
     "projectYouTubeCaptionsForFinalize",
     "listSubtitleTracks",
@@ -912,4 +914,77 @@ test("safeFiniteMs rejects malformed json3 and XML timing strings with trailing 
     '<timedtext><body><p t="100px" d="500">bad1</p><p t="  " d="500">bad2</p><p t="2000" d="300bad">ok-zero-dur</p></body></timedtext>';
   const xmlCues = subtitleEngine.parseSubtitleCues(malformedXml, "srv3");
   assert.deepEqual(xmlCues, [{ startMs: 2000, endMs: 2000, text: "ok-zero-dur" }]);
+});
+
+test("mergeBilingualCues enforces MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE on adversarial 10k x 10k inputs in < 100ms", () => {
+  const cap = subtitleEngine.MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE;
+  assert.equal(cap, 512);
+
+  // 1. Exact per-cue budget boundary: candidate at index (cap - 1) is inspected, index (cap) is skipped
+  const boundaryPrimary = [{ startMs: 0, endMs: 2_000, text: "P" }];
+  const withinCapSecondary = [
+    ...Array.from({ length: cap - 1 }, (_, i) => ({ startMs: 0, endMs: 1_000, text: `small-${i}` })),
+    { startMs: 0, endMs: 2_000, text: "best-at-511" },
+    { startMs: 0, endMs: 2_000, text: "beyond-at-512" },
+  ];
+  assert.deepEqual(subtitleEngine.mergeBilingualCues(boundaryPrimary, withinCapSecondary), [
+    { startMs: 0, endMs: 2_000, text: "P\nbest-at-511" },
+  ]);
+
+  const beyondCapSecondary = [
+    ...Array.from({ length: cap }, (_, i) => ({ startMs: 0, endMs: 1_000, text: `small-${i}` })),
+    { startMs: 0, endMs: 2_000, text: "beyond-at-512" },
+  ];
+  assert.deepEqual(subtitleEngine.mergeBilingualCues(boundaryPrimary, beyondCapSecondary), [
+    { startMs: 0, endMs: 2_000, text: "P\nsmall-0" },
+  ]);
+
+  // 2. Adversarial 10,000 x 10,000 full-overlap input ([0, 3_600_000])
+  const fullPrimary = Array.from({ length: 10_000 }, (_, i) => ({
+    startMs: 0,
+    endMs: 3_600_000,
+    text: `FP-${i}`,
+  }));
+  const fullSecondary = Array.from({ length: 10_000 }, (_, i) => ({
+    startMs: 0,
+    endMs: 3_600_000,
+    text: `FS-${i}`,
+  }));
+  const tFull0 = performance.now();
+  const fullMerged = subtitleEngine.mergeBilingualCues(fullPrimary, fullSecondary);
+  const fullElapsedMs = performance.now() - tFull0;
+  assert.equal(fullMerged.length, 10_000);
+  assert.equal(fullMerged[0].text, "FP-0\nFS-0");
+  assert.equal(fullMerged[5_000].text, "FP-5000\nFS-0");
+  assert.equal(fullMerged[9_999].text, "FP-9999\nFS-0");
+  assert.ok(
+    fullElapsedMs < 100,
+    `Expected adversarial full-overlap 10k x 10k mergeBilingualCues < 100ms, took ${fullElapsedMs.toFixed(1)}ms`,
+  );
+
+  // 3. Adversarial prefix-skip 10,000 x 10,000 input (1 long anchor at index 0 + 9,999 short early cues)
+  const skipSecondary = [
+    { startMs: 0, endMs: 3_600_000, text: "ANCHOR-LONG" },
+    ...Array.from({ length: 9_999 }, (_, i) => ({
+      startMs: 0,
+      endMs: 10,
+      text: `SHORT-${i}`,
+    })),
+  ];
+  const skipPrimary = Array.from({ length: 10_000 }, (_, i) => ({
+    startMs: 100_000 + i * 100,
+    endMs: 100_000 + i * 100 + 50,
+    text: `SP-${i}`,
+  }));
+  const tSkip0 = performance.now();
+  const skipMerged = subtitleEngine.mergeBilingualCues(skipPrimary, skipSecondary);
+  const skipElapsedMs = performance.now() - tSkip0;
+  assert.equal(skipMerged.length, 10_000);
+  assert.equal(skipMerged[0].text, "SP-0\nANCHOR-LONG");
+  assert.equal(skipMerged[5_000].text, "SP-5000\nANCHOR-LONG");
+  assert.equal(skipMerged[9_999].text, "SP-9999\nANCHOR-LONG");
+  assert.ok(
+    skipElapsedMs < 100,
+    `Expected adversarial prefix-skip 10k x 10k mergeBilingualCues < 100ms, took ${skipElapsedMs.toFixed(1)}ms`,
+  );
 });

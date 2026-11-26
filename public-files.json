@@ -364,6 +364,8 @@
     "backend/internal/unified/work_test.go",
     "backend/internal/urlpolicy/instagram.go",
     "backend/internal/urlpolicy/instagram_test.go",
+    "backend/internal/urlpolicy/subtitle_expiry.go",
+    "backend/internal/urlpolicy/subtitle_expiry_test.go",
     "backend/internal/urlpolicy/urlpolicy.go",
     "backend/internal/urlpolicy/urlpolicy_test.go",
     "backend/internal/ytengine/adapter.go",

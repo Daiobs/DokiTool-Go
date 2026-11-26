@@ -3,6 +3,8 @@ import { deliveryRoutes, getSubtitleTrackKind } from "../../utils/mediaContract"
 
 /** Hard client-side byte cap per subtitle track fetch (5 MiB, Guardrail G5). */
 export const MAX_SUBTITLE_TRACK_BYTES = 5 * 1024 * 1024;
+/** Per-primary-cue inner candidate scan cap in mergeBilingualCues (guards adversarial full-overlap inputs). */
+export const MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE = 512;
 
 const MAX_PROJECTED_TRACKS = 64;
 const MAX_CUE_TIME_MS = 86_400_000_000;
@@ -379,7 +381,8 @@ export function mergeBilingualCues(primary: SubtitleCue[], secondary: SubtitleCu
       }
       prevPStart = pStart;
 
-      for (let j = left; j < sec.length; j++) {
+      const scanEnd = Math.min(sec.length, left + MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE);
+      for (let j = left; j < scanEnd; j++) {
         const s = sec[j];
         if (s.sStart > maxStart) break;
         if (s.sEnd < minEnd) continue;
