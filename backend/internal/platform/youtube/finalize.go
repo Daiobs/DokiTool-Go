@@ -287,7 +287,7 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 
 	entries := filterMultiAudioStreamEntries(validatedEntries)
 	nChallenges, sigChallenges := collectFinalizeChallenges(entries)
-	nSolved, sigSolved, err := h.solveFinalizeChallenges(ctx, cachedPlayer, nChallenges, sigChallenges)
+	nSolved, sigSolved, freshN, freshSig, err := h.solveFinalizeChallenges(ctx, cachedPlayer, nChallenges, sigChallenges)
 	if err != nil {
 		return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "YouTube 媒体签名挑战解密失败", false), http.StatusBadGateway
 	}
@@ -296,6 +296,7 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 	if errPayload != nil {
 		return errPayload, errStatus
 	}
+	h.commitSolvedChallenges(cachedPlayer, freshN, freshSig)
 
 	canonicalWatchURL := "https://www.youtube.com/watch?v=" + decoded.videoID
 	info := &ytengine.Info{
@@ -317,14 +318,14 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		EnableHLS:       false,
 	}
 	subtitleAttachments := extractFinalizeSubtitles(decoded.captions, decoded.videoID, time.Unix(nowTime.Unix(), 0).UTC())
-	return buildFinalizeEnvelope(info, opts, subtitleAttachments, nowTime.Unix(), debug)
+	return buildFinalizeEnvelope(ctx, info, opts, subtitleAttachments, nowTime.Unix(), debug)
 }
 
 func (h *Helper) solveFinalizeChallenges(
 	ctx context.Context,
 	player *playerCacheEntry,
 	nChallenges, sigChallenges []string,
-) (map[string]string, map[string]string, error) {
+) (map[string]string, map[string]string, map[string]string, map[string]string, error) {
 	nSolved := make(map[string]string, len(nChallenges))
 	sigSolved := make(map[string]string, len(sigChallenges))
 	var missingN []string
@@ -346,22 +347,32 @@ func (h *Helper) solveFinalizeChallenges(
 	}
 
 	if len(missingN) == 0 && len(missingSig) == 0 {
-		return nSolved, sigSolved, nil
+		return nSolved, sigSolved, nil, nil, nil
 	}
 
 	freshN, freshSig, err := h.sandbox.Solve(ctx, player.PreprocessedPlayerJS, missingN, missingSig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	for k, v := range freshN {
 		nSolved[k] = v
-		h.challengeCache.Put(player.PlayerID, player.Variant, player.PreprocessedDigest, "n", k, v)
 	}
 	for k, v := range freshSig {
 		sigSolved[k] = v
+	}
+	return nSolved, sigSolved, freshN, freshSig, nil
+}
+
+func (h *Helper) commitSolvedChallenges(player *playerCacheEntry, freshN, freshSig map[string]string) {
+	if h == nil || h.challengeCache == nil || player == nil {
+		return
+	}
+	for k, v := range freshN {
+		h.challengeCache.Put(player.PlayerID, player.Variant, player.PreprocessedDigest, "n", k, v)
+	}
+	for k, v := range freshSig {
 		h.challengeCache.Put(player.PlayerID, player.Variant, player.PreprocessedDigest, "sig", k, v)
 	}
-	return nSolved, sigSolved, nil
 }
 
 func decodeFinalizeRequest(body []byte) (*decodedFinalizeRequest, unified.Object, int) {
@@ -446,7 +457,11 @@ func resolveFinalizeStreamURL(item finalizeFormatInput) (streamURL, sigChallenge
 		}
 		sigParam = spVals[0]
 	}
-	return strings.TrimSpace(urls[0]), strings.TrimSpace(sigs[0]), sigParam, nil
+	sig := strings.TrimSpace(sigs[0])
+	if len(sig) > MaxChallengeSigBytes {
+		return "", "", "", unified.ContractError("INVALID_INPUT", "signatureCipher 参数 s 长度超出限制", false)
+	}
+	return strings.TrimSpace(urls[0]), sig, sigParam, nil
 }
 
 func validateFinalizeStreamEntries(allInputs []finalizeFormatInput, videoID string) ([]parsedStreamEntry, unified.Object, int) {
@@ -501,6 +516,9 @@ func validateFinalizeStreamEntries(allInputs []finalizeFormatInput, videoID stri
 				return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 n 无效", false), http.StatusBadRequest
 			}
 			nVal = strings.TrimSpace(nVals[0])
+			if len(nVal) > MaxChallengeNBytes {
+				return nil, unified.ContractError("INVALID_INPUT", "媒体链接参数 n 长度超出限制", false), http.StatusBadRequest
+			}
 		}
 
 		validatedEntries = append(validatedEntries, parsedStreamEntry{
@@ -578,8 +596,14 @@ func applySolvedChallengesToFormats(entries []parsedStreamEntry, nSolved, sigSol
 	return ytFormats, nil, 0
 }
 
-func buildFinalizeEnvelope(info *ytengine.Info, opts ytengine.AdaptOptions, subtitleAttachments unified.Array, nowUnix int64, debug bool) (unified.Object, int) {
+func buildFinalizeEnvelope(ctx context.Context, info *ytengine.Info, opts ytengine.AdaptOptions, subtitleAttachments unified.Array, nowUnix int64, debug bool) (unified.Object, int) {
+	if ctx != nil && ctx.Err() != nil {
+		return unified.ContractError("UPSTREAM_TIMEOUT", "YouTube 解析超时，请稍后重试", true), http.StatusGatewayTimeout
+	}
 	payload := ytengine.AdaptInfo(info, opts, nowUnix)
+	if ctx != nil && ctx.Err() != nil {
+		return unified.ContractError("UPSTREAM_TIMEOUT", "YouTube 解析超时，请稍后重试", true), http.StatusGatewayTimeout
+	}
 	if unified.Str(payload["code"]) == "OK" && len(subtitleAttachments) > 0 {
 		if data := unified.Map(payload["data"]); data != nil {
 			existing := unified.Slice(data["attachments"])
@@ -607,6 +631,9 @@ func buildFinalizeEnvelope(info *ytengine.Info, opts ytengine.AdaptOptions, subt
 	}
 	if err := unified.ValidateEnvelopeAt(payload, nowUnix); err != nil {
 		return unified.ContractError("INTERNAL_ERROR", "解析接口合同校验失败", false), http.StatusBadGateway
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return unified.ContractError("UPSTREAM_TIMEOUT", "YouTube 解析超时，请稍后重试", true), http.StatusGatewayTimeout
 	}
 	status := http.StatusOK
 	if unified.Str(payload["code"]) != "OK" {

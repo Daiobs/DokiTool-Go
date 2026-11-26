@@ -52,7 +52,22 @@ const (
 	StalePlayerFallbackWindow = time.Hour
 
 	// MaxChallengeCacheEntries caps the deterministic (player_id, variant, digest, input) solver LRU.
-	MaxChallengeCacheEntries = 4096
+	MaxChallengeCacheEntries = telemetry.YouTubeHelperMaxChallengeCacheEntries
+
+	// MaxChallengeNBytes caps raw YouTube 'n' challenge parameter length before Deno evaluation.
+	MaxChallengeNBytes = 256
+
+	// MaxChallengeSigBytes caps raw YouTube signatureCipher 's' parameter length before Deno evaluation.
+	MaxChallengeSigBytes = 512
+
+	// MaxChallengeOutputBytes caps solved challenge string length accepted into challengeCache.
+	MaxChallengeOutputBytes = 1024
+
+	// MaxChallengeCacheBytes caps cumulative retained key+value bytes in challengeCache at 4 MiB.
+	MaxChallengeCacheBytes = 4 << 20
+
+	// DefaultChallengeCacheTTL expires cached solver entries after 6 hours.
+	DefaultChallengeCacheTTL = 6 * time.Hour
 
 	maxCachedPlayers = 8
 )
@@ -206,7 +221,7 @@ func NewHelper(executor fetch.Executor, sandbox *EJSSandbox, now func() time.Tim
 		bgRefreshInterval:      BackgroundRefreshInterval,
 		prewarmBackoffs:        append([]time.Duration(nil), startupPrewarmBackoffs...),
 		refreshFailureBackoffs: append([]time.Duration(nil), defaultRefreshFailureBackoffs...),
-		challengeCache:         newChallengeLRU(MaxChallengeCacheEntries),
+		challengeCache:         newChallengeLRUWithConfig(MaxChallengeCacheEntries, MaxChallengeCacheBytes, DefaultChallengeCacheTTL, now),
 		cache:                  make(map[string]*playerCacheEntry),
 	}, nil
 }

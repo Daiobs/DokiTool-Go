@@ -286,3 +286,30 @@ func MarkShanghaiFallback(ctx context.Context) {
 		tracker.degraded.Store(true)
 	}
 }
+
+type callerScopedFailureKey struct{}
+
+type callerScopedFailureTracker struct {
+	callerScoped atomic.Bool
+}
+
+// WithCallerScopedFailureTracker attaches a per-request atomic flag to ctx so
+// platform parsers can mark failures caused by caller-controlled inputs (e.g.
+// nonexistent share subdomains, missing work IDs, or caller-domain DNS
+// timeouts) without altering legacy wire error codes while preventing those
+// outcomes from tripping process-wide shared platform circuit breakers.
+func WithCallerScopedFailureTracker(ctx context.Context) (context.Context, func() bool) {
+	tracker := &callerScopedFailureTracker{}
+	return context.WithValue(ctx, callerScopedFailureKey{}, tracker), tracker.callerScoped.Load
+}
+
+// MarkCallerScopedFailure records that the current parse failure was triggered
+// by caller-supplied input rather than a platform-wide upstream outage.
+func MarkCallerScopedFailure(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if tracker, ok := ctx.Value(callerScopedFailureKey{}).(*callerScopedFailureTracker); ok && tracker != nil {
+		tracker.callerScoped.Store(true)
+	}
+}

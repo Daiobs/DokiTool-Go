@@ -115,6 +115,7 @@ func (p *Parser) parseLegacy(parent context.Context, input string, save *tbvideo
 	}
 	post := field(field(decoded, "data"), "post")
 	if post == nil {
+		unified.MarkCallerScopedFailure(ctx)
 		return failure(500, "响应中缺少 data.post 字段"), nil
 	}
 	videos := unified.Array{}

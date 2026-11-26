@@ -486,22 +486,26 @@ func TestBilibiliUntrustedWireValidationDNSDedupAndQueueWait(t *testing.T) {
 		DURLQuality: 64,
 		DURLPieces: []bilibili.ShanghaiDURLPiece{{
 			URLs: []string{
-				"http://upos-sz-mirrorcos.bilivideo.com/1.mp4?deadline=1800007200",
-				"https://cn-zjhz-cu-01-01.bilivideo.com/cn-edge.mp4?deadline=1800007200",
-				"https://xy123.mcdn.bilivideo.com/mcdn.mp4?deadline=1800007200",
-				"https://bilivideo.com/apex.mp4?deadline=1800007200",
-				"https://evilbilivideo.com/spoof.mp4?deadline=1800007200",
-				"https://upos-expired.bilivideo.com/exp.mp4?deadline=1800000000",
-				"https://upos-private.bilivideo.com/priv.mp4?deadline=1800007200",
-				"https://upos-sz-mirrorcos.bilivideo.com/good1.mp4?deadline=1800007200",
+				"http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+				"https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+				"https://xy123.mcdn.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+				"https://evilbilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+				"https://upos-expired.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800000000",
+				"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/999/999-1-64.mp4?deadline=1800007200",
+				"https://upos-private.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+				"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
 			},
 		}},
 		DashVideo: []bilibili.ShanghaiDashTrack{
-			{ID: 80, CodecID: 7, Codecs: "avc1.640028", URLs: []string{"https://cn-zjhz-cu-01-01.bilivideo.com/cn-drop.m4s?deadline=1800007200", "https://upos-sz-mirrorcos.bilivideo.com/v80.m4s?deadline=1800007200"}},
-			{ID: 64, CodecID: 7, Codecs: "avc1.64001F", URLs: []string{"https://upos-sz-mirrorhw.bilivideo.com/v64.m4s?deadline=1800007200"}},
+			{ID: 80, CodecID: 7, Codecs: "avc1.640028", URLs: []string{
+				"https://cn-zjhz-cu-01-01.bilivideo.com/upgcxcode/12/34/101/101-1-30080.m4s?deadline=1800007200",
+				"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/999/999-1-30080.m4s?deadline=1800007200",
+				"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-30080.m4s?deadline=1800007200",
+			}},
+			{ID: 64, CodecID: 7, Codecs: "avc1.64001F", URLs: []string{"https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/12/34/101/101-1-30064.m4s?deadline=1800007200"}},
 		},
 		DashAudio: []bilibili.ShanghaiDashTrack{
-			{ID: 30280, Codecs: "mp4a.40.2", URLs: []string{"https://upos-sz-mirrorcos.bilivideo.com/a80.m4s?deadline=1800007200"}},
+			{ID: 30280, Codecs: "mp4a.40.2", URLs: []string{"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-30280.m4s?deadline=1800007200"}},
 		},
 	})
 	if err != nil {
@@ -512,26 +516,28 @@ func TestBilibiliUntrustedWireValidationDNSDedupAndQueueWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validateBilibiliResponse failed: %v", err)
 	}
-	// Exactly 3 distinct valid upos-* future-deadline hosts were queried in DNS:
+	// Exactly 3 distinct valid upos-* future-deadline CID-bound hosts were queried in DNS:
 	// upos-private.bilivideo.com, upos-sz-mirrorcos.bilivideo.com, upos-sz-mirrorhw.bilivideo.com
-	// (cn-* and mcdn.* are rejected before DNS).
+	// (cn-*, mcdn.*, non-upgcxcode, and wrong-CID URLs are rejected before DNS).
 	if dnsCalls.Load() != 3 {
 		t.Fatalf("expected deduplicated DNS lookups = 3, got %d", dnsCalls.Load())
 	}
-	if len(got.DURLPieces) != 1 || len(got.DURLPieces[0].URLs) != 1 || got.DURLPieces[0].URLs[0] != "https://upos-sz-mirrorcos.bilivideo.com/good1.mp4?deadline=1800007200" {
+	if len(got.DURLPieces) != 1 || len(got.DURLPieces[0].URLs) != 1 || got.DURLPieces[0].URLs[0] != "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200" {
 		t.Fatalf("unexpected validated DURL pieces: %+v", got.DURLPieces)
 	}
-	if len(got.DashVideo) != 2 || len(got.DashVideo[0].URLs) != 1 || got.DashVideo[0].URLs[0] != "https://upos-sz-mirrorcos.bilivideo.com/v80.m4s?deadline=1800007200" {
-		t.Fatalf("unexpected validated DashVideo (cn-* must be dropped): %+v", got.DashVideo)
+	if len(got.DashVideo) != 2 || len(got.DashVideo[0].URLs) != 1 || got.DashVideo[0].URLs[0] != "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-30080.m4s?deadline=1800007200" {
+		t.Fatalf("unexpected validated DashVideo (cn-* and wrong-CID must be dropped): %+v", got.DashVideo)
 	}
 
-	// Reject unknown fields, wrong BVID, wrong CID, all-expired URLs, or cn-*-only URLs.
+	// Reject unknown fields, wrong BVID, wrong CID, non-CID-bound UPOS path, all-expired URLs, or cn-*-only URLs.
 	badPayloads := [][]byte{
 		[]byte(`{"bvid":"BV1234567890","cid":101,"unknown":1}`),
-		[]byte(`{"bvid":"BV1999999999","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/1.mp4?deadline=1800007200"]}]}`),
-		[]byte(`{"bvid":"BV1234567890","cid":102,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/1.mp4?deadline=1800007200"]}]}`),
-		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/1.mp4?deadline=1799999999"]}]}`),
-		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://cn-sh-fx-01-01.bilivideo.com/1.mp4?deadline=1800007200"]}]}`),
+		[]byte(`{"bvid":"BV1999999999","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200"]}]}`),
+		[]byte(`{"bvid":"BV1234567890","cid":102,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/upgcxcode/12/34/102/102-1-64.mp4?deadline=1800007200"]}]}`),
+		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/good1.mp4?deadline=1800007200"]}]}`),
+		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/upgcxcode/99/88/999/999-1-64.mp4?deadline=1800007200"]}]}`),
+		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://upos-a.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1799999999"]}]}`),
+		[]byte(`{"bvid":"BV1234567890","cid":101,"durl_quality":64,"durl_pieces":[{"urls":["https://cn-sh-fx-01-01.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200"]}]}`),
 	}
 	for i, bad := range badPayloads {
 		if _, err := validator.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, bad); err == nil {

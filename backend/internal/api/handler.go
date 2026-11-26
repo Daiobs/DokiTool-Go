@@ -654,7 +654,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeResponse(w, res)
 		return
 	}
-	if h.cache == nil || h.cache.cfg.Disabled || !isCacheableRequestWithPolicy(platform, source, policySnap.Cache) {
+	parseSource := canonicalizeParseInput(platform, source)
+	if h.cache == nil || h.cache.cfg.Disabled || !isCacheableRequestWithPolicy(platform, parseSource, policySnap.Cache) {
 		h.stats.recordCacheUncacheable(channel)
 		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, h.now())
 		if !allowed {
@@ -665,9 +666,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), parseTimeout)
 		defer cancel()
-		res := h.runUncachedParse(ctx, path, platform, source, resolveItemID, debugView)
+		parseCtx, callerScopedFailure := unified.WithCallerScopedFailureTracker(ctx)
+		res := h.runUncachedParse(parseCtx, path, platform, parseSource, resolveItemID, debugView)
 		cbCode := res.code
-		if r.Context().Err() != nil {
+		if r.Context().Err() != nil || callerScopedFailure() {
 			cbCode = ""
 		}
 		h.cb.Finish(platform, cbCode, halfOpenGen, h.now())
@@ -678,11 +680,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := cacheKey{
 		route:    path,
 		platform: platform,
-		url:      normalizeCacheURL(platform, source),
+		url:      normalizeCacheURL(platform, parseSource),
 		itemID:   resolveItemID,
 		debug:    debugView,
 	}
-	h.serveCachedParse(w, r, key, path, platform, source, resolveItemID, debugView, channel, wallStart)
+	h.serveCachedParse(w, r, key, path, platform, parseSource, resolveItemID, debugView, channel, wallStart)
 }
 
 func (h *Handler) serveCachedParse(
@@ -819,6 +821,7 @@ func (h *Handler) runSingleflight(
 		hardExpiresAt time.Time
 		cacheable     bool
 		completed     bool
+		callerScoped  bool
 	)
 	defer func() {
 		if p := recover(); p != nil {
@@ -841,7 +844,7 @@ func (h *Handler) runSingleflight(
 		}
 		abandoned := call.abandoned
 		cbCode := res.code
-		if abandoned {
+		if abandoned || callerScoped {
 			cbCode = ""
 		}
 		h.cb.Finish(platform, cbCode, halfOpenGen, finishNow)
@@ -877,7 +880,9 @@ func (h *Handler) runSingleflight(
 		encOK   bool
 	)
 	parseCtx, shanghaiFallback := unified.WithShanghaiFallbackTracker(ctx)
+	parseCtx, isCallerScoped := unified.WithCallerScopedFailureTracker(parseCtx)
 	res, payload, encOK = h.executeParse(parseCtx, path, platform, source, itemID, debug, h.now())
+	callerScoped = isCallerScoped()
 	finishNow = h.now()
 	if encOK && payload != nil {
 		freshUntil, hardExpiresAt, cacheable = computeCacheDeadlines(platform, payload, finishNow, shanghaiFallback(), h.currentPolicySnapshot().Cache)
@@ -973,6 +978,9 @@ func (h *Handler) executeParse(
 		return errorResult(502, "内部解析接口平台不一致", "")
 	}
 	if h.publicMedia != nil {
+		if ctx.Err() != nil {
+			return errorResult(504, "上游解析超时，请稍后重试", actualPlatform)
+		}
 		targetPlatform := platform
 		if platform == PlatformGeneric {
 			targetPlatform = actualPlatform
@@ -994,6 +1002,9 @@ func (h *Handler) executeParse(
 		if unified.Str(unified.Map(payload["data"])["platform"]) != targetPlatform {
 			return errorResult(502, "内部解析接口平台不一致", actualPlatform)
 		}
+	}
+	if ctx.Err() != nil {
+		return errorResult(504, "上游解析超时，请稍后重试", actualPlatform)
 	}
 	payload = unified.PublicView(payload, debug, now)
 	if path == "/api/resolve" {

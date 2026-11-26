@@ -296,3 +296,57 @@ func TestKuaishouHTTPResolveMissingItem(t *testing.T) {
 		}
 	}
 }
+
+type nv05ExecFunc func(context.Context, fetch.Request) (fetch.Response, error)
+
+func (f nv05ExecFunc) Do(ctx context.Context, req fetch.Request) (fetch.Response, error) {
+	return f(ctx, req)
+}
+
+func TestKuaishouFragmentAndDefaultPortDoNotPoisonSharedParseCache(t *testing.T) {
+	cat := loadCacheTestCatalog(t)
+	const validInitHTML = `<html><script>window.INIT_STATE={"tusjoh1":{"photo":{"caption":"synthetic ok","coverUrls":[{"url":"https://tx2.a.kwimgs.com/cover.jpg"}],"mainMvUrls":[{"url":"https://txmov2.a.kwimgs.com/video.mp4"}],"width":720,"height":1280}}};</script></html>`
+	const desktopApolloHTML = `<html><script>window.__APOLLO_STATE__={"defaultClient":{"VisionVideoDetailPhoto:3xsynthetic7":{"caption":"apollo","photoUrl":"https://txmov2.a.kwimgs.com/video.mp4","coverUrl":"https://tx2.a.kwimgs.com/cover.jpg"}}};</script></html>`
+
+	var requestedURLs []string
+	exec := nv05ExecFunc(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+		requestedURLs = append(requestedURLs, req.URL)
+		if strings.HasPrefix(req.URL, "https://c.kuaishou.com/fw/photo/3xsynthetic7") {
+			return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(validInitHTML)}, nil
+		}
+		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(desktopApolloHTML)}, nil
+	})
+
+	now := time.Unix(1793361600, 0).UTC()
+	h, err := New(cat, map[string]Adapter{"kuaishou": kuaishou.New(exec)}, func() time.Time { return now }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Request with #fragment must canonicalize before Kuaishou rewrite & never poison parseCache (NV-05).
+	reqFrag := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://www.kuaishou.com/short-video/3xsynthetic7#testfrag"), nil)
+	wFrag := httptest.NewRecorder()
+	h.ServeHTTP(wFrag, reqFrag)
+	if wFrag.Code != http.StatusOK {
+		t.Fatalf("fragment request failed: HTTP %d body=%s", wFrag.Code, wFrag.Body.String())
+	}
+	if strings.Contains(wFrag.Body.String(), "#testfrag") {
+		t.Fatalf("cached payload leaked unkeyed #fragment into response: %s", wFrag.Body.String())
+	}
+	if len(requestedURLs) == 0 || !strings.HasPrefix(requestedURLs[0], "https://c.kuaishou.com/fw/photo/3xsynthetic7") {
+		t.Fatalf("expected canonical rewrite to c.kuaishou.com, got requestedURLs=%v", requestedURLs)
+	}
+
+	// 2. Canonical request and explicit :443 variant must both hit warm 200 OK cache (zero 404 poisoning).
+	for _, raw := range []string{
+		"https://www.kuaishou.com/short-video/3xsynthetic7",
+		"https://www.kuaishou.com:443/short-video/3xsynthetic7",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape(raw), nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || w.Header().Get("X-DokiTool-Cache") != "hit" {
+			t.Fatalf("expected warm 200 cache hit for %q, got HTTP %d cache=%q", raw, w.Code, w.Header().Get("X-DokiTool-Cache"))
+		}
+	}
+}

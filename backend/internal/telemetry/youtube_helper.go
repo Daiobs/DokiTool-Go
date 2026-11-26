@@ -2,6 +2,11 @@
 // shared across backend subsystem boundaries without reverse package imports.
 package telemetry
 
+// YouTubeHelperMaxChallengeCacheEntries is the single source of truth for the
+// deterministic YouTube helper solver LRU entry capacity, shared by
+// internal/platform/youtube and cmd/genstatstypes.
+const YouTubeHelperMaxChallengeCacheEntries = 4096
+
 // YouTubeHelperStats exposes strictly redacted, closed-vocabulary telemetry for
 // GET /api/stats (zero URLs, IPs, error messages, tokens, or local paths).
 type YouTubeHelperStats struct {

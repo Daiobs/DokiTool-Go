@@ -232,3 +232,78 @@ func TestMediaRelayMaxLengthRejectedBeforeBody(t *testing.T) {
 		t.Fatalf("oversize media not rejected: %d %s", w.Code, w.Body.String())
 	}
 }
+
+func TestMediaRelayStalledDownstreamReaderReleasesSlotAtWatchdog(t *testing.T) {
+	relay, path := relayFixture(t)
+	relay.rollingWindow = 120 * time.Millisecond
+	relay.rollingMinBytes = 30 * 1024
+	relay.writeBudget = 10 * time.Second
+
+	// Stream a 32 MiB synthetic MP4 (exceeds loopback TCP buffers) so the server
+	// blocks inside ResponseWriter.Write once the client stops reading.
+	const totalBytes = 32 << 20
+	var upstreamCanceled int32
+	relay.open = func(ctx context.Context, _ string, _ netip.Addr, _ string) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			defer pw.Close()
+			header := []byte("\x00\x00\x00\x0cftypisom")
+			if _, err := pw.Write(header); err != nil {
+				return
+			}
+			chunk := make([]byte, 32*1024)
+			for rem := totalBytes - len(header); rem > 0; {
+				select {
+				case <-ctx.Done():
+					upstreamCanceled = 1
+					_ = pw.CloseWithError(ctx.Err())
+					return
+				default:
+				}
+				n := len(chunk)
+				if rem < n {
+					n = rem
+				}
+				if _, err := pw.Write(chunk[:n]); err != nil {
+					return
+				}
+				rem -= n
+			}
+		}()
+		h := make(http.Header)
+		h.Set("Content-Type", "video/mp4")
+		h.Set("Content-Length", strconv.Itoa(totalBytes))
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: pr}, nil
+	}
+
+	handlerDone := make(chan time.Duration, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		relay.ServeHTTP(w, r)
+		handlerDone <- time.Since(start)
+	}))
+	defer srv.Close()
+
+	// Client reads headers then pauses without draining body (stalled downstream reader).
+	resp, err := srv.Client().Get(srv.URL + path)
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	select {
+	case elapsed := <-handlerDone:
+		if elapsed >= 3*time.Second {
+			t.Fatalf("handler held relay slot too long (%v); expected watchdog abort well below writeBudget", elapsed)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("handler stayed blocked in stalled ResponseWriter.Write past watchdog (NV-02)")
+	}
+	if len(relay.slots) != 0 {
+		t.Fatalf("expected all relay slots released, still occupied: %d", len(relay.slots))
+	}
+	_ = upstreamCanceled
+}

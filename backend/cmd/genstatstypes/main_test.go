@@ -24,6 +24,9 @@ func TestGeneratedStatsTypesUpToDate(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("%s is out of date with Go api.StatsSnapshot; run `(cd backend && go run ./cmd/genstatstypes)`", target)
 	}
+	if !strings.Contains(string(got), "export const YOUTUBE_HELPER_CHALLENGE_LRU_CAPACITY = 4096;") {
+		t.Fatalf("generated TS missing YOUTUBE_HELPER_CHALLENGE_LRU_CAPACITY constant")
+	}
 }
 
 func TestRenderTypeProjectsJSONTagsAndQuotedKeys(t *testing.T) {

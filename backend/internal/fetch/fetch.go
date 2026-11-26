@@ -459,6 +459,7 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 			if (response.StatusCode == 301 || response.StatusCode == 302 || response.StatusCode == 303) && method != http.MethodHead {
 				method, body = http.MethodGet, nil
 				headers.Del("Content-Type")
+				headers.Del("Content-Length")
 			}
 			current = next.String()
 			history = append(history, current)

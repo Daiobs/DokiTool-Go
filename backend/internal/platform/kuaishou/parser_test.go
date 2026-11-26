@@ -623,3 +623,14 @@ func TestPreparePublicMarksKuaishouCDNSources(t *testing.T) {
 		t.Fatal("non-kuaishou payload changed")
 	}
 }
+
+func TestContentIDStopsAtFragment(t *testing.T) {
+	kind, id := contentID("https://www.kuaishou.com/short-video/3xsynthetic7#testfrag")
+	if kind != "short-video" || id != "3xsynthetic7" {
+		t.Fatalf("contentID with fragment = (%q, %q), want (short-video, 3xsynthetic7)", kind, id)
+	}
+	kind, id = contentID("https://c.kuaishou.com/fw/photo/3xsynthetic7?a=1#frag")
+	if kind != "fw-photo" || id != "3xsynthetic7" {
+		t.Fatalf("contentID with query+fragment = (%q, %q), want (fw-photo, 3xsynthetic7)", kind, id)
+	}
+}

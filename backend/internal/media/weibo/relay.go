@@ -17,27 +17,56 @@ import (
 )
 
 const (
-	mediaBudget      = 300 * time.Second
-	mediaWriteBudget = 310 * time.Second
-	mediaSlots       = 12
+	mediaBudget            = 300 * time.Second
+	mediaWriteBudget       = 310 * time.Second
+	mediaSlots             = 12
+	defaultRollingWindow   = 30 * time.Second
+	defaultRollingMinBytes = 30 * 1024
 )
 
 // MediaRelay implements the existing PHP binary response boundary, not the
 // unified JSON API and not a general-purpose URL proxy. The only outbound
 // target is the exact CDN host authenticated by the PHP-compatible ticket.
 type MediaRelay struct {
-	key    string
-	now    func() time.Time
-	lookup DNSLookup
-	open   func(context.Context, string, netip.Addr, string) (*http.Response, error)
-	slots  chan struct{}
+	key             string
+	now             func() time.Time
+	lookup          DNSLookup
+	open            func(context.Context, string, netip.Addr, string) (*http.Response, error)
+	slots           chan struct{}
+	writeBudget     time.Duration
+	rollingWindow   time.Duration
+	rollingMinBytes int64
 }
 
 func NewMediaRelay(key string) *MediaRelay {
 	return &MediaRelay{
 		key: key, now: time.Now, lookup: defaultDNS,
 		open: fetch.OpenWeiboMedia, slots: make(chan struct{}, mediaSlots),
+		writeBudget:     mediaWriteBudget,
+		rollingWindow:   defaultRollingWindow,
+		rollingMinBytes: defaultRollingMinBytes,
 	}
+}
+
+func (m *MediaRelay) effectiveWriteBudget() time.Duration {
+	if m != nil && m.writeBudget > 0 {
+		return m.writeBudget
+	}
+	return mediaWriteBudget
+}
+
+func (m *MediaRelay) effectiveRollingWindow() time.Duration {
+	if m != nil && m.rollingWindow > 0 {
+		return m.rollingWindow
+	}
+	return defaultRollingWindow
+}
+
+func (m *MediaRelay) effectiveRollingMinBytes() int64 {
+	if m != nil && m.rollingMinBytes > 0 {
+		return m.rollingMinBytes
+	}
+	return defaultRollingMinBytes
 }
 
 func mediaError(w http.ResponseWriter, method string, status int, message string) {
@@ -86,7 +115,10 @@ func publishMedia(w http.ResponseWriter, status int, headers http.Header) {
 	w.WriteHeader(status)
 }
 
-type mediaFlusher struct{ target http.ResponseWriter }
+type mediaFlusher struct {
+	target http.ResponseWriter
+	bytes  *atomic.Int64
+}
 
 func (f mediaFlusher) Write(bytes []byte) (int, error) {
 	n, err := f.target.Write(bytes)
@@ -94,49 +126,64 @@ func (f mediaFlusher) Write(bytes []byte) (int, error) {
 		if flush, ok := f.target.(http.Flusher); ok {
 			flush.Flush()
 		}
+		if f.bytes != nil {
+			f.bytes.Add(int64(n))
+		}
 	}
 	return n, err
 }
 
-type measuredReader struct {
-	reader io.Reader
-	bytes  *atomic.Int64
-}
-
-func (r measuredReader) Read(output []byte) (int, error) {
-	n, err := r.reader.Read(output)
-	r.bytes.Add(int64(n))
-	return n, err
-}
-
-// copyLimited bounds memory, duration and the 30-second rolling download
+// copyLimited bounds memory, duration and the rolling downstream transfer
 // minimum. The caller has already verified headers and the optional ftyp
-// prefix; if a later read fails, it MUST NOT append a JSON error to media.
-func copyLimited(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, body io.Reader, remaining int64) error {
+// prefix; if a later read/write fails, it MUST NOT append a JSON error to media.
+func copyLimited(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	w http.ResponseWriter,
+	body io.Reader,
+	remaining int64,
+	window time.Duration,
+	minBytes int64,
+) error {
 	if remaining == 0 {
 		return nil
 	}
-	var received atomic.Int64
+	if window <= 0 {
+		window = defaultRollingWindow
+	}
+	if minBytes <= 0 {
+		minBytes = defaultRollingMinBytes
+	}
+	var written atomic.Int64
 	complete := make(chan struct{})
+	watchdogDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		defer close(watchdogDone)
+		ticker := time.NewTicker(window)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if received.Swap(0) < 30*1024 {
+				if written.Swap(0) < minBytes {
 					cancel()
+					// Interrupt a blocked downstream ResponseWriter.Write so stalled
+					// readers cannot hold global relay slots until mediaWriteBudget.
+					_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
 					return
 				}
 			case <-complete:
 				return
 			case <-ctx.Done():
+				_ = http.NewResponseController(w).SetWriteDeadline(time.Now())
 				return
 			}
 		}
 	}()
-	defer close(complete)
-	_, err := io.CopyN(mediaFlusher{target: w}, measuredReader{reader: body, bytes: &received}, remaining)
+	defer func() {
+		close(complete)
+		<-watchdogDone
+	}()
+	_, err := io.CopyN(mediaFlusher{target: w, bytes: &written}, body, remaining)
 	return err
 }
 
@@ -177,7 +224,7 @@ func (m *MediaRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		mediaError(w, r.Method, int(status), unified.Str(prepared["message"]))
 		return
 	}
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(mediaWriteBudget)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(m.effectiveWriteBudget())); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		mediaError(w, r.Method, 503, "微博媒体服务暂不可用，请稍后重试")
 		return
 	}
@@ -277,5 +324,5 @@ func (m *MediaRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// After headers or media bytes have been committed, return silently on
 	// incomplete upstream data. Appending JSON would corrupt the saved file.
-	_ = copyLimited(ctx, cancel, w, response.Body, length)
+	_ = copyLimited(ctx, cancel, w, response.Body, length, m.effectiveRollingWindow(), m.effectiveRollingMinBytes())
 }

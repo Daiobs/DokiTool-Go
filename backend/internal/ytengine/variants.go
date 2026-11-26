@@ -208,6 +208,14 @@ func classifyEntryFormats(entry *Info, opts AdaptOptions) classifiedFormats {
 
 	sortFormats(out.mp4)
 	sortDASHVideoFormats(out.dashVideo)
+	if len(out.dashAudio) > maxAdaptedFormatsPerBucket {
+		sortAudioFormats(out.dashAudio)
+		out.dashAudio = out.dashAudio[:maxAdaptedFormatsPerBucket]
+	}
+	if len(out.hlsVideo) > maxAdaptedFormatsPerBucket {
+		sortFormats(out.hlsVideo)
+		out.hlsVideo = out.hlsVideo[:maxAdaptedFormatsPerBucket]
+	}
 	sortAudioFormats(out.dashAudio)
 	sortFormats(out.hlsVideo)
 	sortAudioFormats(out.hlsAudio)
@@ -1202,11 +1210,21 @@ func sortAudioFormats(formats []Format) {
 	})
 }
 
+const (
+	// maxAdaptedFormatsPerBucket caps emitted formats per classification bucket
+	// (progressive MP4, DASH video, DASH audio, HLS) so adversarial <=16 MiB
+	// yt-dlp -J responses cannot fan out into thousands of variants.
+	maxAdaptedFormatsPerBucket = 64
+)
+
 func deduplicateProgressiveFormats(formats []Format) []Format {
-	out := make([]Format, 0, len(formats))
+	out := make([]Format, 0, min(len(formats), maxAdaptedFormatsPerBucket))
 	seenRes := make(map[string]bool)
 	seenURL := make(map[string]bool)
 	for _, f := range formats {
+		if len(out) >= maxAdaptedFormatsPerBucket {
+			break
+		}
 		if seenURL[f.URL] {
 			continue
 		}
@@ -1225,10 +1243,13 @@ func deduplicateProgressiveFormats(formats []Format) []Format {
 }
 
 func deduplicateDASHVideoFormats(formats []Format) []Format {
-	out := make([]Format, 0, len(formats))
+	out := make([]Format, 0, min(len(formats), maxAdaptedFormatsPerBucket))
 	seenTier := make(map[string]bool)
 	seenURL := make(map[string]bool)
 	for _, f := range formats {
+		if len(out) >= maxAdaptedFormatsPerBucket {
+			break
+		}
 		if seenURL[f.URL] {
 			continue
 		}

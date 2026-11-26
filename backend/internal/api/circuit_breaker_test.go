@@ -605,3 +605,70 @@ func TestGenericCircuitBreakerSnapshotIsolation(t *testing.T) {
 		t.Fatalf("unexpected disabled GenericCircuitBreaker: %+v", snapDisabled.GenericCircuitBreaker)
 	}
 }
+
+func TestCircuitBreakerIgnoresCallerScopedFailures(t *testing.T) {
+	baseNow := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	cat := loadCacheTestCatalog(t)
+
+	var mode atomic.Int32 // 0 = caller-scoped 502, 1 = real upstream 502, 2 = 200 OK
+	adapter := AdapterFunc(func(ctx context.Context, source string, now int64) (unified.Object, error) {
+		switch mode.Load() {
+		case 0:
+			unified.MarkCallerScopedFailure(ctx)
+			return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "nxdomain share host", false), nil
+		case 1:
+			return unified.ContractError("UPSTREAM_UNAVAILABLE", "real upstream outage", true), nil
+		default:
+			exp := baseNow.Add(10 * time.Minute).Format(time.RFC3339)
+			return makeSyntheticEnvelope("pipixia", source, now, exp), nil
+		}
+	})
+
+	h, err := New(cat, map[string]Adapter{"pipixia": adapter}, func() time.Time { return baseNow }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := DefaultRuntimeConfig()
+	rt.CircuitBreaker.ConsecutiveFailures = 3
+	if !ApplyRuntimeConfig(nil, h, rt, true, false) {
+		t.Fatal("ApplyRuntimeConfig failed")
+	}
+
+	// 1. Five caller-scoped failures on distinct uncached URLs MUST NOT open the breaker (NV-01).
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://nx"+string(rune('a'+i))+".pipix.com/s/1"), nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("caller-scoped call %d: got HTTP %d, want 502", i, w.Code)
+		}
+	}
+	for _, snap := range h.Stats().Snapshot().CircuitBreakers {
+		if snap.Platform == "pipixia" && (snap.State != CircuitStateClosed || snap.ConsecutiveFailures != 0) {
+			t.Fatalf("caller-scoped failures tripped pipixia breaker: %+v", snap)
+		}
+	}
+
+	// 2. Subsequent healthy request succeeds immediately without 503.
+	mode.Store(2)
+	reqOK := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://h5.pipix.com/ppx/item/123456"), nil)
+	wOK := httptest.NewRecorder()
+	h.ServeHTTP(wOK, reqOK)
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected healthy request to succeed after caller-scoped failures, got HTTP %d: %s", wOK.Code, wOK.Body.String())
+	}
+
+	// 3. Real upstream outages (unmarked) MUST still trip the breaker after 3 failures.
+	mode.Store(1)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://h5.pipix.com/ppx/item/99900"+string(rune('1'+i))), nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+	}
+	reqBlocked := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape("https://h5.pipix.com/ppx/item/888888"), nil)
+	wBlocked := httptest.NewRecorder()
+	h.ServeHTTP(wBlocked, reqBlocked)
+	if wBlocked.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected real upstream outages to open breaker (503), got HTTP %d", wBlocked.Code)
+	}
+}

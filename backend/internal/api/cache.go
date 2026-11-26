@@ -444,6 +444,50 @@ func (c *parseCache) configSnapshot() (enabled bool, entries int, totalBytes int
 	return !c.cfg.Disabled, c.lru.Len(), c.totalBytes, c.cfg.MaxEntries, c.cfg.MaxBytes
 }
 
+// canonicalizeParseInput strips unkeyed URL fragments and standard default
+// HTTP/HTTPS ports (:80/:443) — and canonicalizes Instagram extra path segments
+// — before dispatching source to platform adapters so cache keys and parser
+// inputs stay aligned without shrinking overlong strictInput2048 URLs.
+func canonicalizeParseInput(platform, source string) string {
+	if traitsForPlatform(platform).strictInput2048 && len(source) > maxYTDLPInputBytes {
+		return source
+	}
+	u, err := url.Parse(source)
+	if err != nil || u.Host == "" || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
+		return source
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	escapedPath := u.EscapedPath()
+	if platform == "instagram" && (scheme == "http" || scheme == "https") && port == "" {
+		if s, h, p, ok := normalizeInstagramCacheURL(source); ok {
+			scheme, host, escapedPath = s, h, p
+		}
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	var b strings.Builder
+	b.Grow(len(source) + 8)
+	b.WriteString(scheme)
+	b.WriteString("://")
+	b.WriteString(host)
+	if port != "" {
+		b.WriteByte(':')
+		b.WriteString(port)
+	}
+	b.WriteString(escapedPath)
+	if u.ForceQuery || u.RawQuery != "" {
+		b.WriteByte('?')
+		b.WriteString(u.RawQuery)
+	}
+	return b.String()
+}
+
 // normalizeCacheURL canonicalizes HTTP-equivalent URL syntax and known domain
 // aliases without reordering or stripping query parameters (preserving ?p=N,
 // duplicate query precedence, xsec_token, modal_id, and path selectors).

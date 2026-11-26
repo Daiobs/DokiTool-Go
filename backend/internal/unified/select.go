@@ -142,36 +142,106 @@ func VariantVideoMetadata(variant Object) Object {
 	return out
 }
 
-// QualityCompare reports spatial dominance; comparable=false is PHP's null.
-// No codec, bitrate, label or original-endpoint claim creates higher quality.
-func QualityCompare(left, right Object) (comparison int, comparable bool) {
-	a, b := VariantVideoMetadata(left), VariantVideoMetadata(right)
-	aw, awOK := Numeric(a["width"])
-	ah, ahOK := Numeric(a["height"])
-	bw, bwOK := Numeric(b["width"])
-	bh, bhOK := Numeric(b["height"])
-	if !awOK || !ahOK || !bwOK || !bhOK || aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0 {
+type variantGeometry struct {
+	known      bool
+	shortEdge  float64
+	longEdge   float64
+	ratio      float64
+	hasDimPair bool
+	isOriginal bool
+	id         string
+}
+
+func resolveGeometryField(metadata, facts Object, isMux bool, field string) any {
+	if nonNullField(Map(metadata["field_conflicts"]), field) {
+		return nil
+	}
+	if isMux {
+		if nonNullField(Map(facts["field_conflicts"]), field) {
+			return nil
+		}
+		if nonNullField(metadata, field) && nonNullField(facts, field) && !Equal(metadata[field], facts[field]) {
+			return nil
+		}
+		if val, exists := metadata[field]; exists {
+			return val
+		}
+		return facts[field]
+	}
+	return metadata[field]
+}
+
+// extractVariantGeometry reads spatial geometry and tie-break keys without
+// cloning metadata maps, preserving exact VariantVideoMetadata conflict rules.
+func extractVariantGeometry(variant Object) variantGeometry {
+	metadata := Map(variant["metadata"])
+	delivery := Map(variant["delivery"])
+	var facts Object
+	isMux := false
+	if Str(delivery["kind"]) == "mux" {
+		for _, value := range Slice(delivery["resources"]) {
+			resource := Map(value)
+			if Str(resource["role"]) == "video" {
+				facts = Map(resource["metadata"])
+				isMux = true
+				break
+			}
+		}
+	}
+	wVal := resolveGeometryField(metadata, facts, isMux, "width")
+	hVal := resolveGeometryField(metadata, facts, isMux, "height")
+	g := variantGeometry{
+		hasDimPair: wVal != nil && hVal != nil,
+		isOriginal: Str(variant["provenance"]) == "original_endpoint",
+		id:         Str(variant["id"]),
+	}
+	w, wOK := Numeric(wVal)
+	h, hOK := Numeric(hVal)
+	if wOK && hOK && w > 0 && h > 0 {
+		if w > h {
+			w, h = h, w
+		}
+		g.known = true
+		g.shortEdge = w
+		g.longEdge = h
+		g.ratio = h / w
+	}
+	return g
+}
+
+func compareGeometry(a, b variantGeometry) (int, bool) {
+	if !a.known || !b.known {
 		return 0, false
 	}
-	if aw > ah {
-		aw, ah = ah, aw
-	}
-	if bw > bh {
-		bw, bh = bh, bw
-	}
-	if math.Abs((ah/aw)/(bh/bw)-1) > 0.01 {
+	if math.Abs(a.ratio/b.ratio-1) > 0.01 {
 		return 0, false
 	}
-	if aw == bw && ah == bh {
+	if a.shortEdge == b.shortEdge && a.longEdge == b.longEdge {
 		return 0, true
 	}
-	if aw >= bw && ah >= bh {
+	if a.shortEdge >= b.shortEdge && a.longEdge >= b.longEdge {
 		return 1, true
 	}
-	if aw <= bw && ah <= bh {
+	if a.shortEdge <= b.shortEdge && a.longEdge <= b.longEdge {
 		return -1, true
 	}
 	return 0, false
+}
+
+func geometryBefore(a, b variantGeometry) bool {
+	if a.hasDimPair != b.hasDimPair {
+		return a.hasDimPair
+	}
+	if a.isOriginal != b.isOriginal {
+		return a.isOriginal
+	}
+	return comparePHPID(a.id, b.id) < 0
+}
+
+// QualityCompare reports spatial dominance; comparable=false is PHP's null.
+// No codec, bitrate, label or original-endpoint claim creates higher quality.
+func QualityCompare(left, right Object) (comparison int, comparable bool) {
+	return compareGeometry(extractVariantGeometry(left), extractVariantGeometry(right))
 }
 
 func readyState(object Object) bool {
@@ -179,18 +249,7 @@ func readyState(object Object) bool {
 }
 
 func variantBefore(a, b Object) bool {
-	am, bm := VariantVideoMetadata(a), VariantVideoMetadata(b)
-	aKnown := nonNullField(am, "width") && nonNullField(am, "height")
-	bKnown := nonNullField(bm, "width") && nonNullField(bm, "height")
-	if aKnown != bKnown {
-		return aKnown
-	}
-	aOriginal := Str(a["provenance"]) == "original_endpoint"
-	bOriginal := Str(b["provenance"]) == "original_endpoint"
-	if aOriginal != bOriginal {
-		return aOriginal
-	}
-	return comparePHPID(Str(a["id"]), Str(b["id"])) < 0
+	return geometryBefore(extractVariantGeometry(a), extractVariantGeometry(b))
 }
 
 var numericID = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
@@ -371,22 +430,37 @@ func SelectDefaultForPlatform(platform string, input Object, now int64) Object {
 		}
 	}
 	eligible := defaultEligibleFiles(platform, Str(item["type"]), usableFiles)
-	highest := make([]Object, 0)
-	for _, v := range eligible {
+	geoms := make([]variantGeometry, len(eligible))
+	knownIndices := make([]int, 0, len(eligible))
+	for i, v := range eligible {
+		geoms[i] = extractVariantGeometry(v)
+		if geoms[i].known {
+			knownIndices = append(knownIndices, i)
+		}
+	}
+	type rankedCandidate struct {
+		variant Object
+		geom    variantGeometry
+	}
+	highest := make([]rankedCandidate, 0, len(eligible))
+	for i, v := range eligible {
 		dominated := false
-		for _, other := range eligible {
-			if cmp, comparable := QualityCompare(other, v); comparable && cmp == 1 {
-				dominated = true
-				break
+		if geoms[i].known {
+			for _, j := range knownIndices {
+				if cmp, comparable := compareGeometry(geoms[j], geoms[i]); comparable && cmp == 1 {
+					dominated = true
+					break
+				}
 			}
 		}
 		if !dominated {
-			highest = append(highest, v)
+			highest = append(highest, rankedCandidate{variant: v, geom: geoms[i]})
 		}
 	}
-	sort.SliceStable(highest, func(i, j int) bool { return variantBefore(highest[i], highest[j]) })
+	sort.SliceStable(highest, func(i, j int) bool { return geometryBefore(highest[i].geom, highest[j].geom) })
 	if len(highest) > 0 {
-		selected := highest[0]
+		selected := highest[0].variant
+		selectedGeom := highest[0].geom
 		for _, value := range Slice(Map(selected["delivery"])["sources"]) {
 			source := Map(value)
 			if !SourceUsable(source, now) {
@@ -402,13 +476,15 @@ func SelectDefaultForPlatform(platform string, input Object, now int64) Object {
 			break
 		}
 		higher := Array{}
-		for _, value := range variants {
-			v := Map(value)
-			if cmp, comparable := QualityCompare(v, selected); !comparable || cmp != 1 || !DeliveryUsable(Map(v["delivery"]), now) {
-				continue
-			}
-			if required := DeliveryRequires(Map(v["delivery"])); len(required) > 0 {
-				higher = append(higher, Object{"variant_id": v["id"], "requires": Slice(required)})
+		if selectedGeom.known {
+			for _, value := range variants {
+				v := Map(value)
+				if cmp, comparable := compareGeometry(extractVariantGeometry(v), selectedGeom); !comparable || cmp != 1 || !DeliveryUsable(Map(v["delivery"]), now) {
+					continue
+				}
+				if required := DeliveryRequires(Map(v["delivery"])); len(required) > 0 {
+					higher = append(higher, Object{"variant_id": v["id"], "requires": Slice(required)})
+				}
 			}
 		}
 		if len(higher) > 0 {
