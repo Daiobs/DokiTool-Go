@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -1596,5 +1597,81 @@ test("Issue #48 Batch 1: [P1-2] clientSplitMux auto-upgrade, [P1-4]/[P0-1] unifi
     videoFilenameMod.buildMediaFilename({ title: "我的MVP1", index: 1, total: 3, fallback: "bili_3", extension: "mp4" }),
     "我的MVP1_P1.mp4",
     "must not strip non-boundary P1 suffix inside word",
+  );
+});
+
+test("Architecture Boundary Gate: static import direction & planning host-purity negative checks", () => {
+  const withTempFrontend = (files, fn) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dokitool-arch-gate-"));
+    try {
+      const writeRel = (rel, content) => {
+        const abs = path.join(tmpRoot, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, content, "utf8");
+      };
+      writeRel("src/style.css", "@media (forced-colors: active) { .btn { border: 1px solid ButtonText; } }\n");
+      writeRel("src/assets/design-system.css", "@media (forced-colors: active) { .ux-btn-primary { border: 1px solid ButtonText; } }\n");
+      for (const [rel, content] of Object.entries(files)) {
+        writeRel(rel, content);
+      }
+      fn(tmpRoot);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  };
+
+  // 1) Clean fixture (including commented-out forbidden import) must pass cleanly
+  withTempFrontend(
+    {
+      "src/extension/planning/cleanPlan.ts":
+        "// import { x } from \"../opfsStreamTransfer\";\nexport const ok = 1;\n",
+      "src/extension/bg/cleanBg.ts":
+        "// import { buildEnqueueItemsForMedia } from \"../extensionDownload\";\nimport { ok } from \"../planning/cleanPlan\";\nexport const v = ok;\n",
+    },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, true, `unexpected violations: ${res.violations.join("\n")}`);
+      assert.equal(res.importDirectionFilesChecked, 2);
+    },
+  );
+
+  // 2) bg/** -> ../extensionDownload (static & dynamic) must fail
+  withTempFrontend(
+    {
+      "src/extension/bg/badStatic.ts":
+        "import { buildEnqueueItemsForMedia } from \"../extensionDownload\";\nexport const fn = buildEnqueueItemsForMedia;\n",
+      "src/extension/bg/badDynamic.ts":
+        "export async function load() { return import(\"../extensionDownload\"); }\n",
+    },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, false);
+      assert.ok(res.violations.some((v) => v.includes("[import-direction]") && v.includes("badStatic.ts")));
+      assert.ok(res.violations.some((v) => v.includes("[import-direction]") && v.includes("badDynamic.ts")));
+    },
+  );
+
+  // 3) planning/** -> opfsStreamTransfer / jszip / bg/** / host side-effect globals must fail
+  withTempFrontend(
+    {
+      "src/extension/planning/badOpfs.ts":
+        "import { whitelistedFetch } from \"../opfsStreamTransfer\";\nexport const f = whitelistedFetch;\n",
+      "src/extension/planning/badZip.ts":
+        "import JSZip from \"jszip\";\nexport const z = JSZip;\n",
+      "src/extension/planning/badBg.ts":
+        "export { createSpecRefresher } from \"../bg/specRefresher\";\n",
+      "src/extension/planning/badHost.ts":
+        "export function peek() { return [chrome.runtime, navigator.storage, navigator.locks]; }\n",
+    },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, false);
+      assert.ok(res.violations.some((v) => v.includes("[import-direction]") && v.includes("badOpfs.ts")));
+      assert.ok(res.violations.some((v) => v.includes("[import-direction]") && v.includes("badZip.ts")));
+      assert.ok(res.violations.some((v) => v.includes("[import-direction]") && v.includes("badBg.ts")));
+      assert.ok(res.violations.some((v) => v.includes("[planning-host-side-effect]") && v.includes("chrome-api")));
+      assert.ok(res.violations.some((v) => v.includes("[planning-host-side-effect]") && v.includes("navigator-storage")));
+      assert.ok(res.violations.some((v) => v.includes("[planning-host-side-effect]") && v.includes("navigator-locks")));
+    },
   );
 });

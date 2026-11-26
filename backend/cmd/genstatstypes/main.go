@@ -17,9 +17,6 @@ import (
 	"strings"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
 var validTSIdent = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
@@ -35,19 +32,10 @@ type extraField struct {
 	optional bool
 }
 
-// tsTypeNames maps cross-package Go struct types to their canonical frontend
-// TypeScript interface names so frontend consumers keep stable identifiers.
+// tsTypeNames maps API DTO Go struct types whose Go identifier differs from
+// their canonical frontend TypeScript interface name so consumers stay stable.
 var tsTypeNames = map[reflect.Type]string{
-	reflect.TypeOf(ytengine.HistogramBuckets{}):         "HistogramBuckets",
-	reflect.TypeOf(ytengine.HistogramSnapshot{}):        "HistogramSnapshot",
-	reflect.TypeOf(ytengine.ChannelSlotStatsSnapshot{}): "ChannelSlotStatsSnapshot",
-	reflect.TypeOf(ytengine.SlotChannelBreakdown{}):     "YTDLPChannelBreakdown",
-	reflect.TypeOf(ytengine.SlotStatsSnapshot{}):        "YTDLPStatsSnapshot",
-	reflect.TypeOf(youtube.HelperStatsSnapshot{}):       "YouTubeHelperStatsSnapshot",
-	reflect.TypeOf(shresolver.ChannelStatsSnapshot{}):   "ShanghaiChannelStats",
-	reflect.TypeOf(shresolver.ChannelBreakdown{}):       "ShanghaiChannelBreakdown",
-	reflect.TypeOf(shresolver.PlatformBreakdown{}):      "ShanghaiPlatformBreakdown",
-	reflect.TypeOf(shresolver.StatsSnapshot{}):          "ShanghaiStatsSnapshot",
+	reflect.TypeOf(api.YTDLPSlotStatsSnapshot{}): "YTDLPStatsSnapshot",
 }
 
 // fieldOverrides preserves narrow TypeScript union types and rolling-upgrade

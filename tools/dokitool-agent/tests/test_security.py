@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
 import socket
 import sys
@@ -17,6 +18,19 @@ if str(AGENT_DIR) not in sys.path:
 
 import http_transport  # noqa: E402
 import security  # noqa: E402
+
+
+_PROXY_ENV_KEYS = (
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+)
+
+
+def _clean_proxy_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _PROXY_ENV_KEYS}
+    if overrides:
+        env.update(overrides)
+    return env
 
 
 def _fake_public_resolver(host: str, port: int, family: int = 0, socktype: int = 0):
@@ -133,31 +147,16 @@ class SecurityTests(unittest.TestCase):
 
     def test_ssrf_rejects_private_loopback_metadata_and_bad_schemes(self) -> None:
         forbidden_urls = [
-            "http://127.0.0.1/sub.vtt",
-            "https://127.0.0.2:443/sub.vtt",
-            "http://[::1]/sub.vtt",
-            "http://[::ffff:127.0.0.1]/sub.vtt",
-            "http://10.0.0.1/sub.vtt",
-            "https://172.16.0.1/sub.vtt",
-            "https://192.168.1.5/sub.vtt",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://[fe80::1]/sub.vtt",
-            "http://[fec0::1]/sub.vtt",
-            "http://[fc00::1]/sub.vtt",
-            "http://[fd12:3456::1]/sub.vtt",
-            "http://100.64.0.1/sub.vtt",
-            "http://192.88.99.1/sub.vtt",
-            "http://0.0.0.0/sub.vtt",
-            "http://[::]/sub.vtt",
-            "https://localhost/sub.vtt",
-            "https://api.localhost/sub.vtt",
-            "https://printer.local/sub.vtt",
-            "https://metadata.google.internal/computeMetadata/v1/",
-            "http://127.1/sub.vtt",
-            "file:///etc/passwd",
-            "ftp://example.com/sub.vtt",
-            "data:text/plain;base64,SGVsbG8=",
-            "https://user:secret@example.com/sub.vtt",
+            "http://127.0.0.1/sub.vtt", "https://127.0.0.2:443/sub.vtt",
+            "http://[::1]/sub.vtt", "http://[::ffff:127.0.0.1]/sub.vtt",
+            "http://10.0.0.1/sub.vtt", "https://172.16.0.1/sub.vtt", "https://192.168.1.5/sub.vtt",
+            "http://169.254.169.254/latest/meta-data/", "http://[fe80::1]/sub.vtt",
+            "http://[fec0::1]/sub.vtt", "http://[fc00::1]/sub.vtt", "http://[fd12:3456::1]/sub.vtt",
+            "http://100.64.0.1/sub.vtt", "http://192.88.99.1/sub.vtt", "http://0.0.0.0/sub.vtt",
+            "http://[::]/sub.vtt", "https://localhost/sub.vtt", "https://api.localhost/sub.vtt",
+            "https://printer.local/sub.vtt", "https://metadata.google.internal/computeMetadata/v1/",
+            "http://127.1/sub.vtt", "file:///etc/passwd", "ftp://example.com/sub.vtt",
+            "data:text/plain;base64,SGVsbG8=", "https://user:secret@example.com/sub.vtt",
             "https://example.com/sub.vtt#frag",
         ]
         for url in forbidden_urls:
@@ -337,8 +336,9 @@ class SecurityTests(unittest.TestCase):
                 dialed.append((ip_str, p))
                 return real_connect("127.0.0.1", port, timeout, source_address)
 
-            # Also set HTTP_PROXY in env to prove --no-proxy bypasses env proxy and enforces IP pinning.
-            with mock.patch.dict("os.environ", {"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9"}), \
+            # Also set HTTP_PROXY in a clean env to prove --no-proxy bypasses env proxy and enforces IP pinning.
+            clean_env = _clean_proxy_env({"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9"})
+            with mock.patch.dict("os.environ", clean_env, clear=True), \
                  mock.patch.object(http_transport, "_connect_pinned_ip", side_effect=_intercept_dial), \
                  mock.patch("socket.getaddrinfo", side_effect=AssertionError("connect must not re-query DNS")):
                 self.assertTrue(http_transport.has_env_proxy_for("http", "rebind.example.com", port))
@@ -349,9 +349,7 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(_CookieAndRedirectHandler.recorded_hosts, [f"rebind.example.com:{port}", f"hop2.example.com:{port}"])
 
             # 2) HTTPS pinned connection dials validated numeric IP while preserving original SNI server_hostname.
-            fake_ctx = mock.MagicMock()
-            fake_sock = mock.MagicMock()
-            fake_tls = mock.MagicMock()
+            fake_ctx, fake_sock, fake_tls = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
             fake_ctx.wrap_socket.return_value = fake_tls
             with mock.patch.object(http_transport, "_connect_pinned_ip", return_value=fake_sock) as mock_dial:
                 conn = http_transport._PinnedHTTPSConnection("sni.example.com", 443, context=fake_ctx, pinned_ips=("93.184.216.34",))
@@ -359,10 +357,41 @@ class SecurityTests(unittest.TestCase):
             mock_dial.assert_called_once_with("93.184.216.34", 443, conn.timeout, conn.source_address)
             fake_ctx.wrap_socket.assert_called_once_with(fake_sock, server_hostname="sni.example.com")
             self.assertIs(conn.sock, fake_tls)
+
+            # 3) Loopback localhost API fetch resolves and pins loopback numeric IP without re-querying DNS at connect.
+            lb_dialed: list[tuple[str, int]] = []
+            with mock.patch.object(http_transport, "_connect_pinned_ip", side_effect=lambda ip, p, t, s=None: (lb_dialed.append((ip, p)), real_connect(ip, p, t, s))[1]), \
+                 mock.patch("socket.getaddrinfo", side_effect=AssertionError("localhost connect must use pinned IP")):
+                lb_fetcher = http_transport.SafeHTTPFetcher(timeout=5.0, resolver=_make_private_resolver("127.0.0.1"))
+                lb_resp = lb_fetcher.fetch_bytes(f"http://localhost:{port}/after-redirect", max_bytes=4096, allow_loopback=True, media_mode=False)
+            self.assertEqual(lb_resp.status, 200)
+            self.assertEqual(lb_dialed, [("127.0.0.1", port)])
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2.0)
+
+    def test_proxy_env_case_isolation_and_localhost_pinning_validation(self) -> None:
+        # R66-02: uppercase/lowercase proxy overrides and NO_PROXY matching under isolated env.
+        with mock.patch.dict("os.environ", _clean_proxy_env({"HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9", "http_proxy": ""}), clear=True):
+            self.assertFalse(http_transport.has_env_proxy_for("http", "rebind.example.com", 80))
+            self.assertTrue(http_transport.has_env_proxy_for("https", "rebind.example.com", 443))
+        with mock.patch.dict("os.environ", _clean_proxy_env({"HTTP_PROXY": "http://127.0.0.1:9", "NO_PROXY": ".example.com"}), clear=True):
+            self.assertFalse(http_transport.has_env_proxy_for("http", "rebind.example.com", 80))
+            self.assertTrue(http_transport.has_env_proxy_for("http", "cdn.other.org", 80))
+        with mock.patch.dict("os.environ", _clean_proxy_env({"http_proxy": "http://127.0.0.1:9", "no_proxy": "other.org"}), clear=True):
+            self.assertTrue(http_transport.has_env_proxy_for("http", "rebind.example.com", 80))
+            self.assertFalse(http_transport.has_env_proxy_for("http", "cdn.other.org", 80))
+        # R66-03: localhost / *.localhost loopback pinning and fail-closed on non-loopback /etc/hosts override.
+        self.assertEqual(security.validate_and_resolve_remote_url("http://127.0.0.1:8080/x", allow_loopback=True)[1], ("127.0.0.1",))
+        self.assertEqual(security.validate_and_resolve_remote_url("http://[::1]:8080/x", allow_loopback=True)[1], ("::1",))
+        self.assertEqual(security.validate_and_resolve_remote_url("http://localhost:8080/x", allow_loopback=True, resolve_dns=False)[1], ("127.0.0.1", "::1"))
+        self.assertEqual(security.validate_and_resolve_remote_url("http://api.localhost:8080/x", allow_loopback=True, resolve_dns=False)[1], ("127.0.0.1", "::1"))
+        multi_lb = lambda h, p, f=0, s=0: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p)), (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", p)), (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p))]
+        self.assertEqual(security.validate_and_resolve_remote_url("http://localhost:8080/x", allow_loopback=True, resolver=multi_lb)[1], ("127.0.0.1", "::1"))
+        for bad_ip in ("93.184.216.34", "10.0.0.1", "169.254.169.254"):
+            with self.assertRaises(security.SecurityError):
+                security.validate_and_resolve_remote_url("http://localhost:8080/x", allow_loopback=True, resolver=_make_private_resolver(bad_ip))
 
 
 if __name__ == "__main__":

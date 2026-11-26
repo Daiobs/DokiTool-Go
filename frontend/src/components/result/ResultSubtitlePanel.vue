@@ -2,9 +2,10 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import AppIcon from "../AppIcon.vue";
 import {
-  buildSubtitleDownloadResult,
-  type SubtitleTrackOption,
-} from "../../core/media/subtitleEngine";
+  createSubtitleDownloadController,
+  type SubtitleControllerState,
+} from "../../core/media/subtitleController";
+import type { SubtitleTrackOption } from "../../core/media/subtitleEngine";
 
 const props = withDefaults(
   defineProps<{
@@ -23,108 +24,6 @@ const props = withDefaults(
 );
 
 const isEn = computed(() => props.locale === "en");
-const targetFormat = ref<"vtt" | "srt">("vtt");
-const primaryId = ref<string>("");
-const secondaryId = ref<string>("");
-const busyKey = ref<string>("");
-const errorMessage = ref<string>("");
-const statusMessage = ref<string>("");
-let activeController: AbortController | null = null;
-
-watch(
-  () => props.tracks,
-  (list) => {
-    const safeList = Array.isArray(list) ? list : [];
-    if (!safeList.some((track) => track.id === primaryId.value)) {
-      primaryId.value = safeList[0]?.id || "";
-    }
-    if (
-      secondaryId.value &&
-      (!safeList.some((track) => track.id === secondaryId.value) ||
-        secondaryId.value === primaryId.value)
-    ) {
-      secondaryId.value = "";
-    }
-    errorMessage.value = "";
-    statusMessage.value = "";
-  },
-  { immediate: true },
-);
-
-watch(primaryId, (nextPrimary) => {
-  if (secondaryId.value === nextPrimary) {
-    secondaryId.value = "";
-  }
-});
-
-onUnmounted(() => {
-  activeController?.abort();
-  activeController = null;
-});
-
-const primaryTrack = computed(
-  () =>
-    props.tracks.find((track) => track.id === primaryId.value) ||
-    props.tracks[0] ||
-    null,
-);
-const secondaryCandidates = computed(() =>
-  props.tracks.filter((track) => track.id !== primaryTrack.value?.id),
-);
-const secondaryTrack = computed(
-  () =>
-    secondaryCandidates.value.find((track) => track.id === secondaryId.value) ||
-    null,
-);
-const canMergeBilingual = computed(() => props.tracks.length >= 2);
-
-const trackKindLabel = (kind: SubtitleTrackOption["trackKind"]): string => {
-  if (kind === "manual") return isEn.value ? "Manual" : "人工";
-  if (kind === "auto") return isEn.value ? "Auto" : "自动";
-  return "";
-};
-
-const formatTrackOptionLabel = (track: SubtitleTrackOption): string => {
-  const kindText = trackKindLabel(track.trackKind);
-  const langTag =
-    track.language &&
-    track.label.toLowerCase() !== track.language.toLowerCase()
-      ? ` (${track.language})`
-      : "";
-  return `${track.label}${langTag}${kindText ? ` · ${kindText}` : ""}`;
-};
-
-const triggerBlobDownload = (
-  content: string,
-  filename: string,
-  mimeType: string,
-): void => {
-  if (
-    typeof Blob === "undefined" ||
-    typeof URL === "undefined" ||
-    typeof URL.createObjectURL !== "function" ||
-    typeof document === "undefined"
-  ) {
-    return;
-  }
-  const blob = new Blob([content], { type: mimeType });
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
-  link.rel = "noopener";
-  link.style.display = "none";
-  document.body?.appendChild?.(link);
-  link.click?.();
-  link.remove?.();
-  setTimeout(() => {
-    try {
-      URL.revokeObjectURL(objectUrl);
-    } catch {
-      // Ignore revoke errors
-    }
-  }, 1000);
-};
 
 const formatDownloadError = (err: unknown): string => {
   const rec = err as { code?: string; name?: string } | null;
@@ -147,55 +46,75 @@ const formatDownloadError = (err: unknown): string => {
     : "字幕下载或转换失败，请稍后重试。";
 };
 
-const runDownload = async (
-  primary: SubtitleTrackOption | null,
-  secondary: SubtitleTrackOption | null,
-  format: "vtt" | "srt",
-  key: string,
-): Promise<void> => {
-  if (!primary || props.disabled || busyKey.value) return;
-  activeController?.abort();
-  const controller = new AbortController();
-  activeController = controller;
-  busyKey.value = key;
-  errorMessage.value = "";
-  statusMessage.value = "";
-
-  try {
-    const result = await buildSubtitleDownloadResult({
-      primaryTrack: primary,
-      secondaryTrack: secondary,
-      targetFormat: format,
-      baseTitle: props.baseTitle || "subtitle",
-      fetchImpl: props.fetchImpl,
-      signal: controller.signal,
-    });
-    if (controller.signal.aborted) return;
-    if (result.cueCount === 0) {
-      errorMessage.value = isEn.value
-        ? "No valid subtitle cues were found in this track."
-        : "未能从该字幕轨解析出有效时间轴内容。";
-      return;
-    }
-    triggerBlobDownload(result.content, result.filename, result.mimeType);
-    statusMessage.value = isEn.value
+const controllerState = ref<SubtitleControllerState | null>(null);
+const controller = createSubtitleDownloadController({
+  getBaseTitle: () => props.baseTitle || "subtitle",
+  isDisabled: () => props.disabled,
+  getFetchImpl: () => props.fetchImpl,
+  formatError: formatDownloadError,
+  formatEmptyCuesError: () =>
+    isEn.value
+      ? "No valid subtitle cues were found in this track."
+      : "未能从该字幕轨解析出有效时间轴内容。",
+  formatSuccessStatus: (result) =>
+    isEn.value
       ? `Saved ${result.filename} (${result.cueCount} cues)`
-      : `已生成 ${result.filename}（共 ${result.cueCount} 条字幕）`;
-  } catch (err: unknown) {
-    if ((err as { name?: string } | null)?.name === "AbortError") return;
-    errorMessage.value = formatDownloadError(err);
-  } finally {
-    if (activeController === controller) {
-      activeController = null;
-    }
-    if (busyKey.value === key) {
-      busyKey.value = "";
-    }
-  }
+      : `已生成 ${result.filename}（共 ${result.cueCount} 条字幕）`,
+  onStateChange: (next) => {
+    controllerState.value = next;
+  },
+});
+controllerState.value = controller.getState();
+
+watch(
+  () => props.tracks,
+  (list) => controller.syncTracks(list),
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  controller.dispose();
+});
+
+const snap = computed(() => controllerState.value ?? controller.getState());
+const targetFormat = computed({
+  get: () => snap.value.targetFormat,
+  set: (v) => controller.setTargetFormat(v),
+});
+const primaryId = computed({
+  get: () => snap.value.primaryId,
+  set: (v) => controller.setPrimaryId(v),
+});
+const secondaryId = computed({
+  get: () => snap.value.secondaryId,
+  set: (v) => controller.setSecondaryId(v),
+});
+const primaryTrack = computed(() => snap.value.primaryTrack);
+const secondaryCandidates = computed(() => snap.value.secondaryCandidates);
+const secondaryTrack = computed(() => snap.value.secondaryTrack);
+const canMergeBilingual = computed(() => snap.value.canMergeBilingual);
+const busyKey = computed(() => snap.value.busyKey);
+const errorMessage = computed(() => snap.value.errorMessage);
+const statusMessage = computed(() => snap.value.statusMessage);
+
+const trackKindLabel = (kind: SubtitleTrackOption["trackKind"]): string => {
+  if (kind === "manual") return isEn.value ? "Manual" : "人工";
+  if (kind === "auto") return isEn.value ? "Auto" : "自动";
+  return "";
 };
 
-const downloadConfigured = () =>
-  runDownload(primaryTrack.value, secondaryTrack.value, targetFormat.value, "configured");
+const formatTrackOptionLabel = (track: SubtitleTrackOption): string => {
+  const kindText = trackKindLabel(track.trackKind);
+  const langTag =
+    track.language &&
+    track.label.toLowerCase() !== track.language.toLowerCase()
+      ? ` (${track.language})`
+      : "";
+  return `${track.label}${langTag}${kindText ? ` · ${kindText}` : ""}`;
+};
+
+const runDownload = controller.runDownload;
+const downloadConfigured = controller.downloadConfigured;
 </script>
 
 <template>

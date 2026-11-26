@@ -4,25 +4,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/youtube"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
-
-// YouTubeHelperStatsSnapshot aliases youtube.HelperStatsSnapshot so /api/stats
-// exposes YouTube helper refresh/cooldown/LRU telemetry with one canonical schema.
-type YouTubeHelperStatsSnapshot = youtube.HelperStatsSnapshot
-
-// YouTubeHelperStatsSource provides a point-in-time redacted YouTube helper telemetry snapshot.
-type YouTubeHelperStatsSource interface {
-	HelperStatsSnapshot() youtube.HelperStatsSnapshot
-}
-
-// HistogramBuckets aliases ytengine.HistogramBuckets so API telemetry shares one exact schema.
-type HistogramBuckets = ytengine.HistogramBuckets
-
-// HistogramSnapshot aliases ytengine.HistogramSnapshot so API telemetry shares one exact schema.
-type HistogramSnapshot = ytengine.HistogramSnapshot
 
 // PlatformOutcomeCount reports one non-zero cell in the bounded platform × code × channel cube.
 type PlatformOutcomeCount struct {
@@ -262,14 +245,14 @@ type StatsSnapshot struct {
 	Cache                 CacheStatsSnapshot               `json:"cache"`
 	Admission             AdmissionStatsSnapshot           `json:"admission"`
 	APIKeys               []APIKeyStatsSnapshot            `json:"api_keys"`
-	YTDLP                 ytengine.SlotStatsSnapshot       `json:"ytdlp"`
-	YTDLPGeneric          ytengine.SlotStatsSnapshot       `json:"ytdlp_generic"`
+	YTDLP                 YTDLPSlotStatsSnapshot           `json:"ytdlp"`
+	YTDLPGeneric          YTDLPSlotStatsSnapshot           `json:"ytdlp_generic"`
 	YTDLPPools            YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
 	YouTubeHelper         YouTubeHelperStatsSnapshot       `json:"youtube_helper"`
 	CircuitBreakers       []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
 	GenericCircuitBreaker CircuitBreakerPlatformSnapshot   `json:"generic_circuit_breaker"`
 	RuntimePolicy         RuntimePolicySummary             `json:"runtime_policy"`
-	Shanghai              shresolver.StatsSnapshot         `json:"shanghai"`
+	Shanghai              ShanghaiStatsSnapshot            `json:"shanghai"`
 	ParseLatencyMS        LatencyStatsSnapshot             `json:"parse_latency_ms"`
 	Runtime               RuntimeConfigSnapshot            `json:"runtime"`
 	Daily                 []DailyStatsBucket               `json:"daily"`

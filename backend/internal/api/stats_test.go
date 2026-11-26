@@ -1972,8 +1972,8 @@ func TestStatsGenericYTDLPAndGenericSlowAdmission(t *testing.T) {
 	}
 	st.SetGenericYTDLPEngine(stubYTDLPStatsSource{snap: wantMock})
 	mockSnap := st.Snapshot()
-	if mockSnap.YTDLPGeneric != wantMock {
-		t.Fatalf("YTDLPGeneric = %+v, want %+v", mockSnap.YTDLPGeneric, wantMock)
+	if mockSnap.YTDLPGeneric != toAPIYTDLPSlotStats(wantMock) {
+		t.Fatalf("YTDLPGeneric = %+v, want %+v", mockSnap.YTDLPGeneric, toAPIYTDLPSlotStats(wantMock))
 	}
 	if mockSnap.YTDLP.Enabled || mockSnap.YTDLP.ConcurrencyLimit != 0 {
 		t.Fatalf("YTDLP should remain zero when only generic source is set: %+v", mockSnap.YTDLP)

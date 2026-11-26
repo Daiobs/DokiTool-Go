@@ -20,7 +20,6 @@ import (
 )
 
 var (
-	shortcodePattern        = regexp.MustCompile(`^[A-Za-z0-9_-]{5,32}$`)
 	privateShortcodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{33,80}$`)
 	storySegmentPattern     = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 )
@@ -74,65 +73,7 @@ func (p *Parser) WithFetcher(fetcher fetch.Executor) *Parser {
 //   - canonicalURL: the sanitized URL safe to pass to yt-dlp
 //   - ok: whether the input URL is a valid Instagram post/reel URL
 func ExtractPostTarget(raw string) (string, string, bool) {
-	if unified.MediaURL(raw) == "" || len(raw) > 2048 {
-		return "", "", false
-	}
-	for _, r := range raw {
-		if r <= 0x20 || r >= 0x7f || r == '\\' {
-			return "", "", false
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.Opaque != "" || strings.HasSuffix(u.Host, ":") {
-		return "", "", false
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", "", false
-	}
-	if port := u.Port(); port != "" {
-		if !((scheme == "https" && port == "443") || (scheme == "http" && port == "80")) {
-			return "", "", false
-		}
-	}
-
-	host := strings.ToLower(u.Hostname())
-	isShortDomain := false
-	switch host {
-	case "instagram.com", "www.instagram.com", "m.instagram.com":
-	case "instagr.am", "www.instagr.am":
-		isShortDomain = true
-	default:
-		return "", "", false
-	}
-
-	segments := splitNonEmptyPath(u.EscapedPath())
-	var kind, shortcode string
-
-	if isShortDomain {
-		if len(segments) != 2 || !isInstagramPostKind(segments[0]) {
-			return "", "", false
-		}
-		kind = normalizeKind(segments[0])
-		shortcode = segments[1]
-	} else {
-		switch {
-		case len(segments) >= 2 && isInstagramPostKind(segments[0]):
-			kind = normalizeKind(segments[0])
-			shortcode = segments[1]
-		case len(segments) >= 3 && isInstagramPostKind(segments[1]):
-			kind = normalizeKind(segments[1])
-			shortcode = segments[2]
-		default:
-			return "", "", false
-		}
-	}
-
-	if !shortcodePattern.MatchString(shortcode) {
-		return "", "", false
-	}
-	canonicalURL := "https://www.instagram.com/" + kind + "/" + shortcode + "/"
-	return shortcode, canonicalURL, true
+	return urlpolicy.ExtractInstagramPostTarget(raw)
 }
 
 func requiresLoginInstagramURL(raw string) bool {
@@ -183,17 +124,6 @@ func isInstagramPostKind(seg string) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-func normalizeKind(seg string) string {
-	switch strings.ToLower(seg) {
-	case "reel", "reels":
-		return "reel"
-	case "tv":
-		return "tv"
-	default:
-		return "p"
 	}
 }
 

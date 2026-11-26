@@ -142,6 +142,7 @@
 !/backend/internal/platform/
 !/backend/internal/probe/
 !/backend/internal/shresolver/
+!/backend/internal/telemetry/
 !/backend/internal/testsupport/
 !/backend/internal/testutil/
 !/backend/internal/unified/
@@ -283,6 +284,7 @@
 !/frontend/tests/download-worker.test.mjs
 !/frontend/tests/extension-download-flow.test.mjs
 !/frontend/tests/extension-filename.test.mjs
+!/frontend/tests/extension-planning.test.mjs
 !/frontend/tests/extension-security.test.mjs
 !/frontend/tests/extension-v44-bg.test.mjs
 !/frontend/tests/fixtures/
@@ -297,6 +299,7 @@
 !/frontend/tests/result-layout.test.mjs
 !/frontend/tests/route-probe.test.mjs
 !/frontend/tests/seo-contract.test.mjs
+!/frontend/tests/subtitle-controller.test.mjs
 !/frontend/tests/subtitle-engine.test.mjs
 !/frontend/tests/ui-download-contract.test.mjs
 !/frontend/tests/youtube-helper.test.mjs
@@ -430,6 +433,7 @@
 !/backend/internal/api/admission_test.go
 !/backend/internal/api/apikeys.go
 !/backend/internal/api/apikeys_test.go
+!/backend/internal/api/architecture_deps_test.go
 !/backend/internal/api/bilibili_shanghai_test.go
 !/backend/internal/api/bilibili_test.go
 !/backend/internal/api/cache.go
@@ -455,6 +459,8 @@
 !/backend/internal/api/runtime_config_test.go
 !/backend/internal/api/stats.go
 !/backend/internal/api/stats_buckets.go
+!/backend/internal/api/stats_dto.go
+!/backend/internal/api/stats_dto_test.go
 !/backend/internal/api/stats_histogram.go
 !/backend/internal/api/stats_persistence.go
 !/backend/internal/api/stats_reporter.go
@@ -531,6 +537,8 @@
 !/backend/internal/shresolver/server.go
 !/backend/internal/shresolver/server_test.go
 !/backend/internal/shresolver/stats.go
+/backend/internal/telemetry/*
+!/backend/internal/telemetry/youtube_helper.go
 /backend/internal/testsupport/*
 !/backend/internal/testsupport/publicoracle/
 /backend/internal/testutil/*
@@ -563,6 +571,8 @@
 !/backend/internal/unified/work.go
 !/backend/internal/unified/work_test.go
 /backend/internal/urlpolicy/*
+!/backend/internal/urlpolicy/instagram.go
+!/backend/internal/urlpolicy/instagram_test.go
 !/backend/internal/urlpolicy/urlpolicy.go
 !/backend/internal/urlpolicy/urlpolicy_test.go
 /backend/internal/ytengine/*
@@ -693,6 +703,7 @@
 !/frontend/src/extension/offscreen.html
 !/frontend/src/extension/offscreen.ts
 !/frontend/src/extension/opfsStreamTransfer.ts
+!/frontend/src/extension/planning/
 !/frontend/src/extension/protocol.ts
 !/frontend/src/extension/sidepanel.css
 !/frontend/src/extension/sidepanel.html
@@ -1005,6 +1016,7 @@
 !/frontend/src/core/media/index.ts
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts
+!/frontend/src/core/media/subtitleController.ts
 !/frontend/src/core/media/subtitleEngine.ts
 !/frontend/src/core/media/variantDefaultUpgrade.ts
 !/frontend/src/core/media/variantSort.ts
@@ -1027,6 +1039,9 @@
 !/frontend/src/extension/components/SidePanelResult.vue
 !/frontend/src/extension/components/SidePanelSettings.vue
 !/frontend/src/extension/components/SidePanelSubtitlePanel.vue
+/frontend/src/extension/planning/*
+!/frontend/src/extension/planning/enqueuePlanBuilder.ts
+!/frontend/src/extension/planning/variantSelection.ts
 /frontend/src/monitor/components/*
 !/frontend/src/monitor/components/ProtectionPolicySection.vue
 !/frontend/src/monitor/components/YouTubeHelperCard.vue
