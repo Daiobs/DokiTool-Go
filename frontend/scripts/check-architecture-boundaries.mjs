@@ -62,6 +62,29 @@ const PLATFORM_HARDCODE_PATTERNS = [
 const FILE_LINE_LIMITS = [
   { relDir: "core", maxLines: 600 },
   { relDir: path.join("extension", "bg"), maxLines: 900 },
+  { relDir: path.join("extension", "planning"), maxLines: 900 },
+];
+
+const PLANNING_FORBIDDEN_TARGETS = new Set([
+  "extension/extensionDownload",
+  "extension/offscreen",
+  "extension/dashMuxDownload",
+  "extension/opfsStreamTransfer",
+  "extension/youtubeExtensionBridge",
+]);
+
+const BG_FORBIDDEN_TARGETS = new Set([
+  "extension/extensionDownload",
+  "extension/offscreen",
+]);
+
+const PLANNING_HOST_SIDE_EFFECT_PATTERNS = [
+  { name: "chrome-api", regex: /\bchrome\s*\./ },
+  { name: "navigator-storage", regex: /\bnavigator\s*\.\s*storage\b/ },
+  { name: "navigator-locks", regex: /\bnavigator\s*\.\s*locks\b/ },
+  { name: "window-global", regex: /\bwindow\s*\./ },
+  { name: "document-global", regex: /\bdocument\s*\./ },
+  { name: "fetch-call", regex: /\bfetch\s*\(/ },
 ];
 
 const SINGLE_FILE_LINE_LIMITS = [
@@ -134,6 +157,114 @@ function stripCommentsPreserveLines(source) {
     .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
     .replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "))
     .replace(/(^|[^:\\])\/\/[^\n]*/g, (_m, prefix) => prefix);
+}
+
+/**
+ * Extracts static and dynamic ESM/TypeScript module specifiers from
+ * comment-stripped source (`import ... from "..."`, `export ... from "..."`,
+ * side-effect `import "..."`, and `import("...")`).
+ */
+export function extractModuleSpecifiers(strippedSource) {
+  const results = [];
+  const patterns = [
+    /\b(?:import|export)\s+(?:type\s+)?(?:[^;'"`]*?)\bfrom\s*["']([^"'\n]+)["']/g,
+    /(?:^|[;\n])\s*import\s*["']([^"'\n]+)["']/g,
+    /\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/g,
+  ];
+  for (const re of patterns) {
+    let match;
+    while ((match = re.exec(strippedSource)) !== null) {
+      const lineNo =
+        strippedSource.slice(0, match.index).split("\n").length;
+      results.push({ specifier: match[1], lineNo });
+    }
+  }
+  return results;
+}
+
+function normalizeResolvedModuleTarget(targetSrcRoot, filePath, specifier) {
+  if (!specifier.startsWith(".")) {
+    return { isRelative: false, normalized: specifier };
+  }
+  const absResolved = path.resolve(path.dirname(filePath), specifier);
+  const relPosix = toPosixRel(targetSrcRoot, absResolved).replace(
+    /\.(?:mts|cts|tsx|ts|mjs|cjs|jsx|js|vue)$/i,
+    "",
+  );
+  return { isRelative: true, normalized: relPosix };
+}
+
+function checkExtensionImportDirections(
+  targetFrontendRoot,
+  targetSrcRoot,
+  violations,
+) {
+  let checked = 0;
+
+  // 4a. src/extension/planning/** must stay pure (no offscreen/bg/JSZip imports or host side effects)
+  const planningDir = path.join(targetSrcRoot, "extension", "planning");
+  for (const filePath of walkFiles(planningDir, [".ts", ".js"])) {
+    checked++;
+    const rel = toPosixRel(targetFrontendRoot, filePath);
+    const stripped = stripCommentsPreserveLines(fs.readFileSync(filePath, "utf8"));
+    for (const { specifier, lineNo } of extractModuleSpecifiers(stripped)) {
+      const target = normalizeResolvedModuleTarget(
+        targetSrcRoot,
+        filePath,
+        specifier,
+      );
+      const isForbidden =
+        (!target.isRelative &&
+          (target.normalized === "jszip" ||
+            target.normalized.startsWith("jszip/"))) ||
+        (target.isRelative &&
+          (PLANNING_FORBIDDEN_TARGETS.has(target.normalized) ||
+            target.normalized === "extension/bg" ||
+            target.normalized.startsWith("extension/bg/")));
+      if (isForbidden) {
+        violations.push(
+          `[import-direction] ${rel}:${lineNo}: planning module must not import "${specifier}" (${target.normalized})`,
+        );
+      }
+    }
+    const lines = stripped.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      for (const rule of PLANNING_HOST_SIDE_EFFECT_PATTERNS) {
+        if (rule.regex.test(lines[i])) {
+          violations.push(
+            `[planning-host-side-effect] ${rel}:${i + 1} (${rule.name}): pure planning module must not access browser/host side-effect globals`,
+          );
+        }
+      }
+    }
+  }
+
+  // 4b. src/extension/bg/** must never pull in extensionDownload / offscreen / jszip
+  const bgDir = path.join(targetSrcRoot, "extension", "bg");
+  for (const filePath of walkFiles(bgDir, [".ts", ".js"])) {
+    checked++;
+    const rel = toPosixRel(targetFrontendRoot, filePath);
+    const stripped = stripCommentsPreserveLines(fs.readFileSync(filePath, "utf8"));
+    for (const { specifier, lineNo } of extractModuleSpecifiers(stripped)) {
+      const target = normalizeResolvedModuleTarget(
+        targetSrcRoot,
+        filePath,
+        specifier,
+      );
+      const isForbidden =
+        (!target.isRelative &&
+          (target.normalized === "jszip" ||
+            target.normalized.startsWith("jszip/"))) ||
+        (target.isRelative && BG_FORBIDDEN_TARGETS.has(target.normalized));
+      if (isForbidden) {
+        violations.push(
+          `[import-direction] ${rel}:${lineNo}: background module must not import "${specifier}" (${target.normalized}); import from ../planning/* instead`,
+        );
+      }
+    }
+  }
+
+  return checked;
 }
 
 function extractStyleBlocks(filePath, source) {
@@ -379,6 +510,13 @@ export function runArchitectureBoundaryCheck(options = {}) {
     }
   }
 
+  // 4. Static ESM/TS import direction & planning host-purity gate
+  const importDirectionFilesChecked = checkExtensionImportDirections(
+    targetFrontendRoot,
+    targetSrcRoot,
+    violations,
+  );
+
   return {
     passed: violations.length === 0,
     businessFilesChecked,
@@ -387,6 +525,7 @@ export function runArchitectureBoundaryCheck(options = {}) {
     ratchetNotices,
     cssFilesChecked,
     distCssFilesChecked,
+    importDirectionFilesChecked,
     violations,
   };
 }
@@ -411,6 +550,6 @@ if (isMain) {
     process.exit(1);
   }
   console.log(
-    `Architecture boundary check PASSED (business=${result.businessFilesChecked}, lineCap=${result.lineCapFilesChecked}, ratchet=${result.ratchetFilesChecked}, css=${result.cssFilesChecked}, distCss=${result.distCssFilesChecked})`,
+    `Architecture boundary check PASSED (business=${result.businessFilesChecked}, lineCap=${result.lineCapFilesChecked}, ratchet=${result.ratchetFilesChecked}, css=${result.cssFilesChecked}, distCss=${result.distCssFilesChecked}, importDir=${result.importDirectionFilesChecked})`,
   );
 }

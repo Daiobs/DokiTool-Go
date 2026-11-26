@@ -433,6 +433,7 @@
 !/backend/internal/api/admission_test.go
 !/backend/internal/api/apikeys.go
 !/backend/internal/api/apikeys_test.go
+!/backend/internal/api/architecture_deps_test.go
 !/backend/internal/api/bilibili_shanghai_test.go
 !/backend/internal/api/bilibili_test.go
 !/backend/internal/api/cache.go
