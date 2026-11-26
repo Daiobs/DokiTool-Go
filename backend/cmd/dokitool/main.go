@@ -442,7 +442,11 @@ func reloadRuntimeConfigOnce(
 	}
 	if err := api.ApplyRuntimeConfigWithHook(entry, handler, next, fromFile, true, hook); err != nil {
 		if logf != nil {
-			logf("dokitool: runtime config reload rejected (keeping previous configuration): %v", err)
+			if errors.Is(err, errCompartmentRollbackFailed) {
+				logf("dokitool: CRITICAL runtime config reload rollback failed; compartment limits may be partially mutated — re-apply valid runtime config or restart process: %v", err)
+			} else {
+				logf("dokitool: runtime config reload rejected (previous configuration preserved): %v", err)
+			}
 		}
 		return false
 	}
@@ -561,11 +565,12 @@ func configureYTDLPWithOptions(c *catalog.Catalog, adapters map[string]api.Adapt
 }
 
 type ytdlpConfigResult struct {
-	engine         *ytengine.Engine
-	youtubeEngine  *ytengine.Engine
-	socialEngine   *ytengine.Engine
-	genericEngine  *ytengine.Engine
-	genericAdapter api.Adapter
+	engine           *ytengine.Engine
+	youtubeEngine    *ytengine.Engine
+	socialEngine     *ytengine.Engine
+	genericEngine    *ytengine.Engine
+	genericAdapter   api.Adapter
+	testBuildTargets func(ytSlots, socialSlots, genericSlots int) []compartmentLimitTarget
 }
 
 func (r *ytdlpConfigResult) Close() error {
@@ -574,6 +579,8 @@ func (r *ytdlpConfigResult) Close() error {
 	}
 	return r.engine.Close()
 }
+
+var errCompartmentRollbackFailed = errors.New("compartment rollback failed")
 
 type compartmentLimiter interface {
 	ConcurrencyLimit() int
@@ -587,9 +594,11 @@ type compartmentLimitTarget struct {
 	next    int
 }
 
-// applyCompartmentLimitTargets updates all compartments atomically: if any step fails,
-// every previously mutated compartment is rolled back in reverse order and any rollback
-// error is joined into the returned error.
+// applyCompartmentLimitTargets updates each ytengine compartment limit in-place
+// sequentially under the caller's serialized reload lock. If any compartment fails,
+// previously mutated compartments are rolled back in reverse order on a best-effort
+// basis; any rollback failure is wrapped with errCompartmentRollbackFailed and joined
+// into the returned error so callers can emit a CRITICAL operator alert.
 func applyCompartmentLimitTargets(targets []compartmentLimitTarget) error {
 	for i, t := range targets {
 		if t.limiter == nil {
@@ -602,7 +611,7 @@ func applyCompartmentLimitTargets(targets []compartmentLimitTarget) error {
 					continue
 				}
 				if rbErr := targets[j].limiter.SetConcurrencyLimit(targets[j].prev); rbErr != nil {
-					errs = append(errs, fmt.Errorf("compartment %s rollback failed: %w", targets[j].name, rbErr))
+					errs = append(errs, fmt.Errorf("%w (%s): %w", errCompartmentRollbackFailed, targets[j].name, rbErr))
 				}
 			}
 			return errors.Join(errs...)
@@ -614,6 +623,9 @@ func applyCompartmentLimitTargets(targets []compartmentLimitTarget) error {
 func (r *ytdlpConfigResult) SetCompartmentLimits(ytSlots, socialSlots, genericSlots int) error {
 	if r == nil {
 		return nil
+	}
+	if r.testBuildTargets != nil {
+		return applyCompartmentLimitTargets(r.testBuildTargets(ytSlots, socialSlots, genericSlots))
 	}
 	var targets []compartmentLimitTarget
 	if r.youtubeEngine != nil {

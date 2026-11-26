@@ -805,37 +805,70 @@ test("ResultSubtitlePanel.vue & ResultDetailsSidebar.vue render manual/auto badg
 });
 
 test("mergeBilingualCues matches naive O(N*M) tie-breaks exactly and scales to 10k x 10k cues in < 250ms", () => {
+  const BANNER_EXCESS_MS = 6000;
   const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const isBetterOverlap = (cand, prev, pDurEff) => {
+    if (cand.bannerTier !== prev.bannerTier) return cand.bannerTier < prev.bannerTier;
+    if (cand.sDurEff === prev.sDurEff) {
+      if (cand.overlap !== prev.overlap) return cand.overlap > prev.overlap;
+    } else {
+      const lhs = cand.overlap * (pDurEff + prev.sDurEff);
+      const rhs = prev.overlap * (pDurEff + cand.sDurEff);
+      if (Number.isSafeInteger(lhs) && Number.isSafeInteger(rhs)) {
+        if (lhs !== rhs) return lhs > rhs;
+      } else {
+        const diff = cand.overlap / (pDurEff + cand.sDurEff) - prev.overlap / (pDurEff + prev.sDurEff);
+        if (Math.abs(diff) > 1e-12) return diff > 0;
+      }
+    }
+    return cand.midDiff < prev.midDiff;
+  };
   const naiveMerge = (primary, secondary) => {
     if (!primary.length) return secondary.map((c) => ({ ...c }));
     if (!secondary.length) return primary.map((c) => ({ ...c }));
     return primary.map((p) => {
       const pStart = Math.max(0, p.startMs);
       const pEnd = Math.max(pStart, p.endMs);
+      const pEndEff = Math.max(pEnd, pStart + 1);
+      const pDurEff = pEndEff - pStart;
       const pMid = (pStart + pEnd) / 2;
       let bestOverlap = null;
-      let nearest = null;
+      let nearestLocal = null;
+      let nearestAny = null;
       for (const s of secondary) {
         const sStart = Math.max(0, s.startMs);
         const sEnd = Math.max(sStart, s.endMs);
-        const overlap = Math.min(Math.max(pEnd, pStart + 1), Math.max(sEnd, sStart + 1)) - Math.max(pStart, sStart);
+        const sEndEff = Math.max(sEnd, sStart + 1);
+        const sDurEff = sEndEff - sStart;
+        const overlap = Math.min(pEndEff, sEndEff) - Math.max(pStart, sStart);
         if (overlap > 0) {
-          const midDiff = Math.abs(pMid - (sStart + sEnd) / 2);
-          if (!bestOverlap || overlap > bestOverlap.overlap || (overlap === bestOverlap.overlap && midDiff < bestOverlap.midDiff)) {
-            bestOverlap = { cue: s, overlap, midDiff };
+          const bannerTier = (sDurEff - overlap) > BANNER_EXCESS_MS && overlap * 4 < sDurEff ? 1 : 0;
+          const cand = { cue: s, bannerTier, overlap, sDurEff, midDiff: Math.abs(pMid - (sStart + sEnd) / 2) };
+          if (!bestOverlap || isBetterOverlap(cand, bestOverlap, pDurEff)) {
+            bestOverlap = cand;
           }
           continue;
         }
+        if (bestOverlap?.bannerTier === 0) continue;
         const gap = Math.max(0, Math.max(pStart, sStart) - Math.min(pEnd, sEnd));
         if (gap <= 1500) {
           const startDiff = Math.abs(pStart - sStart);
-          if (!nearest || gap < nearest.gap || (gap === nearest.gap && startDiff < nearest.startDiff)) {
-            nearest = { cue: s, gap, startDiff };
+          const isLocal = sDurEff <= BANNER_EXCESS_MS * 2;
+          const prev = isLocal ? nearestLocal : nearestAny;
+          if (!prev || gap < prev.gap || (gap === prev.gap && startDiff < prev.startDiff)) {
+            const next = { cue: s, gap, startDiff };
+            if (isLocal) nearestLocal = next;
+            else nearestAny = next;
           }
         }
       }
       const pText = p.text.trim();
-      const sText = (bestOverlap?.cue ?? nearest?.cue)?.text.trim() || "";
+      const chosen =
+        (bestOverlap?.bannerTier === 0 ? bestOverlap.cue : null) ??
+        nearestLocal?.cue ??
+        bestOverlap?.cue ??
+        nearestAny?.cue;
+      const sText = chosen?.text.trim() || "";
       if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
       const normS = norm(sText);
       const lines = new Set(pText.split("\n").map(norm));
@@ -1065,7 +1098,24 @@ test("mergeBilingualCues handles 10 full-video annotation banners + 1,000 dense 
 });
 
 test("mergeBilingualCues matches naive O(N*M) Oracle bit-for-bit across 35 seeded random streams (<= 400 cues)", () => {
+  const BANNER_EXCESS_MS = 6000;
   const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const isBetterOverlap = (cand, prev, pDurEff) => {
+    if (cand.bannerTier !== prev.bannerTier) return cand.bannerTier < prev.bannerTier;
+    if (cand.sDurEff === prev.sDurEff) {
+      if (cand.overlap !== prev.overlap) return cand.overlap > prev.overlap;
+    } else {
+      const lhs = cand.overlap * (pDurEff + prev.sDurEff);
+      const rhs = prev.overlap * (pDurEff + cand.sDurEff);
+      if (Number.isSafeInteger(lhs) && Number.isSafeInteger(rhs)) {
+        if (lhs !== rhs) return lhs > rhs;
+      } else {
+        const diff = cand.overlap / (pDurEff + cand.sDurEff) - prev.overlap / (pDurEff + prev.sDurEff);
+        if (Math.abs(diff) > 1e-12) return diff > 0;
+      }
+    }
+    return cand.midDiff < prev.midDiff;
+  };
   const naiveOracle = (primary, secondary) => {
     if (!primary.length) return secondary.map((c) => ({ ...c }));
     if (!secondary.length) return primary.map((c) => ({ ...c }));
@@ -1073,43 +1123,48 @@ test("mergeBilingualCues matches naive O(N*M) Oracle bit-for-bit across 35 seede
       const pStart = Math.max(0, p.startMs);
       const pEnd = Math.max(pStart, p.endMs);
       const pEndEff = Math.max(pEnd, pStart + 1);
+      const pDurEff = pEndEff - pStart;
       const pMid = (pStart + pEnd) / 2;
       let bestOverlap = null;
-      let nearest = null;
+      let nearestLocal = null;
+      let nearestAny = null;
       if (Number.isFinite(pStart) && Number.isFinite(pEnd)) {
         for (const s of secondary) {
           if (!Number.isFinite(s.startMs) || !Number.isFinite(s.endMs)) continue;
           const sStart = Math.max(0, s.startMs);
           const sEnd = Math.max(sStart, s.endMs);
           const sEndEff = Math.max(sEnd, sStart + 1);
+          const sDurEff = sEndEff - sStart;
           const overlap = Math.min(pEndEff, sEndEff) - Math.max(pStart, sStart);
           if (overlap > 0) {
-            const midDiff = Math.abs(pMid - (sStart + sEnd) / 2);
-            if (
-              !bestOverlap ||
-              overlap > bestOverlap.overlap ||
-              (overlap === bestOverlap.overlap && midDiff < bestOverlap.midDiff)
-            ) {
-              bestOverlap = { cue: s, overlap, midDiff };
+            const bannerTier = (sDurEff - overlap) > BANNER_EXCESS_MS && overlap * 4 < sDurEff ? 1 : 0;
+            const cand = { cue: s, bannerTier, overlap, sDurEff, midDiff: Math.abs(pMid - (sStart + sEnd) / 2) };
+            if (!bestOverlap || isBetterOverlap(cand, bestOverlap, pDurEff)) {
+              bestOverlap = cand;
             }
             continue;
           }
-          if (bestOverlap) continue;
+          if (bestOverlap?.bannerTier === 0) continue;
           const gap = Math.max(0, Math.max(pStart, sStart) - Math.min(pEnd, sEnd));
           if (gap <= 1500) {
             const startDiff = Math.abs(pStart - sStart);
-            if (
-              !nearest ||
-              gap < nearest.gap ||
-              (gap === nearest.gap && startDiff < nearest.startDiff)
-            ) {
-              nearest = { cue: s, gap, startDiff };
+            const isLocal = sDurEff <= BANNER_EXCESS_MS * 2;
+            const prev = isLocal ? nearestLocal : nearestAny;
+            if (!prev || gap < prev.gap || (gap === prev.gap && startDiff < prev.startDiff)) {
+              const next = { cue: s, gap, startDiff };
+              if (isLocal) nearestLocal = next;
+              else nearestAny = next;
             }
           }
         }
       }
       const pText = p.text.trim();
-      const sText = (bestOverlap?.cue ?? nearest?.cue)?.text.trim() || "";
+      const chosen =
+        (bestOverlap?.bannerTier === 0 ? bestOverlap.cue : null) ??
+        nearestLocal?.cue ??
+        bestOverlap?.cue ??
+        nearestAny?.cue;
+      const sText = chosen?.text.trim() || "";
       if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
       const normS = norm(sText);
       const lines = new Set(pText.split("\n").map(norm));
@@ -1236,7 +1291,7 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   ];
   const w2BeyondStats = { totalScans: 0, maxScansPerCue: 0 };
   assert.deepEqual(subtitleEngine.mergeBilingualCues(w2Primary, w2Beyond, w2BeyondStats), [
-    { startMs: 100_000, endMs: 102_000, text: "W2-P\nW2-BANNER" },
+    { startMs: 100_000, endMs: 102_000, text: "W2-P\nw2-short-0" },
   ]);
   assert.equal(w2BeyondStats.maxScansPerCue, maxDualScans);
 
@@ -1320,4 +1375,76 @@ test("mergeBilingualCues bounds two-window scans to <= 1,024 per cue and < 500ms
   assert.equal(satMerged[0].text, "SAT-P-0\nSAT-LOCAL-0");
   assert.equal(satStats.maxScansPerCue, maxDualScans);
   assert.ok(satElapsedMs < 500, `dual-window saturation 10k x 10k took ${satElapsedMs.toFixed(1)}ms (>= 500ms)`);
+});
+
+test("mergeBilingualCues prefers heterogeneous local dialogues over long-lived full-video banners (F70-R2-01)", () => {
+  const banners = [
+    { startMs: 0, endMs: 10_000_000, text: "TOP-BANNER-A" },
+    { startMs: 500, endMs: 10_000_500, text: "TOP-BANNER-B" },
+  ];
+  const earlyNoise = Array.from({ length: 750 }, (_, i) => ({
+    startMs: 1_000 + i * 1_000,
+    endMs: 1_000 + i * 1_000 + 700,
+    text: `EARLY-EXPIRED-${i}`,
+  }));
+  const latePrimary = [];
+  const lateSecondary = [];
+  for (let i = 0; i < 600; i++) {
+    const pStart = 3_600_000 + i * 8_000;
+    const pEnd = pStart + 4_000;
+    latePrimary.push({ startMs: pStart, endMs: pEnd, text: `HET-PRI-${i}` });
+    const kind = i % 5;
+    if (kind === 0) {
+      // Case 1: secondary shorter than primary by 900ms
+      lateSecondary.push({ startMs: pStart, endMs: pEnd - 900, text: `HET-SEC-${i}` });
+    } else if (kind === 1) {
+      // Case 2: equal duration shifted by +120ms
+      lateSecondary.push({ startMs: pStart + 120, endMs: pEnd + 120, text: `HET-SEC-${i}` });
+    } else if (kind === 2) {
+      // Case 3: small 150ms tail overlap only
+      lateSecondary.push({ startMs: pEnd - 150, endMs: pEnd + 1_850, text: `HET-SEC-${i}` });
+    } else if (kind === 3) {
+      // Case 4: zero-duration point cue (startMs === endMs) inside primary window
+      lateSecondary.push({ startMs: pStart + 1_000, endMs: pStart + 1_000, text: `HET-SEC-${i}` });
+    } else {
+      // Case 5: zero overlap, adjacent within 250ms <= 1500ms tolerance
+      lateSecondary.push({ startMs: pEnd + 250, endMs: pEnd + 2_250, text: `HET-SEC-${i}` });
+    }
+  }
+
+  const stats = { totalScans: 0, maxScansPerCue: 0 };
+  const merged = subtitleEngine.mergeBilingualCues(
+    latePrimary,
+    [...banners, ...earlyNoise, ...lateSecondary],
+    stats,
+  );
+  assert.equal(merged.length, 600);
+  let exactHits = 0;
+  let bannerFallbacks = 0;
+  for (let i = 0; i < 600; i++) {
+    if (merged[i].text === `HET-PRI-${i}\nHET-SEC-${i}`) exactHits++;
+    if (merged[i].text.includes("TOP-BANNER")) bannerFallbacks++;
+  }
+  assert.equal(
+    exactHits,
+    600,
+    `Expected 600/600 heterogeneous local hits (got ${exactHits}/600, bannerFallbacks=${bannerFallbacks}, sample[0]=${JSON.stringify(merged[0]?.text)}, sample[3]=${JSON.stringify(merged[3]?.text)}, sample[4]=${JSON.stringify(merged[4]?.text)})`,
+  );
+  assert.equal(bannerFallbacks, 0, `Expected 0 banner overrides, got ${bannerFallbacks}`);
+  assert.ok(stats.maxScansPerCue <= 1_024, `maxScansPerCue=${stats.maxScansPerCue} exceeded 1024`);
+});
+
+test("mergeBilingualCues still falls back to long-lived banner when no local dialogue matches (F70-R2-01)", () => {
+  const secondary = [
+    { startMs: 0, endMs: 7_200_000, text: "PERSISTENT-BANNER" },
+    { startMs: 10_000, endMs: 13_000, text: "LOCAL-LINE-1" },
+  ];
+  const primary = [
+    { startMs: 10_000, endMs: 13_500, text: "P-WITH-LOCAL" },
+    { startMs: 600_000, endMs: 604_000, text: "P-ORPHAN-INSTRUMENTAL" },
+  ];
+  assert.deepEqual(subtitleEngine.mergeBilingualCues(primary, secondary), [
+    { startMs: 10_000, endMs: 13_500, text: "P-WITH-LOCAL\nLOCAL-LINE-1" },
+    { startMs: 600_000, endMs: 604_000, text: "P-ORPHAN-INSTRUMENTAL\nPERSISTENT-BANNER" },
+  ]);
 });

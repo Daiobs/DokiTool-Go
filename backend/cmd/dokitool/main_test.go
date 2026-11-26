@@ -2743,8 +2743,8 @@ func TestApplyCompartmentLimitTargetsReverseRollbackAndErrorJoin(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when generic compartment resize fails")
 	}
-	if !errors.Is(err, genericResizeErr) || !errors.Is(err, socialRollbackErr) {
-		t.Fatalf("expected joined resize + rollback errors, got: %v", err)
+	if !errors.Is(err, genericResizeErr) || !errors.Is(err, socialRollbackErr) || !errors.Is(err, errCompartmentRollbackFailed) {
+		t.Fatalf("expected joined resize + rollback + sentinel errors, got: %v", err)
 	}
 	// Verify reverse-order rollback attempted social first, then youtube (and youtube succeeded!).
 	wantOps := []string{"youtube:4->9", "social:6->10", "generic:2->5", "social:10->6", "youtube:9->4"}
@@ -2753,5 +2753,74 @@ func TestApplyCompartmentLimitTargetsReverseRollbackAndErrorJoin(t *testing.T) {
 	}
 	if yt.limit != 4 || generic.limit != 2 {
 		t.Fatalf("unexpected final limits: yt=%d generic=%d, want 4/2", yt.limit, generic.limit)
+	}
+}
+
+func TestReloadRuntimeConfigOnceLogsCriticalOnCompartmentRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime.json")
+	cfgJSON := `{"schema_version":"1.0","ytdlp":{"youtube_slots":9,"social_slots":10,"generic_slots":5}}`
+	if err := os.WriteFile(runtimePath, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := catalog.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := api.New(c, map[string]api.Adapter{}, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits, err := api.LoadAdmissionConfig(func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := api.WithAdmissionWithOwner(h, nil, "direct", "", limits, api.OwnerAuth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(k string) string {
+		if k == api.EnvRuntimeConfigFile {
+			return runtimePath
+		}
+		return ""
+	}
+
+	var ops []string
+	ytRollbackErr := errors.New("youtube rollback failure")
+	socialResizeErr := errors.New("social resize failure")
+	yt := &fakeCompartmentLimiter{name: "youtube", limit: 4, failLimit: 4, failErr: ytRollbackErr, ops: &ops}
+	social := &fakeCompartmentLimiter{name: "social", limit: 6, failLimit: 10, failErr: socialResizeErr, ops: &ops}
+	generic := &fakeCompartmentLimiter{name: "generic", limit: 2, ops: &ops}
+	ytCfg := ytdlpConfigResult{
+		testBuildTargets: func(ytSlots, socialSlots, genericSlots int) []compartmentLimitTarget {
+			return []compartmentLimitTarget{
+				{name: "youtube", limiter: yt, prev: yt.ConcurrencyLimit(), next: ytSlots},
+				{name: "social", limiter: social, prev: social.ConcurrencyLimit(), next: socialSlots},
+				{name: "generic", limiter: generic, prev: generic.ConcurrencyLimit(), next: genericSlots},
+			}
+		},
+	}
+
+	var logged []string
+	logf := func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	genBefore := h.RuntimeConfigGeneration()
+	if ok := reloadRuntimeConfigOnce(entry, h, &ytCfg, getenv, logf); ok {
+		t.Fatal("expected reloadRuntimeConfigOnce to fail when compartment #2 resize and compartment #1 rollback both fail")
+	}
+	if h.RuntimeConfigGeneration() != genBefore {
+		t.Fatalf("generation mutated despite rollback failure: got %d want %d", h.RuntimeConfigGeneration(), genBefore)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "dokitool: CRITICAL runtime config reload rollback failed") || strings.Contains(logged[0], "previous configuration preserved") {
+		t.Fatalf("expected CRITICAL rollback failure log without preserved claim, got: %q", logged)
+	}
+	if !strings.Contains(logged[0], "compartment rollback failed") || !strings.Contains(logged[0], "social resize failure") || !strings.Contains(logged[0], "youtube rollback failure") {
+		t.Fatalf("CRITICAL log missing joined root-cause errors: %q", logged[0])
+	}
+	wantOps := []string{"youtube:4->9", "social:6->10", "youtube:9->4"}
+	if strings.Join(ops, ",") != strings.Join(wantOps, ",") {
+		t.Fatalf("compartment ops = %v, want %v", ops, wantOps)
 	}
 }

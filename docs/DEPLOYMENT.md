@@ -23,7 +23,7 @@
 在与线上运行目录隔离的干净源码检出目录执行确定性构建：
 
 1. **精确检出源码树**：执行 `git fetch` 并 `git checkout --detach <40位目标SHA>`，强校验 `git rev-parse HEAD` 与 `git rev-parse HEAD^{tree}` 与目标提交完全一致，且工作区无未跟踪或修改文件。
-2. **后端编译**：使用 `backend/go.mod` 锁定的 Go `1.27.3`（`GOTOOLCHAIN=local`），以 `CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=<40位目标SHA>"` 构建 `./cmd/dokitool`（涉及上海解析端变更时同步构建 `./cmd/shanghai-resolver`），并执行 `<binary> version` 核对输出版本一致。
+2. **后端编译**：使用 `backend/go.mod` 锁定的 Go `1.27.4`（`GOTOOLCHAIN=local`），以 `CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=<40位目标SHA>"` 构建 `./cmd/dokitool`（涉及上海解析端变更时同步构建 `./cmd/shanghai-resolver`），并执行 `<binary> version` 核对输出版本一致。
 3. **前端编译**：在 `frontend/` 执行 `npm ci --ignore-scripts` 与同源模式 `npm run build`（勿单独运行 `vite build`，完整 `npm run build` 会同时产出客户端资源、预渲染首页 HTML 及 SEO 静态文件）。
 
 ### 3. 构建清单与关键产物核验

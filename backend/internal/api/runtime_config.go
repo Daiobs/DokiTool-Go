@@ -654,7 +654,8 @@ func (s *RuntimePolicySnapshot) DisabledPlatforms() []string {
 // ytengine compartment SetConcurrencyLimit) inside the serialized reload critical
 // section after validation and snapshot preparation, and before mutating admission
 // pools, circuit breakers, cache entries, or publishing the next policy snapshot.
-// Returning a non-nil error aborts the reload with zero state mutation.
+// Returning a non-nil error aborts the reload before admission/handler state is mutated
+// (the hook itself is responsible for best-effort compartment rollback on partial failure).
 type RuntimeConfigCommitHook func(next RuntimeConfig) error
 
 // ApplyRuntimeConfig applies a validated RuntimeConfig in-place to the live admission
@@ -665,9 +666,15 @@ func ApplyRuntimeConfig(entry http.Handler, handler *Handler, cfg RuntimeConfig,
 }
 
 // ApplyRuntimeConfigWithHook executes a serialized validate -> prepare -> commit
-// runtime config reload. Concurrent reloads are serialized under reloadMu; any
-// validation failure or non-nil hook error leaves admission pools, circuit breakers,
-// cache entries, RuntimePolicySnapshot, stats, and generation completely untouched.
+// runtime config reload. Concurrent reloads are serialized under reloadMu:
+//   - atomic.Pointer[RuntimePolicySnapshot] provides lock-free single-generation
+//     consistency for request-path policy reads;
+//   - external ytengine compartments and each admission *pool are updated sequentially
+//     in-place (thread-safe per pool without dropping active leases or FIFO waiters)
+//     rather than as a single cross-subsystem instant transaction.
+//
+// Validation errors or non-nil hook errors abort before admission pools, circuit breakers,
+// cache entries, RuntimePolicySnapshot, stats, or generation are modified.
 func ApplyRuntimeConfigWithHook(
 	entry http.Handler,
 	handler *Handler,
