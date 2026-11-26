@@ -42,7 +42,7 @@ DokiTool 将 PHP 后端和 Vue 3/Vite 前端整合为一个独立维护的项目
 
 本文件与 `UPSTREAM.json`（及历史初始快照 `.github/upstream-watch-baseline.json`）保留早期 PHP 后端与 Vue 前端的来源归属与许可记录。进入 `DokiTool-Go` 阶段后，GitHub Actions 每日定时任务改为检查 Go 期锁定的上游运行时（`yt-dlp/yt-dlp` 与 `denoland/deno`）正式版 Release 变化并通过专用 Issue 通知；此任务同样只检测不自动采用代码或部署。
 
-升级 `yt-dlp` 或 `Deno` 时，维护者可使用纯标准库辅助脚本 [`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 一键同步更新全仓 5 处锁定文件（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）中的版本号与官方 SHA-256 摘要（其中 Deno 校验归档内 `deno` 可执行文件本体的 SHA-256，绝不混用 `.zip` 归档哈希，且脚本绝不执行任何二进制）：
+升级 `yt-dlp` 或 `Deno` 时，维护者可使用纯标准库辅助脚本 [`scripts/bump-runtime-pins.py`](../scripts/bump-runtime-pins.py) 一键同步更新全仓 6 处锁定文件（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、`.github/workflows/release-build.yml`、`.github/workflows/upstream-canary.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）中的版本号与官方 SHA-256 摘要（其中 Deno 校验归档内 `deno` 可执行文件本体的 SHA-256，绝不混用 `.zip` 归档哈希，且脚本绝不执行任何二进制）：
 
 ```bash
 # 离线模式预览（零网络请求、零文件改写）

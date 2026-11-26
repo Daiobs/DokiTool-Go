@@ -40,6 +40,7 @@ All public JSON API endpoints require `schema_version=1.0` and return `applicati
 ### Agent Channel & Specifications
 
 - Optional Bearer API key authentication (`Authorization: Bearer <token>`) is available for automated agents and personal batch workflows; tokens must only be sent in the `Authorization` header (never in URL query parameters or forwarded to third-party media CDNs).
+- Zero-dependency Python 3.9+ Agent CLI and default read-only Stdio MCP Server (`tools/dokitool-agent/README.md`, `tools/dokitool-agent/SKILL.md`): supports `platforms`, `parse`, `resolve`, direct media download (with anti-SSRF IP pinning and default no-clobber protection), and VTT/SRT/`json3`/bilingual subtitle export.
 - Machine-readable OpenAPI 3.1.0 specification and Agent integration guide are maintained in the repository at `docs/openapi.json` and `docs/AGENT-API.md`.
 
 ## Monitoring

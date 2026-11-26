@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synchronize pinned yt-dlp and Deno versions and SHA-256 digests across all 5 lock files.
+"""Synchronize pinned yt-dlp and Deno versions and SHA-256 digests across all 6 lock files.
 
 Uses only the Python 3 standard library. Never executes downloaded or local binaries.
 Reuses authoritative version/digest patterns and verify_local_pin_consistency from
@@ -42,6 +42,7 @@ LOCK_FILES = _WATCH.LOCK_FILES
 YTDLP_SOURCE_REL = _WATCH.YTDLP_SOURCE_REL
 DENO_SOURCE_REL = _WATCH.DENO_SOURCE_REL
 RELEASE_BUILD_WORKFLOW_REL = _WATCH.RELEASE_BUILD_WORKFLOW_REL
+UPSTREAM_CANARY_WORKFLOW_REL = _WATCH.UPSTREAM_CANARY_WORKFLOW_REL
 GATEWAY_ISOLATION_WORKFLOW_REL = _WATCH.GATEWAY_ISOLATION_WORKFLOW_REL
 VALIDATION_REQUIREMENTS_REL = _WATCH.VALIDATION_REQUIREMENTS_REL
 WatchError = _WATCH.WatchError
@@ -539,10 +540,10 @@ def rewrite_ejs_sandbox_go(text, deno_version, deno_hashes):
     return updated
 
 
-def rewrite_release_build_workflow(text, deno_version, deno_linux_sha):
+def rewrite_deno_workflow(text, deno_version, deno_linux_sha, workflow_rel):
     validate_deno_version(deno_version)
     validate_sha256_hex(deno_linux_sha, 'deno-x86_64-unknown-linux-gnu SHA-256')
-    rel = RELEASE_BUILD_WORKFLOW_REL.as_posix()
+    rel = workflow_rel.as_posix()
     updated = _replace_exact_count(
         _RELEASE_STEP_TITLE_REPLACE_RE,
         lambda m: f'{m.group(1)}{deno_version}{m.group(3)}',
@@ -572,6 +573,14 @@ def rewrite_release_build_workflow(text, deno_version, deno_linux_sha):
         description=f'Deno version assertion in {rel}',
     )
     return updated
+
+
+def rewrite_release_build_workflow(text, deno_version, deno_linux_sha):
+    return rewrite_deno_workflow(text, deno_version, deno_linux_sha, RELEASE_BUILD_WORKFLOW_REL)
+
+
+def rewrite_upstream_canary_workflow(text, deno_version, deno_linux_sha):
+    return rewrite_deno_workflow(text, deno_version, deno_linux_sha, UPSTREAM_CANARY_WORKFLOW_REL)
 
 
 def rewrite_validation_requirements(text, deno_version):
@@ -764,6 +773,11 @@ def run_bump(
         )
         staged_texts[RELEASE_BUILD_WORKFLOW_REL] = rewrite_release_build_workflow(
             staged_texts[RELEASE_BUILD_WORKFLOW_REL],
+            deno_version,
+            deno_hashes['deno-x86_64-unknown-linux-gnu'],
+        )
+        staged_texts[UPSTREAM_CANARY_WORKFLOW_REL] = rewrite_upstream_canary_workflow(
+            staged_texts[UPSTREAM_CANARY_WORKFLOW_REL],
             deno_version,
             deno_hashes['deno-x86_64-unknown-linux-gnu'],
         )

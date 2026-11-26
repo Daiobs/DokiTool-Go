@@ -248,10 +248,10 @@ sudo sha256sum "/proc/${PID}/exe"
 
 ### 3.2 强制运行与安全红线
 
-1. **强制无头静默与零残留**：工具固定携带 `--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic`，使用独立临时 `--user-data-dir`，严禁弹出前台窗口或抢占焦点；`finally` 与信号处理分支强制销毁全部拉起的 Chrome 进程树与临时目录，并在退出前核验 `RESIDUAL_CHROME=0`。
+1. **强制无头静默与零残留**：工具固定携带 `--headless=new --no-first-run --no-default-browser-check --use-mock-keychain --password-store=basic`，使用独立临时 `--user-data-dir`，POSIX 平台通过 `--remote-debugging-pipe` 私有 FD 管道（零本机 TCP 端口暴露）控制 CDP，仅在 Chrome 不支持 `--load-extension` 时按需附带 `--enable-unsafe-extension-debugging`；严禁弹出前台窗口或抢占焦点，`finally` 与信号处理分支强制销毁全部拉起的 Chrome 进程树、关闭所有非保活 HTTP 句柄与临时目录，并在退出前核验 `RESIDUAL_CHROME=0`。
 2. **零本机硬编码与凭据禁令**：自动按 `DOKITOOL_CHROME_BIN` → Playwright 缓存最新 `Google Chrome for Testing` → 系统 Chrome/Chromium 探测浏览器，按 `--proxy` / `HTTPS_PROXY` / `HTTP_PROXY`（遵守 `NO_PROXY` 且回环直连）自动适配网络；拒绝 `--base-url` 或代理 URL 携带任何凭据；默认只读不修改 Git 跟踪文件、不执行 GitHub 写操作。
-3. **可选本地扩展原子同步**：仅当传入 `--sync-local-extension <dir>`、线上 ZIP 验签通过且目标路径**未被 Git 跟踪**（如 gitignored 的 `frontend/dist-extension`）时才原子解压同步。
-4. **Fail-Closed 输出脱敏**：写入 `--json-out` / `--md-out` 或打印 stdout 前自动拦截任何完整 `http(s)://`/`ws(s)://` URL、IPv4/IPv6、`xsec_token`/`owner_token`/`Bearer`、`ticket=`/`sign=`/`sig=`、查询串、`/api/media/` 路径及 `/Users/`、`/home/`、`C:\Users\` 等本机路径，命中即非零退出。
+3. **可选本地扩展原子同步（Fail-Closed）**：`--sync-local-extension <dir>` 强制要求同时传入 `--manifest <release-manifest.json>`（严格校验 ZIP 的 SHA-256 与 `size_bytes`），仅在目标路径**未被 Git 跟踪**、版本号单调不降级且**全部无头 Chrome 检查通过之后**才以 `{ flag: "wx" }` 原子解压同步。
+4. **运行态元数据与 Fail-Closed 输出脱敏**：常规模式同步校验 `/helper/extension-version.json`（`http_extension_version_json`）并与线上 ZIP 版本及 `sha256` 交叉一致；写入 `--json-out` / `--md-out` 或打印 stdout 前自动拦截任何完整 `http(s)://`/`ws(s)://` URL、IPv4/IPv6、`xsec_token`/`owner_token`/`Bearer`、`ticket=`/`sign=`/`sig=`、查询串、`/api/media/` 路径及 `/Users/`、`/home/`、`C:\Users\` 等本机路径，命中即非零退出。
 
 ### 3.3 三级风险分档（`skip` / `lite` / `full`）
 
@@ -303,9 +303,10 @@ node scripts/prod-smoke/stage2_browser.mjs \
 
 | 检查项 (`id`) | 分组 (`group`) | 结论 (`status`) | 耗时 (ms) | 媒体域名 (`media_hostnames`) | 关键核对摘要 (`note`) |
 | --- | --- | --- | ---: | --- | --- |
-| `artifact_extension_zip` | `artifact_verify` | **PASS** | 320 | - | `size=<N>B, sha256[:12]=<hex>, files=13, v4.2.0, id=ihamkldlkdibleacagiejklpfofapkpo, manifestMatch=true, zeroContentScripts=true, zeroCookies=true` |
+| `artifact_extension_zip` | `artifact_verify` | **PASS** | 320 | - | `size=<N>B, sha256[:12]=<hex>, files=13, v4.5.0, id=ihamkldlkdibleacagiejklpfofapkpo, manifestMatch=true, zeroContentScripts=true, zeroCookies=true` |
+| `http_extension_version_json` | `http_surface` | **PASS** | 90 | - | `version=4.5.0, id=ihamkldlkdibleacagiejklpfofapkpo, sha256Match=true, cacheControl=no-cache` |
 | `web_home_hydration` | `pure_web_chrome` | **PASS** | 450 | - | `hydrated=true, themeBootstrap=true, colorScheme=light, csp=0, consoleErr=0, pageErr=0` |
 | `web_sw_bridge` | `pure_web_chrome` | **PASS** | 120 | - | `scope=/downloads/, bridgeControlled=true, workerBuild=<BUILD>, admission=true` |
 | `web_monitor_responsive` | `pure_web_chrome` | **PASS** | 280 | - | `desktop(1440x900) overflow=0px, mobile(390x844) overflow=0px, csp=0, consoleErr=0, pageErr=0` |
-| `ext_bridge_handshake` | `official_extension_chrome` | **PASS** | 680 | - | `WEB_EXT_PING ok (v4.2.0, id=ihamkldlkdibleacagiejklpfofapkpo, caps=dash_mux,direct_download,youtube_parse,youtube_mux), noUpdateNotice=true, ytHelperGlobal=false, csp=0, consoleErr=0, pageErr=0` |
+| `ext_bridge_handshake` | `official_extension_chrome` | **PASS** | 680 | - | `WEB_EXT_PING ok (v4.5.0, id=ihamkldlkdibleacagiejklpfofapkpo, caps=dash_mux,direct_download,youtube_parse,youtube_mux), noUpdateNotice=true, ytHelperGlobal=false, csp=0, consoleErr=0, pageErr=0` |
 ````

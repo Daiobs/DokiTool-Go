@@ -5,7 +5,7 @@ Modes:
   --offline      Deterministic, zero-network repository supply-chain audit:
                    1. frontend/package-lock.json: every non-root package entry
                       (excluding verified in-repo workspace links) MUST have
-                      valid SRI integrity (sha512/sha384/sha256/sha1) and an
+                      valid SRI integrity (sha512/sha384/sha256) and an
                       HTTPS resolved tarball URL on an allowed npm registry
                       (rejects git+, http://, file:, non-registry tarballs).
                    2. backend/go.mod & backend/go.sum: both exist and non-empty,
@@ -57,7 +57,7 @@ ALLOWED_NPM_REGISTRY_HOSTS: Set[str] = {
     "registry.npmmirror.com",
 }
 
-SRI_TOKEN_RE = re.compile(r"^sha(?:512|384|256|1)-[A-Za-z0-9+/]{16,}={0,2}$")
+SRI_TOKEN_RE = re.compile(r"^sha(?:512|384|256)-[A-Za-z0-9+/]{16,}={0,2}$")
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 DOCKER_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -461,7 +461,7 @@ def check_npm_lockfile(
         if not _is_valid_sri(meta.get("integrity")):
             violations.append(
                 f"[npm-lock-integrity] {pkg_path}: missing or invalid SRI integrity hash "
-                f"(expected sha512/sha384/sha256/sha1-...): {meta.get('integrity')!r}"
+                f"(expected sha512/sha384/sha256-...): {meta.get('integrity')!r}"
             )
 
         resolved_err = _validate_npm_resolved_url(pkg_path, meta.get("resolved"), hosts)

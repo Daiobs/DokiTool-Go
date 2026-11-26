@@ -1,132 +1,285 @@
-# DokiTool
+<p align="center">
+  <img src="frontend/public/dokitool.svg" width="96" height="96" alt="DokiTool Logo" />
+</p>
 
-DokiTool 是面向多平台的公开短视频、图集与实况照片无水印解析及浏览器直连保存工具，线上站点：<https://snap.dokitool.com>。
+<h1 align="center">DokiTool</h1>
 
-## 支持平台（14 个）
+<p align="center">
+  <strong>多平台公开媒体无水印解析 · 浏览器零 Cookie 直连下载 · Chrome MV3 侧边栏合流 · 零依赖 Agent CLI &amp; MCP</strong>
+</p>
 
-平台目录真值位于 `backend/config/platforms.json` 与 `backend/internal/catalog/catalog.go`（部分平台按服务端启动开关启用，详见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）。前端粘贴文本时会自动提取首个 `http(s)` 链接并剥离尾随标点。
+<p align="center">
+  <a href="#-5-分钟快速上手"><img src="https://img.shields.io/badge/Quick_Start-5_min-4f46e5?style=for-the-badge" alt="Quick Start" /></a>
+  <a href="https://snap.dokitool.com"><img src="https://img.shields.io/badge/Live_Demo-snap.dokitool.com-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Live Demo" /></a>
+  <a href="docs/EXTENSION.md"><img src="https://img.shields.io/badge/Chrome_MV3-v4.5.0-10b981?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Chrome MV3 v4.5.0" /></a>
+  <a href="tools/dokitool-agent/README.md"><img src="https://img.shields.io/badge/Agent_CLI_%26_MCP-Stdlib_Only-8b5cf6?style=for-the-badge&logo=python&logoColor=white" alt="Agent CLI and MCP" /></a>
+  <a href="docs/openapi.json"><img src="https://img.shields.io/badge/OpenAPI-3.1.0-0284c7?style=for-the-badge&logo=openapiinitiative&logoColor=white" alt="OpenAPI 3.1.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-64748b?style=for-the-badge" alt="MIT License" /></a>
+</p>
 
-| 平台 | 支持媒体类型 | 接受的链接形式（含短链与域名归一化） | 已知限制 |
+<p align="center">
+  <img src="https://img.shields.io/badge/Go-1.27.4-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.27.4" />
+  <img src="https://img.shields.io/badge/Vue-3_%2B_Vite-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white" alt="Vue 3 + Vite" />
+  <img src="https://img.shields.io/badge/Platforms-14_Core_%2B_1000%2B_Long--Tail-ec4899?style=flat-square" alt="Platforms" />
+  <img src="https://img.shields.io/badge/Privacy-Zero--Cookie-16a34a?style=flat-square" alt="Zero-Cookie" />
+  <img src="https://img.shields.io/badge/Supply_Chain-SLSA_v1_%2B_SHA--256-f59e0b?style=flat-square" alt="SLSA v1" />
+  <img src="https://img.shields.io/badge/Tests-L1--L4_Regression-6366f1?style=flat-square" alt="L1-L4 Tests" />
+</p>
+
+> [!TIP]
+> **🌐 纯 Web 零安装**：访问 [**snap.dokitool.com**](https://snap.dokitool.com)，粘贴分享链接即可解析并由浏览器无 Cookie 直连上游 CDN 流式保存（基于统一媒体契约 `schema_version=1.0`）。
+
+> [!IMPORTANT]
+> **🧩 [Chrome MV3 侧边栏原生扩展 `v4.5.0`](docs/EXTENSION.md)**：免油猴直接支持 **YouTube 4K60** 与 **B 站免登录 1080P DASH** 本地 `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出、后台多 P 流式队列、运行态 `/helper/extension-version.json` 自动同步检测与单端口回环权限隔离。
+
+> [!NOTE]
+> **🤖 [零依赖 Agent CLI & Stdio MCP Server](tools/dokitool-agent/README.md)**：仅需 Python 3.9+ 标准库（零 `pip`），自带 [`SKILL.md`](tools/dokitool-agent/SKILL.md)，默认 **100% 只读** 接入 Claude Code / Cursor / Codex，内置公网 IP pinning、默认不覆盖落盘（no-clobber）与 `json3`/VTT/SRT 字幕提取。
+
+---
+
+## ✨ 核心亮点
+
+- **🌐 14 个核心平台 + 1000+ Tier-2 长尾站点**：主目录覆盖抖音、快手、B 站、小红书、今日头条、微博、皮皮虾、皮皮搞笑、最右、X、YouTube、Instagram、Facebook、Tumblr；可选开启 `DOKITOOL_YTDLP_GENERIC_ENABLED` 后，未命中核心目录的合法公网链接自动走受控具名提取器隔离池（严禁盲抓 `generic`）。
+- **🎬 免油猴 4K60 & B 站 1080P 无损合流**：Chrome MV3 扩展 `v4.5.0` 采用 `sidePanel` + `background` + `offscreen` OPFS 架构，本地并发拉流并用 `Mediabunny 1.65.2` 无重编码封装完整 `.mp4`，关闭侧边栏不断流，无需安装 Tampermonkey。
+- **💬 纯客户端 VTT / SRT / 双语字幕导出**：侧边栏与 Agent 工具链均支持单轨 VTT/SRT 转换、双语主副字幕时间轴合并与 YouTube `json3` 字幕解析，零服务端字幕代理。
+- **🚀 日本主解析 + 上海国内线路补充**：主后端与上海 `shanghai-resolver` 节点通过出站 `pull` 长轮询（`v2` 协议）协同补充抖音国内 `*.douyinvod.com` 4K 原画及可选 B 站国内线路，前端自动对多条线路并发 Range 测速择优。
+- **📊 `/monitor` 只读运维大盘 + `SIGHUP` 热配置**：原生 SVG + CSS 宽屏监控大盘覆盖 9 大只读观测区块，令牌仅驻留页面内存或单标签页 `sessionStorage`；支持 `SIGHUP` 原地无损热重载多 Key 注册表与分舱/熔断策略。
+- **🛡️ 供应链与契约硬门禁**：`yt-dlp` 与 `Deno` 全仓 6 处锁定文件 SHA-256 强制对账、GitHub Actions 40 位 SHA 引脚、SLSA v1 构件溯源验签、SSOT 全栈一致性门禁与 L1–L4 自动化回归。
+
+---
+
+## 🎯 三端能力矩阵
+
+| 能力维度 | 🌐 纯 Web SPA（零安装） | 🧩 Chrome MV3 扩展（`v4.5.0`） | 🤖 Agent CLI & Stdio MCP |
 | --- | --- | --- | --- |
-| 抖音（`douyin`） | 视频 / 图片 / 实况 | `douyin.com`（`www.douyin.com`、`v.douyin.com`）、`iesdouyin.com` | 不支持合集链接（`mix_id`） |
-| 快手（`kuaishou`） | 视频 / 图片 | `kuaishou.com`（`www.kuaishou.com/short-video/...`、`/f/...`、`v.kuaishou.com`、`c.kuaishou.com`） | 仅公开分享作品；触发上游页面风控时返回 `UPSTREAM_BLOCKED` |
-| 哔哩哔哩（`bilibili`） | 视频 | `bilibili.com`（`www.bilibili.com`、`m.bilibili.com`）、`b23.tv` | 多 P 分集按需逐集调用 `/api/resolve`；不支持番剧、付费或大会员专享稿件 |
-| 小红书（`xiaohongshu`） | 视频 / 图片 / 实况 | `xiaohongshu.com`、`xhslink.com`、`rednote.com` | 网页直链须含 `xsec_token`，缺失时需从小红书 App 复制分享链接 |
-| 今日头条（`toutiao`） | 视频 | `toutiao.com`（`www.toutiao.com`、`m.toutiao.com` 的 `/video/`、`/group/`、`/i<id>`） | `*.toutiaovod.com` 上游无跨域读取头与附件下载头，通过「打开源链接」在新标签页右键「视频另存为」（手机端长按保存） |
-| 微博（`weibo`） | 视频 | `weibo.com`、`www.weibo.com`、`video.weibo.com/show?fid=...`、`m.weibo.cn` | 视频经本站 `/api/media/weibo` 短期签名票据（30 分钟有效）中转，依赖服务端配置签名密钥 |
+| **安装与依赖** | 打开网页即用 | 解压加载 `dokitool-chrome-extension.zip`（Chrome/Edge 116+） | Python 3.9+ 标准库（零第三方 `pip` 依赖） |
+| **14 核心平台 + 长尾站点** | 支持（14 核心 + 服务端开启时支持长尾） | 支持（标签页自动跟随严格限 14 核心，主动输入/右键支持长尾） | 支持（受 Key `platforms` 白名单与预算控制） |
+| **YouTube HD / 4K60** | 可选安装油猴脚本 `1.3.2` 或跳转使用扩展 | **内置免油猴**（`TVHTML5` + Deno 沙箱解算 + OPFS `Mediabunny` 合流） | 默认跳过（YouTube 流通常绑定出口 IP，优先走扩展） |
+| **B 站 1080P DASH** | 渐进式 MP4 预览与下载 | **免登录 1080P（AVC/HEVC/AV1）+ 30280 AAC 无损合流 & 独立 M4A** | 支持渐进式直链与多 P `/api/resolve` |
+| **字幕提取与双语导出** | 展示字幕附件直链 | **纯客户端 VTT / SRT / 双语合并落盘**（5 MiB 单轨上限） | **CLI/MCP 支持 VTT / SRT / `json3` / 双语导出**（带扇出与字节上限） |
+| **多图 / 多 P / 历史** | 单图直存、多图 `<= 500 MiB` ZIP、SW 流式下载 | 子目录无上限流式落盘、后台多 P 队列、G6 脱敏 50 条持久化历史 | 流式 `.part` 落盘、默认 no-clobber 防覆盖、可选 `--overwrite` |
+| **权限与安全边界** | 同源 `/downloads/` SW、零 Cookie 直连 CDN | 零 `<all_urls>`、零 Content Script、DNR `1004/1006–1008`、单端口回环隔离 | 默认 100% 只读 MCP、逐跳公网 IP pinning、严格后缀白名单 |
+
+---
+
+## 🏗️ 系统架构与数据流
+
+```mermaid
+flowchart LR
+    subgraph Clients["客户端（零 Cookie 直连媒体 CDN）"]
+        Web["Web SPA (Vue 3 + SW)"]
+        Ext["Chrome MV3 扩展 v4.5.0\n(sidePanel + offscreen OPFS)"]
+        Agent["Agent CLI & Stdio MCP\n(Python 3.9+ stdlib)"]
+    end
+
+    subgraph Edge["边缘网关"]
+        Caddy["Caddy 显式路径白名单\n(/api/* · /downloads/* · /helper/*)"]
+    end
+
+    subgraph Backend["主后端服务 (Go 1.27.4)"]
+        GoAPI["dokitool serve\n(统一契约 v1.0 · 5 核心准入池 + 缓存 + 熔断)"]
+        Deno["零权限 Deno 2.9.8 沙箱\n(yt-dlp/ejs 签名解算)"]
+        YTDLP["受锁 yt-dlp 回环网关\n(分舱池: youtube/social/generic)"]
+        SH["上海节点 shanghai-resolver\n(出站 pull v2 补充国内线路)"]
+    end
+
+    CDN["上游平台媒体 CDN\n(直连下载 / 仅微博走 HMAC /api/media/weibo 例外)"]
+
+    Web --> Caddy
+    Ext --> Caddy
+    Agent --> Caddy
+    Caddy --> GoAPI
+    GoAPI --> Deno
+    GoAPI --> YTDLP
+    SH -. "出站长轮询认领任务" .-> GoAPI
+    Web -. "无 Cookie 直连拉流 / 测速" .-> CDN
+    Ext -. "无 Cookie OPFS 合流 / DNR 隔离" .-> CDN
+    Agent -. "无 Cookie + IP Pinning 直连" .-> CDN
+```
+
+- **浏览器/客户端直连 CDN，服务端仅解析**：Go 后端只处理输入校验、平台解析与统一契约 `schema_version=1.0` 输出；音视频与图片字节由用户端直接拉取，**微博视频（`/api/media/weibo` 30 分钟短期 HMAC 票据）是唯一的服务端流式中转例外**。
+- **运行态版本单源同步**：前端与扩展共享 `frontend/src/core/extensionReleaseMeta.json` 与线上 `/helper/extension-version.json`（含 `version`、`extensionId` 与 ZIP `sha256`），长驻未刷新的 Web 页面打开下载弹窗或切回前台即可实时感知新版本并准确区分「2 步覆盖升级」与「3 步全新安装」。
+
+---
+
+## ⚡ 5 分钟快速上手
+
+### 1️⃣ 纯 Web 零安装
+
+直接打开 [**https://snap.dokitool.com**](https://snap.dokitool.com)，粘贴任意支持平台的分享口令或链接即可预览画质、切换线路并流式保存到本地。
+
+### 2️⃣ 安装 Chrome MV3 扩展 `v4.5.0`（推荐桌面用户）
+
+1. 下载官方预构建包：[`https://snap.dokitool.com/helper/dokitool-chrome-extension.zip`](https://snap.dokitool.com/helper/dokitool-chrome-extension.zip)（根目录直出 `manifest.json`，也可在站点顶部「Chrome 扩展」弹窗下载）；
+2. 解压至本地目录，在 Chrome 打开 `chrome://extensions/` 并开启右上角 **「开发者模式」**；
+3. 将解压后的目录拖入扩展页面即可加载（固定到工具栏或按 **`Alt+Shift+D`** 随时呼出侧边栏）。
+
+> **升级旧版只需 2 步**：下载新版压缩包覆盖解压到原目录 → 在 `chrome://extensions/` 点击扩展卡片上的 **刷新** 按钮，偏好设置、主题与脱敏历史完整保留。详细构建与权限说明见 [docs/EXTENSION.md](docs/EXTENSION.md)。
+
+### 3️⃣ AI Agent CLI & Stdio MCP Server（零 `pip` 依赖）
+
+```bash
+# 1. 列出当前实例启用平台（零凭据即可匿名验证）
+python3 tools/dokitool-agent/dokitool_agent.py platforms
+
+# 2. 解析单条分享链接（配置 DOKITOOL_API_TOKEN 走个人配额池）
+export DOKITOOL_API_TOKEN='<your-token-from-secret-store>'
+python3 tools/dokitool-agent/dokitool_agent.py parse 'https://www.douyin.com/video/EXAMPLE_ID'
+
+# 3. 作为默认 100% 只读 Stdio MCP Server 接入 Claude Code / Cursor / Codex
+python3 tools/dokitool-agent/mcp_server.py
+```
+
+更多子命令（`resolve`、`download`、`subtitles`、`--overwrite`、批量脚本）与 MCP 写操作显式开启参数见 [tools/dokitool-agent/README.md](tools/dokitool-agent/README.md) 与 [tools/dokitool-agent/SKILL.md](tools/dokitool-agent/SKILL.md)。
+
+### 4️⃣ 开发者本地全栈启动
+
+环境要求：**Go `1.27.4`**（见 `backend/go.mod`）、**Node.js `20+`**（CI 锁定 `24`）、**Python `3.9+`**。
+
+```bash
+# 1. 前端依赖安装、类型检查、单测与生产构建（含扩展包、预渲染与首屏体积门禁）
+cd frontend
+npm ci --ignore-scripts
+npm run typecheck && npm test && npm run build
+
+# 2. 后端全量竞态检测单测与本地回环启动
+cd ../backend
+go test -race ./...
+go run ./cmd/dokitool serve -listen 127.0.0.1:18080
+
+# 3. 仓库契约、SSOT 与离线供应链总检
+cd ..
+python3 -B scripts/check-ssot-consistency.py
+python3 -B scripts/check-supply-chain.py --offline
+```
+
+---
+
+## 🌐 平台支持范围（14 核心平台 + 1000+ 长尾站点）
+
+- **核心目录 SSOT**：`backend/config/platforms.json`（同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）与 `backend/config/platforms_extra.json`。
+- **Tier-2 长尾兜底**：启用 `DOKITOOL_YTDLP_GENERIC_ENABLED=true` 后，`GET /api/parse` 在 `platform=all`（或省略）模式下可将合法公网长尾链接路由至独立 `PARSE_GENERIC` 隔离池（覆盖 Vimeo、TikTok、Reddit、SoundCloud 等 1000+ 具名提取器，严格禁用盲抓 `generic`）。
+
+<details>
+<summary><strong>点击展开：14 个核心平台链接形式、交付方式与已知限制明细表</strong></summary>
+
+| 平台 | 支持媒体类型 | 接受的链接形式（含短链与域名归一化） | 交付方式与已知限制 |
+| --- | --- | --- | --- |
+| 抖音（`douyin`） | 视频 / 图片 / 实况 | `douyin.com`（`www.`、`v.`）、`iesdouyin.com` | 上海 `pull` 通道补充国内 4K 原画，不支持合集链接（`mix_id`） |
+| 快手（`kuaishou`） | 视频 / 图片 | `kuaishou.com`（`/short-video/`、`/f/`、`v.`、`c.`） | 仅公开分享作品；触发上游页面风控时返回 `UPSTREAM_BLOCKED` |
+| 哔哩哔哩（`bilibili`） | 视频 / 多 P | `bilibili.com`（`www.`、`m.`）、`b23.tv` | Chrome 扩展支持免登录 1080P DASH 合流与独立 M4A；多 P 按需调用 `/api/resolve`；不支持番剧/付费/大会员专享 |
+| 小红书（`xiaohongshu`） | 视频 / 图片 / 实况 | `xiaohongshu.com`、`xhslink.com`、`rednote.com` | 网页直链须含 `xsec_token`，缺失时请从小红书 App 复制分享链接 |
+| 今日头条（`toutiao`） | 视频 | `toutiao.com`（`www.`、`m.` 的 `/video/`、`/group/`、`/i<id>`） | `*.toutiaovod.com` 无 CORS 与附件头，Web 端通过「打开源链接」右键另存为 |
+| 微博（`weibo`） | 视频 | `weibo.com`、`www.weibo.com`、`video.weibo.com/show?fid=...`、`m.weibo.cn` | 匿名网页经 `/api/media/weibo` 30 分钟 HMAC 票据中转；Bearer 通道返回直链（直连需 `Referer: https://weibo.com/`） |
 | 皮皮虾（`pipixia`） | 视频 / 图片 | `pipix.com`（`h5.pipix.com/item/...`、`/ppx/item/...`） | 仅支持公开分享帖子 |
-| 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP 打包），失败回退手动打开源链接 |
+| 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP），失败回退手动打开 |
 | 最右（`zuiyou`） | 视频 / 图片 | `izuiyou.com`、`share.xiaochuankeji.cn` | 线上关闭视频 `tbvideo` 改写，视频通过「打开源链接」手动保存；图片支持直下与打包 |
-| X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（含 `www.`、`mobile.`、`m.` 状态页及 `/photo/<N>`、`/video/<N>`）、`t.co`（受控单跳展开至推文页） | `t.co` 未指向有效推文页时返回 `INVALID_INPUT`；纯文本推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需开启 `-x-tombstone-fallback=fxtwitter` 才查询公开回退源 |
-| YouTube（`youtube`） | 视频 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | 桌面端需安装并启用用户脚本 `DokiTool YouTube Helper`（`1.3.2`）取址与浏览器内无损合并；手机端无脚本管理器时暂不支持 |
-| Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.`）、`instagr.am`（`www.`）的 `/p/`、`/reel/`、`/reels/`、`/tv/` | `instagr.am` 仅接受标准帖子/Reels/TV 短链路径；不支持 Stories（`/stories/`）及私密或需登录帖（返回 `UPSTREAM_BLOCKED`） |
-| Facebook（`facebook`） | 视频 | `facebook.com`、`www.facebook.com`、`m.facebook.com`、`fb.watch` | `fb.watch` 短链需登录展开，接口直接返回 `INVALID_INPUT` 提示先在浏览器打开并复制 `facebook.com` 完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
+| X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（状态页、`/photo/<N>`、`/video/<N>`）、`t.co`（受控单跳） | 纯文字推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需启用 `-x-tombstone-fallback=fxtwitter` |
+| YouTube（`youtube`） | 视频 / 字幕 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | **推荐使用 Chrome MV3 扩展 `v4.5.0` 免油猴解析、4K60 无损合流与双语字幕导出**；桌面纯 Web 亦可选装 `DokiTool YouTube Helper`（`1.3.2`）用户脚本 |
+| Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.`）、`instagr.am`（`/p/`、`/reel/`、`/reels/`、`/tv/`） | 不支持 Stories（`/stories/`）及私密/需登录帖（返回 `UPSTREAM_BLOCKED`） |
+| Facebook（`facebook`） | 视频 | `facebook.com`、`www.`、`m.`、`fb.watch` | `fb.watch` 短链需登录展开，接口提示先在浏览器打开并复制完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
 | Tumblr（`tumblr`） | 视频 | `tumblr.com`、`www.tumblr.com`、`*.tumblr.com` | 仅支持公开视频帖（单帖最多提取 4 个视频条目） |
 
-## 架构概览
+</details>
 
-- **浏览器直下，服务端仅解析**：Go 后端负责输入校验、上游页面/接口解析与统一媒体 v1（`schema_version=1.0`）契约输出；媒体文件由用户浏览器直接连接平台 CDN 下载（通过同源 Service Worker 流式落盘、缓冲拼接或原生附件移交）。**微博视频（`/api/media/weibo`）是唯一的服务端签名媒体流中转例外**。
-- **日本主解析 + 上海国内线路补充（抖音与可选哔哩哔哩）**：主后端承担全站路由与准入限流；上海 `shanghai-resolver` 通过出站 `pull` 模式（`v2` 协议）保持在线：默认认领抖音 `aweme_id` 提取国内 `*.douyinvod.com` 各档清晰度与 4K 原画候选，并在主后端显式开启 `DOKITOOL_SHANGHAI_BILIBILI`（默认关闭）时认领哔哩哔哩 `(bvid, cid)` 补充国内 `*.bilivideo.com` 播放地址，交回主后端合并后由前端并发测速择优下载；上海忙碌或超时时主后端无阻塞回退本地解析。
-- **YouTube 浏览器端取址与无损合并**：桌面浏览器安装同源用户脚本 `dokitool-youtube.user.js` 后，在客户端直接向 `www.youtube.com` 请求播放清单，交由服务端无权限 Deno `ejs` 沙箱解算签名挑战；`1080p` / `4K` 等分离音视频由脚本并发拉取 `googlevideo.com` 并在浏览器内用 Mediabunny 无损封装保存。
-- **Chrome MV3 原生侧边栏扩展（可选）**：桌面 Chrome 用户亦可通过 `cd frontend && npm run build:extension` 构建并加载原生扩展（`sidePanel` + `offscreen` 架构），支持关闭侧边栏后台保活落盘、右键极速下载、`Alt+Shift+D` 呼出、多链接批量队列与免油猴 YouTube 4K60 无损合流，且严格遵循零 Cookie、零 Content Script 与显式 CDN 白名单边界（详见 [docs/EXTENSION.md](docs/EXTENSION.md)）。
+---
 
-## 目录结构
+## 📊 监控大盘与运维热配置
+
+- **宽屏只读监控面板（`/monitor`）**：纯原生 SVG + CSS 渲染（零第三方图表库、严格 `noindex`、零写入端点），需携带 `owner` 角色 Bearer Token 查询 `GET /api/stats`；令牌仅存页面内存或可选单标签页 `sessionStorage`（绝不写入 `localStorage` / Cookie / URL 参数）。集中展示核心指标卡、11 项脱敏运行开关、准入与 `yt-dlp` 分舱水位、14 平台熔断器状态、近 30 天日趋势 / 近 24 小时时趋势、平台健康度排行与多 Key 统计表。
+- **`SIGHUP` 无损热重载**：配置 `DOKITOOL_API_KEYS_FILE` 或 `DOKITOOL_RUNTIME_CONFIG_FILE` 后，执行 `kill -HUP <PID>` 或 `systemctl reload dokitool-go` 即可原地热更新多角色密钥、分舱并发、单平台熔断与 `disabled_platforms` 秒级止血策略，新配置校验失败自动回退保留原内存策略。
+
+<details>
+<summary><strong>点击展开：多池准入与限流分舱规则速查</strong></summary>
+
+服务端按可信客户端 IPv4 或 IPv6 `/64` 前缀隔离匿名预算（另保留微博流中转 `DOKITOOL_WEIBO_` 与下载上报 `DOKITOOL_REPORT_` 辅助池；完整参数见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）：
+
+| 准入池 | 环境变量前缀 | 覆盖请求范围与分流规则 |
+| --- | --- | --- |
+| `fast` | `DOKITOOL_PARSE_` | 未命中缓存的纯 Go 国内平台 `GET /api/parse`（含热配置单平台舱壁 `fast_per_platform_max_concurrency`）及已退役旧路径 |
+| `resolve` | `DOKITOOL_RESOLVE_` | 未命中缓存的纯 Go 平台按需分集解析 `GET /api/resolve`（如 B 站多 P），拥有更宽的独立单 IP 突发与并发配额 |
+| `slow` | `DOKITOOL_PARSE_SLOW_` | 未命中缓存的海外慢解析平台（`x`、`youtube`、`instagram`、`facebook`、`tumblr`）及未命中缓存的 YouTube EJS 助手端点 |
+| `generic_slow` | `DOKITOOL_PARSE_GENERIC_` | 启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，第二级长尾具名提取器兜底使用的独立隔离准入池与子进程槽位 |
+| `catalog` | `DOKITOOL_CATALOG_` | `GET /api/platforms`、命中缓存的 `GET /api/youtube/context`，以及命中进程内新鲜缓存的匿名 `GET /api/parse` / `GET /api/resolve` |
+| `owner` / 多 Key | `DOKITOOL_OWNER_*` / `DOKITOOL_API_KEYS_FILE` | 按密钥独立并发池、慢解析子并发上限与零槽位新鲜缓存快路径；无效鉴权头扣减来源 IP 防刷配额并返回 `401` / `429`，绝不静默降级 |
+
+</details>
+
+---
+
+## 🛡️ 安全与隐私红线
+
+- **零 Cookie 与逐跳防 SSRF**：服务端与三端客户端均不采集或转发平台账号 Cookie；所有服务端出站请求及 `tools/dokitool-agent` / 示例批量下载器均执行逐跳重定向重验、禁止 `https -> http` 降级、禁止非标准端口与公网 IP 绑定拨号（拦截回环、私网、链路本地与云元数据地址）。
+- **零服务端媒体中转**：音视频、图片与字幕字节由用户端直连拉取；仅匿名网页访客的微博视频例外，使用 30 分钟短期 HMAC-SHA256 签名票据且受慢写超时与响应类型校验保护。
+- **Chrome MV3 最小权限隔离**：零 `content_scripts`、零 `<all_urls>`、零 `cookies` 权限；DNR 规则（含 B 站国内 Rule `1004` 与海外 Akamai UPOS 窄匹配 Rule `1006–1008`）严格限定 `initiatorDomains: [chrome.runtime.id]`；本机调试回环地址按单端口精确申请并在切换源站时自动回收；被动落盘执行严格安全后缀白名单。
+- **Agent 与运维脚本边界**：`tools/dokitool-agent` 默认只读 MCP、下载默认 `overwrite=False`（原子 `os.link` 防静默覆盖）、字幕与多轨解析带深度/字节/墙钟上限；阶段二无头验收工具 `stage2_browser.mjs` 强制 `--headless=new`、`--remote-debugging-pipe` 私有管道与 Fail-Closed 脱敏扫描。
+- **供应链与生产治理**：`yt-dlp` 与 `Deno` 全仓 6 处锁定文件 SHA-256 强门禁、GitHub Actions 40 位 commit SHA 引脚、npm SRI 禁弱 `sha1-`、`.github/workflows/release-build.yml` 静态 `CGO_ENABLED=0` + SLSA v1 构件溯源；**合入 `main` 不自动上线，一切生产变更仅通过发布 Issue 执行**。
+
+---
+
+## 🧪 L1–L4 自动化回归与仓库结构
+
+| 层级 | 覆盖范围 | 核心入口 |
+| --- | --- | --- |
+| **L1 离线契约 & 单测** | Go `-race` 全量包单测、统一 Schema v1、OpenAPI 3.1.0、6 文件运行时锁、SSOT 7 项一致性门禁、供应链离线审计、前端 31 组单测 & 首屏体积预算 | `go test -race ./...` · `npm test` · `scripts/check-ssot-consistency.py` · `scripts/check-supply-chain.py --offline` |
+| **L2 无头浏览器 E2E** | 真实 `--headless=new` Chrome（`--remote-debugging-pipe`）加载扩展与 SW：水合、主题、桥接握手、OPFS 合流、文件名冲突对抗、零残余进程 `RESIDUAL_CHROME=0` | `scripts/test-extension-e2e.mjs` · `scripts/test-download-browser.mjs` · `scripts/prod-smoke/test_stage2_browser.mjs` |
+| **L3 定时线上巡检** | 每日 `yt-dlp` / `Deno` 正式版监控（`upstream-watch.yml`）+ 每 12 小时零权限 Deno/EJS `tv`+`main` 变体与只读接口低噪 Canary（`upstream-canary.yml`） | `scripts/check-upstream-updates.py` · `scripts/check-upstream-canary.py` |
+| **L4 发布后生产验收** | 阶段一服务端/静态全量 SHA-256 + 14 平台 API 冒烟（`smoke.py`）+ 阶段二零修改官方扩展无头 Chrome 复测（`stage2_browser.mjs`） | `scripts/prod-smoke/smoke.py` · `scripts/prod-smoke/stage2_browser.mjs` · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) |
+
+<details>
+<summary><strong>点击展开：仓库目录结构</strong></summary>
 
 ```text
 .
 ├── backend/
 │   ├── cmd/
-│   │   ├── dokitool/          # 主后端 HTTP API 服务（serve）与 catalog / validate / version 子命令
-│   │   ├── shanghai-resolver/ # 上海国内线路辅助解析进程（出站 pull 模式或历史 direct 模式）
-│   │   └── loadtest/          # 仅限本地回环（127.0.0.1）运行的混合流量压测工具
-│   ├── config/                # 内嵌平台注册目录真值（platforms.json）
-│   └── internal/              # Go 内部模块（按包划分职责边界；ytengine、platform/x、platform/instagram 等大包在包内按职责拆分为多文件）
-│       ├── fetch/             # 受控出站 HTTP 客户端（逐跳 DNS 校验、PublicIP 检查、IP 绑定拨号与页面 TLS 传输）
-│       ├── urlpolicy/         # 跨平台复用的媒体/封面直链语法、控制字符、标准端口与域名后缀白名单校验
-│       ├── bearer/            # 统一长度上限、可打印 ASCII 与 SHA-256 常量时间比对的 Bearer 请求头鉴权
-│       ├── unified/           # 统一媒体 v1（schema_version=1.0）契约模型、内嵌 Schema 校验与默认画质选择
-│       ├── catalog/           # 平台目录加载、查询与运行时动态启用控制
-│       ├── probe/             # 有界 ISO BMFF / MP4 头部与原子元数据探测（不拉取完整媒体文件）
-│       ├── ytengine/          # 受 SHA-256 锁定的 yt-dlp 提取器进程池、本地回环出站安全网关、并发槽位与契约适配
-│       ├── platform/          # 各平台解析适配器（douyin、bilibili、weibo、xiaohongshu、kuaishou、toutiao、pipixia、pipigx、zuiyou、x、youtube、instagram 及通用长尾包 ytgeneric）
-│       ├── media/             # 特殊媒体交付协议（media/weibo 短期签名票据与流式中转、media/tbvideo 同路径无水印候选构造）
-│       ├── shresolver/        # 上海通道任务分发 Broker、出站 pull 工作协程与跨地域统计
-│       └── api/               # HTTP 路由分发、多池准入与排队限流、短时解析缓存（singleflight + LRU）及 /api/stats 统计
-├── frontend/                  # Vue 3 + Vite 单页应用、同源 Service Worker 流式下载器与 YouTube 浏览器助手用户脚本
-├── ops/                       # Caddy 反向代理配置示例与生产发布/回滚脚本（ops/release/）
-├── scripts/                   # OpenAPI/JSON Schema 校验、公开文件清单门禁、Go 迁移对拍（go-migration/）与冒烟测试脚本
-├── docs/                      # 接口契约、配置参考、下载机制、部署回滚与历史归档文档
-└── examples/                  # 仅依赖 Python 标准库的个人 Agent 批量直连下载参考脚本
+│   │   ├── dokitool/          # 主后端 HTTP API 服务（serve）与 catalog / hash-token / validate / version 子命令
+│   │   ├── shanghai-resolver/ # 上海国内线路辅助解析进程（出站 pull v2 模式）
+│   │   ├── genstatstypes/     # 从 Go 类型与常量生成 frontend/src/monitor/statsTypes.generated.ts（SSOT）
+│   │   └── loadtest/          # 仅限本机回环（127.0.0.1）运行的混合流量压测工具
+│   ├── config/                # 内嵌平台注册目录真值（platforms.json / platforms_extra.json）
+│   └── internal/              # fetch、urlpolicy、bearer、unified、catalog、probe、ytengine、platform/*、media/*、shresolver、api
+├── frontend/                  # Vue 3 + Vite SPA（dokitool-web）、/monitor 大盘、SW 流式下载器、Chrome MV3 扩展源码与 YouTube 用户脚本
+├── tools/dokitool-agent/      # 零第三方依赖 Python 3.9+ CLI、默认只读 Stdio MCP Server、SKILL.md 与安全回归测试
+├── ops/                       # Caddy 反向代理脱敏示例、运行时/多 Key 配置示例与发布/回滚脚本（ops/release/）
+├── scripts/                   # SSOT 一致性门禁、供应链审计、运行时锁同步、OpenAPI 校验、生产冒烟（prod-smoke/）与 L2 浏览器测试
+├── docs/                      # 接口契约、配置、扩展、下载、发布回执、上游监控、Agent 指南与历史归档文档
+└── examples/                  # 独立 Python 3.9+ 标准库个人 Agent 批量直连下载参考脚本
 ```
 
-## 准入与限流
+</details>
 
-服务端按可信客户端 IPv4 或 IPv6 `/64` 前缀隔离匿名预算，并将 API 请求分发至 5 个核心准入池（另为微博媒体流中转 `DOKITOOL_WEIBO_` 与下载结果上报 `DOKITOOL_REPORT_` 保留专用辅助池；全部环境变量说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）：
+<details>
+<summary><strong>点击展开：已退役的 PHP 对拍基准代码（Oracle）边界说明</strong></summary>
 
-| 准入池 | 环境变量前缀 | 覆盖请求范围与分流规则 |
-| --- | --- | --- |
-| `fast` | `DOKITOOL_PARSE_` | 未命中缓存的纯 Go 国内平台 `GET /api/parse` 请求及已退役旧路径，含单客户端/全局令牌桶、并发上限与有界 FIFO 等待队列 |
-| `resolve` | `DOKITOOL_RESOLVE_` | 未命中缓存的纯 Go 平台按需分集解析 `GET /api/resolve`（如哔哩哔哩多 P 选集），提供独立更宽的单 IP 突发与并发配额，避免挤占首次解析配额 |
-| `slow` | `DOKITOOL_PARSE_SLOW_` | 未命中缓存的海外慢解析平台（`x`、`youtube`、`instagram`、`facebook`、`tumblr`）`/api/parse` 与 `/api/resolve`，以及未命中缓存的 `GET /api/youtube/context` 和 `POST /api/youtube/finalize` |
-| `catalog` | `DOKITOOL_CATALOG_` | `GET /api/platforms`、命中缓存的 `GET /api/youtube/context`，以及**命中进程内新鲜缓存（`DOKITOOL_PARSE_CACHE`）的 `GET /api/parse` 与 `GET /api/resolve` 请求**（零上游开销，不消耗解析池配额） |
-| `owner` | `DOKITOOL_OWNER_*` | 携带有效 `Authorization: Bearer $DOKITOOL_OWNER_TOKEN` 的个人 Agent 通道请求（与匿名池完全隔离；无效鉴权头绝不降级为匿名请求，而是扣减调用方 IP 在 `fast` 池的防刷配额并返回 `401` / `429`） |
+仓库内原地保留历史 PHP 代码、导出脚本与配置示例（`backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`、`backend/tests/*.php`、`scripts/go-migration/produce*.php`、`ops/examples/snap-fpm.conf`）。
 
-## 安全边界
+上述文件**均已退役，完全不参与线上生产运行**（生产环境不部署 PHP / PHP-FPM，全部流量由 Go 二进制独立承载），原地保留仅用作 Go 实现的冻结行为对拍基准（Oracle），供 [`.github/workflows/php-oracle.yml`](.github/workflows/php-oracle.yml) 与离线门禁 `scripts/go-migration/check.py --check-php-source` 重放和核对固定版本源码摘要。**禁止在这些 PHP 文件中新增功能**，仅允许为维持既有对拍能力所必需的修正。
 
-- **无状态零 Cookie 出站与逐跳目标白名单**：服务端解析请求不携带任何用户或平台账号 Cookie；所有出站请求按平台白名单限制域名、协议与标准端口，并在逐跳重定向与 DNS 解析时拦截回环、私网、链路本地与云元数据地址。`yt-dlp` 子进程经本地回环任务网关强制执行同一出站域名白名单。
-- **浏览器直链语法白名单与服务端出站 DNS/IP 绑定分层**：返回给浏览器直连下载的媒体与封面直链仅执行纯本地 URL 语法及平台域名白名单校验（服务端不对其发起 DNS 查询）；而所有由服务端主动发起的出站请求（含页面/接口抓取、媒体头部探测、微博流中转及 `yt-dlp` 回环网关转发）均经 `fetch.Client` 执行逐跳 DNS 解析、公网 IP 校验（`fetch.PublicIP`）与已验证 IP 绑定拨号。
-- **服务端不中转媒体**：除微博视频使用短期 HMAC-SHA256 签名票据（严格校验 `*.weibocdn.com` / `*.miaopai.com` 与上游响应类型）外，服务端不代理或落盘任何平台音视频与图片字节。
-- **用户脚本最小权限**：`frontend/public/helper/dokitool-youtube.user.js` 仅响应固定页面事件，`@connect` 严格限定 `www.youtube.com` 与 `googlevideo.com`（覆盖 `*.googlevideo.com` 媒体子域），且全部跨域请求强制设置 `anonymous: true`（不附带浏览器 Cookie）。
-- **唯一第三方解析回退依赖**：仅当启动参数显式设为 `-x-tombstone-fallback=fxtwitter` 且 X 官方 Syndication 接口返回 `TweetTombstone` 时，服务端才向公开接口 `api.fxtwitter.com` 查询推文元数据，且媒体域名仍强制限制为 `pbs.twimg.com` 与 `video.twimg.com`。
+</details>
 
-## 本地开发与测试
+---
 
-环境要求：**Go `1.27.4`**（见 `backend/go.mod`）、**Node.js `20+`**。
+## 📚 文档导航
 
-```bash
-# 1. 前端依赖安装、单测与生产构建
-cd frontend
-npm ci
-npm test
-npm run build
+| 文档 | 内容摘要 |
+| --- | --- |
+| [docs/API.md](docs/API.md) · [docs/openapi.json](docs/openapi.json) | 统一媒体 v1（`schema_version=1.0`）接口契约、错误码、YouTube 助手接口与 OpenAPI `3.1.0` 规范 |
+| [docs/EXTENSION.md](docs/EXTENSION.md) | Chrome MV3 原生侧边栏扩展 `v4.5.0` 安装、源码构建、凭据配置与安全边界 |
+| [tools/dokitool-agent/README.md](tools/dokitool-agent/README.md) · [SKILL.md](tools/dokitool-agent/SKILL.md) | 零依赖 Python Agent CLI 与默认只读 Stdio MCP Server 使用与集成规范 |
+| [docs/AGENT-API.md](docs/AGENT-API.md) · [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md) | 个人 Agent 通道鉴权、多角色配额、批量直连下载流水线与断点续传实践 |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `dokitool` 与 `shanghai-resolver` 启动参数、环境变量、多 Key 与 `SIGHUP` 热配置全量参考 |
+| [docs/DOWNLOADS.md](docs/DOWNLOADS.md) | 浏览器流式 SW 下载、多线路 Range 测速、ZIP 上限与历史下载验收记录 |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) | 生产发布受控闭环、阶段一/二脱敏回执模板与 [回滚手册](docs/go-migration/rollback.md) |
+| [docs/UPSTREAM-WATCH.md](docs/UPSTREAM-WATCH.md) · [docs/UPSTREAM-CANARY.md](docs/UPSTREAM-CANARY.md) | `yt-dlp` / `Deno` 6 文件锁同步、每日版本巡检与 12 小时低噪 Canary 探针 |
+| [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md) · [docs/HISTORY.md](docs/HISTORY.md) | 上海 `pull` v2 通道设计说明、Go 迁移历程与早期架构归档 |
 
-# 2. 后端全量离线契约与单元测试
-cd ../backend
-go test ./...
+---
 
-# 3. 本地启动 Go API 服务（默认同源路由，可配合 Vite 开发代理联调）
-go run ./cmd/dokitool serve
-```
-
-## 已退役的 PHP 对拍代码
-
-仓库内原地保留以下历史 PHP 代码、导出脚本与配置示例：
-
-- `backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`
-- `backend/tests/*.php`、`scripts/go-migration/produce*.php`
-- 历史 PHP-FPM 配置示例：`ops/examples/snap-fpm.conf`
-
-上述文件均**已退役，完全不参与线上生产运行**（生产环境不部署 PHP / PHP-FPM，所有流量由 Go 二进制独立承载），原地保留仅用作 Go 实现的冻结行为对拍基准（Oracle），供 `.github/workflows/go-migration.yml` 中的 `bilibili-php-oracle` CI 任务以及离线门禁脚本 `scripts/go-migration/check.py --check-php-source` 重放和核对固定版本源码摘要使用。**禁止在这些 PHP 文件中新增功能，仅允许为维持既有对拍能力所必需的修正。**
-
-## 文档索引
-
-- [docs/API.md](docs/API.md)：统一媒体 v1 接口契约、错误码（含 `UNSUPPORTED_PLATFORM`、`UPSTREAM_BLOCKED`、`NO_MEDIA`、`429` 退避）与 YouTube Helper 接口
-- [docs/AGENT-API.md](docs/AGENT-API.md)：面向个人脚本与自动化 Agent 的私有通道认证、接口参考、错误码处置及并发/缓存说明
-- [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md)：Agent 批量下载流水线、多线路切换、断点续传最佳实践与零依赖示例脚本说明
-- [docs/openapi.json](docs/openapi.json)：统一媒体 v1 与个人 Agent 通道的 OpenAPI `3.1.0` 规范文件
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md)：`dokitool` 与 `shanghai-resolver` 全部命令行启动参数及环境变量说明
-- [docs/DOWNLOADS.md](docs/DOWNLOADS.md)：浏览器流式下载、多线路测速、ZIP 打包上限、调试开关与应用内置浏览器提示说明
-- [docs/EXTENSION.md](docs/EXTENSION.md)：Chrome MV3 原生侧边栏扩展构建、加载、专属凭据配置与最小权限边界说明
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：生产发布流程（发布 Issue → 干净构建 → 清单核验 → systemd drop-in 与软链原子切换 → 冒烟与复测）
-- [docs/go-migration/rollback.md](docs/go-migration/rollback.md)：生产回滚操作流程与核验门禁
-- [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md)：抖音上海 `pull` 模式（`v2` 协议、3 worker、超时预算、回退与自动重启）设计说明
-- [docs/schema/unified-v1/README.md](docs/schema/unified-v1/README.md)：统一媒体 v1 JSON Schema 定义与校验命令
-- [docs/HISTORY.md](docs/HISTORY.md)：PHP 时期架构、Go 迁移历程与早期验收归档
-
-## 许可证与上游致谢
+## ⚖️ 许可证与上游致谢
 
 本仓库原创与衍生代码采用 [MIT License](LICENSE)，完整第三方组件与许可证声明见 [NOTICE](NOTICE)：
 
 - **早期架构与解析参考**：[jiuhunwl/short_videos](https://github.com/jiuhunwl/short_videos)（MIT）与 [jiuhunwl/shortvideo-html](https://github.com/jiuhunwl/shortvideo-html)（MIT）— 详见 [NOTICE](NOTICE) 与 [docs/HISTORY.md](docs/HISTORY.md)。
-- **Mediabunny**（`1.65.2`，`MPL-2.0`，Vanilagy）：内嵌于公开用户脚本 `frontend/public/helper/dokitool-youtube.user.js`，用于在浏览器端对 YouTube 分离视频轨与音轨执行无损 MP4/WebM 封装合并；文件级源码获取说明保留在用户脚本头部与 [NOTICE](NOTICE)。
+- **Mediabunny**（`1.65.2`，`MPL-2.0`，Vanilagy）：作为未修改上游库同时内嵌于公开用户脚本 `frontend/public/helper/dokitool-youtube.user.js` 与 Chrome MV3 扩展的 `offscreen` 打包产物中，用于在浏览器本地对 YouTube 分离轨与 B 站 DASH 音视频执行无损封装；完整 MPL-2.0 文本保留在 `frontend/public/licenses/mediabunny-MPL-2.0.txt` 与 [NOTICE](NOTICE)。
 - **FixTweet**（`api.fxtwitter.com`）：在服务端显式启用 `-x-tombstone-fallback=fxtwitter` 时，作为 X 受限推文（`TweetTombstone`）的可选公开 HTTP 元数据查询源；本仓库未复制或分发 FixTweet 源代码（详见 [NOTICE](NOTICE)）。

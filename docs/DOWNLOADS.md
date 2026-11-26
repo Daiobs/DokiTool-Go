@@ -31,6 +31,8 @@ Weibo's signed `/api/media/weibo` route remains a server relay when required.
    - Blob 兼容下载（`blob.ts`）、fMP4 HLS / 字节分片拼接（`segmentDownload.ts`）以及 ZIP 打包（`useMediaDownload.ts`）在触发浏览器保存后，统一延迟 **`45 秒`（`45_000 ms`）** 再执行 `URL.revokeObjectURL`，防止系统保存对话框未确认前对象地址失效。
 6. **无跨域与附件头直链的「打开源链接」交付（今日头条、最右视频等）**：
    - 对实测既无 `Access-Control-Allow-Origin` 跨域读取头、又无 `Content-Disposition: attachment` 附件头的 CDN 直链（如今日头条 `*.toutiaovod.com`、线上关闭 `tbvideo` 改写的最右视频），任务卡片不再假报 `已交给浏览器`，而是直接置为 `manual`（「`打开源链接`」），使用隔离的 `noopener noreferrer` + `no-referrer` 打开源视频并提示右键「视频另存为」（手机端长按保存）。
+7. **Chrome MV3 原生侧边栏扩展无损合流通道（`v4.5.0`）**：
+   - 桌面 Chrome/Edge 用户安装官方 MV3 扩展后，可在独立的 `offscreen` OPFS 沙箱内免油猴完成 **YouTube 4K60** 与 **B 站免登录 1080P DASH** `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出及无体积上限的子目录多图/多 P 流式落盘（详见 [docs/EXTENSION.md](EXTENSION.md)）；纯 Web 端仍保留 `DokiTool YouTube Helper`（`1.3.2`）油猴脚本作为桌面备选路径。
 
 ---
 

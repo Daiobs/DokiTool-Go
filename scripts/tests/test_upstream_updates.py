@@ -128,6 +128,22 @@ def write_synthetic_lock_files(
             '            *) exit 1 ;;\n'
             '          esac\n'
         ),
+        watch.UPSTREAM_CANARY_WORKFLOW_REL: (
+            'name: Upstream canary probe\n'
+            'jobs:\n'
+            '  canary:\n'
+            '    steps:\n'
+            f'      - name: Install pinned Deno {deno_version}\n'
+            '        run: |\n'
+            '          curl --fail --silent --show-error --location \\\n'
+            f'            https://github.com/denoland/deno/releases/download/v{deno_version}/deno-x86_64-unknown-linux-gnu.zip \\\n'
+            '            --output "$RUNNER_TEMP/deno/deno.zip"\n'
+            f'          echo "{deno_linux_sha}  $RUNNER_TEMP/deno/deno" | sha256sum --check --strict\n'
+            '          case "$first_line" in\n'
+            f'            "deno {deno_version}"|"deno {deno_version} "*) ;;\n'
+            '            *) exit 1 ;;\n'
+            '          esac\n'
+        ),
         watch.GATEWAY_ISOLATION_WORKFLOW_REL: (
             'name: Gateway isolation\n'
             'jobs:\n'
@@ -224,11 +240,11 @@ class FakeGitHub:
 class PinnedVersionAndConsistencyTests(unittest.TestCase):
     def test_module_imports_cleanly_without_coupling_unittest_to_real_repo_locks(self):
         self.assertTrue(watch.ROOT.is_dir())
-        self.assertEqual(len(watch.LOCK_FILES), 5)
+        self.assertEqual(len(watch.LOCK_FILES), 6)
         for rel in watch.LOCK_FILES:
             self.assertIn(rel.as_posix(), watch.UPGRADE_REMINDER)
 
-    def test_synthetic_five_lock_files_pass_consistency_and_cli_without_token_or_network(self):
+    def test_synthetic_six_lock_files_pass_consistency_and_cli_without_token_or_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_synthetic_lock_files(root)
@@ -253,7 +269,7 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
                 report,
                 {
                     'passed': True,
-                    'lock_files': 5,
+                    'lock_files': 6,
                     'pinned': {'yt-dlp/yt-dlp': '2026.10.26', 'denoland/deno': '2.9.8'},
                 },
             )
@@ -379,6 +395,27 @@ class PinnedVersionAndConsistencyTests(unittest.TestCase):
                 lambda s: s.replace(SYNTHETIC_DENO_SHA, wrong_sha),
                 'denoland/deno',
                 '.github/workflows/release-build.yml',
+            ),
+            (
+                'upstream-canary-deno-url-version',
+                watch.UPSTREAM_CANARY_WORKFLOW_REL,
+                lambda s: s.replace('/download/v2.9.8/', '/download/v2.9.7/'),
+                'denoland/deno',
+                '.github/workflows/upstream-canary.yml',
+            ),
+            (
+                'upstream-canary-deno-assert-exact-branch',
+                watch.UPSTREAM_CANARY_WORKFLOW_REL,
+                lambda s: s.replace('"deno 2.9.8"|', '"deno 2.9.7"|'),
+                'denoland/deno',
+                '.github/workflows/upstream-canary.yml',
+            ),
+            (
+                'upstream-canary-deno-sha256',
+                watch.UPSTREAM_CANARY_WORKFLOW_REL,
+                lambda s: s.replace(SYNTHETIC_DENO_SHA, wrong_sha),
+                'denoland/deno',
+                '.github/workflows/upstream-canary.yml',
             ),
             (
                 'gateway-isolation-ytdlp-url-version',

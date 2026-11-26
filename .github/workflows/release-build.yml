@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   build-and-publish:
-    if: github.repository == 'Daiobs/DokiTool-Go'
+    if: github.repository == 'Daiobs/DokiTool-Go' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -79,10 +79,10 @@ jobs:
             echo "release_tag=${RELEASE_TAG}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up pinned Go 1.27.4 toolchain
+      - name: Set up pinned Go toolchain
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27.4'
+          go-version-file: backend/go.mod
           cache: false
 
       - name: Set up Node for frontend build and tests
@@ -123,7 +123,9 @@ jobs:
           GOTOOLCHAIN: local
         run: |
           set -euo pipefail
-          go version | grep -F 'go1.27.4'
+          EXPECTED_GO="$(awk '/^toolchain[[:space:]]+go[0-9]/{print $2; exit}' go.mod)"
+          test -n "$EXPECTED_GO"
+          go version | grep -F "$EXPECTED_GO"
           go test -v ./cmd/dokitool
 
       - name: Run pre-build frontend tests
@@ -136,6 +138,7 @@ jobs:
           TREE_SHA: ${{ steps.target.outputs.tree_sha }}
           RELEASE_TAG: ${{ steps.target.outputs.release_tag }}
           GOTOOLCHAIN: local
+          CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: amd64
         run: |

@@ -62,7 +62,7 @@ GitHub Actions 的 **Upstream canary probe**（[`.github/workflows/upstream-cana
 - **零新增 Secret**：工作流仅使用 GitHub Actions 默认提供的 `GITHUB_TOKEN`，权限收紧至 `contents: read`、`issues: write`、`actions: read`；不使用 `DOKITOOL_OWNER_TOKEN`、不使用 Cookie、不启用 `persist-credentials`。
 - **固定 SHA 引脚**：所有第三方 Action（`actions/checkout`、`actions/setup-go`）均固定至 40 位完整 commit SHA；Deno 2.9.8 二进制经官方 SHA-256 严格校验后才进入零权限沙箱（`--deny-net --deny-read --deny-write --deny-env --deny-run --deny-ffi --deny-sys --deny-import`）。
 - **Fail-Closed 脱敏门禁**：`scripts/check-upstream-canary.py` 在渲染正文与发送任何 GitHub API 写入前均强制校验 `assert_desensitized`，拒绝任何含本机路径、IPv4/IPv6、令牌/认证头、签名查询参数（`sig=`、`upsig=`、`ticket=`、`ip=` 等）或非白名单 URL 的输出。
-- **只检测不自动变更**：本巡检不会自动修改仓库代码、提交 PR 或触发生产部署；若告警确认由上游变更引起，仍须通过人工审查的 PR 与正式发布 Issue 处理（升级 Deno 版本时请同步核对本工作流中的版本与 SHA-256）。
+- **只检测不自动变更**：本巡检不会自动修改仓库代码、提交 PR 或触发生产部署；若告警确认由上游变更引起，仍须通过人工审查的 PR 与正式发布 Issue 处理（本工作流已纳入全仓 6 文件 Deno 锁，升级 Deno 时使用 `scripts/bump-runtime-pins.py` 自动同步更新并由 `check-upstream-updates.py --check-local-pins` 强门禁校验）。
 
 ## 本地离线验证
 
