@@ -1,9 +1,10 @@
 <script setup>
 import AppIcon from './AppIcon.vue'
-import { ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import BrandWordmark from './BrandWordmark.vue'
+import { LATEST_EXTENSION_VERSION, isExtensionVersionOutdated } from '../core/capabilityHub'
 
-defineProps({
+const props = defineProps({
   isDark: Boolean,
   locale: String,
   t: Function,
@@ -12,6 +13,27 @@ defineProps({
 })
 
 const emit = defineEmits(['toggle-theme', 'set-locale', 'open-extension'])
+
+const isExtensionOutdated = computed(
+  () =>
+    props.extensionConnected &&
+    isExtensionVersionOutdated(props.extensionVersion, LATEST_EXTENSION_VERSION),
+)
+
+const desktopExtLabel = computed(() => {
+  if (isExtensionOutdated.value) {
+    return props.locale === 'en'
+      ? `Ext v${props.extensionVersion} · Update v${LATEST_EXTENSION_VERSION}`
+      : `扩展 v${props.extensionVersion} · 有新版 v${LATEST_EXTENSION_VERSION}`
+  }
+  return getLabel(props.locale, props.extensionConnected ? 'extConnectedShort' : 'extShort')
+})
+
+const mobileExtOutdatedBadge = computed(() =>
+  props.locale === 'en'
+    ? `Update v${LATEST_EXTENSION_VERSION}`
+    : `有新版 v${LATEST_EXTENSION_VERSION}`,
+)
 
 const isMobileMenuOpen = ref(false)
 const scrollProgress = ref(0)
@@ -129,19 +151,22 @@ const handleKeydown = (e) => {
             type="button"
             data-extension-modal-trigger="header"
             :data-extension-connected="extensionConnected ? 'true' : undefined"
+            :data-extension-outdated="isExtensionOutdated ? 'true' : undefined"
             :title="extensionConnected && extensionVersion ? `DokiTool Extension v${extensionVersion}` : undefined"
             @click="emit('open-extension')"
             :class="[
               'theme-colors hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ux-focus',
-              extensionConnected
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-400/30 dark:hover:bg-emerald-500/25'
-                : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-400/30 dark:hover:bg-indigo-500/25',
+              isExtensionOutdated
+                ? 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-400/35 dark:hover:bg-amber-500/25'
+                : extensionConnected
+                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-400/30 dark:hover:bg-emerald-500/25'
+                  : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100 dark:bg-indigo-500/15 dark:text-indigo-300 dark:border-indigo-400/30 dark:hover:bg-indigo-500/25',
             ]"
           >
             <span
               v-if="extensionConnected"
               data-testid="header-ext-connected-dot"
-              class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"
+              :class="['w-2 h-2 rounded-full shrink-0', isExtensionOutdated ? 'bg-amber-500' : 'bg-emerald-500']"
               aria-hidden="true"
             ></span>
             <svg
@@ -157,7 +182,7 @@ const handleKeydown = (e) => {
             >
               <path :d="EXT_ICON_PATH" />
             </svg>
-            <span>{{ getLabel(locale, extensionConnected ? 'extConnectedShort' : 'extShort') }}</span>
+            <span>{{ desktopExtLabel }}</span>
           </button>
 
           <div class="relative">
@@ -221,6 +246,8 @@ const handleKeydown = (e) => {
           <button
             type="button"
             data-extension-modal-trigger="mobile"
+            :data-extension-connected="extensionConnected ? 'true' : undefined"
+            :data-extension-outdated="isExtensionOutdated ? 'true' : undefined"
             @click="openExtensionFromMobile"
             class="theme-colors w-full flex items-center gap-2 px-4 py-3 text-sm font-medium text-indigo-600 dark:text-indigo-400 rounded-lg hover:bg-indigo-50 dark:hover:bg-slate-800 text-left ux-focus"
           >
@@ -237,6 +264,13 @@ const handleKeydown = (e) => {
               <path :d="EXT_ICON_PATH" />
             </svg>
             <span>{{ getLabel(locale, 'extFull') }}</span>
+            <span
+              v-if="isExtensionOutdated"
+              data-testid="mobile-ext-outdated-badge"
+              class="ml-auto inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-800 border border-amber-300 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-400/35"
+            >
+              {{ mobileExtOutdatedBadge }}
+            </span>
           </button>
         </nav>
       </div>

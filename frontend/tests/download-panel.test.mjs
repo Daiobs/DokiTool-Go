@@ -9,13 +9,13 @@ import { renderToString } from '@vue/server-renderer';
 
 const { createRenderer, createSSRApp, h, markRaw, nextTick, ref } = vue;
 const require = createRequire(import.meta.url);
-let DownloadCard;
+let DownloadCard, saveFilePicker;
 before(async () => {
   const pickerSource = await readFile(new URL('../src/downloads/saveFilePicker.ts', import.meta.url), 'utf8');
   const compiledPicker = await transformWithEsbuild(pickerSource, 'saveFilePicker.ts', { loader: 'ts', format: 'cjs' });
   const pickerModule = { exports: {} };
   new Function('require', 'module', 'exports', compiledPicker.code)(require, pickerModule, pickerModule.exports);
-  const saveFilePicker = pickerModule.exports;
+  saveFilePicker = pickerModule.exports;
 
   const source = await readFile(new URL('../src/components/DownloadCard.vue', import.meta.url), 'utf8');
   const { descriptor } = parse(source);
@@ -28,7 +28,6 @@ before(async () => {
   const transition = { setup: (_, { slots }) => () => slots.default?.() };
   new Function('require', 'module', 'exports', compiled.code)(id => {
     if (id === './AppIcon.vue') return { __esModule: true, default: { render: () => h('i') } };
-    if (id === '../downloads/saveFilePicker') return saveFilePicker;
     if (id === 'vue') return { ...vue, Transition: transition, TransitionGroup: transition };
     return require(id);
   }, componentModule, componentModule.exports);
@@ -41,7 +40,7 @@ const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].j
 const descendants = (node, predicate) => [...(predicate(node) ? [node] : []), ...(node.children || []).flatMap(child => descendants(child, predicate))];
 const visible = node => !node || (![true, 'hidden', ''].includes(node.props?.hidden) && node.style?.display !== 'none' && visible(node.parent));
 
-async function mount(t, downloads = [], { storageBlocked = false, preference, search = '', debug = false } = {}) {
+async function mount(t, downloads = [], { storageBlocked = false, preference, search = '', debug = false, locale = 'zh-CN' } = {}) {
   const saved = { window: Object.getOwnPropertyDescriptor(globalThis, 'window'), document: Object.getOwnPropertyDescriptor(globalThis, 'document') };
   const values = new Map();
   if (preference) values.set('dokitool.download-panel', preference);
@@ -81,8 +80,9 @@ async function mount(t, downloads = [], { storageBlocked = false, preference, se
   });
   const events = [];
   const state = ref(downloads);
+  const localeRef = ref(locale);
   const root = element('root');
-  const app = renderer.createApp({ render: () => h(DownloadCard, { downloads: state.value,
+  const app = renderer.createApp({ render: () => h(DownloadCard, { downloads: state.value, locale: localeRef.value,
     onCancel: id => events.push(['cancel', id]), onRetry: id => events.push(['retry', id]),
     onQuery: id => events.push(['query', id]),
     onHandoff: id => events.push(['handoff', id]), onClearCompleted: id => events.push(['clear-completed', id]),
@@ -112,7 +112,7 @@ async function mount(t, downloads = [], { storageBlocked = false, preference, se
   const button = (label, within = root) => descendants(within, node => node.type === 'button' && visible(node)
     && (node.props.title === label || node.props['aria-label'] === label || textOf(node).trim() === label))[0];
   app.mount(root); await flush();
-  return { root, state, events, timers, values, stop, toggle, panel, rows, row, expanded, button, click, fire, flush,
+  return { root, state, locale: localeRef, events, timers, values, stop, toggle, panel, rows, row, expanded, button, click, fire, flush,
     async update(downloads) { state.value = downloads; await flush(); },
     async advance(milliseconds) {
       const end = now + milliseconds;
@@ -510,7 +510,7 @@ test('mounting DownloadCard with a single manual task respects saved collapsed p
   assert.ok(view.row('toutiao-saved-collapsed'));
 });
 
-test('Issue #48 [P1-1] Spec B.3: DownloadCard renders filenameWarning alert and toggles Web showSaveFilePicker preference when supported', async t => {
+test('Post-#68 Batch 1A: DownloadCard omits web-save-file-picker-toggle and renders filenameWarning with bilingual ZH/EN conflict remediation guidance', async t => {
   const prevPicker = globalThis.showSaveFilePicker;
   try {
     globalThis.showSaveFilePicker = async () => ({ createWritable: async () => ({ write() {}, close() {} }) });
@@ -519,28 +519,51 @@ test('Issue #48 [P1-1] Spec B.3: DownloadCard renders filenameWarning alert and 
       [
         task('tamper-1', 'completed', {
           filename: '作品_1080p.mp4',
-          filenameWarning: '检测到浏览器内其他下载类扩展改写了保存文件名，可停用冲突下载插件或开启系统另存为直写',
+          filenameWarning: '检测到浏览器内其他下载类扩展改写了保存文件名',
         }),
       ],
-      { preference: 'expanded' },
+      { preference: 'expanded', locale: 'zh-CN' },
     );
+    // Even if legacy localStorage residue exists and showSaveFilePicker is supported, DownloadCard never renders the permanent toggle
+    globalThis.window.localStorage.setItem('dokitool:save-file-picker', '1');
+    await view.flush();
+
+    const toggles = descendants(view.root, n => n.props?.['data-testid'] === 'web-save-file-picker-toggle');
+    assert.equal(toggles.length, 0, 'DownloadCard must NOT render web-save-file-picker-toggle');
+
     const row = view.row('tamper-1');
     assert.ok(row);
     const warnings = descendants(row, n => 'data-download-filename-warning' in (n.props || {}));
     assert.equal(warnings.length, 1);
-    assert.match(textOf(warnings[0]), /其他下载类扩展改写了保存文件名/);
+    const zhWarningText = textOf(warnings[0]);
+    assert.match(zhWarningText, /其他下载类扩展改写了保存文件名/);
+    assert.match(zhWarningText, /下载时询问保存位置/);
+    assert.match(zhWarningText, /停用冲突/);
 
-    const toggle = descendants(view.root, n => n.props?.['data-testid'] === 'web-save-file-picker-toggle')[0];
-    assert.ok(toggle, 'expected Web showSaveFilePicker toggle when API is supported');
-    assert.equal(toggle.props.checked, false);
-    toggle.props.onChange({ target: { checked: true } });
-    await nextTick();
-    assert.equal(globalThis.window.localStorage.getItem('dokitool:save-file-picker'), '1');
-    toggle.props.onChange({ target: { checked: false } });
-    await nextTick();
-    assert.equal(globalThis.window.localStorage.getItem('dokitool:save-file-picker'), null);
+    // Switch locale to EN -> keeps item.filenameWarning and switches remediation copy to English
+    view.locale.value = 'en';
+    await view.flush();
+    const enWarningText = textOf(descendants(view.row('tamper-1'), n => 'data-download-filename-warning' in (n.props || {}))[0]);
+    assert.match(enWarningText, /其他下载类扩展改写了保存文件名/);
+    assert.match(enWarningText, /Ask where to save each file/);
+    assert.match(enWarningText, /disable conflicting download extensions/i);
+
+    // Disconnected state: readWebSaveFilePickerPreference() ignores and clears legacy localStorage residue
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
+    globalThis.window.localStorage.setItem('dokitool:save-file-picker', '1');
+    assert.equal(
+      saveFilePicker.readWebSaveFilePickerPreference(),
+      false,
+      'disconnected Web page must never read legacy localStorage dokitool:save-file-picker residue as true',
+    );
+    assert.equal(
+      globalThis.window.localStorage.getItem('dokitool:save-file-picker'),
+      null,
+      'readWebSaveFilePickerPreference must actively clear legacy localStorage residue',
+    );
     view.stop();
   } finally {
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
     if (prevPicker === undefined) delete globalThis.showSaveFilePicker;
     else globalThis.showSaveFilePicker = prevPicker;
   }

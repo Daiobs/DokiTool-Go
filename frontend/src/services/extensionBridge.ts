@@ -1,3 +1,4 @@
+import { syncWebSaveFilePickerPreference } from "../downloads/saveFilePicker";
 import {
   DOKITOOL_EXTENSION_ID,
   errRpc,
@@ -31,6 +32,7 @@ export interface ExtensionBridgeState {
   version: string;
   extensionId: string;
   capabilities: WebBridgeCapability[];
+  useSaveFilePicker: boolean;
 }
 
 export const DISCONNECTED_EXTENSION_STATE: Readonly<ExtensionBridgeState> =
@@ -39,6 +41,7 @@ export const DISCONNECTED_EXTENSION_STATE: Readonly<ExtensionBridgeState> =
     version: "",
     extensionId: "",
     capabilities: [],
+    useSaveFilePicker: false,
   });
 
 interface ChromeExternalRuntimeLike {
@@ -172,6 +175,7 @@ export async function pingInstalledExtension(options?: {
   );
 
   if (!resp.ok) {
+    syncWebSaveFilePickerPreference(false);
     return { ...DISCONNECTED_EXTENSION_STATE, capabilities: [] };
   }
 
@@ -181,6 +185,8 @@ export async function pingInstalledExtension(options?: {
         KNOWN_WEB_BRIDGE_CAPABILITIES.has(cap),
       )
     : [];
+  const useSaveFilePicker = data?.useSaveFilePicker === true;
+  syncWebSaveFilePickerPreference(useSaveFilePicker);
 
   return {
     connected: true,
@@ -190,6 +196,7 @@ export async function pingInstalledExtension(options?: {
         ? data.extensionId
         : options?.extensionId || DOKITOOL_EXTENSION_ID,
     capabilities,
+    useSaveFilePicker,
   };
 }
 

@@ -12,14 +12,14 @@ import extensionReleaseMeta from "./extensionReleaseMeta.json";
  */
 
 export const LATEST_EXTENSION_VERSION: string = String(
-  extensionReleaseMeta.version || "4.4.0",
+  extensionReleaseMeta.version || "4.4.1",
 );
 
 /**
  * Minimum DokiTool extension version that supports built-in zero-userscript
  * YouTube parsing & lossless muxing (`youtube_parse` / `youtube_mux`).
  * Keeping this at `"4.3.0"` allows v4.3.0 users to parse YouTube seamlessly
- * while still receiving `"有新版 v4.4.0"` update notifications.
+ * while still receiving `"有新版 v4.4.1"` update notifications.
  */
 export const MIN_EXTENSION_YOUTUBE_VERSION = "4.3.0" as const;
 

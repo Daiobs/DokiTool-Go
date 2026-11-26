@@ -5,10 +5,10 @@
  */
 
 export const FILENAME_TAMPER_WARNING_ZH =
-  "检测到浏览器内其他下载类扩展改写了保存文件名，可停用冲突下载插件或开启系统另存为直写";
+  "检测到浏览器内其他下载类扩展改写了保存文件名，可在扩展设置开启“下载时询问保存位置”或停用冲突下载插件";
 
 export const FILENAME_TAMPER_WARNING_EN =
-  "Another browser download extension rewrote the saved filename. Disable conflicting download extensions or enable Save-As direct write.";
+  'Another download extension rewrote the saved filename. Enable "Ask where to save each file" in extension settings or disable conflicts.';
 
 const UUID_FILENAME_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\s*\(\d+\))?\.[a-z0-9]{1,12}$/i;

@@ -712,6 +712,7 @@
 !/frontend/src/extension/targetSpecBuilder.ts
 !/frontend/src/extension/uiTargetHelpers.ts
 !/frontend/src/extension/urlMatcher.ts
+!/frontend/src/extension/versionCheck.ts
 !/frontend/src/extension/youtubeExtensionBridge.ts
 /frontend/src/generated/*
 !/frontend/src/generated/platform-catalog.json

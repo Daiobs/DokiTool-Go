@@ -323,6 +323,15 @@ const resultAnchorRef = ref(null);
 const handleExtensionStateChange = (state) => {
   extensionConnected.value = Boolean(state?.connected);
   extensionVersion.value = state?.version || "";
+  if (!state || state.useSaveFilePicker !== undefined || !state.connected) {
+    void import("./downloads/saveFilePicker")
+      .then(({ syncWebSaveFilePickerPreference }) =>
+        syncWebSaveFilePickerPreference(
+          Boolean(state?.connected && state?.useSaveFilePicker),
+        ),
+      )
+      .catch(() => {});
+  }
 };
 
 const probeHeaderExtension = async () => {
@@ -458,11 +467,14 @@ onUnmounted(() => {
     <ExtensionDownloadModal
       v-if="isReady && showExtensionModal"
       :locale="locale"
+      :extension-connected="extensionConnected"
+      :extension-version="extensionVersion"
       @close="showExtensionModal = false"
     />
     <DownloadCard
       v-if="videoStore.downloads.length > 0"
       :downloads="videoStore.downloads"
+      :locale="locale"
       @cancel="handleCancelDownload"
       @retry="handleRetryDownload"
       @refresh="handleRefreshDownload"

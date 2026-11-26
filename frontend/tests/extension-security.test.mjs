@@ -2235,7 +2235,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
       );
     }
 
-    // WEB_EXT_PING returns strictly scoped version/extensionId/capabilities & zero secrets
+    // WEB_EXT_PING returns strictly scoped version/extensionId/capabilities/useSaveFilePicker & zero secrets
     const pingResp = await sendExternal({ type: "WEB_EXT_PING" });
     assert.deepEqual(pingResp, {
       ok: true,
@@ -2248,6 +2248,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
           "youtube_parse",
           "youtube_mux",
         ],
+        useSaveFilePicker: false,
       },
     });
     assert.equal(
@@ -2415,6 +2416,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
       version: "",
       extensionId: "",
       capabilities: [],
+      useSaveFilePicker: false,
     });
 
     // lastError path
@@ -2475,6 +2477,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
       version: "1.2.3",
       extensionId: DOKITOOL_EXTENSION_ID,
       capabilities: ["dash_mux", "direct_download"],
+      useSaveFilePicker: false,
     });
     assert.equal(extensionBridge.hasExtensionCapability(info, "dash_mux"), true);
     const enq = await extensionBridge.enqueueMediaViaExtension({
@@ -3369,7 +3372,7 @@ test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloa
     runtime: {
       id: DOKITOOL_EXTENSION_ID,
       getManifest: () => ({
-        version: "4.4.0",
+        version: "4.4.1",
         host_permissions: ["https://snap.dokitool.com/*"],
         optional_host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
       }),
@@ -3755,7 +3758,401 @@ test("Issue #48 PR #50 [F1]: SidePanel saveFilePicker enforces hostWhitelist + r
     },
   });
   assert.equal(route1Aborted, true, "stalled route 1 must be aborted on idle timeout");
-  assert.equal(fallbackRes.loaded, 4);
-  assert.equal(hTimeoutFallback.stats().closeCalls, 1);
-  assert.equal(hTimeoutFallback.stats().abortCalls, 0);
+    assert.equal(fallbackRes.loaded, 4);
+    assert.equal(hTimeoutFallback.stats().closeCalls, 1);
+    assert.equal(hTimeoutFallback.stats().abortCalls, 0);
+  });
+
+test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json, versionCheck enforces whitelist/no-polling/same-origin download_url, WEB_EXT_PING exposes ONLY useSaveFilePicker, saveFilePicker clears legacy localStorage, and filenameAudit warnings stay < 150 chars", async () => {
+  const [versionCheck, filenameAudit, bridgeAndPicker, capabilityHub] = await Promise.all([
+    bundleTsModule("../src/extension/versionCheck.ts"),
+    bundleTsModule("../src/extension/bg/filenameAudit.ts"),
+    (async () => {
+      const bundled = await build({
+        stdin: {
+          contents: `
+            export * as saveFilePicker from "./src/downloads/saveFilePicker.ts";
+            export * as extensionBridge from "./src/services/extensionBridge.ts";
+          `,
+          resolveDir: fileURLToPath(new URL("..", import.meta.url)),
+          loader: "ts",
+        },
+        bundle: true,
+        write: false,
+        platform: "node",
+        format: "esm",
+      });
+      return import(
+        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
+      );
+    })(),
+    bundleTsModule("../src/core/capabilityHub.ts"),
+  ]);
+  const { saveFilePicker, extensionBridge: sharedBridge } = bridgeAndPicker;
+
+  const releaseMeta = JSON.parse(
+    await readFile(new URL("../src/core/extensionReleaseMeta.json", import.meta.url), "utf8"),
+  );
+  assert.equal(releaseMeta.version, "4.4.1");
+  assert.equal(capabilityHub.LATEST_EXTENSION_VERSION, "4.4.1");
+
+  // (a) build-extension.mjs --zip-out in isolated temp dir writes deterministic extension-version.json
+  const tmpRoot = await mkdtemp(join(tmpdir(), "dokitool-batch1a-vermeta-"));
+  const frontendDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
+  try {
+    const extOutDir = join(tmpRoot, "ext");
+    const zipOutPath = join(tmpRoot, "helper", "dokitool-chrome-extension.zip");
+    const versionJsonPath = join(tmpRoot, "helper", "extension-version.json");
+    const cli = spawnSync(
+      process.execPath,
+      [
+        join(frontendDir, "scripts", "build-extension.mjs"),
+        "--out-dir",
+        extOutDir,
+        "--zip-out",
+        zipOutPath,
+        "--quiet",
+      ],
+      { cwd: frontendDir, encoding: "utf8" },
+    );
+    assert.equal(cli.status, 0, `build-extension CLI failed: ${cli.stderr || cli.stdout}`);
+    assert.equal(existsSync(zipOutPath), true);
+    assert.equal(existsSync(versionJsonPath), true, "expected sibling extension-version.json");
+
+    const rawVersionJson = await readFile(versionJsonPath, "utf8");
+    assert.equal(
+      rawVersionJson,
+      `${JSON.stringify({ version: releaseMeta.version, download_url: "/helper/dokitool-chrome-extension.zip" })}\n`,
+    );
+    const parsedVersionJson = JSON.parse(rawVersionJson);
+    assert.equal(parsedVersionJson.version, releaseMeta.version);
+    assert.equal(parsedVersionJson.download_url, "/helper/dokitool-chrome-extension.zip");
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true });
+  }
+
+  // (b) versionCheck.ts static & runtime security checks
+  const versionCheckSrc = await readFile(
+    new URL("../src/extension/versionCheck.ts", import.meta.url),
+    "utf8",
+  );
+  const versionCheckLines = versionCheckSrc.trimEnd().split("\n").length;
+  assert.ok(versionCheckLines <= 90, `versionCheck.ts must stay <= 90 lines, got ${versionCheckLines}`);
+  assert.equal(/\bsetInterval\b/.test(versionCheckSrc), false, "versionCheck.ts must have ZERO setInterval polling");
+
+  // Disallowed origins make ZERO fetch calls
+  let disallowedFetches = 0;
+  for (const badOrigin of [
+    "",
+    "https://evil.example.com",
+    "https://www.youtube.com",
+    "https://upos-sz-mirrorcos.bilivideo.com",
+    "http://snap.dokitool.com",
+    "http://192.168.1.1:8080",
+    "https://snap.dokitool.com/subpath",
+  ]) {
+    assert.equal(versionCheck.resolveAllowedVersionCheckOrigin(badOrigin), null);
+    const res = await versionCheck.checkForExtensionUpdate({
+      installedVersion: "4.4.0",
+      apiBaseUrl: badOrigin,
+      fetchImpl: async () => {
+        disallowedFetches += 1;
+        return new Response("{}", { status: 200 });
+      },
+    });
+    assert.equal(res, null);
+  }
+  assert.equal(disallowedFetches, 0, "disallowed origins must trigger zero fetch calls");
+
+  // Allowed official + loopback origins enforce credentials:omit, cache:no-cache, AbortSignal
+  const observed = [];
+  const validProd = await versionCheck.checkForExtensionUpdate({
+    installedVersion: "4.4.0",
+    apiBaseUrl: "https://snap.dokitool.com/",
+    fetchImpl: async (url, init) => {
+      observed.push({ url: String(url), init });
+      return new Response(
+        JSON.stringify({ version: "4.4.1", download_url: "/helper/dokitool-chrome-extension.zip" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    },
+  });
+  assert.deepEqual(validProd, {
+    latestVersion: "4.4.1",
+    downloadUrl: "https://snap.dokitool.com/helper/dokitool-chrome-extension.zip",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].url, "https://snap.dokitool.com/helper/extension-version.json");
+  assert.equal(observed[0].init.credentials, "omit");
+  assert.equal(observed[0].init.cache, "no-cache");
+  assert.ok(observed[0].init.signal instanceof AbortSignal);
+
+  const validLoopback = await versionCheck.checkForExtensionUpdate({
+    installedVersion: "4.4.0",
+    apiBaseUrl: "http://127.0.0.1:18080",
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify({ version: "4.5.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
+        { status: 200 },
+      ),
+  });
+  assert.deepEqual(validLoopback, {
+    latestVersion: "4.5.0",
+    downloadUrl: "http://127.0.0.1:18080/helper/dokitool-chrome-extension.zip",
+  });
+
+  // Non-same-origin / unexpected-path download_url in remote JSON MUST be rejected
+  for (const badDownloadUrl of [
+    "https://evil.example.com/dokitool-chrome-extension.zip",
+    "https://evil.example.com/helper/dokitool-chrome-extension.zip",
+    "//evil.example.com/helper/dokitool-chrome-extension.zip",
+    "/other/dokitool-chrome-extension.zip",
+    "/helper/dokitool-chrome-extension.zip?x=1",
+    "/helper/dokitool-chrome-extension.zip#frag",
+    "https://user:pass@snap.dokitool.com/helper/dokitool-chrome-extension.zip",
+    "javascript:alert(1)",
+    "",
+  ]) {
+    const res = await versionCheck.checkForExtensionUpdate({
+      installedVersion: "4.4.0",
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({ version: "4.5.0", download_url: badDownloadUrl }),
+          { status: 200 },
+        ),
+    });
+    assert.equal(res, null, `must reject tampered download_url: ${badDownloadUrl}`);
+  }
+
+  // Redirect escape on resp.url rejected
+  const escapedResp = await versionCheck.checkForExtensionUpdate({
+    installedVersion: "4.4.0",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      url: "https://evil.example.com/helper/extension-version.json",
+      async json() {
+        return { version: "4.5.0", download_url: "/helper/dokitool-chrome-extension.zip" };
+      },
+    }),
+  });
+  assert.equal(escapedResp, null);
+
+  // Silent null on timeout, caller abort, network error, non-2xx, malformed JSON, non-semver, up-to-date
+  let timedOutSignalAborted = false;
+  const timedOut = await versionCheck.checkForExtensionUpdate({
+    installedVersion: "4.4.0",
+    timeoutMs: 25,
+    fetchImpl: async (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          timedOutSignalAborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      }),
+  });
+  assert.equal(timedOut, null);
+  assert.equal(timedOutSignalAborted, true);
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  let abortedFetchCalls = 0;
+  assert.equal(
+    await versionCheck.checkForExtensionUpdate({
+      installedVersion: "4.4.0",
+      signal: preAborted.signal,
+      fetchImpl: async () => {
+        abortedFetchCalls += 1;
+        return new Response("{}", { status: 200 });
+      },
+    }),
+    null,
+  );
+  assert.equal(abortedFetchCalls, 0);
+
+  for (const mock of [
+    async () => { throw new TypeError("network down"); },
+    async () => new Response("not found", { status: 404 }),
+    async () => new Response("not-json", { status: 200 }),
+    async () => new Response("[]", { status: 200 }),
+    async () => new Response(JSON.stringify({ version: "4.5" }), { status: 200 }),
+    async () => new Response(JSON.stringify({ version: "4.5.0-rc1" }), { status: 200 }),
+    async () => new Response(JSON.stringify({ version: "4.4.0" }), { status: 200 }),
+    async () => new Response(JSON.stringify({ version: "4.3.9" }), { status: 200 }),
+  ]) {
+    assert.equal(
+      await versionCheck.checkForExtensionUpdate({
+        installedVersion: "4.4.0",
+        fetchImpl: mock,
+      }),
+      null,
+    );
+  }
+
+  // (c) WEB_EXT_PING exposes ONLY useSaveFilePicker boolean (zero other settings fields) + saveFilePicker in-memory sync
+  const extStore = storage.createExtensionStorage({
+    local: storage.createMemoryStorageArea(),
+    session: storage.createMemoryStorageArea(),
+  });
+  await extStore.updateSettings({
+    bearerToken: "doki_ping_secret_never_leak",
+    apiBaseUrl: "https://custom-gateway.example.com",
+    subfolderPrefix: "PrivateFolder",
+    batchSaveMode: "zip",
+    qualityPreference: "1080p",
+    autoFollowTab: true,
+    useSaveFilePicker: true,
+    theme: "dark",
+  });
+  const extListeners = [];
+  const pingChrome = {
+    runtime: {
+      id: DOKITOOL_EXTENSION_ID,
+      getManifest: () => ({
+        version: "4.4.1",
+        externally_connectable: { matches: PROD_EXTERNALLY_CONNECTABLE_MATCHES },
+      }),
+      onMessage: { addListener() {}, removeListener() {} },
+      onMessageExternal: {
+        addListener(fn) { extListeners.push(fn); },
+        removeListener(fn) {
+          const i = extListeners.indexOf(fn);
+          if (i >= 0) extListeners.splice(i, 1);
+        },
+      },
+      onConnect: { addListener() {}, removeListener() {} },
+      sendMessage: async () => ({ ok: true }),
+      getContexts: async () => [],
+    },
+    declarativeNetRequest: { getDynamicRules: async () => [], updateDynamicRules: async () => {} },
+    downloads: { download: async () => 1, onChanged: { addListener() {}, removeListener() {} } },
+    offscreen: { createDocument: async () => {}, closeDocument: async () => {} },
+    action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+  };
+  const bg = backgroundMod.createBackgroundController({ chrome: pingChrome, storage: extStore });
+  try {
+    const pingTrue = await new Promise((resolveResp) => {
+      extListeners[0](
+        { type: "WEB_EXT_PING" },
+        { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+        resolveResp,
+      );
+    });
+    assert.equal(pingTrue.ok, true);
+    assert.deepEqual(Object.keys(pingTrue.data).sort(), [
+      "capabilities",
+      "extensionId",
+      "useSaveFilePicker",
+      "version",
+    ]);
+    assert.equal(pingTrue.data.useSaveFilePicker, true);
+    for (const forbidden of [
+      "doki_ping_secret_never_leak",
+      "custom-gateway.example.com",
+      "PrivateFolder",
+      "batchSaveMode",
+      "qualityPreference",
+      "autoFollowTab",
+      "bearerToken",
+      "apiBaseUrl",
+      "theme",
+    ]) {
+      assert.equal(
+        JSON.stringify(pingTrue).includes(forbidden),
+        false,
+        `WEB_EXT_PING must NEVER expose ${forbidden}`,
+      );
+    }
+
+    await extStore.updateSettings({ useSaveFilePicker: false });
+    const pingFalse = await new Promise((resolveResp) => {
+      extListeners[0](
+        { type: "WEB_EXT_PING" },
+        { origin: "https://snap.dokitool.com", url: "https://snap.dokitool.com/" },
+        resolveResp,
+      );
+    });
+    assert.equal(pingFalse.ok, true);
+    assert.equal(pingFalse.data.useSaveFilePicker, false);
+  } finally {
+    bg.dispose();
+  }
+
+  // saveFilePicker in-memory sync & active legacy localStorage cleanup
+  const prevWin = globalThis.window;
+  const prevChromeGlobal = globalThis.chrome;
+  try {
+    const lsMap = new Map([[saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, "1"]]);
+    let setItemCalls = 0;
+    globalThis.window = {
+      localStorage: {
+        getItem: (k) => lsMap.get(k) ?? null,
+        setItem: (k, v) => { setItemCalls += 1; lsMap.set(k, String(v)); },
+        removeItem: (k) => { lsMap.delete(k); },
+      },
+    };
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
+    assert.equal(lsMap.has(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), false);
+
+    // Re-seed legacy residue and verify readWebSaveFilePickerPreference NEVER trusts it and clears it
+    lsMap.set(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, "1");
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+    assert.equal(lsMap.has(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), false);
+
+    // writeWebSaveFilePickerPreference syncs in-memory only and never writes localStorage
+    lsMap.set(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, "1");
+    saveFilePicker.writeWebSaveFilePickerPreference(true);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), true);
+    assert.equal(lsMap.has(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), false);
+    assert.equal(setItemCalls, 0);
+
+    // extensionBridge.pingInstalledExtension syncs in-memory saveFilePicker=true and resets false on disconnect
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
+    lsMap.set(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, "1");
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_id, _msg, cb) {
+          cb({
+            ok: true,
+            data: {
+              version: "4.4.1",
+              extensionId: DOKITOOL_EXTENSION_ID,
+              capabilities: ["direct_download"],
+              useSaveFilePicker: true,
+            },
+          });
+        },
+      },
+    };
+    const pingedOn = await sharedBridge.pingInstalledExtension({ timeoutMs: 200 });
+    assert.equal(pingedOn.useSaveFilePicker, true);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), true);
+    assert.equal(lsMap.has(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), false);
+
+    delete globalThis.chrome;
+    const pingedOff = await sharedBridge.pingInstalledExtension({ timeoutMs: 50 });
+    assert.equal(pingedOff.connected, false);
+    assert.equal(pingedOff.useSaveFilePicker, false);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+    assert.equal(setItemCalls, 0);
+  } finally {
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
+    if (prevWin === undefined) delete globalThis.window;
+    else globalThis.window = prevWin;
+    if (prevChromeGlobal === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChromeGlobal;
+  }
+
+  // (d) FILENAME_TAMPER_WARNING_ZH & FILENAME_TAMPER_WARNING_EN < 150 chars & aligned names
+  assert.ok(
+    filenameAudit.FILENAME_TAMPER_WARNING_ZH.length < 150,
+    `ZH warning must be < 150 chars, got ${filenameAudit.FILENAME_TAMPER_WARNING_ZH.length}`,
+  );
+  assert.ok(
+    filenameAudit.FILENAME_TAMPER_WARNING_EN.length < 150,
+    `EN warning must be < 150 chars, got ${filenameAudit.FILENAME_TAMPER_WARNING_EN.length}`,
+  );
+  assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_ZH.includes("检测到浏览器内其他下载类扩展改写了保存文件名"));
+  assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_ZH.includes("下载时询问保存位置"));
+  assert.ok(filenameAudit.FILENAME_TAMPER_WARNING_EN.includes("Ask where to save each file"));
 });

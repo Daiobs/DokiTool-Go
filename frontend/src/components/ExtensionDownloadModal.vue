@@ -1,13 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { LATEST_EXTENSION_VERSION } from "../core/capabilityHub";
+import {
+  LATEST_EXTENSION_VERSION,
+  isExtensionVersionOutdated,
+} from "../core/capabilityHub";
 
 const props = withDefaults(
   defineProps<{
     locale?: string;
+    extensionConnected?: boolean;
+    extensionVersion?: string;
   }>(),
   {
     locale: "zh-CN",
+    extensionConnected: false,
+    extensionVersion: "",
   },
 );
 
@@ -19,72 +26,104 @@ const CHROME_EXTENSIONS_URL = "chrome://extensions";
 const copied = ref(false);
 let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 
-const copy = computed(() =>
-  props.locale === "en"
-    ? {
-        badge: `Chrome MV3 Native Side Panel v${LATEST_EXTENSION_VERSION} · Anonymous Ready`,
-        title: "DokiTool Chrome Extension",
-        subtitle:
-          "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
-        closeLabel: "Close dialog",
-        ctaLabel: "Download Extension (.zip)",
-        ctaHint:
-          "Ready to use anonymously with no login or token (optional personal key in extension settings) · Desktop Chrome 116+ / Edge",
-        guideTitle: "3-Step Quick Install",
-        step1Title: "Download & Extract ZIP",
-        step1Prefix: "Click the button above to download ",
-        step1Suffix:
-          ', then double-click (macOS) or right-click "Extract All" (Windows) to get the extension folder.',
-        step2Title: "Open Extensions & Enable Developer Mode",
-        step2Prefix: "Open ",
-        step2Suffix:
-          ' in your browser address bar, then toggle on "Developer mode" in the top-right corner.',
-        copyUrl: "Copy URL",
-        copiedUrl: "Copied",
-        step3Title: "Drag & Drop Folder to Load",
-        step3Prefix: "Drag the extracted folder from Step 1 ",
-        step3Strong: "directly onto the chrome://extensions page",
-        step3Suffix:
-          ' (or click "Load unpacked" in the top-left and select it), then pin the extension icon to your toolbar for one-click side panel access.',
-        updateLabel: "Updates:",
-        updateNote:
-          "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact. If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.",
-        privacyLabel: "Privacy:",
-        privacyNote:
-          "Zero cookies, zero page script injection, and zero <all_urls> wildcard: auto-sync only matches the 14 core platforms; non-whitelisted long-tail direct links are handed off directly to Chrome's native downloader (the extension does not proxy requests, read response bodies, or attach cookies); Bilibili Referer DNR rules (1004, 1006–1008) are strictly scoped to extension-initiated Bilibili CDN and overseas Akamai UPOS requests without affecting other sites.",
-      }
-    : {
-        badge: `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
-        title: "DokiTool Chrome 扩展",
-        subtitle:
-          "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
-        closeLabel: "关闭弹窗",
-        ctaLabel: "下载 Chrome 扩展包（.zip）",
-        ctaHint:
-          "匿名开箱即用，无需登录或配置 Token（可选在扩展设置中绑定专属 Key）· 支持桌面 Chrome 116+ / Edge",
-        guideTitle: "3 步快速安装",
-        step1Title: "下载并解压 ZIP",
-        step1Prefix: "点击上方按钮下载 ",
-        step1Suffix:
-          "，双击（macOS）或右键「全部解压缩」（Windows）得到文件夹。",
-        step2Title: "打开扩展页并开启开发者模式",
-        step2Prefix: "在浏览器地址栏打开 ",
-        step2Suffix: "，打开右上角「开发者模式」开关。",
-        copyUrl: "复制地址",
-        copiedUrl: "已复制",
-        step3Title: "直接拖入文件夹完成加载",
-        step3Prefix: "把第 1 步解压出的文件夹",
-        step3Strong: "直接拖进 chrome://extensions 页面",
-        step3Suffix:
-          "（或点左上角「加载已解压的扩展程序」选中该文件夹），然后把扩展图标固定到工具栏即可一键打开侧边栏。",
-        updateLabel: "后续更新：",
-        updateNote:
-          "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。",
-        privacyLabel: "隐私边界：",
-        privacyNote:
-          "零 Cookie、零网页脚本注入、零 <all_urls> 通配权限：自动跟随仅匹配 14 核心平台；非白名单长尾渐进直链直接移交浏览器原生下载器（扩展不代理请求、不读取响应体、不附加 Cookie）；B 站防盗链 DNR 规则（1004、1006–1008）仅作用于扩展自身的 B 站及海外 Akamai UPOS 请求，不影响其他站点与正常浏览。",
-      },
+const isUpgradeMode = computed(
+  () =>
+    Boolean(props.extensionConnected) &&
+    isExtensionVersionOutdated(props.extensionVersion, LATEST_EXTENSION_VERSION),
 );
+
+const copy = computed(() => {
+  const upgrade = isUpgradeMode.value;
+  const currentVersion = props.extensionVersion || "";
+  if (props.locale === "en") {
+    return {
+      badge: upgrade
+        ? `Upgrade v${currentVersion} → v${LATEST_EXTENSION_VERSION} (keeps history & settings)`
+        : `Chrome MV3 Native Side Panel v${LATEST_EXTENSION_VERSION} · Anonymous Ready`,
+      title: "DokiTool Chrome Extension",
+      subtitle:
+        "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
+      closeLabel: "Close dialog",
+      ctaLabel: upgrade
+        ? `Download Latest Extension v${LATEST_EXTENSION_VERSION} (.zip)`
+        : "Download Extension (.zip)",
+      ctaHint:
+        "Ready to use anonymously with no login or token (optional personal key in extension settings) · Desktop Chrome 116+ / Edge",
+      guideTitle: upgrade
+        ? "2-Step Overwrite Upgrade"
+        : "3-Step Quick Install",
+      step1Title: upgrade
+        ? "Download & Overwrite Existing Folder"
+        : "Download & Extract ZIP",
+      step1Prefix: upgrade
+        ? "Click the button above to download the latest "
+        : "Click the button above to download ",
+      step1Suffix: upgrade
+        ? " and extract it overwriting the existing extension folder."
+        : ', then double-click (macOS) or right-click "Extract All" (Windows) to get the extension folder.',
+      step2Title: upgrade
+        ? "Reload in Extensions Page to Apply"
+        : "Open Extensions & Enable Developer Mode",
+      step2Prefix: "Open ",
+      step2Suffix: upgrade
+        ? " and click the Reload button on the DokiTool card to apply immediately without losing task history or settings."
+        : ' in your browser address bar, then toggle on "Developer mode" in the top-right corner.',
+      copyUrl: "Copy URL",
+      copiedUrl: "Copied",
+      step3Title: "Drag & Drop Folder to Load",
+      step3Prefix: "Drag the extracted folder from Step 1 ",
+      step3Strong: "directly onto the chrome://extensions page",
+      step3Suffix:
+        ' (or click "Load unpacked" in the top-left and select it), then pin the extension icon to your toolbar for one-click side panel access.',
+      updateLabel: "Updates:",
+      updateNote:
+        "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact. If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.",
+      privacyLabel: "Privacy:",
+      privacyNote:
+        "Zero cookies, zero page script injection, and zero <all_urls> wildcard: auto-sync only matches the 14 core platforms; non-whitelisted long-tail direct links are handed off directly to Chrome's native downloader (the extension does not proxy requests, read response bodies, or attach cookies); Bilibili Referer DNR rules (1004, 1006–1008) are strictly scoped to extension-initiated Bilibili CDN and overseas Akamai UPOS requests without affecting other sites.",
+    };
+  }
+  return {
+    badge: upgrade
+      ? `从 v${currentVersion} 升级至 v${LATEST_EXTENSION_VERSION}（保留任务历史与设置）`
+      : `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
+    title: "DokiTool Chrome 扩展",
+    subtitle:
+      "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
+    closeLabel: "关闭弹窗",
+    ctaLabel: upgrade
+      ? `下载新版 Chrome 扩展包 v${LATEST_EXTENSION_VERSION}（.zip）`
+      : "下载 Chrome 扩展包（.zip）",
+    ctaHint:
+      "匿名开箱即用，无需登录或配置 Token（可选在扩展设置中绑定专属 Key）· 支持桌面 Chrome 116+ / Edge",
+    guideTitle: upgrade ? "2 步覆盖升级" : "3 步快速安装",
+    step1Title: upgrade ? "下载最新 ZIP 并解压覆盖原扩展文件夹" : "下载并解压 ZIP",
+    step1Prefix: upgrade ? "点击上方按钮下载最新 " : "点击上方按钮下载 ",
+    step1Suffix: upgrade
+      ? " 并解压覆盖原扩展文件夹。"
+      : "，双击（macOS）或右键「全部解压缩」（Windows）得到文件夹。",
+    step2Title: upgrade
+      ? "在扩展管理页点击「刷新」立即生效"
+      : "打开扩展页并开启开发者模式",
+    step2Prefix: upgrade ? "打开 " : "在浏览器地址栏打开 ",
+    step2Suffix: upgrade
+      ? "，点击 DokiTool 卡片上的「刷新」按钮即可立即生效，任务历史与设置不会丢失。"
+      : "，打开右上角「开发者模式」开关。",
+    copyUrl: "复制地址",
+    copiedUrl: "已复制",
+    step3Title: "直接拖入文件夹完成加载",
+    step3Prefix: "把第 1 步解压出的文件夹",
+    step3Strong: "直接拖进 chrome://extensions 页面",
+    step3Suffix:
+      "（或点左上角「加载已解压的扩展程序」选中该文件夹），然后把扩展图标固定到工具栏即可一键打开侧边栏。",
+    updateLabel: "后续更新：",
+    updateNote:
+      "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。",
+    privacyLabel: "隐私边界：",
+    privacyNote:
+      "零 Cookie、零网页脚本注入、零 <all_urls> 通配权限：自动跟随仅匹配 14 核心平台；非白名单长尾渐进直链直接移交浏览器原生下载器（扩展不代理请求、不读取响应体、不附加 Cookie）；B 站防盗链 DNR 规则（1004、1006–1008）仅作用于扩展自身的 B 站及海外 Akamai UPOS 请求，不影响其他站点与正常浏览。",
+  };
+});
 
 const copyExtensionsUrl = async () => {
   let ok = false;
@@ -156,13 +195,19 @@ onUnmounted(() => {
         @click.self="emit('close')"
       >
         <div
+          :data-extension-modal-mode="isUpgradeMode ? 'upgrade' : 'install'"
           class="theme-colors relative w-full max-w-xl max-h-[92vh] overflow-y-auto rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
         >
           <div class="p-5 sm:p-6">
             <div class="flex items-start justify-between gap-4">
               <div class="space-y-1.5">
                 <span
-                  class="inline-flex items-center gap-1.5 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300"
+                  :class="[
+                    'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium',
+                    isUpgradeMode
+                      ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/35 dark:bg-amber-500/15 dark:text-amber-300'
+                      : 'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300',
+                  ]"
                 >
                   <svg
                     class="h-3.5 w-3.5 shrink-0"
@@ -249,7 +294,12 @@ onUnmounted(() => {
 
               <ol class="mt-2.5 space-y-2.5">
                 <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
-                  <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
+                  <span
+                    :class="[
+                      'flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white',
+                      isUpgradeMode ? 'bg-amber-600' : 'bg-indigo-500',
+                    ]"
+                  >
                     1
                   </span>
                   <div class="min-w-0 flex-1 text-sm">
@@ -263,7 +313,12 @@ onUnmounted(() => {
                 </li>
 
                 <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
-                  <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
+                  <span
+                    :class="[
+                      'flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white',
+                      isUpgradeMode ? 'bg-amber-600' : 'bg-indigo-500',
+                    ]"
+                  >
                     2
                   </span>
                   <div class="min-w-0 flex-1 text-sm">
@@ -321,7 +376,10 @@ onUnmounted(() => {
                   </div>
                 </li>
 
-                <li class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
+                <li
+                  v-if="!isUpgradeMode"
+                  class="flex gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50"
+                >
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
                     3
                   </span>

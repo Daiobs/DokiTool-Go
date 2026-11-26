@@ -108,7 +108,7 @@ function createMockMv3Env({
     runtime: {
       id: "abcdefghijklmnopabcdefghijklmnop",
       getManifest: () => ({
-        version: "4.4.0",
+        version: "4.4.1",
         host_permissions: ["https://snap.dokitool.com/*"],
         optional_host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
       }),
@@ -2234,4 +2234,142 @@ test("Round 1 red-team regressions: G6 workFingerprint & full CDN/sensitive-key 
   assert.equal(mpSnap.tasks[0].title.includes("合集主标题 - 合集主标题"), false);
   assert.match(mpSnap.tasks[0].filename, /002\.mp4$/);
   mpBg.dispose();
+});
+
+// ============================================================================
+// 11. Batch 1A (v4.4.1): SidePanelHeader Upgrade Pill & SidePanelSettings Copy
+// ============================================================================
+
+test("Batch 1A (v4.4.1): SidePanelHeader silent version check renders upgrade pill when outdated, opens same-origin zip via chrome.tabs.create, aborts on unmount; SidePanelSettings preserves toggle testid and de-jargonized copy", async () => {
+  const [SidePanelHeader, SidePanelSettings] = await Promise.all([
+    loadSidePanelSfc("../src/extension/components/SidePanelHeader.vue"),
+    loadSidePanelSfc("../src/extension/components/SidePanelSettings.vue"),
+  ]);
+
+  const origChrome = globalThis.chrome;
+  const openedTabs = [];
+  const fetchCalls = [];
+  try {
+    globalThis.chrome = {
+      runtime: {
+        getManifest: () => ({ version: "4.4.0" }),
+      },
+      tabs: {
+        create(opts) {
+          openedTabs.push(opts.url);
+        },
+      },
+    };
+
+    const outdatedView = mountSfcTree(SidePanelHeader, {
+      settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+      connection: null,
+      mode: "single",
+      batchUrlCount: 0,
+      fetchImpl: async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        return new Response(
+          JSON.stringify({
+            version: "4.4.1",
+            download_url: "/helper/dokitool-chrome-extension.zip",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    try {
+      await outdatedView.flush(20);
+      assert.equal(fetchCalls.length, 1);
+      assert.equal(fetchCalls[0].url, "https://snap.dokitool.com/helper/extension-version.json");
+      assert.equal(fetchCalls[0].init.credentials, "omit");
+      assert.equal(fetchCalls[0].init.cache, "no-cache");
+
+      const pill = outdatedView.findAll(
+        (n) => n.props["data-testid"] === "sidepanel-update-pill",
+      )[0];
+      assert.ok(pill, "expected sidepanel-update-pill when installed 4.4.0 < remote 4.4.1");
+      assert.match(outdatedView.textOf(pill), /新版本 v4\.4\.1/);
+
+      await outdatedView.fire(pill, "onClick");
+      assert.deepEqual(openedTabs, [
+        "https://snap.dokitool.com/helper/dokitool-chrome-extension.zip",
+      ]);
+    } finally {
+      outdatedView.unmount();
+    }
+
+    // Up-to-date installed version (4.4.1 === 4.4.1) hides upgrade pill
+    const upToDateView = mountSfcTree(SidePanelHeader, {
+      settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+      connection: null,
+      mode: "single",
+      batchUrlCount: 0,
+      installedVersion: "4.4.1",
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            version: "4.4.1",
+            download_url: "/helper/dokitool-chrome-extension.zip",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    try {
+      await upToDateView.flush(20);
+      assert.equal(
+        upToDateView.findAll((n) => n.props["data-testid"] === "sidepanel-update-pill").length,
+        0,
+        "must hide upgrade pill when installed version is up to date",
+      );
+    } finally {
+      upToDateView.unmount();
+    }
+
+    // Unmounting mid-flight aborts the single version-check request cleanly
+    let abortedOnUnmount = false;
+    const abortView = mountSfcTree(SidePanelHeader, {
+      settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+      connection: null,
+      mode: "single",
+      batchUrlCount: 0,
+      installedVersion: "4.4.0",
+      fetchImpl: async (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            abortedOnUnmount = true;
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        }),
+    });
+    await abortView.flush(10);
+    abortView.unmount();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(abortedOnUnmount, true, "unmounting SidePanelHeader must abort in-flight version check");
+
+    // SidePanelSettings preserves data-testid="save-file-picker-toggle" and updated copy
+    const settingsView = mountSfcTree(SidePanelSettings, {
+      open: true,
+      settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+      connection: null,
+    });
+    try {
+      await settingsView.flush();
+      const toggle = settingsView.findAll(
+        (n) => n.props["data-testid"] === "save-file-picker-toggle",
+      )[0];
+      assert.ok(toggle, 'SidePanelSettings must preserve data-testid="save-file-picker-toggle"');
+      const fullText = settingsView.textOf();
+      assert.ok(fullText.includes("下载时询问保存位置"));
+      assert.ok(
+        fullText.includes(
+          "每次弹出系统“另存为”窗口自选保存目录，同时可避免其他下载插件篡改文件名",
+        ),
+      );
+    } finally {
+      settingsView.unmount();
+    }
+  } finally {
+    if (origChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = origChrome;
+  }
 });
