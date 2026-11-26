@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { PROD_API_ORIGIN } from "../hostWhitelist";
 import type {
   ConnectionCheckResult,
   ExtensionSettings,
   ExtensionThemeMode,
 } from "../protocol";
 import { normalizeExtensionThemeMode } from "../storage";
+import { openSafeHttpTab } from "../uiTargetHelpers";
+import {
+  checkForExtensionUpdate,
+  type ExtensionUpdateInfo,
+} from "../versionCheck";
 
 export type PanelViewMode = "single" | "batch";
 
@@ -15,6 +21,8 @@ const props = defineProps<{
   mode: PanelViewMode;
   batchUrlCount?: number;
   ownerConfirmed?: boolean;
+  installedVersion?: string;
+  fetchImpl?: typeof fetch;
 }>();
 
 const emit = defineEmits<{
@@ -23,6 +31,49 @@ const emit = defineEmits<{
   (e: "cycle-theme"): void;
   (e: "open-settings"): void;
 }>();
+
+const updateInfo = ref<ExtensionUpdateInfo | null>(null);
+let versionCheckController: AbortController | null = null;
+
+function resolveInstalledVersion(): string {
+  if (props.installedVersion) return props.installedVersion.trim();
+  const g = globalThis as unknown as {
+    chrome?: { runtime?: { getManifest?: () => { version?: string } } };
+  };
+  return String(g.chrome?.runtime?.getManifest?.()?.version || "").trim();
+}
+
+function handleOpenUpdateDownload() {
+  if (!updateInfo.value?.downloadUrl) return;
+  openSafeHttpTab(updateInfo.value.downloadUrl);
+}
+
+onMounted(() => {
+  const isExtTest = Boolean(
+    (globalThis as unknown as { __DOKITOOL_EXT_TEST__?: boolean })
+      .__DOKITOOL_EXT_TEST__,
+  );
+  if (isExtTest && !props.fetchImpl) return;
+  const installedVersion = resolveInstalledVersion();
+  if (!installedVersion) return;
+  const controller = new AbortController();
+  versionCheckController = controller;
+  void checkForExtensionUpdate({
+    installedVersion,
+    apiBaseUrl: props.settings.apiBaseUrl || PROD_API_ORIGIN,
+    signal: controller.signal,
+    fetchImpl: props.fetchImpl,
+  }).then((result) => {
+    if (result && !controller.signal.aborted) {
+      updateInfo.value = result;
+    }
+  });
+});
+
+onUnmounted(() => {
+  versionCheckController?.abort();
+  versionCheckController = null;
+});
 
 const currentTheme = computed<ExtensionThemeMode>(() =>
   normalizeExtensionThemeMode(props.settings.theme),
@@ -202,6 +253,22 @@ const authStatus = computed<{
           </svg>
         </button>
       </div>
+    </div>
+
+    <div v-if="updateInfo" class="sp-header__update">
+      <button
+        type="button"
+        class="sp-update-pill"
+        data-testid="sidepanel-update-pill"
+        :title="`点击下载 DokiTool 扩展 v${updateInfo.latestVersion}（解压覆盖原目录并在 chrome://extensions 刷新即可保留历史与设置）`"
+        @click="handleOpenUpdateDownload"
+      >
+        <span class="sp-update-pill__left">
+          <span class="sp-update-pill__dot" aria-hidden="true" />
+          <span class="sp-update-pill__text">新版本 v{{ updateInfo.latestVersion }}</span>
+        </span>
+        <span class="sp-update-pill__action">下载更新 ↗</span>
+      </button>
     </div>
 
     <div class="sp-header__bar">
@@ -519,5 +586,65 @@ const authStatus = computed<{
 .sp-follow-pill--on .sp-follow-pill__indicator {
   background: var(--sp-accent-solid);
   box-shadow: var(--sp-accent-dot-glow);
+}
+
+.sp-header__update {
+  display: flex;
+  min-width: 0;
+}
+
+.sp-update-pill {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: var(--sp-radius-pill);
+  border: 1px solid var(--sp-warning-border);
+  background: var(--sp-warning-soft);
+  color: var(--sp-warning-text);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+  transition: filter 150ms ease, border-color 150ms ease;
+}
+
+.sp-update-pill:hover {
+  filter: brightness(0.97);
+  border-color: var(--sp-warning);
+}
+
+.sp-update-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sp-focus-ring);
+}
+
+.sp-update-pill__left {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sp-update-pill__dot {
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--sp-warning);
+}
+
+.sp-update-pill__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sp-update-pill__action {
+  flex-shrink: 0;
+  opacity: 0.9;
 }
 </style>

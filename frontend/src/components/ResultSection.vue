@@ -1006,8 +1006,8 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
         <AppIcon class="fas fa-redo rs-ext-reload-banner-icon" />
         <span>{{
           locale === "en"
-            ? `Your loaded DokiTool extension (v${extensionBridgeState.version || "old"}) is behind v${LATEST_EXTENSION_VERSION}. Open chrome://extensions and click Reload to update the background worker.`
-            : `检测到当前内存中的 DokiTool 扩展（v${extensionBridgeState.version || "旧版"}）低于最新版 v${LATEST_EXTENSION_VERSION}，请前往扩展管理页点击「刷新」升级后台 Worker 以启用最新防改名与平滑合流能力。`
+            ? `Your loaded DokiTool extension (v${extensionBridgeState.version || "old"}) is behind v${LATEST_EXTENSION_VERSION}. Download the latest .zip, extract it over your original extension directory, then open chrome://extensions and click Reload.`
+            : `检测到当前已加载的 DokiTool 扩展（v${extensionBridgeState.version || "旧版"}）低于最新版 v${LATEST_EXTENSION_VERSION}，请先下载新版 .zip 解压覆盖原扩展目录，再在 chrome://extensions 点击「刷新」即可生效。`
         }}</span>
       </div>
       <button

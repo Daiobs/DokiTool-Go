@@ -943,13 +943,39 @@ export async function buildExtension({
   }
 
   let zip = null;
+  let versionMetaPath = null;
   if (resolvedZipOut) {
     const packaged = await packageExtensionZip(resolvedOutDir, resolvedZipOut);
     await verifyExtensionZip(resolvedZipOut, resolvedOutDir);
     zip = packaged;
+
+    const versionMeta = {
+      version: verification.manifest.version,
+      download_url: "/helper/dokitool-chrome-extension.zip",
+    };
+    versionMetaPath = path.join(
+      path.dirname(resolvedZipOut),
+      "extension-version.json",
+    );
+    const tmpVersionPath = `${versionMetaPath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await fsp.writeFile(
+        tmpVersionPath,
+        `${JSON.stringify(versionMeta)}\n`,
+        "utf8",
+      );
+      await fsp.rename(tmpVersionPath, versionMetaPath);
+    } catch (err) {
+      await fsp.rm(tmpVersionPath, { force: true }).catch(() => {});
+      throw err;
+    }
+
     if (!quiet) {
       console.log(
         `[build:extension] Packaged deterministic ZIP -> ${packaged.zipPath} (${packaged.sizeBytes} bytes, sha256=${packaged.sha256})`,
+      );
+      console.log(
+        `[build:extension] Wrote version metadata -> ${versionMetaPath} (v${versionMeta.version})`,
       );
     }
   }
@@ -959,6 +985,7 @@ export async function buildExtension({
     manifest: verification.manifest,
     checkedFiles: verification.checkedFiles,
     zip,
+    versionMetaPath,
   };
 }
 

@@ -570,6 +570,7 @@ export interface WebExtPingData {
   version: string;
   extensionId: string;
   capabilities: WebBridgeCapability[];
+  useSaveFilePicker?: boolean;
 }
 
 export interface WebExtParseYouTubeData {

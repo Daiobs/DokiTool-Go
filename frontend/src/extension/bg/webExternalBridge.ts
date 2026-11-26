@@ -394,10 +394,12 @@ export function createWebExternalBridge(
 
     switch (req.type) {
       case "WEB_EXT_PING": {
+        const settings = await storage.getSettings();
         return okRpc({
           version: manifestVersion,
           extensionId: chromeApi.runtime.id || DOKITOOL_EXTENSION_ID,
           capabilities: [...WEB_BRIDGE_CAPABILITIES],
+          useSaveFilePicker: Boolean(settings.useSaveFilePicker),
         });
       }
 

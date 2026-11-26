@@ -33,26 +33,32 @@ export function isSaveFilePickerSupported(): boolean {
   return typeof g.showSaveFilePicker === "function";
 }
 
-export function readWebSaveFilePickerPreference(): boolean {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return false;
-    return window.localStorage.getItem(WEB_SAVE_FILE_PICKER_PREF_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
+let syncedWebSaveFilePicker = false;
 
-export function writeWebSaveFilePickerPreference(enabled: boolean): void {
+function clearLegacyWebSaveFilePickerStorage(): void {
   try {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    if (enabled) {
-      window.localStorage.setItem(WEB_SAVE_FILE_PICKER_PREF_KEY, "1");
-    } else {
-      window.localStorage.removeItem(WEB_SAVE_FILE_PICKER_PREF_KEY);
-    }
+    const storage =
+      typeof window !== "undefined" && window.localStorage
+        ? window.localStorage
+        : (globalThis as { localStorage?: Storage }).localStorage;
+    storage?.removeItem(WEB_SAVE_FILE_PICKER_PREF_KEY);
   } catch {
     // Storage access is optional in private browsing.
   }
+}
+
+export function syncWebSaveFilePickerPreference(enabled: boolean): void {
+  syncedWebSaveFilePicker = Boolean(enabled);
+  clearLegacyWebSaveFilePickerStorage();
+}
+
+export function readWebSaveFilePickerPreference(): boolean {
+  clearLegacyWebSaveFilePickerStorage();
+  return syncedWebSaveFilePicker;
+}
+
+export function writeWebSaveFilePickerPreference(enabled: boolean): void {
+  syncWebSaveFilePickerPreference(enabled);
 }
 
 function normalizeLeafSuggestedName(rawFilename: string): string {

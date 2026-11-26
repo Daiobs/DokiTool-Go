@@ -5283,7 +5283,7 @@ test('Issue #48 [B2-Polish-1] & [P2-5f]: extension bridge preserves refreshAvail
             cb({
               ok: true,
               data: {
-                version: '4.4.0',
+                version: '4.4.1',
                 extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
                 capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
               },
@@ -5552,4 +5552,132 @@ test('PR-B1 [G4 + CORS guidance]: Tier-2 refresh_url enables handleRefreshDownlo
   assert.ok(
     hCors.toasts.some(([msg]) => msg.includes('CORS') && msg.includes('视频另存为') && msg.includes('Chrome 扩展')),
   );
+});
+
+test('Post-#68 Batch 1A: WEB_EXT_PING syncs in-memory useSaveFilePicker, disconnected orphan localStorage never triggers SaveFilePicker, and DownloadCard renders bilingual filenameWarning remediation without permanent toggle', async () => {
+  const [extensionBridge, saveFilePicker] = await Promise.all([
+    vite.ssrLoadModule('/src/services/extensionBridge.ts'),
+    vite.ssrLoadModule('/src/downloads/saveFilePicker.ts'),
+  ]);
+  const prevChrome = globalThis.chrome;
+  const prevPicker = globalThis.showSaveFilePicker;
+  const prevLocalStorage = globalThis.window.localStorage;
+  const storageMap = new Map();
+  const mockLocalStorage = {
+    getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+    setItem: (k, v) => { storageMap.set(k, String(v)); },
+    removeItem: (k) => { storageMap.delete(k); },
+  };
+  let pickerCalls = 0;
+
+  try {
+    globalThis.window.localStorage = mockLocalStorage;
+    globalThis.showSaveFilePicker = async () => {
+      pickerCalls++;
+      return { createWritable: async () => ({ write() {}, close() {} }) };
+    };
+
+    // (a) Disconnected with legacy localStorage["dokitool:save-file-picker"] = "1" residue
+    delete globalThis.chrome;
+    mockLocalStorage.setItem(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, '1');
+    const disconnectedState = await extensionBridge.pingInstalledExtension();
+    assert.equal(disconnectedState.connected, false);
+    assert.equal(disconnectedState.useSaveFilePicker, false);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+    assert.equal(
+      mockLocalStorage.getItem(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY),
+      null,
+      'disconnected probe/read must clear legacy localStorage dokitool:save-file-picker residue',
+    );
+
+    // Even if legacy key is re-injected while disconnected, a normal download must NEVER invoke showSaveFilePicker
+    mockLocalStorage.setItem(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY, '1');
+    const hPlain = harness(base);
+    await hPlain.instance.downloadMainVideo();
+    await settled(hPlain.store.downloads[0]);
+    assert.equal(hPlain.store.downloads[0].status, 'completed');
+    assert.equal(pickerCalls, 0, 'legacy localStorage residue must never trigger showSaveFilePicker when disconnected');
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+    assert.equal(mockLocalStorage.getItem(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), null);
+
+    // (b) WEB_EXT_PING returning useSaveFilePicker: true -> syncs true; false or disconnect -> immediately resets to false
+    let extPickerEnabled = true;
+    globalThis.chrome = {
+      runtime: {
+        sendMessage(_extId, msg, cb) {
+          if (msg?.type === 'WEB_EXT_PING') {
+            cb({
+              ok: true,
+              data: {
+                version: '4.4.1',
+                extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+                capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+                useSaveFilePicker: extPickerEnabled,
+              },
+            });
+          }
+        },
+      },
+    };
+    const enabledState = await extensionBridge.pingInstalledExtension();
+    assert.equal(enabledState.connected, true);
+    assert.equal(enabledState.useSaveFilePicker, true);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), true);
+    assert.equal(mockLocalStorage.getItem(saveFilePicker.WEB_SAVE_FILE_PICKER_PREF_KEY), null);
+
+    extPickerEnabled = false;
+    const disabledState = await extensionBridge.pingInstalledExtension();
+    assert.equal(disabledState.connected, true);
+    assert.equal(disabledState.useSaveFilePicker, false);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+
+    extPickerEnabled = true;
+    await extensionBridge.pingInstalledExtension();
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), true);
+
+    delete globalThis.chrome;
+    const afterDisconnect = await extensionBridge.pingInstalledExtension();
+    assert.equal(afterDisconnect.connected, false);
+    assert.equal(afterDisconnect.useSaveFilePicker, false);
+    assert.equal(saveFilePicker.readWebSaveFilePickerPreference(), false);
+
+    // (c) DownloadCard omits web-save-file-picker-toggle and renders bilingual filenameWarning conflict remediation
+    const warningTask = [
+      {
+        id: 'warn-1',
+        status: 'completed',
+        filename: 'demo.mp4',
+        filenameWarning: '检测到其他下载插件修改了文件名',
+      },
+    ];
+    const zhCardHtml = await renderToString(
+      createSSRApp({ render: () => h(DownloadCard, { downloads: warningTask, locale: 'zh-CN' }) }),
+    );
+    assert.doesNotMatch(zhCardHtml, /web-save-file-picker-toggle/);
+    assert.match(zhCardHtml, /检测到其他下载插件修改了文件名/);
+    assert.match(zhCardHtml, /下载时询问保存位置/);
+
+    const enCardHtml = await renderToString(
+      createSSRApp({ render: () => h(DownloadCard, { downloads: warningTask, locale: 'en' }) }),
+    );
+    assert.doesNotMatch(enCardHtml, /web-save-file-picker-toggle/);
+    assert.match(enCardHtml, /检测到其他下载插件修改了文件名/);
+    assert.match(enCardHtml, /Ask where to save each file/);
+
+    // (d) App.vue wires extension props to ExtensionDownloadModal and locale to DownloadCard without static saveFilePicker/extensionBridge imports
+    const appSource = await readFile(new URL('../src/App.vue', import.meta.url), 'utf8');
+    const modalTag = appSource.match(/<ExtensionDownloadModal[\s\S]*?\/>/)?.[0] || '';
+    assert.match(modalTag, /:extension-connected="extensionConnected"/);
+    assert.match(modalTag, /:extension-version="extensionVersion"/);
+    const cardTag = appSource.match(/<DownloadCard[\s\S]*?\/>/)?.[0] || '';
+    assert.match(cardTag, /:locale="locale"/);
+    assert.doesNotMatch(appSource, /^import\s+.*from\s+["']\.\/(?:downloads\/saveFilePicker|services\/extensionBridge)["']/m);
+  } finally {
+    saveFilePicker.syncWebSaveFilePickerPreference(false);
+    globalThis.window.localStorage = prevLocalStorage;
+    if (prevPicker === undefined) delete globalThis.showSaveFilePicker;
+    else globalThis.showSaveFilePicker = prevPicker;
+    if (prevChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = prevChrome;
+  }
 });

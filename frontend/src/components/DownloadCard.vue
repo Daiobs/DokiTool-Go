@@ -1,20 +1,17 @@
 <script setup>
 import AppIcon from './AppIcon.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import {
-  isSaveFilePickerSupported,
-  readWebSaveFilePickerPreference,
-  writeWebSaveFilePickerPreference,
-} from '../downloads/saveFilePicker'
 
-const props = defineProps({ downloads: { type: Array, default: () => [] } })
+const props = defineProps({
+  downloads: { type: Array, default: () => [] },
+  locale: { type: String, default: 'zh-CN' },
+})
 const emit = defineEmits(['cancel', 'retry', 'refresh', 'query', 'handoff', 'clear-completed'])
-const savePickerSupported = ref(false)
-const useSaveFilePicker = ref(false)
-const toggleSaveFilePicker = () => {
-  useSaveFilePicker.value = !useSaveFilePicker.value
-  writeWebSaveFilePickerPreference(useSaveFilePicker.value)
-}
+const filenameWarningRemediation = computed(() =>
+  props.locale === 'en'
+    ? 'Tip: Enable "Ask where to save each file" in DokiTool extension settings, or disable conflicting download extensions.'
+    : '建议：在 DokiTool 扩展设置中开启「下载时询问保存位置」，或停用冲突的第三方下载插件。',
+)
 const isDebug = () => {
   try { if (new URLSearchParams(window.location?.search).get('debug') === '1') return true } catch {}
   try { return window.localStorage?.getItem('dokitool:debug') === '1' } catch { return false }
@@ -95,8 +92,6 @@ const togglePanel = () => {
   try { window.localStorage.setItem(preferenceKey, expanded.value ? 'expanded' : 'collapsed') } catch { /* Storage is optional. */ }
 }
 onMounted(() => {
-  savePickerSupported.value = isSaveFilePickerSupported()
-  useSaveFilePicker.value = readWebSaveFilePickerPreference()
   try {
     const saved = window.localStorage.getItem(preferenceKey)
     manuallyCollapsed.value = saved === 'collapsed'
@@ -221,7 +216,10 @@ onBeforeUnmount(stopCollapseTimer)
             role="alert"
             class="mt-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200/80 dark:border-amber-800/60 rounded-lg px-2.5 py-1.5 leading-snug"
           >
-            {{ item.filenameWarning }}
+            <div>{{ item.filenameWarning }}</div>
+            <div data-download-filename-remediation class="mt-1 opacity-90">
+              {{ filenameWarningRemediation }}
+            </div>
           </div>
 
           <div v-if="item.recoveryExpired" class="mt-2 text-xs text-slate-500 dark:text-slate-400">
@@ -285,21 +283,6 @@ onBeforeUnmount(stopCollapseTimer)
             </div>
           </details>
         </div>
-      </div>
-      <div
-        v-if="savePickerSupported"
-        class="px-4 py-2 border-t border-slate-100 dark:border-slate-700 flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400"
-      >
-        <label class="inline-flex items-center gap-2 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            data-testid="web-save-file-picker-toggle"
-            :checked="useSaveFilePicker"
-            @change="toggleSaveFilePicker"
-            class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-          />
-          <span>系统另存为流式直写（防其他插件改名）</span>
-        </label>
       </div>
     </section>
 
