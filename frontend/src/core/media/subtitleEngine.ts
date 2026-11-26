@@ -19,6 +19,7 @@ const XML_UNSAFE_RE = /<!(?:DOCTYPE|ENTITY)\b/i;
 const VTT_TIME_RE = /(?:(\d{1,3}):)?(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*(?:(\d{1,3}):)?(\d{2}):(\d{2})[.,](\d{1,3})/;
 const CLOCK_RE = /^(?:(\d{1,3}):)?(\d{2}):(\d{2})(?:[.,](\d{1,3}))?$/;
 const OFFSET_RE = /^(\d+(?:\.\d+)?)(h|m|s|ms)$/i;
+const STRICT_FINITE_NUM_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 const ILLEGAL_FN_RE = /[\\/:*?"<>|\u0000-\u001f\u007f]/g;
 
 export interface ProjectedYouTubeCaptions {
@@ -170,8 +171,17 @@ function cleanCueText(raw: string, allowDoubleDecode = false): string {
 }
 
 function safeFiniteMs(raw: unknown, scale = 1): number | null {
-  if (raw === null || raw === undefined) return null;
-  const scaled = (typeof raw === "number" ? raw : Number.parseFloat(String(raw).trim())) * scale;
+  let num: number;
+  if (typeof raw === "number") {
+    num = raw;
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed || !STRICT_FINITE_NUM_RE.test(trimmed)) return null;
+    num = Number(trimmed);
+  } else {
+    return null;
+  }
+  const scaled = num * scale;
   return Number.isFinite(scaled) && scaled >= 0 && scaled <= MAX_CUE_TIME_MS ? Math.round(scaled) : null;
 }
 
@@ -307,32 +317,99 @@ export const formatCuesAsSrt = (cues: SubtitleCue[]): string => {
 
 const normCue = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
 
+interface IndexedSecondaryCue {
+  cue: SubtitleCue;
+  origIdx: number;
+  sStart: number;
+  sEnd: number;
+  sEndEff: number;
+  sMid: number;
+}
+
+function lowerBoundPrefixMaxEnd(prefixMaxEnd: number[], minEnd: number): number {
+  let lo = 0;
+  let hi = prefixMaxEnd.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (prefixMaxEnd[mid] < minEnd) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 export function mergeBilingualCues(primary: SubtitleCue[], secondary: SubtitleCue[]): SubtitleCue[] {
   if (!primary.length) return secondary.map((c) => ({ ...c }));
   if (!secondary.length) return primary.map((c) => ({ ...c }));
+
+  const sec: IndexedSecondaryCue[] = [];
+  for (let i = 0; i < secondary.length; i++) {
+    const cue = secondary[i];
+    if (!Number.isFinite(cue.startMs) || !Number.isFinite(cue.endMs)) continue;
+    const sStart = Math.max(0, cue.startMs);
+    const sEnd = Math.max(sStart, cue.endMs);
+    sec.push({ cue, origIdx: i, sStart, sEnd, sEndEff: Math.max(sEnd, sStart + 1), sMid: (sStart + sEnd) / 2 });
+  }
+  sec.sort((a, b) => a.sStart - b.sStart || a.origIdx - b.origIdx);
+
+  const prefixMaxEnd = new Array<number>(sec.length);
+  let runningMaxEnd = -1;
+  for (let i = 0; i < sec.length; i++) {
+    if (sec[i].sEnd > runningMaxEnd) runningMaxEnd = sec[i].sEnd;
+    prefixMaxEnd[i] = runningMaxEnd;
+  }
+
+  let left = 0;
+  let prevPStart = -Infinity;
+
   return primary.map((p) => {
     const pStart = Math.max(0, p.startMs);
     const pEnd = Math.max(pStart, p.endMs);
+    const pEndEff = Math.max(pEnd, pStart + 1);
     const pMid = (pStart + pEnd) / 2;
-    let bestOverlap: { cue: SubtitleCue; overlap: number; midDiff: number } | null = null;
-    let nearest: { cue: SubtitleCue; gap: number; startDiff: number } | null = null;
+    let bestOverlap: { cue: SubtitleCue; overlap: number; midDiff: number; origIdx: number } | null = null;
+    let nearest: { cue: SubtitleCue; gap: number; startDiff: number; origIdx: number } | null = null;
 
-    for (const s of secondary) {
-      const sStart = Math.max(0, s.startMs);
-      const sEnd = Math.max(sStart, s.endMs);
-      const overlap = Math.min(Math.max(pEnd, pStart + 1), Math.max(sEnd, sStart + 1)) - Math.max(pStart, sStart);
-      if (overlap > 0) {
-        const midDiff = Math.abs(pMid - (sStart + sEnd) / 2);
-        if (!bestOverlap || overlap > bestOverlap.overlap || (overlap === bestOverlap.overlap && midDiff < bestOverlap.midDiff)) {
-          bestOverlap = { cue: s, overlap, midDiff };
-        }
-        continue;
+    if (Number.isFinite(pStart) && Number.isFinite(pEnd) && sec.length > 0) {
+      const minEnd = pStart - BILINGUAL_TOLERANCE_MS;
+      const maxStart = pEnd + BILINGUAL_TOLERANCE_MS;
+      if (pStart < prevPStart) {
+        left = lowerBoundPrefixMaxEnd(prefixMaxEnd, minEnd);
+      } else {
+        while (left < sec.length && prefixMaxEnd[left] < minEnd) left++;
       }
-      const gap = Math.max(0, Math.max(pStart, sStart) - Math.min(pEnd, sEnd));
-      if (gap <= BILINGUAL_TOLERANCE_MS) {
-        const startDiff = Math.abs(pStart - sStart);
-        if (!nearest || gap < nearest.gap || (gap === nearest.gap && startDiff < nearest.startDiff)) {
-          nearest = { cue: s, gap, startDiff };
+      prevPStart = pStart;
+
+      for (let j = left; j < sec.length; j++) {
+        const s = sec[j];
+        if (s.sStart > maxStart) break;
+        if (s.sEnd < minEnd) continue;
+        const overlap = Math.min(pEndEff, s.sEndEff) - Math.max(pStart, s.sStart);
+        if (overlap > 0) {
+          const midDiff = Math.abs(pMid - s.sMid);
+          if (
+            !bestOverlap ||
+            overlap > bestOverlap.overlap ||
+            (overlap === bestOverlap.overlap &&
+              (midDiff < bestOverlap.midDiff ||
+                (midDiff === bestOverlap.midDiff && s.origIdx < bestOverlap.origIdx)))
+          ) {
+            bestOverlap = { cue: s.cue, overlap, midDiff, origIdx: s.origIdx };
+          }
+          continue;
+        }
+        if (bestOverlap) continue;
+        const gap = Math.max(0, Math.max(pStart, s.sStart) - Math.min(pEnd, s.sEnd));
+        if (gap <= BILINGUAL_TOLERANCE_MS) {
+          const startDiff = Math.abs(pStart - s.sStart);
+          if (
+            !nearest ||
+            gap < nearest.gap ||
+            (gap === nearest.gap &&
+              (startDiff < nearest.startDiff ||
+                (startDiff === nearest.startDiff && s.origIdx < nearest.origIdx)))
+          ) {
+            nearest = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
+          }
         }
       }
     }

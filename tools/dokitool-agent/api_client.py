@@ -126,6 +126,7 @@ class DokiToolClient:
         token: str | None = None,
         timeout: float = 60.0,
         max_retries: int = 3,
+        no_proxy: bool = False,
         sleep_fn: Callable[[float], None] = time.sleep,
         fetcher: SafeHTTPFetcher | None = None,
     ) -> None:
@@ -133,8 +134,9 @@ class DokiToolClient:
         self._token = validate_token(token) if token is not None else load_api_token(required=False)
         self.timeout = timeout
         self.max_retries = max(0, int(max_retries))
+        self.no_proxy = bool(no_proxy)
         self._sleep = sleep_fn
-        self.fetcher = fetcher or SafeHTTPFetcher(timeout=timeout)
+        self.fetcher = fetcher or SafeHTTPFetcher(timeout=timeout, no_proxy=self.no_proxy)
 
     @property
     def has_token(self) -> bool:

@@ -6,9 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/url"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
@@ -20,15 +21,14 @@ const (
 	// MaxFinalizeSubtitleAttachments caps emitted subtitle attachments per finalize response.
 	MaxFinalizeSubtitleAttachments = 32
 
-	maxTimedtextURLLength  = 8192
-	maxSubtitleLangCodeLen = 32
-	timedtextCanonicalPath = "/api/timedtext"
-	timedtextCanonicalHost = "www.youtube.com"
+	maxTimedtextURLLength            = 8192
+	maxSubtitleLangCodeLen           = 32
+	timedtextCanonicalPath           = "/api/timedtext"
+	timedtextCanonicalHost           = "www.youtube.com"
+	maxFinalizeSubtitleExpiresWindow = 30 * 24 * time.Hour
 )
 
 var (
-	subtitleExtSafePattern = regexp.MustCompile(`^[a-z0-9]+$`)
-
 	forbiddenTimedtextQueryKeys = map[string]bool{
 		"cookie":        true,
 		"cookies":       true,
@@ -140,6 +140,8 @@ type finalizeSubtitleCandidate struct {
 	url       string
 	ext       string
 	mimeType  string
+	rank      int
+	expiresAt string
 }
 
 func extractCaptionTrackTitle(rawName json.RawMessage) string {
@@ -212,36 +214,84 @@ func hasNonEmptyCaptionQueryParam(rawQuery, key string) bool {
 	return false
 }
 
-func mapTimedtextFormatMetadata(rawFmt string) (ext, mimeType string) {
+func mapTimedtextFormatMetadata(rawFmt string) (ext, mimeType string, rank int, ok bool) {
 	switch strings.ToLower(strings.TrimSpace(rawFmt)) {
 	case "vtt":
-		return "vtt", "text/vtt"
+		return "vtt", "text/vtt", 1, true
 	case "srt":
-		return "srt", "application/x-subrip"
+		return "srt", "application/x-subrip", 2, true
 	case "ttml":
-		return "ttml", "application/ttml+xml"
+		return "ttml", "application/ttml+xml", 3, true
 	case "srv3":
-		return "srv3", "application/xml"
-	case "srv2", "srv1", "xml":
-		return "xml", "application/xml"
+		return "srv3", "application/xml", 4, true
 	case "json3":
-		return "json3", "application/json"
+		return "json3", "application/json", 5, true
+	case "srv2", "srv1", "xml":
+		return "xml", "application/xml", 6, true
 	default:
-		clean := strings.ToLower(strings.TrimSpace(rawFmt))
-		if subtitleExtSafePattern.MatchString(clean) {
-			return clean, "application/xml"
-		}
-		return "xml", "application/xml"
+		return "", "", 0, false
 	}
+}
+
+// extractFinalizeSubtitleExpiresAt parses Unix-second expire/expires query params and
+// returns RFC3339 UTC only when strictly inside (now, now+30d]; returns "" otherwise.
+func extractFinalizeSubtitleExpiresAt(rawURL string, now time.Time) string {
+	if now.IsZero() {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.RawQuery == "" {
+		return ""
+	}
+	maxExp := now.Add(maxFinalizeSubtitleExpiresWindow)
+	var earliest time.Time
+	for _, ampPart := range strings.Split(u.RawQuery, "&") {
+		for _, part := range strings.Split(ampPart, ";") {
+			if part == "" {
+				continue
+			}
+			rawK, rawV, hasVal := strings.Cut(part, "=")
+			if !hasVal {
+				continue
+			}
+			decodedK, kErr := url.QueryUnescape(rawK)
+			if kErr != nil {
+				decodedK = rawK
+			}
+			keyLower := strings.ToLower(strings.TrimSpace(decodedK))
+			if keyLower != "expire" && keyLower != "expires" {
+				continue
+			}
+			val := rawV
+			if decodedV, vErr := url.QueryUnescape(rawV); vErr == nil {
+				val = decodedV
+			}
+			sec, parseErr := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+			if parseErr != nil || sec <= 0 {
+				continue
+			}
+			expTime := time.Unix(sec, 0).UTC()
+			if !expTime.After(now) || expTime.After(maxExp) {
+				continue
+			}
+			if earliest.IsZero() || expTime.Before(earliest) {
+				earliest = expTime
+			}
+		}
+	}
+	if earliest.IsZero() {
+		return ""
+	}
+	return earliest.Format(time.RFC3339)
 }
 
 // ensureTimedtextFormatURL returns a validated timedtext URL without mutating any
 // existing signed query parameter. It appends fmt=vtt only when fmt is absent AND
-// fmt is not listed in sparams.
-func ensureTimedtextFormatURL(rawURL string) (finalURL, ext, mimeType string) {
+// fmt is not listed in sparams. Unknown explicit fmt values are rejected (ok=false).
+func ensureTimedtextFormatURL(rawURL string) (finalURL, ext, mimeType string, rank int, ok bool) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return rawURL, "xml", "application/xml"
+		return "", "", "", 0, false
 	}
 	var existingFmt string
 	hasFmtParam := false
@@ -278,11 +328,14 @@ func ensureTimedtextFormatURL(rawURL string) (finalURL, ext, mimeType string) {
 		}
 	}
 	if hasFmtParam {
-		e, m := mapTimedtextFormatMetadata(existingFmt)
-		return rawURL, e, m
+		e, m, r, valid := mapTimedtextFormatMetadata(existingFmt)
+		if !valid {
+			return "", "", "", 0, false
+		}
+		return rawURL, e, m, r, true
 	}
 	if fmtSigned {
-		return rawURL, "xml", "application/xml"
+		return rawURL, "xml", "application/xml", 6, true
 	}
 	var candidate string
 	switch {
@@ -294,9 +347,9 @@ func ensureTimedtextFormatURL(rawURL string) (finalURL, ext, mimeType string) {
 		candidate = rawURL + "&fmt=vtt"
 	}
 	if !AllowYouTubeTimedtextURL(candidate) {
-		return rawURL, "xml", "application/xml"
+		return rawURL, "xml", "application/xml", 6, true
 	}
-	return candidate, "vtt", "text/vtt"
+	return candidate, "vtt", "text/vtt", 1, true
 }
 
 func captionLanguagePriority(langLower string) int {
@@ -328,9 +381,9 @@ func shortFinalizeDigest(input string) string {
 }
 
 // extractFinalizeSubtitles parses optional client-submitted YouTube captionTracks
-// into validated, deduplicated, deterministically sorted Unified-v1 subtitle
+// into validated, rank-deduplicated, deterministically sorted Unified-v1 subtitle
 // attachments. Invalid tracks are silently skipped without failing finalization.
-func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unified.Array {
+func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string, now time.Time) unified.Array {
 	trimmed := bytes.TrimSpace(rawCaptions)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return nil
@@ -353,7 +406,7 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unifi
 	}
 
 	candidates := make([]finalizeSubtitleCandidate, 0, len(rawTracks))
-	seenLangKind := make(map[string]bool, len(rawTracks))
+	bestByLangKind := make(map[string]int, len(rawTracks))
 
 	for _, rawEntry := range rawTracks {
 		var track rawFinalizeCaptionTrack
@@ -382,19 +435,21 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unifi
 			strings.EqualFold(strings.TrimSpace(parsedURL.Query().Get("kind")), "asr") {
 			trackKind = "auto"
 		}
-		langLower := strings.ToLower(lang)
-		dedupKey := langLower + "\x00" + trackKind
-		if seenLangKind[dedupKey] {
+		finalURL, ext, mimeType, rank, ok := ensureTimedtextFormatURL(track.BaseURL)
+		if !ok {
 			continue
 		}
-		seenLangKind[dedupKey] = true
+		langLower := strings.ToLower(lang)
+		dedupKey := langLower + "\x00" + trackKind
+		if prevIdx, exists := bestByLangKind[dedupKey]; exists && rank >= candidates[prevIdx].rank {
+			continue
+		}
 
 		title := extractCaptionTrackTitle(track.Name)
 		if title == "" {
 			title = lang
 		}
-		finalURL, ext, mimeType := ensureTimedtextFormatURL(track.BaseURL)
-		candidates = append(candidates, finalizeSubtitleCandidate{
+		cand := finalizeSubtitleCandidate{
 			language:  lang,
 			langLower: langLower,
 			title:     title,
@@ -402,7 +457,15 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unifi
 			url:       finalURL,
 			ext:       ext,
 			mimeType:  mimeType,
-		})
+			rank:      rank,
+			expiresAt: extractFinalizeSubtitleExpiresAt(finalURL, now),
+		}
+		if prevIdx, exists := bestByLangKind[dedupKey]; exists {
+			candidates[prevIdx] = cand
+		} else {
+			bestByLangKind[dedupKey] = len(candidates)
+			candidates = append(candidates, cand)
+		}
 	}
 
 	if len(candidates) == 0 {
@@ -432,6 +495,14 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unifi
 	for _, c := range candidates {
 		attID := "sub-" + shortFinalizeDigest("youtube:sub:"+videoID+":"+c.langLower+":"+c.trackKind)
 		srcID := "s-" + shortFinalizeDigest("youtube:sub-src:"+videoID+":"+c.langLower+":"+c.trackKind)
+		src := unified.Object{
+			"id":     srcID,
+			"url":    c.url,
+			"access": "direct",
+		}
+		if c.expiresAt != "" {
+			src["expires_at"] = c.expiresAt
+		}
 		attachments = append(attachments, unified.Object{
 			"id":         attID,
 			"role":       "subtitle",
@@ -448,14 +519,8 @@ func extractFinalizeSubtitles(rawCaptions json.RawMessage, videoID string) unifi
 					"evidence":  "upstream",
 				},
 				"delivery": unified.Object{
-					"kind": "file",
-					"sources": unified.Array{
-						unified.Object{
-							"id":     srcID,
-							"url":    c.url,
-							"access": "direct",
-						},
-					},
+					"kind":    "file",
+					"sources": unified.Array{src},
 				},
 			},
 		})

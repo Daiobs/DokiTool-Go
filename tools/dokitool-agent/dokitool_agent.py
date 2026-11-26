@@ -47,22 +47,24 @@ def create_client(
     *,
     timeout: float = 60.0,
     max_retries: int = 3,
+    no_proxy: bool = False,
 ) -> DokiToolClient:
     """Create an env-authenticated DokiToolClient using DOKITOOL_API_BASE/DOKITOOL_API_TOKEN."""
     resolved_base = api_base or os.environ.get("DOKITOOL_API_BASE", DEFAULT_API_BASE)
-    return DokiToolClient(api_base=resolved_base, timeout=timeout, max_retries=max_retries)
+    return DokiToolClient(api_base=resolved_base, timeout=timeout, max_retries=max_retries, no_proxy=no_proxy)
 
 
 def create_mcp_server(
     *,
     api_base: str | None = None,
     timeout: float = 60.0,
+    no_proxy: bool = False,
     allow_write: bool = False,
     output_dir: str | Path | None = None,
     allow_ffmpeg: bool = False,
 ) -> DokiToolMCPServer:
     """Create a read-only-by-default stdio MCP server (writes/ffmpeg require explicit opt-in)."""
-    client = create_client(api_base=api_base, timeout=timeout)
+    client = create_client(api_base=api_base, timeout=timeout, no_proxy=no_proxy)
     resolved_out = Path(output_dir) if output_dir is not None else None
     return DokiToolMCPServer(
         client,

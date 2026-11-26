@@ -7,7 +7,6 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 from typing import Any, Callable, Sequence
@@ -15,14 +14,8 @@ import urllib.parse
 
 from api_client import DokiToolClient
 from security import (
-    HTTPStatusError,
-    MAX_MEDIA_BYTES,
-    MAX_SUBTITLE_BYTES,
-    SecurityError,
-    redact_sensitive,
-    resolve_jailed_path,
-    sanitize_filename_stem,
-    validate_output_dir,
+    HTTPStatusError, MAX_MEDIA_BYTES, MAX_SUBTITLE_BYTES, SecurityError,
+    redact_sensitive, resolve_jailed_path, sanitize_filename_stem, validate_output_dir,
 )
 from subtitles import extract_subtitles_from_data
 
@@ -31,8 +24,16 @@ _MIME_EXTS = {
     "audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/aac": "aac", "audio/webm": "webm", "audio/ogg": "ogg",
     "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
 }
+_ALLOWED_MEDIA_EXTS = frozenset({
+    *_MIME_EXTS.values(), "flac", "wav", "opus", "m4v", "ts", "avif", "vtt", "srt", "ttml",
+})
+_ALLOWED_SUBTITLE_EXTS = frozenset({"txt", "vtt", "srt", "ttml", "srv3", "json3", "xml"})
+_FORBIDDEN_FILENAME_EXTS = frozenset({
+    "exe", "bat", "cmd", "ps1", "sh", "bash", "zsh", "com", "msi", "vbs", "vbe",
+    "js", "mjs", "cjs", "jse", "hta", "scr", "pif", "jar", "html", "htm", "svg",
+    "command", "app", "dll", "so", "dylib",
+})
 _SAFE_MUX_FORMATS = {"mp4": "mp4", "mkv": "matroska", "matroska": "matroska", "webm": "webm", "mov": "mov"}
-_EXT_RE = re.compile(r"^[a-z0-9]{2,5}$")
 
 
 class DownloadError(RuntimeError):
@@ -64,17 +65,30 @@ def _sniff_magic_ext(path: Path) -> str | None:
     return "webm" if head.startswith(b"\x1a\x45\xdf\xa3") else None
 
 
+def _validate_explicit_filename(output_dir: Path, filename: str) -> Path:
+    """Validate an explicit --filename target inside output_dir and reject dangerous suffixes."""
+    target = resolve_jailed_path(output_dir, filename, allow_subdirs=False)
+    ext = Path(filename).suffix.lower().lstrip(".")
+    if ext in _FORBIDDEN_FILENAME_EXTS:
+        raise SecurityError(f"Refusing dangerous executable or script filename suffix: .{ext}")
+    return target
+
+
 def _infer_ext(meta: dict[str, Any] | None, headers: dict[str, str], url: str, part_path: Path) -> str:
     meta = meta or {}
     for key in ("extension", "container"):
         val = str(meta.get(key) or "").strip().lower().lstrip(".")
-        if _EXT_RE.fullmatch(val) and val != "bin":
-            return "jpg" if val == "jpeg" else val
+        if val == "jpeg":
+            val = "jpg"
+        if val in _ALLOWED_MEDIA_EXTS:
+            return val
     mime = (str(meta.get("mime_type") or "") or headers.get("content-type", "")).split(";")[0].strip().lower()
     if mime in _MIME_EXTS:
         return _MIME_EXTS[mime]
     path_ext = Path(urllib.parse.urlsplit(url).path).suffix.lower().lstrip(".")
-    if path_ext in _MIME_EXTS.values():
+    if path_ext == "jpeg":
+        path_ext = "jpg"
+    if path_ext in _ALLOWED_MEDIA_EXTS:
         return path_ext
     return _sniff_magic_ext(part_path) or "bin"
 
@@ -148,8 +162,12 @@ def _download_routes_atomic(
             written, hdrs, final_url = client.fetcher.download_to_file(url, part_path, output_dir, max_bytes=max_bytes)
             if written <= 0:
                 raise DownloadError("Downloaded file is empty")
-            target_name = explicit_filename if explicit_filename is not None else f"{stem}.{_infer_ext(meta, hdrs, final_url, part_path)}"
-            final_path = resolve_jailed_path(output_dir, target_name, allow_subdirs=False)
+            if explicit_filename is not None:
+                final_path = _validate_explicit_filename(output_dir, explicit_filename)
+            else:
+                final_path = resolve_jailed_path(
+                    output_dir, f"{stem}.{_infer_ext(meta, hdrs, final_url, part_path)}", allow_subdirs=False
+                )
             os.replace(part_path, final_path)
             return final_path, written, False
         except SecurityError:
@@ -217,7 +235,8 @@ def write_subtitle_files(
         kind = sanitize_filename_stem(str(track.get("track_kind") or "sub"), 12)
         out_fmt = str(track.get("output_format") or "txt").lower()
         raw_ext = "txt" if out_fmt == "text" else (track.get("source_format") or "vtt" if out_fmt == "raw" else out_fmt)
-        ext = sanitize_filename_stem(str(raw_ext), 8)
+        clean_ext = str(raw_ext or "").strip().lower().lstrip(".")
+        ext = clean_ext if clean_ext in _ALLOWED_SUBTITLE_EXTS else "txt"
         filename = f"{safe_prefix}.{lang}.{kind}.{ext}"
         dup_n = 2
         while filename in used_names:
@@ -299,8 +318,13 @@ def _download_variant_files(
             if a_exp:
                 return [], True
             out_meta = delivery.get("output") if isinstance(delivery.get("output"), dict) else {}
-            out_ext = sanitize_filename_stem(str(out_meta.get("extension") or "mp4"), 8)
-            final_path = resolve_jailed_path(root, explicit_filename or f"{stem}.{out_ext}", allow_subdirs=False)
+            raw_out_ext = str(out_meta.get("extension") or "mp4").strip().lower().lstrip(".")
+            out_ext = raw_out_ext if raw_out_ext in _SAFE_MUX_FORMATS else "mp4"
+            final_path = (
+                _validate_explicit_filename(root, explicit_filename)
+                if explicit_filename is not None
+                else resolve_jailed_path(root, f"{stem}.{out_ext}", allow_subdirs=False)
+            )
             nbytes = _mux_with_ffmpeg(v_path, a_path, final_path, root, str(out_meta.get("container") or out_ext).lower(), subprocess_runner)
             return [{"role": "muxed", "file": final_path.name, "bytes": nbytes}], False
         finally:
@@ -322,7 +346,7 @@ def download_media(
         raise SecurityError("Local file write is disabled; explicit --allow-write --output-dir is required")
     root = validate_output_dir(output_dir, create=True)
     if filename is not None:
-        resolve_jailed_path(root, filename, allow_subdirs=False)
+        _validate_explicit_filename(root, filename)
 
     data = client.parse(share_url, platform=platform)["data"]
     item = _select_item(data, item_id)

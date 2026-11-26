@@ -75,10 +75,10 @@ func TestAllowYouTubeTimedtextURL(t *testing.T) {
 func TestEnsureTimedtextFormatURLPreservesSparams(t *testing.T) {
 	// 1. fmt absent and NOT in sparams -> appends &fmt=vtt preserving exact original bytes.
 	base := "https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&ei=E1&expire=1794238131&sparams=v%2Cei%2Cexpire&signature=SIG_A%2BB&key=yt8&lang=en"
-	gotURL, gotExt, gotMime := ensureTimedtextFormatURL(base)
+	gotURL, gotExt, gotMime, gotRank, ok := ensureTimedtextFormatURL(base)
 	wantURL := base + "&fmt=vtt"
-	if gotURL != wantURL || gotExt != "vtt" || gotMime != "text/vtt" {
-		t.Fatalf("got (%q, %q, %q), want (%q, vtt, text/vtt)", gotURL, gotExt, gotMime, wantURL)
+	if !ok || gotURL != wantURL || gotExt != "vtt" || gotMime != "text/vtt" || gotRank != 1 {
+		t.Fatalf("got (%q, %q, %q, %d, %v), want (%q, vtt, text/vtt, 1, true)", gotURL, gotExt, gotMime, gotRank, ok, wantURL)
 	}
 
 	// 2. fmt absent BUT listed in sparams (plain or percent-encoded) -> MUST NOT mutate URL.
@@ -86,17 +86,42 @@ func TestEnsureTimedtextFormatURLPreservesSparams(t *testing.T) {
 		"https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&sparams=v,expire,fmt&signature=SIG&lang=en",
 		"https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&sparams=v%2Cexpire%2Cfmt&signature=SIG&lang=en",
 	} {
-		u, ext, mime := ensureTimedtextFormatURL(signed)
-		if u != signed || ext != "xml" || mime != "application/xml" {
-			t.Fatalf("signed sparams fmt mutated URL: got (%q, %q, %q), want (%q, xml, application/xml)", u, ext, mime, signed)
+		u, ext, mime, rank, ok := ensureTimedtextFormatURL(signed)
+		if !ok || u != signed || ext != "xml" || mime != "application/xml" || rank != 6 {
+			t.Fatalf("signed sparams fmt mutated URL: got (%q, %q, %q, %d, %v), want (%q, xml, application/xml, 6, true)", u, ext, mime, rank, ok, signed)
 		}
 	}
 
-	// 3. fmt already present (e.g. fmt=srv3 or fmt=ttml or fmt=vtt) -> MUST NOT mutate URL.
-	existing := "https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&lang=en&fmt=ttml&signature=SIG"
-	u, ext, mime := ensureTimedtextFormatURL(existing)
-	if u != existing || ext != "ttml" || mime != "application/ttml+xml" {
-		t.Fatalf("existing fmt mutated: got (%q, %q, %q)", u, ext, mime)
+	// 3. Known explicit fmt values map to controlled extensions/MIME/ranks without mutating URL.
+	for _, tc := range []struct {
+		fmtParam string
+		wantExt  string
+		wantMime string
+		wantRank int
+	}{
+		{"vtt", "vtt", "text/vtt", 1},
+		{"srt", "srt", "application/x-subrip", 2},
+		{"ttml", "ttml", "application/ttml+xml", 3},
+		{"srv3", "srv3", "application/xml", 4},
+		{"json3", "json3", "application/json", 5},
+		{"srv2", "xml", "application/xml", 6},
+		{"srv1", "xml", "application/xml", 6},
+		{"xml", "xml", "application/xml", 6},
+	} {
+		existing := "https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&lang=en&fmt=" + tc.fmtParam + "&signature=SIG"
+		u, ext, mime, rank, ok := ensureTimedtextFormatURL(existing)
+		if !ok || u != existing || ext != tc.wantExt || mime != tc.wantMime || rank != tc.wantRank {
+			t.Fatalf("fmt=%s got (%q, %q, %q, %d, %v), want (%q, %q, %q, %d, true)",
+				tc.fmtParam, u, ext, mime, rank, ok, existing, tc.wantExt, tc.wantMime, tc.wantRank)
+		}
+	}
+
+	// 4. Unknown explicit fmt values are strictly rejected (never passed through as arbitrary extensions).
+	for _, badFmt := range []string{"exe", "sh", "html", "arbitrary", ""} {
+		badURL := "https://www.youtube.com/api/timedtext?v=I9JvDaciaFk&lang=en&fmt=" + badFmt + "&signature=SIG"
+		if _, _, _, _, ok := ensureTimedtextFormatURL(badURL); ok {
+			t.Fatalf("expected unknown fmt=%q to be rejected", badFmt)
+		}
 	}
 }
 
@@ -343,5 +368,138 @@ func TestFinalizeSubtitlesExtractionAndZeroDiffWithoutCaptions(t *testing.T) {
 	}
 	if subCount != MaxFinalizeSubtitleAttachments {
 		t.Fatalf("emitted subtitle count = %d, want %d", subCount, MaxFinalizeSubtitleAttachments)
+	}
+}
+
+func TestFinalizeSubtitlesRankDedupAndSafeExpiresAt(t *testing.T) {
+	currentNow := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	helper := newGoldenHelper(t, "a5c2aafe", nil, func() time.Time { return currentNow })
+	const videoID = "I9JvDaciaFk"
+
+	futureExp := currentNow.Add(6 * time.Hour).Unix()
+	wantFutureRFC3339 := time.Unix(futureExp, 0).UTC().Format(time.RFC3339)
+	pastExp := currentNow.Add(-1 * time.Hour).Unix()
+	tooFarExp := currentNow.Add(31 * 24 * time.Hour).Unix()
+
+	req := map[string]any{
+		"video_id":  videoID,
+		"player_id": "a5c2aafe",
+		"title":     "Rank and Expiry Video",
+		"formats": []any{
+			map[string]any{
+				"itag":     18,
+				"mimeType": `video/mp4; codecs="avc1.42001E, mp4a.40.2"`,
+				"width":    640,
+				"height":   360,
+				"url":      "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?id=" + videoID + "&itag=18&n=N18",
+			},
+		},
+		"captions": map[string]any{
+			"playerCaptionsTracklistRenderer": map[string]any{
+				"captionTracks": []any{
+					// Unknown fmt -> rejected
+					map[string]any{
+						"baseUrl":      "https://www.youtube.com/api/timedtext?v=" + videoID + "&lang=fr&fmt=exe",
+						"languageCode": "fr",
+						"name":         map[string]any{"simpleText": "Bad Fmt"},
+					},
+					// English: srv1 (rank 6) -> json3 (rank 5) -> vtt (rank 1, valid future expire) -> srt (rank 2) -> vtt #2 (rank 1)
+					// Expect vtt #1 to win deterministically and carry expires_at!
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=srv1&expire=%d", videoID, futureExp),
+						"languageCode": "en",
+						"name":         map[string]any{"simpleText": "English SRV1"},
+					},
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=json3&expire=%d", videoID, futureExp),
+						"languageCode": "en",
+						"name":         map[string]any{"simpleText": "English JSON3"},
+					},
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=vtt&expire=%d&sig=FIRST", videoID, futureExp),
+						"languageCode": "en",
+						"name":         map[string]any{"simpleText": "English VTT First"},
+					},
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=srt&expire=%d", videoID, futureExp),
+						"languageCode": "en",
+						"name":         map[string]any{"simpleText": "English SRT"},
+					},
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=en&fmt=vtt&expire=%d&sig=SECOND", videoID, futureExp),
+						"languageCode": "en",
+						"name":         map[string]any{"simpleText": "English VTT Second"},
+					},
+					// Japanese: historical past expire -> expires_at MUST be omitted
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=ja&fmt=json3&expire=%d", videoID, pastExp),
+						"languageCode": "ja",
+						"name":         map[string]any{"simpleText": "日本語"},
+					},
+					// Korean: >30d expire -> expires_at MUST be omitted
+					map[string]any{
+						"baseUrl":      fmt.Sprintf("https://www.youtube.com/api/timedtext?v=%s&lang=ko&fmt=vtt&expires=%d", videoID, tooFarExp),
+						"languageCode": "ko",
+						"name":         map[string]any{"simpleText": "한국어"},
+					},
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(req)
+	payload, status := helper.Finalize(context.Background(), body, false)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", status, payload)
+	}
+	if err := unified.ValidateEnvelopeAt(payload, currentNow.Unix()); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+
+	byLang := make(map[string]unified.Object)
+	for _, rawAtt := range unified.Slice(unified.Map(payload["data"])["attachments"]) {
+		att := unified.Map(rawAtt)
+		if unified.Str(att["role"]) == "subtitle" {
+			byLang[unified.Str(att["language"])] = att
+		}
+	}
+	if _, hasFr := byLang["fr"]; hasFr {
+		t.Fatalf("unknown fmt=exe track should have been dropped")
+	}
+	if len(byLang) != 3 {
+		t.Fatalf("expected 3 subtitles (en, ja, ko), got %d: %#v", len(byLang), byLang)
+	}
+
+	enSrc := unified.Map(unified.Slice(unified.Map(unified.Map(byLang["en"]["resource"])["delivery"])["sources"])[0])
+	enMeta := unified.Map(unified.Map(byLang["en"]["resource"])["metadata"])
+	if unified.Str(enMeta["extension"]) != "vtt" || !strings.Contains(unified.Str(enSrc["url"]), "sig=FIRST") {
+		t.Fatalf("expected en to pick first vtt track, got ext=%v url=%v", enMeta["extension"], enSrc["url"])
+	}
+	if unified.Str(enSrc["expires_at"]) != wantFutureRFC3339 {
+		t.Fatalf("en expires_at = %q, want %q", unified.Str(enSrc["expires_at"]), wantFutureRFC3339)
+	}
+
+	jaSrc := unified.Map(unified.Slice(unified.Map(unified.Map(byLang["ja"]["resource"])["delivery"])["sources"])[0])
+	jaMeta := unified.Map(unified.Map(byLang["ja"]["resource"])["metadata"])
+	if unified.Str(jaMeta["extension"]) != "json3" || unified.Str(jaMeta["mime_type"]) != "application/json" {
+		t.Fatalf("expected ja json3 metadata, got %#v", jaMeta)
+	}
+	if _, exists := jaSrc["expires_at"]; exists {
+		t.Fatalf("past expire must not set expires_at, got %#v", jaSrc["expires_at"])
+	}
+
+	koSrc := unified.Map(unified.Slice(unified.Map(unified.Map(byLang["ko"]["resource"])["delivery"])["sources"])[0])
+	if _, exists := koSrc["expires_at"]; exists {
+		t.Fatalf(">30d expire must not set expires_at, got %#v", koSrc["expires_at"])
+	}
+
+	// Zero nowTime never emits expires_at
+	rawCaps, _ := json.Marshal(req["captions"])
+	zeroAtts := extractFinalizeSubtitles(rawCaps, videoID, time.Time{})
+	for _, rawAtt := range zeroAtts {
+		src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Map(rawAtt)["resource"])["delivery"])["sources"])[0])
+		if _, exists := src["expires_at"]; exists {
+			t.Fatalf("zero now must not set expires_at, got %#v", src["expires_at"])
+		}
 	}
 }

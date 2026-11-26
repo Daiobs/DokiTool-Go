@@ -36,6 +36,12 @@ class ClassifyPathsTests(unittest.TestCase):
             ["scripts/check-ytdlp-extractors.py", "scripts/tests/test_check_ytdlp_extractors.py"],
             ["docs/openapi.json", "docs/API.md", "docs/CONFIGURATION.md"],
             [
+                "tools/dokitool-agent/README.md",
+                "tools/dokitool-agent/SKILL.md",
+                "tools/dokitool-agent/http_transport.py",
+                "tools/dokitool-agent/tests/test_security.py",
+            ],
+            [
                 "README.md",
                 "LICENSE",
                 "NOTICE",
@@ -153,6 +159,7 @@ class ClassifyPathsTests(unittest.TestCase):
         bad_cases = [
             [],
             ["ops/release/deploy.sh"],
+            ["tools/other/unknown.py"],
             ["unknown-root-file.txt"],
             ["../escape.py"],
             ["/abs/path.go"],

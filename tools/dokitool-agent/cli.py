@@ -58,6 +58,11 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         default="json",
         help="CLI output format (default: json)",
     )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Bypass HTTP_PROXY/HTTPS_PROXY and enforce direct IP-pinned connections",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="DokiTool API origin (default: $DOKITOOL_API_BASE or https://snap.dokitool.com)",
     )
     p_mcp.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds (default: 60)")
+    p_mcp.add_argument("--no-proxy", action="store_true", help="Bypass HTTP_PROXY/HTTPS_PROXY and enforce direct IP-pinned connections")
     p_mcp.add_argument("--allow-write", action="store_true", help="Explicit opt-in to expose dokitool_download_media")
     p_mcp.add_argument("--output-dir", type=Path, help="Jailed output root for opt-in writes (requires --allow-write)")
     p_mcp.add_argument("--allow-ffmpeg", action="store_true", help="Explicit opt-in to allow ffmpeg muxing in MCP downloads")
@@ -238,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
     try:
-        client = DokiToolClient(api_base=args.api_base, timeout=args.timeout)
+        client = DokiToolClient(api_base=args.api_base, timeout=args.timeout, no_proxy=bool(getattr(args, "no_proxy", False)))
         if args.command == "platforms":
             _emit_output(summarize_platforms(client.list_platforms()), args.format, _render_platforms_text)
             return 0

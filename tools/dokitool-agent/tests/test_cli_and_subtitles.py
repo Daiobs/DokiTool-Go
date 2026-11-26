@@ -363,6 +363,27 @@ class CLIAndSubtitlesTests(unittest.TestCase):
             self.assertEqual((out_dir / dup_saved[0]["file"]).read_text(encoding="utf-8"), "one")
             self.assertEqual((out_dir / dup_saved[1]["file"]).read_text(encoding="utf-8"), "two")
 
+            # Extension allowlist: malicious metadata/URL suffixes fall back to magic sniffing or 'bin'
+            raw_part = out_dir / "unknown.part"
+            raw_part.write_bytes(b"NOT_A_KNOWN_MEDIA_MAGIC")
+            mp4_part = out_dir / "mp4.part"
+            mp4_part.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+            for bad_ext in ("exe", "bat", "ps1", "sh", "cmd", "html"):
+                self.assertEqual(downloader._infer_ext({"extension": bad_ext}, {}, f"https://cdn.test/a.{bad_ext}", raw_part), "bin")
+                self.assertEqual(downloader._infer_ext({"container": bad_ext}, {}, f"https://cdn.test/a.{bad_ext}", mp4_part), "mp4")
+            self.assertEqual(downloader._infer_ext({"extension": "jpeg"}, {}, "https://cdn.test/a", raw_part), "jpg")
+            self.assertEqual(downloader._infer_ext({"extension": "flac"}, {}, "https://cdn.test/a", raw_part), "flac")
+
+            # Explicit --filename rejects dangerous executable/script suffixes and path separators
+            for bad_fn in ("payload.exe", "run.sh", "script.ps1", "drop.bat", "index.html", "sub/ok.mp4", "a\\b.mp4"):
+                with self.assertRaises(security.SecurityError, msg=bad_fn):
+                    downloader.download_media(client, "https://example.com/video/1", out_dir, allow_write=True, filename=bad_fn)
+
+            # CLI --no-proxy flag parses cleanly across subcommands
+            args_parse = cli.build_parser().parse_args(["parse", "--no-proxy", "https://example.com/v/1"])
+            args_mcp = cli.build_parser().parse_args(["mcp", "--no-proxy"])
+            self.assertTrue(args_parse.no_proxy and args_mcp.no_proxy)
+
 
 if __name__ == "__main__":
     unittest.main()

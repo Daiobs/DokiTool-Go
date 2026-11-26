@@ -6,7 +6,9 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -17,9 +19,10 @@ const (
 	// MaxSubtitleAttachments caps emitted subtitle attachments per adapted envelope.
 	MaxSubtitleAttachments = 32
 
-	maxSubtitleURLLength   = 8192
-	maxSubtitleLangCodeLen = 32
-	maxSubtitleTitleRunes  = 200
+	maxSubtitleURLLength     = 8192
+	maxSubtitleLangCodeLen   = 32
+	maxSubtitleTitleRunes    = 200
+	maxSubtitleExpiresWindow = 30 * 24 * time.Hour
 )
 
 type subtitleFormatSpec struct {
@@ -35,10 +38,11 @@ var (
 	subtitlePublicTLDRe     = regexp.MustCompile(`^(?:[a-z]{2,}|xn--[a-z0-9-]{2,})$`)
 
 	subtitleFormatSpecs = map[string]subtitleFormatSpec{
-		"vtt":  {rank: 1, container: "vtt", ext: "vtt", mimeType: "text/vtt"},
-		"srt":  {rank: 2, container: "srt", ext: "srt", mimeType: "application/x-subrip"},
-		"ttml": {rank: 3, container: "ttml", ext: "ttml", mimeType: "application/ttml+xml"},
-		"srv3": {rank: 4, container: "srv3", ext: "srv3", mimeType: "application/xml"},
+		"vtt":   {rank: 1, container: "vtt", ext: "vtt", mimeType: "text/vtt"},
+		"srt":   {rank: 2, container: "srt", ext: "srt", mimeType: "application/x-subrip"},
+		"ttml":  {rank: 3, container: "ttml", ext: "ttml", mimeType: "application/ttml+xml"},
+		"srv3":  {rank: 4, container: "srv3", ext: "srv3", mimeType: "application/xml"},
+		"json3": {rank: 5, container: "json3", ext: "json3", mimeType: "application/json"},
 	}
 
 	blockedSubtitleHostSuffixes = []string{
@@ -319,7 +323,51 @@ func collectSubtitleCandidatesFromMap(
 	return out
 }
 
-func buildSubtitleAttachments(entry, parent *Info, opts AdaptOptions) unified.Array {
+// extractSubtitleExpiresAt parses Unix-second expire/expires query params and returns
+// RFC3339 UTC only when strictly inside (now, now+30d]; returns "" otherwise.
+func extractSubtitleExpiresAt(rawURL string, now time.Time) string {
+	if now.IsZero() {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.RawQuery == "" {
+		return ""
+	}
+	maxExp := now.Add(maxSubtitleExpiresWindow)
+	var earliest time.Time
+	forEachSubtitleQueryParam(u.RawQuery, func(rawKey, decodedKey, rawVal string, err error) bool {
+		k := decodedKey
+		if err != nil {
+			k = rawKey
+		}
+		keyLower := strings.ToLower(strings.TrimSpace(k))
+		if keyLower != "expire" && keyLower != "expires" {
+			return true
+		}
+		val := rawVal
+		if decodedV, vErr := url.QueryUnescape(rawVal); vErr == nil {
+			val = decodedV
+		}
+		sec, parseErr := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+		if parseErr != nil || sec <= 0 {
+			return true
+		}
+		expTime := time.Unix(sec, 0).UTC()
+		if !expTime.After(now) || expTime.After(maxExp) {
+			return true
+		}
+		if earliest.IsZero() || expTime.Before(earliest) {
+			earliest = expTime
+		}
+		return true
+	})
+	if earliest.IsZero() {
+		return ""
+	}
+	return earliest.Format(time.RFC3339)
+}
+
+func buildSubtitleAttachments(entry, parent *Info, opts AdaptOptions, now time.Time) unified.Array {
 	var manualMap, autoMap map[string][]SubtitleTrack
 	if entry != nil {
 		manualMap, autoMap = entry.Subtitles, entry.AutomaticCaptions
@@ -363,6 +411,9 @@ func buildSubtitleAttachments(entry, parent *Info, opts AdaptOptions) unified.Ar
 		srcID := "s-" + shortDigest(opts.PlatformID+":sub-src:"+opts.ContentID+":"+c.langLower+":"+c.trackKind)
 		meta := unified.Object{"container": c.spec.container, "extension": c.spec.ext, "mime_type": c.spec.mimeType, "evidence": "upstream"}
 		src := unified.Object{"id": srcID, "url": c.url, "access": "direct"}
+		if exp := extractSubtitleExpiresAt(c.url, now); exp != "" {
+			src["expires_at"] = exp
+		}
 		res := unified.Object{"id": "res-" + attID, "role": "subtitle", "metadata": meta, "delivery": unified.Object{"kind": "file", "sources": unified.Array{src}}}
 		attachments = append(attachments, unified.Object{"id": attID, "role": "subtitle", "language": c.language, "title": c.title, "track_kind": c.trackKind, "resource": res})
 	}

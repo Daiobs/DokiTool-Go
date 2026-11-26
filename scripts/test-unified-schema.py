@@ -1,8 +1,10 @@
 """Independent contract examples and adversarial checks; all inputs synthetic."""
+import ast
 from copy import deepcopy
 import importlib.util
 import json
 from pathlib import Path
+import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -702,6 +704,62 @@ class ContractTests(unittest.TestCase):
                 r['data']['attachments'] = [att]
                 with self.assertRaises(ValueError):
                     contract.validate(r)
+
+    def test_attachment_track_kind_enum_parity_across_four_layers(self):
+        expected = {'manual', 'auto'}
+
+        # 1. JSON Schema
+        schema_doc = json.loads(
+            (ROOT / 'docs/schema/unified-v1/unified-v1.schema.json').read_text(encoding='utf-8')
+        )
+        schema_enum = set(schema_doc['$defs']['Attachment']['properties']['track_kind']['enum'])
+        self.assertEqual(schema_enum, expected)
+
+        # 2. Python contract validator (AST extraction of `attachment['track_kind'] in {...}`)
+        py_tree = ast.parse((ROOT / 'scripts/validate-unified-schema.py').read_text(encoding='utf-8'))
+        py_enums = set()
+        for node in ast.walk(py_tree):
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.In)
+                and isinstance(node.left, ast.Subscript)
+                and isinstance(node.left.value, ast.Name)
+                and node.left.value.id == 'attachment'
+                and isinstance(node.left.slice, ast.Constant)
+                and node.left.slice.value == 'track_kind'
+                and isinstance(node.comparators[0], (ast.Set, ast.Tuple, ast.List))
+            ):
+                for elt in node.comparators[0].elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        py_enums.add(elt.value)
+        self.assertEqual(py_enums, expected)
+
+        # 3. Go backend validator (`backend/internal/unified/validate.go`)
+        go_src = (ROOT / 'backend/internal/unified/validate.go').read_text(encoding='utf-8')
+        go_match = re.search(
+            r'attachment\["track_kind"\](.*?)invalid attachment track_kind',
+            go_src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(go_match, 'Could not locate track_kind check in validate.go')
+        go_enums = set(re.findall(r'trackKind\s*!=\s*"([^"]+)"', go_match.group(1)))
+        self.assertEqual(go_enums, expected)
+
+        # 4. Frontend media contract (`frontend/src/utils/mediaContract.ts`)
+        ts_src = (ROOT / 'frontend/src/utils/mediaContract.ts').read_text(encoding='utf-8')
+        ts_match = re.search(
+            r'function\s+isSubtitleTrackKind\b[^{]*\{([^}]*)\}',
+            ts_src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(ts_match, 'Could not locate isSubtitleTrackKind in mediaContract.ts')
+        ts_enums = set(re.findall(r'===\s*"([^"]+)"', ts_match.group(1)))
+        self.assertEqual(ts_enums, expected)
+
+        self.assertEqual(schema_enum, py_enums)
+        self.assertEqual(py_enums, go_enums)
+        self.assertEqual(go_enums, ts_enums)
 
 
 if __name__ == '__main__':

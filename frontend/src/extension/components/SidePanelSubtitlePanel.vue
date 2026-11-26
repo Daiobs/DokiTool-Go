@@ -283,7 +283,7 @@ async function handleCopyTrackUrl(track: SubtitleTrackOption): Promise<void> {
       </li>
     </ul>
 
-    <p class="sp-sub__foot">纯客户端无 Cookie 直连白名单拉取并本地转换（单轨上限 5 MiB）。</p>
+    <p class="sp-sub__foot">纯客户端无 Cookie 直连白名单即时转换保存（单轨上限 5 MiB，导出期间请保持侧边栏开启）。</p>
   </div>
 </template>
 

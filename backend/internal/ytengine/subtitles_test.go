@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
@@ -274,5 +275,119 @@ func TestAdaptInfoSubtitleCapManualPriorityAndTier2PublicCDN(t *testing.T) {
 		if unified.Str(unified.Map(raw)["track_kind"]) != "manual" {
 			t.Fatalf("att[%d].track_kind = %v, want manual (manual must take priority over auto)", i, unified.Map(raw)["track_kind"])
 		}
+	}
+}
+
+func TestAdaptInfoSubtitleJson3AndSafeExpiresAt(t *testing.T) {
+	const now int64 = 1762300800
+	nowTime := time.Unix(now, 0).UTC()
+	futureExp := nowTime.Add(2 * time.Hour).Unix()
+	wantFutureRFC3339 := time.Unix(futureExp, 0).UTC().Format(time.RFC3339)
+	pastExp := nowTime.Add(-30 * time.Minute).Unix()
+	tooFarExp := nowTime.Add(31 * 24 * time.Hour).Unix()
+	w, h := int64(640), int64(360)
+
+	info := &Info{
+		ID:    "subExpDemo",
+		Title: "Subtitle json3 and expiry",
+		Formats: []Format{
+			{
+				FormatID: "18",
+				URL:      "https://rr1---sn-golden.googlevideo.com/videoplayback?itag=18",
+				Ext:      "mp4",
+				Protocol: "https",
+				Width:    &w,
+				Height:   &h,
+				VCodec:   "avc1.42001E",
+				ACodec:   "mp4a.40.2",
+			},
+		},
+		Subtitles: map[string][]SubtitleTrack{
+			// Only json3 available + valid future expire -> accepted as json3 with expires_at
+			"ko": {
+				{
+					Ext:  "json3",
+					URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=subExpDemo&lang=ko&fmt=json3&expire=%d", futureExp),
+					Name: "한국어",
+				},
+			},
+			// json3 + srv3 -> srv3 wins (rank 4 < rank 5) + valid future expires=
+			"ja": {
+				{
+					Ext:  "json3",
+					URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=subExpDemo&lang=ja&fmt=json3&expires=%d", futureExp),
+					Name: "日本語 JSON3",
+				},
+				{
+					Ext:  "srv3",
+					URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=subExpDemo&lang=ja&fmt=srv3&expires=%d", futureExp),
+					Name: "日本語 SRV3",
+				},
+			},
+			// Historical past expire -> expires_at omitted (must NOT mark source expired!)
+			"en": {
+				{
+					Ext:  "vtt",
+					URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=subExpDemo&lang=en&fmt=vtt&expire=%d", pastExp),
+					Name: "English Past",
+				},
+			},
+			// >30d expire -> expires_at omitted
+			"de": {
+				{
+					Ext:  "vtt",
+					URL:  fmt.Sprintf("https://www.youtube.com/api/timedtext?v=subExpDemo&lang=de&fmt=vtt&expire=%d", tooFarExp),
+					Name: "Deutsch Far",
+				},
+			},
+		},
+	}
+
+	env := AdaptInfo(info, AdaptOptions{
+		PlatformID: "youtube",
+		ContentID:  "subExpDemo",
+		SourceURL:  "https://www.youtube.com/watch?v=subExpDemo",
+		MaxEntries: 1,
+	}, now)
+	if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt failed: %v", err)
+	}
+
+	byLang := make(map[string]unified.Object)
+	for _, raw := range unified.Slice(unified.Map(env["data"])["attachments"]) {
+		att := unified.Map(raw)
+		byLang[unified.Str(att["language"])] = att
+	}
+	if len(byLang) != 4 {
+		t.Fatalf("expected 4 subtitle tracks, got %d", len(byLang))
+	}
+
+	koMeta := unified.Map(unified.Map(byLang["ko"]["resource"])["metadata"])
+	koSrc := unified.Map(unified.Slice(unified.Map(unified.Map(byLang["ko"]["resource"])["delivery"])["sources"])[0])
+	if unified.Str(koMeta["extension"]) != "json3" || unified.Str(koMeta["mime_type"]) != "application/json" {
+		t.Fatalf("ko meta = %#v, want json3/application/json", koMeta)
+	}
+	if unified.Str(koSrc["expires_at"]) != wantFutureRFC3339 {
+		t.Fatalf("ko expires_at = %q, want %q", unified.Str(koSrc["expires_at"]), wantFutureRFC3339)
+	}
+
+	jaMeta := unified.Map(unified.Map(byLang["ja"]["resource"])["metadata"])
+	jaSrc := unified.Map(unified.Slice(unified.Map(unified.Map(byLang["ja"]["resource"])["delivery"])["sources"])[0])
+	if unified.Str(jaMeta["extension"]) != "srv3" {
+		t.Fatalf("ja ext = %v, want srv3 (rank 4 < json3 rank 5)", jaMeta["extension"])
+	}
+	if unified.Str(jaSrc["expires_at"]) != wantFutureRFC3339 {
+		t.Fatalf("ja expires_at = %q, want %q", unified.Str(jaSrc["expires_at"]), wantFutureRFC3339)
+	}
+
+	for _, lang := range []string{"en", "de"} {
+		src := unified.Map(unified.Slice(unified.Map(unified.Map(byLang[lang]["resource"])["delivery"])["sources"])[0])
+		if _, exists := src["expires_at"]; exists {
+			t.Fatalf("%s out-of-window expire must not populate expires_at, got %#v", lang, src["expires_at"])
+		}
+	}
+
+	if got := extractSubtitleExpiresAt(fmt.Sprintf("https://www.youtube.com/api/timedtext?v=x&expire=%d", futureExp), time.Time{}); got != "" {
+		t.Fatalf("zero now must return empty expires_at, got %q", got)
 	}
 }

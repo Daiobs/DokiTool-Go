@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -315,7 +316,7 @@ func (h *Helper) Finalize(ctx context.Context, body []byte, debug bool) (unified
 		EnableDASHMux:   true,
 		EnableHLS:       false,
 	}
-	subtitleAttachments := extractFinalizeSubtitles(decoded.captions, decoded.videoID)
+	subtitleAttachments := extractFinalizeSubtitles(decoded.captions, decoded.videoID, time.Unix(nowTime.Unix(), 0).UTC())
 	return buildFinalizeEnvelope(info, opts, subtitleAttachments, nowTime.Unix(), debug)
 }
 

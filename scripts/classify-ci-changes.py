@@ -209,7 +209,7 @@ def classify_paths(paths: Iterable[str]) -> Classification:
             add_reason("frontend")
             continue
 
-        if path in REPO_ONLY_EXACT_PATHS or path.startswith(("scripts/", "docs/")):
+        if path in REPO_ONLY_EXACT_PATHS or path.startswith(("scripts/", "docs/", "tools/dokitool-agent/")):
             add_reason("repo-only")
             continue
 
