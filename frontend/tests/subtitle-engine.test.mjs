@@ -792,4 +792,12 @@ test("ResultSubtitlePanel.vue & ResultDetailsSidebar.vue render manual/auto badg
   assert.ok(errNode, "CORS/network failure should render error alert");
   assert.match(textOf(errNode), /CORS|跨域/);
   app.unmount();
+
+  // Regression: VTT/SRT cue blocks separated by whitespace-only blank lines (spaces/tabs) still split cleanly
+  const spacedVtt =
+    "WEBVTT\n   \n00:00:01.000 --> 00:00:02.500\nFirst line\n \t \n00:00:03.000 --> 00:00:04.500\nSecond line\n";
+  const spacedCues = subtitleEngine.parseSubtitleCues(spacedVtt, "vtt");
+  assert.equal(spacedCues.length, 2);
+  assert.equal(spacedCues[0].text, "First line");
+  assert.equal(spacedCues[1].text, "Second line");
 });

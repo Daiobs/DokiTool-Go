@@ -104,8 +104,22 @@ const resolveWorkFolderTitle = (media: MultiPartEnqueueMediaMeta): string =>
   media.platform ||
   "download";
 
+const stripWorkTitlePrefix = (rawTitle: string | undefined, workTitle: string): string | undefined => {
+  let t = rawTitle?.trim() || "";
+  if (!t) return undefined;
+  const wt = workTitle.trim();
+  if (wt && t.startsWith(wt)) {
+    const rest = t.slice(wt.length).trim();
+    if (!rest || /^#\d+$/.test(rest)) return undefined;
+    if (rest.startsWith("-") && rest.slice(1).trim()) {
+      t = rest.slice(1).trim();
+    }
+  }
+  return t || undefined;
+};
+
 const resolveCleanEpisodeStem = (itemTitle: string | undefined, workTitle: string): string | undefined => {
-  const t = itemTitle?.trim();
+  const t = stripWorkTitlePrefix(itemTitle, workTitle);
   return t && !isPlaceholderPartTitle(t) && t !== workTitle ? t : undefined;
 };
 

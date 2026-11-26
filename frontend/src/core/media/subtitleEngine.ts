@@ -253,7 +253,7 @@ function parseJson3Subtitles(rawText: string): SubtitleCue[] {
 
 function parseVttOrSrtSubtitles(rawText: string): SubtitleCue[] {
   const cues: SubtitleCue[] = [];
-  for (const block of rawText.split(/\n{2,}/)) {
+  for (const block of rawText.split(/\n(?:[ \t]*\n)+/)) {
     const lines = block.split("\n").filter((l) => l.trim().length > 0);
     if (!lines.length || /^(?:WEBVTT|NOTE|STYLE|REGION)\b/i.test(lines[0].trim())) continue;
     const timeIdx = lines.slice(0, 2).findIndex((l) => VTT_TIME_RE.test(l));

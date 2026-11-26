@@ -48,8 +48,6 @@ const SENSITIVE_QUERY_KEYS = new Set<string>([
 
 const DIRECT_MEDIA_PATH_RE =
   /(?:^\/videoplayback$|\/upgcxcode\/|\.(?:mp4|m4s|m4a|webm|mp3|aac|ts|m3u8|flv|mov|mkv|jpg|jpeg|png|webp|gif|avif|zip)$)/i;
-const CDN_TEXT_HOST_RE =
-  /(?:googlevideo\.com|bilivideo\.com|bilivideo\.cn|weibocdn\.com|akamaized\.net|xhscdn\.com|rednotecdn\.com|douyinvod\.com|kwimgs\.com|sinaimg\.cn|twimg\.com|fbcdn\.net|cdninstagram\.com|hdslb\.com|toutiaovod\.com|ppxvod\.com|ixiaochuan\.cn)/i;
 
 const isBlockedCdnHost = (host: string): boolean =>
   BLOCKED_CDN_EXACT_HOSTS.has(host) ||
@@ -62,6 +60,22 @@ const isSensitiveQueryKey = (rawKey: string): boolean => {
       (SENSITIVE_QUERY_KEYS.has(lower) ||
         /_(?:sig|sign|ticket|secret|token)$/.test(lower)),
   );
+};
+
+const isUnsafePersistedUrl = (rawUrl: string): boolean => {
+  try {
+    const parsed = new URL(rawUrl.replace(/[).,;!?]+$/, ""));
+    const host = parsed.hostname.toLowerCase();
+    return Boolean(
+      parsed.search ||
+        parsed.username ||
+        parsed.password ||
+        isBlockedCdnHost(host) ||
+        DIRECT_MEDIA_PATH_RE.test(parsed.pathname),
+    );
+  } catch {
+    return true;
+  }
 };
 
 /** Validates a canonical public work-page URL safe for Guardrail G6 persistence. */
@@ -95,13 +109,10 @@ export function sanitizePersistedText(raw: unknown, maxChars = 240): string | un
   const scrubbed = trimmed
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/https?:\/\/[^\s"'<>]+/gi, (url) =>
-      url.includes("?") || CDN_TEXT_HOST_RE.test(url) || DIRECT_MEDIA_PATH_RE.test(url)
-        ? "[URL_REDACTED]"
-        : url,
+      isUnsafePersistedUrl(url) ? "[URL_REDACTED]" : url,
     )
-    .replace(
-      /\b(sig|signature|upsig|ticket|token|access_token|auth|authorization|ip|expire|expires|sign|cookie|secret)=[^\s&;,"']+/gi,
-      "$1=[REDACTED]",
+    .replace(/\b([A-Za-z0-9_-]+)=([^\s&;,"']+)/gi, (m, k: string) =>
+      isSensitiveQueryKey(k) ? `${k}=[REDACTED]` : m,
     )
     .replace(/\s+/g, " ")
     .trim();
@@ -114,8 +125,33 @@ const sanitizeOptionalId = (raw: unknown): string | undefined => {
   const t = raw.trim();
   return t && t.length <= 128 && !/\s|https?:\/\//i.test(t) ? t : undefined;
 };
-const sanitizeFingerprint = (raw: unknown): string | undefined =>
-  typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 200) : undefined;
+const sanitizeFingerprint = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string") return undefined;
+  const t = raw.trim();
+  if (!t || t.length > 512 || /\s/.test(t) || /\bBearer\b/i.test(t)) return undefined;
+  const urlMatch = /https?:\/\//i.exec(t);
+  if (urlMatch) {
+    const prefix = t.slice(0, urlMatch.index);
+    const rawUrl = t.slice(urlMatch.index);
+    if (prefix && !/^[a-z0-9_-]+:$/i.test(prefix)) return undefined;
+    const safeUrl = sanitizeCanonicalSourcePageUrl(rawUrl);
+    if (!safeUrl) return undefined;
+    const combined = `${prefix}${safeUrl}`;
+    return combined.length <= 200 ? combined : undefined;
+  }
+  const kvRe = /\b([A-Za-z0-9_-]+)=([^\s&;,"']+)/gi;
+  for (let m = kvRe.exec(t); m; m = kvRe.exec(t)) {
+    if (isSensitiveQueryKey(m[1])) return undefined;
+  }
+  const lower = t.toLowerCase();
+  for (const host of BLOCKED_CDN_EXACT_HOSTS) {
+    if (lower.includes(host)) return undefined;
+  }
+  for (const suffix of BLOCKED_CDN_HOST_SUFFIXES) {
+    if (lower.includes(suffix)) return undefined;
+  }
+  return t.length <= 200 ? t : t.slice(0, 200);
+};
 const sanitizePlatform = (raw: unknown): string =>
   typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 64) : "unknown";
 const isQualityPref = (v: unknown): v is QualityPreference =>

@@ -406,7 +406,10 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       scheduleOffscreenIdleCloseIfIdle,
       notifyIfCompletelyIdle,
     });
-    if (!prepared.ok) return;
+    if (!prepared.ok) {
+      await onTaskHistoryChange?.({ immediate: true });
+      return;
+    }
 
     const { enrichedSpec, effectiveAllowedOrigins, latestTask: latestBeforeStart } =
       prepared;

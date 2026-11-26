@@ -1,7 +1,6 @@
 import { supportedPlatforms } from "./platforms";
 import { withTbvideoItems } from "../services/tbvideo";
 import {
-  LATEST_EXTENSION_VERSION,
   MIN_EXTENSION_YOUTUBE_VERSION,
   resolveClientParseRoute,
   type ClientCapabilityEnvironment,

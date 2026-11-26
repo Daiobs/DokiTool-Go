@@ -2039,3 +2039,199 @@ test("SidePanelDownloads renders task-history-badge for hydrated history tasks a
     else globalThis.document = prevDoc;
   }
 });
+
+// ============================================================================
+// 10. Round 1 Red-Team Regressions (G6 Fingerprint/Text Scrub, Refresh Sync, Multi-P Title)
+// ============================================================================
+
+test("Round 1 red-team regressions: G6 workFingerprint & full CDN/sensitive-key text scrubbing, refresh-failure history sync, and no double-prefixed multi-P title", async () => {
+  // 1) G6 sanitizeFingerprint strips signed URLs, blocked CDN hosts, Bearer tokens, and sensitive params while preserving clean IDs & canonical URLs
+  const cleanIdRec = taskHistoryMod.projectTaskToPersistedHistoryRecord({
+    taskId: "fp-clean-1",
+    title: "Clean ID",
+    filename: "clean.mp4",
+    platform: "bilibili",
+    workFingerprint: "bilibili:BV1uv411q7Mv",
+    status: "completed",
+    statusText: "已完成",
+    percent: 100,
+    loaded: 100,
+    total: 100,
+    speed: 0,
+    createdAt: 1,
+    updatedAt: 2,
+  });
+  assert.equal(cleanIdRec.workFingerprint, "bilibili:BV1uv411q7Mv");
+
+  const cleanUrlRec = taskHistoryMod.projectTaskToPersistedHistoryRecord({
+    taskId: "fp-clean-2",
+    title: "Clean URL",
+    filename: "vimeo.mp4",
+    platform: "vimeo",
+    workFingerprint: "vimeo:https://vimeo.com/987654321",
+    status: "completed",
+    statusText: "已完成",
+    percent: 100,
+    loaded: 100,
+    total: 100,
+    speed: 0,
+    createdAt: 1,
+    updatedAt: 2,
+  });
+  assert.equal(cleanUrlRec.workFingerprint, "vimeo:https://vimeo.com/987654321");
+
+  const leakyFingerprints = [
+    "xiaohongshu:https://www.xiaohongshu.com/explore/abc?xsec_token=SECRET_XSEC",
+    "youtube:https://rr1---sn-abc.googlevideo.com/videoplayback?sig=LEAK",
+    "douyin:https://v3.douyinstatic.com/asset/12345",
+    "zuiyou:https://cdn.xiaochuankeji.cn/raw/item",
+    "custom:id?sig=LEAK_SIG",
+    "custom:x-amz-signature=AWS_SECRET",
+    "custom:Bearer_token_leak Bearer abcdef",
+  ];
+  for (const fp of leakyFingerprints) {
+    const rec = taskHistoryMod.projectTaskToPersistedHistoryRecord({
+      taskId: `fp-bad-${fp.slice(0, 8)}`,
+      title: "Bad FP",
+      filename: "bad.mp4",
+      platform: "douyin",
+      workFingerprint: fp,
+      status: "failed",
+      statusText: "失败",
+      percent: 0,
+      loaded: 0,
+      total: 0,
+      speed: 0,
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    assert.equal(rec.workFingerprint, undefined, `must drop unsafe workFingerprint: ${fp}`);
+    const hydrated = taskHistoryMod.hydratePersistedHistoryRecord({
+      ...rec,
+      workFingerprint: fp,
+    });
+    assert.equal(hydrated?.workFingerprint, undefined, `hydration must also drop unsafe workFingerprint: ${fp}`);
+  }
+
+  // 2) G6 sanitizePersistedText scrubs ALL BLOCKED_CDN hosts (including douyinstatic, snssdk, cdn.xiaochuankeji.cn, media.tumblr.com, yximgs) & ALL SENSITIVE_QUERY_KEYS
+  const scrubbedErr = taskHistoryMod.sanitizePersistedText(
+    "Failed fetching https://v3.douyinstatic.com/plain/noext and https://cdn.xiaochuankeji.cn/path and https://media.tumblr.com/clip and https://tx.yximgs.com/v1 with xsec_token=SECRET_X auth_key=AK_1 x-amz-signature=AMZ_1 x-amz-credential=CRED_1 x-amz-security-token=SEC_1 x-goog-signature=GOOG_1 lsig=LS_1 sparams=SP_1 sapisid=SA_1",
+    1000,
+  );
+  assert.ok(scrubbedErr);
+  for (const leaked of [
+    "douyinstatic.com",
+    "cdn.xiaochuankeji.cn",
+    "media.tumblr.com",
+    "yximgs.com",
+    "SECRET_X",
+    "AK_1",
+    "AMZ_1",
+    "CRED_1",
+    "SEC_1",
+    "GOOG_1",
+    "LS_1",
+    "SP_1",
+    "SA_1",
+  ]) {
+    assert.equal(scrubbedErr.includes(leaked), false, `must redact ${leaked} from persisted text: ${scrubbedErr}`);
+  }
+  assert.match(scrubbedErr, /\[URL_REDACTED\]/);
+  assert.match(scrubbedErr, /xsec_token=\[REDACTED\]/);
+  assert.match(scrubbedErr, /x-amz-signature=\[REDACTED\]/);
+
+  // 3) downloadCoordinator persists terminal failure immediately when prepareSpecForDispatch fails refresh
+  const refreshLocal = storage.createMemoryStorageArea();
+  const refreshEnv = createMockMv3Env({ localArea: refreshLocal });
+  const refreshBg = backgroundMod.createBackgroundController({
+    chrome: refreshEnv.chrome,
+    storage: storage.createExtensionStorage(),
+    historyStorage: refreshLocal,
+    now: () => Date.parse("2026-11-25T10:00:00Z"),
+    fetchImpl: async () => new Response("upstream down", { status: 503 }),
+  });
+  await refreshBg.init();
+  const expiredEnq = await refreshEnv.chrome.runtime.sendMessage({
+    type: "ENQUEUE_DOWNLOADS",
+    items: [
+      {
+        title: "Expired Refresh Failure Sync",
+        platform: "bilibili",
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: ["https://upos-sz-mirrorcos.bilivideo.com/expired.mp4"],
+          filename: "DokiTool/expired.mp4",
+          refreshContext: {
+            parseUrl: "https://www.bilibili.com/video/BV1uv411q7Mv",
+            platform: "bilibili",
+            itemId: "p1",
+            expiresAtMs: Date.parse("2026-11-25T09:00:00Z"),
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(expiredEnq.ok, true);
+  await refreshBg.waitForIdle();
+  const storedAfterRefreshFail = (await refreshLocal.get(taskHistoryMod.TASK_HISTORY_STORAGE_KEY))?.[
+    taskHistoryMod.TASK_HISTORY_STORAGE_KEY
+  ];
+  assert.ok(Array.isArray(storedAfterRefreshFail) && storedAfterRefreshFail.length === 1);
+  assert.equal(storedAfterRefreshFail[0].status, "failed");
+  assert.notEqual(
+    storedAfterRefreshFail[0].statusText,
+    taskHistoryMod.SW_INTERRUPTED_STATUS_TEXT,
+    "refresh failure must sync actual failed state to history instead of leaving stale queued/interrupted record",
+  );
+  refreshBg.dispose();
+
+  // 4) multiPartQueue does NOT double-prefix workTitle when resolved item has empty title & inputItem.title already carries workTitle
+  const mpLocal = storage.createMemoryStorageArea();
+  const mpEnv = createMockMv3Env({ localArea: mpLocal, autoCompleteDownloads: true });
+  const mpBg = backgroundMod.createBackgroundController({
+    chrome: mpEnv.chrome,
+    storage: storage.createExtensionStorage(),
+    historyStorage: mpLocal,
+    fetchImpl: async () =>
+      new Response(
+        JSON.stringify(
+          makeReadyVideoMedia({
+            platform: "bilibili",
+            title: "合集主标题",
+            items: [
+              makeReadyItem("p2", 2, "", "https://upos-sz-mirrorcos.bilivideo.com/p2.mp4"),
+            ],
+          }),
+        ),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+  });
+  await mpBg.init();
+  const mpRes = await mpEnv.chrome.runtime.sendMessage({
+    type: "ENQUEUE_MULTIPART_ITEMS",
+    media: {
+      platform: "bilibili",
+      title: "合集主标题",
+      sourceUrl: "https://www.bilibili.com/video/BV1uv411q7Mv",
+      totalItemCount: 2,
+    },
+    items: [
+      {
+        itemId: "p2",
+        index: 2,
+        title: "合集主标题 #2",
+        state: "deferred",
+        resolveUrl:
+          "/api/resolve?schema_version=1.0&url=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2FBV1uv411q7Mv&item_id=p2",
+      },
+    ],
+  });
+  assert.equal(mpRes.ok, true);
+  await mpBg.waitForIdle();
+  const mpSnap = await mpBg.getSnapshot();
+  assert.equal(mpSnap.tasks[0].title, "合集主标题 #2");
+  assert.equal(mpSnap.tasks[0].title.includes("合集主标题 - 合集主标题"), false);
+  assert.match(mpSnap.tasks[0].filename, /002\.mp4$/);
+  mpBg.dispose();
+});
