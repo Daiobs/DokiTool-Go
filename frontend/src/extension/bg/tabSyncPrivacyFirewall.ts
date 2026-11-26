@@ -1,6 +1,6 @@
 import type { UnifiedMedia } from "../../types/media";
 import { readyItem, readyVariant } from "../../utils/mediaContract";
-import { buildEnqueueItemsForMedia } from "../extensionDownload";
+import { buildEnqueueItemsForMedia } from "../planning/enqueuePlanBuilder";
 import {
   COMMAND_OPEN_SIDEPANEL,
   CONTEXT_MENU_INSPECT_ID,

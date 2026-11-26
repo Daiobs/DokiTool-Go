@@ -283,6 +283,7 @@
 !/frontend/tests/download-worker.test.mjs
 !/frontend/tests/extension-download-flow.test.mjs
 !/frontend/tests/extension-filename.test.mjs
+!/frontend/tests/extension-planning.test.mjs
 !/frontend/tests/extension-security.test.mjs
 !/frontend/tests/extension-v44-bg.test.mjs
 !/frontend/tests/fixtures/
@@ -693,6 +694,7 @@
 !/frontend/src/extension/offscreen.html
 !/frontend/src/extension/offscreen.ts
 !/frontend/src/extension/opfsStreamTransfer.ts
+!/frontend/src/extension/planning/
 !/frontend/src/extension/protocol.ts
 !/frontend/src/extension/sidepanel.css
 !/frontend/src/extension/sidepanel.html
@@ -1027,6 +1029,9 @@
 !/frontend/src/extension/components/SidePanelResult.vue
 !/frontend/src/extension/components/SidePanelSettings.vue
 !/frontend/src/extension/components/SidePanelSubtitlePanel.vue
+/frontend/src/extension/planning/*
+!/frontend/src/extension/planning/enqueuePlanBuilder.ts
+!/frontend/src/extension/planning/variantSelection.ts
 /frontend/src/monitor/components/*
 !/frontend/src/monitor/components/ProtectionPolicySection.vue
 !/frontend/src/monitor/components/YouTubeHelperCard.vue

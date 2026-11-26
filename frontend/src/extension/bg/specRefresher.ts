@@ -13,7 +13,7 @@ import {
   extractDashMuxSpec,
   extractVariantEarliestExpiresAtMs,
 } from "../dashMuxSpec";
-import { buildEnqueueItemsForMedia } from "../extensionDownload";
+import { buildEnqueueItemsForMedia } from "../planning/enqueuePlanBuilder";
 import {
   isSafeNativeBrowserDownloadUrl,
   isWhitelistedMediaUrl,

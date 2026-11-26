@@ -1,7 +1,7 @@
 import { isPlaceholderPartTitle } from "../../core/media";
 import type { MediaItem, UnifiedMedia } from "../../types/media";
 import { readyItem } from "../../utils/mediaContract";
-import { buildEnqueueItemsForMedia } from "../extensionDownload";
+import { buildEnqueueItemsForMedia } from "../planning/enqueuePlanBuilder";
 import { buildSafeDownloadPath } from "../filenameSanitizer";
 import type {
   EnqueueDownloadItem,

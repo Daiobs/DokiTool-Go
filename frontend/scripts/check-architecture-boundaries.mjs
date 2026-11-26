@@ -97,7 +97,7 @@ export const LEGACY_FILE_LINE_RATCHETS = Object.freeze({
   "src/extension/SidePanelApp.vue": 1690,
   "src/extension/components/SidePanelResult.vue": 2850,
   "src/extension/components/SidePanelSettings.vue": 990,
-  "src/extension/extensionDownload.ts": 3180,
+  "src/extension/extensionDownload.ts": 1810,
   "src/extension/opfsStreamTransfer.ts": 1790,
   "src/extension/uiTargetHelpers.ts": 2160,
   "src/extension/urlMatcher.ts": 1160,

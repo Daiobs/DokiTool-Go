@@ -1,5 +1,8 @@
-import { isWhitelistedMediaUrl, validateApiBaseUrl } from "./hostWhitelist";
+import { isWhitelistedMediaUrl } from "./hostWhitelist";
+import { buildEffectiveExtraOrigins } from "./planning/variantSelection";
 import type { OffscreenDownloadSpec } from "./protocol";
+
+export { buildEffectiveExtraOrigins };
 
 export const OPFS_QUOTA_EXCEEDED_MESSAGE =
   "浏览器临时存储空间不足（无损合流约需 2 倍文件体积的可用空间），请清理磁盘空间后重试";
@@ -153,23 +156,6 @@ export async function ensureOpfsQuotaAvailable(
       code: "OPFS_QUOTA_EXCEEDED",
     });
   }
-}
-
-export function buildEffectiveExtraOrigins(
-  apiOrigin: string,
-  extraAllowedOrigins?: string[],
-): string[] {
-  const set = new Set<string>();
-  const validated = validateApiBaseUrl(apiOrigin);
-  if (validated.ok) {
-    set.add(validated.origin);
-  }
-  for (const extra of extraAllowedOrigins ?? []) {
-    if (typeof extra === "string" && extra.trim()) {
-      set.add(extra.trim());
-    }
-  }
-  return Array.from(set);
 }
 
 export function assertWhitelistedUrl(
