@@ -31,6 +31,7 @@ before(async () => {
     '../core/media/extensionRoutes',
     '../core/media/muxSpec',
     '../core/media/subtitleEngine',
+    '../core/media/subtitleController',
     '../core/media/index',
     '../composables/useVideoSelection',
   ]) {
@@ -48,6 +49,7 @@ before(async () => {
         if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
         if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
         if (reqId === './subtitleEngine') return modules['../core/media/subtitleEngine'];
+        if (reqId === './subtitleController') return modules['../core/media/subtitleController'];
         if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
         if (reqId === '../../utils/mediaSources') return modules['../utils/mediaSources'];
         if (reqId === '../../extension/hostWhitelist') return modules['../extension/hostWhitelist'];

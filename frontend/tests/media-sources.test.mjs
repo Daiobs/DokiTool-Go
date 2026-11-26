@@ -52,6 +52,9 @@ before(async () => {
   const subtitleEngine = await load('../src/core/media/subtitleEngine.ts', {
     '../../utils/mediaContract': contract,
   });
+  const subtitleController = await load('../src/core/media/subtitleController.ts', {
+    './subtitleEngine': subtitleEngine,
+  });
   coreMediaBarrel = await load('../src/core/media/index.ts', {
     './cdnTransportHints': cdnTransportHints,
     './muxSpec': muxSpec,
@@ -59,6 +62,7 @@ before(async () => {
     './variantDefaultUpgrade': variantDefaultUpgradeMod,
     './layoutAndFilename': layoutAndFilename,
     './subtitleEngine': subtitleEngine,
+    './subtitleController': subtitleController,
     './extensionRoutes': await load('../src/core/media/extensionRoutes.ts', {
       '../../extension/hostWhitelist': hostWhitelist,
       './cdnTransportHints': cdnTransportHints,
