@@ -1,23 +1,22 @@
 import type { ExtensionDnrRule } from "../dnrRules";
 import {
   okRpc,
-  type BackgroundToOffscreenRequest,
   type EnqueueDownloadItem,
   type ExtensionDownloadTask,
   type ExtensionRpcResponse,
   type ExtensionSettings,
   type HandOffBlobDownloadResult,
   type OffscreenDownloadSpec,
-  type OffscreenResponseMap,
   type OffscreenToBackgroundMessage,
 } from "../protocol";
 import type { ExtensionStorageController } from "../storage";
+import { auditCompletedDownloadFilename } from "./filenameAudit";
+import { createOffscreenLifecycle } from "./offscreenLifecycle";
 import {
   classifySpecDispatchRoute,
   type PrepareSpecForDispatchParams,
   type PrepareSpecForDispatchResult,
 } from "./specRefresher";
-import { auditCompletedDownloadFilename } from "./filenameAudit";
 import {
   FINISHED_TASK_STATUSES,
   sanitizeRelativeDownloadPath,
@@ -46,6 +45,7 @@ export interface DownloadCoordinatorDeps {
     options?: { progressOnly?: boolean },
   ) => void;
   broadcastTasksUpdated: (includeSavedFingerprints?: boolean) => Promise<void>;
+  onTaskHistoryChange?: (options?: { immediate?: boolean }) => Promise<void> | void;
   syncDynamicDnrRules: (extraOrigins?: string[]) => Promise<ExtensionDnrRule[]>;
   resolveExtraAllowedMediaOrigins: (settings: ExtensionSettings) => Promise<string[]>;
   prepareSpecForDispatch: (
@@ -72,15 +72,28 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     notifyIfCompletelyIdle,
     updateBadge,
     broadcastTasksUpdated,
+    onTaskHistoryChange,
     syncDynamicDnrRules,
     resolveExtraAllowedMediaOrigins,
     prepareSpecForDispatch,
   } = deps;
 
-  let offscreenDocumentOpen = false;
-  let inFlightOffscreenRpcs = 0;
-  let offscreenIdleTimer: ReturnType<typeof setTimeout> | null = null;
-  let offscreenMutex: Promise<void> = Promise.resolve();
+  const offscreenLifecycle = createOffscreenLifecycle({
+    chromeApi,
+    offscreenIdleCloseMs,
+    isDisposed,
+    countActiveTasks,
+    getPendingBlobCount: () => pendingBlobDownloads.size,
+    syncDynamicDnrRules,
+  });
+
+  const {
+    clearOffscreenIdleTimer,
+    scheduleOffscreenIdleCloseIfIdle,
+    ensureOffscreenDocument,
+    sendToOffscreen,
+    sendReleaseBlobToOffscreen,
+  } = offscreenLifecycle;
 
   const earlyDownloadDeltas = new Map<number, ChromeDownloadDelta>();
   const observedDownloadFilenames = new Map<number, string>();
@@ -137,145 +150,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
   };
 
   // ==========================================================================
-  // 2. Offscreen Lifecycle & Idle Cleanup
-  // ==========================================================================
-
-  const clearOffscreenIdleTimer = () => {
-    if (offscreenIdleTimer !== null) {
-      clearTimeout(offscreenIdleTimer);
-      offscreenIdleTimer = null;
-    }
-  };
-
-  const isOffscreenIdle = (): boolean =>
-    countActiveTasks() === 0 &&
-    pendingBlobDownloads.size === 0 &&
-    inFlightOffscreenRpcs === 0;
-
-  const hasOpenOffscreenContext = async (): Promise<boolean> => {
-    if (typeof chromeApi.runtime.getContexts === "function") {
-      try {
-        const contexts = await chromeApi.runtime.getContexts({
-          contextTypes: ["OFFSCREEN_DOCUMENT"],
-        });
-        return contexts.length > 0;
-      } catch {
-        // Fall through
-      }
-    }
-    if (typeof chromeApi.offscreen?.hasDocument === "function") {
-      try {
-        return await chromeApi.offscreen.hasDocument();
-      } catch {
-        // Fall through
-      }
-    }
-    return offscreenDocumentOpen;
-  };
-
-  const scheduleOffscreenIdleCloseIfIdle = () => {
-    clearOffscreenIdleTimer();
-    if (isDisposed() || !isOffscreenIdle()) return;
-    offscreenIdleTimer = setTimeout(() => {
-      offscreenIdleTimer = null;
-      if (isDisposed() || !isOffscreenIdle()) return;
-      void (async () => {
-        try {
-          if (offscreenDocumentOpen || (await hasOpenOffscreenContext())) {
-            await chromeApi.offscreen?.closeDocument();
-          }
-        } catch {
-          // Ignore if already closed
-        } finally {
-          offscreenDocumentOpen = false;
-        }
-      })();
-    }, offscreenIdleCloseMs);
-    (offscreenIdleTimer as { unref?: () => void })?.unref?.();
-  };
-
-  const ensureOffscreenDocument = (): Promise<void> => {
-    const run = async (): Promise<void> => {
-      clearOffscreenIdleTimer();
-      await syncDynamicDnrRules();
-      if ((await hasOpenOffscreenContext()) || !chromeApi.offscreen?.createDocument) {
-        offscreenDocumentOpen = true;
-        return;
-      }
-      try {
-        await chromeApi.offscreen.createDocument({
-          url: "offscreen.html",
-          reasons: ["BLOBS"],
-          justification:
-            "Stream media to OPFS and create Blob URLs for cookie-free downloads",
-        });
-        offscreenDocumentOpen = true;
-      } catch (err) {
-        if (/single offscreen document/i.test(err instanceof Error ? err.message : String(err))) {
-          offscreenDocumentOpen = true;
-          return;
-        }
-        throw err;
-      }
-    };
-    const next = offscreenMutex.then(run, run);
-    offscreenMutex = next.then(() => undefined, () => undefined);
-    return next;
-  };
-
-  const sendToOffscreen = async <T extends BackgroundToOffscreenRequest["type"]>(
-    req: Extract<BackgroundToOffscreenRequest, { type: T }>,
-    options?: { skipEnsure?: boolean },
-  ): Promise<OffscreenResponseMap[T]> => {
-    clearOffscreenIdleTimer();
-    const isNonTaskRpc =
-      req.type === "OFFSCREEN_YOUTUBE_PLAYER" || req.type === "OFFSCREEN_PING";
-    if (isNonTaskRpc) inFlightOffscreenRpcs += 1;
-    try {
-      if (!options?.skipEnsure) await ensureOffscreenDocument();
-      const raw = (await chromeApi.runtime.sendMessage(req)) as
-        | ExtensionRpcResponse<OffscreenResponseMap[T]>
-        | undefined;
-      if (!raw || typeof raw !== "object" || !("ok" in raw)) {
-        throw new Error("Offscreen 执行器未响应");
-      }
-      if (!raw.ok) {
-        const err = new Error(raw.error || "Offscreen 请求失败") as Error & {
-          code?: string;
-          status?: number;
-        };
-        err.code = raw.code;
-        err.status = raw.status;
-        throw err;
-      }
-      return raw.data;
-    } finally {
-      if (isNonTaskRpc) {
-        inFlightOffscreenRpcs = Math.max(0, inFlightOffscreenRpcs - 1);
-        scheduleOffscreenIdleCloseIfIdle();
-      }
-    }
-  };
-
-  const sendReleaseBlobToOffscreen = async (params: {
-    taskId: string;
-    blobUrl: string;
-    opfsTempName?: string;
-  }): Promise<void> => {
-    try {
-      await chromeApi.runtime.sendMessage({
-        type: "RELEASE_BLOB",
-        taskId: params.taskId,
-        blobUrl: params.blobUrl,
-        ...(params.opfsTempName ? { opfsTempName: params.opfsTempName } : {}),
-      } satisfies BackgroundToOffscreenRequest);
-    } catch {
-      // Ignore if offscreen already closed
-    }
-  };
-
-  // ==========================================================================
-  // 3. Authoritative Downloads Lifecycle & Blob Handoff
+  // 2. Authoritative Downloads Lifecycle & Blob Handoff
   // ==========================================================================
 
   const failActiveTask = async (
@@ -293,6 +168,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
         updatedAt: nowFn(),
       });
       updateBadge("failed");
+      await onTaskHistoryChange?.({ immediate: true });
       await broadcastTasksUpdated();
     }
     scheduleOffscreenIdleCloseIfIdle();
@@ -372,6 +248,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     }
 
     updateBadge(outcome);
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated(savedWorkUpdated);
     scheduleOffscreenIdleCloseIfIdle();
     notifyIfCompletelyIdle();
@@ -486,6 +363,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       updatedAt: nowFn(),
     });
     updateBadge();
+    void onTaskHistoryChange?.({ immediate: false });
     await broadcastTasksUpdated();
 
     replayEarlyDownloadDelta(record);
@@ -615,6 +493,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
         retryPayload: { kind: "spec", spec: enrichedSpec },
       });
       updateBadge();
+      void onTaskHistoryChange?.({ immediate: false });
       await broadcastTasksUpdated();
       replayEarlyDownloadDelta(record);
       return;
@@ -634,6 +513,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
       retryPayload: { kind: "spec", spec: enrichedSpec },
     });
     updateBadge();
+    void onTaskHistoryChange?.({ immediate: false });
     await broadcastTasksUpdated();
 
     if (tasks.get(taskId)?.status === "cancelled") {
@@ -706,6 +586,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     }
 
     updateBadge();
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated();
 
     for (const created of createdTasks) {
@@ -748,7 +629,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
         void chromeApi.downloads.cancel(task.chromeDownloadId).catch(() => {});
       }
     }
-    if (offscreenDocumentOpen) {
+    if (offscreenLifecycle.isOffscreenDocumentOpen()) {
       void sendToOffscreen(
         { type: "OFFSCREEN_CANCEL_TASK", taskId },
         { skipEnsure: true },
@@ -756,6 +637,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     }
 
     updateBadge(countActiveTasks() === 0 ? "clear" : undefined);
+    await onTaskHistoryChange?.({ immediate: true });
     await broadcastTasksUpdated();
     scheduleOffscreenIdleCloseIfIdle();
     notifyIfCompletelyIdle();
@@ -847,6 +729,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
             updatedAt: nowFn(),
           });
           updateBadge(isCancelled ? undefined : "failed");
+          await onTaskHistoryChange?.({ immediate: true });
           await broadcastTasksUpdated();
         }
         scheduleOffscreenIdleCloseIfIdle();
@@ -867,9 +750,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
   return {
     ensureOffscreenDocument,
     sendToOffscreen,
-    setOffscreenDocumentOpen: (open: boolean) => {
-      offscreenDocumentOpen = open;
-    },
+    setOffscreenDocumentOpen: offscreenLifecycle.setOffscreenDocumentOpen,
     scheduleOffscreenIdleCloseIfIdle,
     enrichSpecAllowedOrigins,
     dispatchSpecTaskToOffscreen,
@@ -880,7 +761,7 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     onChromeDownloadChanged,
     onChromeDeterminingFilename,
     dispose() {
-      clearOffscreenIdleTimer();
+      offscreenLifecycle.dispose();
       authoritativeFilenamesByUrl.clear();
       authoritativeFilenamesByDownloadId.clear();
       authoritativeUrlByDownloadId.clear();

@@ -2,9 +2,11 @@ import { supportedPlatforms } from "./platforms";
 import { withTbvideoItems } from "../services/tbvideo";
 import {
   LATEST_EXTENSION_VERSION,
+  MIN_EXTENSION_YOUTUBE_VERSION,
   resolveClientParseRoute,
   type ClientCapabilityEnvironment,
 } from "../core/capabilityHub";
+import { projectYouTubeCaptionsForFinalize } from "../core/media/subtitleEngine";
 import type {
   parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
   pingInstalledExtension,
@@ -444,11 +446,11 @@ export async function runYouTubeHelperParse(ctx: {
           provider: "extension",
           version: normalizedExtVer || null,
           ...(normalizedExtVer ? { extensionVersion: normalizedExtVer } : {}),
-          min_version: LATEST_EXTENSION_VERSION,
+          min_version: MIN_EXTENSION_YOUTUBE_VERSION,
           script_url: YOUTUBE_HELPER_SCRIPT_URL,
           message: isEn
-            ? `Connected DokiTool extension (${extVerDisplay}) is outdated. Upgrade to v${LATEST_EXTENSION_VERSION}+ to parse and download YouTube without a userscript.`
-            : `检测到已连接的扩展版本（${extVerDisplay}）较低，升级至 v${LATEST_EXTENSION_VERSION}+ 即可免油猴解析下载 YouTube`,
+            ? `Connected DokiTool extension (${extVerDisplay}) is outdated. Upgrade to v${MIN_EXTENSION_YOUTUBE_VERSION}+ to parse and download YouTube without a userscript.`
+            : `检测到已连接的扩展版本（${extVerDisplay}）较低，升级至 v${MIN_EXTENSION_YOUTUBE_VERSION}+ 即可免油猴解析下载 YouTube`,
         }
       : {
           status: ping.installed ? "outdated" : "missing",
@@ -584,6 +586,14 @@ export async function runYouTubeHelperParse(ctx: {
     }
     if (typeof vd?.thumbnail === "string" && vd.thumbnail.trim()) {
       finalizeBody.thumbnail = vd.thumbnail.trim();
+    }
+    if (contextData.supports_captions !== false && playerResult.captions) {
+      const projectedCaptions = projectYouTubeCaptionsForFinalize(
+        playerResult.captions,
+      );
+      if (projectedCaptions) {
+        finalizeBody.captions = projectedCaptions;
+      }
     }
 
     emitStage(3);

@@ -6,10 +6,12 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
 
 ## 核心特性
 
-1. **后台保活落盘（关掉侧边栏不断流）**
+1. **后台保活落盘与脱敏历史记录持久化（v4.4.0，关掉侧边栏不断流，SW 休眠重启不丢记录）**
    - 媒体拉流、多线路顺序回退、HLS / 字节分片拼接、ZIP 打包与 Mediabunny 音视频无损合流均在独立的 `offscreen` 文档中写入浏览器私有文件系统（OPFS），完成后交由 `chrome.downloads` 落盘，并在收到终态事件（`complete` / `interrupted`）后权威回收 `Blob URL` 与 OPFS 临时文件。
-2. **内置免油猴 YouTube 4K60 无损合流**
+   - **Guardrail G6 脱敏任务历史持久化（`dokitool_ext_task_history_v1`）**：在 `chrome.storage.local` 持久化最近 50 条任务元数据（标题、平台、文件名、终态、大小、`chromeDownloadId` 及规范化来源页 `sourcePageUrl` / `itemId` / `variantId`），**严格排除任何带签名 CDN URL、合流 Spec、敏感查询参数、Cookie 与 Bearer Token**。Service Worker 休眠重启后自动恢复历史列表并标注 **「历史」** 徽章：休眠前未完成任务统一收敛为失败态（`后台休眠中断，点击重试将重新解析`），点击 **「重试」** 会按来源页重新解析最新直链，已完成历史记录继续支持一键 **「打开文件夹」** 与 **「清空已完成」**。
+2. **内置免油猴 YouTube 4K60 无损合流与纯客户端 VTT/SRT/双语字幕下载（v4.4.0）**
    - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
+   - **纯客户端字幕下载与双语合并导出**：侧边栏直接列出媒体返回的全部 `attachments[role="subtitle"]` 字幕轨，清晰标注语言与 **「人工」 / 「自动」**（`track_kind`）标签，支持单轨 `.vtt` / `.srt` 转换以及双语主副字幕时间轴合并导出（纯本地 Blob 落盘，不持久化签名链接）。白名单字幕（含 `www.youtube.com/api/timedtext`，由 DNR Rule `1002` 剥离 Cookie/Origin）强制 `credentials: "omit"`、`referrerPolicy: "no-referrer"` 与流式 `<= 5 MiB` 安全上限；非白名单长尾字幕域名绝不绕过白名单，诚实标注 **「非白名单」** 并提供 **「复制直链」** 与 **「打开」** 移交浏览器处理。
 3. **内置 B 站 1080P（免登录）DASH 无损合流（AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
    - **DNR Rule `1004` 与窄匹配规则 `1006–1008` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则，对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com`（Rule `1004`）以及 B 站海外 Akamai UPOS 节点（高优先级 `priority: 3` 的窄匹配 Rule `1006`：`upos-*.akamaized.net`、Rule `1007`：`*bili*.akamaized.net`、Rule `1008`：`akamaized.net` + `/upgcxcode/`）的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头；其余非 B 站 `*.akamaized.net` 流量（如 Vimeo、Facebook、Tumblr）落入 Rule `1005` 仅剥离 `Origin` 与 `Cookie`（零 B 站 Referer 污染），且绝不干扰浏览器正常标签页访问。
    - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
@@ -18,16 +20,18 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基�
 4. **五种高频素材收集入口**
    - **点击工具栏扩展图标**：一键展开侧边栏。
    - **全局快捷键 `Alt+Shift+D`**：全屏看视频或刷信息流时直接呼出侧边栏并同步当前页（可在 `chrome://extensions/shortcuts` 自定义改键）。
-   - **网页右键双菜单（零 Content Script 注入）**：
+   - **网页右键三菜单（零 Content Script 注入、零新增权限）**：
      - 「用 DokiTool 解析此链接」：展开侧边栏预览、选画质或勾选图集条目（支持 14 个核心平台及后端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时的长尾公网媒体链接）；
-     - 「用 DokiTool 极速下载（最高画质 / 全部图集）」：无需打开侧边栏，后台直接按画质偏好静默落盘，工具栏角标实时显示进度与完成状态。
+     - 「用 DokiTool 极速下载（最高画质 / 全部图集）」：无需打开侧边栏，后台直接按画质偏好静默落盘，工具栏角标实时显示进度与完成状态；
+     - 「用 DokiTool 解析选中链接」（v4.4.0，`contexts: ["selection"]`）：在网页选中包含分享口令或纯文本链接的文字后右键一键提取首个合法公网链接并在首行同步打开侧边栏解析，无需额外权限或页面脚本注入。
    - **跟随标签页自动同步（严格核心 14 平台隐私防火墙）**：仅在本地命中 14 个核心受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）；浏览任何长尾或外部网站时绝不自动外发后端请求。
    - **主动输入与批量链接队列模式（支持长尾平台与三档安全交付）**：用户主动在侧边栏输入框或批量队列粘贴分享文本时，自动提取并去重核心 14 平台及合法公网长尾分享链接（拒绝 `chrome://`、`file://`、IP、内网主机名、本站域名及裸根域名），按序解析并落盘。下载执行按目标媒体域名自动分级：
      - **白名单 CDN（OPFS / 无损合流）**：继续走 `offscreen` OPFS 拉流、多线路回退与 `Mediabunny` 无损封装；
      - **非白名单单文件直链（移交浏览器原生下载器）**：无需申请 `<all_urls>` 扩展通配权限，直接移交 Chrome 原生 `chrome.downloads.download` 下载器保存并追踪进度与打开文件夹——在此模式下扩展**不代理请求、不读取响应体、不附加 Cookie**，等价于浏览器原生点击下载；
      - **非白名单 HLS / 分离流（需外链）**：清晰标注 **「需外链 · 非白名单流」**，自动优先选中可直下的渐进式单文件版本，同时提供 **「复制直链」** 与 **「打开原帖」** 操作。
-5. **Pixiv 式勾选与子文件夹无上限保存**
+5. **Pixiv 式勾选、多 P 后台流式队列（v4.4.0）与子文件夹无上限保存**
    - 图集、实况照片（支持「视频 + 封面 / 仅视频 / 仅封面」三档过滤）与哔哩哔哩多 P 支持全选、反选与单项勾选。
+   - **多 P 后台流式队列（`ENQUEUE_MULTIPART_ITEMS`）**：勾选包含多 P 或按需延迟解析分集（`deferred`）点击保存子文件夹时，立即返回排队任务至底部任务抽屉并交由后台 Service Worker 以受控并发（解析并发 `<= 2`、下载并发受限于队列上限）边解析边下载，绝不阻塞侧边栏交互，支持单任务即时取消与 Tier-2 `refresh_url` 回退。
    - 默认按 `<可选前缀>/<安全标题>/001.jpg` 逐个流式落盘（无内存体积上限），同时保留 `500 MiB` 以内的一键 ZIP 打包按钮；下载完成后可一键「打开文件夹」在系统文件管理器中定位文件。
 6. **浅色 / 深色 / 跟随系统主题切换与动态工具栏状态**
    - 侧边栏支持 **浅色（Light）/ 深色（Dark）/ 跟随系统（System）** 三态主题切换，即时持久化保存且与系统深浅色联动。

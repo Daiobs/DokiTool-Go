@@ -12,6 +12,7 @@ import {
   type BackgroundToSidePanelBroadcast,
   type ConnectionCheckResult,
   type EnqueueDownloadItem,
+  type EnqueueMultiPartItemsRequest,
   type ExtensionDownloadTask,
   type ExtensionSettings,
   type ExtensionStateSnapshot,
@@ -803,6 +804,26 @@ async function handleEnqueueDownloads(payload: {
   );
 }
 
+async function handleEnqueueMultiPart(
+  payload: Omit<EnqueueMultiPartItemsRequest, "type">,
+) {
+  if (!payload.items.length) return;
+  const rpc = await sendSidePanelRequest({
+    type: "ENQUEUE_MULTIPART_ITEMS",
+    ...payload,
+  });
+  if (!rpc.ok) {
+    showToast(rpc.error || "提交多P后台队列失败", "error");
+    return;
+  }
+  tasks.value = mergeEnqueuedTasks(tasks.value, rpc.data.tasks);
+  downloadsExpanded.value = true;
+  showToast(
+    `已将 ${rpc.data.tasks.length} 个分集加入后台流式队列（关闭侧边栏不断流）`,
+    "success",
+  );
+}
+
 async function handleSubmitBatchUrls(urls: string[]) {
   if (!urls.length || submittingBatch.value) return;
   submittingBatch.value = true;
@@ -1142,6 +1163,7 @@ onUnmounted(() => {
           :settings="settings"
           :resolving-item-ids="resolvingItemIds"
           @enqueue-downloads="handleEnqueueDownloads"
+          @enqueue-multipart="handleEnqueueMultiPart"
           @request-resolve-item="handleLazyItemResolve"
           @refresh-parse="handleRefreshCurrentResult"
           @notify="(p) => showToast(p.message, p.tone)"

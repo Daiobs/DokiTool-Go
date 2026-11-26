@@ -25,7 +25,7 @@ const copy = computed(() =>
         badge: `Chrome MV3 Native Side Panel v${LATEST_EXTENSION_VERSION} · Anonymous Ready`,
         title: "DokiTool Chrome Extension",
         subtitle:
-          "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
+          "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
         closeLabel: "Close dialog",
         ctaLabel: "Download Extension (.zip)",
         ctaHint:
@@ -57,7 +57,7 @@ const copy = computed(() =>
         badge: `Chrome MV3 侧边栏原生扩展 v${LATEST_EXTENSION_VERSION} · 匿名直用`,
         title: "DokiTool Chrome 扩展",
         subtitle:
-          "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
+          "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
         closeLabel: "关闭弹窗",
         ctaLabel: "下载 Chrome 扩展包（.zip）",
         ctaHint:

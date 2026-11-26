@@ -226,6 +226,14 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
             {{ formatPlatformDisplayName(task.platform) }}
           </span>
           <span
+            v-if="task.persistedFromHistory"
+            class="sp-task__history"
+            data-testid="task-history-badge"
+            title="从本地历史记录恢复（点击重试将重新解析最新直链）"
+          >
+            历史
+          </span>
+          <span
             class="sp-task__name sp-truncate-1"
             :title="task.filename || task.title"
           >
@@ -330,7 +338,8 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
             <button
               v-if="
                 (task.status === 'failed' || task.status === 'cancelled') &&
-                !task.unwhitelistedHost
+                !task.unwhitelistedHost &&
+                (!task.persistedFromHistory || Boolean(task.retryPayload))
               "
               type="button"
               class="sp-btn sp-btn--secondary sp-btn--xs"
@@ -539,6 +548,17 @@ async function handleCopyFallback(task: ExtensionDownloadTask) {
   border-radius: 4px;
   background: var(--sp-muted-pill-bg);
   color: var(--sp-text-secondary);
+  flex-shrink: 0;
+}
+
+.sp-task__history {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--sp-accent-soft);
+  color: var(--sp-accent-text);
+  border: 1px solid var(--sp-accent-border);
   flex-shrink: 0;
 }
 

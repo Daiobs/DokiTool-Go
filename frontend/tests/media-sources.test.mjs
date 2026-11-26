@@ -49,12 +49,16 @@ before(async () => {
   const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {
     './variantSort': variantSort,
   });
+  const subtitleEngine = await load('../src/core/media/subtitleEngine.ts', {
+    '../../utils/mediaContract': contract,
+  });
   coreMediaBarrel = await load('../src/core/media/index.ts', {
     './cdnTransportHints': cdnTransportHints,
     './muxSpec': muxSpec,
     './variantSort': variantSort,
     './variantDefaultUpgrade': variantDefaultUpgradeMod,
     './layoutAndFilename': layoutAndFilename,
+    './subtitleEngine': subtitleEngine,
     './extensionRoutes': await load('../src/core/media/extensionRoutes.ts', {
       '../../extension/hostWhitelist': hostWhitelist,
       './cdnTransportHints': cdnTransportHints,

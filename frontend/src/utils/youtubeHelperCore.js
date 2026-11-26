@@ -692,6 +692,51 @@ function sanitizeFormatArray(list) {
   return out;
 }
 
+function sanitizePlayerCaptions(rawCaptions) {
+  if (!rawCaptions || typeof rawCaptions !== "object" || Array.isArray(rawCaptions)) {
+    return null;
+  }
+  const renderer = rawCaptions.playerCaptionsTracklistRenderer;
+  const rawTracks = Array.isArray(renderer?.captionTracks)
+    ? renderer.captionTracks
+    : Array.isArray(rawCaptions.captionTracks)
+      ? rawCaptions.captionTracks
+      : null;
+  if (!rawTracks || rawTracks.length === 0) return null;
+
+  const captionTracks = [];
+  for (const track of rawTracks) {
+    if (captionTracks.length >= 64) break;
+    if (!track || typeof track !== "object" || Array.isArray(track)) continue;
+    const baseUrl = typeof track.baseUrl === "string" ? track.baseUrl.trim() : "";
+    if (!baseUrl) continue;
+    const clean = { baseUrl };
+    if (typeof track.name === "string" && track.name.trim()) {
+      clean.name = track.name.trim();
+    } else if (track.name && typeof track.name === "object" && !Array.isArray(track.name)) {
+      const nameObj = {};
+      if (typeof track.name.simpleText === "string" && track.name.simpleText.trim()) {
+        nameObj.simpleText = track.name.simpleText.trim();
+      }
+      if (Array.isArray(track.name.runs)) {
+        const runs = track.name.runs
+          .filter((r) => r && typeof r === "object" && typeof r.text === "string")
+          .map((r) => ({ text: r.text }));
+        if (runs.length > 0) nameObj.runs = runs;
+      }
+      if (Object.keys(nameObj).length > 0) clean.name = nameObj;
+    }
+    if (typeof track.vssId === "string" && track.vssId.trim()) clean.vssId = track.vssId.trim();
+    if (typeof track.languageCode === "string" && track.languageCode.trim()) clean.languageCode = track.languageCode.trim();
+    if (typeof track.kind === "string" && track.kind.trim()) clean.kind = track.kind.trim();
+    if (typeof track.isTranslatable === "boolean") clean.isTranslatable = track.isTranslatable;
+    captionTracks.push(clean);
+  }
+  return captionTracks.length > 0
+    ? { playerCaptionsTracklistRenderer: { captionTracks } }
+    : null;
+}
+
 export function sanitizePlayerApiResponse(raw) {
   if (!raw || typeof raw !== "object") {
     throw new Error("YouTube 播放器响应无效");
@@ -715,11 +760,13 @@ export function sanitizePlayerApiResponse(raw) {
       : null;
 
   const videoDetails = sanitizeVideoDetails(raw.videoDetails);
+  const captions = sanitizePlayerCaptions(raw.captions);
 
   return {
     playabilityStatus,
     streamingData,
     ...(videoDetails ? { videoDetails } : {}),
+    ...(captions ? { captions } : {}),
   };
 }
 

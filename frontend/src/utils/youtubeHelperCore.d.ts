@@ -1,4 +1,5 @@
 import type { Attachment, ReadyVariant, Source, Variant } from "../types/media";
+import type { ProjectedYouTubeCaptions } from "../core/media/subtitleEngine";
 
 export const YOUTUBE_HELPER_VERSION: string;
 export const MIN_YOUTUBE_HELPER_VERSION: string;
@@ -95,6 +96,7 @@ export interface YouTubeHelperPlayerResult {
     adaptiveFormats: Record<string, unknown>[];
   } | null;
   videoDetails?: YouTubeHelperVideoDetails;
+  captions?: ProjectedYouTubeCaptions;
 }
 
 export type YouTubeHelperSaveMode =

@@ -2105,5 +2105,6 @@ export {
   buildSingleDownloadEnqueueItem,
   buildChecklistSubfolderEnqueueItems,
   buildChecklistZipEnqueueItem,
+  buildChecklistMultiPartRequest,
   type ChecklistItemSelectionEntry,
 } from "./targetSpecBuilder";

@@ -3369,7 +3369,7 @@ test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloa
     runtime: {
       id: DOKITOOL_EXTENSION_ID,
       getManifest: () => ({
-        version: "4.3.0",
+        version: "4.4.0",
         host_permissions: ["https://snap.dokitool.com/*"],
         optional_host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
       }),
