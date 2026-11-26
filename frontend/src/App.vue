@@ -112,9 +112,11 @@ const {
   parseError,
   parseStatusText,
   currentPlatform,
+  platformMismatchDetected,
   needsManualHelperRefresh,
   parseButton,
   parseVideo,
+  switchToAllAndRetry,
   cancelParse,
   selectPlatform,
   resolveItem,
@@ -135,11 +137,20 @@ const showToast = (message, type = "success", duration = 3000) => {
 };
 
 const resolveSelectedItem = async (item) => {
-  if (!item?.resolve_url || videoStore.resolvingItems.has(item.id)) return;
+  const refreshUrl = videoStore.resultData?.refresh_url?.trim() || "";
+  if (
+    !item ||
+    item.state === "unavailable" ||
+    (!item.resolve_url && !refreshUrl) ||
+    videoStore.resolvingItems.has(item.id)
+  )
+    return;
   const version = videoStore.resultVersion;
   videoStore.setResolving(item.id, true);
   try {
-    const resolved = await resolveItem(item);
+    const resolved = await resolveItem(item, undefined, {
+      ...(refreshUrl ? { refreshUrl } : {}),
+    });
     videoStore.replaceItem(resolved, version);
   } catch (error) {
     if (videoStore.resultVersion === version)
@@ -491,11 +502,13 @@ onUnmounted(() => {
         :is-error="!!parseError || parseButton.state.value === 'error'"
         :parse-error="parseError"
         :parse-status-text="parseStatusText"
+        :platform-mismatch="platformMismatchDetected"
         :locale="locale"
         :current-platform="currentPlatform"
         @parse="parseVideo"
         @cancel="cancelParse"
         @select-platform="selectPlatform"
+        @switch-all-retry="switchToAllAndRetry"
       />
 
       <div

@@ -26,6 +26,7 @@ import type {
   MediaRefreshContext,
   OffscreenDownloadSpec,
 } from "../protocol";
+import { extractParseUrlFromRefreshUrl } from "../targetSpecBuilder";
 import { buildExtensionTargetContext } from "../uiTargetHelpers";
 import { matchActiveParseUrl } from "../urlMatcher";
 
@@ -256,10 +257,12 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
     const targetCtx: TargetContext = buildExtensionTargetContext(apiOrigin, now);
 
     let freshMedia: UnifiedMedia;
+    const parseCandidate =
+      ctx.parseUrl?.trim() || extractParseUrlFromRefreshUrl(ctx.refreshUrl);
     if (ctx.resolveUrl && ctx.resolveUrl.startsWith("/api/resolve?")) {
       freshMedia = await resolveLazyItemInternal(ctx.resolveUrl, settings, signal);
-    } else if (ctx.parseUrl) {
-      const matched = matchActiveParseUrl(ctx.parseUrl);
+    } else if (parseCandidate) {
+      const matched = matchActiveParseUrl(parseCandidate);
       if (!matched) {
         throw new Error("刷新链接无效或不受允许");
       }
@@ -312,12 +315,33 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
     const buildNextRefreshContext = (
       expiresAtMs?: number,
     ): MediaRefreshContext => {
-      const { expiresAtMs: _staleExp, ...baseCtx } = ctx;
+      const {
+        expiresAtMs: _staleExp,
+        refreshUrl: _staleRefreshUrl,
+        ...baseCtx
+      } = ctx;
       const nextResolveUrl =
         targetItem.resolve_url?.trim() || baseCtx.resolveUrl;
+      const freshRefreshUrlRaw = freshMedia.refresh_url?.trim() || "";
+      const freshRefreshUrl =
+        freshRefreshUrlRaw.startsWith("/api/parse?") &&
+        !/[\\\s#]/.test(freshRefreshUrlRaw)
+          ? freshRefreshUrlRaw
+          : undefined;
+      const nextRefreshUrl = !nextResolveUrl
+        ? freshRefreshUrl || _staleRefreshUrl
+        : undefined;
+      const nextParseUrl =
+        baseCtx.parseUrl?.trim() ||
+        targetItem.source_url?.trim() ||
+        freshMedia.source_url?.trim() ||
+        extractParseUrlFromRefreshUrl(nextRefreshUrl) ||
+        "";
       return {
         ...baseCtx,
+        parseUrl: nextParseUrl,
         ...(nextResolveUrl ? { resolveUrl: nextResolveUrl } : {}),
+        ...(nextRefreshUrl ? { refreshUrl: nextRefreshUrl } : {}),
         ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
       };
     };
@@ -511,7 +535,7 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
             variantSelections: {
               [targetItem.id]: { variant_id: targetVariant.id },
             },
-            sourceUrl: ctx.parseUrl,
+            sourceUrl: parseCandidate || ctx.parseUrl,
             now,
           });
           if (rebuilt.length > 0 && rebuilt[0].spec.segments) {
@@ -572,7 +596,7 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
               variantSelections: {
                 [targetItem.id]: { variant_id: targetVariant.id },
               },
-              sourceUrl: ctx.parseUrl,
+              sourceUrl: parseCandidate || ctx.parseUrl,
               now,
             });
             const matchedEntry =
@@ -605,7 +629,7 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
       apiOrigin,
       qualityPreference: ctx.attachmentId ? "audio" : settings.qualityPreference,
       itemIds: [targetItem.id],
-      sourceUrl: ctx.parseUrl,
+      sourceUrl: parseCandidate || ctx.parseUrl,
       now,
     });
     const rebuiltSpec =

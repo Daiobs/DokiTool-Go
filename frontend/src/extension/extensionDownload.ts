@@ -92,6 +92,7 @@ import {
   type QualityPreference,
 } from "./protocol";
 import { buildWorkFingerprint } from "./storage";
+import { extractParseUrlFromRefreshUrl } from "./targetSpecBuilder";
 import { buildExtensionTargetContext } from "./uiTargetHelpers";
 import {
   createYouTubeExtensionBridge,
@@ -1053,14 +1054,22 @@ export function buildEnqueueItemsForMedia(
       ? cleanEpisodeTitle || rawWorkTitle
       : singleItemStem;
     const fallbackUrl = item.source_url || media.source_url;
+    const resolveUrlForItem = item.resolve_url?.trim() || undefined;
+    const rawRefreshUrl = media.refresh_url?.trim() || "";
+    const refreshUrlForItem =
+      !resolveUrlForItem &&
+      rawRefreshUrl.startsWith("/api/parse?") &&
+      !/[\\\s#]/.test(rawRefreshUrl)
+        ? rawRefreshUrl
+        : undefined;
     const parseUrlForItem =
       item.source_url?.trim() ||
       media.source_url?.trim() ||
       options.sourceUrl?.trim() ||
+      extractParseUrlFromRefreshUrl(refreshUrlForItem) ||
       "";
-    const resolveUrlForItem = item.resolve_url?.trim() || undefined;
     const baseRefreshContext: Omit<MediaRefreshContext, "expiresAtMs"> | undefined =
-      parseUrlForItem || resolveUrlForItem
+      parseUrlForItem || resolveUrlForItem || refreshUrlForItem
         ? {
             parseUrl: parseUrlForItem,
             platform: media.platform,
@@ -1069,6 +1078,7 @@ export function buildEnqueueItemsForMedia(
               ? { attachmentId: plan.attachmentId }
               : { variantId: plan.variant.id }),
             ...(resolveUrlForItem ? { resolveUrl: resolveUrlForItem } : {}),
+            ...(refreshUrlForItem ? { refreshUrl: refreshUrlForItem } : {}),
           }
         : undefined;
     const buildLeafRefreshContext = (

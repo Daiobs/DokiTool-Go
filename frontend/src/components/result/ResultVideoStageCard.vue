@@ -19,6 +19,7 @@ defineProps({
   playerQualityTagText: String,
   primaryDownloadLabel: String,
   isResolving: Boolean,
+  canRefreshItem: { type: Boolean, default: undefined },
   targetMessage: String,
   downloadableCount: { type: Number, default: 0 },
   isYouTubeHelperInstallRequired: Boolean,
@@ -148,7 +149,7 @@ const emit = defineEmits([
         >
           {{ t(locale, "reopenUpgradeNotice") }}</button
         ><button
-          v-if="currentItem.resolve_url && !isResolving"
+          v-if="(canRefreshItem !== undefined ? canRefreshItem : Boolean(currentItem && currentItem.state !== 'unavailable' && currentItem.resolve_url)) && !isResolving"
           class="rs-btn rs-btn--ghost"
           @click="emit('refresh-item', currentItem)"
         >

@@ -10,11 +10,12 @@ const props = defineProps({
   isError: Boolean,
   parseError: String,
   parseStatusText: { type: String, default: '' },
+  platformMismatch: { type: Boolean, default: false },
   locale: String,
   currentPlatform: String
 })
 
-const emit = defineEmits(['update:inputUrl', 'parse', 'cancel', 'select-platform'])
+const emit = defineEmits(['update:inputUrl', 'parse', 'cancel', 'select-platform', 'switch-all-retry'])
 
 const content = {
   'zh-CN': {
@@ -33,6 +34,7 @@ const content = {
     error: '解析失败',
     errorTitle: '解析没有完成',
     errorHint: '请检查作品是否公开可访问，或切换平台后再试一次。',
+    switchAllRetry: '切回「所有平台」并重新解析',
     features: [
       { icon: 'fa-check-circle', color: 'text-emerald-500', label: '无水印' },
       { icon: 'fa-bolt', color: 'text-amber-500', label: '高速解析' },
@@ -55,6 +57,7 @@ const content = {
     error: 'Failed',
     errorTitle: 'Parsing did not finish',
     errorHint: 'Check that the post is public, or switch platform and try again.',
+    switchAllRetry: 'Switch to "All" & Retry',
     features: [
       { icon: 'fa-check-circle', color: 'text-emerald-500', label: 'No Watermark' },
       { icon: 'fa-bolt', color: 'text-amber-500', label: 'Fast Parse' },
@@ -207,6 +210,17 @@ const selectPlatform = (tab) => {
               <p class="parse-error-title">{{ getContent(locale).errorTitle }}</p>
               <p class="parse-error-message">{{ parseError }}</p>
               <p class="theme-colors parse-error-hint">{{ getContent(locale).errorHint }}</p>
+              <button
+                v-if="platformMismatch"
+                type="button"
+                data-testid="switch-all-retry-btn"
+                :disabled="!isReady || isLoading"
+                class="theme-colors parse-error-action"
+                @click="emit('switch-all-retry')"
+              >
+                <AppIcon class="fas fa-redo text-xs"></AppIcon>
+                <span>{{ getContent(locale).switchAllRetry }}</span>
+              </button>
             </div>
           </div>
         </Transition>
@@ -444,6 +458,40 @@ const selectPlatform = (tab) => {
 
 :global(.dark) .parse-error-hint {
   color: rgba(254, 205, 211, 0.72);
+}
+
+.parse-error-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.625rem;
+  padding: 0.375rem 0.75rem;
+  border-radius: 0.625rem;
+  border: 1px solid rgba(225, 29, 72, 0.35);
+  background-color: #e11d48;
+  color: #ffffff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.parse-error-action:hover:not(:disabled) {
+  background-color: #be123c;
+}
+
+.parse-error-action:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+:global(.dark) .parse-error-action {
+  border-color: rgba(251, 113, 133, 0.45);
+  background-color: #e11d48;
+  color: #ffffff;
+}
+
+:global(.dark) .parse-error-action:hover:not(:disabled) {
+  background-color: #f43f5e;
 }
 
 .parse-error-enter-active,

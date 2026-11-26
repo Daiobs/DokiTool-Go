@@ -680,6 +680,7 @@
 !/frontend/src/extension/sidepanel.html
 !/frontend/src/extension/sidepanel.ts
 !/frontend/src/extension/storage.ts
+!/frontend/src/extension/targetSpecBuilder.ts
 !/frontend/src/extension/uiTargetHelpers.ts
 !/frontend/src/extension/urlMatcher.ts
 !/frontend/src/extension/youtubeExtensionBridge.ts
@@ -981,6 +982,7 @@
 !/frontend/src/core/media/index.ts
 !/frontend/src/core/media/layoutAndFilename.ts
 !/frontend/src/core/media/muxSpec.ts
+!/frontend/src/core/media/variantDefaultUpgrade.ts
 !/frontend/src/core/media/variantSort.ts
 /frontend/src/extension/bg/*
 !/frontend/src/extension/bg/apiClient.ts

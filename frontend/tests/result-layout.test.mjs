@@ -24,6 +24,7 @@ before(async () => {
     '../utils/mediaContract',
     '../core/media/cdnTransportHints',
     '../core/media/variantSort',
+    '../core/media/variantDefaultUpgrade',
     '../core/media/layoutAndFilename',
     '../extension/hostWhitelist',
     '../extension/dashMuxSpec',
@@ -42,6 +43,7 @@ before(async () => {
         if (reqId === './cdnTransportHints') return modules['../core/media/cdnTransportHints'];
         if (reqId === './extensionRoutes') return modules['../core/media/extensionRoutes'];
         if (reqId === './variantSort') return modules['../core/media/variantSort'];
+        if (reqId === './variantDefaultUpgrade') return modules['../core/media/variantDefaultUpgrade'];
         if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
         if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
         if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
@@ -2243,4 +2245,201 @@ test('Issue #48 [P2-1, P2-2, P2-5a, P2-5b, P2-5e]: 8K badge dedup, EN PlatformGr
   );
   assert.doesNotMatch(headerDisconnectedHtml, /header-ext-connected-dot/);
   assert.match(headerDisconnectedHtml, /Chrome 扩展/);
+});
+
+test('PR-B1: adaptive HLS/DASH streamCopyUrl copy button, single-HLS copyVideoUrl, Tier-2 refresh_url stage button, and ExtensionDownloadModal Q5A/G1 disclosure', async () => {
+  const { renderToString } = await import('@vue/server-renderer');
+  const { createSSRApp } = await import('vue');
+  const textOf = (node) => [node.text || '', ...(node.children || []).map(textOf)].join('');
+
+  // 1) Adaptive HLS & DASH non-downloadable variants expose streamCopyUrl and emit copy-url on click
+  const adaptiveItem = {
+    id: 'tier2-hls-1',
+    type: 'video',
+    state: 'ready',
+    default: { variant_id: 'mp4-720', url: 'https://cdn.vimeo.test/720.mp4' },
+    variants: [
+      fileVariant('mp4-720', 'https://cdn.vimeo.test/720.mp4', { width: 1280, height: 720, has_audio: true }),
+      {
+        id: 'hls-adaptive',
+        label: '1080p HLS',
+        metadata: { width: 1920, height: 1080, has_audio: true },
+        delivery: {
+          kind: 'hls',
+          scope: 'adaptive',
+          sources: [{ id: 'hls-1', url: 'https://cdn.vimeo.test/master.m3u8' }],
+        },
+      },
+      {
+        id: 'dash-adaptive',
+        label: '4K DASH',
+        metadata: { width: 3840, height: 2160, has_audio: true },
+        delivery: {
+          kind: 'dash',
+          scope: 'adaptive',
+          sources: [{ id: 'dash-1', url: 'https://cdn.vimeo.test/manifest.mpd' }],
+        },
+      },
+    ],
+  };
+  const copiedUrls = [];
+  const vAdaptive = await mount({
+    platform: 'vimeo',
+    title: 'Adaptive Stream Copy',
+    refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
+    default_item_id: 'tier2-hls-1',
+    items: [adaptiveItem],
+  });
+  vAdaptive.state.value = { ...vAdaptive.state.value, onCopyUrl: (u) => copiedUrls.push(u) };
+  await vAdaptive.flush();
+  try {
+    const backupTab = vAdaptive.findAll((n) => n.type === 'button' && textOf(n).includes('画质'))[0];
+    assert.ok(backupTab, 'quality tab button must exist');
+    backupTab.props.onClick();
+    await vAdaptive.flush();
+
+    const streamBtns = vAdaptive.findAll((n) => n.props?.['data-testid'] === 'copy-stream-url-btn');
+    assert.equal(streamBtns.length, 2, 'adaptive HLS and DASH variants must both render 复制流链接 buttons');
+    assert.match(textOf(streamBtns[0]), /复制流链接/);
+    streamBtns[0].props.onClick();
+    streamBtns[1].props.onClick();
+    assert.ok(copiedUrls.includes('https://cdn.vimeo.test/master.m3u8'));
+    assert.ok(copiedUrls.includes('https://cdn.vimeo.test/manifest.mpd'));
+  } finally {
+    vAdaptive.app.unmount();
+  }
+
+  // 2) Single-HLS target exposes primary URL via copyVideoUrl AND Tier-2 refresh_url enables stage refresh button without item.resolve_url
+  const singleHlsItem = {
+    id: 'tier2-single-hls',
+    type: 'video',
+    state: 'ready',
+    default: null,
+    default_unavailable_reason: 'processing_required',
+    variants: [
+      {
+        id: 'hls-single',
+        label: '1080p HLS',
+        metadata: { width: 1920, height: 1080, has_audio: true },
+        delivery: {
+          kind: 'hls',
+          scope: 'single',
+          sources: [{ id: 's-hls', url: 'https://cdn.vimeo.test/single-1080.m3u8' }],
+        },
+      },
+    ],
+  };
+  const refreshedItems = [];
+  const hlsCopied = [];
+  const vSingleHls = await mount({
+    platform: 'vimeo',
+    title: 'Single HLS & Refresh',
+    refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F456',
+    default_item_id: 'tier2-single-hls',
+    items: [singleHlsItem],
+  });
+  vSingleHls.state.value = {
+    ...vSingleHls.state.value,
+    onCopyUrl: (u) => hlsCopied.push(u),
+    onRefreshItem: (it) => refreshedItems.push(it),
+  };
+  await vSingleHls.flush();
+  try {
+    // Stage overlay refresh button is shown via resultData.refresh_url even without item.resolve_url
+    const refreshBtn = vSingleHls.findAll((n) => n.type === 'button' && textOf(n).includes('刷新此条目'))[0];
+    assert.ok(refreshBtn, 'stage refresh button must render when resultData.refresh_url is present');
+    refreshBtn.props.onClick();
+    assert.equal(refreshedItems.length, 1);
+    assert.equal(refreshedItems[0].id, 'tier2-single-hls');
+
+    // Select the single HLS variant -> copyVideoUrl exposes its m3u8 URL
+    vSingleHls.state.value.selection.choose({ variant_id: 'hls-single' });
+    await vSingleHls.flush();
+    const copyBtn = vSingleHls.findAll((n) => n.type === 'button' && textOf(n).includes('复制链接'))[0];
+    assert.ok(copyBtn, 'copy video button must exist');
+    assert.equal(Boolean(copyBtn.props.disabled), false, 'copy video button must be enabled for single HLS target');
+    copyBtn.props.onClick();
+    assert.deepEqual(hlsCopied, ['https://cdn.vimeo.test/single-1080.m3u8']);
+  } finally {
+    vSingleHls.app.unmount();
+  }
+
+  // 2b) Unavailable item must NOT render "刷新此条目" button even when top-level resultData.refresh_url is present (P1)
+  const vUnavailable = await mount({
+    platform: 'vimeo',
+    title: 'Unavailable Tier-2',
+    refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F789',
+    default_item_id: 'unavail-1',
+    items: [
+      {
+        id: 'unavail-1',
+        type: 'video',
+        state: 'unavailable',
+        default: null,
+        default_unavailable_reason: 'unavailable',
+        error: { code: 'CONTENT_UNAVAILABLE', message: '作品不可用' },
+      },
+    ],
+  });
+  try {
+    const refreshBtns = vUnavailable.findAll((n) => n.type === 'button' && textOf(n).includes('刷新此条目'));
+    assert.equal(refreshBtns.length, 0, 'unavailable item must never render 刷新此条目 button');
+  } finally {
+    vUnavailable.app.unmount();
+  }
+
+  // 2c) Adaptive HLS/DASH source explicitly marked availability="unavailable" must NOT expose streamCopyUrl (P2)
+  const vUnavailStream = await mount({
+    platform: 'vimeo',
+    title: 'Unavailable Stream Source Guard',
+    default_item_id: 'stream-guard-1',
+    items: [
+      {
+        id: 'stream-guard-1',
+        type: 'video',
+        state: 'ready',
+        default: { variant_id: 'mp4-720', url: 'https://cdn.vimeo.test/720.mp4' },
+        variants: [
+          fileVariant('mp4-720', 'https://cdn.vimeo.test/720.mp4', { width: 1280, height: 720, has_audio: true }),
+          {
+            id: 'hls-dead',
+            label: '1080p Dead HLS',
+            metadata: { width: 1920, height: 1080, has_audio: true },
+            delivery: {
+              kind: 'hls',
+              scope: 'adaptive',
+              sources: [{ id: 'dead-1', url: 'https://cdn.vimeo.test/dead.m3u8', availability: 'unavailable' }],
+            },
+          },
+        ],
+      },
+    ],
+  });
+  try {
+    const backupTab = vUnavailStream.findAll((n) => n.type === 'button' && textOf(n).includes('画质'))[0];
+    backupTab.props.onClick();
+    await vUnavailStream.flush();
+    const deadCopyBtns = vUnavailStream.findAll((n) => n.props?.['data-testid'] === 'copy-stream-url-btn');
+    assert.equal(deadCopyBtns.length, 0, 'unavailable HLS source must not expose 复制流链接 button');
+  } finally {
+    vUnavailStream.app.unmount();
+  }
+
+  // 3) ExtensionDownloadModal.vue reflects Q5A native_direct disclosure & G1 DNR rules 1006–1008 in zh-CN & en
+  const zhCtx = {};
+  await renderToString(
+    createSSRApp({ render: () => h(ExtensionDownloadModal, { locale: 'zh-CN' }) }),
+    zhCtx,
+  );
+  const zhModalHtml = String(zhCtx.teleports?.body || '');
+  assert.match(zhModalHtml, /浏览器原生下载器/);
+  assert.match(zhModalHtml, /1006–1008/);
+  const enCtx = {};
+  await renderToString(
+    createSSRApp({ render: () => h(ExtensionDownloadModal, { locale: 'en' }) }),
+    enCtx,
+  );
+  const enModalHtml = String(enCtx.teleports?.body || '');
+  assert.match(enModalHtml, /native downloader/i);
+  assert.match(enModalHtml, /1006–1008/);
 });

@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FRONTEND_DIR = resolve(__dirname, '..');
 let tmpExtBundleDir = '';
-let labels, contract, useVideoSelection, ResultSection, uiTargetHelpers, parseHelpers, SidePanelResult;
+let labels, contract, useVideoSelection, ResultSection, uiTargetHelpers, parseHelpers, SidePanelResult, coreMediaBarrel, variantDefaultUpgradeMod;
 const originals = { window: globalThis.window, document: globalThis.document };
 before(async () => {
   const modules = {};
@@ -33,6 +33,9 @@ before(async () => {
   modules['../services/apiConfig'] = { apiConfig: { baseUrl: '' } };
   const cdnTransportHints = await load('../src/core/media/cdnTransportHints.ts');
   const variantSort = await load('../src/core/media/variantSort.ts');
+  variantDefaultUpgradeMod = await load('../src/core/media/variantDefaultUpgrade.ts', {
+    './variantSort': variantSort,
+  });
   const hostWhitelist = await load('../src/extension/hostWhitelist.ts');
   const dashMuxSpec = await load('../src/extension/dashMuxSpec.ts', {
     '../utils/mediaContract': contract,
@@ -46,12 +49,18 @@ before(async () => {
   const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {
     './variantSort': variantSort,
   });
-  modules['../core/media'] = {
-    ...cdnTransportHints,
-    ...muxSpec,
-    ...variantSort,
-    ...layoutAndFilename,
-  };
+  coreMediaBarrel = await load('../src/core/media/index.ts', {
+    './cdnTransportHints': cdnTransportHints,
+    './muxSpec': muxSpec,
+    './variantSort': variantSort,
+    './variantDefaultUpgrade': variantDefaultUpgradeMod,
+    './layoutAndFilename': layoutAndFilename,
+    './extensionRoutes': await load('../src/core/media/extensionRoutes.ts', {
+      '../../extension/hostWhitelist': hostWhitelist,
+      './cdnTransportHints': cdnTransportHints,
+    }),
+  });
+  modules['../core/media'] = coreMediaBarrel;
   ({ useVideoSelection } = await load('../src/composables/useVideoSelection.ts'));
   ResultSection = await loadSfc(
     new URL('../src/components/ResultSection.vue', import.meta.url),
@@ -1346,4 +1355,11 @@ test('Attachment.track_kind preserves valid manual/auto only for subtitle attach
     assert.equal('track_kind' in out.attachments[0], false);
     assert.equal(contract.getSubtitleTrackKind(bgm), undefined);
   }
+});
+
+test('PR-B1 cohesive split: variantDefaultUpgrade exports match core/media barrel cleanly without circular imports', () => {
+  assert.equal(coreMediaBarrel.resolveEffectiveDefaultVariant, variantDefaultUpgradeMod.resolveEffectiveDefaultVariant);
+  assert.equal(coreMediaBarrel.shouldAutoUpgradeDefaultVariant, variantDefaultUpgradeMod.shouldAutoUpgradeDefaultVariant);
+  assert.equal(typeof variantDefaultUpgradeMod.resolveEffectiveDefaultVariant, 'function');
+  assert.equal(typeof variantDefaultUpgradeMod.shouldAutoUpgradeDefaultVariant, 'function');
 });

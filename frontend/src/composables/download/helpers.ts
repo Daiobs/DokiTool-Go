@@ -39,7 +39,10 @@ export interface UseMediaDownloadOptions {
   resolveItem: (
     item: MediaItem,
     signal?: AbortSignal,
-    options?: { onRateLimitWait?: (seconds: number) => void },
+    options?: {
+      onRateLimitWait?: (seconds: number) => void;
+      refreshUrl?: string;
+    },
   ) => Promise<MediaItem>;
 }
 
@@ -66,6 +69,7 @@ export interface ItemSnapshot {
   version: number;
   selectionKey: string;
   platform?: string;
+  refreshUrl?: string;
   hasClientHelper?: boolean;
   isAttachment?: boolean;
   resource?: {
@@ -445,6 +449,7 @@ export function createSnapshotHelpers(deps: {
         }
       }
     }
+    const refreshUrl = videoStore.resultData?.refresh_url?.trim() || undefined;
     return freeze({
       item,
       choice: pinnedChoice,
@@ -455,6 +460,7 @@ export function createSnapshotHelpers(deps: {
       contentId: videoStore.resultData?.content_id,
       total: videoStore.resultData?.items?.length ?? 1,
       platform: videoStore.resultData?.platform,
+      ...(refreshUrl ? { refreshUrl } : {}),
       hasClientHelper: Boolean(
         (videoStore.resultData?.extra as Record<string, unknown> | undefined)
           ?.youtube_helper,
@@ -467,7 +473,7 @@ export function createSnapshotHelpers(deps: {
     if (
       snapshot.resource ||
       !readyItem(snapshot.item) ||
-      !snapshot.item.resolve_url ||
+      !(snapshot.item.resolve_url || snapshot.refreshUrl) ||
       !snapshot.choice?.source_id
     )
       return false;
@@ -610,7 +616,13 @@ export function createSnapshotHelpers(deps: {
       try {
         item = await abortable(
           withRateLimitRetry(
-            () => resolveItem(item, combined, { onRateLimitWait: notifyWait }),
+            () =>
+              resolveItem(item, combined, {
+                onRateLimitWait: notifyWait,
+                ...(snapshot.refreshUrl
+                  ? { refreshUrl: snapshot.refreshUrl }
+                  : {}),
+              }),
             combined,
             notifyWait,
           ),

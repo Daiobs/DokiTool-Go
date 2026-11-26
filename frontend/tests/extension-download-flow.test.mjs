@@ -26,6 +26,8 @@ let dashMuxDownloadMod;
 let dashMuxEngineMod;
 let extensionDownloadMod;
 let uiTargetHelpersMod;
+let targetSpecBuilderMod;
+let specRefresherMod;
 let offscreenMod;
 let backgroundMod;
 let mediaContractMod;
@@ -50,6 +52,8 @@ async function bundleExtensionSuite() {
         export * as dashMuxEngineMod from "./src/extension/dashMuxEngine.ts";
         export * as extensionDownloadMod from "./src/extension/extensionDownload.ts";
         export * as uiTargetHelpersMod from "./src/extension/uiTargetHelpers.ts";
+        export * as targetSpecBuilderMod from "./src/extension/targetSpecBuilder.ts";
+        export * as specRefresherMod from "./src/extension/bg/specRefresher.ts";
         export * as offscreenMod from "./src/extension/offscreen.ts";
         export * as backgroundMod from "./src/extension/background.ts";
         export * as mediaContractMod from "./src/utils/mediaContract.ts";
@@ -77,6 +81,8 @@ before(async () => {
   dashMuxEngineMod = suite.dashMuxEngineMod;
   extensionDownloadMod = suite.extensionDownloadMod;
   uiTargetHelpersMod = suite.uiTargetHelpersMod;
+  targetSpecBuilderMod = suite.targetSpecBuilderMod;
+  specRefresherMod = suite.specRefresherMod;
   offscreenMod = suite.offscreenMod;
   backgroundMod = suite.backgroundMod;
   mediaContractMod = suite.mediaContractMod;
@@ -748,8 +754,8 @@ test("Offscreen <-> Background: authoritative RELEASE_BLOB only after downloads.
   });
   await bg.init();
 
-  // Verify dynamic DNR rules synced on init
-  assert.equal(env.dnrRulesState.size, 5);
+  // Verify dynamic DNR rules synced on init (Rules 1001-1008 including G1 narrow Bilibili Akamai rules)
+  assert.equal(env.dnrRulesState.size, 8);
 
   // Connect SidePanel Port and verify immediate STATE_SNAPSHOT
   const spMessages = [];
@@ -10713,6 +10719,14 @@ test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classific
     );
     assert.ok(nativeBadges.length >= 1, "renders 浏览器直下 badge on native_direct options");
     assert.ok(vimeoView.textOf(nativeBadges[0]).includes("浏览器直下"));
+    const nativeNotices = vimeoView.findAll(
+      (n) => n.props?.["data-testid"] === "native-direct-notice",
+    );
+    assert.ok(nativeNotices.length >= 1, "Q5A: renders honest native-direct-notice disclosure");
+    assert.match(vimeoView.textOf(nativeNotices[0]), /移交浏览器原生下载器/);
+    assert.match(vimeoView.textOf(nativeNotices[0]), /不代理请求/);
+    assert.match(vimeoView.textOf(nativeNotices[0]), /不读取响应体/);
+    assert.match(vimeoView.textOf(nativeNotices[0]), /不附加\s*Cookie/);
     assert.equal(extBadges.length, 2);
     assert.ok(vimeoView.textOf(extBadges[0]).includes("需外链 · 非白名单流"));
     assert.equal(extFallbacks.length, 2);
@@ -12573,5 +12587,177 @@ test("Issue #48 [P1-6] & [P2-5d]: 3-way parallel context+prefetch, short-TTL con
       false,
       `${rel} must not hardcode 4K in generic mux progress copy`,
     );
+  }
+});
+
+test("PR-B1 [G4 + Q5A]: Tier-2 refresh_url fallback in targetSpecBuilder/extensionDownload/specRefresher + SidePanelSettings disclosure", async () => {
+  // 1) extractParseUrlFromRefreshUrl accepts valid /api/parse? and rejects unsafe inputs
+  assert.equal(
+    targetSpecBuilderMod.extractParseUrlFromRefreshUrl(
+      "/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F987654",
+    ),
+    "https://vimeo.com/987654",
+  );
+  for (const bad of [
+    "",
+    null,
+    undefined,
+    "https://evil.test/api/parse?url=https://vimeo.com/1",
+    "/api/resolve?url=https%3A%2F%2Fvimeo.com%2F1",
+    "/api/parse?url=https%3A%2F%2Fvimeo.com%2F1#frag",
+    "/api/parse?url=javascript:alert(1)",
+  ]) {
+    assert.equal(targetSpecBuilderMod.extractParseUrlFromRefreshUrl(bad), "");
+  }
+
+  // 2) Tier-2 media omitting item.resolve_url & source_url populates refreshUrl and extracts parseUrl
+  const tier2Media = {
+    platform: "vimeo",
+    content_id: "987654",
+    title: "Tier2 Refresh Fallback",
+    generated_at: "2026-11-25T00:00:00Z",
+    refresh_url: "/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F987654",
+    items: [
+      {
+        id: "vimeo-item-1",
+        type: "video",
+        variants: [
+          {
+            id: "mp4-720",
+            label: "720p",
+            metadata: { width: 1280, height: 720, has_audio: true, extension: "mp4", mime_type: "video/mp4" },
+            delivery: {
+              kind: "file",
+              sources: [
+                {
+                  id: "s1",
+                  url: "https://vod-progressive.akamaized.net/exp=100/old-720.mp4",
+                  expires_at: "2099-01-01T00:00:00Z",
+                },
+              ],
+            },
+          },
+        ],
+        default: {
+          variant_id: "mp4-720",
+          source_id: "s1",
+          url: "https://vod-progressive.akamaized.net/exp=100/old-720.mp4",
+          expires_at: "2099-01-01T00:00:00Z",
+        },
+      },
+    ],
+  };
+
+  const options = uiTargetHelpersMod.buildSidePanelQualityOptions(
+    tier2Media,
+    tier2Media.items[0],
+    "https://snap.dokitool.com",
+  );
+  const singleEnqueue = uiTargetHelpersMod.buildSingleDownloadEnqueueItem({
+    media: tier2Media,
+    item: tier2Media.items[0],
+    option: options[0],
+    settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+  });
+  assert.equal(singleEnqueue.refreshContext?.resolveUrl, undefined);
+  assert.equal(singleEnqueue.refreshContext?.refreshUrl, tier2Media.refresh_url);
+  assert.equal(singleEnqueue.refreshContext?.parseUrl, "https://vimeo.com/987654");
+
+  const bgItems = extensionDownloadMod.buildEnqueueItemsForMedia(tier2Media, {
+    apiOrigin: "https://snap.dokitool.com",
+  });
+  assert.equal(bgItems.length, 1);
+  assert.equal(bgItems[0].refreshContext?.resolveUrl, undefined);
+  assert.equal(bgItems[0].refreshContext?.refreshUrl, tier2Media.refresh_url);
+  assert.equal(bgItems[0].refreshContext?.parseUrl, "https://vimeo.com/987654");
+
+  // 3) specRefresher falls back to refreshUrl when parseUrl & resolveUrl are absent, and preserves refreshUrl across refresh
+  let parsedUrls = [];
+  let resolveLazyCalls = 0;
+  const refresher = specRefresherMod.createSpecRefresher({
+    nowFn: () => Date.parse("2026-11-25T00:05:00Z"),
+    async resolveLazyItemInternal() {
+      resolveLazyCalls += 1;
+      throw new Error("Tier-2 refresh must not call /api/resolve");
+    },
+    async parseSupportedUrlInternal(matched) {
+      parsedUrls.push(matched.url);
+      return {
+        ...tier2Media,
+        refresh_url: "/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F987654",
+        items: [
+          {
+            ...tier2Media.items[0],
+            variants: [
+              {
+                ...tier2Media.items[0].variants[0],
+                delivery: {
+                  kind: "file",
+                  sources: [
+                    {
+                      id: "s1",
+                      url: "https://vod-progressive.akamaized.net/exp=999/fresh-720.mp4",
+                      expires_at: "2026-11-25T02:00:00Z",
+                    },
+                  ],
+                },
+              },
+            ],
+            default: {
+              variant_id: "mp4-720",
+              source_id: "s1",
+              url: "https://vod-progressive.akamaized.net/exp=999/fresh-720.mp4",
+              expires_at: "2026-11-25T02:00:00Z",
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  const specWithoutParseUrl = {
+    ...singleEnqueue.spec,
+    refreshContext: {
+      parseUrl: "",
+      platform: "vimeo",
+      itemId: "vimeo-item-1",
+      variantId: "mp4-720",
+      refreshUrl: tier2Media.refresh_url,
+      expiresAtMs: Date.parse("2026-11-25T00:00:10Z"),
+    },
+  };
+  const refreshedSpec = await refresher.refreshSpecFromContext(
+    specWithoutParseUrl,
+    { ...storage.DEFAULT_EXTENSION_SETTINGS },
+  );
+  assert.equal(resolveLazyCalls, 0);
+  assert.deepEqual(parsedUrls, ["https://vimeo.com/987654"]);
+  assert.deepEqual(refreshedSpec.routes, [
+    "https://vod-progressive.akamaized.net/exp=999/fresh-720.mp4",
+  ]);
+  assert.equal(refreshedSpec.refreshContext?.resolveUrl, undefined);
+  assert.equal(refreshedSpec.refreshContext?.refreshUrl, tier2Media.refresh_url);
+  assert.equal(refreshedSpec.refreshContext?.parseUrl, "https://vimeo.com/987654");
+
+  // 4) Q5A + G1 disclosure renders in SidePanelSettings.vue
+  const SidePanelSettings = await loadSidePanelSfc(
+    "../src/extension/components/SidePanelSettings.vue",
+  );
+  const settingsView = mountSfcTree(SidePanelSettings, {
+    open: true,
+    settings: { ...storage.DEFAULT_EXTENSION_SETTINGS },
+    connection: null,
+  });
+  try {
+    await settingsView.flush();
+    const disclosureNodes = settingsView.findAll(
+      (n) => n.props?.["data-testid"] === "privacy-boundary-disclosure",
+    );
+    assert.equal(disclosureNodes.length, 1);
+    const disclosureText = settingsView.textOf(disclosureNodes[0]);
+    assert.match(disclosureText, /浏览器原生下载器/);
+    assert.match(disclosureText, /1006–1008/);
+  } finally {
+    settingsView.unmount();
   }
 });

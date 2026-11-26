@@ -144,6 +144,25 @@ export function resolveApiUrl(raw: string): string {
       : "&schema_version=1.0")
   );
 }
+
+export function resolveRefreshApiUrl(raw: string): string {
+  if (
+    typeof raw !== "string" ||
+    (!raw.startsWith("/api/resolve?") && !raw.startsWith("/api/parse?")) ||
+    /[\\\s#]/.test(raw) ||
+    raw.includes("..")
+  ) {
+    throw new Error("条目刷新地址无效");
+  }
+  const queryPart = raw.slice(raw.indexOf("?") + 1);
+  return (
+    apiConfig.baseUrl +
+    raw +
+    (new URLSearchParams(queryPart).has("schema_version")
+      ? ""
+      : "&schema_version=1.0")
+  );
+}
 export function useVideoParser(options: {
   videoStore: ReturnType<typeof useVideoStore>;
   locale: Ref<string>;
@@ -199,6 +218,7 @@ export function useVideoParser(options: {
     parseError = shallowRef(""),
     parseStatusText = shallowRef(""),
     currentPlatform = shallowRef("all"),
+    platformMismatchDetected = shallowRef(false),
     needsManualHelperRefresh = shallowRef(false);
   let checkingHelperInstall = false;
 
@@ -279,6 +299,7 @@ export function useVideoParser(options: {
     parseButton.reset();
     parseError.value = "";
     parseStatusText.value = "";
+    platformMismatchDetected.value = false;
     videoStore.clearResult();
   };
   watch([inputUrl, currentPlatform], invalidate, { flush: "sync" });
@@ -382,6 +403,7 @@ export function useVideoParser(options: {
     videoStore.clearResult();
     parseError.value = "";
     parseStatusText.value = "";
+    platformMismatchDetected.value = false;
     parseButton.setLoading(true);
     try {
       if (currentPlatform.value !== "all") {
@@ -391,6 +413,7 @@ export function useVideoParser(options: {
         if (detected && detected !== currentPlatform.value) {
           invalidate();
           parseError.value = mismatchMsg;
+          platformMismatchDetected.value = true;
           showToast(mismatchMsg, "error");
           return;
         }
@@ -422,6 +445,7 @@ export function useVideoParser(options: {
         ((error instanceof HttpStatusError &&
           error.code === "PLATFORM_MISMATCH") ||
           /对应平台|平台不匹配|platform mismatch/i.test(rawMsg));
+      platformMismatchDetected.value = isMismatch;
       parseError.value =
         isMismatch && (isEn || !rawMsg.includes("所有平台"))
           ? mismatchMsg
@@ -435,21 +459,41 @@ export function useVideoParser(options: {
       }
     }
   }
+  async function switchToAllAndRetry(): Promise<void> {
+    const preservedUrl = inputUrl.value;
+    currentPlatform.value = "all";
+    if (inputUrl.value !== preservedUrl) {
+      inputUrl.value = preservedUrl;
+    }
+    platformMismatchDetected.value = false;
+    if (inputUrl.value.trim()) {
+      await parseVideo();
+    }
+  }
   function cancelParse(): void {
     if (active) invalidate();
   }
   async function resolveItem(
     item: MediaItem,
     signal?: AbortSignal,
-    options?: { onRateLimitWait?: (seconds: number) => void },
+    options?: {
+      onRateLimitWait?: (seconds: number) => void;
+      refreshUrl?: string;
+    },
   ): Promise<MediaItem> {
     if (item.state === "unavailable") throw new Error(item.error.message);
-    if (!item.resolve_url) {
+    const rawResolveUrl = item.resolve_url?.trim() || "";
+    const rawRefreshUrl = !rawResolveUrl
+      ? options?.refreshUrl?.trim() || ""
+      : "";
+    if (!rawResolveUrl && !rawRefreshUrl) {
       const { readyItem } = await import("../utils/mediaContract");
       if (readyItem(item)) return item;
       throw new Error("条目缺少解析入口");
     }
-    const url = resolveApiUrl(item.resolve_url);
+    const url = rawResolveUrl
+      ? resolveApiUrl(rawResolveUrl)
+      : resolveRefreshApiUrl(rawRefreshUrl);
     const [rawPayload, { validateMediaEnvelope }, { withTbvideoItems }] =
       await Promise.all([
         withRateLimitRetry(
@@ -461,7 +505,14 @@ export function useVideoParser(options: {
         import("../services/tbvideo"),
       ]);
     const data = withTbvideoItems(validateMediaEnvelope(rawPayload));
-    const resolved = data.items.find((candidate) => candidate.id === item.id);
+    const exactMatch = data.items.find((candidate) => candidate.id === item.id);
+    const resolved =
+      exactMatch ??
+      (!rawResolveUrl &&
+      data.items.length === 1 &&
+      data.items[0].type === item.type
+        ? { ...data.items[0], id: item.id }
+        : undefined);
     if (!resolved) throw new Error("解析响应缺少所请求条目");
     return resolved;
   }
@@ -605,9 +656,11 @@ export function useVideoParser(options: {
     parseError,
     parseStatusText,
     currentPlatform,
+    platformMismatchDetected,
     needsManualHelperRefresh,
     parseButton,
     parseVideo,
+    switchToAllAndRetry,
     cancelParse,
     resolveItem,
     markWaitingForYouTubeHelperInstall,

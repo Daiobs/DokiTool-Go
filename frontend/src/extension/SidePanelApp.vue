@@ -32,6 +32,7 @@ import {
 import {
   applyExtensionTheme,
   createSidePanelBroadcastBridge,
+  extractParseUrlFromRefreshUrl,
   getNextExtensionTheme,
   mergeEnqueuedTasks,
   mergeMediaAttachmentsById,
@@ -644,7 +645,17 @@ function handleLazyItemResolve(
   item: MediaItem,
   done: (resolved: MediaItem | null) => void,
 ) {
-  if (!activeMedia.value || item.state === "unavailable" || !item.resolve_url) {
+  if (!activeMedia.value || item.state === "unavailable") {
+    done(item);
+    return;
+  }
+  const resolveUrl = item.resolve_url?.trim() || "";
+  const refreshFallbackUrl = !resolveUrl
+    ? item.source_url?.trim() ||
+      activeMedia.value.source_url?.trim() ||
+      extractParseUrlFromRefreshUrl(activeMedia.value.refresh_url)
+    : "";
+  if (!resolveUrl && !refreshFallbackUrl) {
     done(item);
     return;
   }
@@ -655,7 +666,6 @@ function handleLazyItemResolve(
   }
 
   const platform = activeMedia.value.platform;
-  const resolveUrl = item.resolve_url;
 
   const nextSet = new Set(resolvingItemIds.value);
   nextSet.add(item.id);
@@ -663,23 +673,36 @@ function handleLazyItemResolve(
 
   const promise = (async (): Promise<MediaItem | null> => {
     try {
-      const rpc = await sendSidePanelRequest({
-        type: "RESOLVE_LAZY_ITEM",
-        resolveUrl,
-        platform,
-        locale: "zh-CN",
-      });
+      const rpc = resolveUrl
+        ? await sendSidePanelRequest({
+            type: "RESOLVE_LAZY_ITEM",
+            resolveUrl,
+            platform,
+            locale: "zh-CN",
+          })
+        : await sendSidePanelRequest({
+            type: "PARSE_URL",
+            url: refreshFallbackUrl,
+          });
       if (!rpc.ok) {
         showToast(rpc.error || "分集解析失败", "error");
         return null;
       }
+      const exactResolved = rpc.data.media.items.find(
+        (cand) => cand.id === item.id,
+      );
       const rawResolvedItem =
-        rpc.data.media.items.find((cand) => cand.id === item.id) ??
-        rpc.data.media.items[0] ??
-        null;
+        exactResolved ??
+        (resolveUrl
+          ? rpc.data.media.items[0] ?? null
+          : rpc.data.media.items.length === 1 &&
+              rpc.data.media.items[0].type === item.type
+            ? { ...rpc.data.media.items[0], id: item.id }
+            : null);
       const resolvedItem: MediaItem | null =
         rawResolvedItem &&
         (!rawResolvedItem.state || rawResolvedItem.state === "ready") &&
+        resolveUrl &&
         !rawResolvedItem.resolve_url
           ? { ...rawResolvedItem, resolve_url: resolveUrl }
           : rawResolvedItem;

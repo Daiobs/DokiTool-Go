@@ -123,6 +123,11 @@ export interface MediaRefreshContext {
   attachmentId?: string;
   resourceRole?: "motion" | "video" | "image";
   resolveUrl?: string;
+  /**
+   * Optional top-level `/api/parse?...` fallback returned in `UnifiedMedia.refresh_url`
+   * when Tier-2 items omit `item.resolve_url` (Guardrail G4).
+   */
+  refreshUrl?: string;
   expiresAtMs?: number;
 }
 

@@ -865,4 +865,155 @@ test('Issue #48 [P1-6]: Web context short-TTL cache, 1x player_id 400 retry, and
   }
 });
 
+test('PR-B1 [G4]: resolveRefreshApiUrl and resolveItem fall back to data.refresh_url when item.resolve_url is omitted', async () => {
+  assert.equal(
+    parser.resolveRefreshApiUrl('/api/resolve?item_id=p1'),
+    '/api/resolve?item_id=p1&schema_version=1.0',
+  );
+  assert.equal(
+    parser.resolveRefreshApiUrl('/api/parse?url=https%3A%2F%2Fvimeo.com%2F123'),
+    '/api/parse?url=https%3A%2F%2Fvimeo.com%2F123&schema_version=1.0',
+  );
+  assert.equal(
+    parser.resolveRefreshApiUrl('/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123'),
+    '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
+  );
+  for (const bad of [
+    '',
+    'https://evil.test/api/parse?url=https://vimeo.com/123',
+    '//evil.test/api/parse?url=1',
+    '/api/other?url=1',
+    '/api/parse?url=https://vimeo.com/../secret',
+    '/api/parse?url=https://vimeo.com/123#frag',
+    '/api/parse?url=https://vimeo.com/123 with space',
+    '/api/parse?url=https://vimeo.com\\123',
+  ]) {
+    assert.throws(() => parser.resolveRefreshApiUrl(bad), `must reject unsafe refresh URL: ${bad}`);
+  }
+
+  const { instance } = harness();
+  const tier2Item = file('vimeo-1', 'https://vod-progressive.akamaized.net/old.mp4');
+  let requested = '';
+  const refreshedItem = file('vimeo-1', 'https://vod-progressive.akamaized.net/fresh.mp4');
+  globalThis.fetch = async (url) => {
+    requested = url;
+    return Response.json(good({ platform: 'vimeo', items: [refreshedItem] }));
+  };
+  const resolved = await instance.resolveItem(tier2Item, undefined, {
+    refreshUrl: '/api/parse?url=https%3A%2F%2Fvimeo.com%2F123',
+  });
+  assert.equal(requested, '/api/parse?url=https%3A%2F%2Fvimeo.com%2F123&schema_version=1.0');
+  assert.equal(resolved.default.url, 'https://vod-progressive.akamaized.net/fresh.mp4');
+
+  // Single matching-type item fallback when Tier-2 item id changes on re-parse preserves original item.id for store.replaceItem & download refresh
+  const { instance: rotInst, store: rotStore } = harness();
+  rotStore.setResult(good({ platform: 'vimeo', refresh_url: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123', items: [tier2Item] }).data);
+  const rotatedItem = file('vimeo-rotated', 'https://vod-progressive.akamaized.net/fresh2.mp4');
+  globalThis.fetch = async () => Response.json(good({ platform: 'vimeo', items: [rotatedItem] }));
+  const resolvedRotated = await rotInst.resolveItem(tier2Item, undefined, {
+    refreshUrl: '/api/parse?schema_version=1.0&url=https%3A%2F%2Fvimeo.com%2F123',
+  });
+  assert.equal(resolvedRotated.id, 'vimeo-1', 'rotated single-item fallback must preserve original item.id');
+  assert.equal(resolvedRotated.default.url, 'https://vod-progressive.akamaized.net/fresh2.mp4');
+  assert.equal(rotStore.replaceItem(resolvedRotated, rotStore.resultVersion), true);
+  assert.equal(rotStore.resultData.items[0].id, 'vimeo-1');
+  assert.equal(rotStore.resultData.items[0].default.url, 'https://vod-progressive.akamaized.net/fresh2.mp4');
+});
+
+test('PR-B1: platform mismatch exposes 1-click switchToAllAndRetry while keeping parseError wording and HeroSection button', async () => {
+  // 1) Client-side platform mismatch
+  let fetchCalls = 0;
+  let lastPlatform = '';
+  globalThis.fetch = async (url) => {
+    fetchCalls += 1;
+    const u = new URL(url, 'https://snap.example.test');
+    lastPlatform = u.searchParams.get('platform') || '';
+    return Response.json(good({ platform: 'bilibili', title: 'Recovered Bilibili' }));
+  };
+  const { instance, store } = harness('https://www.bilibili.com/video/BV1xx411c7mD');
+  instance.selectPlatform('douyin');
+  await instance.parseVideo();
+  assert.equal(fetchCalls, 0);
+  assert.match(instance.parseError.value, /所有平台/);
+  assert.equal(instance.platformMismatchDetected.value, true);
+
+  await instance.switchToAllAndRetry();
+  assert.equal(instance.currentPlatform.value, 'all');
+  assert.equal(instance.inputUrl.value, 'https://www.bilibili.com/video/BV1xx411c7mD');
+  assert.equal(instance.platformMismatchDetected.value, false);
+  assert.equal(fetchCalls, 1);
+  assert.equal(lastPlatform, 'all');
+  assert.equal(store.resultData?.title, 'Recovered Bilibili');
+
+  // 2) Server-side PLATFORM_MISMATCH
+  const srv = harness('https://short.example.test/opaque-tier2');
+  srv.instance.selectPlatform('douyin');
+  let srvAttempt = 0;
+  globalThis.fetch = async (url) => {
+    srvAttempt += 1;
+    const u = new URL(url, 'https://snap.example.test');
+    if (u.searchParams.get('platform') !== 'all') {
+      return Response.json(
+        { schema_version: '1.0', code: 'PLATFORM_MISMATCH', error: { code: 'PLATFORM_MISMATCH', message: '平台不匹配' } },
+        { status: 400 },
+      );
+    }
+    return Response.json(good({ platform: 'vimeo', title: 'Recovered Tier-2' }));
+  };
+  await srv.instance.parseVideo();
+  assert.equal(srv.instance.platformMismatchDetected.value, true);
+  assert.match(srv.instance.parseError.value, /所有平台/);
+  await srv.instance.switchToAllAndRetry();
+  assert.equal(srvAttempt, 2);
+  assert.equal(srv.instance.currentPlatform.value, 'all');
+  assert.equal(srv.instance.platformMismatchDetected.value, false);
+  assert.equal(srv.store.resultData?.title, 'Recovered Tier-2');
+
+  // 3) HeroSection renders data-testid="switch-all-retry-btn" in zh-CN & en only when platformMismatch=true
+  const { createSSRApp, h } = await import('vue');
+  const { renderToString } = await import('@vue/server-renderer');
+  const HeroSection = (await vite.ssrLoadModule('/src/components/HeroSection.vue')).default;
+  const zhHtml = await renderToString(createSSRApp({
+    render: () => h(HeroSection, {
+      inputUrl: 'https://www.bilibili.com/video/BV1xx411c7mD',
+      isReady: true,
+      isLoading: false,
+      isError: true,
+      parseError: '链接与所选平台不匹配，请切回「所有平台」再试',
+      platformMismatch: true,
+      locale: 'zh-CN',
+      currentPlatform: 'douyin',
+    }),
+  }));
+  assert.match(zhHtml, /data-testid="switch-all-retry-btn"/);
+  assert.match(zhHtml, /切回「所有平台」并重新解析/);
+  const enHtml = await renderToString(createSSRApp({
+    render: () => h(HeroSection, {
+      inputUrl: 'https://www.bilibili.com/video/BV1xx411c7mD',
+      isReady: true,
+      isLoading: false,
+      isError: true,
+      parseError: 'Link does not match the selected platform. Please switch back to "All".',
+      platformMismatch: true,
+      locale: 'en',
+      currentPlatform: 'douyin',
+    }),
+  }));
+  assert.match(enHtml, /data-testid="switch-all-retry-btn"/);
+  assert.match(enHtml, /Switch to &quot;All&quot; &amp; Retry|Switch to "All" &amp; Retry/);
+  const hiddenHtml = await renderToString(createSSRApp({
+    render: () => h(HeroSection, {
+      inputUrl: 'https://www.bilibili.com/video/BV1xx411c7mD',
+      isReady: true,
+      isLoading: false,
+      isError: true,
+      parseError: '作品不存在',
+      platformMismatch: false,
+      locale: 'zh-CN',
+      currentPlatform: 'all',
+    }),
+  }));
+  assert.doesNotMatch(hiddenHtml, /data-testid="switch-all-retry-btn"/);
+});
+
 });
