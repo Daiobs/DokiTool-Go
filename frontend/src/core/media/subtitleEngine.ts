@@ -352,47 +352,48 @@ function lowerBoundStart(sec: IndexedSecondaryCue[], fromIdx: number, targetStar
   return lo;
 }
 
-function isBetterOverlap(cand: OverlapCandidate, prev: OverlapCandidate, pDurEff: number): boolean {
-  if (cand.bannerTier !== prev.bannerTier) return cand.bannerTier < prev.bannerTier;
-  if (cand.sDurEff === prev.sDurEff) {
-    if (cand.overlap !== prev.overlap) return cand.overlap > prev.overlap;
+function isBetterOverlap(
+  tier: 0 | 1, overlap: number, sDur: number, midDiff: number, origIdx: number,
+  prev: OverlapCandidate, pDur: number,
+): boolean {
+  if (tier !== prev.bannerTier) return tier < prev.bannerTier;
+  if (sDur === prev.sDurEff) {
+    if (overlap !== prev.overlap) return overlap > prev.overlap;
   } else {
-    const lhs = cand.overlap * (pDurEff + prev.sDurEff);
-    const rhs = prev.overlap * (pDurEff + cand.sDurEff);
+    const lhs = overlap * (pDur + prev.sDurEff), rhs = prev.overlap * (pDur + sDur);
     if (Number.isSafeInteger(lhs) && Number.isSafeInteger(rhs)) {
       if (lhs !== rhs) return lhs > rhs;
     } else {
-      const diff = cand.overlap / (pDurEff + cand.sDurEff) - prev.overlap / (pDurEff + prev.sDurEff);
+      const diff = overlap / (pDur + sDur) - prev.overlap / (pDur + prev.sDurEff);
       if (Math.abs(diff) > 1e-12) return diff > 0;
     }
   }
-  return cand.midDiff !== prev.midDiff ? cand.midDiff < prev.midDiff : cand.origIdx < prev.origIdx;
+  return midDiff !== prev.midDiff ? midDiff < prev.midDiff : origIdx < prev.origIdx;
 }
 
 function evaluateBilingualCandidate(
-  s: IndexedSecondaryCue,
-  pStart: number, pEnd: number, pEndEff: number, pDurEff: number, pMid: number, minEnd: number,
+  s: IndexedSecondaryCue, pStart: number, pEnd: number, pEndEff: number, pDurEff: number, pMid: number, minEnd: number,
   state: BilingualMatchState,
 ): void {
   if (s.sEnd < minEnd) return;
   const overlap = Math.min(pEndEff, s.sEndEff) - Math.max(pStart, s.sStart);
   if (overlap > 0) {
     const bannerTier: 0 | 1 = (s.sDurEff - overlap) > BILINGUAL_BANNER_EXCESS_MS && overlap * 4 < s.sDurEff ? 1 : 0;
-    const cand: OverlapCandidate = { cue: s.cue, bannerTier, overlap, sDurEff: s.sDurEff, midDiff: Math.abs(pMid - s.sMid), origIdx: s.origIdx };
-    if (!state.bestOverlap || isBetterOverlap(cand, state.bestOverlap, pDurEff)) state.bestOverlap = cand;
+    const midDiff = Math.abs(pMid - s.sMid);
+    if (!state.bestOverlap || isBetterOverlap(bannerTier, overlap, s.sDurEff, midDiff, s.origIdx, state.bestOverlap, pDurEff)) {
+      state.bestOverlap = { cue: s.cue, bannerTier, overlap, sDurEff: s.sDurEff, midDiff, origIdx: s.origIdx };
+    }
     return;
   }
   if (state.bestOverlap?.bannerTier === 0) return;
   const gap = Math.max(0, Math.max(pStart, s.sStart) - Math.min(pEnd, s.sEnd));
-  if (gap <= BILINGUAL_TOLERANCE_MS) {
-    const startDiff = Math.abs(pStart - s.sStart);
-    const isLocal = s.sDurEff <= BILINGUAL_BANNER_EXCESS_MS * 2;
-    const prev = isLocal ? state.nearestLocal : state.nearestAny;
-    if (!prev || gap < prev.gap || (gap === prev.gap && (startDiff < prev.startDiff || (startDiff === prev.startDiff && s.origIdx < prev.origIdx)))) {
-      const next: NearestCandidate = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
-      if (isLocal) state.nearestLocal = next;
-      else state.nearestAny = next;
-    }
+  if (gap > BILINGUAL_TOLERANCE_MS) return;
+  const startDiff = Math.abs(pStart - s.sStart);
+  const isLocal = s.sDurEff <= BILINGUAL_BANNER_EXCESS_MS * 2;
+  const prev = isLocal ? state.nearestLocal : state.nearestAny;
+  if (!prev || gap < prev.gap || (gap === prev.gap && (startDiff < prev.startDiff || (startDiff === prev.startDiff && s.origIdx < prev.origIdx)))) {
+    const next: NearestCandidate = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
+    if (isLocal) state.nearestLocal = next; else state.nearestAny = next;
   }
 }
 

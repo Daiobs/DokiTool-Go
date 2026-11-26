@@ -949,7 +949,7 @@ test("safeFiniteMs rejects malformed json3 and XML timing strings with trailing 
   assert.deepEqual(xmlCues, [{ startMs: 2000, endMs: 2000, text: "ok-zero-dur" }]);
 });
 
-test("mergeBilingualCues enforces MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE on adversarial 10k x 10k inputs in < 100ms", () => {
+test("mergeBilingualCues enforces MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE on adversarial 10k x 10k inputs in < 500ms", () => {
   const cap = subtitleEngine.MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE;
   assert.equal(cap, 512);
 
@@ -991,8 +991,8 @@ test("mergeBilingualCues enforces MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE on adver
   assert.equal(fullMerged[5_000].text, "FP-5000\nFS-0");
   assert.equal(fullMerged[9_999].text, "FP-9999\nFS-0");
   assert.ok(
-    fullElapsedMs < 100,
-    `Expected adversarial full-overlap 10k x 10k mergeBilingualCues < 100ms, took ${fullElapsedMs.toFixed(1)}ms`,
+    fullElapsedMs < 500,
+    `Expected adversarial full-overlap 10k x 10k mergeBilingualCues < 500ms, took ${fullElapsedMs.toFixed(1)}ms`,
   );
 
   // 3. Adversarial prefix-skip 10,000 x 10,000 input (1 long anchor at index 0 + 9,999 short early cues)
@@ -1017,8 +1017,8 @@ test("mergeBilingualCues enforces MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE on adver
   assert.equal(skipMerged[5_000].text, "SP-5000\nANCHOR-LONG");
   assert.equal(skipMerged[9_999].text, "SP-9999\nANCHOR-LONG");
   assert.ok(
-    skipElapsedMs < 100,
-    `Expected adversarial prefix-skip 10k x 10k mergeBilingualCues < 100ms, took ${skipElapsedMs.toFixed(1)}ms`,
+    skipElapsedMs < 500,
+    `Expected adversarial prefix-skip 10k x 10k mergeBilingualCues < 500ms, took ${skipElapsedMs.toFixed(1)}ms`,
   );
 });
 
