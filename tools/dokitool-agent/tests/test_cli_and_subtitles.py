@@ -1,0 +1,368 @@
+"""Offline unit tests for CLI, API client backoff/auth, subtitles, and opt-in downloader."""
+from __future__ import annotations
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+import urllib.parse
+
+AGENT_DIR = Path(__file__).resolve().parents[1]
+if str(AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(AGENT_DIR))
+
+import api_client  # noqa: E402
+import cli  # noqa: E402
+import downloader  # noqa: E402
+import security  # noqa: E402
+import subtitles  # noqa: E402
+
+TEST_TOKEN = "T" * 40
+
+
+def _sub_att(att_id: str, lang: str, title: str, kind: str, ext: str, mime: str, url: str) -> dict:
+    return {
+        "id": att_id, "role": "subtitle", "language": lang, "title": title, "track_kind": kind,
+        "resource": {
+            "id": f"res-{att_id}", "role": "subtitle",
+            "metadata": {"container": ext, "extension": ext, "mime_type": mime},
+            "delivery": {"kind": "file", "sources": [{"url": url}]},
+        },
+    }
+
+
+def _sample_parse_envelope(cdn_base: str, *, expired_first: bool = False, mux_only: bool = False, deferred_p2: bool = False) -> dict:
+    video_url = f"{cdn_base}/media/expired.mp4" if expired_first else f"{cdn_base}/media/video.mp4"
+    if mux_only:
+        variants = [{
+            "id": "mux-1080p", "label": "1080p", "state": "ready",
+            "delivery": {
+                "kind": "mux", "output": {"container": "mp4", "extension": "mp4", "mime_type": "video/mp4"},
+                "resources": [
+                    {"id": "v1", "role": "video", "metadata": {"extension": "mp4"}, "delivery": {"kind": "file", "sources": [{"url": f"{cdn_base}/media/v.mp4"}]}},
+                    {"id": "a1", "role": "audio", "metadata": {"extension": "m4a"}, "delivery": {"kind": "file", "sources": [{"url": f"{cdn_base}/media/a.m4a"}]}},
+                ],
+            },
+        }]
+        default_sel = None
+    else:
+        variants = [{
+            "id": "v-1080p", "label": "1080p", "state": "ready",
+            "metadata": {"extension": "mp4", "mime_type": "video/mp4", "width": 1920, "height": 1080, "has_audio": True},
+            "delivery": {"kind": "file", "sources": [{"id": "s1", "url": video_url, "access": "direct"}]},
+        }]
+        default_sel = {"variant_id": "v-1080p", "source_id": "s1", "url": video_url, "access": "direct"}
+
+    items = [{"id": "item-1", "type": "video", "state": "ready", "title": "Sample Video", "default": default_sel, "variants": variants}]
+    if deferred_p2:
+        items.append({
+            "id": "item-2", "type": "video", "state": "deferred", "default": None,
+            "default_unavailable_reason": "needs_resolve",
+            "resolve_url": "/api/resolve?schema_version=1.0&platform=bilibili&url=https%3A%2F%2Fb23.tv%2Fdemo&item_id=item-2",
+        })
+    return {
+        "schema_version": "1.0", "code": "OK",
+        "data": {
+            "platform": "youtube", "content_id": "vid12345678", "title": "Sample Video",
+            "source_url": "https://www.youtube.com/watch?v=vid12345678",
+            "refresh_url": "/api/parse?schema_version=1.0&url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dvid12345678&refreshed=1",
+            "items": items,
+            "attachments": [
+                _sub_att("sub-zh-auto", "zh-Hans", "Chinese (auto)", "auto", "vtt", "text/vtt", f"{cdn_base}/sub/zh_auto.vtt"),
+                _sub_att("sub-zh-manual", "zh-Hans", "Chinese (manual)", "manual", "vtt", "text/vtt", f"{cdn_base}/sub/zh_manual.vtt"),
+                _sub_att("sub-en-srt", "en-US", "English SRT", "manual", "srt", "application/x-subrip", f"{cdn_base}/sub/en.srt"),
+                _sub_att("sub-oversize", "fr", "Oversize French", "manual", "vtt", "text/vtt", f"{cdn_base}/sub/oversize.vtt"),
+            ],
+        },
+    }
+
+
+class _MockServerState:
+    def __init__(self) -> None:
+        self.base_url = ""
+        self.rate_limit_once = False
+        self.cb_503_once = False
+        self.require_auth = False
+        self.auth_401_hits = 0
+        self.last_auth_header: str | None = None
+
+
+class _MockDokiToolHandler(BaseHTTPRequestHandler):
+    state: _MockServerState
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        return
+
+    def _send_json(self, status: int, payload: dict, extra_headers: dict[str, str] | None = None) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, content_type: str, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        self.state.last_auth_header = self.headers.get("Authorization")
+
+        if parsed.path.startswith("/api/"):
+            if self.state.require_auth and self.headers.get("Authorization") != f"Bearer {TEST_TOKEN}":
+                self.state.auth_401_hits += 1
+                self._send_json(401, {"schema_version": "1.0", "code": "INVALID_INPUT", "error": {"code": "INVALID_INPUT", "message": "Invalid token", "retryable": False}})
+                return
+            if self.state.rate_limit_once:
+                self.state.rate_limit_once = False
+                self._send_json(429, {"schema_version": "1.0", "code": "RATE_LIMITED", "error": {"code": "RATE_LIMITED", "message": "Slow down", "retryable": True, "retry_after_seconds": 1}}, {"Retry-After": "1"})
+                return
+            if self.state.cb_503_once:
+                self.state.cb_503_once = False
+                self._send_json(503, {"schema_version": "1.0", "code": "UPSTREAM_UNAVAILABLE", "error": {"code": "UPSTREAM_UNAVAILABLE", "message": "Circuit open", "retryable": True, "retry_after_seconds": 1}})
+                return
+
+        if parsed.path == "/api/platforms":
+            self._send_json(200, {"schema_version": "1.0", "code": "OK", "data": {"platforms": [{"id": "douyin", "name": "Douyin", "site_url": "https://www.douyin.com/", "capabilities": ["video"]}]}})
+        elif parsed.path == "/api/parse":
+            target = (qs.get("url") or [""])[0]
+            self._send_json(200, _sample_parse_envelope(self.state.base_url, expired_first=("expired" in target and "refreshed" not in qs), mux_only=("mux" in target), deferred_p2=("multi" in target)))
+        elif parsed.path == "/api/resolve":
+            env = _sample_parse_envelope(self.state.base_url)
+            env["data"]["items"][0]["id"] = (qs.get("item_id") or ["item-2"])[0]
+            self._send_json(200, env)
+        elif parsed.path == "/sub/zh_manual.vtt":
+            self._send_bytes("text/vtt; charset=utf-8", "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\n<c>你好</c> 世界\n\n00:00:02.000 --> 00:00:04.000\n你好 世界\n\n00:00:04.000 --> 00:00:06.000\n第二行字幕\n".encode("utf-8"))
+        elif parsed.path == "/sub/zh_auto.vtt":
+            self._send_bytes("text/vtt", b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nAuto line\n")
+        elif parsed.path == "/sub/en.srt":
+            self._send_bytes("application/x-subrip", b"1\n00:00:01,000 --> 00:00:03,500\nHello &amp; welcome\n")
+        elif parsed.path == "/sub/oversize.vtt":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/vtt")
+            self.send_header("Content-Length", str(security.MAX_SUBTITLE_BYTES + 1))
+            self.end_headers()
+        elif parsed.path == "/media/expired.mp4":
+            self.send_response(403)
+            self.end_headers()
+        elif parsed.path in ("/media/video.mp4", "/media/v.mp4", "/media/a.m4a"):
+            self._send_bytes("video/mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"0" * 64)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+class CLIAndSubtitlesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = _MockServerState()
+        handler_cls = type("BoundHandler", (_MockDokiToolHandler,), {"state": self.state})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        self.state.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.local_fetcher = security.SafeHTTPFetcher(timeout=5.0, url_validator=lambda u, **kw: urllib.parse.urlsplit(u))
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2.0)
+
+    def test_cli_rejects_token_flags_without_echoing_secret(self) -> None:
+        secret = "SuperSecretTokenValue1234567890ABCDEF"
+        for argv in (
+            ["platforms", "--token", secret],
+            ["platforms", f"--token={secret}"],
+            ["parse", "-t", secret, "https://example.com/v/1"],
+            ["parse", f"-t{secret}", "https://example.com/v/1"],
+        ):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with mock.patch("sys.stderr", err):
+                    rc = cli.main(argv)
+                self.assertEqual(rc, 2)
+                self.assertNotIn(secret, err.getvalue())
+                self.assertIn("DOKITOOL_API_TOKEN", err.getvalue())
+
+    def test_cli_subcommands_and_opt_in_gates(self) -> None:
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            self.assertEqual(cli.main(["download", "--api-base", self.state.base_url, "https://example.com/v/1"]), 2)
+            self.assertEqual(cli.main(["subtitles", "--api-base", self.state.base_url, "--output-dir", "/tmp", "https://example.com/v/1"]), 2)
+        self.assertIn("--allow-write", err.getvalue())
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            rc = cli.main(["platforms", "--api-base", self.state.base_url])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["count"], 1)
+
+        out2 = io.StringIO()
+        with mock.patch("sys.stdout", out2):
+            rc2 = cli.main(["parse", "--api-base", self.state.base_url, "--resolve-item", "item-2", "https://b23.tv/multi"])
+        self.assertEqual(rc2, 0)
+        self.assertEqual(json.loads(out2.getvalue())["items"][0]["id"], "item-2")
+
+    def test_api_client_auth_401_no_retry_and_429_503_backoff(self) -> None:
+        sleeps: list[float] = []
+        self.state.require_auth = True
+        bad_client = api_client.DokiToolClient(self.state.base_url, token="X" * 40, sleep_fn=sleeps.append, fetcher=self.local_fetcher)
+        with self.assertRaises(api_client.DokiToolAuthError):
+            bad_client.list_platforms()
+        self.assertEqual(self.state.auth_401_hits, 1)
+        self.assertEqual(sleeps, [])
+
+        ok_client = api_client.DokiToolClient(self.state.base_url, token=TEST_TOKEN, sleep_fn=sleeps.append, fetcher=self.local_fetcher)
+        self.state.rate_limit_once = True
+        self.state.cb_503_once = True
+        self.assertEqual(ok_client.list_platforms()["code"], "OK")
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(self.state.last_auth_header, f"Bearer {TEST_TOKEN}")
+
+    def test_subtitle_track_kind_filtering_conversions_and_5mib_cap(self) -> None:
+        data = _sample_parse_envelope(self.state.base_url)["data"]
+        tracks = subtitles.discover_subtitle_tracks(data)
+        self.assertEqual([t.id for t in tracks[:2]], ["sub-zh-manual", "sub-oversize"])
+        self.assertEqual(tracks[-1].track_kind, "auto")
+
+        self.assertEqual([t.id for t in subtitles.select_subtitle_tracks(tracks, lang="zh", track_kind="manual")], ["sub-zh-manual"])
+        self.assertEqual([t.id for t in subtitles.select_subtitle_tracks(tracks, lang="zh", track_kind="auto")], ["sub-zh-auto"])
+        self.assertEqual([t.id for t in subtitles.select_subtitle_tracks(tracks, lang="zh", track_kind="all", select_all=True)], ["sub-zh-manual", "sub-zh-auto"])
+
+        res_txt = subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="zh", track_kind="manual", output_format="text")
+        self.assertEqual(res_txt["tracks"][0]["content"], "你好 世界\n第二行字幕\n")
+
+        res_srt = subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="zh", track_kind="manual", output_format="srt")
+        self.assertIn("00:00:00,500 --> 00:00:02,000", res_srt["tracks"][0]["content"])
+
+        res_vtt = subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="en", track_kind="manual", output_format="vtt")
+        self.assertIn("WEBVTT", res_vtt["tracks"][0]["content"])
+        self.assertIn("Hello & welcome", res_vtt["tracks"][0]["content"])
+
+        with self.assertRaises(security.SizeLimitExceededError):
+            subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="fr")
+
+        ttml = '<tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="00:00:01.000" end="00:00:02.500">Line 1<br/>Line 2</p></div></body></tt>'
+        self.assertEqual(subtitles.render_subtitles(ttml, "ttml", "text"), ("Line 1\nLine 2\n", 1))
+
+        srv3 = '<timedtext><body><p t="1000" d="1500"><s>Hello </s><s>world</s></p></body></timedtext>'
+        srv3_srt, srv3_cnt = subtitles.render_subtitles(srv3, "srv3", "srt")
+        self.assertEqual(srv3_cnt, 1)
+        self.assertIn("00:00:01,000 --> 00:00:02,500\nHello world", srv3_srt)
+
+        with self.assertRaises(security.SecurityError):
+            subtitles.parse_cues("<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><tt/>", "ttml")
+
+        # Malformed / NaN / Inf XML timing attributes are safely ignored without crashing
+        bad_xml = '<timedtext><body><p t="NaN" d="Inf">bad1</p><p t="abc" d="100">bad2</p><p t="1000" d="500">good</p></body></timedtext>'
+        self.assertEqual(subtitles.render_subtitles(bad_xml, "srv3", "text"), ("good\n", 1))
+        bad_legacy = '<transcript><text start="inf" dur="1">skip</text><text start="2.0" dur="bad">ok</text></transcript>'
+        self.assertEqual(subtitles.render_subtitles(bad_legacy, "xml", "text"), ("ok\n", 1))
+
+    def test_api_relative_path_validation_and_cli_oserror_handling(self) -> None:
+        self.assertEqual(
+            api_client._validate_api_relative_path("/api/parse?schema_version=1.0&url=https://example.com/v"),
+            "/api/parse?schema_version=1.0&url=https://example.com/v",
+        )
+        for bad in (
+            "/api/parse-evil?x=1", "/api/parse/extra?x=1", "/api/parse/%2e%2e/monitor",
+            "//evil.example.com/api/parse?x=1", "https://evil.example.com/api/parse?x=1", "/api/stats",
+        ):
+            with self.assertRaises(security.SecurityError, msg=bad):
+                api_client._validate_api_relative_path(bad)
+        with self.assertRaises(security.SecurityError):
+            api_client._validate_api_relative_path("/api/resolve", required_path="/api/resolve", require_query=True)
+
+        err = io.StringIO()
+        with mock.patch.object(api_client.DokiToolClient, "list_platforms", side_effect=PermissionError("denied https://x.test/a?sig=SECRET")):
+            with mock.patch("sys.stderr", err):
+                rc = cli.main(["platforms", "--api-base", self.state.base_url])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("SECRET", err.getvalue())
+
+    def test_opt_in_download_refresh_retry_and_ffmpeg_gate(self) -> None:
+        client = api_client.DokiToolClient(self.state.base_url, fetcher=self.local_fetcher)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "downloads"
+            with self.assertRaises(security.SecurityError):
+                downloader.download_media(client, "https://example.com/video/1", out_dir, allow_write=False)
+
+            res = downloader.download_media(
+                client, "https://example.com/video/expired", out_dir, allow_write=True,
+                include_subtitles=True, subtitle_lang="zh", subtitle_kind="manual", subtitle_format="vtt",
+            )
+            self.assertEqual(len(res["files"]), 1)
+            self.assertTrue((out_dir / res["files"][0]["file"]).is_file())
+            self.assertEqual(len(res["subtitle_files"]), 1)
+            self.assertTrue((out_dir / res["subtitle_files"][0]["file"]).is_file())
+
+            with self.assertRaises(security.SecurityError):
+                downloader.download_media(client, "https://example.com/video/1", out_dir, allow_write=True, filename="../escape.mp4")
+
+            with self.assertRaises(downloader.DownloadError):
+                downloader.download_media(client, "https://example.com/video/mux", out_dir, allow_write=True, allow_ffmpeg=False)
+
+            captured_cmds: list[tuple[list[str], bool]] = []
+
+            def _fake_ffmpeg(cmd, **kwargs):
+                captured_cmds.append((list(cmd), bool(kwargs.get("shell"))))
+                Path(cmd[-1]).write_bytes(b"MUXED_MP4_DATA")
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                mux_res = downloader.download_media(
+                    client, "https://example.com/video/mux", out_dir, allow_write=True,
+                    allow_ffmpeg=True, filename="muxed_out.mp4", subprocess_runner=_fake_ffmpeg,
+                )
+            self.assertEqual(len(captured_cmds), 1)
+            cmd, used_shell = captured_cmds[0]
+            self.assertFalse(used_shell)
+            # -protocol_whitelist file must precede BOTH -i inputs
+            self.assertEqual(cmd.count("-protocol_whitelist"), 2)
+            self.assertEqual(mux_res["files"][0]["file"], "muxed_out.mp4")
+            self.assertEqual((out_dir / "muxed_out.mp4").read_bytes(), b"MUXED_MP4_DATA")
+
+            # mkv container maps to ffmpeg muxer name 'matroska', and leading '-' filename is rejected
+            v_tmp, a_tmp = out_dir / "v_in.mp4", out_dir / "a_in.m4a"
+            v_tmp.write_bytes(b"V")
+            a_tmp.write_bytes(b"A")
+            mkv_cmds: list[list[str]] = []
+
+            def _fake_mkv(c, **kw):
+                mkv_cmds.append(list(c))
+                Path(c[-1]).write_bytes(b"MKV")
+                return subprocess.CompletedProcess(c, 0, b"", b"")
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+                downloader._mux_with_ffmpeg(v_tmp, a_tmp, out_dir / "out.mkv", out_dir, "mkv", _fake_mkv)
+                with self.assertRaises(security.SecurityError):
+                    downloader._mux_with_ffmpeg(v_tmp, a_tmp, out_dir / "-evil.mp4", out_dir, "mp4", _fake_mkv)
+            self.assertEqual(mkv_cmds[0][mkv_cmds[0].index("-f") + 1], "matroska")
+
+            # Duplicate subtitle filenames are disambiguated rather than overwritten
+            dup_saved = downloader.write_subtitle_files(
+                [
+                    {"language": "en", "track_kind": "manual", "output_format": "vtt", "content": "one"},
+                    {"language": "en", "track_kind": "manual", "output_format": "vtt", "content": "two"},
+                ],
+                out_dir, allow_write=True, stem_prefix="dup",
+            )
+            self.assertEqual(len({f["file"] for f in dup_saved}), 2)
+            self.assertEqual((out_dir / dup_saved[0]["file"]).read_text(encoding="utf-8"), "one")
+            self.assertEqual((out_dir / dup_saved[1]["file"]).read_text(encoding="utf-8"), "two")
+
+
+if __name__ == "__main__":
+    unittest.main()
