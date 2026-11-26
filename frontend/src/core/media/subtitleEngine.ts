@@ -3,7 +3,7 @@ import { deliveryRoutes, getSubtitleTrackKind } from "../../utils/mediaContract"
 
 /** Hard client-side byte cap per subtitle track fetch (5 MiB, Guardrail G5). */
 export const MAX_SUBTITLE_TRACK_BYTES = 5 * 1024 * 1024;
-/** Per-primary-cue inner candidate scan cap in mergeBilingualCues (guards adversarial full-overlap inputs). */
+/** Per-window candidate scan cap in mergeBilingualCues (two disjoint windows <= 2x per cue). */
 export const MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE = 512;
 
 const MAX_PROJECTED_TRACKS = 64;
@@ -320,17 +320,15 @@ export const formatCuesAsSrt = (cues: SubtitleCue[]): string => {
 const normCue = (text: string) => text.replace(/\s+/g, " ").trim().toLowerCase();
 
 interface IndexedSecondaryCue {
-  cue: SubtitleCue;
-  origIdx: number;
-  sStart: number;
-  sEnd: number;
-  sEndEff: number;
-  sMid: number;
+  cue: SubtitleCue; origIdx: number; sStart: number; sEnd: number; sEndEff: number; sMid: number;
+}
+interface BilingualMatchState {
+  bestOverlap: { cue: SubtitleCue; overlap: number; midDiff: number; origIdx: number } | null;
+  nearest: { cue: SubtitleCue; gap: number; startDiff: number; origIdx: number } | null;
 }
 
 function lowerBoundPrefixMaxEnd(prefixMaxEnd: number[], minEnd: number): number {
-  let lo = 0;
-  let hi = prefixMaxEnd.length;
+  let lo = 0, hi = prefixMaxEnd.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
     if (prefixMaxEnd[mid] < minEnd) lo = mid + 1;
@@ -339,7 +337,47 @@ function lowerBoundPrefixMaxEnd(prefixMaxEnd: number[], minEnd: number): number 
   return lo;
 }
 
-export function mergeBilingualCues(primary: SubtitleCue[], secondary: SubtitleCue[]): SubtitleCue[] {
+function lowerBoundStart(sec: IndexedSecondaryCue[], fromIdx: number, targetStart: number): number {
+  if (fromIdx >= sec.length || sec[fromIdx].sStart >= targetStart) return fromIdx;
+  let lo = fromIdx + 1, hi = sec.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sec[mid].sStart < targetStart) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function evaluateBilingualCandidate(
+  s: IndexedSecondaryCue,
+  pStart: number, pEnd: number, pEndEff: number, pMid: number, minEnd: number,
+  state: BilingualMatchState,
+): void {
+  if (s.sEnd < minEnd) return;
+  const overlap = Math.min(pEndEff, s.sEndEff) - Math.max(pStart, s.sStart);
+  if (overlap > 0) {
+    const midDiff = Math.abs(pMid - s.sMid);
+    const prev = state.bestOverlap;
+    if (!prev || overlap > prev.overlap || (overlap === prev.overlap && (midDiff < prev.midDiff || (midDiff === prev.midDiff && s.origIdx < prev.origIdx)))) {
+      state.bestOverlap = { cue: s.cue, overlap, midDiff, origIdx: s.origIdx };
+    }
+    return;
+  }
+  if (state.bestOverlap) return;
+  const gap = Math.max(0, Math.max(pStart, s.sStart) - Math.min(pEnd, s.sEnd));
+  if (gap <= BILINGUAL_TOLERANCE_MS) {
+    const startDiff = Math.abs(pStart - s.sStart);
+    const prev = state.nearest;
+    if (!prev || gap < prev.gap || (gap === prev.gap && (startDiff < prev.startDiff || (startDiff === prev.startDiff && s.origIdx < prev.origIdx)))) {
+      state.nearest = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
+    }
+  }
+}
+
+export function mergeBilingualCues(
+  primary: SubtitleCue[], secondary: SubtitleCue[], stats?: { totalScans: number; maxScansPerCue: number },
+): SubtitleCue[] {
+  if (stats) stats.totalScans = stats.maxScansPerCue = 0;
   if (!primary.length) return secondary.map((c) => ({ ...c }));
   if (!secondary.length) return primary.map((c) => ({ ...c }));
 
@@ -360,64 +398,43 @@ export function mergeBilingualCues(primary: SubtitleCue[], secondary: SubtitleCu
     prefixMaxEnd[i] = runningMaxEnd;
   }
 
-  let left = 0;
-  let prevPStart = -Infinity;
+  let left = 0, prevPStart = -Infinity;
 
   return primary.map((p) => {
     const pStart = Math.max(0, p.startMs);
     const pEnd = Math.max(pStart, p.endMs);
     const pEndEff = Math.max(pEnd, pStart + 1);
     const pMid = (pStart + pEnd) / 2;
-    let bestOverlap: { cue: SubtitleCue; overlap: number; midDiff: number; origIdx: number } | null = null;
-    let nearest: { cue: SubtitleCue; gap: number; startDiff: number; origIdx: number } | null = null;
+    const state: BilingualMatchState = { bestOverlap: null, nearest: null };
 
     if (Number.isFinite(pStart) && Number.isFinite(pEnd) && sec.length > 0) {
       const minEnd = pStart - BILINGUAL_TOLERANCE_MS;
       const maxStart = pEnd + BILINGUAL_TOLERANCE_MS;
-      if (pStart < prevPStart) {
-        left = lowerBoundPrefixMaxEnd(prefixMaxEnd, minEnd);
-      } else {
-        while (left < sec.length && prefixMaxEnd[left] < minEnd) left++;
-      }
+      if (pStart < prevPStart) left = lowerBoundPrefixMaxEnd(prefixMaxEnd, minEnd);
+      else while (left < sec.length && prefixMaxEnd[left] < minEnd) left++;
       prevPStart = pStart;
 
-      const scanEnd = Math.min(sec.length, left + MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE);
-      for (let j = left; j < scanEnd; j++) {
+      // Invariant: for k < left, sec[k].sStart <= sec[k].sEnd <= prefixMaxEnd[k] < minEnd,
+      // so nearIdx >= left and the two bounded scan windows are strictly disjoint.
+      const nearIdx = lowerBoundStart(sec, left, minEnd);
+      const leadEnd = Math.min(nearIdx, left + MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE);
+      for (let j = left; j < leadEnd; j++) evaluateBilingualCandidate(sec[j], pStart, pEnd, pEndEff, pMid, minEnd, state);
+      const nearEnd = Math.min(sec.length, nearIdx + MAX_BILINGUAL_CANDIDATE_SCANS_PER_CUE);
+      let nearScanned = 0;
+      for (let j = nearIdx; j < nearEnd; j++) {
+        nearScanned++;
         const s = sec[j];
         if (s.sStart > maxStart) break;
-        if (s.sEnd < minEnd) continue;
-        const overlap = Math.min(pEndEff, s.sEndEff) - Math.max(pStart, s.sStart);
-        if (overlap > 0) {
-          const midDiff = Math.abs(pMid - s.sMid);
-          if (
-            !bestOverlap ||
-            overlap > bestOverlap.overlap ||
-            (overlap === bestOverlap.overlap &&
-              (midDiff < bestOverlap.midDiff ||
-                (midDiff === bestOverlap.midDiff && s.origIdx < bestOverlap.origIdx)))
-          ) {
-            bestOverlap = { cue: s.cue, overlap, midDiff, origIdx: s.origIdx };
-          }
-          continue;
-        }
-        if (bestOverlap) continue;
-        const gap = Math.max(0, Math.max(pStart, s.sStart) - Math.min(pEnd, s.sEnd));
-        if (gap <= BILINGUAL_TOLERANCE_MS) {
-          const startDiff = Math.abs(pStart - s.sStart);
-          if (
-            !nearest ||
-            gap < nearest.gap ||
-            (gap === nearest.gap &&
-              (startDiff < nearest.startDiff ||
-                (startDiff === nearest.startDiff && s.origIdx < nearest.origIdx)))
-          ) {
-            nearest = { cue: s.cue, gap, startDiff, origIdx: s.origIdx };
-          }
-        }
+        evaluateBilingualCandidate(s, pStart, pEnd, pEndEff, pMid, minEnd, state);
+      }
+      if (stats) {
+        const scans = (leadEnd - left) + nearScanned;
+        stats.totalScans += scans;
+        if (scans > stats.maxScansPerCue) stats.maxScansPerCue = scans;
       }
     }
     const pText = p.text.trim();
-    const sText = (bestOverlap?.cue ?? nearest?.cue)?.text.trim() || "";
+    const sText = (state.bestOverlap?.cue ?? state.nearest?.cue)?.text.trim() || "";
     if (!sText) return { startMs: pStart, endMs: pEnd, text: pText };
     const normS = normCue(sText);
     const lines = new Set(pText.split("\n").map(normCue));

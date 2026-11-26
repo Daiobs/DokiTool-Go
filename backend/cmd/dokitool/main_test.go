@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -2632,33 +2633,125 @@ func TestYTDLPThreeCompartmentsAndRuntimeHotReloadSIGHUP(t *testing.T) {
 			ytEnvOnly.youtubeEngine.ConcurrencyLimit(), ytEnvOnly.socialEngine.ConcurrencyLimit(), ytEnvOnly.genericEngine.ConcurrencyLimit())
 	}
 
-	// 5. Fault-injected SIGHUP atomic rollback (F4 / NB-1):
-	// When socialEngine fails SetConcurrencyLimit (disabled engine), youtubeEngine MUST roll back to its previous limit
-	// and api.ApplyRuntimeConfig MUST NOT mutate admission/handler/runtime_policy!
+	// 5. Fault-injected SIGHUP atomic rollback (F4 / NB-1 / ARCH-05):
+	// Inject BOTH compartment #2 (socialEngine) and compartment #3 (genericEngine) failures and assert
+	// all prior compartments, admission pools, circuit breakers, cache policy, and generation remain untouched.
+	genBeforeRollback := h.RuntimeConfigGeneration()
+	if genBeforeRollback != 2 {
+		t.Fatalf("expected generation=2 after startup apply + 1 valid reload, got %d", genBeforeRollback)
+	}
+	policyBeforeRollback := h.RuntimePolicySnapshot()
 	rollbackJSON := strings.ReplaceAll(updatedJSON, `"youtube_slots": 8`, `"youtube_slots": 11`)
 	rollbackJSON = strings.ReplaceAll(rollbackJSON, `"social_slots": 7`, `"social_slots": 10`)
+	rollbackJSON = strings.ReplaceAll(rollbackJSON, `"generic_slots": 4`, `"generic_slots": 6`)
+	rollbackJSON = strings.ReplaceAll(rollbackJSON, `"youtube_parse_ttl": "0s"`, `"youtube_parse_ttl": "180s"`)
+	rollbackJSON = strings.ReplaceAll(rollbackJSON, `"disabled_platforms": ["tumblr"]`, `"disabled_platforms": ["douyin"]`)
 	if err := os.WriteFile(runtimePath, []byte(rollbackJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	faultyYTCfg := ytdlpConfigResult{
+
+	// (a) Compartment #2 (social) failure -> compartment #1 (youtube) rolls back to 8; zero contamination!
+	faultyComp2 := ytdlpConfigResult{
 		engine:        ytCfg.engine,
 		youtubeEngine: ytCfg.youtubeEngine, // currently 8
-		socialEngine:  ytengine.NewDisabled("injected failure"),
+		socialEngine:  ytengine.NewDisabled("injected compartment #2 failure"),
 		genericEngine: ytCfg.genericEngine, // currently 4
 	}
-	if ok := reloadRuntimeConfigOnce(entry, h, &faultyYTCfg, getenv, logf); ok {
-		t.Fatal("expected reloadRuntimeConfigOnce to return false when SetCompartmentLimits fails")
+	if ok := reloadRuntimeConfigOnce(entry, h, &faultyComp2, getenv, logf); ok {
+		t.Fatal("expected reloadRuntimeConfigOnce to return false when compartment #2 fails")
 	}
-	if ytCfg.youtubeEngine.ConcurrencyLimit() != 8 || ytCfg.genericEngine.ConcurrencyLimit() != 4 {
-		t.Fatalf("SetCompartmentLimits failed to roll back youtubeEngine: yt=%d generic=%d, want 8/4",
-			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
+	if ytCfg.youtubeEngine.ConcurrencyLimit() != 8 || ytCfg.socialEngine.ConcurrencyLimit() != 7 || ytCfg.genericEngine.ConcurrencyLimit() != 4 {
+		t.Fatalf("compartment #2 failure did not roll back youtubeEngine: yt=%d social=%d generic=%d, want 8/7/4",
+			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.socialEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
 	}
-	snapAfterRollback := h.Stats().Snapshot()
-	if snapAfterRollback.RuntimePolicy.ReloadCount != 1 ||
+
+	// (b) Compartment #3 (generic) failure -> compartments #2 (social) and #1 (youtube) roll back in reverse order to 7 & 8!
+	faultyComp3 := ytdlpConfigResult{
+		engine:        ytCfg.engine,
+		youtubeEngine: ytCfg.youtubeEngine, // currently 8
+		socialEngine:  ytCfg.socialEngine,  // currently 7
+		genericEngine: ytengine.NewDisabled("injected compartment #3 failure"),
+	}
+	if ok := reloadRuntimeConfigOnce(entry, h, &faultyComp3, getenv, logf); ok {
+		t.Fatal("expected reloadRuntimeConfigOnce to return false when compartment #3 fails")
+	}
+	if ytCfg.youtubeEngine.ConcurrencyLimit() != 8 || ytCfg.socialEngine.ConcurrencyLimit() != 7 || ytCfg.genericEngine.ConcurrencyLimit() != 4 {
+		t.Fatalf("compartment #3 failure did not roll back compartments #1/#2: yt=%d social=%d generic=%d, want 8/7/4",
+			ytCfg.youtubeEngine.ConcurrencyLimit(), ytCfg.socialEngine.ConcurrencyLimit(), ytCfg.genericEngine.ConcurrencyLimit())
+	}
+
+	// Assert generation, immutable policy snapshot, admission pools, circuit breakers, and cache TTL are 100% untouched.
+	if h.RuntimeConfigGeneration() != genBeforeRollback || h.RuntimePolicySnapshot() != policyBeforeRollback {
+		t.Fatalf("policy snapshot or generation mutated after compartment failures: gen=%d want %d",
+			h.RuntimeConfigGeneration(), genBeforeRollback)
+	}
+	if snapAfterRollback := h.Stats().Snapshot(); snapAfterRollback.RuntimePolicy.ReloadCount != 1 ||
 		snapAfterRollback.RuntimePolicy.YouTubeSlots != 8 ||
+		snapAfterRollback.RuntimePolicy.SocialSlots != 7 ||
+		snapAfterRollback.RuntimePolicy.GenericSlots != 4 ||
+		snapAfterRollback.RuntimePolicy.YouTubeParseTTLSeconds != 0 ||
+		len(snapAfterRollback.RuntimePolicy.DisabledPlatforms) != 1 ||
+		snapAfterRollback.RuntimePolicy.DisabledPlatforms[0] != "tumblr" ||
 		snapAfterRollback.YTDLPPools.YouTube.ConcurrencyLimit != 8 ||
-		snapAfterRollback.YTDLPPools.Social.ConcurrencyLimit != 7 {
-		t.Fatalf("admission/stats mutated despite ytengine slot resize failure: policy=%+v pools=%+v",
+		snapAfterRollback.YTDLPPools.Social.ConcurrencyLimit != 7 ||
+		snapAfterRollback.YTDLPPools.Generic.ConcurrencyLimit != 4 {
+		t.Fatalf("admission/cb/cache/stats mutated despite compartment failure: policy=%+v pools=%+v",
 			snapAfterRollback.RuntimePolicy, snapAfterRollback.YTDLPPools)
+	}
+	for _, cbSnap := range h.Stats().Snapshot().CircuitBreakers {
+		if cbSnap.Platform == "douyin" && cbSnap.DisabledByConfig {
+			t.Fatal("circuit breaker disabled_platforms leaked douyin after failed compartment resize")
+		}
+		if cbSnap.Platform == "tumblr" && !cbSnap.DisabledByConfig {
+			t.Fatal("circuit breaker lost prior disabled platform tumblr after failed compartment resize")
+		}
+	}
+}
+
+type fakeCompartmentLimiter struct {
+	name      string
+	limit     int
+	failLimit int
+	failErr   error
+	ops       *[]string
+}
+
+func (f *fakeCompartmentLimiter) ConcurrencyLimit() int { return f.limit }
+
+func (f *fakeCompartmentLimiter) SetConcurrencyLimit(next int) error {
+	*f.ops = append(*f.ops, fmt.Sprintf("%s:%d->%d", f.name, f.limit, next))
+	if f.failErr != nil && next == f.failLimit {
+		return f.failErr
+	}
+	f.limit = next
+	return nil
+}
+
+func TestApplyCompartmentLimitTargetsReverseRollbackAndErrorJoin(t *testing.T) {
+	var ops []string
+	yt := &fakeCompartmentLimiter{name: "youtube", limit: 4, ops: &ops}
+	socialRollbackErr := errors.New("social rollback failure")
+	social := &fakeCompartmentLimiter{name: "social", limit: 6, failLimit: 6, failErr: socialRollbackErr, ops: &ops}
+	genericResizeErr := errors.New("generic resize failure")
+	generic := &fakeCompartmentLimiter{name: "generic", limit: 2, failLimit: 5, failErr: genericResizeErr, ops: &ops}
+
+	err := applyCompartmentLimitTargets([]compartmentLimitTarget{
+		{name: "youtube", limiter: yt, prev: yt.ConcurrencyLimit(), next: 9},
+		{name: "social", limiter: social, prev: social.ConcurrencyLimit(), next: 10},
+		{name: "generic", limiter: generic, prev: generic.ConcurrencyLimit(), next: 5},
+	})
+	if err == nil {
+		t.Fatal("expected error when generic compartment resize fails")
+	}
+	if !errors.Is(err, genericResizeErr) || !errors.Is(err, socialRollbackErr) {
+		t.Fatalf("expected joined resize + rollback errors, got: %v", err)
+	}
+	// Verify reverse-order rollback attempted social first, then youtube (and youtube succeeded!).
+	wantOps := []string{"youtube:4->9", "social:6->10", "generic:2->5", "social:10->6", "youtube:9->4"}
+	if strings.Join(ops, ",") != strings.Join(wantOps, ",") {
+		t.Fatalf("compartment ops = %v, want %v", ops, wantOps)
+	}
+	if yt.limit != 4 || generic.limit != 2 {
+		t.Fatalf("unexpected final limits: yt=%d generic=%d, want 4/2", yt.limit, generic.limit)
 	}
 }

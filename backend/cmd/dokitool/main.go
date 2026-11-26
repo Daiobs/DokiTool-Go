@@ -434,43 +434,25 @@ func reloadRuntimeConfigOnce(
 		}
 		return false
 	}
-	var prevYT, prevSocial, prevGeneric int
+	var hook api.RuntimeConfigCommitHook
 	if ytCfg != nil {
-		if ytCfg.youtubeEngine != nil {
-			prevYT = ytCfg.youtubeEngine.ConcurrencyLimit()
-		}
-		if ytCfg.socialEngine != nil {
-			prevSocial = ytCfg.socialEngine.ConcurrencyLimit()
-		}
-		if ytCfg.genericEngine != nil {
-			prevGeneric = ytCfg.genericEngine.ConcurrencyLimit()
-		}
-		if err := ytCfg.SetCompartmentLimits(next.YTDLP.YouTubeSlots, next.YTDLP.SocialSlots, next.YTDLP.GenericSlots); err != nil {
-			if logf != nil {
-				logf("dokitool: runtime config reload rejected during ytengine slot resize (keeping previous configuration): %v", err)
-			}
-			return false
+		hook = func(cfg api.RuntimeConfig) error {
+			return ytCfg.SetCompartmentLimits(cfg.YTDLP.YouTubeSlots, cfg.YTDLP.SocialSlots, cfg.YTDLP.GenericSlots)
 		}
 	}
-	if !api.ApplyRuntimeConfig(entry, handler, next, fromFile, true) {
-		if ytCfg != nil {
-			if ytCfg.youtubeEngine != nil && prevYT >= 1 {
-				_ = ytCfg.youtubeEngine.SetConcurrencyLimit(prevYT)
-			}
-			if ytCfg.socialEngine != nil && prevSocial >= 1 {
-				_ = ytCfg.socialEngine.SetConcurrencyLimit(prevSocial)
-			}
-			if ytCfg.genericEngine != nil && prevGeneric >= 1 {
-				_ = ytCfg.genericEngine.SetConcurrencyLimit(prevGeneric)
-			}
-		}
+	if err := api.ApplyRuntimeConfigWithHook(entry, handler, next, fromFile, true, hook); err != nil {
 		if logf != nil {
-			logf("dokitool: runtime config reload rejected by admission/handler apply (keeping previous configuration)")
+			logf("dokitool: runtime config reload rejected (keeping previous configuration): %v", err)
 		}
 		return false
 	}
 	if logf != nil {
-		logf("dokitool: runtime config reloaded (yt=%d social=%d generic=%d ejs=%d fast_per_platform=%d cb_enabled=%t disabled=%d)",
+		var gen uint64
+		if handler != nil {
+			gen = handler.RuntimeConfigGeneration()
+		}
+		logf("dokitool: runtime config reloaded (gen=%d yt=%d social=%d generic=%d ejs=%d fast_per_platform=%d cb_enabled=%t disabled=%d)",
+			gen,
 			next.YTDLP.YouTubeSlots,
 			next.YTDLP.SocialSlots,
 			next.YTDLP.GenericSlots,
@@ -593,36 +575,57 @@ func (r *ytdlpConfigResult) Close() error {
 	return r.engine.Close()
 }
 
+type compartmentLimiter interface {
+	ConcurrencyLimit() int
+	SetConcurrencyLimit(int) error
+}
+
+type compartmentLimitTarget struct {
+	name    string
+	limiter compartmentLimiter
+	prev    int
+	next    int
+}
+
+// applyCompartmentLimitTargets updates all compartments atomically: if any step fails,
+// every previously mutated compartment is rolled back in reverse order and any rollback
+// error is joined into the returned error.
+func applyCompartmentLimitTargets(targets []compartmentLimitTarget) error {
+	for i, t := range targets {
+		if t.limiter == nil {
+			continue
+		}
+		if err := t.limiter.SetConcurrencyLimit(t.next); err != nil {
+			errs := []error{fmt.Errorf("compartment %s resize failed: %w", t.name, err)}
+			for j := i - 1; j >= 0; j-- {
+				if targets[j].limiter == nil || targets[j].prev < 1 {
+					continue
+				}
+				if rbErr := targets[j].limiter.SetConcurrencyLimit(targets[j].prev); rbErr != nil {
+					errs = append(errs, fmt.Errorf("compartment %s rollback failed: %w", targets[j].name, rbErr))
+				}
+			}
+			return errors.Join(errs...)
+		}
+	}
+	return nil
+}
+
 func (r *ytdlpConfigResult) SetCompartmentLimits(ytSlots, socialSlots, genericSlots int) error {
 	if r == nil {
 		return nil
 	}
-	type target struct {
-		eng  *ytengine.Engine
-		prev int
-		next int
-	}
-	var targets []target
+	var targets []compartmentLimitTarget
 	if r.youtubeEngine != nil {
-		targets = append(targets, target{eng: r.youtubeEngine, prev: r.youtubeEngine.ConcurrencyLimit(), next: ytSlots})
+		targets = append(targets, compartmentLimitTarget{name: "youtube", limiter: r.youtubeEngine, prev: r.youtubeEngine.ConcurrencyLimit(), next: ytSlots})
 	}
 	if r.socialEngine != nil {
-		targets = append(targets, target{eng: r.socialEngine, prev: r.socialEngine.ConcurrencyLimit(), next: socialSlots})
+		targets = append(targets, compartmentLimitTarget{name: "social", limiter: r.socialEngine, prev: r.socialEngine.ConcurrencyLimit(), next: socialSlots})
 	}
 	if r.genericEngine != nil {
-		targets = append(targets, target{eng: r.genericEngine, prev: r.genericEngine.ConcurrencyLimit(), next: genericSlots})
+		targets = append(targets, compartmentLimitTarget{name: "generic", limiter: r.genericEngine, prev: r.genericEngine.ConcurrencyLimit(), next: genericSlots})
 	}
-	for i, t := range targets {
-		if err := t.eng.SetConcurrencyLimit(t.next); err != nil {
-			for j := i - 1; j >= 0; j-- {
-				if targets[j].prev >= 1 {
-					_ = targets[j].eng.SetConcurrencyLimit(targets[j].prev)
-				}
-			}
-			return err
-		}
-	}
-	return nil
+	return applyCompartmentLimitTargets(targets)
 }
 
 func parseYTDLPGenericConcurrency(getenv func(string) string) (int, error) {

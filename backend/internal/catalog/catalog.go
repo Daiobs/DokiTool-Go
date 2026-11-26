@@ -2,12 +2,17 @@
 package catalog
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/config"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
@@ -18,55 +23,207 @@ type Catalog struct {
 	byID map[string]unified.Object
 }
 
-var identifier = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
-var hostName = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`)
+type extraConfig struct {
+	ExactDomainAdditions map[string][]string `json:"exact_domain_additions"`
+	ExtraPlatforms       []extraPlatformSpec `json:"extra_platforms"`
+	byID                 map[string]extraPlatformSpec
+}
+
+type extraPlatformSpec struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	SiteURL        string   `json:"site_url"`
+	Icon           string   `json:"icon"`
+	Capabilities   []string `json:"capabilities"`
+	Domains        []string `json:"domains"`
+	ExactDomains   []string `json:"exact_domains"`
+	DisplayDomains []string `json:"display_domains,omitempty"`
+}
+
+var (
+	identifier        = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+	hostName          = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`)
+	embeddedExtraOnce sync.Once
+	embeddedExtraCfg  *extraConfig
+	embeddedExtraErr  error
+)
+
+func validateHostList(field, platformID string, hosts []string) error {
+	seen := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if !hostName.MatchString(h) || h != strings.ToLower(h) {
+			return fmt.Errorf("platform %s has invalid %s entry %q", platformID, field, h)
+		}
+		if seen[h] {
+			return fmt.Errorf("platform %s has duplicate %s entry %q", platformID, field, h)
+		}
+		seen[h] = true
+	}
+	return nil
+}
+
+func decodeExtraConfig(data []byte) (*extraConfig, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var cfg extraConfig
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode platforms_extra.json: %w", err)
+	}
+	var tail any
+	if err := dec.Decode(&tail); err != io.EOF {
+		return nil, fmt.Errorf("decode platforms_extra.json: trailing JSON data")
+	}
+	for id, domains := range cfg.ExactDomainAdditions {
+		if !identifier.MatchString(id) {
+			return nil, fmt.Errorf("invalid exact_domain_additions platform id %q", id)
+		}
+		if len(domains) == 0 {
+			return nil, fmt.Errorf("exact_domain_additions for %q must be nonempty", id)
+		}
+		if err := validateHostList("exact_domain_additions", id, domains); err != nil {
+			return nil, err
+		}
+	}
+	if len(cfg.ExtraPlatforms) == 0 {
+		return nil, fmt.Errorf("extra_platforms must be a nonempty array")
+	}
+	cfg.byID = make(map[string]extraPlatformSpec, len(cfg.ExtraPlatforms))
+	for _, spec := range cfg.ExtraPlatforms {
+		if !identifier.MatchString(spec.ID) {
+			return nil, fmt.Errorf("invalid extra platform id %q", spec.ID)
+		}
+		if _, dup := cfg.byID[spec.ID]; dup {
+			return nil, fmt.Errorf("duplicate extra platform id %q", spec.ID)
+		}
+		if spec.Name == "" || spec.SiteURL == "" || spec.Icon == "" {
+			return nil, fmt.Errorf("extra platform %q lacks required metadata", spec.ID)
+		}
+		if len(spec.Capabilities) == 0 {
+			return nil, fmt.Errorf("extra platform %q lacks capabilities", spec.ID)
+		}
+		for _, capName := range spec.Capabilities {
+			if strings.TrimSpace(capName) == "" {
+				return nil, fmt.Errorf("extra platform %q has empty capability", spec.ID)
+			}
+		}
+		if len(spec.Domains) == 0 && len(spec.ExactDomains) == 0 {
+			return nil, fmt.Errorf("extra platform %q lacks domains and exact_domains", spec.ID)
+		}
+		if err := validateHostList("domains", spec.ID, spec.Domains); err != nil {
+			return nil, err
+		}
+		if err := validateHostList("exact_domains", spec.ID, spec.ExactDomains); err != nil {
+			return nil, err
+		}
+		if err := validateHostList("display_domains", spec.ID, spec.DisplayDomains); err != nil {
+			return nil, err
+		}
+		cfg.byID[spec.ID] = spec
+	}
+	return &cfg, nil
+}
+
+func loadEmbeddedExtra() (*extraConfig, error) {
+	embeddedExtraOnce.Do(func() {
+		embeddedExtraCfg, embeddedExtraErr = decodeExtraConfig(config.PlatformsExtra())
+	})
+	return embeddedExtraCfg, embeddedExtraErr
+}
+
+func stringSliceToUnifiedArray(items []string) unified.Array {
+	out := make(unified.Array, len(items))
+	for i, item := range items {
+		out[i] = item
+	}
+	return out
+}
+
+func (s extraPlatformSpec) toCatalogObject() unified.Object {
+	obj := unified.Object{
+		"id":           s.ID,
+		"name":         s.Name,
+		"site_url":     s.SiteURL,
+		"icon":         s.Icon,
+		"capabilities": stringSliceToUnifiedArray(s.Capabilities),
+		"domains":      stringSliceToUnifiedArray(s.Domains),
+	}
+	if len(s.ExactDomains) > 0 {
+		obj["exact_domains"] = stringSliceToUnifiedArray(s.ExactDomains)
+	}
+	return obj
+}
 
 func Load() (*Catalog, error) {
 	c, err := Decode(config.Platforms())
 	if err != nil {
 		return nil, err
 	}
-	if err := c.AddExactDomains("zuiyou", "share.xiaochuankeji.cn"); err != nil {
+	extra, err := loadEmbeddedExtra()
+	if err != nil {
 		return nil, err
+	}
+	additionIDs := make([]string, 0, len(extra.ExactDomainAdditions))
+	for id := range extra.ExactDomainAdditions {
+		additionIDs = append(additionIDs, id)
+	}
+	sort.Strings(additionIDs)
+	for _, id := range additionIDs {
+		if err := c.AddExactDomains(id, extra.ExactDomainAdditions[id]...); err != nil {
+			return nil, err
+		}
+	}
+	for _, spec := range extra.ExtraPlatforms {
+		if c.Has(spec.ID) {
+			return nil, fmt.Errorf("extra platform %q duplicates base registry entry", spec.ID)
+		}
 	}
 	return c, nil
 }
 
-// XPlatform returns the optional registry entry for X / Twitter.
-func XPlatform() unified.Object {
-	return unified.Object{
-		"id":           "x",
-		"name":         "X",
-		"site_url":     "https://x.com/",
-		"icon":         "x",
-		"capabilities": unified.Array{"video", "image"},
-		"domains":      unified.Array{"x.com", "twitter.com", "t.co"},
+// ExtraPlatform returns a deep copy of the static catalog registration entry for an
+// optional Go-registered platform defined in backend/config/platforms_extra.json.
+func ExtraPlatform(id string) (unified.Object, bool) {
+	extra, err := loadEmbeddedExtra()
+	if err != nil {
+		return nil, false
 	}
+	spec, ok := extra.byID[id]
+	if !ok {
+		return nil, false
+	}
+	return spec.toCatalogObject(), true
 }
+
+// ExtraPlatformIDs returns the canonical ordered IDs of all optional platforms
+// defined in backend/config/platforms_extra.json.
+func ExtraPlatformIDs() []string {
+	extra, err := loadEmbeddedExtra()
+	if err != nil {
+		return nil
+	}
+	ids := make([]string, len(extra.ExtraPlatforms))
+	for i, spec := range extra.ExtraPlatforms {
+		ids[i] = spec.ID
+	}
+	return ids
+}
+
+func mustExtraPlatform(id string) unified.Object {
+	entry, ok := ExtraPlatform(id)
+	if !ok {
+		panic(fmt.Sprintf("catalog: missing embedded extra platform %q", id))
+	}
+	return entry
+}
+
+// XPlatform returns the optional registry entry for X / Twitter.
+func XPlatform() unified.Object { return mustExtraPlatform("x") }
 
 // YouTubePlatform returns the optional registry entry for YouTube.
-func YouTubePlatform() unified.Object {
-	return unified.Object{
-		"id":           "youtube",
-		"name":         "YouTube",
-		"site_url":     "https://www.youtube.com/",
-		"icon":         "youtube",
-		"capabilities": unified.Array{"video"},
-		"domains":      unified.Array{"youtube.com", "youtu.be"},
-	}
-}
+func YouTubePlatform() unified.Object { return mustExtraPlatform("youtube") }
 
 // InstagramPlatform returns the optional registry entry for Instagram.
-func InstagramPlatform() unified.Object {
-	return unified.Object{
-		"id":           "instagram",
-		"name":         "Instagram",
-		"site_url":     "https://www.instagram.com/",
-		"icon":         "instagram",
-		"capabilities": unified.Array{"video", "image"},
-		"domains":      unified.Array{"instagram.com", "instagr.am"},
-	}
-}
+func InstagramPlatform() unified.Object { return mustExtraPlatform("instagram") }
 
 func Decode(data []byte) (*Catalog, error) {
 	value, err := unified.DecodeValue(data)

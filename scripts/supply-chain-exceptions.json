@@ -1,0 +1,51 @@
+[
+  {
+    "id": "GHSA-G2V6-RQMX-R4W6",
+    "package": "@vue/server-renderer",
+    "ecosystem": "npm",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GHSA-28WG-GHJ8-5HJV",
+    "package": "nanoid",
+    "ecosystem": "npm",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GHSA-2V37-7H3G-55P8",
+    "package": "nanoid",
+    "ecosystem": "npm",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GHSA-R28C-9Q8G-F849",
+    "package": "postcss",
+    "ecosystem": "npm",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GHSA-68FV-2MGG-JV7Q",
+    "package": "source-map-js",
+    "ecosystem": "npm",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GO-2026-6859",
+    "package": "stdlib",
+    "ecosystem": "go",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  },
+  {
+    "id": "GO-2026-6865",
+    "package": "github.com/klauspost/compress",
+    "ecosystem": "go",
+    "reason": "Frozen lockfiles per PR #70 scope; scheduled for post-v4.4.1 dependency upgrade PR",
+    "expires_on": "2026-12-10"
+  }
+]

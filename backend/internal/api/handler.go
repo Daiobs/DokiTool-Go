@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
@@ -48,8 +49,8 @@ type Handler struct {
 	finalizeReadTimeout time.Duration
 	cache               *parseCache
 	cb                  *circuitBreakerManager
-	policyMu            sync.RWMutex
-	cachePolicy         RuntimeCachePolicy
+	reloadMu            sync.Mutex
+	policy              atomic.Pointer[RuntimePolicySnapshot]
 	observersMu         sync.RWMutex
 	observers           []RuntimeConfigObserver
 	stats               *Stats
@@ -86,7 +87,7 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 	stats := NewStats(nil)
 	stats.setCacheSource(cache)
 	stats.setCircuitBreakerSource(cb)
-	return &Handler{
+	h := &Handler{
 		catalog:             c,
 		adapters:            registered,
 		now:                 now,
@@ -94,39 +95,48 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 		finalizeReadTimeout: defaultYouTubeFinalizeReadTimeout,
 		cache:               cache,
 		cb:                  cb,
-		cachePolicy:         defaultRT.Cache,
 		stats:               stats,
 		panicLogf:           log.Printf,
-	}, nil
+	}
+	h.policy.Store(newRuntimePolicySnapshot(defaultRT, 0))
+	return h, nil
+}
+
+func (h *Handler) currentPolicySnapshot() *RuntimePolicySnapshot {
+	if h != nil {
+		if snap := h.policy.Load(); snap != nil {
+			return snap
+		}
+	}
+	return defaultRuntimePolicySnapshot
+}
+
+// RuntimePolicySnapshot returns the current immutable lock-free hot-path policy snapshot.
+func (h *Handler) RuntimePolicySnapshot() *RuntimePolicySnapshot {
+	return h.currentPolicySnapshot()
+}
+
+// RuntimeConfigGeneration returns the monotonic generation of the active runtime policy.
+func (h *Handler) RuntimeConfigGeneration() uint64 {
+	return h.currentPolicySnapshot().Generation
 }
 
 func (h *Handler) getCachePolicy() RuntimeCachePolicy {
-	if h == nil {
-		return defaultRuntimeCachePolicy()
-	}
-	h.policyMu.RLock()
-	p := h.cachePolicy
-	h.policyMu.RUnlock()
-	return p
+	return h.currentPolicySnapshot().Cache
 }
 
-func (h *Handler) setCachePolicy(p RuntimeCachePolicy) {
-	if h == nil {
-		return
-	}
-	h.policyMu.Lock()
-	h.cachePolicy = p
-	h.policyMu.Unlock()
-}
-
-func (h *Handler) isCacheableRequest(platform, source string) bool {
+func isCacheableRequestWithPolicy(platform, source string, policy RuntimeCachePolicy) bool {
 	if !cacheableRequest(platform, source) {
 		return false
 	}
-	if platform == "youtube" && h.getCachePolicy().YouTubeParseTTL <= 0 {
+	if platform == "youtube" && policy.YouTubeParseTTL <= 0 {
 		return false
 	}
 	return true
+}
+
+func (h *Handler) isCacheableRequest(platform, source string) bool {
+	return isCacheableRequestWithPolicy(platform, source, h.getCachePolicy())
 }
 
 // Stats returns the handler's bounded-cardinality in-process telemetry collector.
@@ -201,8 +211,15 @@ func (h *Handler) recordParseTelemetry(routePlatform, dynamicPlatform, code, cha
 }
 
 func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, string, bool) {
+	return h.deriveCacheableParseKeyWithPolicy(path, rawQuery, h.currentPolicySnapshot())
+}
+
+func (h *Handler) deriveCacheableParseKeyWithPolicy(path, rawQuery string, snap *RuntimePolicySnapshot) (cacheKey, string, bool) {
 	if h == nil || h.catalog == nil || h.cache == nil || h.cache.cfg.Disabled {
 		return cacheKey{}, "", false
+	}
+	if snap == nil {
+		snap = h.currentPolicySnapshot()
 	}
 	if path != "/api/parse" && path != "/api/resolve" {
 		return cacheKey{}, "", false
@@ -236,10 +253,10 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 			return cacheKey{}, "", false
 		}
 	}
-	if !h.isCacheableRequest(platform, source) {
+	if !isCacheableRequestWithPolicy(platform, source, snap.Cache) {
 		return cacheKey{}, "", false
 	}
-	if h.cb.IsDisabled(platform) {
+	if snap.IsPlatformDisabled(platform) {
 		return cacheKey{}, "", false
 	}
 	itemID := ""
@@ -267,8 +284,9 @@ func (h *Handler) deriveCacheableParseKey(path, rawQuery string) (cacheKey, stri
 // pre-cache validation guards and cache key derivation in ServeHTTP so invalid
 // requests never masquerade as cache hits, and it never mutates the cache.
 func (h *Handler) HasFreshCachedParse(path, rawQuery string) bool {
-	ck, platform, ok := h.deriveCacheableParseKey(path, rawQuery)
-	if !ok || h.cb.IsDisabled(platform) {
+	snap := h.currentPolicySnapshot()
+	ck, _, ok := h.deriveCacheableParseKeyWithPolicy(path, rawQuery, snap)
+	if !ok {
 		return false
 	}
 	return h.cache.fresh(ck, h.now())
@@ -282,7 +300,8 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 	if r.Method != http.MethodGet {
 		return false
 	}
-	ck, platform, ok := h.deriveCacheableParseKey(r.URL.EscapedPath(), r.URL.RawQuery)
+	snap := h.currentPolicySnapshot()
+	ck, platform, ok := h.deriveCacheableParseKeyWithPolicy(r.URL.EscapedPath(), r.URL.RawQuery, snap)
 	if !ok {
 		return false
 	}
@@ -292,7 +311,7 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 		rejectUnauthorizedWithMessage(w, r, parser, "当前凭据无权访问该平台")
 		return true
 	}
-	if h.cb.IsDisabled(platform) {
+	if snap.IsPlatformDisabled(platform) {
 		res := circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
 		h.recordParseTelemetry(platform, res.platform, res.code, ChannelOwner, time.Since(wallStart))
 		if key != nil {
@@ -628,13 +647,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if path == "/api/resolve" {
 		resolveItemID = itemID
 	}
-	if h.cb.IsDisabled(platform) {
+	policySnap := h.currentPolicySnapshot()
+	if policySnap.IsPlatformDisabled(platform) {
 		res := circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
 		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		writeResponse(w, res)
 		return
 	}
-	if h.cache == nil || h.cache.cfg.Disabled || !h.isCacheableRequest(platform, source) {
+	if h.cache == nil || h.cache.cfg.Disabled || !isCacheableRequestWithPolicy(platform, source, policySnap.Cache) {
 		h.stats.recordCacheUncacheable(channel)
 		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, h.now())
 		if !allowed {
@@ -705,9 +725,9 @@ func (h *Handler) serveCachedParse(
 	if !joining {
 		allowed, retryAfterSec, halfOpenGen := h.cb.Allow(platform, now)
 		if !allowed {
-			if !h.cb.IsDisabled(platform) {
-				policy := h.getCachePolicy()
-				if staleRes, ok := h.cache.getStaleLocked(key, now, policy.StaleIfErrorTTL); ok {
+			curSnap := h.currentPolicySnapshot()
+			if !curSnap.IsPlatformDisabled(platform) {
+				if staleRes, ok := h.cache.getStaleLocked(key, now, curSnap.Cache.StaleIfErrorTTL); ok {
 					h.cache.mu.Unlock()
 					h.stats.recordCacheStaleHit(channel)
 					h.recordParseTelemetry(platform, staleRes.platform, staleRes.code, channel, time.Since(wallStart))
@@ -813,8 +833,6 @@ func (h *Handler) runSingleflight(
 			finishNow = h.now()
 		}
 
-		policy := h.getCachePolicy()
-
 		// Maintain strict lock order h.cache.mu -> h.cb.mu and complete circuit breaker
 		// accounting BEFORE closing call.done so waking waiters observe updated state.
 		h.cache.mu.Lock()
@@ -828,14 +846,18 @@ func (h *Handler) runSingleflight(
 		}
 		h.cb.Finish(platform, cbCode, halfOpenGen, finishNow)
 
+		// Load one lock-free policy snapshot under h.cache.mu so disabled-platform
+		// checks and stale-if-error TTL come from the exact same generation and
+		// synchronize with ApplyRuntimeConfig's policy.Store -> purgePlatforms edge.
+		commitSnap := h.currentPolicySnapshot()
 		servedStale := false
 		if !abandoned && ctx.Err() == nil {
-			if h.cb.IsDisabled(platform) {
+			if commitSnap.IsPlatformDisabled(platform) {
 				res = circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
 			} else if cacheable {
 				h.cache.putWithStaleLocked(key, res, freshUntil, hardExpiresAt, res.code == "OK")
 			} else if isStaleFallbackTrigger(res) {
-				if staleRes, ok := h.cache.getStaleLocked(key, finishNow, policy.StaleIfErrorTTL); ok {
+				if staleRes, ok := h.cache.getStaleLocked(key, finishNow, commitSnap.Cache.StaleIfErrorTTL); ok {
 					res = staleRes
 					servedStale = true
 				}
@@ -858,7 +880,7 @@ func (h *Handler) runSingleflight(
 	res, payload, encOK = h.executeParse(parseCtx, path, platform, source, itemID, debug, h.now())
 	finishNow = h.now()
 	if encOK && payload != nil {
-		freshUntil, hardExpiresAt, cacheable = computeCacheDeadlines(platform, payload, finishNow, shanghaiFallback(), h.getCachePolicy())
+		freshUntil, hardExpiresAt, cacheable = computeCacheDeadlines(platform, payload, finishNow, shanghaiFallback(), h.currentPolicySnapshot().Cache)
 	}
 	completed = true
 }

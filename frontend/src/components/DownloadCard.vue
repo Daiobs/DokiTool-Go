@@ -12,6 +12,8 @@ const filenameWarningRemediation = computed(() =>
     ? 'Tip: Enable "Ask where to save each file" in DokiTool extension settings, or disable conflicting download extensions.'
     : '建议：在 DokiTool 扩展设置中开启「下载时询问保存位置」，或停用冲突的第三方下载插件。',
 )
+const shouldShowFilenameRemediation = (item) =>
+  typeof item?.filenameWarning === 'string' && !item.filenameWarning.includes('下载时询问保存位置')
 const isDebug = () => {
   try { if (new URLSearchParams(window.location?.search).get('debug') === '1') return true } catch {}
   try { return window.localStorage?.getItem('dokitool:debug') === '1' } catch { return false }
@@ -217,7 +219,7 @@ onBeforeUnmount(stopCollapseTimer)
             class="mt-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200/80 dark:border-amber-800/60 rounded-lg px-2.5 py-1.5 leading-snug"
           >
             <div>{{ item.filenameWarning }}</div>
-            <div data-download-filename-remediation class="mt-1 opacity-90">
+            <div v-if="shouldShowFilenameRemediation(item)" data-download-filename-remediation class="mt-1 opacity-90">
               {{ filenameWarningRemediation }}
             </div>
           </div>

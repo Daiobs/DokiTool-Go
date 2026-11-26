@@ -40,6 +40,7 @@ FULL_EXACT_PATHS = frozenset(
         "public-files.json",
         ".gitignore",
         "backend/config/platforms.json",
+        "backend/config/platforms_extra.json",
         "frontend/src/monitor/statsTypes.generated.ts",
         "frontend/scripts/test-pipixia-representation.mjs",
         "frontend/scripts/test-shanghai-original.mjs",
@@ -59,6 +60,7 @@ L2_E2E_FRONTEND_PREFIXES = (
     "frontend/src/downloads/",
     "frontend/public/downloads/",
     "frontend/src/extension/",
+    "frontend/src/utils/youtube/",
     "frontend/tests/fixtures/download/",
 )
 L2_E2E_FRONTEND_EXACT_PATHS = frozenset(

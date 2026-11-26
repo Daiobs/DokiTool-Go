@@ -235,6 +235,7 @@ type admission struct {
 	public, resolve, youtubeSlow, slow, genericSlow, youtubeEJS, catalog, relay, reports *pool
 	owner                                                                                *keyPool
 	reloadMu                                                                             sync.Mutex
+	runtimeReloadMu                                                                      sync.Mutex
 	keys                                                                                 atomic.Pointer[APIKeyRegistry]
 }
 
@@ -745,6 +746,16 @@ func (p *pool) currentQueueWait() time.Duration {
 	d := p.queueWait
 	p.mu.Unlock()
 	return d
+}
+
+func (p *pool) currentPerPlatformLimit() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	limit := p.perPlatformLimit
+	p.mu.Unlock()
+	return limit
 }
 
 // updateLimits modifies concurrency and queue bounds in-place under p.mu so all

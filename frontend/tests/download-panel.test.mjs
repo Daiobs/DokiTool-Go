@@ -535,6 +535,8 @@ test('Post-#68 Batch 1A: DownloadCard omits web-save-file-picker-toggle and rend
     assert.ok(row);
     const warnings = descendants(row, n => 'data-download-filename-warning' in (n.props || {}));
     assert.equal(warnings.length, 1);
+    const zhRemediations = descendants(warnings[0], n => 'data-download-filename-remediation' in (n.props || {}));
+    assert.equal(zhRemediations.length, 1, 'generic warning without embedded guidance must render remediation sub-line');
     const zhWarningText = textOf(warnings[0]);
     assert.match(zhWarningText, /其他下载类扩展改写了保存文件名/);
     assert.match(zhWarningText, /下载时询问保存位置/);
@@ -543,7 +545,12 @@ test('Post-#68 Batch 1A: DownloadCard omits web-save-file-picker-toggle and rend
     // Switch locale to EN -> keeps item.filenameWarning and switches remediation copy to English
     view.locale.value = 'en';
     await view.flush();
-    const enWarningText = textOf(descendants(view.row('tamper-1'), n => 'data-download-filename-warning' in (n.props || {}))[0]);
+    const enWarningEl = descendants(view.row('tamper-1'), n => 'data-download-filename-warning' in (n.props || {}))[0];
+    assert.equal(
+      descendants(enWarningEl, n => 'data-download-filename-remediation' in (n.props || {})).length,
+      1,
+    );
+    const enWarningText = textOf(enWarningEl);
     assert.match(enWarningText, /其他下载类扩展改写了保存文件名/);
     assert.match(enWarningText, /Ask where to save each file/);
     assert.match(enWarningText, /disable conflicting download extensions/i);
@@ -567,4 +574,80 @@ test('Post-#68 Batch 1A: DownloadCard omits web-save-file-picker-toggle and rend
     if (prevPicker === undefined) delete globalThis.showSaveFilePicker;
     else globalThis.showSaveFilePicker = prevPicker;
   }
+});
+
+test('R69: DownloadCard deduplicates data-download-filename-remediation when filenameWarning already includes 下载时询问保存位置 and renders it for generic/English warnings', async t => {
+  const fullZhAuditWarning =
+    '检测到浏览器内其他下载类扩展改写了保存文件名，可在扩展设置开启“下载时询问保存位置”或停用冲突下载插件';
+  const genericEnglishWarning =
+    'Saved filename was modified by another download extension.';
+  const view = await mount(
+    t,
+    [
+      task('dedup-zh', 'completed', {
+        filename: '作品_1080p.mp4',
+        filenameWarning: fullZhAuditWarning,
+      }),
+      task('generic-en', 'completed', {
+        filename: 'clip_1080p.mp4',
+        filenameWarning: genericEnglishWarning,
+      }),
+    ],
+    { preference: 'expanded', locale: 'zh-CN' },
+  );
+
+  // 1) Warning that already mentions "下载时询问保存位置" hides duplicate remediation sub-line
+  const dedupWarning = descendants(
+    view.row('dedup-zh'),
+    n => 'data-download-filename-warning' in (n.props || {}),
+  )[0];
+  assert.ok(dedupWarning);
+  assert.equal(
+    descendants(dedupWarning, n => 'data-download-filename-remediation' in (n.props || {})).length,
+    0,
+    'must hide duplicate data-download-filename-remediation when warning already includes 下载时询问保存位置',
+  );
+  const dedupText = textOf(dedupWarning);
+  assert.equal(dedupText.includes(fullZhAuditWarning), true);
+  assert.equal(
+    dedupText.split('下载时询问保存位置').length - 1,
+    1,
+    'guidance phrase must appear exactly once without duplication',
+  );
+
+  // 2) Generic/English warning renders bilingual remediation sub-line normally (ZH and EN)
+  const genericZhWarning = descendants(
+    view.row('generic-en'),
+    n => 'data-download-filename-warning' in (n.props || {}),
+  )[0];
+  assert.ok(genericZhWarning);
+  assert.equal(
+    descendants(genericZhWarning, n => 'data-download-filename-remediation' in (n.props || {})).length,
+    1,
+  );
+  assert.match(textOf(genericZhWarning), /下载时询问保存位置/);
+
+  view.locale.value = 'en';
+  await view.flush();
+
+  const dedupEnWarning = descendants(
+    view.row('dedup-zh'),
+    n => 'data-download-filename-warning' in (n.props || {}),
+  )[0];
+  assert.equal(
+    descendants(dedupEnWarning, n => 'data-download-filename-remediation' in (n.props || {})).length,
+    0,
+  );
+
+  const genericEnWarning = descendants(
+    view.row('generic-en'),
+    n => 'data-download-filename-warning' in (n.props || {}),
+  )[0];
+  assert.equal(
+    descendants(genericEnWarning, n => 'data-download-filename-remediation' in (n.props || {})).length,
+    1,
+  );
+  assert.match(textOf(genericEnWarning), /Ask where to save each file/);
+  assert.match(textOf(genericEnWarning), /disable conflicting download extensions/i);
+  view.stop();
 });

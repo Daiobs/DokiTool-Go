@@ -78,6 +78,23 @@ const BG_FORBIDDEN_TARGETS = new Set([
   "extension/offscreen",
 ]);
 
+const PURE_VIEW_MODEL_FILES = [
+  path.join("monitor", "monitorViewModel.ts"),
+  path.join("extension", "sidePanelResultModel.ts"),
+];
+
+const VIEW_MODEL_FORBIDDEN_PACKAGES = new Set(["vue", "pinia", "jszip"]);
+
+const VIEW_MODEL_FORBIDDEN_TARGETS = new Set([
+  "extension/extensionDownload",
+  "extension/offscreen",
+  "extension/dashMuxDownload",
+  "extension/opfsStreamTransfer",
+  "extension/youtubeExtensionBridge",
+  "extension/storage",
+  "monitor/monitorStorage",
+]);
+
 const PLANNING_HOST_SIDE_EFFECT_PATTERNS = [
   { name: "chrome-api", regex: /\bchrome\s*\./ },
   { name: "navigator-storage", regex: /\bnavigator\s*\.\s*storage\b/ },
@@ -85,6 +102,11 @@ const PLANNING_HOST_SIDE_EFFECT_PATTERNS = [
   { name: "window-global", regex: /\bwindow\s*\./ },
   { name: "document-global", regex: /\bdocument\s*\./ },
   { name: "fetch-call", regex: /\bfetch\s*\(/ },
+];
+
+const VIEW_MODEL_HOST_SIDE_EFFECT_PATTERNS = [
+  ...PLANNING_HOST_SIDE_EFFECT_PATTERNS,
+  { name: "web-storage", regex: /\b(?:localStorage|sessionStorage)\b/ },
 ];
 
 const SINGLE_FILE_LINE_LIMITS = [
@@ -118,14 +140,14 @@ export const LEGACY_FILE_LINE_RATCHETS = Object.freeze({
   "src/components/result/ResultDetailsSidebar.vue": 1240,
   "src/composables/useMediaDownload.ts": 1680,
   "src/extension/SidePanelApp.vue": 1690,
-  "src/extension/components/SidePanelResult.vue": 2850,
+  "src/extension/components/SidePanelResult.vue": 2290,
   "src/extension/components/SidePanelSettings.vue": 990,
   "src/extension/extensionDownload.ts": 1810,
   "src/extension/opfsStreamTransfer.ts": 1790,
   "src/extension/uiTargetHelpers.ts": 2160,
   "src/extension/urlMatcher.ts": 1160,
-  "src/monitor/MonitorApp.vue": 2340,
-  "src/utils/youtubeHelperCore.js": 3160,
+  "src/monitor/MonitorApp.vue": 1870,
+  "src/utils/youtubeHelperCore.js": 2490,
 });
 
 function countSourceLines(raw) {
@@ -260,6 +282,47 @@ function checkExtensionImportDirections(
         violations.push(
           `[import-direction] ${rel}:${lineNo}: background module must not import "${specifier}" (${target.normalized}); import from ../planning/* instead`,
         );
+      }
+    }
+  }
+
+  // 4c. Pure extracted SFC view models (monitorViewModel.ts, sidePanelResultModel.ts)
+  // must remain strictly unidirectional and host-pure (no .vue/vue/side-effect imports or DOM/Chrome globals)
+  for (const relModel of PURE_VIEW_MODEL_FILES) {
+    const filePath = path.join(targetSrcRoot, relModel);
+    if (!fs.existsSync(filePath)) continue;
+    checked++;
+    const rel = toPosixRel(targetFrontendRoot, filePath);
+    const stripped = stripCommentsPreserveLines(fs.readFileSync(filePath, "utf8"));
+    for (const { specifier, lineNo } of extractModuleSpecifiers(stripped)) {
+      const target = normalizeResolvedModuleTarget(
+        targetSrcRoot,
+        filePath,
+        specifier,
+      );
+      const isVueSfc = /\.vue$/i.test(specifier);
+      const pkgRoot = !target.isRelative ? target.normalized.split("/")[0] : "";
+      const isForbidden =
+        isVueSfc ||
+        (!target.isRelative && VIEW_MODEL_FORBIDDEN_PACKAGES.has(pkgRoot)) ||
+        (target.isRelative &&
+          (VIEW_MODEL_FORBIDDEN_TARGETS.has(target.normalized) ||
+            target.normalized === "extension/bg" ||
+            target.normalized.startsWith("extension/bg/")));
+      if (isForbidden) {
+        violations.push(
+          `[view-model-import-direction] ${rel}:${lineNo}: pure view-model must not import "${specifier}" (${target.normalized})`,
+        );
+      }
+    }
+    const lines = stripped.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      for (const rule of VIEW_MODEL_HOST_SIDE_EFFECT_PATTERNS) {
+        if (rule.regex.test(lines[i])) {
+          violations.push(
+            `[view-model-host-side-effect] ${rel}:${i + 1} (${rule.name}): pure view-model must not access browser/DOM/Chrome side-effect globals`,
+          );
+        }
       }
     }
   }

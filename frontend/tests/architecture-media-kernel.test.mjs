@@ -1674,4 +1674,29 @@ test("Architecture Boundary Gate: static import direction & planning host-purity
       assert.ok(res.violations.some((v) => v.includes("[planning-host-side-effect]") && v.includes("navigator-locks")));
     },
   );
+
+  // 4) Pure SFC view models (monitorViewModel.ts, sidePanelResultModel.ts) must reject .vue/vue/side-effect imports and browser globals
+  withTempFrontend(
+    {
+      "src/monitor/monitorViewModel.ts":
+        "import { computed } from \"vue\";\nimport MonitorApp from \"./MonitorApp.vue\";\nexport const bad = () => [computed, MonitorApp, window.location, document.body, fetch(\"/api\"), localStorage.getItem(\"k\")];\n",
+      "src/extension/sidePanelResultModel.ts":
+        "import SidePanelResult from \"./components/SidePanelResult.vue\";\nimport { buildEnqueueItemsForMedia } from \"./extensionDownload\";\nimport { ensureOffscreen } from \"./offscreen\";\nexport const bad = () => [SidePanelResult, buildEnqueueItemsForMedia, ensureOffscreen, chrome.runtime, navigator.storage];\n",
+    },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, false);
+      assert.ok(res.violations.some((v) => v.includes("[view-model-import-direction]") && v.includes("monitorViewModel.ts") && v.includes("\"vue\"")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-import-direction]") && v.includes("MonitorApp.vue")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-import-direction]") && v.includes("SidePanelResult.vue")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-import-direction]") && v.includes("extensionDownload")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-import-direction]") && v.includes("offscreen")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("window-global")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("document-global")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("fetch-call")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("web-storage")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("chrome-api")));
+      assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("navigator-storage")));
+    },
+  );
 });

@@ -80,6 +80,7 @@
 !/scripts/check-go-file-budgets.py
 !/scripts/check-openapi.py
 !/scripts/check-public-files.py
+!/scripts/check-supply-chain.py
 !/scripts/check-upstream-canary.py
 !/scripts/check-upstream-updates.py
 !/scripts/check-ytdlp-extractors.py
@@ -88,6 +89,7 @@
 !/scripts/go-migration/
 !/scripts/prod-smoke/
 !/scripts/requirements-validation.txt
+!/scripts/supply-chain-exceptions.json
 !/scripts/test-download-browser.mjs
 !/scripts/test-download-claim.mjs
 !/scripts/test-extension-e2e.mjs
@@ -128,6 +130,7 @@
 /backend/config/*
 !/backend/config/embed.go
 !/backend/config/platforms.json
+!/backend/config/platforms_extra.json
 /backend/docs/*
 !/backend/docs/Unified-Video-Parsing-JSON-Format-3.0.md
 !/backend/docs/视频解析统一JSON格式3.0.md
@@ -294,14 +297,18 @@
 !/frontend/tests/media-delivery.test.mjs
 !/frontend/tests/media-sources.test.mjs
 !/frontend/tests/monitor-dashboard.test.mjs
+!/frontend/tests/monitor-view-model.test.mjs
 !/frontend/tests/parser-contract.test.mjs
+!/frontend/tests/platform-catalog-parity.test.mjs
 !/frontend/tests/prerender.test.mjs
 !/frontend/tests/result-layout.test.mjs
 !/frontend/tests/route-probe.test.mjs
 !/frontend/tests/seo-contract.test.mjs
+!/frontend/tests/side-panel-result-model.test.mjs
 !/frontend/tests/subtitle-controller.test.mjs
 !/frontend/tests/subtitle-engine.test.mjs
 !/frontend/tests/ui-download-contract.test.mjs
+!/frontend/tests/youtube-helper-modular.test.mjs
 !/frontend/tests/youtube-helper.test.mjs
 /ops/examples/*
 !/ops/examples/api-keys.example.json
@@ -374,6 +381,7 @@
 /scripts/tests/*
 !/scripts/tests/test_bump_runtime_pins.py
 !/scripts/tests/test_check_go_file_budgets.py
+!/scripts/tests/test_check_supply_chain.py
 !/scripts/tests/test_check_ytdlp_extractors.py
 !/scripts/tests/test_classify_ci_changes.py
 !/scripts/tests/test_dokitool_agent_bridge.py
@@ -707,6 +715,7 @@
 !/frontend/src/extension/opfsStreamTransfer.ts
 !/frontend/src/extension/planning/
 !/frontend/src/extension/protocol.ts
+!/frontend/src/extension/sidePanelResultModel.ts
 !/frontend/src/extension/sidepanel.css
 !/frontend/src/extension/sidepanel.html
 !/frontend/src/extension/sidepanel.ts
@@ -725,6 +734,7 @@
 !/frontend/src/monitor/main.ts
 !/frontend/src/monitor/monitor.css
 !/frontend/src/monitor/monitorStorage.ts
+!/frontend/src/monitor/monitorViewModel.ts
 !/frontend/src/monitor/statsTypes.generated.ts
 !/frontend/src/monitor/statsTypes.ts
 !/frontend/src/monitor/statsValidation.ts
@@ -755,6 +765,7 @@
 !/frontend/src/utils/platforms.ts
 !/frontend/src/utils/segmentDownload.ts
 !/frontend/src/utils/videoFilename.ts
+!/frontend/src/utils/youtube/
 !/frontend/src/utils/youtubeHelperCore.d.ts
 !/frontend/src/utils/youtubeHelperCore.js
 !/frontend/src/utils/youtubeHelperEntry.js
@@ -1048,6 +1059,10 @@
 /frontend/src/monitor/components/*
 !/frontend/src/monitor/components/ProtectionPolicySection.vue
 !/frontend/src/monitor/components/YouTubeHelperCard.vue
+/frontend/src/utils/youtube/*
+!/frontend/src/utils/youtube/helperValidation.js
+!/frontend/src/utils/youtube/muxSelector.js
+!/frontend/src/utils/youtube/playerPayload.js
 /frontend/tests/fixtures/download/*
 !/frontend/tests/fixtures/download/one-frame-audio.m4a
 !/frontend/tests/fixtures/download/one-frame-avc.mp4

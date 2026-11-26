@@ -59,6 +59,45 @@ const ALLOWED_WEB_BRIDGE_EXTENSIONS = new Set([
 
 const ALLOWED_YOUTUBE_DIRECT_EXTENSIONS = new Set(["mp4", "m4a", "webm"]);
 
+export const WEB_EXT_PING_SETTINGS_TIMEOUT_MS = 200;
+
+/**
+ * Reads `useSaveFilePicker` from extension storage with a strict upper time bound
+ * so `WEB_EXT_PING` never stalls or fails when `chrome.storage` is slow or broken.
+ * Always falls back to `false` on error, non-boolean value, or timeout, clearing
+ * its timer in `finally` and swallowing late rejections.
+ */
+export async function readSaveFilePickerPrefBounded(
+  storage: Pick<ExtensionStorageController, "getSettings">,
+  timeoutMs: number = WEB_EXT_PING_SETTINGS_TIMEOUT_MS,
+): Promise<boolean> {
+  const safeTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : WEB_EXT_PING_SETTINGS_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settingsPromise: Promise<boolean> = Promise.resolve()
+    .then(() => storage.getSettings())
+    .then((settings) =>
+      Boolean(
+        settings &&
+          typeof settings === "object" &&
+          settings.useSaveFilePicker === true,
+      ),
+    )
+    .catch(() => false);
+  const timeoutPromise = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), safeTimeoutMs);
+  });
+  try {
+    return await Promise.race([settingsPromise, timeoutPromise]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 /**
  * Strictly validates an external `onMessageExternal` sender origin.
  * Production builds ONLY accept exact `https://snap.dokitool.com`.
@@ -394,12 +433,12 @@ export function createWebExternalBridge(
 
     switch (req.type) {
       case "WEB_EXT_PING": {
-        const settings = await storage.getSettings();
+        const useSaveFilePicker = await readSaveFilePickerPrefBounded(storage);
         return okRpc({
           version: manifestVersion,
           extensionId: chromeApi.runtime.id || DOKITOOL_EXTENSION_ID,
           capabilities: [...WEB_BRIDGE_CAPABILITIES],
-          useSaveFilePicker: Boolean(settings.useSaveFilePicker),
+          useSaveFilePicker,
         });
       }
 

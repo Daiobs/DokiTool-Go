@@ -5,7 +5,7 @@ Performs zero external network requests. Verifies:
 1. OpenAPI 3.1.0 top-level metadata, paths, parameters, status codes, headers, and BearerAuth security;
 2. Every internal $ref resolves cleanly with zero external/network $refs;
 3. Exact structural & enum parity between docs/openapi.json and docs/schema/unified-v1/unified-v1.schema.json,
-   backend/config/platforms.json, and the GET /api/stats StatsSnapshot & APIKeyStatsSnapshot contracts;
+   backend/config/platforms.json + backend/config/platforms_extra.json, and the GET /api/stats StatsSnapshot & APIKeyStatsSnapshot contracts;
 4. Draft 2020-12 JSON Schema validity and fixture conformance (via jsonschema when installed,
    required when --require-jsonschema is passed in CI);
 5. Caddy example per-path @api whitelist parity and 404 JSON catch-all ordering in ops/examples/snap.caddy,
@@ -41,6 +41,7 @@ API_KEYS_EXAMPLE_PATH = ROOT / "ops/examples/api-keys.example.json"
 RUNTIME_CONFIG_EXAMPLE_PATH = ROOT / "ops/examples/runtime.example.json"
 UNIFIED_SCHEMA_PATH = ROOT / "docs/schema/unified-v1/unified-v1.schema.json"
 PLATFORMS_PATH = ROOT / "backend/config/platforms.json"
+PLATFORMS_EXTRA_PATH = ROOT / "backend/config/platforms_extra.json"
 EXAMPLES_DIR = ROOT / "docs/schema/unified-v1/examples"
 BATCH_EXAMPLE_PATH = ROOT / "examples/agent_batch_download.py"
 
@@ -272,7 +273,34 @@ def rewrite_component_refs_to_defs(node):
     return node
 
 
-def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: list[dict]) -> int:
+def load_extra_platforms_config(extra_cfg: dict | None = None) -> tuple[list[dict], list[str]]:
+    if extra_cfg is None:
+        require(PLATFORMS_EXTRA_PATH.is_file(), f"Missing extra platforms config: {PLATFORMS_EXTRA_PATH}")
+        extra_cfg = json.loads(PLATFORMS_EXTRA_PATH.read_text(encoding="utf-8"))
+    require(isinstance(extra_cfg, dict), "backend/config/platforms_extra.json must be a JSON object")
+    extra_entries = extra_cfg.get("extra_platforms")
+    require(
+        isinstance(extra_entries, list) and len(extra_entries) >= 1,
+        "backend/config/platforms_extra.json extra_platforms must be a non-empty array",
+    )
+    extra_ids: list[str] = []
+    seen: set[str] = set()
+    for idx, entry in enumerate(extra_entries):
+        require(isinstance(entry, dict), f"platforms_extra.json extra_platforms[{idx}] must be an object")
+        pid = entry.get("id")
+        require(isinstance(pid, str) and bool(pid), f"platforms_extra.json extra_platforms[{idx}] missing valid id")
+        require(pid not in seen, f"Duplicate extra platform id in platforms_extra.json: {pid!r}")
+        seen.add(pid)
+        extra_ids.append(pid)
+    return extra_entries, extra_ids
+
+
+def check_openapi_structure(
+    spec: dict,
+    unified_schema: dict,
+    platforms_cfg: list[dict],
+    platforms_extra_cfg: dict | None = None,
+) -> int:
     require(spec.get("openapi") == "3.1.0", "openapi version must be exactly '3.1.0'")
     require(
         spec.get("jsonSchemaDialect") == "https://json-schema.org/draft/2020-12/schema",
@@ -412,18 +440,22 @@ def check_openapi_structure(spec: dict, unified_schema: dict, platforms_cfg: lis
         "Attachment.properties.track_kind must be string enum ['manual', 'auto'] with additionalProperties=false",
     )
 
-    # Parity check with backend/config/platforms.json + 5 optional Go-registered platforms
-    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
+    # Parity check with backend/config/platforms.json + backend/config/platforms_extra.json
+    extra_entries, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
     platform_ids = [entry["id"] for entry in platforms_cfg] + optional_go_platforms
-    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs across platforms.json + Go adapters")
+    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs across platforms.json + platforms_extra.json")
     require(
         comp_schemas["PlatformQuery"]["enum"] == ["all", *platform_ids],
         "PlatformQuery enum does not match the 14 registered platform IDs",
     )
-    all_cfg_caps = {cap for entry in platforms_cfg for cap in entry.get("capabilities", [])}
+    all_cfg_caps = {
+        cap
+        for entry in [*platforms_cfg, *extra_entries]
+        for cap in entry.get("capabilities", [])
+    }
     require(
         all_cfg_caps <= set(comp_schemas["PlatformCapability"]["enum"]),
-        "PlatformCapability enum is missing capability values from backend/config/platforms.json",
+        "PlatformCapability enum is missing capability values from backend/config/platforms*.json",
     )
     stats_platform = comp_schemas.get("StatsPlatform") or {}
     require(
@@ -1469,7 +1501,7 @@ def check_caddy_whitelist() -> int:
     return len(api_paths)
 
 
-def check_api_keys_example(platforms_cfg: list[dict]) -> int:
+def check_api_keys_example(platforms_cfg: list[dict], platforms_extra_cfg: dict | None = None) -> int:
     require(API_KEYS_EXAMPLE_PATH.is_file(), f"Missing API keys example: {API_KEYS_EXAMPLE_PATH}")
     raw_bytes = API_KEYS_EXAMPLE_PATH.read_bytes()
     require(len(raw_bytes) <= 64 * 1024, "ops/examples/api-keys.example.json must not exceed 64 KiB")
@@ -1484,7 +1516,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
         "ops/examples/api-keys.example.json 'keys' must be a non-empty array of <= 64 entries",
     )
 
-    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
+    _, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
     valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms)
     require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
     valid_key_platforms = valid_platforms | {"ytdlp_generic"}
@@ -1606,7 +1638,7 @@ def _parse_go_duration_seconds(raw: object, field_name: str) -> float:
     return val / 1000.0 if unit == "ms" else (val * 60.0 if unit == "m" else val)
 
 
-def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
+def check_runtime_config_example(platforms_cfg: list[dict], platforms_extra_cfg: dict | None = None) -> bool:
     require(RUNTIME_CONFIG_EXAMPLE_PATH.is_file(), f"Missing runtime config example: {RUNTIME_CONFIG_EXAMPLE_PATH}")
     raw_bytes = RUNTIME_CONFIG_EXAMPLE_PATH.read_bytes()
     require(len(raw_bytes) <= 64 * 1024, "ops/examples/runtime.example.json must not exceed 64 KiB")
@@ -1618,7 +1650,7 @@ def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
     )
     require(doc["schema_version"] == "1.0", "runtime.example.json schema_version must be '1.0'")
 
-    optional_go_platforms = ["x", "youtube", "instagram", "facebook", "tumblr"]
+    _, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
     valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms) | {"ytdlp_generic"}
     require(len(valid_platforms) == 15, "Expected 14 core platforms + ytdlp_generic")
 
@@ -2124,14 +2156,15 @@ def main(argv: list[str] | None = None) -> int:
     spec = json.loads(OPENAPI_PATH.read_text(encoding="utf-8"))
     unified_schema = json.loads(UNIFIED_SCHEMA_PATH.read_text(encoding="utf-8"))
     platforms_cfg = json.loads(PLATFORMS_PATH.read_text(encoding="utf-8"))
+    platforms_extra_cfg = json.loads(PLATFORMS_EXTRA_PATH.read_text(encoding="utf-8"))
 
-    ref_count = check_openapi_structure(spec, unified_schema, platforms_cfg)
+    ref_count = check_openapi_structure(spec, unified_schema, platforms_cfg, platforms_extra_cfg)
     doc_blocks = len(extract_markdown_json_blocks(AGENT_API_DOC_PATH))
     js_report = check_with_jsonschema(spec, require_installed=args.require_jsonschema)
     check_python_scripts()
     caddy_paths = check_caddy_whitelist()
-    api_keys_count = check_api_keys_example(platforms_cfg)
-    runtime_cfg_ok = check_runtime_config_example(platforms_cfg)
+    api_keys_count = check_api_keys_example(platforms_cfg, platforms_extra_cfg)
+    runtime_cfg_ok = check_runtime_config_example(platforms_cfg, platforms_extra_cfg)
     batch_report = check_batch_downloader_behavior()
 
     summary = {
