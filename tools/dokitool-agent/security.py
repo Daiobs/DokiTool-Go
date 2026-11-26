@@ -102,14 +102,16 @@ def _parse_ip(raw_host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | 
         return None
 
 
+def _is_loopback_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return addr.ipv4_mapped.is_loopback if (isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped) else addr.is_loopback
+
+
 def is_loopback_host(host: str) -> bool:
     norm = (host or "").strip().lower().rstrip(".")
-    if norm == "localhost":
+    if norm == "localhost" or (norm.endswith(".localhost") and all(_DNS_LABEL_RE.match(lbl) for lbl in norm.split("."))):
         return True
     ip = _parse_ip(norm)
-    if ip is None:
-        return False
-    return ip.ipv4_mapped.is_loopback if (isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped) else ip.is_loopback
+    return _is_loopback_ip(ip) if ip is not None else False
 
 
 def is_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -165,6 +167,30 @@ def validate_api_base(api_base: str) -> str:
     return cleaned
 
 
+def _resolve_and_pin(
+    host: str, parsed: urllib.parse.SplitResult,
+    resolver: Callable[..., list[Any]] | None,
+    predicate: Callable[[ipaddress.IPv4Address | ipaddress.IPv6Address], bool],
+    reject_label: str,
+) -> tuple[str, ...]:
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        infos = (resolver or socket.getaddrinfo)(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise SecurityError(f"DNS resolution failed for host {host}") from exc
+    if not infos:
+        raise SecurityError(f"DNS resolution returned no addresses for host {host}")
+    pinned: list[str] = []
+    for entry in infos:
+        resolved_ip = _parse_ip(str(entry[4][0]))
+        if resolved_ip is None or not predicate(resolved_ip):
+            raise SecurityError(f"Host {host} resolved to {reject_label} IP address")
+        ip_text = str(resolved_ip)
+        if ip_text not in pinned:
+            pinned.append(ip_text)
+    return tuple(pinned)
+
+
 def validate_and_resolve_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
@@ -175,10 +201,14 @@ def validate_and_resolve_remote_url(
     if "%" in host:
         raise SecurityError("Scoped IPv6 addresses are forbidden")
     if is_loopback_host(host):
-        if allow_loopback:
-            ip = _parse_ip(host)
-            return parsed, ((str(ip),) if ip is not None else ())
-        raise SecurityError("Loopback address is forbidden for media/subtitle fetch")
+        if not allow_loopback:
+            raise SecurityError("Loopback address is forbidden for media/subtitle fetch")
+        ip = _parse_ip(host)
+        if ip is not None:
+            return parsed, (str(ip),)
+        if not resolve_dns:
+            return parsed, ("127.0.0.1", "::1")
+        return parsed, _resolve_and_pin(host, parsed, resolver, _is_loopback_ip, "non-loopback")
     _check_blocked_suffix(host)
     ip = _parse_ip(host)
     if ip is not None:
@@ -188,23 +218,8 @@ def validate_and_resolve_remote_url(
     labels = host.split(".")
     if len(labels) < 2 or not _PUBLIC_TLD_RE.match(labels[-1]) or not all(_DNS_LABEL_RE.match(lbl) for lbl in labels):
         raise SecurityError(f"Invalid public DNS hostname: {host}")
-    pinned: list[str] = []
-    if resolve_dns:
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-        try:
-            infos = (resolver or socket.getaddrinfo)(host, port, 0, socket.SOCK_STREAM)
-        except OSError as exc:
-            raise SecurityError(f"DNS resolution failed for host {host}") from exc
-        if not infos:
-            raise SecurityError(f"DNS resolution returned no addresses for host {host}")
-        for entry in infos:
-            resolved_ip = _parse_ip(str(entry[4][0]))
-            if resolved_ip is None or not is_public_ip(resolved_ip):
-                raise SecurityError(f"Host {host} resolved to non-public IP address")
-            ip_text = str(resolved_ip)
-            if ip_text not in pinned:
-                pinned.append(ip_text)
-    return parsed, tuple(pinned)
+    pinned = _resolve_and_pin(host, parsed, resolver, is_public_ip, "non-public") if resolve_dns else ()
+    return parsed, pinned
 
 
 def validate_remote_url(
