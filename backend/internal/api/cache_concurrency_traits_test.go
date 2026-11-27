@@ -602,6 +602,7 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 		"pipigx":      {"https://h5.pipigx.com/pp/post/12345", "https://file.ippzone.com/video/demo.mp4"},
 		"zuiyou":      {"https://share.xiaochuankeji.cn/hybrid/share/post?pid=12345", "https://tbvideo.ixiaochuan.cn/zyvd/demo.mp4"},
 		"xiaohongshu": {"https://www.xiaohongshu.com/explore/66a1b2c3d4e5f6a7b8c9d0e1", "http://sns-video-bd.xhscdn.com/stream/demo.mp4"},
+		"pinterest":   {"https://www.pinterest.com/pin/858146903966145191/", "https://v1.pinimg.com/videos/mc/720p/aa/bb/demo.mp4"},
 		"x":           {"https://x.com/user/status/1800000000000000001", "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/demo.mp4"},
 		"youtube":     {"https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?itag=18"},
 		"instagram":   {"https://www.instagram.com/reel/C123456/", "https://scontent.cdninstagram.com/v/demo.mp4"},
@@ -656,5 +657,19 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 	}
 	if !weiboVaried {
 		t.Fatal("regression test sanity check failed: weibo PublicMedia did not differ between anonymous and owner")
+	}
+}
+
+func TestPinterestCacheURLNormalization(t *testing.T) {
+	want := normalizeCacheURL("pinterest", "https://www.pinterest.com/pin/858146903966145191/")
+	variants := []string{
+		"https://jp.pinterest.com/pin/858146903966145191/sent/?invite_code=abc",
+		"https://www.pinterest.ca/pin/cool-slug--858146903966145191/",
+		"http://pinterest.co.uk/pin/858146903966145191",
+	}
+	for _, raw := range variants {
+		if got := normalizeCacheURL("pinterest", raw); got != want {
+			t.Fatalf("normalizeCacheURL(pinterest, %q) = %q, want %q", raw, got, want)
+		}
 	}
 }

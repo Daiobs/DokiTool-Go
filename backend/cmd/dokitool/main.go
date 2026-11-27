@@ -29,6 +29,7 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pinterest"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipigx"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/toutiao"
@@ -172,6 +173,7 @@ func run(args []string) error {
 		"pipigx":      pipigx.NewWithTBVideo(executor, pipigxSave),
 		"zuiyou":      zuiyou.NewWithTBVideo(executor, zuiyouSave),
 		"xiaohongshu": xiaohongshu.New(xhsExecutor),
+		"pinterest":   pinterest.New(executor),
 	}
 	runtimeCfg, runtimeFromFile, err := api.LoadRuntimeConfig(os.Getenv)
 	if err != nil {

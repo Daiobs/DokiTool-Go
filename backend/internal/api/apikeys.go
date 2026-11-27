@@ -85,6 +85,7 @@ var allowedKeyPlatforms = map[string]struct{}{
 	"pipigx":        {},
 	"zuiyou":        {},
 	"xiaohongshu":   {},
+	"pinterest":     {},
 	"x":             {},
 	"youtube":       {},
 	"instagram":     {},

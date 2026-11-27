@@ -588,6 +588,8 @@ test("urlMatcher: matches all 14 platforms & shortlinks and strictly blocks non-
     ["pipigx", "https://h5.ippzone.com/pp/post/860538173891"],
     ["zuiyou", "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379"],
     ["zuiyou", "https://h5.izuiyou.com/hybrid/share/post?pid=163566379"],
+    ["pinterest", "https://www.pinterest.com/pin/858146903966145191/"],
+    ["pinterest", "https://pin.it/3abcXYZ"],
     ["x", "https://x.com/i/status/1575560063510810624"],
     ["x", "https://twitter.com/jack/status/20"],
     ["x", "https://t.co/AbCdEf123"],
@@ -617,7 +619,7 @@ test("urlMatcher: matches all 14 platforms & shortlinks and strictly blocks non-
     );
     matchedPlatforms.add(matched.platform);
   }
-  assert.equal(matchedPlatforms.size, 14, "all 14 platforms must be covered");
+  assert.equal(matchedPlatforms.size, 15, "all 15 platforms must be covered");
 
   // Preserve xsec_token in matched.url while normalizing dedupeKey
   const xhs1 = urlMatcher.matchSupportedPlatformUrl(

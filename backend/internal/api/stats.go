@@ -50,9 +50,9 @@ const (
 	chOwnerIdx = 1
 	numCh      = 2
 
-	numCorePlatforms   = 14
-	platformUnknownIdx = 14
-	numPlatforms       = 15
+	numCorePlatforms   = 15
+	platformUnknownIdx = 15
+	numPlatforms       = 16
 
 	outcomeOKIdx          = 0
 	outcomeInternalErrIdx = 11
@@ -71,6 +71,7 @@ var knownPlatforms = [numPlatforms]string{
 	"pipigx",
 	"zuiyou",
 	"xiaohongshu",
+	"pinterest",
 	"x",
 	"youtube",
 	"instagram",
@@ -95,7 +96,7 @@ var knownOutcomeCodes = [numOutcomeCodes]string{
 	OutcomeUnauthorized,
 }
 
-// KnownPlatforms returns a copy of the closed 15-element platform vocabulary (14 platforms + "unknown").
+// KnownPlatforms returns a copy of the closed 16-element platform vocabulary (15 platforms + "unknown").
 func KnownPlatforms() []string {
 	out := make([]string, len(knownPlatforms))
 	copy(out, knownPlatforms[:])
@@ -129,16 +130,18 @@ func corePlatformIndex(raw string) int {
 		return 7
 	case "xiaohongshu":
 		return 8
-	case "x":
+	case "pinterest":
 		return 9
-	case "youtube":
+	case "x":
 		return 10
-	case "instagram":
+	case "youtube":
 		return 11
-	case "facebook":
+	case "instagram":
 		return 12
-	case "tumblr":
+	case "facebook":
 		return 13
+	case "tumblr":
+		return 14
 	default:
 		return -1
 	}

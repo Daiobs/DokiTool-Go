@@ -94,6 +94,16 @@
         ]
       },
       {
+        "id": "pinterest",
+        "name": "Pinterest",
+        "site_url": "https://www.pinterest.com/",
+        "icon": "pinterest",
+        "capabilities": [
+          "video",
+          "image"
+        ]
+      },
+      {
         "id": "x",
         "name": "X",
         "site_url": "https://x.com/",

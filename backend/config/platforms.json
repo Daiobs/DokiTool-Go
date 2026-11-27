@@ -73,6 +73,26 @@
     "exact_domains": ["share.xiaochuankeji.cn"]
   },
   {
+    "id": "pinterest",
+    "name": "Pinterest",
+    "site_url": "https://www.pinterest.com/",
+    "icon": "pinterest",
+    "capabilities": ["video", "image"],
+    "domains": [
+      "pinterest.com",
+      "pin.it",
+      "pinterest.co.uk",
+      "pinterest.ca",
+      "pinterest.jp",
+      "pinterest.de",
+      "pinterest.fr",
+      "pinterest.es",
+      "pinterest.it",
+      "pinterest.com.au",
+      "pinterest.com.mx"
+    ]
+  },
+  {
     "id": "x",
     "name": "X",
     "site_url": "https://x.com/",

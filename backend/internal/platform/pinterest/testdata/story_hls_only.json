@@ -1,0 +1,34 @@
+{
+  "resource_response": {
+    "status": "success",
+    "data": {
+      "id": "900000000000000105",
+      "title": "HLS-Only Story Pin",
+      "images": {
+        "orig": { "url": "https://i.pinimg.com/originals/77/00/00/root_cover.jpg", "width": 1080, "height": 1920 }
+      },
+      "story_pin_data": {
+        "pages": [
+          {
+            "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/77/01/01/page_cover.jpg", "width": 1080, "height": 1920 } } },
+            "blocks": [
+              {
+                "block_type": 3,
+                "video": {
+                  "video_list": {
+                    "V_HLSV3_MOBILE": {
+                      "url": "https://v1.pinimg.com/videos/iht/hls/77/01/mobile.m3u8",
+                      "width": 720,
+                      "height": 1280,
+                      "duration": 15200
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

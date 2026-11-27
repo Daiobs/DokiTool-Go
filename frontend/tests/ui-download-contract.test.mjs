@@ -185,9 +185,9 @@ async function waitUntil(predicate) {
 }
 const base = { title: '示例', images: [], live_photo: [], video_backup: [], music: {}, extra: {}, url: 'https://media.test/main.mp4' };
 
-test('all fourteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
+test('all fifteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
   assert.deepEqual(platforms.supportedPlatforms.value.map((item) => item.id), [
-    'douyin', 'kuaishou', 'bilibili', 'xiaohongshu', 'toutiao', 'weibo', 'pipixia', 'pipigx', 'zuiyou',
+    'douyin', 'kuaishou', 'bilibili', 'xiaohongshu', 'toutiao', 'weibo', 'pipixia', 'pipigx', 'zuiyou', 'pinterest',
     'x', 'youtube', 'instagram', 'facebook', 'tumblr',
   ]);
   const heroHtml = await renderToString(createSSRApp({ render: () => h(HeroSection, { locale: 'zh-CN', currentPlatform: 'all' }) }));

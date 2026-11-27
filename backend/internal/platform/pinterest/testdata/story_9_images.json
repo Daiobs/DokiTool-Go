@@ -1,0 +1,26 @@
+{
+  "resource_response": {
+    "status": "success",
+    "data": {
+      "id": "900000000000000103",
+      "grid_title": "9-Page Story Idea Pin",
+      "images": {
+        "orig": { "url": "https://i.pinimg.com/originals/99/00/00/cover.jpg", "width": 1080, "height": 1920 }
+      },
+      "story_pin_data": {
+        "metadata": { "pin_title": "Nine Photos" },
+        "pages": [
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/01/p1.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/02/p2.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/03/p3.webp", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/04/p4.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/05/p5.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/06/p6.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/07/p7.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/08/p8.jpg", "width": 1080, "height": 1920 } } } }] },
+          { "blocks": [{ "block_type": 2, "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/99/01/09/p9.jpg", "width": 1080, "height": 1920 } } } }] }
+        ]
+      }
+    }
+  }
+}

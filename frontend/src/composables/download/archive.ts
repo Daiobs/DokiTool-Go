@@ -1,5 +1,5 @@
 import { acquireBufferedSlot } from "../../downloads/buffered";
-import { isTbvideoVideoItem } from "../../core/media";
+import { isCorsBlockedDirectUrl, isTbvideoVideoItem } from "../../core/media";
 import type {
   Attachment,
   MediaItem,
@@ -383,6 +383,8 @@ export function createPublicDownloadActions(deps: {
   selection: VideoSelection;
   apiContext: { apiOrigin: string };
   snapshotItem: (item: MediaItem, choice?: MediaSelection | null) => ItemSnapshot;
+  snapshotTarget?: (snapshot: ItemSnapshot, item: MediaItem) => DownloadTarget;
+  isExtensionConnected?: () => Promise<boolean>;
   enqueueItem: (
     snapshot: ItemSnapshot,
     retryId?: number,
@@ -401,6 +403,8 @@ export function createPublicDownloadActions(deps: {
     selection,
     apiContext,
     snapshotItem,
+    snapshotTarget,
+    isExtensionConnected,
     enqueueItem,
     archiveItems,
   } = deps;
@@ -544,6 +548,33 @@ export function createPublicDownloadActions(deps: {
     }
     if (snapshots.length === 1 && snapshots[0].item.type !== "live_photo") {
       await enqueueItem(snapshots[0]);
+      return;
+    }
+    const hasCorsBlockedDirect =
+      typeof snapshotTarget === "function" &&
+      snapshots.some((s) => {
+        const t = snapshotTarget(s, s.item);
+        return (
+          t.kind === "file" &&
+          (isCorsBlockedDirectUrl(t.url) ||
+            t.routes.some((route) => isCorsBlockedDirectUrl(route)))
+        );
+      });
+    if (hasCorsBlockedDirect) {
+      const extConnected = isExtensionConnected
+        ? await isExtensionConnected()
+        : false;
+      if (extConnected) {
+        for (const snapshot of snapshots) {
+          await enqueueItem(snapshot);
+        }
+        return;
+      }
+      showToast(
+        "该站点图片受浏览器 CORS 限制，暂不支持网页打包 ZIP；请单张打开保存，或安装 DokiTool 扩展一键批量下载",
+        "warning",
+        5000,
+      );
       return;
     }
     await archiveItems(

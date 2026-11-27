@@ -1,0 +1,40 @@
+{
+  "resource_response": {
+    "status": "success",
+    "data": {
+      "id": "900000000000000104",
+      "title": "Story Pin with Progressive MP4",
+      "images": {
+        "orig": { "url": "https://i.pinimg.com/originals/88/00/00/cover.jpg", "width": 720, "height": 1280 }
+      },
+      "story_pin_data": {
+        "pages": [
+          {
+            "image": { "images": { "originals": { "url": "https://i.pinimg.com/originals/88/01/01/frame.jpg", "width": 720, "height": 1280 } } },
+            "blocks": [
+              {
+                "block_type": 3,
+                "video": {
+                  "video_list": {
+                    "V_EXP5": {
+                      "url": "https://v1.pinimg.com/videos/mc/expMp4/88/01/clip720.mp4",
+                      "width": 720,
+                      "height": 1280,
+                      "duration": 12450
+                    },
+                    "V_EXP3": {
+                      "url": "https://v1.pinimg.com/videos/mc/expMp4/88/01/clip360.mp4",
+                      "width": 360,
+                      "height": 640,
+                      "duration": 12450
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

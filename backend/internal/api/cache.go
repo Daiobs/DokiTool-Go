@@ -464,7 +464,7 @@ func canonicalizeParseInput(platform, source string) string {
 	}
 	escapedPath := u.EscapedPath()
 	if platform == "instagram" && (scheme == "http" || scheme == "https") && port == "" {
-		if s, h, p, ok := normalizeInstagramCacheURL(source); ok {
+		if s, h, p, _, ok := normalizeInstagramCacheURL(source); ok {
 			scheme, host, escapedPath = s, h, p
 		}
 	}
@@ -511,8 +511,9 @@ func normalizeCacheURL(platform, source string) string {
 	forceQuery := u.ForceQuery
 	isStandardHTTP := (scheme == "http" || scheme == "https") && port == ""
 
+	dropQuery := false
 	if isStandardHTTP {
-		scheme, host, escapedPath = normalizePlatformCacheURL(platform, source, scheme, host, escapedPath)
+		scheme, host, escapedPath, dropQuery = normalizePlatformCacheURL(platform, source, scheme, host, escapedPath)
 	}
 
 	if strings.Contains(host, ":") {
@@ -531,7 +532,7 @@ func normalizeCacheURL(platform, source string) string {
 		b.WriteString(port)
 	}
 	b.WriteString(escapedPath)
-	if forceQuery || u.RawQuery != "" {
+	if !dropQuery && (forceQuery || u.RawQuery != "") {
 		b.WriteByte('?')
 		b.WriteString(u.RawQuery)
 	}

@@ -46,7 +46,7 @@ func TestCircuitBreakerStateMachineAndNoFalsePositives(t *testing.T) {
 		}
 	}
 	snaps := cb.Snapshot(baseNow)
-	if len(snaps) != 14 || snaps[0].Platform != "douyin" || snaps[0].State != CircuitStateClosed ||
+	if len(snaps) != numCorePlatforms || snaps[0].Platform != "douyin" || snaps[0].State != CircuitStateClosed ||
 		snaps[0].ConsecutiveFailures != 0 || snaps[0].WindowFailures != 0 || snaps[0].WindowTotal != 0 {
 		t.Fatalf("neutral codes polluted breaker state: %+v", snaps[0])
 	}

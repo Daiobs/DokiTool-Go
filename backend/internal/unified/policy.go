@@ -259,7 +259,11 @@ func PublicView(payload Object, debug bool, now int64) Object {
 		items = append(items, item)
 	}
 	data["items"] = items
-	return FinalizeData(data, now)
+	out := FinalizeData(data, now)
+	if warnings := Slice(payload["warnings"]); len(warnings) > 0 {
+		out["warnings"] = CloneValue(warnings)
+	}
+	return out
 }
 
 type shanghaiFallbackKey struct{}

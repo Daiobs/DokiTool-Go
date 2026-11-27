@@ -11,6 +11,7 @@ const EXTENSIONLESS_MP4_HOST_SUFFIXES = [".toutiaovod.com"] as const;
 const CORS_BLOCKED_DIRECT_HOST_SUFFIXES = [
   ".toutiaovod.com",
   ".googlevideo.com",
+  ".pinimg.com",
 ] as const;
 
 const CORS_BLOCKED_DIRECT_EXACT_HOSTS = new Set(["googlevideo.com"]);

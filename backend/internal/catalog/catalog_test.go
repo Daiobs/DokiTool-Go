@@ -26,12 +26,16 @@ func TestCatalogUsesSingleRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	oracle, err := unified.Decode(baseline)
-	if err != nil || !unified.Equal(c.Envelope(), oracle["expected"]) {
-		t.Fatal("public catalogue differs from baseline output")
+	if err != nil {
+		t.Fatal("failed to decode baseline catalog")
 	}
+	expectedRows := unified.Slice(unified.Map(unified.Map(oracle["expected"])["data"])["platforms"])
 	rows := unified.Slice(unified.Map(c.Envelope()["data"])["platforms"])
-	if len(rows) != 9 || unified.Map(rows[0])["id"] != "douyin" {
-		t.Fatal("catalog order/size changed")
+	if len(rows) != 10 || unified.Map(rows[0])["id"] != "douyin" || unified.Map(rows[9])["id"] != "pinterest" {
+		t.Fatalf("catalog order/size changed: len=%d", len(rows))
+	}
+	if !unified.Equal(rows[:len(expectedRows)], expectedRows) {
+		t.Fatal("public catalogue core prefix differs from baseline output")
 	}
 	for _, value := range rows {
 		row := unified.Map(value)
@@ -150,8 +154,8 @@ func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
 	}
 
 	rows := unified.Slice(unified.Map(c.Envelope()["data"])["platforms"])
-	if len(rows) != 14 {
-		t.Fatalf("expected 14 registered platforms, got %d", len(rows))
+	if len(rows) != 15 {
+		t.Fatalf("expected 15 registered platforms, got %d", len(rows))
 	}
 	for _, value := range rows {
 		row := unified.Map(value)

@@ -36,7 +36,7 @@ test("generate-platform-catalog.mjs --check passes on committed snapshot and rej
     0,
     `expected --check exit 0, got ${res.status}\nstdout: ${res.stdout}\nstderr: ${res.stderr}`,
   );
-  assert.match(res.stdout, /PASSED \(14 platforms\)/);
+  assert.match(res.stdout, /PASSED \(15 platforms\)/);
 
   // Unknown CLI flag must fail closed.
   const badFlag = spawnSync(process.execPath, [GENERATOR_SCRIPT, "--bogus"], {
@@ -67,7 +67,7 @@ test("generate-platform-catalog.mjs --check passes on committed snapshot and rej
 test("single-source backend/config/platforms.json matches generated platform-catalog.json with zero private field leakage", async () => {
   const { registry, corePlatforms, optionalPlatforms } =
     await loadSingleSourcePlatformConfigs();
-  assert.equal(corePlatforms.length, 9, "platforms.json must contain 9 default core platforms");
+  assert.equal(corePlatforms.length, 10, "platforms.json must contain 10 default core platforms");
   assert.deepEqual(
     optionalPlatforms.map((p) => p.id),
     ["x", "youtube", "instagram", "facebook", "tumblr"],
@@ -99,7 +99,7 @@ test("single-source backend/config/platforms.json matches generated platform-cat
   const diskCatalog = JSON.parse(await readFile(GENERATED_CATALOG_PATH, "utf8"));
   assert.equal(diskCatalog.schema_version, "1.0");
   assert.equal(diskCatalog.code, "OK");
-  assert.equal(diskCatalog.data.platforms.length, 14);
+  assert.equal(diskCatalog.data.platforms.length, 15);
   assert.deepEqual(
     diskCatalog.data.platforms,
     registry.map(({ id, name, site_url, icon, capabilities }) => ({
@@ -127,7 +127,7 @@ test("urlMatcher.ts PLATFORM_DOMAIN_SPECS stays in 100% parity with unified back
     [...urlMatcher.SUPPORTED_PLATFORM_IDS],
     registry.map((p) => p.id),
   );
-  assert.equal(urlMatcher.PLATFORM_DOMAIN_SPECS.length, 14);
+  assert.equal(urlMatcher.PLATFORM_DOMAIN_SPECS.length, 15);
 
   for (let i = 0; i < registry.length; i++) {
     const src = registry[i];
@@ -202,6 +202,8 @@ test("urlMatcher.ts intentional shortlink/subdomain rules and Facebook exact-hos
     ["https://youtu.be/dQw4w9WgXcQ", "youtube", false],
     ["https://instagr.am/p/aye83DjauH/", "instagram", false],
     ["https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379", "zuiyou", false],
+    ["https://pin.it/3abcXYZ", "pinterest", false],
+    ["https://jp.pinterest.com/pin/858146903966145191/sent/", "pinterest", false],
     ["https://fb.watch/vtkorrRM0p/", "facebook", false],
     ["https://maskofthedragon.tumblr.com/post/626907179849564160", "tumblr", false],
   ];

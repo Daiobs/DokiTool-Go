@@ -26,7 +26,7 @@ const BUSINESS_SCAN_DIRS = [
 ];
 
 const KNOWN_PLATFORM_LITERALS =
-  "bilibili|youtube|douyin|xiaohongshu|weibo|kuaishou|pipixia|pipigx|zuiyou|x|instagram|facebook|tumblr|toutiao";
+  "bilibili|youtube|douyin|xiaohongshu|weibo|kuaishou|pipixia|pipigx|zuiyou|pinterest|x|instagram|facebook|tumblr|toutiao";
 
 const PLATFORM_HARDCODE_PATTERNS = [
   {
@@ -53,7 +53,7 @@ const PLATFORM_HARDCODE_PATTERNS = [
   {
     name: "cdn-host-suffix-hardcode",
     regex:
-      /\.endsWith\(\s*["']\.(?:bilivideo|googlevideo|toutiaovod|douyinvod|weibocdn|xhscdn|rednotecdn|twimg|kwimgs|ppxvod)/i,
+      /\.endsWith\(\s*["']\.(?:bilivideo|googlevideo|toutiaovod|douyinvod|weibocdn|xhscdn|rednotecdn|twimg|kwimgs|ppxvod|pinimg)/i,
   },
 ];
 

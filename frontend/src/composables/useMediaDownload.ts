@@ -1579,6 +1579,17 @@ export function useMediaDownload({
     selection,
     apiContext,
     snapshotItem,
+    snapshotTarget,
+    isExtensionConnected: async () => {
+      if (!hasExternalExtensionRuntime()) return false;
+      try {
+        const bridge = await loadExtensionBridge();
+        const extState = await bridge.pingInstalledExtension();
+        return extState.connected;
+      } catch {
+        return false;
+      }
+    },
     enqueueItem,
     archiveItems,
   });

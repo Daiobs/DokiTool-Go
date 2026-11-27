@@ -425,15 +425,15 @@ def check_openapi_structure(
         "Attachment.properties.track_kind must be string enum ['manual', 'auto'] with additionalProperties=false",
     )
 
-    # Parity check with unified backend/config/platforms.json (9 core + 5 optional)
-    require(isinstance(platforms_cfg, list) and len(platforms_cfg) == 14, "Expected 14 entries in backend/config/platforms.json")
+    # Parity check with unified backend/config/platforms.json (10 core + 5 optional)
+    require(isinstance(platforms_cfg, list) and len(platforms_cfg) == 15, "Expected 15 entries in backend/config/platforms.json")
     platform_ids = [entry["id"] for entry in platforms_cfg]
     optional_go_platforms = {entry["id"] for entry in platforms_cfg if entry.get("optional") is True}
-    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs in backend/config/platforms.json")
+    require(len(set(platform_ids)) == 15, "Expected 15 distinct platform IDs in backend/config/platforms.json")
     require(len(optional_go_platforms) == 5, "Expected 5 optional platform IDs in backend/config/platforms.json")
     require(
         comp_schemas["PlatformQuery"]["enum"] == ["all", *platform_ids],
-        "PlatformQuery enum does not match the 14 registered platform IDs",
+        "PlatformQuery enum does not match the 15 registered platform IDs",
     )
     all_cfg_caps = {
         cap
@@ -664,7 +664,7 @@ def check_openapi_structure(
     )
     require(
         set(cb_props["platform"].get("enum") or []) == set(platform_ids)
-        and len(cb_props["platform"].get("enum") or []) == 14
+        and len(cb_props["platform"].get("enum") or []) == 15
         and cb_props["state"].get("$ref") == "#/components/schemas/CircuitBreakerState"
         and cb_props["disabled_by_config"].get("type") == "boolean",
         "CircuitBreakerPlatformSnapshot platform/state/disabled_by_config schema mismatch",
@@ -756,10 +756,10 @@ def check_openapi_structure(
     cb_list_prop = comp_schemas["StatsSnapshot"]["properties"].get("circuit_breakers") or {}
     require(
         cb_list_prop.get("type") == "array"
-        and cb_list_prop.get("minItems") == 14
-        and cb_list_prop.get("maxItems") == 14
+        and cb_list_prop.get("minItems") == 15
+        and cb_list_prop.get("maxItems") == 15
         and (cb_list_prop.get("items") or {}).get("$ref") == "#/components/schemas/CircuitBreakerPlatformSnapshot",
-        "StatsSnapshot.circuit_breakers must be fixed 14-item array of CircuitBreakerPlatformSnapshot",
+        "StatsSnapshot.circuit_breakers must be fixed 15-item array of CircuitBreakerPlatformSnapshot",
     )
     gcb_prop = comp_schemas["StatsSnapshot"]["properties"].get("generic_circuit_breaker") or {}
     require(
@@ -887,9 +887,9 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "generic": {**zero_comp_pool, "enabled": False, "concurrency_limit": 2, "queue_limit": 16},
         "youtube_ejs": {**zero_comp_pool, "enabled": True, "concurrency_limit": 6, "queue_limit": 64},
     }
-    core_14_platforms = [
+    core_platforms = [
         "douyin", "bilibili", "weibo", "toutiao", "kuaishou", "pipixia", "pipigx",
-        "zuiyou", "xiaohongshu", "x", "youtube", "instagram", "facebook", "tumblr",
+        "zuiyou", "xiaohongshu", "pinterest", "x", "youtube", "instagram", "facebook", "tumblr",
     ]
     sample_circuit_breakers = [
         {
@@ -901,7 +901,7 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
             "open_until": "",
             "disabled_by_config": False,
         }
-        for p in core_14_platforms
+        for p in core_platforms
     ]
     sample_runtime_policy = {
         "config_file_active": False,
@@ -1071,9 +1071,9 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "code": "OK",
         "data": {
             **base_stats_data,
-            "circuit_breakers": sample_circuit_breakers[:13],
+            "circuit_breakers": sample_circuit_breakers[:14],
         },
-    }))), "circuit_breakers with fewer than 14 items must be rejected")
+    }))), "circuit_breakers with fewer than 15 items must be rejected")
     sample_generic_cb = {
         "platform": "ytdlp_generic",
         "state": "closed",
@@ -1519,7 +1519,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
     )
 
     valid_platforms = {entry["id"] for entry in platforms_cfg}
-    require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
+    require(len(valid_platforms) == 15, "Expected 15 distinct active platform IDs")
     valid_key_platforms = valid_platforms | {"ytdlp_generic"}
 
     allowed_fields = {
@@ -1652,7 +1652,7 @@ def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
     require(doc["schema_version"] == "1.0", "runtime.example.json schema_version must be '1.0'")
 
     valid_platforms = {entry["id"] for entry in platforms_cfg} | {"ytdlp_generic"}
-    require(len(valid_platforms) == 15, "Expected 14 core platforms + ytdlp_generic")
+    require(len(valid_platforms) == 16, "Expected 15 core platforms + ytdlp_generic")
 
     def require_int_range(obj: dict, key: str, lo: int, hi: int, prefix: str) -> int:
         val = obj.get(key)

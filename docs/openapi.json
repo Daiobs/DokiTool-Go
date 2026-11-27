@@ -2010,6 +2010,7 @@
           "pipixia",
           "pipigx",
           "zuiyou",
+          "pinterest",
           "x",
           "youtube",
           "instagram",
@@ -2213,7 +2214,7 @@
         "type": "string",
         "pattern": "^[a-z0-9][a-z0-9_:-]{0,31}$",
         "maxLength": 32,
-        "description": "Core 14 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), 'ytdlp_unmatched', or 'ytdlp_other'."
+        "description": "Core 15 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), 'ytdlp_unmatched', or 'ytdlp_other'."
       },
       "StatsOutcomeCode": {
         "type": "string",
@@ -3388,6 +3389,7 @@
               "pipigx",
               "zuiyou",
               "xiaohongshu",
+              "pinterest",
               "x",
               "youtube",
               "instagram",
@@ -3502,6 +3504,7 @@
           "pipigx",
           "zuiyou",
           "xiaohongshu",
+          "pinterest",
           "x",
           "youtube",
           "instagram",
@@ -3738,9 +3741,9 @@
           },
           "circuit_breakers": {
             "type": "array",
-            "minItems": 14,
-            "maxItems": 14,
-            "description": "Current circuit breaker state for all 14 core platforms in fixed canonical order.",
+            "minItems": 15,
+            "maxItems": 15,
+            "description": "Current circuit breaker state for all 15 core platforms in fixed canonical order.",
             "items": {
               "$ref": "#/components/schemas/CircuitBreakerPlatformSnapshot"
             }
