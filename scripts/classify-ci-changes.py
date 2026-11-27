@@ -105,6 +105,7 @@ FRONTEND_EXACT_PATHS = frozenset(
 # Paths covered completely by repo-contracts (inventory/scripts/OpenAPI/docs).
 REPO_ONLY_EXACT_PATHS = frozenset(
     {
+        "Makefile",
         "README.md",
         "LICENSE",
         "NOTICE",

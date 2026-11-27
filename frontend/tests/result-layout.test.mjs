@@ -453,7 +453,7 @@ test('quality selection badge shows 当前已选 / Selected across platforms and
     items: [ytItem],
     default_item_id: ytItem.id,
     author: { name: 'Creator', id: 'creator' },
-    extra: { youtube_helper: { status: 'ready', version: '1.3.2', script_url: '/helper/dokitool-youtube.user.js' } },
+    extra: { youtube_helper: { status: 'ready', provider: 'extension', version: '4.5.0' } },
   };
 
   const view = await mount(ytData);
@@ -463,8 +463,8 @@ test('quality selection badge shows 当前已选 / Selected across platforms and
     assert.equal(view.elements('rs-yt-helper-notice').length, 0);
     const hint = view.elements('rs-header-hint')[0];
     assert.ok(hasClass(hint, 'rs-header-hint--ready'));
-    assert.equal(textOf(hint), '助手 v1.3.2 已就绪 · 自动合成原声');
-    assert.match(hint.props.title, /YouTube 助手 \(v1\.3\.2\)已就绪/);
+    assert.equal(textOf(hint), '扩展 v4.5.0 已就绪 · 无损合流');
+    assert.match(hint.props.title, /DokiTool 扩展 \(v4\.5\.0\)已就绪/);
 
     // Switch to Quality tab -> pure Scheme A cards (no .rs-backup-split-actions) and 当前已选 badge
     await view.tab('画质选项');
@@ -493,8 +493,8 @@ test('quality selection badge shows 当前已选 / Selected across platforms and
     view.elements('rs-backup-item')[0].props.onClick();
     view.state.value = { ...view.state.value, locale: 'en' };
     await view.flush();
-    assert.equal(textOf(view.elements('rs-header-hint')[0]), 'Helper v1.3.2 Ready · Auto Audio Mux');
-    assert.match(view.elements('rs-header-hint')[0].props.title, /YouTube Helper \(v1\.3\.2\) is ready/);
+    assert.equal(textOf(view.elements('rs-header-hint')[0]), 'Extension v4.5.0 Ready · Lossless Mux');
+    assert.match(view.elements('rs-header-hint')[0].props.title, /DokiTool Extension \(v4\.5\.0\) is ready/);
     assert.equal(textOf(view.elements('rs-backup-playing')[0]), 'Selected');
     assert.equal(textOf(view.elements('rs-backup-name')[0]), '~97.0 MB · 2026p60 (4K)');
     assert.equal(textOf(view.elements('rs-quality-tag')[0]), '2026p60 · 4K (Silent preview · Audio included on download)');
@@ -1291,7 +1291,7 @@ test('PR #34 Round 2: unwhitelisted Tier-2 mux NEVER renders extension M4A card/
   }
 });
 
-test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero body scroll lock, extension-first CTA, collapsed legacy userscript, dismiss/reopen)', async () => {
+test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero body scroll lock, single-path extension CTA, zero userscript fallback, dismiss/reopen)', async () => {
   const prevChrome = globalThis.chrome;
   delete globalThis.chrome;
 
@@ -1314,8 +1314,8 @@ test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero bo
     extra: {
       youtube_helper: {
         status: 'missing',
-        min_version: '1.3.1',
-        script_url: '/helper/dokitool-youtube.user.js',
+        provider: 'extension',
+        min_version: '4.3.0',
         message: '需要本地解析能力',
       },
     },
@@ -1325,14 +1325,9 @@ test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero bo
   const view = await mount(ytMissingData);
   const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
   let openExtensionCalls = 0;
-  let installHelperCalls = 0;
-  let refreshPageCalls = 0;
   view.state.value = {
     ...view.state.value,
-    needsManualHelperRefresh: false,
     onOpenExtension() { openExtensionCalls++; },
-    onInstallYoutubeHelper() { installHelperCalls++; },
-    onRefreshYoutubeHelperPage() { refreshPageCalls++; },
   };
   await view.flush();
 
@@ -1346,52 +1341,28 @@ test('P1 PR-2: CapabilityUpgradeNotice renders non-blocking corner card (zero bo
     assert.equal(notice().props['aria-modal'], undefined);
     assert.equal(view.portalFindAll(n => 'data-yt-helper-modal' in n.props).length, 0);
 
-    // 2. Primary CTA opens extension modal
+    // 2. Primary CTA opens extension modal; zero legacy userscript links remain
     const primaryCta = view.portalFindAll(n => 'data-upgrade-open-extension' in n.props)[0];
     assert.ok(primaryCta);
-    assert.equal(textOf(primaryCta), '安装 DokiTool 扩展（免油猴解锁 YouTube 4K60 & B 站 1080P）');
+    assert.equal(textOf(primaryCta), '安装 DokiTool 扩展（解锁 YouTube 4K60 & B 站 1080P）');
     primaryCta.props.onClick();
     await view.flush();
     assert.equal(openExtensionCalls, 1);
 
-    // 3. Legacy userscript fallback starts collapsed with install link and no manual refresh button
-    const legacyDetails = () => view.portalFindAll(n => 'data-legacy-userscript-fallback' in n.props)[0];
-    assert.ok(legacyDetails());
-    assert.equal(legacyDetails().props.open, undefined);
-    assert.ok(textOf(legacyDetails()).includes('使用 Firefox 或旧版油猴脚本？'));
-    const installLink = view.portalFindAll(n => 'data-yt-helper-install-link' in n.props)[0];
-    assert.ok(installLink);
-    assert.equal(installLink.props.href, '/helper/dokitool-youtube.user.js');
-    installLink.props.onClick();
-    await view.flush();
-    assert.equal(installHelperCalls, 1);
-    assert.equal(view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props).length, 0);
+    assert.equal(view.portalFindAll(n => 'data-legacy-userscript-fallback' in n.props).length, 0);
+    assert.equal(view.portalFindAll(n => 'data-yt-helper-install-link' in n.props).length, 0);
+    assert.doesNotMatch(textOf(notice()), /dokitool-youtube\.user\.js|Tampermonkey|油猴/);
 
-    // 4. needsManualHelperRefresh opens <details> and exposes manual refresh button
-    view.state.value = { ...view.state.value, needsManualHelperRefresh: true };
-    await view.flush();
-    assert.equal(legacyDetails().props.open, true);
-    const refreshBtn = view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props)[0];
-    assert.ok(refreshBtn);
-    assert.equal(textOf(refreshBtn), '刷新页面');
-    refreshBtn.props.onClick();
-    await view.flush();
-    assert.equal(refreshPageCalls, 1);
-
-    // 5. English locale copy
+    // 3. English locale copy
     view.state.value = { ...view.state.value, locale: 'en' };
     await view.flush();
     assert.equal(
       textOf(view.portalFindAll(n => 'data-upgrade-open-extension' in n.props)[0]),
       'Install DokiTool Extension (YouTube 4K60 & Bilibili 1080P)',
     );
-    assert.ok(textOf(legacyDetails()).includes('Using Firefox or legacy userscript?'));
-    assert.equal(
-      textOf(view.portalFindAll(n => 'data-yt-helper-manual-refresh' in n.props)[0]),
-      'Refresh Page',
-    );
+    assert.doesNotMatch(textOf(notice()), /dokitool-youtube\.user\.js|Tampermonkey|userscript/i);
 
-    // 6. Dismiss corner notice -> stage card shows updated reopen CTA (Install Extension / 安装扩展解锁) -> click reopens notice
+    // 4. Dismiss corner notice -> stage card shows updated reopen CTA (Install Extension / 安装扩展解锁) -> click reopens notice
     view.state.value = { ...view.state.value, locale: 'zh-CN' };
     await view.flush();
     const closeBtn = view.portalFindAll(n => 'data-capability-upgrade-close' in n.props)[0];
@@ -1532,7 +1503,7 @@ test('P1 PR-2 & Issue #48 B.3: extension-update-badge pill and extension-reload-
   }
 });
 
-test('P1 PR-2: extension-powered YouTube header ready status shows 免油猴无损合流 / No Userscript while preserving legacy userscript wording', async () => {
+test('P1 PR-2: extension-powered YouTube header ready status shows 无损合流 / Lossless Mux in zh-CN & en', async () => {
   const prevChrome = globalThis.chrome;
   delete globalThis.chrome;
   const textOf = node => [node.text || '', ...(node.children || []).map(textOf)].join('');
@@ -1547,8 +1518,8 @@ test('P1 PR-2: extension-powered YouTube header ready status shows 免油猴无�
       youtube_helper: {
         status: 'ready',
         provider: 'extension',
-        extensionVersion: '4.2.0',
-        version: '4.2.0',
+        extensionVersion: '4.5.0',
+        version: '4.5.0',
       },
     },
   };
@@ -1558,13 +1529,13 @@ test('P1 PR-2: extension-powered YouTube header ready status shows 免油猴无�
   try {
     const hint = () => view.elements('rs-header-hint')[0];
     assert.ok(hasClass(hint(), 'rs-header-hint--ready'));
-    assert.equal(textOf(hint()), '扩展 v4.2.0 已就绪 · 免油猴无损合流');
-    assert.match(hint().props.title, /DokiTool 扩展 \(v4\.2\.0\)已就绪/);
+    assert.equal(textOf(hint()), '扩展 v4.5.0 已就绪 · 无损合流');
+    assert.match(hint().props.title, /DokiTool 扩展 \(v4\.5\.0\)已就绪/);
 
     view.state.value = { ...view.state.value, locale: 'en' };
     await view.flush();
-    assert.equal(textOf(hint()), 'Extension v4.2.0 Ready · No Userscript');
-    assert.match(hint().props.title, /DokiTool Extension \(v4\.2\.0\) is ready/);
+    assert.equal(textOf(hint()), 'Extension v4.5.0 Ready · Lossless Mux');
+    assert.match(hint().props.title, /DokiTool Extension \(v4\.5\.0\) is ready/);
 
     // Versionless extension ready fallback
     const versionlessData = {
@@ -1574,11 +1545,11 @@ test('P1 PR-2: extension-powered YouTube header ready status shows 免油猴无�
     view.state.value = { ...view.state.value, resultVersion: 2, locale: 'zh-CN', resultData: versionlessData };
     view.state.value.selection.syncResult();
     await view.flush();
-    assert.equal(textOf(hint()), '扩展已就绪 · 免油猴无损合流');
+    assert.equal(textOf(hint()), '扩展已就绪 · 无损合流');
 
     view.state.value = { ...view.state.value, locale: 'en' };
     await view.flush();
-    assert.equal(textOf(hint()), 'Extension Ready · No Userscript');
+    assert.equal(textOf(hint()), 'Extension Ready · Lossless Mux');
   } finally {
     view.app.unmount();
     if (prevChrome === undefined) delete globalThis.chrome;

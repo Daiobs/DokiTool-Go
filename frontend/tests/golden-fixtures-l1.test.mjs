@@ -410,7 +410,6 @@ test("L1 Golden Routing Matrix (M1 / M2 / M3): youtube_direct, toutiaovod, tbvid
     extensionConnected: false,
     extensionVersion: "",
     extensionCapabilities: [],
-    userscriptReady: false,
     swMultiRangeAvailable: true,
   };
   const m2ExtConnected = {
@@ -422,7 +421,6 @@ test("L1 Golden Routing Matrix (M1 / M2 / M3): youtube_direct, toutiaovod, tbvid
       "youtube_parse",
       "youtube_mux",
     ],
-    userscriptReady: false,
     swMultiRangeAvailable: true,
   };
 

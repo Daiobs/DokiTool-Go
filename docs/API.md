@@ -15,7 +15,7 @@
 | `GET /api/youtube/context` | `schema_version=1.0`（必填）；在启用 `DOKITOOL_YOUTUBE_HELPER` 时返回当前缓存的 YouTube `player_id`、`signature_timestamp` 与固定客户端参数，供同源用户脚本在浏览器端请求播放清单。未启用时返回 `404`。 |
 | `POST /api/youtube/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收浏览器端用户脚本提交的流清单载荷（`<= 512 KiB`），在无权限 Deno `ejs` 沙箱内完成签名解算并返回标准统一媒体 v1 结果。未启用时返回 `404`。 |
 
-> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；同源浏览器油猴助手内部握手端点（`/api/youtube/context`、`POST /api/youtube/finalize`）及签名图片受限中转路径（`/api/media/weibo`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。
+> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；Chrome MV3 官方扩展内部握手端点（`/api/youtube/context`、`POST /api/youtube/finalize`）及签名媒体受限中转路径（`/api/media/weibo`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。
 
 ```sh
 curl --get 'https://snap.example.com/api/parse' \
@@ -81,7 +81,7 @@ curl --get 'https://snap.example.com/api/parse' \
 
 | delivery | 行为说明 |
 | --- | --- |
-| `file` | 完整视频、音频或图片；读取服务端默认或用户显式选择，接入下载管理器（YouTube 分离轨道可通过 Chrome MV3 扩展免油猴或在纯 Web 端经用户脚本并发拉取并使用 Mediabunny 无损合并）。 |
+| `file` | 完整视频、音频或图片；读取服务端默认或用户显式选择，接入下载管理器（YouTube 分离轨道由 Chrome MV3 官方扩展并发拉取并使用 Mediabunny 无损合并）。 |
 | `hls` | 保留显式清单及作用域（如单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
 | `segments` | 只有具备布局验证证据的 `byte_concat` 才允许拼接；`remux` 明确暂不支持。 |
 | `pair` | 静图与动态片段有明确角色，按实况操作处理。 |

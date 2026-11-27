@@ -4,7 +4,6 @@ import type {
   parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
   pingInstalledExtension,
 } from "../services/extensionBridge";
-import type { pingYouTubeHelper } from "../utils/youtubeHelperCore";
 import type { useVideoStore } from "../stores/video";
 import type {
   MediaItem,
@@ -123,16 +122,6 @@ export async function fetchJSON(
   }
 }
 
-export const YT_HELPER_INSTALL_WAIT_KEY = "dokitool.yt_helper_install_wait";
-
-interface PendingYouTubeHelperInstallState {
-  waiting: boolean;
-  url: string;
-  platform: string;
-  reloaded: boolean;
-  updatedAt: number;
-}
-
 export function resolveApiUrl(raw: string): string {
   if (!raw.startsWith("/api/resolve?") || /[\\\s#]/.test(raw))
     throw new Error("条目解析地址无效");
@@ -167,36 +156,10 @@ export function useVideoParser(options: {
   videoStore: ReturnType<typeof useVideoStore>;
   locale: Ref<string>;
   showToast: (message: string, type?: ToastType, duration?: number) => unknown;
-  sessionStorage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
-  reloadPage?: () => void;
-  pingHelper?: typeof pingYouTubeHelper;
   pingExtension?: typeof pingInstalledExtension;
   parseYouTubeViaExtension?: typeof parseYouTubeViaExtensionFn;
 }) {
   const { videoStore, showToast } = options;
-  const resolveSessionStorage = () => {
-    if (options.sessionStorage !== undefined) return options.sessionStorage;
-    try {
-      return typeof window !== "undefined" ? window.sessionStorage : null;
-    } catch {
-      return null;
-    }
-  };
-  const reloadPage =
-    options.reloadPage ??
-    (() => {
-      if (typeof window !== "undefined" && window.location) {
-        window.location.reload();
-      }
-    });
-  const pingHelper: typeof pingYouTubeHelper =
-    options.pingHelper ??
-    (async (...args) => {
-      const { pingYouTubeHelper: ping } = await import(
-        "../utils/youtubeHelperCore"
-      );
-      return ping(...args);
-    });
   const pingExtension: typeof pingInstalledExtension =
     options.pingExtension ??
     (async (...args) => {
@@ -218,55 +181,7 @@ export function useVideoParser(options: {
     parseError = shallowRef(""),
     parseStatusText = shallowRef(""),
     currentPlatform = shallowRef("all"),
-    platformMismatchDetected = shallowRef(false),
-    needsManualHelperRefresh = shallowRef(false);
-  let checkingHelperInstall = false;
-
-  function readHelperWaitState(): PendingYouTubeHelperInstallState | null {
-    const store = resolveSessionStorage();
-    if (!store) return null;
-    try {
-      const raw = store.getItem(YT_HELPER_INSTALL_WAIT_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object" || parsed.waiting !== true) {
-        return null;
-      }
-      return {
-        waiting: true,
-        url: typeof parsed.url === "string" ? parsed.url.trim() : "",
-        platform:
-          typeof parsed.platform === "string" && parsed.platform.trim()
-            ? parsed.platform.trim()
-            : "all",
-        reloaded: parsed.reloaded === true,
-        updatedAt:
-          typeof parsed.updatedAt === "number" ? parsed.updatedAt : Date.now(),
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  function writeHelperWaitState(state: PendingYouTubeHelperInstallState): void {
-    const store = resolveSessionStorage();
-    if (!store) return;
-    try {
-      store.setItem(YT_HELPER_INSTALL_WAIT_KEY, JSON.stringify(state));
-    } catch {
-      // Ignore storage quota / privacy mode errors
-    }
-  }
-
-  function clearHelperWaitState(): void {
-    const store = resolveSessionStorage();
-    if (!store) return;
-    try {
-      store.removeItem(YT_HELPER_INSTALL_WAIT_KEY);
-    } catch {
-      // Ignore storage errors
-    }
-  }
+    platformMismatchDetected = shallowRef(false);
   const parseButtonState = ref<string>("idle");
   const parseButtonError = ref<Error | null>(null);
   const parseButton = {
@@ -335,7 +250,7 @@ export function useVideoParser(options: {
   }
 
   async function parseYouTubeWithHelper(
-    url: string,
+    _url: string,
     videoId: string,
     run: number,
     controller: AbortController,
@@ -347,16 +262,9 @@ export function useVideoParser(options: {
       locale: options.locale.value,
       signal: controller.signal,
       isCurrent: () => run === generation && !controller.signal.aborted,
-      pingHelper,
       pingExtension,
       parseYouTubeViaExtension,
-      requestStandardParse: () => requestStandardParse(url, controller.signal),
-      fetchJSON,
-      baseUrl: apiConfig.baseUrl,
-      onHelperReady: () => {
-        clearHelperWaitState();
-        needsManualHelperRefresh.value = false;
-      },
+      onHelperReady: () => {},
       onStageChange: (_stage, statusText) => {
         if (run === generation && !controller.signal.aborted) {
           parseStatusText.value = statusText;
@@ -516,157 +424,17 @@ export function useVideoParser(options: {
     if (!resolved) throw new Error("解析响应缺少所请求条目");
     return resolved;
   }
-  function markWaitingForYouTubeHelperInstall(): void {
-    const candidateUrl =
-      inputUrl.value.trim() || videoStore.resultData?.source_url || "";
-    needsManualHelperRefresh.value = false;
-    writeHelperWaitState({
-      waiting: true,
-      url: candidateUrl,
-      platform: currentPlatform.value || "all",
-      reloaded: false,
-      updatedAt: Date.now(),
-    });
-  }
-
-  async function isYouTubeClientParseReady(): Promise<boolean> {
-    let extState: Awaited<ReturnType<typeof pingInstalledExtension>> | null =
-      null;
-    try {
-      extState = await pingExtension();
-    } catch {
-      extState = null;
-    }
-    const { resolveClientParseRoute } = await import("../core/capabilityHub");
-    const extRoute = resolveClientParseRoute(true, {
-      extensionConnected: Boolean(extState?.connected),
-      extensionVersion: extState?.version || "",
-      extensionCapabilities: extState?.capabilities ?? [],
-      userscriptReady: false,
-    });
-    if (extRoute.channel === "extension_client_parse") {
-      return true;
-    }
-    const ping = await pingHelper();
-    const fallbackRoute = resolveClientParseRoute(true, {
-      extensionConnected: Boolean(extState?.connected),
-      extensionVersion: extState?.version || "",
-      extensionCapabilities: extState?.capabilities ?? [],
-      userscriptReady: Boolean(ping.installed && ping.supported),
-      userscriptVersion: ping.version || undefined,
-    });
-    return fallbackRoute.channel === "userscript_client_parse";
-  }
-
-  async function handleYouTubeHelperTabReturn(): Promise<boolean> {
-    if (checkingHelperInstall) return false;
-    const state = readHelperWaitState();
-    if (!state?.waiting) return false;
-
-    checkingHelperInstall = true;
-    try {
-      if (await isYouTubeClientParseReady()) {
-        clearHelperWaitState();
-        needsManualHelperRefresh.value = false;
-        if (state.platform && state.platform !== currentPlatform.value) {
-          currentPlatform.value = state.platform;
-        }
-        if (state.url && state.url !== inputUrl.value) {
-          inputUrl.value = state.url;
-        }
-        if (inputUrl.value.trim()) {
-          await parseVideo();
-        }
-        return true;
-      }
-
-      if (!state.reloaded) {
-        writeHelperWaitState({
-          ...state,
-          reloaded: true,
-          updatedAt: Date.now(),
-        });
-        reloadPage();
-        return false;
-      }
-
-      needsManualHelperRefresh.value = true;
-      return false;
-    } finally {
-      checkingHelperInstall = false;
-    }
-  }
-
-  async function resumePendingYouTubeHelperInstall(): Promise<boolean> {
-    if (checkingHelperInstall) return false;
-    const state = readHelperWaitState();
-    if (!state?.waiting) return false;
-
-    checkingHelperInstall = true;
-    try {
-      if (state.platform && state.platform !== currentPlatform.value) {
-        currentPlatform.value = state.platform;
-      }
-      if (state.url && state.url !== inputUrl.value) {
-        inputUrl.value = state.url;
-      }
-
-      if (await isYouTubeClientParseReady()) {
-        clearHelperWaitState();
-        needsManualHelperRefresh.value = false;
-        if (inputUrl.value.trim()) {
-          await parseVideo();
-        }
-        return true;
-      }
-
-      writeHelperWaitState({
-        ...state,
-        reloaded: true,
-        updatedAt: Date.now(),
-      });
-      needsManualHelperRefresh.value = true;
-      if (inputUrl.value.trim()) {
-        await parseVideo();
-      }
-      return false;
-    } finally {
-      checkingHelperInstall = false;
-    }
-  }
-
-  function triggerManualHelperRefresh(): void {
-    const candidateUrl =
-      inputUrl.value.trim() ||
-      readHelperWaitState()?.url ||
-      videoStore.resultData?.source_url ||
-      "";
-    writeHelperWaitState({
-      waiting: true,
-      url: candidateUrl,
-      platform: currentPlatform.value || "all",
-      reloaded: true,
-      updatedAt: Date.now(),
-    });
-    reloadPage();
-  }
-
   return {
     inputUrl,
     parseError,
     parseStatusText,
     currentPlatform,
     platformMismatchDetected,
-    needsManualHelperRefresh,
     parseButton,
     parseVideo,
     switchToAllAndRetry,
     cancelParse,
     resolveItem,
-    markWaitingForYouTubeHelperInstall,
-    handleYouTubeHelperTabReturn,
-    resumePendingYouTubeHelperInstall,
-    triggerManualHelperRefresh,
     selectPlatform: (platform: string) => {
       currentPlatform.value = platform;
     },

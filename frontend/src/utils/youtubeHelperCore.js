@@ -1,7 +1,6 @@
-// Standalone core module for the DokiTool YouTube userscript and page bridge.
-// Designed so that the exact same validation and request logic runs in the
-// userscript (Tampermonkey / Violentmonkey), the Vue frontend, and Node unit tests,
-// and can be packaged into a browser extension in the future.
+// Shared YouTube media core reused by the DokiTool Chrome MV3 extension
+// (Offscreen TVHTML5 player, chunked googlevideo downloads, Mediabunny OPFS muxing)
+// and Web URL/mux-pair helpers.
 
 import {
   MIN_YOUTUBE_HELPER_VERSION,
@@ -25,8 +24,6 @@ export {
 } from "./youtube/playerPayload.js";
 export * from "./youtube/muxSelector.js";
 
-export const YOUTUBE_HELPER_VERSION = "1.3.2";
-export const YOUTUBE_HELPER_SCRIPT_URL = "/helper/dokitool-youtube.user.js";
 export const YOUTUBE_OPFS_TEMP_PREFIX = "dokitool-yt-tmp-";
 export const YOUTUBE_FILE_PICKER_ID = "dokitool-youtube";
 export const DEFAULT_OPFS_CLEANUP_DELAY_MS = 120 * 1000;
@@ -196,7 +193,7 @@ export function createUserscriptController(options = {}) {
     opfsStorage = null,
     webLocks = null,
     now = () => Date.now(),
-    version = YOUTUBE_HELPER_VERSION,
+    version = MIN_YOUTUBE_HELPER_VERSION,
     mediabunny = null,
     muxConfig = {},
     saveBuffer = null,

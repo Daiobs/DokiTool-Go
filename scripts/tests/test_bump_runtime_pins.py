@@ -387,7 +387,7 @@ class OfflineBumpTests(unittest.TestCase):
             proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
             self.assertEqual(proc.returncode, 0, msg=proc.stderr)
             self.assertIn('Runtime pin update [APPLIED]', proc.stdout)
-            self.assertIn('docs/go-migration/README.md', proc.stdout)
+            self.assertIn('docs/UPSTREAM-MAINTENANCE.md', proc.stdout)
             self.assertIn('never auto-commits, pushes, or deploys', proc.stdout)
 
             gate = subprocess.run(

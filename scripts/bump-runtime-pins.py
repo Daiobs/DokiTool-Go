@@ -866,7 +866,7 @@ def format_summary(result):
     lines.extend([
         f'  Self-check: verify_local_pin_consistency PASSED ({len(LOCK_FILES)} lock files synchronized)',
         '  Next steps & governance:',
-        '    1. Review docs/go-migration/README.md (and PinnedEJSVersion / solver digests in '
+        '    1. Review docs/UPSTREAM-MAINTENANCE.md (and PinnedEJSVersion / solver digests in '
         'backend/internal/platform/youtube/ejs_sandbox.go when upgrading yt-dlp) if applicable.',
         '    2. Run PR verification gates: python3 -B scripts/check-upstream-updates.py --check-local-pins, '
         'python3 -B -m unittest discover -s scripts/tests -v, '

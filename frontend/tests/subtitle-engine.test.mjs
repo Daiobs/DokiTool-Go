@@ -436,7 +436,7 @@ test("fetchSubtitleTrackText enforces credentials:'omit', route fallback, and st
   assert.ok(dl.content.includes("00:00:01,000 --> 00:00:02,500\n你好\nHello"));
 });
 
-test("projectYouTubeCaptionsForFinalize & sanitizePlayerApiResponse strip translationLanguages and parseHelpers respects supports_captions", async () => {
+test("projectYouTubeCaptionsForFinalize & sanitizePlayerApiResponse strip translationLanguages and parseHelpers forwards extension subtitle attachments", async () => {
   const bloatedCaptions = {
     playerCaptionsTracklistRenderer: {
       captionTracks: [
@@ -487,134 +487,77 @@ test("projectYouTubeCaptionsForFinalize & sanitizePlayerApiResponse strip transl
   assert.deepEqual(sanitizedPlayer.captions, projected);
   assert.ok(JSON.stringify(sanitizedPlayer.captions).length < 1024);
 
-  // 3. parseHelpers.runYouTubeHelperParse passes projected captions when supports_captions !== false, and omits when false
-  const runParseWithContext = async (supportsCaptions) => {
-    parseHelpers.clearCachedYouTubeContext();
-    const origWindow = globalThis.window;
-    const origCustomEvent = globalThis.CustomEvent;
-    const bus = new EventTarget();
-    globalThis.window = bus;
-    if (typeof globalThis.CustomEvent !== "function") {
-      globalThis.CustomEvent = class extends Event {
-        constructor(type, init = {}) {
-          super(type);
-          this.detail = init.detail;
-        }
-      };
-    }
-    const listener = (event) => {
-      const req = JSON.parse(event.detail);
-      if (req.action === "prefetch") {
-        bus.dispatchEvent(
-          new globalThis.CustomEvent(YOUTUBE_HELPER_RESPONSE_EVENT, {
-            detail: JSON.stringify({
-              requestId: req.requestId,
-              ok: true,
-              data: { visitorData: "", oembed: null },
-            }),
-          }),
-        );
-      } else if (req.action === "player") {
-        bus.dispatchEvent(
-          new globalThis.CustomEvent(YOUTUBE_HELPER_RESPONSE_EVENT, {
-            detail: JSON.stringify({
-              requestId: req.requestId,
-              ok: true,
-              data: {
-                playabilityStatus: { status: "OK" },
-                streamingData: { formats: [], adaptiveFormats: [] },
-                videoDetails: { title: "Caption Demo" },
-                captions: bloatedCaptions,
-              },
-            }),
-          }),
-        );
-      }
-    };
-    bus.addEventListener(YOUTUBE_HELPER_REQUEST_EVENT, listener);
-
-    let capturedFinalizeBody = null;
-    try {
-      await parseHelpers.runYouTubeHelperParse({
-        videoId: "dQw4w9WgXcQ",
-        locale: "zh-CN",
-        signal: new AbortController().signal,
-        isCurrent: () => true,
-        pingExtension: async () => ({ connected: false, version: "", capabilities: [] }),
-        pingHelper: async () => ({ installed: true, version: "1.3.2", supported: true }),
-        requestStandardParse: async () => {
-          throw new Error("should not fall back");
-        },
-        fetchJSON: async (url, _sig, init) => {
-          if (url.includes("/api/youtube/context")) {
-            return {
-              schema_version: "1.0",
-              code: "OK",
-              data: {
-                player_id: "p123",
-                signature_timestamp: 20200,
-                client: { name: "TVHTML5", version: "7.20250101.00.00" },
-                expires_at: new Date(Date.now() + 3600_000).toISOString(),
-                ...(supportsCaptions !== undefined
-                  ? { supports_captions: supportsCaptions }
-                  : {}),
-              },
-            };
-          }
-          capturedFinalizeBody = JSON.parse(String(init?.body || "{}"));
-          return {
-            schema_version: "1.0",
-            code: "OK",
-            data: {
-              platform: "youtube",
-              content_id: "dQw4w9WgXcQ",
-              title: "Caption Demo",
-              items: [
+  // 3. parseHelpers.runYouTubeHelperParse delegates to the Chrome MV3 extension and preserves subtitle attachments
+  // (The extension's supports_captions !== false finalize gate is covered in extension-v44-bg.test.mjs.)
+  let receivedResult = null;
+  let helperReadyCalled = false;
+  await parseHelpers.runYouTubeHelperParse({
+    videoId: "dQw4w9WgXcQ",
+    locale: "zh-CN",
+    signal: new AbortController().signal,
+    isCurrent: () => true,
+    pingExtension: async () => ({
+      connected: true,
+      version: "4.5.0",
+      capabilities: ["youtube_parse", "youtube_mux"],
+    }),
+    parseYouTubeViaExtension: async () => ({
+      ok: true,
+      data: {
+        media: {
+          platform: "youtube",
+          content_id: "dQw4w9WgXcQ",
+          title: "Caption Demo",
+          items: [
+            {
+              id: "v1",
+              type: "video",
+              state: "ready",
+              variants: [
                 {
-                  id: "v1",
-                  type: "video",
-                  state: "ready",
-                  variants: [
-                    {
-                      id: "m1",
-                      delivery: {
-                        kind: "file",
-                        sources: [{ id: "s1", url: "https://rr1---sn-a.googlevideo.com/videoplayback?itag=18" }],
-                      },
-                    },
-                  ],
-                  default: {
-                    variant_id: "m1",
-                    source_id: "s1",
-                    url: "https://rr1---sn-a.googlevideo.com/videoplayback?itag=18",
+                  id: "m1",
+                  delivery: {
+                    kind: "file",
+                    sources: [{ id: "s1", url: "https://rr1---sn-a.googlevideo.com/videoplayback?itag=18" }],
                   },
                 },
               ],
+              default: {
+                variant_id: "m1",
+                source_id: "s1",
+                url: "https://rr1---sn-a.googlevideo.com/videoplayback?itag=18",
+              },
             },
-          };
+          ],
+          attachments: [
+            makeSubtitleAttachment({
+              id: "sub-en",
+              language: "en",
+              title: "English",
+              trackKind: "manual",
+              ext: "vtt",
+              url: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=vtt",
+            }),
+          ],
         },
-        baseUrl: "https://snap.dokitool.com",
-        onHelperReady: () => {},
-        setResult: () => {},
-        setError: (msg) => {
-          throw new Error(`unexpected error: ${msg}`);
-        },
-      });
-    } finally {
-      bus.removeEventListener(YOUTUBE_HELPER_REQUEST_EVENT, listener);
-      globalThis.window = origWindow;
-      globalThis.CustomEvent = origCustomEvent;
-      parseHelpers.clearCachedYouTubeContext();
-    }
-    return capturedFinalizeBody;
-  };
+      },
+    }),
+    onHelperReady: () => {
+      helperReadyCalled = true;
+    },
+    setResult: (data) => {
+      receivedResult = data;
+    },
+    setError: (msg) => {
+      throw new Error(`unexpected error: ${msg}`);
+    },
+  });
 
-  const bodySupported = await runParseWithContext(true);
-  assert.deepEqual(bodySupported.captions, projected);
-  assert.equal("translationLanguages" in bodySupported.captions.playerCaptionsTracklistRenderer, false);
-
-  const bodyUnsupported = await runParseWithContext(false);
-  assert.equal("captions" in bodyUnsupported, false);
+  assert.equal(helperReadyCalled, true);
+  assert.equal(receivedResult?.extra?.youtube_helper?.provider, "extension");
+  assert.equal(receivedResult?.extra?.youtube_helper?.version, "4.5.0");
+  assert.equal(receivedResult?.attachments?.length, 1);
+  assert.equal(receivedResult?.attachments?.[0]?.id, "sub-en");
 });
 
 test("ResultSubtitlePanel.vue & ResultDetailsSidebar.vue render manual/auto badges cleanly and isolate subtitles from Music tab", async () => {

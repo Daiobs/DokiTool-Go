@@ -81,6 +81,10 @@ def _create_valid_repo(repo: Path) -> None:
         "Mediabunny 1.65.2 https://github.com/Vanilagy/mediabunny/tree/v1.65.2\n",
     )
     _write(
+        repo / "frontend/public/licenses/mediabunny-MPL-2.0.txt",
+        "Mozilla Public License Version 2.0\n",
+    )
+    _write(
         repo / "backend/go.mod",
         "module example.com/dokitool/backend\n\ngo 1.27.0\n\ntoolchain go1.27.4\n",
     )
@@ -92,21 +96,6 @@ def _create_valid_repo(repo: Path) -> None:
         + "          go-version-file: backend/go.mod\n"
         + "          CGO_ENABLED: '0'\n",
         encoding="utf-8",
-    )
-    _write(
-        repo / "frontend/src/utils/youtubeHelperCore.js",
-        'export const YOUTUBE_HELPER_VERSION = "1.3.2";\n',
-    )
-    _write(
-        repo / "frontend/public/helper/dokitool-youtube.user.js",
-        "// ==UserScript==\n"
-        "// @version      1.3.2\n"
-        "// ==/UserScript==\n"
-        "/* Mediabunny v1.65.2 https://github.com/Vanilagy/mediabunny/tree/v1.65.2 */\n",
-    )
-    _write(
-        repo / "frontend/src/components/result/CapabilityUpgradeNotice.vue",
-        "<script setup>\nimport { MIN_YOUTUBE_HELPER_VERSION } from '../../utils/youtube/helperValidation'\n</script>\n",
     )
     _write(repo / "tools/dokitool-agent/security.py", 'AGENT_VERSION = "1.0.0"\n')
     _write(repo / "tools/dokitool-agent/dokitool_agent.py", "from security import AGENT_VERSION\n__version__ = AGENT_VERSION\n")
@@ -120,12 +109,11 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
             _create_valid_repo(repo)
             report = SSOT.run_all_checks(repo)
             self.assertTrue(report["passed"], msg=report["violations"])
-            self.assertEqual(report["checks"], 7)
+            self.assertEqual(report["checks"], 6)
             self.assertEqual(report["summary"]["extension_version"], "4.5.0")
             self.assertEqual(report["summary"]["mediabunny_version"], "1.65.2")
             self.assertEqual(report["summary"]["go_toolchain"], "1.27.4")
             self.assertEqual(report["summary"]["runtime_lock_files"], 6)
-            self.assertEqual(report["summary"]["youtube_helper_version"], "1.3.2")
             self.assertEqual(report["summary"]["agent_version"], "1.0.0")
 
             proc = subprocess.run(
@@ -152,12 +140,6 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
                 "[ext-ssot]",
             ),
             (
-                "mediabunny-userscript-drift",
-                "frontend/public/helper/dokitool-youtube.user.js",
-                lambda s: s.replace("1.65.2", "1.64.0"),
-                "[mediabunny-ssot]",
-            ),
-            (
                 "mediabunny-notice-drift",
                 "NOTICE",
                 lambda s: s.replace("1.65.2", "1.64.0"),
@@ -174,12 +156,6 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
                 ".github/workflows/upstream-canary.yml",
                 lambda s: s.replace("/download/v2.9.8/", "/download/v2.9.7/"),
                 "[runtime-pins]",
-            ),
-            (
-                "hardcoded-helper-version-in-vue",
-                "frontend/src/components/result/CapabilityUpgradeNotice.vue",
-                lambda s: s + "<!-- v1.3.2 -->\n",
-                "[yt-helper-ssot]",
             ),
             (
                 "hardcoded-mcp-version",

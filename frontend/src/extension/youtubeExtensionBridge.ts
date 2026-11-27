@@ -1,7 +1,7 @@
 import * as mediabunny from "mediabunny";
+import { LATEST_EXTENSION_VERSION } from "../core/capabilityHub";
 import { projectYouTubeCaptionsForFinalize } from "../core/media/subtitleEngine";
 import {
-  YOUTUBE_HELPER_VERSION,
   YOUTUBE_OPFS_TEMP_PREFIX,
   createUserscriptController,
   downloadViaYouTubeHelper,
@@ -616,7 +616,7 @@ export function createYouTubeExtensionBridge(
       options.webLocks ??
       (typeof navigator !== "undefined" ? navigator.locks : null),
     now: nowFn,
-    version: YOUTUBE_HELPER_VERSION,
+    version: LATEST_EXTENSION_VERSION,
     mediabunny:
       options.mediabunnyImpl !== undefined
         ? options.mediabunnyImpl
@@ -649,7 +649,7 @@ export function createYouTubeExtensionBridge(
 
   return {
     getHelperVersion(): string {
-      return YOUTUBE_HELPER_VERSION;
+      return LATEST_EXTENSION_VERSION;
     },
 
     ping(timeoutMs = 600): Promise<YouTubeHelperPingResult> {

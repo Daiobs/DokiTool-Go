@@ -20,11 +20,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 EXT_ID_RE = re.compile(r"^[a-p]{32}$")
 GO_TOOLCHAIN_RE = re.compile(r"^[ \t]*toolchain[ \t]+go(\d+\.\d+\.\d+)[ \t]*$", re.MULTILINE)
-HELPER_CORE_VER_RE = re.compile(
-    r"^[ \t]*export[ \t]+const[ \t]+YOUTUBE_HELPER_VERSION[ \t]*=[ \t]*['\"](\d+\.\d+\.\d+)['\"][ \t]*;?",
-    re.MULTILINE,
-)
-USERSCRIPT_VER_RE = re.compile(r"^//[ \t]*@version[ \t]+(\d+\.\d+\.\d+)[ \t]*$", re.MULTILINE)
 AGENT_VER_RE = re.compile(r"^AGENT_VERSION(?:\s*:\s*str)?\s*=\s*['\"](\d+\.\d+\.\d+)['\"]", re.MULTILINE)
 
 DESENSITIZATION_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
@@ -138,20 +133,15 @@ def check_mediabunny_parity(root: Path) -> Tuple[Dict[str, str], List[str]]:
     if not SEMVER_RE.fullmatch(mb_ver):
         return {}, [f"[mediabunny-ssot] invalid mediabunny semver {raw_ver!r}"]
 
-    us_rel = Path("frontend/public/helper/dokitool-youtube.user.js")
-    us_text = _read_text(root / us_rel)
-    if us_text is None:
-        violations.append(f"[mediabunny-ssot] unable to read {us_rel.as_posix()}")
-    else:
-        header = us_text[:2048]
-        if f"Mediabunny v{mb_ver}" not in header or f"mediabunny/tree/v{mb_ver}" not in header:
-            violations.append(f"[mediabunny-ssot] {us_rel.as_posix()} header does not match Mediabunny v{mb_ver}")
-
     notice_text = _read_text(root / "NOTICE")
     if notice_text is None:
         violations.append("[mediabunny-ssot] unable to read NOTICE")
     elif f"Mediabunny {mb_ver}" not in notice_text or f"mediabunny/tree/v{mb_ver}" not in notice_text:
         violations.append(f"[mediabunny-ssot] NOTICE does not match Mediabunny {mb_ver}")
+
+    mpl_rel = Path("frontend/public/licenses/mediabunny-MPL-2.0.txt")
+    if not (root / mpl_rel).is_file():
+        violations.append(f"[mediabunny-ssot] missing {mpl_rel.as_posix()} license text")
 
     return {"mediabunny_version": mb_ver}, violations
 
@@ -192,45 +182,6 @@ def check_upstream_runtime_pins(root: Path) -> Tuple[Dict[str, Any], List[str]]:
         return {"runtime_pins": pinned, "runtime_lock_files": len(watch.LOCK_FILES)}, []
     except Exception as exc:
         return {}, [f"[runtime-pins] {exc}"]
-
-
-def check_youtube_helper_ssot(root: Path) -> Tuple[Dict[str, str], List[str]]:
-    violations: List[str] = []
-    core_rel = Path("frontend/src/utils/youtubeHelperCore.js")
-    us_rel = Path("frontend/public/helper/dokitool-youtube.user.js")
-    notice_rel = Path("frontend/src/components/result/CapabilityUpgradeNotice.vue")
-
-    core_text = _read_text(root / core_rel)
-    us_text = _read_text(root / us_rel)
-    if core_text is None:
-        return {}, [f"[yt-helper-ssot] unable to read {core_rel.as_posix()}"]
-    if us_text is None:
-        return {}, [f"[yt-helper-ssot] unable to read {us_rel.as_posix()}"]
-
-    core_matches = HELPER_CORE_VER_RE.findall(core_text)
-    us_matches = USERSCRIPT_VER_RE.findall(us_text[:1024])
-    if len(core_matches) != 1:
-        violations.append(f"[yt-helper-ssot] {core_rel.as_posix()} missing unique YOUTUBE_HELPER_VERSION constant")
-    if len(us_matches) != 1:
-        violations.append(f"[yt-helper-ssot] {us_rel.as_posix()} missing unique @version header")
-    if violations:
-        return {}, violations
-
-    if core_matches[0] != us_matches[0]:
-        violations.append(
-            f"[yt-helper-ssot] {core_rel.as_posix()} ({core_matches[0]}) != {us_rel.as_posix()} ({us_matches[0]})"
-        )
-
-    vue_text = _read_text(root / notice_rel)
-    if vue_text is None:
-        violations.append(f"[yt-helper-ssot] unable to read {notice_rel.as_posix()}")
-    else:
-        if re.search(r"\bv1\.\d+\.\d+\b", vue_text):
-            violations.append(f"[yt-helper-ssot] {notice_rel.as_posix()} contains a hardcoded userscript version literal")
-        if "MIN_YOUTUBE_HELPER_VERSION" not in vue_text:
-            violations.append(f"[yt-helper-ssot] {notice_rel.as_posix()} must reference MIN_YOUTUBE_HELPER_VERSION SSOT")
-
-    return {"youtube_helper_version": core_matches[0]}, violations
 
 
 def check_agent_version_ssot(root: Path) -> Tuple[Dict[str, str], List[str]]:
@@ -293,7 +244,6 @@ def run_all_checks(root: Path = ROOT) -> Dict[str, Any]:
         check_mediabunny_parity,
         check_go_toolchain_parity,
         check_upstream_runtime_pins,
-        check_youtube_helper_ssot,
         check_agent_version_ssot,
         check_public_docs_desensitization,
     ):
@@ -302,7 +252,7 @@ def run_all_checks(root: Path = ROOT) -> Dict[str, Any]:
         violations.extend(errs)
     return {
         "passed": len(violations) == 0,
-        "checks": 7,
+        "checks": 6,
         "summary": summary,
         "violations": violations,
     }

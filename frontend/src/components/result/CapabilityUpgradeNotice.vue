@@ -2,7 +2,6 @@
 import { computed } from "vue";
 import AppIcon from "../AppIcon.vue";
 import { LATEST_EXTENSION_VERSION } from "../../core/capabilityHub";
-import { MIN_YOUTUBE_HELPER_VERSION } from "../../utils/youtube/helperValidation";
 import { t } from "./resultI18n";
 
 const props = defineProps({
@@ -13,44 +12,23 @@ const props = defineProps({
     default: "client_session",
   },
   youtubeHelper: Object,
-  youtubeHelperScriptUrl: {
-    type: String,
-    default: "/helper/dokitool-youtube.user.js",
-  },
   latestExtensionVersion: {
     type: String,
     default: "",
   },
-  needsManualHelperRefresh: Boolean,
   locale: {
     type: String,
     default: "zh-CN",
   },
 });
 
-const emit = defineEmits([
-  "close",
-  "open-extension",
-  "install-youtube-helper",
-  "refresh-youtube-helper-page",
-]);
+const emit = defineEmits(["close", "open-extension"]);
 
-const isOutdated = computed(() => props.youtubeHelper?.status === "outdated");
 const isOutdatedExtension = computed(
-  () => isOutdated.value && props.youtubeHelper?.provider === "extension",
-);
-const isOutdatedUserscript = computed(
-  () => isOutdated.value && props.youtubeHelper?.provider !== "extension",
+  () => props.youtubeHelper?.status === "outdated",
 );
 const upgradeReason = computed(() =>
-  isOutdatedExtension.value
-    ? "outdated_extension"
-    : isOutdatedUserscript.value
-      ? "outdated_userscript"
-      : "missing",
-);
-const effectiveScriptUrl = computed(
-  () => props.youtubeHelperScriptUrl || "/helper/dokitool-youtube.user.js",
+  isOutdatedExtension.value ? "outdated_extension" : "missing",
 );
 
 const copy = computed(() => {
@@ -68,11 +46,6 @@ const copy = computed(() => {
   )
     .trim()
     .replace(/^v/i, "");
-  const minUserscriptVer = String(
-    props.youtubeHelper?.min_version || MIN_YOUTUBE_HELPER_VERSION,
-  )
-    .trim()
-    .replace(/^v/i, "");
 
   if (isEn) {
     return {
@@ -82,23 +55,13 @@ const copy = computed(() => {
           ? "Unlock Lossless HD Mux with DokiTool Extension"
           : isOutdatedExtension.value
             ? `Upgrade DokiTool Extension to v${targetExtVer}+`
-            : isOutdatedUserscript.value
-              ? "Upgrade to DokiTool Extension (No Userscript)"
-              : "Unlock Local Parsing & Lossless HD Mux",
+            : "Install DokiTool Chrome Extension",
       description: isOutdatedExtension.value
-        ? `Connected DokiTool extension (${extVerText}) is outdated. Upgrade to v${targetExtVer}+ to parse and download YouTube 4K60 & Bilibili 1080P without a userscript.`
-        : "Zero-cookie local parsing and lossless 4K60 / 1080P muxing directly in Chrome or Edge without installing Tampermonkey.",
+        ? `Connected DokiTool extension (${extVerText}) is outdated. Upgrade to v${targetExtVer}+ to parse and download YouTube 4K60 & Bilibili 1080P losslessly.`
+        : "Zero-cookie local parsing and background lossless 4K60 / 1080P muxing directly in Chrome or Edge via the official DokiTool MV3 extension.",
       primaryCta: isOutdatedExtension.value
         ? `Upgrade DokiTool Extension to v${targetExtVer} (YouTube 4K60 & Bilibili 1080P)`
         : "Install DokiTool Extension (YouTube 4K60 & Bilibili 1080P)",
-      legacySummary: "Using Firefox or legacy userscript?",
-      legacyNote: isOutdatedUserscript.value
-        ? `Your legacy userscript needs an update (current v${props.youtubeHelper?.version || "unknown"}, requires v${minUserscriptVer}+). Chrome/Edge users can switch to the extension above, or enable "Allow User Scripts" and update below.`
-        : 'Firefox or legacy Tampermonkey users can still install the userscript below (enable "Allow User Scripts" in Chrome/Edge extension details), then return to this tab.',
-      legacyLinkLabel: isOutdatedUserscript.value
-        ? "Update YouTube Userscript (/helper/dokitool-youtube.user.js)"
-        : "Install YouTube Userscript (/helper/dokitool-youtube.user.js)",
-      refreshPage: "Refresh Page",
     };
   }
   return {
@@ -107,24 +70,14 @@ const copy = computed(() => {
       props.mode === "extension_mux"
         ? "安装 DokiTool 扩展解锁高清无损合流"
         : isOutdatedExtension.value
-          ? `升级 DokiTool 扩展至 v${targetExtVer}+（免油猴）`
-          : isOutdatedUserscript.value
-            ? "推荐升级至 DokiTool 扩展（免油猴）"
-            : "安装 DokiTool 扩展解锁本地解析与无损合流",
+          ? `升级 DokiTool 扩展至 v${targetExtVer}+`
+          : "安装 DokiTool Chrome 官方扩展",
     description: isOutdatedExtension.value
-      ? `检测到已连接的扩展版本（${extVerText}）较低，升级至 v${targetExtVer}+ 即可免油猴解析下载 YouTube 4K60 与 B 站 1080P 高清视频。`
-      : "零 Cookie 本地解析，无需安装油猴（Tampermonkey）即可后台无损合流 YouTube 4K60 与 B 站 1080P 高清视频。",
+      ? `检测到已连接的扩展版本（${extVerText}）较低，升级至 v${targetExtVer}+ 即可本地解析下载 YouTube 4K60 与 B 站 1080P 高清视频。`
+      : "安装官方 Chrome MV3 扩展即可实现零 Cookie 本地解析，并支持后台无损合流 YouTube 4K60 与 B 站 1080P 高清视频。",
     primaryCta: isOutdatedExtension.value
-      ? `升级 DokiTool 扩展至 v${targetExtVer}（免油猴解锁 YouTube 4K60）`
-      : "安装 DokiTool 扩展（免油猴解锁 YouTube 4K60 & B 站 1080P）",
-    legacySummary: "使用 Firefox 或旧版油猴脚本？",
-    legacyNote: isOutdatedUserscript.value
-      ? `检测到旧版 YouTube 下载助手脚本需要更新（当前 v${props.youtubeHelper?.version || "未知"}，要求 v${minUserscriptVer}+）。Chrome / Edge 用户推荐安装上方扩展替代油猴；如继续使用脚本，请开启「允许用户脚本」后更新。`
-      : "Firefox 或习惯油猴的用户仍需要安装 YouTube 下载助手脚本（Chrome / Edge 需在 Tampermonkey 详情中开启「允许用户脚本」），安装完成后切回本页即可自动识别。",
-    legacyLinkLabel: isOutdatedUserscript.value
-      ? "更新 YouTube 助手脚本 (/helper/dokitool-youtube.user.js)"
-      : "安装 YouTube 助手脚本 (/helper/dokitool-youtube.user.js)",
-    refreshPage: "刷新页面",
+      ? `升级 DokiTool 扩展至 v${targetExtVer}（解锁 YouTube 4K60）`
+      : "安装 DokiTool 扩展（解锁 YouTube 4K60 & B 站 1080P）",
   };
 });
 </script>
@@ -170,43 +123,6 @@ const copy = computed(() => {
             <span>{{ copy.primaryCta }}</span>
           </button>
         </div>
-
-        <details
-          v-if="mode !== 'extension_mux'"
-          data-legacy-userscript-fallback
-          class="rs-upgrade-legacy"
-          :open="needsManualHelperRefresh || undefined"
-        >
-          <summary class="rs-upgrade-legacy-summary">
-            {{ copy.legacySummary }}
-          </summary>
-          <div class="rs-upgrade-legacy-body">
-            <p class="rs-upgrade-legacy-note">{{ copy.legacyNote }}</p>
-            <div class="rs-upgrade-legacy-actions">
-              <a
-                :href="effectiveScriptUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                data-yt-helper-install-link
-                class="rs-upgrade-legacy-link"
-                @click="emit('install-youtube-helper')"
-              >
-                <AppIcon class="fas fa-external-link-alt" />
-                <span>{{ copy.legacyLinkLabel }}</span>
-              </a>
-              <button
-                v-if="needsManualHelperRefresh"
-                type="button"
-                data-yt-helper-manual-refresh
-                class="rs-btn rs-btn--ghost rs-upgrade-refresh-btn"
-                @click="emit('refresh-youtube-helper-page')"
-              >
-                <AppIcon class="fas fa-redo" />
-                <span>{{ copy.refreshPage }}</span>
-              </button>
-            </div>
-          </div>
-        </details>
       </div></Transition
     ></Teleport
   >
@@ -376,70 +292,7 @@ const copy = computed(() => {
   outline-offset: 2px;
 }
 
-.rs-btn--ghost {
-  background: var(--cun-bg-subtle);
-  color: var(--cun-fg);
-  border: 1px solid var(--cun-border);
-}
-
 .rs-upgrade-notice-cta {
-  width: 100%;
-}
-
-.rs-upgrade-legacy {
-  margin-top: 0.75rem;
-  padding-top: 0.625rem;
-  border-top: 1px solid var(--cun-border);
-  font-size: 0.75rem;
-  color: var(--cun-fg-2);
-}
-
-.rs-upgrade-legacy-summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--cun-fg-2);
-  user-select: none;
-  list-style-position: inside;
-}
-
-.rs-upgrade-legacy-summary:hover {
-  color: var(--cun-fg);
-}
-
-.rs-upgrade-legacy-body {
-  margin-top: 0.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.rs-upgrade-legacy-note {
-  margin: 0;
-  line-height: 1.55;
-  color: var(--cun-fg-2);
-}
-
-.rs-upgrade-legacy-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.rs-upgrade-legacy-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  color: var(--cun-accent);
-  font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-}
-
-.rs-upgrade-refresh-btn {
-  padding: 0.45rem 0.75rem;
-  font-size: 0.75rem;
   width: 100%;
 }
 

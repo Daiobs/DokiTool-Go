@@ -32,17 +32,17 @@ Weibo's signed `/api/media/weibo` route remains a server relay when required.
 6. **无跨域与附件头直链的「打开源链接」交付（今日头条、最右视频等）**：
    - 对实测既无 `Access-Control-Allow-Origin` 跨域读取头、又无 `Content-Disposition: attachment` 附件头的 CDN 直链（如今日头条 `*.toutiaovod.com`、线上关闭 `tbvideo` 改写的最右视频），任务卡片不再假报 `已交给浏览器`，而是直接置为 `manual`（「`打开源链接`」），使用隔离的 `noopener noreferrer` + `no-referrer` 打开源视频并提示右键「视频另存为」（手机端长按保存）。
 7. **Chrome MV3 原生侧边栏扩展无损合流通道（`v4.5.0`）**：
-   - 桌面 Chrome/Edge 用户安装官方 MV3 扩展后，可在独立的 `offscreen` OPFS 沙箱内免油猴完成 **YouTube 4K60** 与 **B 站免登录 1080P DASH** `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出及无体积上限的子目录多图/多 P 流式落盘（详见 [docs/EXTENSION.md](EXTENSION.md)）；纯 Web 端仍保留 `DokiTool YouTube Helper`（`1.3.2`）油猴脚本作为桌面备选路径。
+   - 桌面 Chrome/Edge 用户安装官方 MV3 扩展后，可在独立的 `offscreen` OPFS 沙箱内完成 **YouTube 4K60** 与 **B 站免登录 1080P DASH** `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出及无体积上限的子目录多图/多 P 流式落盘（详见 [docs/EXTENSION.md](EXTENSION.md)；早期独立油猴脚本已于 `v4.5.0` 退役并归档至 `archive/youtube-userscript-final`）。
 
 ---
 
 ### 早期九平台生产交付基线记录
 
-下表保留早期九平台生产按钮验收、浏览器直接打开附件实测及手动保存入口记录。截至历史 [#33 发布回执](https://github.com/Brilliant666/DokiTool-Go/pull/33#issuecomment-6649301507)（后续抖音上海 `v2` 升级见 [douyin-shanghai.md](go-migration/douyin-shanghai.md)，14 平台完整矩阵见根 [README.md](../README.md)）：
+下表保留早期九平台生产按钮验收、浏览器直接打开附件实测及手动保存入口记录。截至历史 [#33 发布回执](https://github.com/Brilliant666/DokiTool-Go/pull/33#issuecomment-6649301507)（早期 `douyin-shanghai.md` 迁移记录封存于永久标签 `archive/php-oracle-final`，14 平台完整矩阵见根 [README.md](../README.md)）：
 
 | 平台 | 已确认的能力和边界 |
 | --- | --- |
-| 抖音 | 上海主动领取取址已启用，4K 原画有[生产基线及维护者保存记录](go-migration/douyin-shanghai.md)。上海提供候选地址，文件由浏览器从 CDN 下载。 |
+| 抖音 | 上海主动领取取址已启用，4K 原画有历史生产基线及维护者保存记录（详见标签 `archive/php-oracle-final` 中的 `docs/go-migration/douyin-shanghai.md`）。上海提供候选地址，文件由浏览器从 CDN 下载。 |
 | 小红书实况 | **生产 d82ff77 仍有新增 HTTP v28 导致 ZIP 失败的缺口。** 本次修复候选对适配器已提取的实况 motion 直连来源做同址 HTTPS 准备，不再枚举 CDN 节点或域名；尚未部署，也不等同于声明每个来源均可跨域读取。历史 #30 只覆盖 v11/v27：一笔生产样本的两个地址均已升级，原按钮保存了视频、对应封面及同组 ZIP；单视频和 ZIP 中的视频实取 v11，封面沿用自己的来源。视频和封面完整解码，ZIP 通过 CRC，成员与单项的长度及 SHA-256 一致。v27 未单独整存；这不是小红书 4K 全量验收。[发布回执](https://github.com/Brilliant666/DokiTool-Go/pull/30#issuecomment-6628340403) · [Chat 接收记录（非独立生产复测）](https://github.com/Brilliant666/DokiTool-Go/pull/30#issuecomment-6629159922) |
 | 今日头条 | 作品 `7501991960077500979` 原选 1080p：上游缺少允许网页读取的跨域响应头，带 `Content-Disposition: attachment` 且不校验 Referer；下载按钮已将 `*.toutiaovod.com` 接入隔离的浏览器原生附件路线（`noopener`、`no-referrer`，任务状态记为 `handed-off`「已交给浏览器」，不读取跨域字节、不经服务端中转；本地验证通过，生产保存结果待上线后补）。独立 Edge 此前直接接收该附件时，以系统命名 `download.mp4` 实际保存 25,912,280 字节，H.264 视频和 AAC 音轨全片解码通过。进度由浏览器下载管理器管理，页面只能确认交接。此前一次仅收到 15,662 字节，未证实慢的原因。 |
 | 皮皮搞笑、最右 | 已测作品（分别为 `860538173891`、`163566379`）的 HTTP 媒体被浏览器拦截。同址 HTTPS 可预览，但不允许网页跨域读取，直接打开也未触发附件下载。保留「打开原视频，手动保存」入口；该轮未发现原域名上可一键保存的候选；未启动中继。 |
@@ -840,9 +840,9 @@ HTTP 升级不是可用性证明：实际浏览器仍须通过 TLS、CORS、完�
 的视频、封面、ZIP 完整保存/解码、CRC/配对及同源成员一致性。未取得
 该证据前保持“修复候选”，不重新运行大文件下载或 CDN 排名。
 
-### YouTube：用户脚本（`1.3.2`）分块并发拉取与浏览器内无损合并
+### YouTube：Chrome MV3 扩展分块并发拉取与本地无损合并（含早期油猴内存基线归档）
 
-YouTube 下载全程不经过本站服务器中转媒体字节，由桌面浏览器安装并启用同源公开用户脚本 `frontend/public/helper/dokitool-youtube.user.js`（当前版本 `1.3.2`）配合完成：
+YouTube 下载全程不经过本站服务器中转媒体字节，当前统一由 **Chrome MV3 官方扩展（`v4.5.0`）** 复用 `youtubeHelperCore.js` 在独立 `offscreen` OPFS 沙箱内分块并发拉取并使用 `Mediabunny` 无损封装（早期独立油猴用户脚本 `dokitool-youtube.user.js` 已于 `v4.5.0` 退役并永久归档至 `archive/youtube-userscript-final`，详见 [HISTORY.md](HISTORY.md#已退役-youtube-油猴用户脚本正式归档记录)）：
 
 - **自带音频直链（如 `360p`，`itag=18`）**：支持直接交给浏览器原生附件保存，或经脚本拉取保存。
 - **高画质分离音视频（如 `1080p`、`1440p`、`4K` 仅视频轨 + 最优配对音轨）**：点击主下载按钮时，页面通过 `mux_download` 委托用户脚本以 `anonymous: true`（不带 Cookie）分块并发从 `*.googlevideo.com` 拉取视频轨与配对音轨，并在浏览器内使用内嵌的 **Mediabunny**（`1.65.2`）执行无损容器封装，直接输出完整有声 `.mp4` 或 `.webm` 文件：

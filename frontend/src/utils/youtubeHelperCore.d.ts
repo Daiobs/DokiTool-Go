@@ -1,9 +1,7 @@
 import type { Attachment, ReadyVariant, Source, Variant } from "../types/media";
 import type { ProjectedYouTubeCaptions } from "../core/media/subtitleEngine";
 
-export const YOUTUBE_HELPER_VERSION: string;
 export const MIN_YOUTUBE_HELPER_VERSION: string;
-export const YOUTUBE_HELPER_SCRIPT_URL: string;
 export const YOUTUBE_OPFS_TEMP_PREFIX: string;
 export const YOUTUBE_FILE_PICKER_ID: string;
 export const DEFAULT_OPFS_CLEANUP_DELAY_MS: number;

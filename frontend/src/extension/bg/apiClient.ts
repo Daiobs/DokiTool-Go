@@ -1,3 +1,7 @@
+import {
+  LATEST_EXTENSION_VERSION,
+  MIN_EXTENSION_YOUTUBE_VERSION,
+} from "../../core/capabilityHub";
 import { projectYouTubeCaptionsForFinalize } from "../../core/media/subtitleEngine";
 import { isValidStatsSnapshot } from "../../monitor/statsTypes";
 import { withTbvideoItems } from "../../services/tbvideo";
@@ -8,12 +12,7 @@ import type {
   YouTubeHelperState,
 } from "../../types/media";
 import { readyItem, validateMediaEnvelope } from "../../utils/mediaContract";
-import {
-  MIN_YOUTUBE_HELPER_VERSION,
-  YOUTUBE_HELPER_SCRIPT_URL,
-  YOUTUBE_HELPER_VERSION,
-  type YouTubeHelperContextResponse,
-} from "../../utils/youtubeHelperCore";
+import type { YouTubeHelperContextResponse } from "../../utils/youtubeHelperCore";
 import type { ExtensionDnrRule } from "../dnrRules";
 import { validateApiBaseUrl } from "../hostWhitelist";
 import {
@@ -670,10 +669,9 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
       const readyState: YouTubeHelperState = {
         status: "ready",
         provider: "extension",
-        version: helperVersion,
+        version: extensionVersion || helperVersion,
         ...(extensionVersion ? { extensionVersion } : {}),
-        min_version: MIN_YOUTUBE_HELPER_VERSION,
-        script_url: YOUTUBE_HELPER_SCRIPT_URL,
+        min_version: MIN_EXTENSION_YOUTUBE_VERSION,
       };
       return {
         ...finalized,
@@ -714,7 +712,7 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
         videoId: matched.youtubeVideoId,
         apiOrigin,
         authSettings: settings,
-        helperVersion: YOUTUBE_HELPER_VERSION,
+        helperVersion: manifestVersion || LATEST_EXTENSION_VERSION,
         ...(manifestVersion ? { extensionVersion: manifestVersion } : {}),
         signal,
         onContextNotFound: requestStandardParse,

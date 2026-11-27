@@ -54,7 +54,7 @@
 | --- | --- | --- | --- |
 | **安装与依赖** | 打开网页即用 | 解压加载 `dokitool-chrome-extension.zip`（Chrome/Edge 116+） | Python 3.9+ 标准库（零第三方 `pip` 依赖） |
 | **14 核心平台 + 长尾站点** | 支持（14 核心 + 服务端开启时支持长尾） | 支持（标签页自动跟随严格限 14 核心，主动输入/右键支持长尾） | 支持（受 Key `platforms` 白名单与预算控制） |
-| **YouTube HD / 4K60** | 可选安装油猴脚本 `1.3.2` 或跳转使用扩展 | **内置免油猴**（`TVHTML5` + Deno 沙箱解算 + OPFS `Mediabunny` 合流） | 默认跳过（YouTube 流通常绑定出口 IP，优先走扩展） |
+| **YouTube HD / 4K60** | 引导安装 Chrome MV3 官方扩展（纯 Web 不内置油猴） | **内置免油猴**（`TVHTML5` + Deno 沙箱解算 + OPFS `Mediabunny` 合流） | 默认跳过（YouTube 流通常绑定出口 IP，优先走扩展） |
 | **B 站 1080P DASH** | 渐进式 MP4 预览与下载 | **免登录 1080P（AVC/HEVC/AV1）+ 30280 AAC 无损合流 & 独立 M4A** | 支持渐进式直链与多 P `/api/resolve` |
 | **字幕提取与双语导出** | 展示字幕附件直链 | **纯客户端 VTT / SRT / 双语合并落盘**（5 MiB 单轨上限） | **CLI/MCP 支持 VTT / SRT / `json3` / 双语导出**（带扇出与字节上限） |
 | **多图 / 多 P / 历史** | 单图直存、多图 `<= 500 MiB` ZIP、SW 流式下载 | 子目录无上限流式落盘、后台多 P 队列、G6 脱敏 50 条持久化历史 | 流式 `.part` 落盘、默认 no-clobber 防覆盖、可选 `--overwrite` |
@@ -132,25 +132,15 @@ python3 tools/dokitool-agent/mcp_server.py
 
 更多子命令（`resolve`、`download`、`subtitles`、`--overwrite`、批量脚本）与 MCP 写操作显式开启参数见 [tools/dokitool-agent/README.md](tools/dokitool-agent/README.md) 与 [tools/dokitool-agent/SKILL.md](tools/dokitool-agent/SKILL.md)。
 
-### 4️⃣ 开发者本地全栈启动
+### 4️⃣ 开发者本地全栈启动（4 个标准 `Makefile` 入口）
 
-环境要求：**Go `1.27.4`**（见 `backend/go.mod`）、**Node.js `20+`**（CI 锁定 `24`）、**Python `3.9+`**。
+环境要求：**Go `1.27.4`**（见 `backend/go.mod`）、**Node.js `20+`**（CI 锁定 `24`）、**Python `3.9+`**。首次克隆先执行 `cd frontend && npm ci --ignore-scripts`，之后根目录直接使用 4 个零黑魔法 `Makefile` 命令：
 
 ```bash
-# 1. 前端依赖安装、类型检查、单测与生产构建（含扩展包、预渲染与首屏体积门禁）
-cd frontend
-npm ci --ignore-scripts
-npm run typecheck && npm test && npm run build
-
-# 2. 后端全量竞态检测单测与本地回环启动
-cd ../backend
-go test -race ./...
-go run ./cmd/dokitool serve -listen 127.0.0.1:18080
-
-# 3. 仓库契约、SSOT 与离线供应链总检
-cd ..
-python3 -B scripts/check-ssot-consistency.py
-python3 -B scripts/check-supply-chain.py --offline
+make dev    # 本地并行启动 Go 后端 (127.0.0.1:8081) 与 Vite 前端开发服务器
+make test   # 全量回归：Go -race 单测 + 前端单测 + Python 契约 / Agent / 冒烟单测
+make check  # 安全与契约总检：公开仓凭据守门 + SSOT + 供应链离线 + OpenAPI/Schema + typecheck + go vet
+make build  # 生产构建：Go 静态二进制 + 前端静态资源 + Chrome MV3 扩展 ZIP + 首屏体积预算校验
 ```
 
 ---
@@ -175,7 +165,7 @@ python3 -B scripts/check-supply-chain.py --offline
 | 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP），失败回退手动打开 |
 | 最右（`zuiyou`） | 视频 / 图片 | `izuiyou.com`、`share.xiaochuankeji.cn` | 线上关闭视频 `tbvideo` 改写，视频通过「打开源链接」手动保存；图片支持直下与打包 |
 | X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（状态页、`/photo/<N>`、`/video/<N>`）、`t.co`（受控单跳） | 纯文字推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需启用 `-x-tombstone-fallback=fxtwitter` |
-| YouTube（`youtube`） | 视频 / 字幕 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | **推荐使用 Chrome MV3 扩展 `v4.5.0` 免油猴解析、4K60 无损合流与双语字幕导出**；桌面纯 Web 亦可选装 `DokiTool YouTube Helper`（`1.3.2`）用户脚本 |
+| YouTube（`youtube`） | 视频 / 字幕 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | **使用 Chrome MV3 官方扩展 `v4.5.0` 本地解析、4K60 无损合流与双语字幕导出**（独立油猴脚本已归档至 `archive/youtube-userscript-final`） |
 | Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.`）、`instagr.am`（`/p/`、`/reel/`、`/reels/`、`/tv/`） | 不支持 Stories（`/stories/`）及私密/需登录帖（返回 `UPSTREAM_BLOCKED`） |
 | Facebook（`facebook`） | 视频 | `facebook.com`、`www.`、`m.`、`fb.watch` | `fb.watch` 短链需登录展开，接口提示先在浏览器打开并复制完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
 | Tumblr（`tumblr`） | 视频 | `tumblr.com`、`www.tumblr.com`、`*.tumblr.com` | 仅支持公开视频帖（单帖最多提取 4 个视频条目） |
@@ -221,7 +211,7 @@ python3 -B scripts/check-supply-chain.py --offline
 
 | 层级 | 覆盖范围 | 核心入口 |
 | --- | --- | --- |
-| **L1 离线契约 & 单测** | Go `-race` 全量包单测、统一 Schema v1、OpenAPI 3.1.0、6 文件运行时锁、SSOT 7 项一致性门禁、供应链离线审计、前端 31 组单测 & 首屏体积预算 | `go test -race ./...` · `npm test` · `scripts/check-ssot-consistency.py` · `scripts/check-supply-chain.py --offline` |
+| **L1 离线契约 & 单测** | Go `-race` 全量包单测、统一 Schema v1、OpenAPI 3.1.0、6 文件运行时锁、SSOT 6 项一致性门禁、供应链离线审计、前端全量单测 & 首屏体积预算 | `make test` · `make check` · `.github/workflows/ci.yml` |
 | **L2 无头浏览器 E2E** | 真实 `--headless=new` Chrome（`--remote-debugging-pipe`）加载扩展与 SW：水合、主题、桥接握手、OPFS 合流、文件名冲突对抗、零残余进程 `RESIDUAL_CHROME=0` | `scripts/test-extension-e2e.mjs` · `scripts/test-download-browser.mjs` · `scripts/prod-smoke/test_stage2_browser.mjs` |
 | **L3 定时线上巡检** | 每日 `yt-dlp` / `Deno` 正式版监控（`upstream-watch.yml`）+ 每 12 小时零权限 Deno/EJS `tv`+`main` 变体与只读接口低噪 Canary（`upstream-canary.yml`） | `scripts/check-upstream-updates.py` · `scripts/check-upstream-canary.py` |
 | **L4 发布后生产验收** | 阶段一服务端/静态全量 SHA-256 + 14 平台 API 冒烟（`smoke.py`）+ 阶段二零修改官方扩展无头 Chrome 复测（`stage2_browser.mjs`） | `scripts/prod-smoke/smoke.py` · `scripts/prod-smoke/stage2_browser.mjs` · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) |
@@ -239,12 +229,13 @@ python3 -B scripts/check-supply-chain.py --offline
 │   │   └── loadtest/          # 仅限本机回环（127.0.0.1）运行的混合流量压测工具
 │   ├── config/                # 内嵌平台注册目录唯一真值（platforms.json）
 │   └── internal/              # fetch、urlpolicy、bearer、unified、catalog、probe、ytengine、platform/*、media/*、shresolver、api
-├── frontend/                  # Vue 3 + Vite SPA（dokitool-web）、/monitor 大盘、SW 流式下载器、Chrome MV3 扩展源码与 YouTube 用户脚本
+├── frontend/                  # Vue 3 + Vite SPA（dokitool-web）、/monitor 大盘、SW 流式下载器与 Chrome MV3 扩展源码
 ├── tools/dokitool-agent/      # 零第三方依赖 Python 3.9+ CLI、默认只读 Stdio MCP Server、SKILL.md 与安全回归测试
 ├── ops/                       # Caddy 反向代理脱敏示例、运行时/多 Key 配置示例与发布/回滚脚本（ops/release/）
-├── scripts/                   # SSOT 一致性门禁、供应链审计、运行时锁同步、OpenAPI 校验、生产冒烟（prod-smoke/）与 L2 浏览器测试
+├── scripts/                   # 公开仓凭据守门、SSOT 一致性门禁、供应链审计、运行时锁同步、OpenAPI 校验、生产冒烟（prod-smoke/）与 L2 浏览器测试
 ├── docs/                      # 接口契约、配置、扩展、下载、发布回执、上游监控、Agent 指南与历史归档文档
-└── examples/                  # 独立 Python 3.9+ 标准库个人 Agent 批量直连下载参考脚本
+├── examples/                  # 独立 Python 3.9+ 标准库个人 Agent 批量直连下载参考脚本
+└── Makefile                   # 本地开发、测试、安全契约检查与生产构建统一入口（dev / test / check / build）
 ```
 
 </details>
@@ -261,9 +252,9 @@ python3 -B scripts/check-supply-chain.py --offline
 | [docs/AGENT-API.md](docs/AGENT-API.md) · [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md) | 个人 Agent 通道鉴权、多角色配额、批量直连下载流水线与断点续传实践 |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `dokitool` 与 `shanghai-resolver` 启动参数、环境变量、多 Key 与 `SIGHUP` 热配置全量参考 |
 | [docs/DOWNLOADS.md](docs/DOWNLOADS.md) | 浏览器流式 SW 下载、多线路 Range 测速、ZIP 上限与历史下载验收记录 |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) | 生产发布受控闭环、阶段一/二脱敏回执模板与 [回滚手册](docs/go-migration/rollback.md) |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) | 生产发布受控闭环、阶段一/二脱敏回执模板与原子回滚说明 |
 | [docs/UPSTREAM-WATCH.md](docs/UPSTREAM-WATCH.md) · [docs/UPSTREAM-CANARY.md](docs/UPSTREAM-CANARY.md) | `yt-dlp` / `Deno` 6 文件锁同步、每日版本巡检与 12 小时低噪 Canary 探针 |
-| [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md) · [docs/HISTORY.md](docs/HISTORY.md) | 上海 `pull` v2 通道设计说明、Go 迁移历程与早期架构归档（含 `archive/php-oracle-final` PHP 对拍源码树退役归档） |
+| [docs/HISTORY.md](docs/HISTORY.md) | Go 迁移历程、早期架构记录与永久归档快照索引（`archive/php-oracle-final`、`archive/youtube-userscript-final`） |
 
 ---
 
@@ -272,5 +263,5 @@ python3 -B scripts/check-supply-chain.py --offline
 本仓库原创与衍生代码采用 [MIT License](LICENSE)，完整第三方组件与许可证声明见 [NOTICE](NOTICE)：
 
 - **早期架构与解析参考**：[jiuhunwl/short_videos](https://github.com/jiuhunwl/short_videos)（MIT）与 [jiuhunwl/shortvideo-html](https://github.com/jiuhunwl/shortvideo-html)（MIT）— 详见 [NOTICE](NOTICE) 与 [docs/HISTORY.md](docs/HISTORY.md)。
-- **Mediabunny**（`1.65.2`，`MPL-2.0`，Vanilagy）：作为未修改上游库同时内嵌于公开用户脚本 `frontend/public/helper/dokitool-youtube.user.js` 与 Chrome MV3 扩展的 `offscreen` 打包产物中，用于在浏览器本地对 YouTube 分离轨与 B 站 DASH 音视频执行无损封装；完整 MPL-2.0 文本保留在 `frontend/public/licenses/mediabunny-MPL-2.0.txt` 与 [NOTICE](NOTICE)。
+- **Mediabunny**（`1.65.2`，`MPL-2.0`，Vanilagy）：作为未修改上游库内嵌于 Chrome MV3 扩展的 `offscreen` 打包产物（`dokitool-chrome-extension.zip`）中，用于在浏览器本地对 YouTube 分离轨与 B 站 DASH 音视频执行无损封装；完整 MPL-2.0 文本保留在 `frontend/public/licenses/mediabunny-MPL-2.0.txt` 与 [NOTICE](NOTICE)。
 - **FixTweet**（`api.fxtwitter.com`）：在服务端显式启用 `-x-tombstone-fallback=fxtwitter` 时，作为 X 受限推文（`TweetTombstone`）的可选公开 HTTP 元数据查询源；本仓库未复制或分发 FixTweet 源代码（详见 [NOTICE](NOTICE)）。

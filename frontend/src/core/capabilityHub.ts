@@ -5,10 +5,9 @@ import extensionReleaseMeta from "./extensionReleaseMeta.json";
  *
  * Strictly capability-driven (zero DOM, zero `chrome.*`, zero platform-name
  * branching). Enforces the canonical execution priority:
- *   1. Connected DokiTool Extension (`dash_mux` / `youtube_mux` / `youtube_parse` / `direct_download`)
- *   2. Legacy Userscript Helper (non-Chromium or extension-disconnected fallback)
- *   3. Web Service Worker Multi-Range Stream
- *   4. Native Browser Direct Download / External Link
+ *   1. Connected DokiTool Chrome Extension (`dash_mux` / `youtube_mux` / `youtube_parse` / `direct_download`)
+ *   2. Web Service Worker Multi-Range Stream
+ *   3. Native Browser Direct Download / External Link
  */
 
 const STRICT_SEMVER_RE = /^\d+\.\d+\.\d+$/;
@@ -59,8 +58,6 @@ export interface ClientCapabilityEnvironment {
   extensionConnected: boolean;
   extensionVersion: string;
   extensionCapabilities: ReadonlyArray<string>;
-  userscriptReady: boolean;
-  userscriptVersion?: string;
   swMultiRangeAvailable?: boolean;
 }
 
@@ -87,8 +84,6 @@ export type ExecutionChannel =
   | "extension_youtube_mux"
   | "extension_mux"
   | "extension_direct"
-  | "userscript_mux"
-  | "userscript_direct"
   | "web_sw_stream"
   | "browser_direct"
   | "external_link"
@@ -98,13 +93,12 @@ export interface ExecutionPlan {
   channel: ExecutionChannel;
   canDownload: boolean;
   usesExtension: boolean;
-  usesUserscript: boolean;
   requiresUpgradeNotice: boolean;
   reason?: string;
 }
 
 export interface ClientParseRoute {
-  channel: "extension_client_parse" | "userscript_client_parse" | "server_api";
+  channel: "extension_client_parse" | "server_api";
 }
 
 function parseSemverTuple(raw: string): [number, number, number] | null {
@@ -216,7 +210,7 @@ export function hasClientExtensionCapability(
 
 /**
  * Decides how a client-session-required URL should be parsed:
- * Priority: Connected Extension (`youtube_parse`) > Userscript Helper > Server API.
+ * Priority: Connected Extension (`youtube_parse`) > Server API.
  */
 export function resolveClientParseRoute(
   requiresClientSession: boolean,
@@ -228,15 +222,12 @@ export function resolveClientParseRoute(
   if (hasClientExtensionCapability(env, "youtube_parse")) {
     return { channel: "extension_client_parse" };
   }
-  if (env.userscriptReady) {
-    return { channel: "userscript_client_parse" };
-  }
   return { channel: "server_api" };
 }
 
 /**
  * Unified execution plan resolver for any media option across all platforms.
- * Priority: Connected Extension > Userscript Helper > Web SW Stream > Native Direct.
+ * Priority: Connected Extension > Web SW Stream > Native Direct.
  */
 export function resolveExecutionPlan(
   option: ExecutionPlanInput,
@@ -253,7 +244,6 @@ export function resolveExecutionPlan(
         channel: "extension_mux",
         canDownload: true,
         usesExtension: true,
-        usesUserscript: false,
         requiresUpgradeNotice: false,
       };
     }
@@ -261,7 +251,6 @@ export function resolveExecutionPlan(
       channel: "blocked",
       canDownload: false,
       usesExtension: false,
-      usesUserscript: false,
       requiresUpgradeNotice: true,
       reason: "extension_mux_required",
     };
@@ -274,16 +263,6 @@ export function resolveExecutionPlan(
         channel: "extension_youtube_mux",
         canDownload: true,
         usesExtension: true,
-        usesUserscript: false,
-        requiresUpgradeNotice: false,
-      };
-    }
-    if (env.userscriptReady) {
-      return {
-        channel: "userscript_mux",
-        canDownload: true,
-        usesExtension: false,
-        usesUserscript: true,
         requiresUpgradeNotice: false,
       };
     }
@@ -292,7 +271,6 @@ export function resolveExecutionPlan(
         channel: "blocked",
         canDownload: false,
         usesExtension: false,
-        usesUserscript: false,
         requiresUpgradeNotice: true,
         reason: "client_mux_required",
       };
@@ -306,16 +284,6 @@ export function resolveExecutionPlan(
         channel: "extension_direct",
         canDownload: true,
         usesExtension: true,
-        usesUserscript: false,
-        requiresUpgradeNotice: false,
-      };
-    }
-    if (env.userscriptReady) {
-      return {
-        channel: "userscript_direct",
-        canDownload: true,
-        usesExtension: false,
-        usesUserscript: true,
         requiresUpgradeNotice: false,
       };
     }
@@ -323,7 +291,6 @@ export function resolveExecutionPlan(
       channel: "blocked",
       canDownload: false,
       usesExtension: false,
-      usesUserscript: false,
       requiresUpgradeNotice: true,
       reason: "client_session_required",
     };
@@ -344,7 +311,6 @@ export function resolveExecutionPlan(
       channel: "extension_direct",
       canDownload: true,
       usesExtension: true,
-      usesUserscript: false,
       requiresUpgradeNotice: false,
     };
   }
@@ -361,7 +327,6 @@ export function resolveExecutionPlan(
         channel: "browser_direct",
         canDownload: true,
         usesExtension: false,
-        usesUserscript: false,
         requiresUpgradeNotice: false,
       };
     }
@@ -370,7 +335,6 @@ export function resolveExecutionPlan(
         channel: "web_sw_stream",
         canDownload: true,
         usesExtension: false,
-        usesUserscript: false,
         requiresUpgradeNotice: false,
       };
     }
@@ -378,7 +342,6 @@ export function resolveExecutionPlan(
       channel: "browser_direct",
       canDownload: true,
       usesExtension: false,
-      usesUserscript: false,
       requiresUpgradeNotice: false,
     };
   }
@@ -387,7 +350,6 @@ export function resolveExecutionPlan(
     channel: "external_link",
     canDownload: false,
     usesExtension: false,
-    usesUserscript: false,
     requiresUpgradeNotice: false,
   };
 }

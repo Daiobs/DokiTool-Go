@@ -561,7 +561,7 @@ describe("youtubeHelperCore.js re-export identity contract", () => {
       );
     }
 
-    // Ensure youtubeHelperCore preserves exact original 51 exported symbols (no dropped or leaked exports)
-    assert.equal(Object.keys(youtubeHelperCore).length, 51);
+    // Ensure youtubeHelperCore preserves exact 49 exported symbols (after retiring standalone YOUTUBE_HELPER_VERSION & YOUTUBE_HELPER_SCRIPT_URL)
+    assert.equal(Object.keys(youtubeHelperCore).length, 49);
   });
 });

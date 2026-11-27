@@ -1,7 +1,8 @@
 export function resolveApiConfig(env: Record<string, string | undefined>) {
-  const mode = (env.VITE_API_MODE || "php").trim();
-  if (mode !== "php" && mode !== "secure") {
-    throw new Error("VITE_API_MODE must be php or secure");
+  const rawMode = (env.VITE_API_MODE || "same-origin").trim();
+  const mode = rawMode === "php" ? "same-origin" : rawMode;
+  if (mode !== "same-origin" && mode !== "secure") {
+    throw new Error("VITE_API_MODE must be same-origin or secure");
   }
   const baseUrl = (env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
   // Empty means same origin. An explicit base must be an HTTP(S) origin,

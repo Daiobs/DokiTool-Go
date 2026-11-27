@@ -3802,7 +3802,7 @@ test('copy-url button remains enabled and emits exact activeVideoUrl on YouTube 
     source_url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
     default_item_id: 'yt-item-1',
     extra: {
-      youtube_helper: { status: 'ready', version: '1.3.2', script_url: '/helper/dokitool-youtube.user.js' },
+      youtube_helper: { status: 'ready', provider: 'extension', version: '4.5.0' },
     },
     items: [
       {
@@ -4369,7 +4369,7 @@ test('PR #34 Round 2: WEB_EXT_ENQUEUE_MEDIA strips unwhitelisted fallback routes
   }
 });
 
-test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_EXT_PARSE_YOUTUBE, handles LOGIN_REQUIRED & transport fallback, and auto-resumes on tab return', async () => {
+test('P1 (PR-2) Web <-> Extension YouTube single-path parsing: uses WEB_EXT_PARSE_YOUTUBE, handles LOGIN_REQUIRED & transport error fallback with zero /api/parse calls', async () => {
   const prevChrome = globalThis.chrome;
   const sentMessages = [];
   let extParseMode = 'ok';
@@ -4402,7 +4402,7 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
       },
     ],
     extra: {
-      youtube_helper: { status: 'ready', version: '1.3.2' },
+      youtube_helper: { status: 'ready', provider: 'extension', version: '4.5.0' },
     },
   });
 
@@ -4418,7 +4418,7 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
           cb({
             ok: true,
             data: {
-              version: '4.2.0',
+              version: '4.5.0',
               extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
               capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
             },
@@ -4445,14 +4445,7 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
   };
 
   try {
-    const storageMap = new Map();
-    const mockSessionStorage = {
-      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
-      setItem: (k, v) => storageMap.set(k, String(v)),
-      removeItem: (k) => storageMap.delete(k),
-    };
-
-    const createParserEnv = (pingHelperFn, opts = {}) => {
+    const createParserEnv = (opts = {}) => {
       const store = {
         resultData: null,
         resultVersion: 0,
@@ -4460,56 +4453,43 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
         setResult(d) { this.resultData = d; this.resultVersion++; },
       };
       const toasts = [];
-      let reloadCount = 0;
       const inst = parser.useVideoParser({
         videoStore: store,
         locale: ref(opts.locale || 'zh-CN'),
         showToast: (...args) => toasts.push(args),
-        sessionStorage: mockSessionStorage,
-        reloadPage: () => { reloadCount += 1; },
-        pingHelper: pingHelperFn,
       });
-      return { store, toasts, inst, getReloadCount: () => reloadCount };
+      return { store, toasts, inst };
     };
 
-    // 1) Extension connected with `youtube_parse`: parses via WEB_EXT_PARSE_YOUTUBE, sets provider="extension", NEVER calls userscript pingHelper
-    let pingHelperCalls = 0;
-    const envOk = createParserEnv(async () => {
-      pingHelperCalls++;
-      return { installed: false, version: null, supported: false };
-    });
+    // 1) Extension connected with `youtube_parse`: parses via WEB_EXT_PARSE_YOUTUBE, sets provider="extension"
+    const envOk = createParserEnv();
     envOk.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await envOk.inst.parseVideo();
 
-    assert.equal(pingHelperCalls, 0, 'userscript pingHelper MUST NOT be called when extension handles youtube_parse');
     assert.equal(envOk.inst.parseError.value, '');
     assert.equal(envOk.store.resultData?.title, 'Extension Parsed 4K60 Video');
     assert.equal(envOk.store.resultData?.extra?.youtube_helper?.status, 'ready');
     assert.equal(envOk.store.resultData?.extra?.youtube_helper?.provider, 'extension');
-    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.version, '4.2.0');
-    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.2.0');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.version, '4.5.0');
+    assert.equal(envOk.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.5.0');
     const parseCall = sentMessages.find((m) => m.msg.type === 'WEB_EXT_PARSE_YOUTUBE');
     assert.ok(parseCall);
     assert.equal(parseCall.extId, 'ihamkldlkdibleacagiejklpfofapkpo');
     assert.equal(parseCall.msg.videoId, 'I9JvDaciaFk');
     assert.equal(parseCall.msg.locale, 'zh-CN');
 
-    // 2) Extension returns LOGIN_REQUIRED -> sets login_required with provider="extension" and NEVER falls back to userscript
+    // 2) Extension returns LOGIN_REQUIRED -> sets login_required with provider="extension"
     extParseMode = 'login_required';
-    const envLogin = createParserEnv(async () => {
-      pingHelperCalls++;
-      return { installed: false, version: null, supported: false };
-    });
+    const envLogin = createParserEnv();
     envLogin.inst.inputUrl.value = 'https://youtu.be/I9JvDaciaFk';
     await envLogin.inst.parseVideo();
-    assert.equal(pingHelperCalls, 0);
     assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.status, 'login_required');
     assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.provider, 'extension');
-    assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.2.0');
+    assert.equal(envLogin.store.resultData?.extra?.youtube_helper?.extensionVersion, '4.5.0');
     assert.match(envLogin.inst.parseError.value, /需要验证/);
     assert.equal(envLogin.toasts.at(-1)?.[1], 'error');
 
-    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> cleanly falls through to legacy userscript check, and when helper is missing renders fallback with ZERO /api/parse calls
+    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> renders extension missing fallback with ZERO /api/parse calls
     extParseMode = 'transport_timeout';
     let fallbackStandardParseCalls = 0;
     globalThis.fetch = async () => {
@@ -4520,57 +4500,12 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript parsing: prefers WEB_E
         data: makeYouTubeMedia('Server Redacted Preview'),
       });
     };
-    const envFallback = createParserEnv(async () => {
-      pingHelperCalls++;
-      return { installed: false, version: null, supported: false };
-    });
+    const envFallback = createParserEnv();
     envFallback.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await envFallback.inst.parseVideo();
-    assert.equal(pingHelperCalls, 1, 'transport error must fall through to legacy userscript pingHelper');
-    assert.equal(fallbackStandardParseCalls, 0, 'fallback when helper is missing must NOT call /api/parse');
+    assert.equal(fallbackStandardParseCalls, 0, 'fallback when extension bridge fails must NOT call /api/parse');
     assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.status, 'missing');
-
-    // 4) Tab return & resumePendingYouTubeHelperInstall detect connected extension with `youtube_parse`, clear wait state, and auto-re-parse with zero reload and zero userscript check
-    extParseMode = 'ok';
-    extConnected = true;
-    pingHelperCalls = 0;
-    const envTab = createParserEnv(async () => {
-      pingHelperCalls++;
-      return { installed: false, version: null, supported: false };
-    }, { locale: 'en' });
-    envTab.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
-    envTab.inst.markWaitingForYouTubeHelperInstall();
-    assert.ok(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY));
-
-    const resumedOnTab = await envTab.inst.handleYouTubeHelperTabReturn();
-    assert.equal(resumedOnTab, true);
-    assert.equal(envTab.getReloadCount(), 0);
-    assert.equal(pingHelperCalls, 0);
-    assert.equal(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY), null);
-    assert.equal(envTab.store.resultData?.extra?.youtube_helper?.provider, 'extension');
-    assert.equal(sentMessages.at(-1)?.msg?.locale, 'en');
-
-    // Also verify resumePendingYouTubeHelperInstall on page load
-    mockSessionStorage.setItem(
-      parser.YT_HELPER_INSTALL_WAIT_KEY,
-      JSON.stringify({
-        waiting: true,
-        url: 'https://www.youtube.com/watch?v=I9JvDaciaFk',
-        platform: 'all',
-        reloaded: true,
-        updatedAt: Date.now(),
-      }),
-    );
-    const envResume = createParserEnv(async () => {
-      pingHelperCalls++;
-      return { installed: false, version: null, supported: false };
-    });
-    const resumedOnLoad = await envResume.inst.resumePendingYouTubeHelperInstall();
-    assert.equal(resumedOnLoad, true);
-    assert.equal(pingHelperCalls, 0);
-    assert.equal(mockSessionStorage.getItem(parser.YT_HELPER_INSTALL_WAIT_KEY), null);
-    assert.equal(envResume.store.resultData?.extra?.youtube_helper?.status, 'ready');
-    assert.equal(envResume.store.resultData?.extra?.youtube_helper?.provider, 'extension');
+    assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.provider, 'extension');
   } finally {
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
@@ -4594,9 +4529,8 @@ test('P1 (PR-2) Web <-> Extension YouTube zero-userscript downloads: 4K60/1080p 
       youtube_helper: {
         status: 'ready',
         provider: 'extension',
-        version: '4.2.0',
-        extensionVersion: '4.2.0',
-        script_url: '/helper/dokitool-youtube.user.js',
+        version: '4.5.0',
+        extensionVersion: '4.5.0',
       },
     },
     items: [
