@@ -548,6 +548,8 @@ async function checkNative() {
   } finally {
     await writeFile(path.join(runDir, 'native-isolation-results.json'), JSON.stringify(report, null, 2) + '\n')
     browser.close()
+    cdnServer.closeAllConnections?.()
+    appServer.closeAllConnections?.()
     cdnServer.close()
     appServer.close()
   }

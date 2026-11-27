@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -16,8 +17,8 @@ import urllib.request
 
 from security import (
     FetchResponse, HTTPStatusError, MAX_ERROR_BODY_BYTES, MAX_MEDIA_BYTES, MAX_REDIRECTS,
-    STREAM_CHUNK_BYTES, SecurityError, SizeLimitExceededError, build_media_headers,
-    is_loopback_host, resolve_jailed_path, validate_and_resolve_remote_url,
+    STANDARD_HTTP_PORTS, STREAM_CHUNK_BYTES, SecurityError, SizeLimitExceededError,
+    build_media_headers, is_loopback_host, resolve_jailed_path, validate_and_resolve_remote_url,
 )
 
 
@@ -114,22 +115,33 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PinnedHTTPSConnection, req, context=self._context, pinned_ips=self._pinned_ips)
 
 
+def _get_env_proxies() -> dict[str, str]:
+    """Read HTTP(S) proxies strictly from process environment variables, never OS system settings."""
+    raw = urllib.request.getproxies_environment()
+    return {
+        k.lower(): v
+        for k, v in raw.items()
+        if k.lower() in ("http", "https") and isinstance(v, str) and v.strip()
+    }
+
+
 def has_env_proxy_for(scheme: str, host: str, port: int | None = None) -> bool:
     """Return True if an environment HTTP(S) proxy applies to the target host."""
-    proxies = urllib.request.getproxies()
+    proxies = _get_env_proxies()
     if not proxies.get(scheme.lower()):
         return False
     hostport = f"{host}:{port}" if port is not None else host
-    return not urllib.request.proxy_bypass(hostport)
+    return not urllib.request.proxy_bypass_environment(hostport)
 
 
 def build_safe_opener(*, bypass_proxy: bool, pinned_ips: Sequence[str] = ()) -> urllib.request.OpenerDirector:
-    """Build OpenerDirector with NO cookies, NO auto-redirects, NO file/ftp handlers."""
+    """Build OpenerDirector with NO cookies, NO auto-redirects, NO file/ftp handlers, NO OS proxies."""
     opener = urllib.request.OpenerDirector()
     ctx = ssl.create_default_context()
     use_pin = bypass_proxy and bool(pinned_ips)
+    proxy_map = {} if bypass_proxy else _get_env_proxies()
     handlers = (
-        urllib.request.ProxyHandler({}) if bypass_proxy else urllib.request.ProxyHandler(),
+        urllib.request.ProxyHandler(proxy_map),
         PinnedHTTPHandler(pinned_ips) if use_pin else urllib.request.HTTPHandler(),
         PinnedHTTPSHandler(context=ctx, pinned_ips=pinned_ips) if use_pin else urllib.request.HTTPSHandler(context=ctx),
         urllib.request.HTTPDefaultErrorHandler(),
@@ -189,14 +201,22 @@ class SafeHTTPFetcher:
         self, *, timeout: float = 30.0, max_redirects: int = MAX_REDIRECTS, no_proxy: bool = False,
         resolver: Callable[..., list[Any]] | None = None, url_validator: Callable[..., Any] | None = None,
         opener_factory: Callable[[bool], urllib.request.OpenerDirector] | None = None,
+        allowed_media_ports: frozenset[int] | None = STANDARD_HTTP_PORTS,
     ) -> None:
         self.timeout, self.max_redirects, self.no_proxy = timeout, max_redirects, bool(no_proxy)
         self._resolver, self._url_validator, self._opener_factory = resolver, url_validator, opener_factory
+        self._allowed_media_ports = allowed_media_ports
         self._redirects = SafeRedirectHandler(max_redirects=max_redirects)
 
-    def _validate_hop(self, url: str, *, allow_loopback: bool) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
+    def _validate_hop(
+        self, url: str, *, allow_loopback: bool, media_mode: bool,
+    ) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
         if self._url_validator is None:
-            return validate_and_resolve_remote_url(url, allow_loopback=allow_loopback, resolve_dns=True, resolver=self._resolver)
+            ports = self._allowed_media_ports if media_mode else None
+            return validate_and_resolve_remote_url(
+                url, allow_loopback=allow_loopback, resolve_dns=True,
+                resolver=self._resolver, allowed_ports=ports,
+            )
         res = self._url_validator(url, allow_loopback=allow_loopback, resolve_dns=True, resolver=self._resolver)
         return (res[0], tuple(res[1])) if (isinstance(res, tuple) and len(res) == 2) else (res, ())
 
@@ -205,14 +225,21 @@ class SafeHTTPFetcher:
         allow_redirects: bool, media_mode: bool, timeout: float | None,
     ) -> tuple[Any, str]:
         current, hops, req_timeout = url, 0, (self.timeout if timeout is None else timeout)
+        prev_scheme: str | None = None
         while True:
-            parsed, pinned_ips = self._validate_hop(current, allow_loopback=(allow_loopback if hops == 0 else False))
+            parsed, pinned_ips = self._validate_hop(
+                current, allow_loopback=(allow_loopback if hops == 0 else False), media_mode=media_mode,
+            )
+            curr_scheme = parsed.scheme.lower()
+            if hops > 0 and prev_scheme == "https" and curr_scheme != "https":
+                raise SecurityError("Refusing HTTPS-to-HTTP redirect downgrade")
+            prev_scheme = curr_scheme
             stripped = ("cookie", "authorization", "proxy-authorization") if hops > 0 else ("cookie",)
             req_headers = build_media_headers(current, extra_headers=headers) if media_mode else {
                 k: v for k, v in (headers or {}).items() if k.lower().strip() not in stripped
             }
             host = (parsed.hostname or "").lower().rstrip(".")
-            use_proxy = (not self.no_proxy) and (not is_loopback_host(host)) and has_env_proxy_for(parsed.scheme, host, parsed.port)
+            use_proxy = (not self.no_proxy) and (not is_loopback_host(host)) and has_env_proxy_for(curr_scheme, host, parsed.port)
             bypass = not use_proxy
             opener = self._opener_factory(bypass) if self._opener_factory is not None else build_safe_opener(bypass_proxy=bypass, pinned_ips=pinned_ips if bypass else ())
             try:
@@ -254,8 +281,10 @@ class SafeHTTPFetcher:
         resp, final_url = self._open_with_redirects(
             url, headers=headers, allow_loopback=False, allow_redirects=True, media_mode=True, timeout=timeout
         )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         try:
-            with open(safe_part, "wb") as handle:
+            fd = os.open(safe_part, flags, 0o600)
+            with os.fdopen(fd, "wb") as handle:
                 written, hdrs = _stream_bounded(resp, max_bytes, handle.write, check_complete=True)
                 handle.flush()
             return written, hdrs, final_url

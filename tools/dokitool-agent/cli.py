@@ -95,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sub.add_argument("--all-tracks", action="store_true", help="Fetch all matching subtitle tracks")
     p_sub.add_argument("--allow-write", action="store_true", help="Explicit opt-in to write subtitle files locally")
     p_sub.add_argument("--output-dir", type=Path, help="Jailed directory for writing subtitle files (requires --allow-write)")
+    p_sub.add_argument("--overwrite", action="store_true", help="Allow replacing existing files in --output-dir")
 
     p_dl = sub.add_parser("download", help="Download media locally (explicit --allow-write --output-dir required)", allow_abbrev=False)
     _add_shared_args(p_dl)
@@ -105,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--filename", help="Optional target basename strictly inside --output-dir")
     p_dl.add_argument("--allow-write", action="store_true", help="Required explicit opt-in to write files")
     p_dl.add_argument("--output-dir", type=Path, help="Required jailed output directory")
+    p_dl.add_argument("--overwrite", action="store_true", help="Allow replacing existing files in --output-dir (default: no-clobber)")
     p_dl.add_argument("--allow-ffmpeg", action="store_true", help="Explicit opt-in to run local ffmpeg for mux variants")
     p_dl.add_argument("--with-subtitles", action="store_true", help="Also fetch and save matching subtitles")
     p_dl.add_argument("--lang", help="Subtitle language filter when --with-subtitles is set")
@@ -199,7 +201,8 @@ def _cmd_subtitles(client: DokiToolClient, args: argparse.Namespace) -> int:
     if args.allow_write and args.output_dir is not None and result["tracks"]:
         prefix = f"{result.get('platform') or 'media'}_{result.get('content_id') or 'sub'}"
         result["saved_files"] = write_subtitle_files(
-            result["tracks"], args.output_dir, allow_write=True, stem_prefix=prefix
+            result["tracks"], args.output_dir, allow_write=True, stem_prefix=prefix,
+            overwrite=bool(getattr(args, "overwrite", False)),
         )
     _emit_output(result, args.format, _render_subtitles_text)
     return 0
@@ -215,6 +218,7 @@ def _cmd_download(client: DokiToolClient, args: argparse.Namespace) -> int:
         args.output_dir,
         allow_write=True,
         allow_ffmpeg=args.allow_ffmpeg,
+        overwrite=bool(getattr(args, "overwrite", False)),
         platform=args.platform,
         item_id=args.item_id,
         variant_id=args.variant_id,
@@ -269,6 +273,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return server.serve_forever()
         return 2
+    except KeyboardInterrupt:
+        sys.stderr.write("interrupted\n")
+        return 130
     except DokiToolAuthError as exc:
         sys.stderr.write(f"auth error: {redact_sensitive(str(exc))}\n")
         return 3

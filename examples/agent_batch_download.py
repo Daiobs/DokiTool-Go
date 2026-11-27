@@ -2,11 +2,12 @@
 """Minimal standalone batch downloader for the DokiTool Personal Agent API.
 
 Uses the Python 3.9+ standard library only (zero third-party or repo imports).
-Reads the owner token exclusively from the DOKITOOL_OWNER_TOKEN environment
-variable, sends it only via the Authorization: Bearer header (never in URL query
-parameters, where tokens are ignored as anonymous visitor requests without error
-while leaking into access logs and shell history), and never forwards
-Authorization or Cookie headers to media CDNs.
+Reads the API token exclusively from the DOKITOOL_API_TOKEN (or legacy
+DOKITOOL_OWNER_TOKEN) environment variable, sends it only via the
+Authorization: Bearer header (never in URL query parameters, where tokens are
+ignored as anonymous visitor requests without error while leaking into access
+logs and shell history), enforces anti-SSRF IP pinning on CDN downloads and
+redirects, and never forwards Authorization or Cookie headers to media CDNs.
 """
 from __future__ import annotations
 
@@ -14,11 +15,15 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
 import random
 import re
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -30,6 +35,28 @@ CHUNK_BYTES = 256 * 1024
 PROBE_BYTES = 256 * 1024
 MAGIC_PEEK_BYTES = 32
 EXPIRY_MARGIN_SECONDS = 30
+MAX_API_JSON_BYTES = 8 * 1024 * 1024
+MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024
+MAX_CDN_REDIRECTS = 5
+STANDARD_HTTP_PORTS = frozenset({80, 443})
+BLOCKED_HOST_SUFFIXES = (
+    "localhost", "local", "internal", "localdomain", "home.arpa",
+    "invalid", "lan", "corp", "intranet", "private",
+)
+_FORBIDDEN_IPV4_NETS = tuple(ipaddress.ip_network(c) for c in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+))
+_FORBIDDEN_IPV6_NETS = tuple(ipaddress.ip_network(c) for c in (
+    "::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+    "2001::/32", "2001:2::/48", "2001:db8::/32", "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+))
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
+_URL_USERINFO_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://)[^\s/@#\"'<>]+@")
+_URL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://[^\s?#\"'<>]+)\?[^\s#\"'<>]+")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_PUBLIC_TLD_RE = re.compile(r"^(?:[a-z]{2,}|xn--[a-z0-9-]{2,})$")
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -107,15 +134,240 @@ def is_expired(expires_at: str | None, margin_seconds: int = EXPIRY_MARGIN_SECON
     return (dt - utc_now()).total_seconds() <= margin_seconds
 
 
+def redact_sensitive(text: str) -> str:
+    out = _BEARER_RE.sub("Bearer [REDACTED]", str(text or ""))
+    for env_key in ("DOKITOOL_API_TOKEN", "DOKITOOL_OWNER_TOKEN"):
+        secret = (os.environ.get(env_key) or "").strip()
+        if len(secret) >= 8:
+            out = out.replace(secret, "[REDACTED_TOKEN]")
+    return _URL_QUERY_RE.sub(r"\1?[REDACTED]", _URL_USERINFO_RE.sub(r"\1[REDACTED]@", out))
+
+
+def _parse_ip(raw_host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(raw_host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    norm = (host or "").strip().lower().rstrip(".")
+    if norm == "localhost" or (norm.endswith(".localhost") and all(_DNS_LABEL_RE.match(lbl) for lbl in norm.split("."))):
+        return True
+    ip = _parse_ip(norm)
+    if ip is None:
+        return False
+    return ip.ipv4_mapped.is_loopback if (isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped) else ip.is_loopback
+
+
+def _is_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return _is_public_ip(addr.ipv4_mapped)
+    if (
+        addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast
+        or addr.is_reserved or addr.is_unspecified or getattr(addr, "is_site_local", False) or not addr.is_global
+    ):
+        return False
+    nets = _FORBIDDEN_IPV4_NETS if isinstance(addr, ipaddress.IPv4Address) else _FORBIDDEN_IPV6_NETS
+    return not any(addr in net for net in nets)
+
+
+def _get_env_proxies() -> dict[str, str]:
+    raw = urllib.request.getproxies_environment()
+    return {
+        k.lower(): v
+        for k, v in raw.items()
+        if k.lower() in ("http", "https") and isinstance(v, str) and v.strip()
+    }
+
+
+def _has_env_proxy_for(scheme: str, host: str, port: int | None = None) -> bool:
+    proxies = _get_env_proxies()
+    if not proxies.get(scheme.lower()):
+        return False
+    hostport = f"{host}:{port}" if port is not None else host
+    return not urllib.request.proxy_bypass_environment(hostport)
+
+
+def _connect_pinned_ip(ip_str: str, port: int, timeout: float | None, source_address: tuple[str, int] | None = None) -> socket.socket:
+    addr = ipaddress.ip_address(ip_str)
+    family = socket.AF_INET6 if isinstance(addr, ipaddress.IPv6Address) else socket.AF_INET
+    sockaddr = (ip_str, port, 0, 0) if family == socket.AF_INET6 else (ip_str, port)
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if isinstance(timeout, (int, float)):
+            sock.settimeout(timeout)
+        if source_address:
+            sock.bind(source_address)
+        sock.connect(sockaddr)
+        return sock
+    except OSError:
+        sock.close()
+        raise
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, *args, pinned_ips: tuple[str, ...] = (), **kwargs) -> None:
+        self._pinned_ips = pinned_ips
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self) -> None:
+        if not self._pinned_ips:
+            super().connect()
+            return
+        last_err: OSError | None = None
+        for ip in self._pinned_ips:
+            try:
+                self.sock = _connect_pinned_ip(ip, self.port, self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self._tunnel()
+                return
+            except OSError as exc:
+                last_err = exc
+        raise last_err or OSError(f"Failed to connect to pinned IP for {self.host}")
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, *args, pinned_ips: tuple[str, ...] = (), **kwargs) -> None:
+        self._pinned_ips = pinned_ips
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self) -> None:
+        if not self._pinned_ips:
+            super().connect()
+            return
+        last_err: OSError | None = None
+        for ip in self._pinned_ips:
+            sock: socket.socket | None = None
+            try:
+                sock = _connect_pinned_ip(ip, self.port, self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self.sock = sock
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(sock, server_hostname=self._tunnel_host or self.host)
+                return
+            except OSError as exc:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self.sock, last_err = None, exc
+        raise last_err or OSError(f"Failed to establish TLS to pinned IP for {self.host}")
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, pinned_ips: tuple[str, ...] = ()) -> None:
+        super().__init__()
+        self._pinned_ips = pinned_ips
+
+    def http_open(self, req: urllib.request.Request):
+        return self.do_open(_PinnedHTTPConnection, req, pinned_ips=self._pinned_ips)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context: ssl.SSLContext, pinned_ips: tuple[str, ...] = ()) -> None:
+        super().__init__(context=context)
+        self._pinned_ips = pinned_ips
+
+    def https_open(self, req: urllib.request.Request):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context, pinned_ips=self._pinned_ips)
+
+
+def _build_safe_opener(*, bypass_proxy: bool, pinned_ips: tuple[str, ...] = ()) -> urllib.request.OpenerDirector:
+    """OpenerDirector with zero cookies, zero auto-redirects, zero file/ftp handlers, zero OS proxies."""
+    opener = urllib.request.OpenerDirector()
+    ctx = ssl.create_default_context()
+    use_pin = bypass_proxy and bool(pinned_ips)
+    proxy_map = {} if bypass_proxy else _get_env_proxies()
+    for handler in (
+        urllib.request.ProxyHandler(proxy_map),
+        _PinnedHTTPHandler(pinned_ips) if use_pin else urllib.request.HTTPHandler(),
+        _PinnedHTTPSHandler(ctx, pinned_ips) if use_pin else urllib.request.HTTPSHandler(context=ctx),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+def validate_remote_url_and_pin(
+    url: str,
+    *,
+    allowed_loopback_origin: tuple[str, str, int] | None = None,
+    enforce_standard_ports: bool = True,
+) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
+    if not isinstance(url, str) or not url or len(url) > 8192:
+        raise ValueError("Invalid remote URL")
+    if any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in ("\\", "#") for ch in url):
+        raise ValueError("URL contains forbidden characters")
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported URL scheme: {scheme or '<empty>'}")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc or not parsed.hostname:
+        raise ValueError("URL userinfo is forbidden and hostname is required")
+    host = parsed.hostname.lower().rstrip(".")
+    if "%" in host:
+        raise ValueError("Scoped IPv6 addresses are forbidden")
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    if _is_loopback_host(host):
+        if allowed_loopback_origin is None or (scheme, host, port) != allowed_loopback_origin:
+            raise ValueError("Refusing loopback/local URL for media fetch")
+        ip = _parse_ip(host)
+        if ip is not None:
+            return parsed, (str(ip),)
+        return parsed, ("127.0.0.1", "::1")
+
+    if enforce_standard_ports and port not in STANDARD_HTTP_PORTS:
+        raise ValueError(f"Refusing non-standard media port: {port}")
+    if any(host == s or host.endswith("." + s) for s in BLOCKED_HOST_SUFFIXES):
+        raise ValueError(f"Blocked internal hostname suffix: {host}")
+    ip = _parse_ip(host)
+    if ip is not None:
+        if not _is_public_ip(ip):
+            raise ValueError("Refusing non-public IP literal")
+        return parsed, (str(ip),)
+    labels = host.split(".")
+    if len(labels) < 2 or not _PUBLIC_TLD_RE.match(labels[-1]) or not all(_DNS_LABEL_RE.match(lbl) for lbl in labels):
+        raise ValueError(f"Invalid public DNS hostname: {host}")
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"DNS resolution failed for {host}") from exc
+    pinned: list[str] = []
+    for entry in infos:
+        resolved = _parse_ip(str(entry[4][0]))
+        if resolved is None or not _is_public_ip(resolved):
+            raise ValueError(f"Host {host} resolved to non-public IP")
+        ip_str = str(resolved)
+        if ip_str not in pinned:
+            pinned.append(ip_str)
+    if not pinned:
+        raise ValueError(f"No public IP addresses resolved for {host}")
+    return parsed, tuple(pinned)
+
+
 def validate_api_base(api_base: str) -> str:
     cleaned = api_base.strip().rstrip("/")
     parsed = urllib.parse.urlsplit(cleaned)
     scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    if scheme not in {"http", "https"} or not host or parsed.query or parsed.fragment:
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        scheme not in {"http", "https"} or not host or parsed.query or parsed.fragment
+        or parsed.username is not None or parsed.password is not None or "@" in parsed.netloc
+    ):
         raise ValueError("Invalid --api-base URL")
-    if scheme == "http" and host not in {"127.0.0.1", "localhost", "::1"}:
+    if _is_loopback_host(host):
+        return cleaned
+    if scheme != "https":
         raise ValueError("Refusing to send Bearer token over plaintext HTTP to non-loopback host")
+    if any(host == s or host.endswith("." + s) for s in BLOCKED_HOST_SUFFIXES):
+        raise ValueError("Refusing internal hostname for --api-base")
+    ip = _parse_ip(host)
+    if ip is not None and not _is_public_ip(ip):
+        raise ValueError("Refusing non-public IP literal for --api-base")
     return cleaned
 
 
@@ -150,7 +402,7 @@ def infer_extension_from_result(
     meta = metadata or {}
     raw_ext = str(meta.get("extension") or "").strip().lower().lstrip(".")
     raw_ext = CONTAINER_ALIASES.get(raw_ext, raw_ext)
-    if re.fullmatch(r"[a-z0-9]{2,5}", raw_ext) and raw_ext != "bin":
+    if raw_ext in KNOWN_MEDIA_EXTENSIONS:
         return raw_ext
 
     by_mime = extension_from_content_type(str(meta.get("mime_type") or ""))
@@ -159,7 +411,7 @@ def infer_extension_from_result(
 
     raw_container = str(meta.get("container") or "").strip().lower().lstrip(".")
     raw_container = CONTAINER_ALIASES.get(raw_container, raw_container)
-    if re.fullmatch(r"[a-z0-9]{2,5}", raw_container) and raw_container != "bin":
+    if raw_container in KNOWN_MEDIA_EXTENSIONS:
         return raw_container
 
     for candidate_url in (url, route_url):
@@ -216,8 +468,21 @@ def infer_extension(
 
 
 def safe_output_path(output_dir: Path, filename: str) -> Path:
+    if output_dir.is_symlink():
+        raise ValueError("Output directory cannot be a symlink")
+    if (
+        not filename
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename)
+        or "/" in filename or "\\" in filename or ":" in filename
+        or filename.endswith((".", " "))
+        or filename.split(".", 1)[0].upper() in WINDOWS_RESERVED
+    ):
+        raise ValueError(f"Unsafe output filename rejected: {filename}")
     root = output_dir.resolve()
-    candidate = (root / filename).resolve()
+    raw_target = root / filename
+    if raw_target.is_symlink():
+        raise ValueError(f"Symlink target rejected: {filename}")
+    candidate = raw_target.resolve()
     if candidate.parent != root:
         raise ValueError(f"Unsafe output filename rejected: {filename}")
     return candidate
@@ -266,8 +531,53 @@ class AgentClient:
         self.token = token
         self.abort_event = abort_event
         self.timeout = timeout
-        # Dedicated opener without HTTPCookieProcessor so zero cookies are ever stored or sent.
-        self.cdn_opener = urllib.request.build_opener()
+        parsed_api = urllib.parse.urlsplit(api_base)
+        api_host = (parsed_api.hostname or "").lower().rstrip(".")
+        api_port = parsed_api.port or (443 if parsed_api.scheme.lower() == "https" else 80)
+        self._allowed_loopback_origin: tuple[str, str, int] | None = (
+            (parsed_api.scheme.lower(), api_host, api_port) if _is_loopback_host(api_host) else None
+        )
+
+    def open_safe_url(
+        self,
+        url: str,
+        *,
+        headers_fn,
+        timeout: float,
+        allow_redirects: bool,
+        is_api: bool = False,
+    ):
+        """Open HTTP(S) URL with zero cookies, anti-SSRF IP pinning, and manual redirect re-validation."""
+        current = url
+        hops = 0
+        prev_scheme: str | None = None
+        while True:
+            parsed, pinned_ips = validate_remote_url_and_pin(
+                current,
+                allowed_loopback_origin=self._allowed_loopback_origin if (is_api or hops == 0 or self._allowed_loopback_origin is not None) else None,
+                enforce_standard_ports=not is_api,
+            )
+            scheme = parsed.scheme.lower()
+            if hops > 0 and prev_scheme == "https" and scheme != "https":
+                raise ValueError("Refusing HTTPS-to-HTTP redirect downgrade")
+            prev_scheme = scheme
+            host = (parsed.hostname or "").lower().rstrip(".")
+            use_proxy = (not _is_loopback_host(host)) and _has_env_proxy_for(scheme, host, parsed.port)
+            bypass = not use_proxy
+            opener = _build_safe_opener(bypass_proxy=bypass, pinned_ips=pinned_ips if bypass else ())
+            req = urllib.request.Request(current, headers=headers_fn(current, hops), method="GET")
+            try:
+                return opener.open(req, timeout=timeout), current
+            except urllib.error.HTTPError as exc:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    location = (exc.headers.get("Location") or "").strip() if exc.headers else ""
+                    exc.close()
+                    if not allow_redirects or not location or hops >= MAX_CDN_REDIRECTS:
+                        raise ValueError(f"Redirect rejected or exceeded limit ({MAX_CDN_REDIRECTS})") from exc
+                    current = urllib.parse.urljoin(current, location)
+                    hops += 1
+                    continue
+                raise
 
     def api_get(self, path_and_query: str) -> dict:
         url = f"{self.api_base}{path_and_query}"
@@ -278,35 +588,41 @@ class AgentClient:
             if self.abort_event.is_set():
                 raise FatalAuthError("Aborted due to earlier HTTP 401 authentication failure")
 
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Accept": "application/json",
-                    "User-Agent": "DokiToolAgentBatchExample/1.0",
-                },
-                method="GET",
-            )
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
+                resp, _ = self.open_safe_url(
+                    url,
+                    headers_fn=lambda _u, _h: {
+                        "Authorization": f"Bearer {self.token}",
+                        "Accept": "application/json",
+                        "User-Agent": "DokiToolAgentBatchExample/1.0",
+                    },
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                    is_api=True,
+                )
+                with resp:
+                    raw_bytes = resp.read(MAX_API_JSON_BYTES + 1)
+                    if len(raw_bytes) > MAX_API_JSON_BYTES:
+                        raise PermanentAPIError(resp.status, "RESPONSE_TOO_LARGE", "API JSON response exceeded 8 MiB limit")
+                    payload = json.loads(raw_bytes.decode("utf-8"))
                     if payload.get("code") != "OK":
                         err = payload.get("error") or {}
                         raise PermanentAPIError(
                             resp.status,
                             str(err.get("code") or payload.get("code") or "UNKNOWN"),
-                            str(err.get("message") or "Unexpected non-OK response"),
+                            redact_sensitive(str(err.get("message") or "Unexpected non-OK response")),
                         )
                     return payload
             except urllib.error.HTTPError as exc:
-                raw_body = exc.read().decode("utf-8", errors="replace")
+                raw_body = exc.read(64 * 1024).decode("utf-8", errors="replace")
+                exc.close()
                 try:
                     body = json.loads(raw_body)
                 except ValueError:
                     body = {}
                 err = body.get("error") if isinstance(body.get("error"), dict) else {}
                 code = str(err.get("code") or body.get("code") or f"HTTP_{exc.code}")
-                message = str(err.get("message") or exc.reason or "HTTP error")
+                message = redact_sensitive(str(err.get("message") or exc.reason or "HTTP error"))
                 retryable = bool(err.get("retryable"))
 
                 # CRITICAL: HTTP 401 returns code="INVALID_INPUT" and charges the anonymous
@@ -345,21 +661,22 @@ class AgentClient:
                     continue
 
                 raise PermanentAPIError(exc.code, code, message) from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if transient_attempts < 2:
                     transient_attempts += 1
                     self._sleep(2.0 * transient_attempts)
                     continue
-                raise PermanentAPIError(0, "NETWORK_ERROR", str(exc)) from exc
+                raise PermanentAPIError(0, "NETWORK_ERROR", redact_sensitive(str(exc))) from exc
 
     def parse_url(self, share_url: str) -> dict:
         qs = urllib.parse.urlencode({"schema_version": "1.0", "url": share_url})
         return self.api_get(f"/api/parse?{qs}")
 
     def resolve_item(self, resolve_url: str) -> dict:
-        if not resolve_url.startswith("/api/resolve?"):
+        parsed = urllib.parse.urlsplit((resolve_url or "").strip())
+        if parsed.scheme or parsed.netloc or parsed.fragment or parsed.path != "/api/resolve" or not parsed.query:
             raise PermanentAPIError(400, "INVALID_RESOLVE_URL", "Refusing unexpected resolve_url path")
-        return self.api_get(resolve_url)
+        return self.api_get(resolve_url.strip())
 
     def probe_throughput(self, routes: list[dict]) -> list[dict]:
         if len(routes) <= 1:
@@ -367,13 +684,14 @@ class AgentClient:
         scored: list[tuple[float, int, dict]] = []
         for idx, route in enumerate(routes[:3]):
             start = time.monotonic()
-            req = urllib.request.Request(
-                route["url"],
-                headers=cdn_headers_for_url(route["url"], 0, PROBE_BYTES - 1),
-                method="GET",
-            )
             try:
-                with self.cdn_opener.open(req, timeout=8.0) as resp:
+                resp, _ = self.open_safe_url(
+                    route["url"],
+                    headers_fn=lambda u, _h: cdn_headers_for_url(u, 0, PROBE_BYTES - 1),
+                    timeout=8.0,
+                    allow_redirects=True,
+                )
+                with resp:
                     if resp.status not in {200, 206}:
                         scored.append((-1.0, idx, route))
                         continue
@@ -540,7 +858,7 @@ def find_existing_complete_file(
 
 
 def download_single_route(
-    opener: urllib.request.OpenerDirector,
+    client: AgentClient,
     route: dict,
     task: dict,
 ) -> tuple[Path, int]:
@@ -550,6 +868,8 @@ def download_single_route(
     result_url: str = str(task.get("result_url") or "")
     part_path = safe_output_path(output_dir, f"{stem}.part")
     expected_size = route.get("size_bytes")
+    if expected_size is not None and expected_size > MAX_MEDIA_BYTES:
+        raise ValueError(f"Declared media size exceeds {MAX_MEDIA_BYTES} byte limit")
     known_ext = infer_extension_from_result(metadata, result_url, route_url=route["url"])
 
     if not part_path.is_file():
@@ -562,12 +882,13 @@ def download_single_route(
         part_path.unlink(missing_ok=True)
         offset = 0
 
-    req = urllib.request.Request(
+    resp, final_url = client.open_safe_url(
         route["url"],
-        headers=cdn_headers_for_url(route["url"], byte_offset=offset),
-        method="GET",
+        headers_fn=lambda u, _h: cdn_headers_for_url(u, byte_offset=offset),
+        timeout=45.0,
+        allow_redirects=True,
     )
-    with opener.open(req, timeout=45.0) as resp:
+    with resp:
         status = resp.status
         resp_content_type = resp.headers.get("Content-Type", "") if resp.headers else ""
         mode = "wb"
@@ -588,15 +909,20 @@ def download_single_route(
             if cl.isdigit():
                 remote_total = int(cl)
         else:
-            raise urllib.error.HTTPError(route["url"], status, "Unexpected CDN status", resp.headers, None)
+            raise urllib.error.HTTPError(final_url, status, "Unexpected CDN status", resp.headers, None)
+
+        if remote_total is not None and remote_total > MAX_MEDIA_BYTES:
+            raise ValueError(f"CDN Content-Length exceeds {MAX_MEDIA_BYTES} byte limit")
 
         with open(part_path, mode) as handle:
             while True:
                 chunk = resp.read(CHUNK_BYTES)
                 if not chunk:
                     break
-                handle.write(chunk)
                 written += len(chunk)
+                if written > MAX_MEDIA_BYTES:
+                    raise ValueError(f"Downloaded media exceeded {MAX_MEDIA_BYTES} byte limit")
+                handle.write(chunk)
             handle.flush()
 
     target_total = expected_size if expected_size is not None else remote_total
@@ -611,7 +937,7 @@ def download_single_route(
         result_url,
         content_type=resp_content_type,
         head_bytes=head_bytes,
-        route_url=route["url"],
+        route_url=final_url,
     )
     final_path = safe_output_path(output_dir, f"{stem}.{resolved_ext}")
     os.replace(part_path, final_path)
@@ -634,7 +960,7 @@ def download_with_failover(
             saw_auth_or_gone = True
             continue
         try:
-            final_path, saved_bytes = download_single_route(client.cdn_opener, route, task)
+            final_path, saved_bytes = download_single_route(client, route, task)
             return final_path, saved_bytes, False
         except urllib.error.HTTPError as exc:
             last_err = exc
@@ -647,7 +973,7 @@ def download_with_failover(
 
     if saw_auth_or_gone:
         return None, 0, True
-    raise RuntimeError(f"All {len(candidates)} CDN routes failed: {last_err}")
+    raise RuntimeError(f"All {len(candidates)} CDN routes failed: {redact_sensitive(str(last_err))}")
 
 
 def process_share_input(
@@ -875,7 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
                 "input": share_line,
                 "status": "failed",
                 "error_code": "DOWNLOAD_FAILED",
-                "message": str(exc),
+                "message": redact_sensitive(str(exc)),
                 "updated_at": utc_now().isoformat(),
             })
             with manifest_lock:

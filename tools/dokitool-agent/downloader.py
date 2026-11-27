@@ -4,9 +4,11 @@ Zero third-party dependencies (Python 3.9+ standard library only).
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 from typing import Any, Callable, Sequence
@@ -25,14 +27,9 @@ _MIME_EXTS = {
     "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif",
 }
 _ALLOWED_MEDIA_EXTS = frozenset({
-    *_MIME_EXTS.values(), "flac", "wav", "opus", "m4v", "ts", "avif", "vtt", "srt", "ttml",
+    *_MIME_EXTS.values(), "jpeg", "flac", "wav", "opus", "m4v", "ts", "avif", "heic", "heif", "vtt", "srt", "ttml",
 })
 _ALLOWED_SUBTITLE_EXTS = frozenset({"txt", "vtt", "srt", "ttml", "srv3", "json3", "xml"})
-_FORBIDDEN_FILENAME_EXTS = frozenset({
-    "exe", "bat", "cmd", "ps1", "sh", "bash", "zsh", "com", "msi", "vbs", "vbe",
-    "js", "mjs", "cjs", "jse", "hta", "scr", "pif", "jar", "html", "htm", "svg",
-    "command", "app", "dll", "so", "dylib",
-})
 _SAFE_MUX_FORMATS = {"mp4": "mp4", "mkv": "matroska", "matroska": "matroska", "webm": "webm", "mov": "mov"}
 
 
@@ -43,6 +40,30 @@ class DownloadError(RuntimeError):
 def _unlink_if_regular(path: Path | None) -> None:
     if path is not None and path.exists() and not path.is_symlink():
         path.unlink()
+
+
+def _commit_atomic_file(tmp_path: Path, final_path: Path, *, overwrite: bool) -> None:
+    """Atomically publish tmp_path to final_path; refuse clobber unless overwrite=True."""
+    if overwrite:
+        os.replace(tmp_path, final_path)
+        return
+    try:
+        os.link(tmp_path, final_path)
+    except FileExistsError as exc:
+        raise DownloadError(
+            f"Target file already exists (no-clobber default): {final_path.name}; pass --overwrite to replace"
+        ) from exc
+    except OSError as exc:
+        if exc.errno in (errno.EPERM, errno.EXDEV, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
+            if final_path.exists() or final_path.is_symlink():
+                raise DownloadError(
+                    f"Target file already exists (no-clobber default): {final_path.name}; pass --overwrite to replace"
+                ) from exc
+            os.replace(tmp_path, final_path)
+            return
+        raise
+    else:
+        tmp_path.unlink()
 
 
 def _sniff_magic_ext(path: Path) -> str | None:
@@ -66,11 +87,16 @@ def _sniff_magic_ext(path: Path) -> str | None:
 
 
 def _validate_explicit_filename(output_dir: Path, filename: str) -> Path:
-    """Validate an explicit --filename target inside output_dir and reject dangerous suffixes."""
+    """Validate an explicit --filename target inside output_dir against a strict passive extension allowlist."""
     target = resolve_jailed_path(output_dir, filename, allow_subdirs=False)
-    ext = Path(filename).suffix.lower().lstrip(".")
-    if ext in _FORBIDDEN_FILENAME_EXTS:
-        raise SecurityError(f"Refusing dangerous executable or script filename suffix: .{ext}")
+    name = target.name
+    if name.startswith(".") or name.startswith("-"):
+        raise SecurityError("Refusing hidden dotfile or hyphen-prefixed target filename")
+    ext = target.suffix.lower().lstrip(".")
+    if not ext or ext not in _ALLOWED_MEDIA_EXTS:
+        raise SecurityError(
+            f"Refusing unsupported target filename extension: .{ext or '<none>'} (allowed passive media/subtitle formats only)"
+        )
     return target
 
 
@@ -152,9 +178,12 @@ def _default_stem(data: dict[str, Any], item: dict[str, Any]) -> str:
 def _download_routes_atomic(
     client: DokiToolClient, urls: list[str], output_dir: Path, stem: str,
     meta: dict[str, Any] | None, *, explicit_filename: str | None, max_bytes: int,
+    overwrite: bool = False,
 ) -> tuple[Path, int, bool]:
-    """Download first succeeding route to a jailed temp file, then atomically os.replace."""
-    part_path = resolve_jailed_path(output_dir, f".{sanitize_filename_stem(stem, 60)}.{os.getpid()}.part", allow_subdirs=False)
+    """Download first succeeding route to a jailed temp file, then atomically commit."""
+    part_path = resolve_jailed_path(
+        output_dir, f".{sanitize_filename_stem(stem, 52)}.{os.getpid()}.{secrets.token_hex(4)}.part", allow_subdirs=False
+    )
     saw_expired = False
     last_err: Exception | None = None
     for url in urls:
@@ -168,9 +197,9 @@ def _download_routes_atomic(
                 final_path = resolve_jailed_path(
                     output_dir, f"{stem}.{_infer_ext(meta, hdrs, final_url, part_path)}", allow_subdirs=False
                 )
-            os.replace(part_path, final_path)
+            _commit_atomic_file(part_path, final_path, overwrite=overwrite)
             return final_path, written, False
-        except SecurityError:
+        except (SecurityError, DownloadError):
             _unlink_if_regular(part_path)
             raise
         except HTTPStatusError as exc:
@@ -189,6 +218,7 @@ def _download_routes_atomic(
 def _mux_with_ffmpeg(
     video_path: Path, audio_path: Path, final_path: Path,
     output_dir: Path, container: str, subprocess_runner: Callable[..., Any],
+    *, overwrite: bool = False,
 ) -> int:
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -197,10 +227,14 @@ def _mux_with_ffmpeg(
     v_safe = resolve_jailed_path(output_dir, video_path.name, allow_subdirs=False)
     a_safe = resolve_jailed_path(output_dir, audio_path.name, allow_subdirs=False)
     f_safe = resolve_jailed_path(output_dir, final_path.name, allow_subdirs=False)
-    tmp_out = resolve_jailed_path(output_dir, f".mux.{os.getpid()}.{f_safe.name}", allow_subdirs=False)
+    tmp_out = resolve_jailed_path(output_dir, f".mux.{os.getpid()}.{secrets.token_hex(4)}.{f_safe.name}", allow_subdirs=False)
     for p in (v_safe, a_safe, f_safe, tmp_out):
         if str(p).startswith("-") or p.name.startswith("-") or ":" in p.name:
             raise SecurityError("Unsafe path rejected before ffmpeg invocation")
+    if not overwrite and (f_safe.exists() or f_safe.is_symlink()):
+        raise DownloadError(
+            f"Target file already exists (no-clobber default): {f_safe.name}; pass --overwrite to replace"
+        )
     cmd = [
         ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-protocol_whitelist", "file", "-i", str(v_safe),
@@ -213,7 +247,7 @@ def _mux_with_ffmpeg(
             raw_err = getattr(proc, "stderr", b"")
             err_text = raw_err.decode("utf-8", errors="replace") if isinstance(raw_err, bytes) else str(raw_err)
             raise DownloadError(f"ffmpeg mux failed (exit {proc.returncode}): {redact_sensitive(err_text.strip())}")
-        os.replace(tmp_out, f_safe)
+        _commit_atomic_file(tmp_out, f_safe, overwrite=overwrite)
         return f_safe.stat().st_size
     finally:
         _unlink_if_regular(tmp_out)
@@ -221,7 +255,7 @@ def _mux_with_ffmpeg(
 
 def write_subtitle_files(
     extracted_tracks: Sequence[dict[str, Any]], output_dir: Path, *,
-    allow_write: bool, stem_prefix: str = "subtitle",
+    allow_write: bool, stem_prefix: str = "subtitle", overwrite: bool = False,
 ) -> list[dict[str, Any]]:
     """Atomically save extracted subtitle payloads inside jailed output_dir."""
     if not allow_write:
@@ -239,18 +273,24 @@ def write_subtitle_files(
         ext = clean_ext if clean_ext in _ALLOWED_SUBTITLE_EXTS else "txt"
         filename = f"{safe_prefix}.{lang}.{kind}.{ext}"
         dup_n = 2
-        while filename in used_names:
+        while filename in used_names or (
+            not overwrite and ((root / filename).exists() or (root / filename).is_symlink())
+        ):
             filename = f"{safe_prefix}.{lang}.{kind}.{dup_n}.{ext}"
             dup_n += 1
         used_names.add(filename)
         target = resolve_jailed_path(root, filename, allow_subdirs=False)
-        tmp = resolve_jailed_path(root, f".{filename}.{os.getpid()}.part", allow_subdirs=False)
+        tmp = resolve_jailed_path(root, f".{filename}.{os.getpid()}.{secrets.token_hex(4)}.part", allow_subdirs=False)
         content_bytes = str(track.get("content") or "").encode("utf-8")
+        if len(content_bytes) > MAX_SUBTITLE_BYTES:
+            raise SecurityError(f"Subtitle file exceeds {MAX_SUBTITLE_BYTES} byte limit")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         try:
-            with open(tmp, "wb") as handle:
+            fd = os.open(tmp, flags, 0o600)
+            with os.fdopen(fd, "wb") as handle:
                 handle.write(content_bytes)
                 handle.flush()
-            os.replace(tmp, target)
+            _commit_atomic_file(tmp, target, overwrite=overwrite)
         finally:
             _unlink_if_regular(tmp)
         saved.append({"file": target.name, "bytes": len(content_bytes), "language": track.get("language"), "track_kind": track.get("track_kind")})
@@ -260,7 +300,7 @@ def write_subtitle_files(
 def _download_variant_files(
     client: DokiToolClient, variant: dict[str, Any], preferred_source_id: str | None,
     root: Path, stem: str, *, explicit_filename: str | None, allow_ffmpeg: bool,
-    max_media_bytes: int, subprocess_runner: Callable[..., Any],
+    max_media_bytes: int, subprocess_runner: Callable[..., Any], overwrite: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     delivery = variant.get("delivery") or {}
     kind = delivery.get("kind")
@@ -270,11 +310,12 @@ def _download_variant_files(
             return [], True
         path, nbytes, expired = _download_routes_atomic(
             client, urls, root, stem, variant.get("metadata"),
-            explicit_filename=explicit_filename, max_bytes=max_media_bytes,
+            explicit_filename=explicit_filename, max_bytes=max_media_bytes, overwrite=overwrite,
         )
         return ([], True) if expired else ([{"role": "main", "file": path.name, "bytes": nbytes}], False)
     if kind == "pair":
         saved: list[dict[str, Any]] = []
+        pair_stem = sanitize_filename_stem(Path(explicit_filename).stem, 48) if explicit_filename is not None else stem
         for res in delivery.get("resources") or []:
             res_del = res.get("delivery") or {}
             if res_del.get("kind") != "file":
@@ -284,8 +325,8 @@ def _download_variant_files(
             if not urls:
                 return [], True
             path, nbytes, expired = _download_routes_atomic(
-                client, urls, root, f"{stem}_{role}", res.get("metadata"),
-                explicit_filename=None, max_bytes=max_media_bytes,
+                client, urls, root, f"{pair_stem}_{role}", res.get("metadata"),
+                explicit_filename=None, max_bytes=max_media_bytes, overwrite=overwrite,
             )
             if expired:
                 return [], True
@@ -304,16 +345,17 @@ def _download_variant_files(
         if not v_urls or not a_urls:
             return [], True
         v_path, a_path = None, None
+        mux_nonce = secrets.token_hex(4)
         try:
             v_path, _, v_exp = _download_routes_atomic(
-                client, v_urls, root, f"{stem}_video_tmp", v_res.get("metadata"),
-                explicit_filename=None, max_bytes=max_media_bytes,
+                client, v_urls, root, f"{stem}_video_tmp_{mux_nonce}", v_res.get("metadata"),
+                explicit_filename=None, max_bytes=max_media_bytes, overwrite=True,
             )
             if v_exp:
                 return [], True
             a_path, _, a_exp = _download_routes_atomic(
-                client, a_urls, root, f"{stem}_audio_tmp", a_res.get("metadata"),
-                explicit_filename=None, max_bytes=max_media_bytes,
+                client, a_urls, root, f"{stem}_audio_tmp_{mux_nonce}", a_res.get("metadata"),
+                explicit_filename=None, max_bytes=max_media_bytes, overwrite=True,
             )
             if a_exp:
                 return [], True
@@ -325,7 +367,10 @@ def _download_variant_files(
                 if explicit_filename is not None
                 else resolve_jailed_path(root, f"{stem}.{out_ext}", allow_subdirs=False)
             )
-            nbytes = _mux_with_ffmpeg(v_path, a_path, final_path, root, str(out_meta.get("container") or out_ext).lower(), subprocess_runner)
+            nbytes = _mux_with_ffmpeg(
+                v_path, a_path, final_path, root, str(out_meta.get("container") or out_ext).lower(),
+                subprocess_runner, overwrite=overwrite,
+            )
             return [{"role": "muxed", "file": final_path.name, "bytes": nbytes}], False
         finally:
             _unlink_if_regular(v_path)
@@ -335,7 +380,7 @@ def _download_variant_files(
 
 def download_media(
     client: DokiToolClient, share_url: str, output_dir: Path, *,
-    allow_write: bool, allow_ffmpeg: bool = False, platform: str | None = None,
+    allow_write: bool, allow_ffmpeg: bool = False, overwrite: bool = False, platform: str | None = None,
     item_id: str | None = None, variant_id: str | None = None, filename: str | None = None,
     include_subtitles: bool = False, subtitle_lang: str | None = None,
     subtitle_kind: str = "all", subtitle_format: str = "vtt",
@@ -346,7 +391,11 @@ def download_media(
         raise SecurityError("Local file write is disabled; explicit --allow-write --output-dir is required")
     root = validate_output_dir(output_dir, create=True)
     if filename is not None:
-        _validate_explicit_filename(root, filename)
+        explicit_target = _validate_explicit_filename(root, filename)
+        if not overwrite and (explicit_target.exists() or explicit_target.is_symlink()):
+            raise DownloadError(
+                f"Target file already exists (no-clobber default): {explicit_target.name}; pass --overwrite to replace"
+            )
 
     data = client.parse(share_url, platform=platform)["data"]
     item = _select_item(data, item_id)
@@ -364,7 +413,7 @@ def download_media(
     files, expired = _download_variant_files(
         client, variant, preferred_source_id, root, stem,
         explicit_filename=filename, allow_ffmpeg=allow_ffmpeg,
-        max_media_bytes=max_media_bytes, subprocess_runner=subprocess_runner,
+        max_media_bytes=max_media_bytes, subprocess_runner=subprocess_runner, overwrite=overwrite,
     )
     if expired:
         data = client.refresh(data, fallback_url=share_url, item_resolve_url=resolve_url)["data"]
@@ -373,7 +422,7 @@ def download_media(
         files, still_expired = _download_variant_files(
             client, variant, preferred_source_id, root, stem,
             explicit_filename=filename, allow_ffmpeg=allow_ffmpeg,
-            max_media_bytes=max_media_bytes, subprocess_runner=subprocess_runner,
+            max_media_bytes=max_media_bytes, subprocess_runner=subprocess_runner, overwrite=overwrite,
         )
         if still_expired or not files:
             raise DownloadError("CDN links remained expired (403/410) after refresh")
@@ -385,7 +434,9 @@ def download_media(
             output_format=subtitle_format, max_bytes=MAX_SUBTITLE_BYTES,
         )
         if sub_res["tracks"]:
-            sub_files = write_subtitle_files(sub_res["tracks"], root, allow_write=True, stem_prefix=stem)
+            sub_files = write_subtitle_files(
+                sub_res["tracks"], root, allow_write=True, stem_prefix=stem, overwrite=overwrite,
+            )
     return {
         "platform": data.get("platform"), "content_id": data.get("content_id"),
         "item_id": item.get("id"), "variant_id": variant.get("id"),

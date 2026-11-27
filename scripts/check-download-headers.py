@@ -17,6 +17,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _env_proxies_without_credentials():
+    raw = urllib.request.getproxies_environment()
+    clean = {}
+    for scheme, proxy_url in raw.items():
+        lk = scheme.lower()
+        if lk not in ("http", "https") or not isinstance(proxy_url, str) or not proxy_url.strip():
+            continue
+        candidate = proxy_url.strip()
+        if "://" not in candidate:
+            candidate = "http://" + candidate
+        parsed = urllib.parse.urlsplit(candidate)
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            raise ValueError("Environment proxy credentials are forbidden")
+        clean[lk] = proxy_url.strip()
+    return clean
+
+
 def origin(value):
     parsed = urllib.parse.urlsplit(value)
     loopback = parsed.hostname == "localhost"
@@ -117,7 +134,7 @@ def main():
         # Caddy may reject a child path beneath a regular file as malformed.
         ("/downloads/bridge.html/missing", (400, 404), "DENY", None),
     ]
-    opener = urllib.request.build_opener(NoRedirect())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(_env_proxies_without_credentials()), NoRedirect())
     checks = [check(opener, args.base_url, path, status, policy, args.timeout, expected_cache=cache)
               for path, status, policy, cache in paths]
     bridge = checks[1]

@@ -46,6 +46,7 @@ DEFAULT_IPV6_PROBE_TIMEOUT = 1.5
 DEFAULT_IDLE_CONNECTION_TTL = 55.0
 DEFAULT_YOUTUBE_CONTEXT_WARN_MS = 2000
 DEFAULT_YOUTUBE_CONTEXT_FAIL_MS = 15000
+MAX_HTTP_RESPONSE_BYTES = 16 * 1024 * 1024
 
 VALID_TIERS: tuple[str, ...] = ("tier-a", "tier-b", "all")
 
@@ -124,11 +125,14 @@ FORBIDDEN_REQUEST_HEADERS = frozenset({
     "x-dokitool-token",
 })
 
-_URL_RE = re.compile(r"(?i)\b(?:https?|wss?)://[^\s\"'<>`|]+")
+_URL_RE = re.compile(r"(?i)\b(?:https?|wss?|file|ftp)://[^\s\"'<>`|]+")
 _SENSITIVE_TOKEN_RE = re.compile(
     r"(?i)\b(?:xsec_token|xsec_source|owner_token|access_token|auth_key|hdnts)"
     r"(?:\s*[=:]\s*[^\s&\"'<>`,;|)]+)?"
 )
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_UNIX_HOME_PATH_RE = re.compile(r"(?:/Users/|/home/|/private/var/folders/)[^\s\"'<>`|)]+")
+_WIN_HOME_PATH_RE = re.compile(r"(?i)[A-Za-z]:(?:\\{1,2}|/)Users(?:\\{1,2}|/)[^\s\"'<>`|)]+")
 _TICKET_KV_RE = re.compile(r"(?i)\bticket\s*[=:]\s*[^\s&\"'<>`,;|)]+")
 _SIGNATURE_KV_RE = re.compile(
     r"(?i)\b(?:sign|signature|sig|token|key|expires)\s*[=:]\s*[^\s&\"'<>`,;|)]+"
@@ -578,16 +582,23 @@ def _replace_ipv4_candidates(text: str) -> str:
 
 
 def sanitize_text(value: str) -> str:
-    """Scrub URLs, query parameters, tokens, tickets, signatures, and IPs."""
+    """Scrub URLs, query parameters, tokens, Bearer headers, tickets, signatures, local paths, and IPs."""
     if not value:
         return ""
     out = str(value)
     out = _URL_RE.sub("<url-redacted>", out)
     out = _RELAY_PATH_RE.sub("/api/media/<relay-redacted>", out)
+    out = _BEARER_TOKEN_RE.sub("<auth-redacted>", out)
+    out = re.sub(r"(?i)\bBearer\b", "<auth-redacted>", out)
     out = _SENSITIVE_TOKEN_RE.sub("<token-redacted>", out)
     out = _TICKET_KV_RE.sub("<ticket-redacted>", out)
     out = _SIGNATURE_KV_RE.sub("<sig-redacted>", out)
     out = _QUERY_STRING_RE.sub("?<query-redacted>", out)
+    out = _UNIX_HOME_PATH_RE.sub("<path-redacted>", out)
+    out = _WIN_HOME_PATH_RE.sub("<path-redacted>", out)
+    home_str = str(Path.home())
+    if len(home_str) >= 4 and home_str in out:
+        out = out.replace(home_str, "<home-redacted>")
     out = _replace_ipv4_candidates(out)
     out = _replace_ipv6_candidates(out)
     out = " ".join(out.splitlines()).strip()
@@ -595,10 +606,12 @@ def sanitize_text(value: str) -> str:
 
 
 def verify_redacted_output(rendered: str) -> None:
-    """Fail closed if any URL, token, ticket, query parameter, or IP survived."""
+    """Fail closed if any URL, Bearer, token, ticket, query parameter, home path, or IP survived."""
     if _URL_RE.search(rendered):
         raise RedactionViolationError("unredacted URL detected in output")
-    if re.search(r"(?i)\b(?:xsec_token|xsec_source|owner_token)\b", rendered):
+    if re.search(r"(?i)\bBearer\b", rendered):
+        raise RedactionViolationError("unredacted Bearer authorization marker detected in output")
+    if re.search(r"(?i)\b(?:xsec_token|xsec_source|owner_token|access_token)\b", rendered):
         raise RedactionViolationError("unredacted token identifier detected in output")
     if re.search(r"(?i)\bticket\s*=", rendered):
         raise RedactionViolationError("unredacted relay ticket detected in output")
@@ -607,6 +620,13 @@ def verify_redacted_output(rendered: str) -> None:
     for qmatch in _QUERY_STRING_RE.finditer(rendered):
         if qmatch.group(0) != "?<query-redacted>":
             raise RedactionViolationError("unredacted query string detected in output")
+    if _UNIX_HOME_PATH_RE.search(rendered) or _WIN_HOME_PATH_RE.search(rendered):
+        raise RedactionViolationError("unredacted local home directory path detected in output")
+    home_str = str(Path.home())
+    if len(home_str) >= 4:
+        json_escaped_home = json.dumps(home_str)[1:-1]
+        if home_str in rendered or (json_escaped_home and json_escaped_home in rendered):
+            raise RedactionViolationError("unredacted home directory path detected in output")
     for match in _IPV4_CANDIDATE_RE.finditer(rendered):
         if _is_ip_literal(match.group(0)):
             raise RedactionViolationError("unredacted IPv4 address detected in output")
@@ -622,13 +642,15 @@ def parse_base_url(raw_base_url: str) -> tuple[str, str, str]:
     raw = (raw_base_url or "").strip()
     parsed = urllib.parse.urlsplit(raw)
     if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
-        raise SmokeError("invalid --base-url: expected http(s)://<host>[:port]")
-    if parsed.username is not None or parsed.password is not None:
+        raise SmokeError("invalid --base-url: expected https://<host>[:port] or http://<loopback>[:port]")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise SmokeError("invalid --base-url: credentials in URL are forbidden")
     if parsed.query or parsed.fragment:
         raise SmokeError("invalid --base-url: query and fragment are forbidden")
     if parsed.path not in ("", "/"):
         raise SmokeError("invalid --base-url: base path must be root '/'")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise SmokeError("invalid --base-url: use https:// for remote origins (http:// allowed only for loopback)")
     origin = f"{parsed.scheme}://{parsed.netloc}"
     return origin, parsed.scheme, parsed.netloc
 
@@ -824,7 +846,11 @@ class OriginLockedClient:
             try:
                 conn.request("GET", request_target, headers=headers)
                 resp = conn.getresponse()
-                body = resp.read()
+                body = resp.read(MAX_HTTP_RESPONSE_BYTES + 1)
+                if len(body) > MAX_HTTP_RESPONSE_BYTES:
+                    raise SmokeError(
+                        f"response body exceeded {MAX_HTTP_RESPONSE_BYTES} byte inspection limit"
+                    )
                 status = int(resp.status)
                 resp_headers: dict[str, str] = {}
                 for raw_k, raw_v in resp.getheaders():
@@ -1396,13 +1422,21 @@ class SmokeRunner:
 
         try:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except OSError as exc:
             return CheckResult(
                 id="frontend_hashes",
                 group="frontend_hashes",
                 status="FAIL",
                 code="INVALID_MANIFEST",
-                note=f"failed to read manifest: {sanitize_text(str(exc))}",
+                note=f"failed to read manifest {self.manifest_path.name}: {sanitize_text(exc.strerror or type(exc).__name__)}",
+            )
+        except json.JSONDecodeError as exc:
+            return CheckResult(
+                id="frontend_hashes",
+                group="frontend_hashes",
+                status="FAIL",
+                code="INVALID_MANIFEST",
+                note=f"invalid JSON in manifest {self.manifest_path.name}: line {exc.lineno}",
             )
 
         dist_files = manifest.get("frontend_dist_files") if isinstance(manifest, dict) else None
