@@ -52,7 +52,7 @@
 1. **切换后即时冒烟**：
    - 本地回环与公网 `GET /api/platforms?schema_version=1.0` 均返回 HTTP `200`、`code: "OK"`，且启用平台数量与列表符合预期（当前为 14 个平台）；
    - 公网首页返回 HTTP `200`，首页引用的全部新 `/assets/*` chunk 及至少一个保留的上一版 `/assets/*` chunk 均返回 HTTP `200`，不存在的 `/assets/*` 路径返回 `404`（不回退 SPA HTML）；
-   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/helper/extension-version.json` 与 `/helper/dokitool-chrome-extension.zip` 版本/状态码（HTTP `200`）与 SHA-256 摘要正确。
+   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/` 与 `/helper/extension-version.json` 返回 `Cache-Control: no-store`（剥离条件请求头及 `ETag`/`Last-Modified`，携带 `If-Modified-Since: Thu, 01 Jan 2026 00:00:00 GMT` 仍返回完整 `200` 严禁 `304`）；`/helper/dokitool-chrome-extension.zip` 状态码（HTTP `200`）与 SHA-256 摘要正确。
 2. **发布回执与线上复测**：
    - 在发布 Issue 中如实记录切换前后 SHA、二进制与关键静态资源摘要、服务状态与冒烟结果（不含任何敏感环境信息）；
    - 针对本次上线涉及的平台或前端交互在真实线上站点完成端到端复测，验证通过后关闭发布单与对应问题单。
@@ -63,7 +63,7 @@
 
 Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下静态资源与下载 Worker 边界：
 
-- **带哈希静态资源缓存**：现存的 `/assets/*` 文件设置一年 `immutable` 缓存；首页 HTML 与其他非哈希入口文件使用 `Cache-Control: no-cache` 校验更新。缺失的 `/assets/*`、`/downloads/*`、`robots.txt`、`sitemap.xml` 与 `social/dokitool-share-v1.png` 必须返回精确 `404`，严禁回退并返回 SPA 首页 HTML。
+- **带哈希静态资源缓存与固定 `mtime` 防 `304` 碰撞**：现存的 `/assets/*` 带 8 位内容哈希文件设置一年 `immutable` 缓存；其余所有未带哈希静态入口（`/`、`/index.html`、`/helper/*`、`/downloads/*`、`/monitor` 及 SEO 文件）在反向代理层统一剥离 `If-None-Match` 与 `If-Modified-Since` 条件请求头，并对 HTML 入口与 `/helper/extension-version.json` 施加 `Cache-Control: no-store` 及移除 `ETag`/`Last-Modified`，防止确定性构建固定 `mtime` 在跨版本字节数不变时触发 Caddy `304 Not Modified` 旧页缓存碰撞。缺失的 `/assets/*`、`/downloads/*`、`robots.txt`、`sitemap.xml` 与 `social/dokitool-share-v1.png` 必须返回精确 `404`，严禁回退并返回 SPA 首页 HTML。
 - **下载 Worker 与同源 Bridge 头策略**：
   - `/downloads/worker.js` 及其同目录模块仅注册 `/downloads/` 作用域，返回有效 JavaScript MIME 与 `Cache-Control: no-cache`；
   - 仅精确路径 `/downloads/bridge.html` 允许同源 iframe 嵌入（返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`，并在反向代理层剥离条件请求头 `If-None-Match` / `If-Modified-Since` 以避免 Chromium `304` 合并旧 `DENY` 头）；首页、Worker 与其他路径保持 `X-Frame-Options: DENY`。可用 `python3 scripts/check-download-headers.py --base-url https://snap.example.com --output /tmp/headers.json` 检查公开响应头契约。

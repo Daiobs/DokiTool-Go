@@ -2521,7 +2521,12 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
       const xfo = (extVerRes.headers["x-frame-options"] || "").toUpperCase();
       if (xfo !== "DENY") fails.push(`X-Frame-Options=${xfo || "missing"}`);
       const cc = (extVerRes.headers["cache-control"] || "").toLowerCase();
-      if (!cc.includes("no-cache")) fails.push(`Cache-Control=${cc || "missing"}`);
+      const matchedCc = cc.includes("no-store")
+        ? "no-store"
+        : cc.includes("no-cache")
+          ? "no-cache"
+          : "";
+      if (!matchedCc) fails.push(`Cache-Control=${cc || "missing"}`);
       const ct = (extVerRes.headers["content-type"] || "").toLowerCase();
       if (!ct.includes("application/json")) fails.push(`Content-Type=${ct || "missing"}`);
       const bodySha = crypto.createHash("sha256").update(extVerRes.body).digest("hex");
@@ -2550,7 +2555,7 @@ async function runHttpChecks({ client, target, manifestData, skipHttpChecks }) {
           fails.push("extension-version.json sha256 mismatch vs release-manifest");
         }
         discoveredExtVersionMeta = { version: ver, sha256: zipSha };
-        note = `v${ver || "-"}, no-cache, XFO=${xfo}${zipSha ? `, zipSha[:12]=${zipSha.slice(0, 12)}` : ""}`;
+        note = `v${ver || "-"}, ${matchedCc || "no-store"}, XFO=${xfo}${zipSha ? `, zipSha[:12]=${zipSha.slice(0, 12)}` : ""}`;
       } catch {
         fails.push("invalid JSON body");
       }

@@ -153,7 +153,7 @@ export function useExtensionRuntime(
         const resp = await fetchFn(EXTENSION_VERSION_PATH, {
           method: "GET",
           credentials: "omit",
-          cache: "no-cache",
+          cache: "no-store",
           signal: controller.signal,
         });
         if (!resp.ok) return latestExtensionVersion.value;

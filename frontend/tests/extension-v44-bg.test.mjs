@@ -2250,7 +2250,7 @@ test("Batch 1A (v4.4.1): SidePanelHeader silent version check renders upgrade pi
       assert.equal(fetchCalls.length, 1);
       assert.equal(fetchCalls[0].url, "https://snap.dokitool.com/helper/extension-version.json");
       assert.equal(fetchCalls[0].init.credentials, "omit");
-      assert.equal(fetchCalls[0].init.cache, "no-cache");
+      assert.equal(fetchCalls[0].init.cache, "no-store");
 
       const pill = outdatedView.findAll(
         (n) => n.props["data-testid"] === "sidepanel-update-pill",
