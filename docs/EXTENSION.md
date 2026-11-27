@@ -1,6 +1,8 @@
-# DokiTool Chrome MV3 侧边栏原生扩展（`sidePanel` + `offscreen`）
+# DokiTool Chrome MV3 侧边栏原生扩展（`v4.5.0` · `sidePanel` + `offscreen`）
 
-DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展，基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当前版本 **`v4.5.0`**，固定扩展 ID `ihamkldlkdibleacagiejklpfofapkpo`），基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
+
+> **v4.5.0 运行态同步与安全加固**：Web 主站与扩展侧边栏统一以运行态 `/helper/extension-version.json`（附带 ZIP `sha256` 元数据）作为更新真相源，长驻未刷新页面打开弹窗或切回前台时实时同步最新版本号；自定义本机回环后端收紧为单端口精确可选权限并在切换源站时自动回收旧端口授权；外部网页桥接拒绝非白名单 `sender.url`，被动落盘执行严格安全后缀白名单，字幕下载在重定向后强制重验白名单域名，且 `task.error` 自动剥离 URL/凭据片段。
 
 ---
 
@@ -94,7 +96,7 @@ npm run build:extension:zip
 
 点击侧边栏右上角的齿轮按钮打开 **设置抽屉**：
 
-- **后端地址**：默认连接线上 `https://snap.dokitool.com`；仅接受 `https://` 公开域名或本机调试回环地址 `http://127.0.0.1:<port>` / `http://localhost:<port>`（填写本机回环地址点击保存或测试时，浏览器会按需弹窗申请 `optional_host_permissions` 授权）。
+- **后端地址**：默认连接线上 `https://snap.dokitool.com`；仅接受 `https://` 公开域名或本机调试回环地址 `http://127.0.0.1:<port>` / `http://localhost:<port>`（填写本机回环地址点击保存或测试时，浏览器仅按当前**单一精确端口**弹窗申请 `optional_host_permissions` 授权，且切换回线上或更换端口时自动回收先前授予的回环权限）。
 - **专属 Bearer Token**：
   - 由用户本人粘贴保存于扩展隔离的 `chrome.storage.local`（绝不写入网页存储或会话存储）；
   - 点击 **「测试连通性」** 会请求 `GET /api/platforms?schema_version=1.0`：凭据有效显示 `200 已就绪`；凭据错误或已停用明确返回 `401 认证凭据无效`；留空保存则进入匿名模式（完全省略 `Authorization` 请求头）；

@@ -32,12 +32,14 @@ SHA256_HEX_RE = re.compile(r'^[0-9a-f]{64}\Z', re.ASCII)
 YTDLP_SOURCE_REL = Path('backend/internal/ytengine/engine.go')
 DENO_SOURCE_REL = Path('backend/internal/platform/youtube/ejs_sandbox.go')
 RELEASE_BUILD_WORKFLOW_REL = Path('.github/workflows/release-build.yml')
+UPSTREAM_CANARY_WORKFLOW_REL = Path('.github/workflows/upstream-canary.yml')
 GATEWAY_ISOLATION_WORKFLOW_REL = Path('.github/workflows/gateway-isolation.yml')
 VALIDATION_REQUIREMENTS_REL = Path('scripts/requirements-validation.txt')
 LOCK_FILES = (
     YTDLP_SOURCE_REL,
     DENO_SOURCE_REL,
     RELEASE_BUILD_WORKFLOW_REL,
+    UPSTREAM_CANARY_WORKFLOW_REL,
     GATEWAY_ISOLATION_WORKFLOW_REL,
     VALIDATION_REQUIREMENTS_REL,
 )
@@ -73,7 +75,8 @@ STATUS_LABELS = {
 UPGRADE_REMINDER = (
     '升级提醒：升级 `yt-dlp` 或 `Deno` 需通过经人工审查的 PR 同步更新源码、工作流与验证依赖中的锁定版本号及官方 SHA-256 校验摘要'
     '（`backend/internal/ytengine/engine.go`、`backend/internal/platform/youtube/ejs_sandbox.go`、'
-    '`.github/workflows/release-build.yml`、`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）。'
+    '`.github/workflows/release-build.yml`、`.github/workflows/upstream-canary.yml`、'
+    '`.github/workflows/gateway-isolation.yml`、`scripts/requirements-validation.txt`）。'
     '本检查仅读取 GitHub 公开 Release 元数据并发送 Issue 通知，不下载执行上游产物，也不会自动修改仓库代码或部署。'
     '后续机器人评论携带最新观察状态；关闭此 Issue 不会停用检查。'
 )
@@ -215,8 +218,52 @@ def _extract_map_sha256(source, map_re, entry_re):
     return entries[0]
 
 
+def _collect_deno_workflow_drift(root, wf_path_rel, deno_ver, deno_linux_sha, drift):
+    wf_rel = wf_path_rel.as_posix()
+    wf_text = _read_repo_text(root / wf_path_rel)
+    if wf_text is None:
+        drift['denoland/deno'].append(f'无法读取 `{wf_rel}`')
+        return
+    expected_deno_tag = f'v{deno_ver}'
+    url_tags = RELEASE_BUILD_DENO_URL_RE.findall(wf_text)
+    if not url_tags:
+        drift['denoland/deno'].append(f'`{wf_rel}` 未找到 Deno Linux x86_64 下载地址')
+    else:
+        for found_tag in dict.fromkeys(url_tags):
+            if found_tag != expected_deno_tag:
+                drift['denoland/deno'].append(
+                    f'`{wf_rel}` Deno 下载版本（{safe_text(found_tag, 80)}）'
+                    f'与 Go 锁定版本 `{expected_deno_tag}` 不一致'
+                )
+    raw_asserts = RELEASE_BUILD_DENO_ASSERT_RE.findall(wf_text)
+    normalized_asserts = [item[:-1] if item.endswith(' ') else item for item in raw_asserts]
+    if not normalized_asserts:
+        drift['denoland/deno'].append(f'`{wf_rel}` 未找到 `deno <version>` 版本断言')
+    else:
+        for found_ver in dict.fromkeys(normalized_asserts):
+            if found_ver != deno_ver:
+                drift['denoland/deno'].append(
+                    f'`{wf_rel}` Deno 版本断言（deno {safe_text(found_ver, 80)}）'
+                    f'与 Go 锁定版本 `deno {deno_ver}` 不一致'
+                )
+    sha_matches = RELEASE_BUILD_DENO_SHA_RE.findall(wf_text)
+    if len(sha_matches) != 1:
+        drift['denoland/deno'].append(f'`{wf_rel}` 缺失或无法唯一解析 Deno Linux x86_64 SHA-256 校验行')
+    else:
+        found_sha = sha_matches[0].lower()
+        if not SHA256_HEX_RE.fullmatch(found_sha):
+            drift['denoland/deno'].append(
+                f'`{wf_rel}` Deno Linux x86_64 SHA-256（{safe_text(sha_matches[0], 80)}）格式非法'
+            )
+        elif deno_linux_sha is not None and found_sha != deno_linux_sha:
+            drift['denoland/deno'].append(
+                f'`{wf_rel}` Deno Linux x86_64 SHA-256（`{found_sha}`）'
+                f'与 `{DENO_SOURCE_REL.as_posix()}`（`{deno_linux_sha}`）不一致'
+            )
+
+
 def collect_local_pin_drift(root=ROOT, pinned=None):
-    """Inspect all 5 repository lock files and return drift warnings per upstream."""
+    """Inspect all 6 repository lock files and return drift warnings per upstream."""
     root = Path(root)
     pinned = load_pinned_versions(root) if pinned is None else validate_pinned_versions(pinned)
     ytdlp_ver = pinned['yt-dlp/yt-dlp']
@@ -262,47 +309,8 @@ def collect_local_pin_drift(root=ROOT, pinned=None):
                 ' `deno-x86_64-unknown-linux-gnu` SHA-256'
             )
 
-    release_wf_rel = RELEASE_BUILD_WORKFLOW_REL.as_posix()
-    release_wf_text = _read_repo_text(root / RELEASE_BUILD_WORKFLOW_REL)
-    if release_wf_text is None:
-        drift['denoland/deno'].append(f'无法读取 `{release_wf_rel}`')
-    else:
-        expected_deno_tag = f'v{deno_ver}'
-        url_tags = RELEASE_BUILD_DENO_URL_RE.findall(release_wf_text)
-        if not url_tags:
-            drift['denoland/deno'].append(f'`{release_wf_rel}` 未找到 Deno Linux x86_64 下载地址')
-        else:
-            for found_tag in dict.fromkeys(url_tags):
-                if found_tag != expected_deno_tag:
-                    drift['denoland/deno'].append(
-                        f'`{release_wf_rel}` Deno 下载版本（{safe_text(found_tag, 80)}）'
-                        f'与 Go 锁定版本 `{expected_deno_tag}` 不一致'
-                    )
-        raw_asserts = RELEASE_BUILD_DENO_ASSERT_RE.findall(release_wf_text)
-        normalized_asserts = [item[:-1] if item.endswith(' ') else item for item in raw_asserts]
-        if not normalized_asserts:
-            drift['denoland/deno'].append(f'`{release_wf_rel}` 未找到 `deno <version>` 版本断言')
-        else:
-            for found_ver in dict.fromkeys(normalized_asserts):
-                if found_ver != deno_ver:
-                    drift['denoland/deno'].append(
-                        f'`{release_wf_rel}` Deno 版本断言（deno {safe_text(found_ver, 80)}）'
-                        f'与 Go 锁定版本 `deno {deno_ver}` 不一致'
-                    )
-        sha_matches = RELEASE_BUILD_DENO_SHA_RE.findall(release_wf_text)
-        if len(sha_matches) != 1:
-            drift['denoland/deno'].append(f'`{release_wf_rel}` 缺失或无法唯一解析 Deno Linux x86_64 SHA-256 校验行')
-        else:
-            found_sha = sha_matches[0].lower()
-            if not SHA256_HEX_RE.fullmatch(found_sha):
-                drift['denoland/deno'].append(
-                    f'`{release_wf_rel}` Deno Linux x86_64 SHA-256（{safe_text(sha_matches[0], 80)}）格式非法'
-                )
-            elif deno_linux_sha is not None and found_sha != deno_linux_sha:
-                drift['denoland/deno'].append(
-                    f'`{release_wf_rel}` Deno Linux x86_64 SHA-256（`{found_sha}`）'
-                    f'与 `{DENO_SOURCE_REL.as_posix()}`（`{deno_linux_sha}`）不一致'
-                )
+    _collect_deno_workflow_drift(root, RELEASE_BUILD_WORKFLOW_REL, deno_ver, deno_linux_sha, drift)
+    _collect_deno_workflow_drift(root, UPSTREAM_CANARY_WORKFLOW_REL, deno_ver, deno_linux_sha, drift)
 
     gateway_wf_rel = GATEWAY_ISOLATION_WORKFLOW_REL.as_posix()
     gateway_wf_text = _read_repo_text(root / GATEWAY_ISOLATION_WORKFLOW_REL)
@@ -366,7 +374,7 @@ def collect_local_pin_drift(root=ROOT, pinned=None):
 
 
 def verify_local_pin_consistency(root=ROOT):
-    """Fail closed with WatchError if any of the 5 local lock files drift out of sync."""
+    """Fail closed with WatchError if any of the 6 local lock files drift out of sync."""
     pinned = load_pinned_versions(root)
     drift = collect_local_pin_drift(root, pinned)
     problems = [f'{repo}: {detail}' for repo in UPSTREAMS for detail in drift[repo]]
@@ -894,7 +902,7 @@ def main(argv=None):
     parser.add_argument(
         '--check-local-pins',
         action='store_true',
-        help='Verify all 5 local runtime version/SHA-256 lock files offline without network or GITHUB_TOKEN',
+        help='Verify all 6 local runtime version/SHA-256 lock files offline without network or GITHUB_TOKEN',
     )
     parser.add_argument('--root', type=Path, default=ROOT, help='Repository root directory (defaults to checkout root)')
     args = parser.parse_args(argv)

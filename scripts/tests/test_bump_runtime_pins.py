@@ -112,6 +112,24 @@ def write_realistic_lock_files(
             '            *) exit 1 ;;\n'
             '          esac\n'
         ),
+        bump.UPSTREAM_CANARY_WORKFLOW_REL: (
+            'name: Upstream canary probe\n'
+            'jobs:\n'
+            '  canary:\n'
+            '    steps:\n'
+            f'      - name: Install pinned Deno {deno_version}\n'
+            '        run: |\n'
+            '          set -euo pipefail\n'
+            '          curl --fail --silent --show-error --location \\\n'
+            f'            https://github.com/denoland/deno/releases/download/v{deno_version}/deno-x86_64-unknown-linux-gnu.zip \\\n'
+            '            --output "$RUNNER_TEMP/deno/deno.zip"\n'
+            '          unzip -q -o "$RUNNER_TEMP/deno/deno.zip" -d "$RUNNER_TEMP/deno"\n'
+            f'          echo "{deno_hashes["deno-x86_64-unknown-linux-gnu"]}  $RUNNER_TEMP/deno/deno" | sha256sum --check --strict\n'
+            '          case "$first_line" in\n'
+            f'            "deno {deno_version}"|"deno {deno_version} "*) ;;\n'
+            '            *) exit 1 ;;\n'
+            '          esac\n'
+        ),
         bump.GATEWAY_ISOLATION_WORKFLOW_REL: (
             'name: Gateway isolation\n'
             'jobs:\n'
@@ -254,6 +272,7 @@ class OfflineBumpTests(unittest.TestCase):
                 for untouched in (
                     bump.DENO_SOURCE_REL,
                     bump.RELEASE_BUILD_WORKFLOW_REL,
+                    bump.UPSTREAM_CANARY_WORKFLOW_REL,
                     bump.VALIDATION_REQUIREMENTS_REL,
                 ):
                     self.assertEqual(after[untouched], before[untouched])
@@ -301,6 +320,7 @@ class OfflineBumpTests(unittest.TestCase):
                 [
                     bump.DENO_SOURCE_REL.as_posix(),
                     bump.RELEASE_BUILD_WORKFLOW_REL.as_posix(),
+                    bump.UPSTREAM_CANARY_WORKFLOW_REL.as_posix(),
                     bump.VALIDATION_REQUIREMENTS_REL.as_posix(),
                 ],
             )
@@ -315,19 +335,22 @@ class OfflineBumpTests(unittest.TestCase):
 
             sandbox_text = (root_zip / bump.DENO_SOURCE_REL).read_text(encoding='utf-8')
             rel_wf_text = (root_zip / bump.RELEASE_BUILD_WORKFLOW_REL).read_text(encoding='utf-8')
+            canary_wf_text = (root_zip / bump.UPSTREAM_CANARY_WORKFLOW_REL).read_text(encoding='utf-8')
             reqs_text = (root_zip / bump.VALIDATION_REQUIREMENTS_REL).read_text(encoding='utf-8')
             for asset in bump.REQUIRED_DENO_ASSETS:
                 self.assertIn(f'\t"{expected_inner[asset]}": "{asset}",', sandbox_text)
                 self.assertNotIn(outer_zip_shas[asset], sandbox_text)
                 self.assertNotIn(outer_zip_shas[asset], rel_wf_text)
+                self.assertNotIn(outer_zip_shas[asset], canary_wf_text)
 
-            self.assertIn('- name: Install pinned Deno 2.10.1', rel_wf_text)
-            self.assertIn('/releases/download/v2.10.1/deno-x86_64-unknown-linux-gnu.zip', rel_wf_text)
-            self.assertIn(
-                f'{expected_inner["deno-x86_64-unknown-linux-gnu"]}  $RUNNER_TEMP/deno/deno',
-                rel_wf_text,
-            )
-            self.assertIn('"deno 2.10.1"|"deno 2.10.1 "*) ;;', rel_wf_text)
+            for wf_text in (rel_wf_text, canary_wf_text):
+                self.assertIn('- name: Install pinned Deno 2.10.1', wf_text)
+                self.assertIn('/releases/download/v2.10.1/deno-x86_64-unknown-linux-gnu.zip', wf_text)
+                self.assertIn(
+                    f'{expected_inner["deno-x86_64-unknown-linux-gnu"]}  $RUNNER_TEMP/deno/deno',
+                    wf_text,
+                )
+                self.assertIn('"deno 2.10.1"|"deno 2.10.1 "*) ;;', wf_text)
             self.assertIn('deno==2.10.1\n', reqs_text)
 
             # Case B: --deno-sha256 produces the exact same 3-file output
@@ -567,6 +590,8 @@ class FailClosedAndRollbackTests(unittest.TestCase):
             ('missing-deno-map', bump.DENO_SOURCE_REL, lambda s: s.replace('OfficialDenoSHA256Sums', 'OtherDenoSums')),
             ('missing-release-title', bump.RELEASE_BUILD_WORKFLOW_REL, lambda s: s.replace('Install pinned Deno', 'Setup Deno')),
             ('missing-release-assert', bump.RELEASE_BUILD_WORKFLOW_REL, lambda s: s.replace('"deno ', '"runtime ')),
+            ('missing-canary-title', bump.UPSTREAM_CANARY_WORKFLOW_REL, lambda s: s.replace('Install pinned Deno', 'Setup Deno')),
+            ('missing-canary-assert', bump.UPSTREAM_CANARY_WORKFLOW_REL, lambda s: s.replace('"deno ', '"runtime ')),
             ('missing-reqs-deno', bump.VALIDATION_REQUIREMENTS_REL, lambda s: s.replace('deno==2.9.8\n', '')),
         ]
         for label, rel, mutate in mutations:
@@ -692,7 +717,7 @@ class FetchOfficialMockTransportTests(unittest.TestCase):
                 opener=opener,
             )
             self.assertEqual(result['mode'], 'official')
-            self.assertEqual(len(result['changed_files']), 5)
+            self.assertEqual(len(result['changed_files']), 6)
             self.assertEqual(
                 bump.verify_local_pin_consistency(root),
                 {'yt-dlp/yt-dlp': ytdlp_ver, 'denoland/deno': deno_ver},

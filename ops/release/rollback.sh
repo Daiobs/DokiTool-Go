@@ -34,6 +34,8 @@ SERVICE_NAME="${DOKITOOL_SERVICE_NAME:-dokitool-go.service}"
 SYSTEMD_DROPIN_DIR="${DOKITOOL_SYSTEMD_DROPIN_DIR:-/etc/systemd/system/${SERVICE_NAME}.d}"
 DROPIN_FILE="${SYSTEMD_DROPIN_DIR}/${DOKITOOL_DROPIN_FILENAME:-90-release-exec.conf}"
 
+# Compatibility minimum smoke floor (9 legacy core platforms); production runs 14 core platforms
+# and should pass DOKITOOL_EXPECTED_PLATFORMS (or DOKITOOL_MIN_PLATFORMS=14) in release.conf.
 MIN_PLATFORMS="${DOKITOOL_MIN_PLATFORMS:-9}"
 EXPECTED_PLATFORMS="${DOKITOOL_EXPECTED_PLATFORMS:-}"
 STOP_TIMEOUT_SEC="${DOKITOOL_STOP_TIMEOUT_SEC:-315}"

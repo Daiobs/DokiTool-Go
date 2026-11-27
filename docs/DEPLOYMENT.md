@@ -31,7 +31,7 @@
 将干净构建产出的二进制与 `frontend/dist/` 同 CI 生成的 `release-manifest.json` 逐项核对：
 
 - 核对 `frontend_dist_files` 的文件集合无缺失或多余项；
-- 核对 `index.html`、`downloads/worker.js`、`downloads/bridge.html`、公开用户脚本 `helper/dokitool-youtube.user.js` 以及 Chrome 扩展安装包 `helper/dokitool-chrome-extension.zip` 的 SHA-256 摘要与预期完全一致；
+- 核对 `index.html`、`downloads/worker.js`、`downloads/bridge.html`、公开用户脚本 `helper/dokitool-youtube.user.js`、运行态扩展版本清单 `helper/extension-version.json` 以及 Chrome 扩展安装包 `helper/dokitool-chrome-extension.zip` 的 SHA-256 摘要与预期完全一致；
 - 执行 `./dokitool catalog` 离线自检，确认平台目录 JSON 结构合法。
 
 ### 4. 不可变目录落盘与追加哈希静态资源
@@ -52,7 +52,7 @@
 1. **切换后即时冒烟**：
    - 本地回环与公网 `GET /api/platforms?schema_version=1.0` 均返回 HTTP `200`、`code: "OK"`，且启用平台数量与列表符合预期（当前为 14 个平台）；
    - 公网首页返回 HTTP `200`，首页引用的全部新 `/assets/*` chunk 及至少一个保留的上一版 `/assets/*` chunk 均返回 HTTP `200`，不存在的 `/assets/*` 路径返回 `404`（不回退 SPA HTML）；
-   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/helper/dokitool-youtube.user.js` 与 `/helper/dokitool-chrome-extension.zip` 版本/状态码（HTTP `200`）与 SHA-256 摘要正确。
+   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/helper/dokitool-youtube.user.js`、`/helper/extension-version.json` 与 `/helper/dokitool-chrome-extension.zip` 版本/状态码（HTTP `200`）与 SHA-256 摘要正确。
 2. **发布回执与线上复测**：
    - 在发布 Issue 中如实记录切换前后 SHA、二进制与关键静态资源摘要、服务状态与冒烟结果（不含任何敏感环境信息）；
    - 针对本次上线涉及的平台或前端交互在真实线上站点完成端到端复测，验证通过后关闭发布单与对应问题单。

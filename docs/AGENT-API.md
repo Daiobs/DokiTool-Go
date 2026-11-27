@@ -2,7 +2,8 @@
 
 本文档面向命令行脚本、后台任务与自动化 Agent，说明如何使用 Bearer 鉴权凭据（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的多角色密钥：`owner` / `agent` / `friend`）调用 DokiTool 统一媒体 v1（`schema_version=1.0`）接口完成高吞吐解析、状态观测与直链提取。
 
-- 完整的批量下载工程实践与标准库可运行示例脚本见 [docs/AGENT-BATCH-DOWNLOAD.md](AGENT-BATCH-DOWNLOAD.md) 与 [examples/agent_batch_download.py](../examples/agent_batch_download.py)。
+- 开箱即用的零第三方依赖 Python 3.9+ Agent CLI 与默认只读 Stdio MCP Server 见 [tools/dokitool-agent/README.md](../tools/dokitool-agent/README.md) 与 [tools/dokitool-agent/SKILL.md](../tools/dokitool-agent/SKILL.md)（支持 `platforms` / `parse` / `resolve` / `download` / `subtitles`，含 `DOKITOOL_API_TOKEN` 优先与 `DOKITOOL_OWNER_TOKEN` 兼容、逐跳公网 IP pinning、默认 no-clobber 防覆盖及 `json3`/VTT/SRT/双语字幕提取）。
+- 完整的批量下载工程实践与独立标准库参考脚本见 [docs/AGENT-BATCH-DOWNLOAD.md](AGENT-BATCH-DOWNLOAD.md) 与 [examples/agent_batch_download.py](../examples/agent_batch_download.py)。
 - 多密钥 SHA-256 注册表配置规范、角色默认值及 `SIGHUP` 热重载说明见 [docs/CONFIGURATION.md](CONFIGURATION.md)，脱敏配置文件示例见 [ops/examples/api-keys.example.json](../ops/examples/api-keys.example.json)。
 - 机器可读 OpenAPI `3.1.0` 契约见 [docs/openapi.json](openapi.json)；底层 JSON Schema 真值见 [docs/schema/unified-v1/unified-v1.schema.json](schema/unified-v1/unified-v1.schema.json)。
 
@@ -19,7 +20,7 @@
 以下两个平台**不在 Agent 批量下载主支持范围内**：
 
 1. **YouTube（`youtube`）**：
-   - 线上标准产品路径依赖桌面浏览器端同源用户脚本（`DokiTool YouTube Helper`），由浏览器直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与浏览器内 Mediabunny 无损音视频合并（前端在未检测到用户脚本时合成客户端级 `HELPER_REQUIRED` 提示状态）。
+   - 线上标准产品路径优先使用 **Chrome MV3 原生侧边栏扩展（`v4.5.0`，免油猴）** 或桌面浏览器端同源用户脚本（`DokiTool YouTube Helper`），由浏览器直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与浏览器内 Mediabunny 无损音视频合并（纯 Web 端在未检测到扩展或用户脚本时合成客户端级 `HELPER_REQUIRED` 提示状态）。
    - 在默认未开启 `DOKITOOL_YTDLP_YOUTUBE_ENABLED` 的服务端上，对 YouTube 链接调用 `GET /api/parse` 会直接返回 HTTP `503`（`code: "SERVICE_NOT_CONFIGURED"`）；即便在自建实例上开启服务端提取器，`*.googlevideo.com` 媒体直链通常绑定服务端出口 IP，异地客户端直连下载仍会被拒绝。Agent 批量任务应在输入阶段直接过滤或跳过 YouTube 链接。
 2. **微博（`weibo`）**：
    - 微博不在主批量支持范围内：DokiTool 注册的微博能力仅为 `["video"]`（不支持纯图片微博图文提取；非视频微博状态帖会返回 `404 CONTENT_UNAVAILABLE` 或因上游状态接口访客限制返回 `403 UPSTREAM_BLOCKED`），且微博响应不进入服务端短时解析缓存。

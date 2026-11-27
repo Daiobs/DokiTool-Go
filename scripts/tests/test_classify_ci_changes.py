@@ -142,6 +142,9 @@ class ClassifyPathsTests(unittest.TestCase):
             "frontend/scripts/test-pipixia-representation.mjs",
             "frontend/scripts/test-shanghai-original.mjs",
             "scripts/classify-ci-changes.py",
+            "scripts/check-supply-chain.py",
+            "scripts/supply-chain-exceptions.json",
+            "scripts/check-ssot-consistency.py",
         ]
         for path in full_triggers:
             with self.subTest(path=path):

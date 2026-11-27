@@ -45,6 +45,9 @@ FULL_EXACT_PATHS = frozenset(
         "frontend/scripts/test-pipixia-representation.mjs",
         "frontend/scripts/test-shanghai-original.mjs",
         "scripts/classify-ci-changes.py",
+        "scripts/check-supply-chain.py",
+        "scripts/supply-chain-exceptions.json",
+        "scripts/check-ssot-consistency.py",
     }
 )
 FULL_PREFIXES = (

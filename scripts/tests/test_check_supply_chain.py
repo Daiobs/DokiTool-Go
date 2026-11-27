@@ -302,6 +302,27 @@ class CheckSupplyChainOfflineTests(unittest.TestCase):
                 msg=res.violations,
             )
 
+    def test_weak_sha1_integrity_in_package_lock_fails_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_valid_fixture_repo(
+                repo,
+                npm_packages={
+                    "": {"name": "fixture-web", "version": "1.0.0"},
+                    "node_modules/legacy-sha1": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/legacy-sha1/-/legacy-sha1-1.0.0.tgz",
+                        "integrity": "sha1-" + ("A" * 27) + "=",
+                    },
+                },
+            )
+            res = csc.check_offline(repo, today=datetime.date(2026, 11, 26))
+            self.assertFalse(res.passed)
+            self.assertTrue(
+                any("npm-lock-integrity" in v and "legacy-sha1" in v for v in res.violations),
+                msg=res.violations,
+            )
+
     def test_forbidden_resolved_urls_in_package_lock_fail_offline(self) -> None:
         bad_urls = [
             "git+https://github.com/evil/pkg.git#main",

@@ -77,6 +77,7 @@ jobs:
           DOKITOOL_STAGE2_SKIP_BROWSER=1 node --test scripts/prod-smoke/test_stage2_browser.mjs
           python3 -B -X utf8 -m unittest discover -s scripts/tests -v
           python3 -B scripts/check-upstream-updates.py --check-local-pins
+          python3 -B scripts/check-ssot-consistency.py
           python3 -B scripts/go-migration/test-public-projection.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/test-unified-schema.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/check-openapi.py --require-jsonschema
