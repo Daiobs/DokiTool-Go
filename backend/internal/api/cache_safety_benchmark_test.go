@@ -54,11 +54,6 @@ func TestParseCacheExcludesRequesterBoundContent(t *testing.T) {
 	nowSec.Store(1793448000)
 
 	var weiboCalls, youtubeCalls atomic.Int32
-	rawKey := make([]byte, 32)
-	if _, err := rand.Read(rawKey); err != nil {
-		t.Fatal(err)
-	}
-	signingKey := hex.EncodeToString(rawKey)
 
 	weiboAdapter := AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
 		weiboCalls.Add(1)
@@ -79,25 +74,25 @@ func TestParseCacheExcludesRequesterBoundContent(t *testing.T) {
 	h, err := New(c, map[string]Adapter{
 		"weibo":   weiboAdapter,
 		"youtube": youtubeAdapter,
-	}, func() time.Time { return time.Unix(nowSec.Load(), 0) }, weiboplatform.PreparePublic(signingKey))
+	}, func() time.Time { return time.Unix(nowSec.Load(), 0) }, weiboplatform.PreparePublic)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ytHelper := &countingYouTubeHelper{}
 	h.SetYouTubeHelper(ytHelper)
 
-	// 1. Weibo signed relay tickets must NEVER be cached across requests.
+	// 1. Weibo now emits channel-invariant direct URLs (browser_fetch=blocked) and enters parseCache cleanly.
 	weiboPath := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://weibo.com/1234567890/AbCdEfGhI")
 	w1 := httptest.NewRecorder()
 	h.ServeHTTP(w1, httptest.NewRequest(http.MethodGet, weiboPath, nil))
 	nowSec.Add(5)
 	w2 := httptest.NewRecorder()
 	h.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, weiboPath, nil))
-	if w1.Code != http.StatusOK || w2.Code != http.StatusOK || weiboCalls.Load() != 2 {
-		t.Fatalf("weibo should bypass cache: code1=%d code2=%d calls=%d", w1.Code, w2.Code, weiboCalls.Load())
+	if w1.Code != http.StatusOK || w2.Code != http.StatusOK || weiboCalls.Load() != 1 {
+		t.Fatalf("weibo direct responses should enter parseCache: code1=%d code2=%d calls=%d", w1.Code, w2.Code, weiboCalls.Load())
 	}
-	if bytes.Equal(w1.Body.Bytes(), w2.Body.Bytes()) {
-		t.Fatal("weibo responses at distinct timestamps unexpectedly reused identical signed ticket payload")
+	if !bytes.Equal(w1.Body.Bytes(), w2.Body.Bytes()) || strings.Contains(w1.Body.String(), "/api/media/weibo") {
+		t.Fatalf("weibo cached direct payload mismatch or unexpected relay URL: %s", w1.Body.String())
 	}
 
 	// 2. YouTube /api/youtube/{context,finalize} NEVER enter parseCache, while YouTube /api/parse

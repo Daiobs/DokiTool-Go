@@ -23,12 +23,9 @@ type platformTrait struct {
 	// normalizing or serving overlong inputs from a warm entry.
 	strictInput2048 bool
 	// disableParseCache excludes platforms whose responses carry requester-bound
-	// or channel-dependent artifacts:
-	//   - weibo: mints HMAC-signed /api/media/weibo?ticket=... relay tickets (and
-	//     differs between anonymous visitors and owner-token callers).
-	// Note: youtube is allowed into parseCache with a short, dynamically configurable
-	// TTL (cache.youtube_parse_ttl, default 120s; 0s disables YouTube caching) while
-	// /api/youtube/context and /api/youtube/finalize remain outside parseCache.
+	// or channel-dependent artifacts.
+	// Note: weibo now emits channel-invariant direct URLs (browser_fetch=blocked)
+	// and enters parseCache + singleflight; youtube uses cache.youtube_parse_ttl.
 	disableParseCache bool
 	// shanghaiFallbackShortTTL caps OK parseCache TTL at shanghaiFallbackCacheTTL
 	// (15s) when a Shanghai-enabled platform degraded to overseas fallback so the
@@ -85,9 +82,6 @@ var platformTraits = map[string]platformTrait{
 	},
 	"bilibili": {
 		shanghaiFallbackShortTTL: true,
-	},
-	"weibo": {
-		disableParseCache: true,
 	},
 	"pinterest": {
 		normalizeCacheURL: normalizePinterestCacheURL,

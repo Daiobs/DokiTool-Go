@@ -23,7 +23,6 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
-	weibomedia "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/ytgeneric"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/shresolver"
@@ -834,7 +833,6 @@ func TestInvalidOversizedDuplicateAndDisabledAuthThrottlesPerIPWithoutGlobalStar
 		{"oversized-1056b", http.MethodGet, "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.bilibili.com/video/BV1xx411c7mD"), []string{oversized}, false},
 		{"oversized-16kib", http.MethodGet, "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.bilibili.com/video/BV1xx411c7mD"), []string{hugeHeader}, false},
 		{"legacy-route", http.MethodGet, "/api/douyin", []string{"Bearer " + wrongToken}, true},
-		{"media-route", http.MethodGet, "/api/media/weibo", []string{"Bearer " + wrongToken}, true},
 		{"head-parse", http.MethodHead, "/api/parse", []string{"Bearer " + wrongToken}, false},
 	}
 
@@ -953,7 +951,6 @@ func TestInvalidOversizedDuplicateAndDisabledAuthThrottlesPerIPWithoutGlobalStar
 
 func TestQueryParameterTokensNeverAuthenticateAsOwner(t *testing.T) {
 	ownerToken := randomPrintableToken(t, 48)
-	mediaKey := randomPrintableToken(t, 64)
 	edgeKey := randomPrintableToken(t, 40)
 
 	registry, err := catalog.Load()
@@ -973,7 +970,7 @@ func TestQueryParameterTokensNeverAuthenticateAsOwner(t *testing.T) {
 			}),
 		},
 		func() time.Time { return time.Unix(weiboFrozenNow, 0) },
-		weiboplatform.PreparePublicWithOwner(mediaKey, IsOwnerRequest),
+		weiboplatform.PreparePublic,
 		CacheConfig{Disabled: true},
 	)
 	if err != nil {
@@ -1010,16 +1007,8 @@ func TestQueryParameterTokensNeverAuthenticateAsOwner(t *testing.T) {
 		}
 		item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
 		def := unified.Map(item["default"])
-		if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
-			t.Fatalf("query param ?%s= bypassed Weibo relay default=%v", qk, def)
-		}
-		for _, v := range unified.Slice(item["variants"]) {
-			for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
-				src := unified.Map(sv)
-				if src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") {
-					t.Fatalf("query param ?%s= bypassed Weibo relay source=%v", qk, src)
-				}
-			}
+		if def["access"] == "relay" || unified.Str(def["url"]) != weiboCDNURL {
+			t.Fatalf("query param ?%s= unexpected Weibo default=%v", qk, def)
 		}
 	}
 
@@ -1065,7 +1054,6 @@ func (f *fakeWeiboSafeExecutor) Do(ctx context.Context, req fetch.Request) (fetc
 
 func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) {
 	ownerToken := randomPrintableToken(t, 48)
-	mediaKey := randomPrintableToken(t, 64)
 	edgeKey := randomPrintableToken(t, 40)
 
 	registry, err := catalog.Load()
@@ -1073,12 +1061,12 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 		t.Fatal(err)
 	}
 	exec := &fakeWeiboSafeExecutor{body: weiboSyntheticResponse}
-	// Enable parseCache (DefaultCacheConfig) to prove Weibo responses never cross-contaminate via cache or singleflight!
+	// Enable parseCache (DefaultCacheConfig) to verify channel-invariant Weibo direct responses coalesce cleanly via cache + singleflight!
 	h, err := NewWithCacheConfig(
 		registry,
 		map[string]Adapter{"weibo": weiboplatform.New(exec)},
 		func() time.Time { return time.Unix(weiboFrozenNow, 0) },
-		weiboplatform.PreparePublicWithOwner(mediaKey, IsOwnerRequest),
+		weiboplatform.PreparePublic,
 		DefaultCacheConfig(),
 	)
 	if err != nil {
@@ -1099,8 +1087,43 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 	var wg sync.WaitGroup
 	errs := make(chan error, pairs*2)
 
+	checkDirectBlocked := func(label string, w *httptest.ResponseRecorder) {
+		if w.Code != http.StatusOK {
+			errs <- fmt.Errorf("%s status=%d body=%s", label, w.Code, w.Body.String())
+			return
+		}
+		rawBody := w.Body.String()
+		if strings.Contains(rawBody, "/api/media/weibo") {
+			errs <- fmt.Errorf("%s unexpectedly contained relay route: %s", label, rawBody)
+			return
+		}
+		payload, err := unified.Decode(w.Body.Bytes())
+		if err != nil {
+			errs <- err
+			return
+		}
+		if err := unified.ValidateEnvelopeAt(payload, weiboFrozenNow); err != nil {
+			errs <- fmt.Errorf("%s contract invalid: %v", label, err)
+			return
+		}
+		item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
+		def := unified.Map(item["default"])
+		if (def["access"] != nil && def["access"] != "direct") || def["url"] != weiboCDNURL {
+			errs <- fmt.Errorf("%s default=%v, want direct %s", label, def, weiboCDNURL)
+			return
+		}
+		for _, v := range unified.Slice(item["variants"]) {
+			for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
+				src := unified.Map(sv)
+				if src["direct_url"] != nil || src["browser_fetch"] != "blocked" || src["url"] != weiboCDNURL {
+					errs <- fmt.Errorf("%s unexpected source=%v", label, src)
+					return
+				}
+			}
+		}
+	}
+
 	for i := 0; i < pairs; i++ {
-		// Owner caller (all from single IP!)
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -1114,42 +1137,9 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 			req.Header.Set(edgeHeader, edgeKey)
 			req.Header.Set(clientHeader, "198.51.100.1")
 			req.Header.Set("Authorization", "Bearer "+ownerToken)
-			w := call(entry, req)
-			if w.Code != http.StatusOK {
-				errs <- fmt.Errorf("owner #%d status=%d body=%s", idx, w.Code, w.Body.String())
-				return
-			}
-			rawBody := w.Body.String()
-			if strings.Contains(rawBody, "/api/media/weibo?ticket=") {
-				errs <- fmt.Errorf("owner #%d received relay ticket URL: %s", idx, rawBody)
-				return
-			}
-			payload, err := unified.Decode(w.Body.Bytes())
-			if err != nil {
-				errs <- err
-				return
-			}
-			if err := unified.ValidateEnvelopeAt(payload, weiboFrozenNow); err != nil {
-				errs <- fmt.Errorf("owner #%d contract invalid: %v", idx, err)
-				return
-			}
-			item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
-			def := unified.Map(item["default"])
-			if (def["access"] != nil && def["access"] != "direct") || def["url"] != weiboCDNURL {
-				errs <- fmt.Errorf("owner #%d default=%v, want direct %s", idx, def, weiboCDNURL)
-				return
-			}
-			for _, v := range unified.Slice(item["variants"]) {
-				for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
-					if unified.Map(sv)["direct_url"] != nil {
-						errs <- fmt.Errorf("owner #%d source unexpectedly carried direct_url: %v", idx, sv)
-						return
-					}
-				}
-			}
+			checkDirectBlocked(fmt.Sprintf("owner #%d", idx), call(entry, req))
 		}(i)
 
-		// Anonymous caller (distinct visitor IPs)
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -1162,40 +1152,7 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 			req.RemoteAddr = "127.0.0.1:22222"
 			req.Header.Set(edgeHeader, edgeKey)
 			req.Header.Set(clientHeader, fmt.Sprintf("203.0.113.%d", idx+1))
-			w := call(entry, req)
-			if w.Code != http.StatusOK {
-				errs <- fmt.Errorf("anonymous #%d status=%d body=%s", idx, w.Code, w.Body.String())
-				return
-			}
-			payload, err := unified.Decode(w.Body.Bytes())
-			if err != nil {
-				errs <- err
-				return
-			}
-			if err := unified.ValidateEnvelopeAt(payload, weiboFrozenNow); err != nil {
-				errs <- fmt.Errorf("anonymous #%d contract invalid: %v", idx, err)
-				return
-			}
-			item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
-			def := unified.Map(item["default"])
-			if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
-				errs <- fmt.Errorf("anonymous #%d default=%v, want signed relay", idx, def)
-				return
-			}
-			for _, v := range unified.Slice(item["variants"]) {
-				for _, sv := range unified.Slice(unified.Map(unified.Map(v)["delivery"])["sources"]) {
-					src := unified.Map(sv)
-					if src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") || src["direct_url"] != weiboCDNURL {
-						errs <- fmt.Errorf("anonymous #%d unexpected relay source=%v", idx, src)
-						return
-					}
-				}
-			}
-			ticket := strings.TrimPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=")
-			decoded, ok := weibomedia.Verify(ticket, mediaKey, weiboFrozenNow)
-			if !ok || decoded["u"] != weiboCDNURL {
-				errs <- fmt.Errorf("anonymous #%d signed ticket verification failed", idx)
-			}
+			checkDirectBlocked(fmt.Sprintf("anonymous #%d", idx), call(entry, req))
 		}(i)
 	}
 	close(startBarrier)
@@ -1204,46 +1161,19 @@ func TestWeiboOwnerVsAnonymousConcurrentIsolationAndHostAllowlist(t *testing.T) 
 	for err := range errs {
 		t.Fatal(err)
 	}
+	// Verify parseCache + singleflight dramatically coalesced upstream Weibo requests (well below 64).
+	if got := exec.calls.Load(); got > 4 {
+		t.Fatalf("expected Weibo parseCache+singleflight coalescing across 64 concurrent calls, got %d upstream calls", got)
+	}
 
-	// 2. Without SNAP_MEDIA_SIGNING_KEY (""): owner Weibo STILL works (0 relay tickets needed),
-	// whereas anonymous Weibo returns 503 SERVICE_NOT_CONFIGURED without leaking raw URLs.
-	noKeyHandler, err := New(
-		registry,
-		map[string]Adapter{"weibo": weiboplatform.New(exec)},
-		func() time.Time { return time.Unix(weiboFrozenNow, 0) },
-		weiboplatform.PreparePublicWithOwner("", IsOwnerRequest),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	noKeyEntry, err := WithAdmissionWithOwner(noKeyHandler, nil, "caddy", edgeKey, DefaultAdmissionConfig(), auth)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// 2. Disallowed media host from upstream is STILL rejected (allowlist preserved).
 	target := "/api/parse?schema_version=1.0&url=" + url.QueryEscape(weiboFrozenInput)
-	ownerNoKeyReq := httptest.NewRequest(http.MethodGet, target, nil)
-	ownerNoKeyReq.RemoteAddr = "127.0.0.1:22222"
-	ownerNoKeyReq.Header.Set(edgeHeader, edgeKey)
-	ownerNoKeyReq.Header.Set(clientHeader, "198.51.100.1")
-	ownerNoKeyReq.Header.Set("Authorization", "Bearer "+ownerToken)
-	if w := call(noKeyEntry, ownerNoKeyReq); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), weiboCDNURL) {
-		t.Fatalf("owner Weibo without SNAP_MEDIA_SIGNING_KEY failed: status=%d body=%s", w.Code, w.Body.String())
-	}
-	anonNoKeyReq := httptest.NewRequest(http.MethodGet, target, nil)
-	anonNoKeyReq.RemoteAddr = "127.0.0.1:22222"
-	anonNoKeyReq.Header.Set(edgeHeader, edgeKey)
-	anonNoKeyReq.Header.Set(clientHeader, "203.0.113.200")
-	if w := call(noKeyEntry, anonNoKeyReq); w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), weiboCDNURL) {
-		t.Fatalf("anonymous Weibo without signing key unexpected response: status=%d body=%s", w.Code, w.Body.String())
-	}
-
-	// 3. Disallowed media host from upstream is STILL rejected for owner requests (allowlist preserved).
 	disallowedUpstream := `{"idstr":"1234567890","text_raw":"disallowed","page_info":{"media_info":{"mp4_hd_url":"https://evil.example.com/full.mp4","video_title":"t","duration":10}},"user":{"screen_name":"u","idstr":"1"}}`
 	badHostHandler, err := New(
 		registry,
 		map[string]Adapter{"weibo": weiboplatform.New(&fakeWeiboSafeExecutor{body: disallowedUpstream})},
 		func() time.Time { return time.Unix(weiboFrozenNow, 0) },
-		weiboplatform.PreparePublicWithOwner(mediaKey, IsOwnerRequest),
+		weiboplatform.PreparePublic,
 	)
 	if err != nil {
 		t.Fatal(err)

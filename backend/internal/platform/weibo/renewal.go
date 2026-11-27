@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 
-	media "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -17,7 +16,7 @@ var numericMediaID = regexp.MustCompile(`^[0-9]+$`)
 // bytes across changes to lp, uid and ab. Preserve the route shape, path, and
 // every other raw query field. This key is never used as a delivery URL.
 func renewableFileKey(raw string) string {
-	if !media.AllowedURL(raw) {
+	if !AllowedMediaURL(raw) {
 		return ""
 	}
 	base, query, ok := strings.Cut(unified.SourceIdentity(raw), "?")

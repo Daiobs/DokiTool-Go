@@ -46,7 +46,7 @@ func TestRoutePoliciesCoverEveryRouteExhaustively(t *testing.T) {
 		{"/api/resolve", true, ""},
 		{"/api/youtube/context", true, "youtube"},
 		{"/api/youtube/finalize", true, "youtube"},
-		{"/api/media/weibo", true, "weibo"},
+		{"/api/media/weibo", false, ""},
 		{"/api/platforms", false, ""},
 		{"/api/stats", false, ""},
 	} {
@@ -141,7 +141,7 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 	if err := c.Register(catalog.YouTubePlatform()); err != nil {
 		t.Fatalf("catalog.Register(youtube): %v", err)
 	}
-	var ytParseHits, weiboParseHits, weiboRelayHits atomic.Int32
+	var ytParseHits, weiboParseHits atomic.Int32
 	adapters := map[string]Adapter{
 		"youtube": AdapterFunc(func(_ context.Context, _ string, _ int64) (unified.Object, error) {
 			ytParseHits.Add(1)
@@ -160,10 +160,6 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 		t.Fatalf("api.New: %v", err)
 	}
 	h.SetYouTubeHelper(ytHelper)
-	h.SetWeiboRelay(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		weiboRelayHits.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
 
 	// 1. Before kill-switch: YouTube helper warms and serves 200; /api/stats sees active cache.
 	reqCtx := httptest.NewRequest(http.MethodGet, "/api/youtube/context?schema_version=1.0", nil)
@@ -181,11 +177,11 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 		t.Fatalf("unexpected warm YouTubeHelper stats: %+v", snapWarm.YouTubeHelper)
 	}
 
-	// Verify Weibo relay works before kill-switch.
-	recRelayBefore := httptest.NewRecorder()
-	h.ServeHTTP(recRelayBefore, httptest.NewRequest(http.MethodGet, "/api/media/weibo?ticket=test", nil))
-	if recRelayBefore.Code != http.StatusOK || weiboRelayHits.Load() != 1 {
-		t.Fatalf("initial /api/media/weibo status=%d hits=%d", recRelayBefore.Code, weiboRelayHits.Load())
+	// Verify removed /api/media/weibo route returns 404.
+	recRemovedRelay := httptest.NewRecorder()
+	h.ServeHTTP(recRemovedRelay, httptest.NewRequest(http.MethodGet, "/api/media/weibo?ticket=test", nil))
+	if recRemovedRelay.Code != http.StatusNotFound {
+		t.Fatalf("removed /api/media/weibo status=%d, want 404", recRemovedRelay.Code)
 	}
 
 	// 2. Apply runtime emergency kill-switch for youtube and weibo via ApplyRuntimeConfig.
@@ -219,7 +215,6 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 		{"youtube-context", http.MethodGet, "/api/youtube/context?schema_version=1.0", ""},
 		{"youtube-finalize", http.MethodPost, "/api/youtube/finalize?schema_version=1.0", string(sampleFinalize)},
 		{"parse-weibo", http.MethodGet, "/api/parse?schema_version=1.0&url=https://weibo.com/123456/AbCdEf", ""},
-		{"weibo-relay", http.MethodGet, "/api/media/weibo?ticket=test", ""},
 	} {
 		rec := httptest.NewRecorder()
 		var req *http.Request
@@ -240,9 +235,9 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 			t.Fatalf("%s unexpected error envelope: %s", tc.name, rec.Body.String())
 		}
 	}
-	if ytParseHits.Load() != 0 || weiboParseHits.Load() != 0 || weiboRelayHits.Load() != 1 || ytExec.upstreamHits.Load() != hitsAtDisable {
-		t.Fatalf("kill-switch leaked upstream calls: ytParse=%d weiboParse=%d weiboRelay=%d ytHelperUpstream=%d (want %d)",
-			ytParseHits.Load(), weiboParseHits.Load(), weiboRelayHits.Load(), ytExec.upstreamHits.Load(), hitsAtDisable)
+	if ytParseHits.Load() != 0 || weiboParseHits.Load() != 0 || ytExec.upstreamHits.Load() != hitsAtDisable {
+		t.Fatalf("kill-switch leaked upstream calls: ytParse=%d weiboParse=%d ytHelperUpstream=%d (want %d)",
+			ytParseHits.Load(), weiboParseHits.Load(), ytExec.upstreamHits.Load(), hitsAtDisable)
 	}
 
 	// Background refresh loop must stay silent while youtube is disabled.
@@ -253,7 +248,7 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 		t.Fatalf("background refresh issued upstream calls while disabled: got %d, want %d", ytExec.upstreamHits.Load(), hitsAtDisable)
 	}
 
-	// 3. Re-enabling via SIGHUP ApplyRuntimeConfig restores YouTube helper and Weibo relay cleanly.
+	// 3. Re-enabling via SIGHUP ApplyRuntimeConfig restores YouTube helper cleanly.
 	cfgEnabled := DefaultRuntimeConfig()
 	if !ApplyRuntimeConfig(nil, h, cfgEnabled, true, true) {
 		stopBg()
@@ -265,10 +260,5 @@ func TestDisabledPlatformsKillSwitchCoversAllPlatformSubsystems(t *testing.T) {
 	h.ServeHTTP(recCtxAfter, httptest.NewRequest(http.MethodGet, "/api/youtube/context?schema_version=1.0", nil))
 	if recCtxAfter.Code != http.StatusOK {
 		t.Fatalf("re-enabled /api/youtube/context = %d, want 200 (body=%s)", recCtxAfter.Code, recCtxAfter.Body.String())
-	}
-	recRelayAfter := httptest.NewRecorder()
-	h.ServeHTTP(recRelayAfter, httptest.NewRequest(http.MethodGet, "/api/media/weibo?ticket=test", nil))
-	if recRelayAfter.Code != http.StatusOK || weiboRelayHits.Load() != 2 {
-		t.Fatalf("re-enabled /api/media/weibo status=%d hits=%d", recRelayAfter.Code, weiboRelayHits.Load())
 	}
 }

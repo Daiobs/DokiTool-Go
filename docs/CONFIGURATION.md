@@ -53,8 +53,9 @@
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
-| `SNAP_MEDIA_SIGNING_KEY` | 微博视频同源中转接口签发与校验短期访问票据所用的共享 HMAC 密钥 | 是 |
 | `SNAP_INGRESS_KEY` | 前置反向代理转发客户端真实地址时用于认证边缘请求头的共享密钥 | 是 |
+| `DOKITOOL_TIKTOK_PROXY_URL` | 可选，TikTok 元数据水合页与短链跳转专用轮换出口代理地址（支持 `http://` / `https://` / `socks5://`；仅作用于 `tiktok-page` 与 `tiktok-shortlink`，永不承载 `tiktok-play-302` 或任何媒体流；代理凭据与主机名在错误日志中强制脱敏） | 是 |
+| `DOKITOOL_TIKTOK_DIRECT_RPM` | 可选，TikTok 直连模式（未配置代理时）单出口令牌桶速率护栏（默认 `6` 次/分，设为 `0` 关闭） | 否 |
 | `DOKITOOL_SHANGHAI_PULL_TOKEN` | 上海拉取模式下任务认领与结果回传内部路由专用的独立 Bearer 鉴权令牌（不得与其他密钥相同） | 是 |
 | `DOKITOOL_SHANGHAI_TOKEN` | 历史上海入站直连模式下的请求 Bearer 鉴权令牌 | 是 |
 | `DOKITOOL_OWNER_TOKEN` | 个人 `owner` 通道及只读统计接口（`/api/stats`）的私有 Bearer 鉴权令牌（非空时生成隐式 `id: "owner"`、`role: "owner"` 密钥，可与 `DOKITOOL_API_KEYS_FILE` 并存；须为独立凭据且不得与其他密钥或摘要冲突） | 是 |
@@ -215,7 +216,7 @@
   ```sh
   printf '%s' "$TOKEN" | ./dokitool hash-token
   ```
-- **摘要唯一性与独立凭据强校验**：拒绝全零摘要与空字符串 SHA-256 摘要；所有密钥（含 `enabled: false` 的停用条目以及非空 `DOKITOOL_OWNER_TOKEN` 生成的隐式 `"owner"` 密钥）的 `token_sha256` 必须互不相同，且不得与非空的 `SNAP_INGRESS_KEY`、`SNAP_MEDIA_SIGNING_KEY`、`DOKITOOL_SHANGHAI_TOKEN`、`DOKITOOL_SHANGHAI_PULL_TOKEN` 的 SHA-256 摘要相同。运行时请求鉴权会对全部已配置密钥摘要执行无提前退出的常量时间扫描（`subtle.ConstantTimeCompare`）。
+- **摘要唯一性与独立凭据强校验**：拒绝全零摘要与空字符串 SHA-256 摘要；所有密钥（含 `enabled: false` 的停用条目以及非空 `DOKITOOL_OWNER_TOKEN` 生成的隐式 `"owner"` 密钥）的 `token_sha256` 必须互不相同，且不得与非空的 `SNAP_INGRESS_KEY`、`DOKITOOL_SHANGHAI_TOKEN`、`DOKITOOL_SHANGHAI_PULL_TOKEN` 的 SHA-256 摘要相同。运行时请求鉴权会对全部已配置密钥摘要执行无提前退出的常量时间扫描（`subtle.ConstantTimeCompare`）。
 
 ### 2. JSON Schema 与 `DOKITOOL_OWNER_TOKEN` 并存规则
 
@@ -259,10 +260,10 @@
   - `role`（必填）：闭合枚举 `"owner"` | `"agent"` | `"friend"`：
     - `"owner"`：允许访问只读运行统计 `GET /api/stats` 以及允许范围内的全部解析、目录与助手接口；
     - `"agent"` / `"friend"`：允许访问允许平台范围内的 `/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口；访问 `GET /api/stats` 会被直接拒绝并返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥自身的 `unauthorized` 计数，不扣减匿名单 IP 桶）。
-    - 所有通过鉴权的角色（`owner`、`agent`、`friend`）在解析公开微博视频时均走直链分支（不签发 `/api/media/weibo` 服务端中转票据）。
+    - 微博自 `v4.6.0` 起对所有匿名与鉴权角色统一输出原始 CDN 直链（`browser_fetch: "blocked"`）并接入进程内解析缓存，不再签发服务端中转票据。
   - `enabled`（可选布尔值，省略时默认 `true`）：设为 `false` 时立即停用该密钥的鉴权能力（携带已停用密钥的请求按无效凭据返回 HTTP `401` 并扣减匿名单 IP 突发桶），但该密钥条目仍以 `enabled: false` 展示在 `/api/stats` 的 `data.api_keys` 中。
   - `slow_concurrency`（可选整数）：慢解析子并发上限（覆盖依赖外部提取器的海外慢解析平台、第二级通用具名提取器兜底以及未命中缓存的 YouTube 助手接口），必须满足 `0 <= slow_concurrency <= concurrency`（`0` 表示不单独设子上限，共享 `concurrency`）。队列唤醒采用非队头阻塞（non-HOL-blocking）机制：当慢解析子并发满载而总并发仍有空余时，排在后面的国内纯 Go 快解析请求可直接越过等待中的慢解析请求立即获槽执行。
-  - `platforms`（可选字符串数组）：按密钥限制允许访问的平台白名单。省略或空数组表示允许全部已启用平台（含已开启的第二级通用具名提取器兜底）；非空时每个元素须属于 14 个内置平台 ID（`douyin`、`bilibili`、`weibo`、`toutiao`、`kuaishou`、`pipixia`、`pipigx`、`zuiyou`、`xiaohongshu`、`x`、`youtube`、`instagram`、`facebook`、`tumblr`）或内部通用兜底作用域标识 `"ytdlp_generic"`，禁止重复或未知平台名。未包含 `"ytdlp_generic"` 的非空白名单密钥会拒绝第二级通用兜底请求；请求未授权平台或作用域时（无论缓存命中与否）一律返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。`"ytdlp_generic"` 仅用于内部路由与鉴权范围，绝不会出现在 `/api/platforms` 或响应的 `data.platform` 中。
+  - `platforms`（可选字符串数组）：按密钥限制允许访问的平台白名单。省略或空数组表示允许全部已启用平台（含已开启的第二级通用具名提取器兜底）；非空时每个元素须属于 16 个内置平台 ID（`douyin`、`bilibili`、`weibo`、`toutiao`、`kuaishou`、`pipixia`、`pipigx`、`zuiyou`、`xiaohongshu`、`pinterest`、`tiktok`、`x`、`youtube`、`instagram`、`facebook`、`tumblr`）或内部通用兜底作用域标识 `"ytdlp_generic"`，禁止重复或未知平台名。未包含 `"ytdlp_generic"` 的非空白名单密钥会拒绝第二级通用兜底请求；请求未授权平台或作用域时（无论缓存命中与否）一律返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。`"ytdlp_generic"` 仅用于内部路由与鉴权范围，绝不会出现在 `/api/platforms` 或响应的 `data.platform` 中。
 
 ### 3. 角色默认值与参数合法范围
 

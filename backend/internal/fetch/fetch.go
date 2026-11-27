@@ -31,6 +31,7 @@ var (
 )
 
 type Policy struct {
+	Platform           string
 	Purpose            string
 	AllowedURL         func(string) bool
 	RewriteRedirect    func(string) string
@@ -102,8 +103,10 @@ type dnsCacheEntry struct {
 }
 
 type Client struct {
-	resolver  Resolver
-	transport roundTrip
+	resolver       Resolver
+	transport      roundTrip
+	proxyProvider  ProxyProvider
+	proxyTransport proxyRoundTripFunc
 
 	dial           func(context.Context, string, string) (net.Conn, error)
 	tlsRootCAs     *x509.CertPool
@@ -395,16 +398,36 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 		if err != nil || !p.AllowedURL(current) {
 			return Response{}, ErrPolicy
 		}
-		ips, err := c.lookupPublicIPs(ctx, u.Hostname())
+		proxyURL, err := c.resolveProxy(ctx, p)
 		if err != nil {
 			return Response{}, err
+		}
+		var ips []netip.Addr
+		if proxyURL != nil {
+			if p.FollowRedirects || p.StrictMediaHeaders || p.PartialMediaOnly || !isAllowedProxyTargetHost(u.Hostname()) {
+				return Response{}, ErrPolicy
+			}
+		} else {
+			ips, err = c.lookupPublicIPs(ctx, u.Hostname())
+			if err != nil {
+				return Response{}, err
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, current, bytes.NewReader(body))
 		if err != nil {
 			return Response{}, err
 		}
 		req.Header = headers.Clone()
-		response, err := c.transport(req, ips, p)
+		var response *http.Response
+		if proxyURL != nil {
+			pt := c.proxyTransport
+			if pt == nil {
+				pt = c.standardProxyRoundTrip
+			}
+			response, err = pt(req, proxyURL, p)
+		} else {
+			response, err = c.transport(req, ips, p)
+		}
 		if err != nil {
 			return Response{}, err
 		}

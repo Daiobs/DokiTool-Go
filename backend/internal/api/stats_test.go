@@ -680,9 +680,9 @@ func TestStatsCacheSingleflightShanghaiAndAdmissionQueues(t *testing.T) {
 	if !snap.Cache.Enabled || snap.Cache.Entries == 0 || snap.Cache.Bytes <= 0 {
 		t.Fatalf("expected populated cache occupancy, got %+v", snap.Cache)
 	}
-	if snap.Cache.ByChannel.Anonymous.Hits != 1 || snap.Cache.ByChannel.Owner.Hits != 1 ||
+	if snap.Cache.ByChannel.Anonymous.Hits != 1 || snap.Cache.ByChannel.Owner.Hits != 2 ||
 		snap.Cache.ByChannel.Owner.SingleflightShared != 1 ||
-		snap.Cache.ByChannel.Anonymous.Uncacheable != 1 || snap.Cache.ByChannel.Owner.Uncacheable != 1 {
+		snap.Cache.ByChannel.Anonymous.Uncacheable != 0 || snap.Cache.ByChannel.Owner.Uncacheable != 0 {
 		t.Fatalf("unexpected cache breakdown: %+v", snap.Cache)
 	}
 

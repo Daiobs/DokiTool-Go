@@ -95,9 +95,8 @@ var allowedKeyPlatforms = map[string]struct{}{
 	PlatformGeneric: {},
 }
 
-var dedicatedSystemEnvKeys = [4]string{
+var dedicatedSystemEnvKeys = [3]string{
 	"SNAP_INGRESS_KEY",
-	"SNAP_MEDIA_SIGNING_KEY",
 	"DOKITOOL_SHANGHAI_TOKEN",
 	"DOKITOOL_SHANGHAI_PULL_TOKEN",
 }

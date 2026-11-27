@@ -1,6 +1,6 @@
-# DokiTool Chrome MV3 侧边栏原生扩展（`v4.5.2` · `sidePanel` + `offscreen`）
+# DokiTool Chrome MV3 侧边栏原生扩展（`v4.6.0` · `sidePanel` + `offscreen`）
 
-DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当前版本 **`v4.5.2`**，固定扩展 ID `ihamkldlkdibleacagiejklpfofapkpo`），基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当前版本 **`v4.6.0`**，固定扩展 ID `ihamkldlkdibleacagiejklpfofapkpo`），基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流、B 站 1080P（免登录）DASH 无损合流或 TikTok / 微博防盗链零中转直下。
 
 > **v4.5.2 运行态同步、流韧性与安全加固**：Web 主站与扩展侧边栏统一以 `cache: "no-store"` 请求运行态 `/helper/extension-version.json`（附带 ZIP `sha256` 元数据，边缘网关配合 `Cache-Control: no-store` 与条件头剥离避免固定 `mtime` 引发 `304` 缓存碰撞），长驻未刷新页面打开弹窗或切回前台时实时同步最新版本号；扩展下载器内置单步无进展停滞超时（默认 `45s` 自动续传/切线并释放槽位）、HLS 重定向最终清单基准解析、分片 $O(1)$ 内存流式 OPFS 写入与截断回滚，以及终态 `finally` 确定性 `RELEASE_BLOB` 回收；自定义本机回环后端采用宿主级可选回环授权 + 应用层单端口精确源站隔离并在切换源站时自动回收旧源站权限；外部网页桥接拒绝非白名单 `sender.url`，被动落盘执行严格安全后缀白名单，字幕下载在重定向后强制重验白名单域名，且 `task.error` 自动剥离 URL/凭据片段。
 
@@ -15,7 +15,7 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当�
    - 零修改复用 `frontend/src/utils/youtubeHelperCore.js` 与 Mediabunny，配合仅作用于扩展自身请求（`initiatorDomains: [chrome.runtime.id]`）的动态 `declarativeNetRequest` 规则完成 `TVHTML5` 取址与 4K60 分离音视频浏览器内无损封装。
    - **纯客户端字幕下载与双语合并导出**：侧边栏直接列出媒体返回的全部 `attachments[role="subtitle"]` 字幕轨，清晰标注语言与 **「人工」 / 「自动」**（`track_kind`）标签，支持单轨 `.vtt` / `.srt` 转换以及双语主副字幕时间轴合并导出（纯本地 Blob 落盘，不持久化签名链接）。白名单字幕（含 `www.youtube.com/api/timedtext`，由 DNR Rule `1002` 剥离 Cookie/Origin）强制 `credentials: "omit"`、`referrerPolicy: "no-referrer"` 与流式 `<= 5 MiB` 安全上限；非白名单长尾字幕域名绝不绕过白名单，诚实标注 **「非白名单」** 并提供 **「复制直链」** 与 **「打开」** 移交浏览器处理。
 3. **内置 B 站 1080P（免登录）DASH 无损合流（AVC/HEVC/AV1 + 30280 AAC + 独立 M4A）**
-   - **DNR Rule `1004` 与窄匹配规则 `1006–1008` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则，对扩展自身发往 `bilivideo.com` / `bilivideo.cn` / `hdslb.com`（Rule `1004`）以及 B 站海外 Akamai UPOS 节点（高优先级 `priority: 3` 的窄匹配 Rule `1006`：`upos-*.akamaized.net`、Rule `1007`：`*bili*.akamaized.net`、Rule `1008`：`akamaized.net` + `/upgcxcode/`）的媒体请求注入 `Referer: https://www.bilibili.com/` 并剥离 `Origin` 与 `Cookie` 请求头；其余非 B 站 `*.akamaized.net` 流量（如 Vimeo、Facebook、Tumblr）落入 Rule `1005` 仅剥离 `Origin` 与 `Cookie`（零 B 站 Referer 污染），且绝不干扰浏览器正常标签页访问。
+   - **DNR Rule `1003` / `1004` / `1006–1009` 防盗链来源头注入**：通过仅限定 `initiatorDomains: [chrome.runtime.id]` 的动态 `declarativeNetRequest` 规则，对扩展自身发往微博（Rule `1003`）、B 站（Rule `1004` 及海外 Akamai UPOS 窄匹配 Rule `1006–1008`）以及 TikTok 全部 4 个顶级 CDN 域（Rule `1009`：`tiktokcdn.com`、`tiktokcdn-us.com`、`tiktokcdn-eu.com`、`tiktokv.com`，注入 `Referer: https://www.tiktok.com/`）的媒体请求精准注入对应 `Referer` 并剥离 `Origin` 与 `Cookie` 请求头；其余非 B 站 `*.akamaized.net` 流量（如 Vimeo、Facebook、Tumblr）落入 Rule `1005` 仅剥离 `Origin` 与 `Cookie`（零跨平台 Referer 污染），且绝不干扰浏览器正常标签页访问。
    - **Offscreen OPFS + `Mediabunny` 无损封装**：在独立 `offscreen` 文档中通过白名单 `fetch` 并发将视频 `.m4s`（支持 **1080P H.264 (AVC) / HEVC / AV1** 等全部可用清晰度）与 **30280 AAC** 音频 `.m4s` 流式写入浏览器私有文件系统（OPFS），随后由 `Mediabunny` 直接执行无重编码流拷贝合流输出完整 `.mp4`；合流结束、取消或终态落盘后确定性清理全部 OPFS 临时文件，无内存爆仓风险。
    - **独立 M4A、画质记忆与多 P 无缝衔接**：侧边栏顶部 `<video>` 预览继续使用 `durl` 渐进式 MP4 秒开播放；画质列表完整呈现各档位分辨率、编解码（同分辨率默认优先 `H.264` 兼顾全平台硬解与剪辑软件兼容，同时保留 `HEVC` / `AV1` 自由切换）与估算体积；选择「仅音频」时直接下载 `30280` 独立 `.m4a`；支持 B 站多 P 勾选批量合流与右键「极速下载」。
    - **零 Cookie、零服务端媒体中转**：服务端仅并行解析返回官方优先 CDN 地址（自动过滤未知第三方 PCDN，优先国内加速节点），全部 `.m4s` 媒体流量由用户本机扩展直连拉取；严格遵守零 Cookie 原则，免登录支持 **1080P（免登录，AVC/HEVC/AV1）+ 30280 AAC**，绝不读取或采集浏览器已登录的 B 站 Cookie。
@@ -23,11 +23,11 @@ DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当�
    - **点击工具栏扩展图标**：一键展开侧边栏。
    - **全局快捷键 `Alt+Shift+D`**：全屏看视频或刷信息流时直接呼出侧边栏并同步当前页（可在 `chrome://extensions/shortcuts` 自定义改键）。
    - **网页右键三菜单（零 Content Script 注入、零新增权限）**：
-     - 「用 DokiTool 解析此链接」：展开侧边栏预览、选画质或勾选图集条目（支持 14 个核心平台及后端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时的长尾公网媒体链接）；
+     - 「用 DokiTool 解析此链接」：展开侧边栏预览、选画质或勾选图集条目（支持 16 个核心平台及后端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时的长尾公网媒体链接）；
      - 「用 DokiTool 极速下载（最高画质 / 全部图集）」：无需打开侧边栏，后台直接按画质偏好静默落盘，工具栏角标实时显示进度与完成状态；
      - 「用 DokiTool 解析选中链接」（v4.4.0，`contexts: ["selection"]`）：在网页选中包含分享口令或纯文本链接的文字后右键一键提取首个合法公网链接并在首行同步打开侧边栏解析，无需额外权限或页面脚本注入。
-   - **跟随标签页自动同步（严格核心 14 平台隐私防火墙）**：仅在本地命中 14 个核心受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）；浏览任何长尾或外部网站时绝不自动外发后端请求。
-   - **主动输入与批量链接队列模式（支持长尾平台与三档安全交付）**：用户主动在侧边栏输入框或批量队列粘贴分享文本时，自动提取并去重核心 14 平台及合法公网长尾分享链接（拒绝 `chrome://`、`file://`、IP、内网主机名、本站域名及裸根域名），按序解析并落盘。下载执行按目标媒体域名自动分级：
+   - **跟随标签页自动同步（严格核心 16 平台隐私防火墙）**：仅在本地命中 16 个核心受支持平台作品链接时自动解析（支持防抖、同作品去重与手动结果防覆盖提示条）；浏览任何长尾或外部网站时绝不自动外发后端请求。
+   - **主动输入与批量链接队列模式（支持长尾平台与三档安全交付）**：用户主动在侧边栏输入框或批量队列粘贴分享文本时，自动提取并去重核心 16 平台及合法公网长尾分享链接（拒绝 `chrome://`、`file://`、IP、内网主机名、本站域名及裸根域名），按序解析并落盘。下载执行按目标媒体域名自动分级：
      - **白名单 CDN（OPFS / 无损合流）**：继续走 `offscreen` OPFS 拉流、多线路回退与 `Mediabunny` 无损封装；
      - **非白名单单文件直链（移交浏览器原生下载器）**：无需申请 `<all_urls>` 扩展通配权限，直接移交 Chrome 原生 `chrome.downloads.download` 下载器保存并追踪进度与打开文件夹——在此模式下扩展**不代理请求、不读取响应体、不附加 Cookie**，等价于浏览器原生点击下载；
      - **非白名单 HLS / 分离流（需外链）**：清晰标注 **「需外链 · 非白名单流」**，自动优先选中可直下的渐进式单文件版本，同时提供 **「复制直链」** 与 **「打开原帖」** 操作。

@@ -15,7 +15,7 @@
 | `GET /api/youtube/context` | `schema_version=1.0`（必填）；在启用 `DOKITOOL_YOUTUBE_HELPER` 时返回当前缓存的 YouTube `player_id`、`signature_timestamp` 与固定客户端参数，供同源用户脚本在浏览器端请求播放清单。未启用时返回 `404`。 |
 | `POST /api/youtube/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收浏览器端用户脚本提交的流清单载荷（`<= 512 KiB`），在无权限 Deno `ejs` 沙箱内完成签名解算并返回标准统一媒体 v1 结果。未启用时返回 `404`。 |
 
-> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；Chrome MV3 官方扩展内部握手端点（`/api/youtube/context`、`POST /api/youtube/finalize`）及签名媒体受限中转路径（`/api/media/weibo`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。
+> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；Chrome MV3 官方扩展内部握手端点（`/api/youtube/context`、`POST /api/youtube/finalize`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。全站所有平台均坚持零服务端媒体流中转。
 
 ```sh
 curl --get 'https://snap.example.com/api/parse' \
@@ -85,7 +85,7 @@ curl --get 'https://snap.example.com/api/parse' \
 | `hls` | 保留显式清单及作用域（如单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
 | `segments` | 只有具备布局验证证据的 `byte_concat` 才允许拼接；`remux` 明确暂不支持。 |
 | `pair` | 静图与动态片段有明确角色，按实况操作处理。 |
-| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.5.2`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
+| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.6.0`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
 
 variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标签/来源说明和 `reason`，没有媒体地址、规格或交付结构；不能进入默认选择或更高画质可交付引用。它也不代表已经拿到 4K。当前预留没有隐含的抓取器或自动重试入口。
 
@@ -143,10 +143,12 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 | `UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` | `504` / `502` | 上游抓取超时（`504`）、上游暂不可用或提取失败（`502`）、上游响应不符合预期结构（`502`）。 |
 | `SERVICE_NOT_CONFIGURED` / `INTERNAL_ERROR` | `503` / `500` | 平台适配器或媒体签名密钥未配置完成（`503`），或内部响应编码异常（`500`）。 |
 
-## 微博签名媒体服务与下载边界
+## 零服务端媒体中转与防盗链视频直连边界
 
-微博仍通过固定 `/api/media/weibo?ticket=...` 签名媒体服务，GET/HEAD/Range 行为不变。公开层先处理简单及组合交付的来源资格和签名，再筛选产品视图并重新计算 default，确保投影一致。签名不能延长已知 CDN 有效期；被公开层拒绝的完整文件不能导致有效 mux 被过滤。不再向前端发送 `playback_url/original_url/media_delivery` 旧别名。未配置共享签名密钥明确报错。它不是通用 URL 代理；入口隔离与池配置见 [部署说明](DEPLOYMENT.md#微博播放与下载)。
+自 `v4.6.0` 起，历史 `/api/media/weibo` 签名媒体中转路由已全面退役（请求返回 `404`），全站 16 个核心平台全部坚持**零服务端媒体中转**：
+- 微博与 TikTok 等校验 `Referer` 防盗链的视频 CDN 源统一由公开层校验域名白名单并标注 `access: "direct"` 与 `browser_fetch: "blocked"`（微博接入进程内 `parseCache` 与 `singleflight`）；
+- 桌面 Chrome MV3 官方扩展（`v4.6.0`）通过仅绑定扩展自身（`initiatorDomains: [chrome.runtime.id]`）的零 Cookie 动态 DNR 规则（微博 `RULE 1003`、TikTok `RULE 1009`）在浏览器本地完成满血直下；未安装扩展的纯 Web 页面展示封面蒙层与一键安装扩展引导，不再向 `<video>` 喂入必然 `403` 的防盗链链接。
 
-紫色下载按钮按原生附件、同源 Service Worker 流式下载、YouTube 助手并发拉取 + 浏览器内封装、以及分片拼接/ZIP 打包处理媒体交付。选源、命名和任务快照在交付前固定；具体下载策略、多线路测速、打包上限与调试开关见 [下载说明](DOWNLOADS.md)。
+紫色下载按钮按原生附件、同源 Service Worker 流式下载、Chrome MV3 扩展后台直下/无损合流、以及分片拼接/ZIP 打包处理媒体交付。选源、命名和任务快照在交付前固定；具体下载策略、多线路测速、打包上限与调试开关见 [下载说明](DOWNLOADS.md)。
 
 `/api/v1/session`、`/api/v1/parse`、原始 PHP 路径、开放媒体代理、Cookie 主页和网易云服务不属于此公开合同。小红书 4K 的传输对照及历史研究见 [研究记录](research/xhs-4k-transport-comparison-2026-10-30.md)。

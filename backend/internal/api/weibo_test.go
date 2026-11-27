@@ -11,7 +11,6 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
-	weibomedia "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
@@ -23,7 +22,7 @@ const weiboCDNURL = "https://f.video.weibocdn.com/full.mp4?size=1080"
 const weiboSyntheticResponse = `{"idstr":"1234567890","text_raw":"合成正文视频","page_info":{"media_info":{"mp4_hd_url":"https://f.video.weibocdn.com/full.mp4?size=1080","video_title":"合成标题","duration":16}},"user":{"screen_name":"合成作者","idstr":"90071992547409930012"},"attitudes_count":0}`
 
 // Only upstream responses are synthetic. The parser, request choreography,
-// signing, policy, public gateway and resolve handler all run for real.
+// direct media allowlist, policy, public gateway and resolve handler all run for real.
 type weiboHTTPFixtureExecutor struct {
 	t     *testing.T
 	body  string
@@ -58,7 +57,7 @@ func (f *weiboHTTPFixtureExecutor) Do(ctx context.Context, request fetch.Request
 	}, nil
 }
 
-func newWeiboHTTPFixture(t *testing.T, key, body string) (*Handler, *weiboHTTPFixtureExecutor) {
+func newWeiboHTTPFixture(t *testing.T, body string) (*Handler, *weiboHTTPFixtureExecutor) {
 	t.Helper()
 	registry, err := catalog.Load()
 	if err != nil {
@@ -66,7 +65,7 @@ func newWeiboHTTPFixture(t *testing.T, key, body string) (*Handler, *weiboHTTPFi
 	}
 	tape := &weiboHTTPFixtureExecutor{t: t, body: body}
 	handler, err := New(registry, map[string]Adapter{"weibo": weiboplatform.New(tape)},
-		func() time.Time { return time.Unix(weiboFrozenNow, 0) }, weiboplatform.PreparePublic(key))
+		func() time.Time { return time.Unix(weiboFrozenNow, 0) }, weiboplatform.PreparePublic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +95,11 @@ func weiboHTTPCall(t *testing.T, handler *Handler, route, view string) (int, uni
 	return writer.Code, payload
 }
 
-func TestWeiboHTTPParseAndResolveSignedMedia(t *testing.T) {
-	key := strings.Repeat("k", 64)
+func TestWeiboHTTPParseAndResolveDirectMedia(t *testing.T) {
 	for _, route := range []string{"parse", "resolve"} {
 		for _, view := range []string{"normal", "debug"} {
 			t.Run(route+"/"+view, func(t *testing.T) {
-				handler, tape := newWeiboHTTPFixture(t, key, weiboSyntheticResponse)
+				handler, tape := newWeiboHTTPFixture(t, weiboSyntheticResponse)
 				status, payload := weiboHTTPCall(t, handler, route, view)
 				if status != http.StatusOK || payload["code"] != "OK" || tape.calls != 1 {
 					t.Fatalf("HTTP Go parse failed: %d %v; upstream calls %d", status, payload["code"], tape.calls)
@@ -122,61 +120,44 @@ func TestWeiboHTTPParseAndResolveSignedMedia(t *testing.T) {
 				}
 				item := unified.Map(items[0])
 				selected := unified.Map(item["default"])
-				if selected["access"] != "relay" || !strings.HasPrefix(unified.Str(selected["url"]), "/api/media/weibo?ticket=") {
-					t.Fatal("default did not select signed relay")
-				}
-				ticket := strings.TrimPrefix(unified.Str(selected["url"]), "/api/media/weibo?ticket=")
-				decoded, ok := weibomedia.Verify(ticket, key, weiboFrozenNow)
-				if !ok || decoded["u"] != weiboCDNURL {
-					t.Fatal("signed ticket no longer verifies against original provider URL")
+				if selected["access"] == "relay" || unified.Str(selected["url"]) != weiboCDNURL {
+					t.Fatalf("default did not select direct HTTPS URL: %#v", selected)
 				}
 				if selected["direct_url"] != nil {
-					t.Fatal("default must stay on signed relay URL without direct_url")
+					t.Fatal("default must not carry redundant direct_url")
 				}
-				sawDirectURL := false
+				sawBlockedSource := false
 				for _, value := range unified.Slice(item["variants"]) {
 					variant := unified.Map(value)
 					for _, sourceValue := range unified.Slice(unified.Map(variant["delivery"])["sources"]) {
 						source := unified.Map(sourceValue)
-						if source["access"] != "relay" && unified.SourceUsable(source, weiboFrozenNow) {
-							t.Fatal("ready source bypassed signing")
+						if source["access"] == "relay" || strings.HasPrefix(unified.Str(source["url"]), "/api/media/weibo") {
+							t.Fatalf("unexpected relay source: %#v", source)
 						}
-						if source["access"] == "relay" {
-							if !strings.HasPrefix(unified.Str(source["url"]), "/api/media/weibo?ticket=") {
-								t.Fatalf("relay source url = %v, want signed ticket", source["url"])
-							}
-							if unified.Str(source["direct_url"]) == weiboCDNURL {
-								sawDirectURL = true
-							}
+						if unified.Str(source["url"]) == weiboCDNURL && source["browser_fetch"] == "blocked" {
+							sawBlockedSource = true
 						}
 					}
 				}
-				if !sawDirectURL {
-					t.Fatalf("expected verified HTTPS direct_url=%s on anonymous Weibo relay source", weiboCDNURL)
+				if !sawBlockedSource {
+					t.Fatalf("expected direct HTTPS source with browser_fetch=blocked for %s", weiboCDNURL)
 				}
 			})
 		}
 	}
 }
 
-func writerBody(payload unified.Object) []byte {
-	body, _ := unified.Encode(payload)
-	return body
-}
-
-func TestWeiboHTTPMissingSigningKeyFailsWithoutMediaLeak(t *testing.T) {
-	handler, tape := newWeiboHTTPFixture(t, "", weiboSyntheticResponse)
-	status, payload := weiboHTTPCall(t, handler, "parse", "normal")
-	if status != http.StatusServiceUnavailable || payload["code"] != "SERVICE_NOT_CONFIGURED" || tape.calls != 1 {
-		t.Fatalf("missing signer not rejected: %d %v", status, payload["code"])
-	}
-	if strings.Contains(string(writerBody(payload)), weiboCDNURL) {
-		t.Fatal("raw CDN leaked on unavailable signer")
+func TestWeiboHTTPRemovedRelayRouteReturns404(t *testing.T) {
+	handler, tape := newWeiboHTTPFixture(t, weiboSyntheticResponse)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/media/weibo?ticket=legacy", nil))
+	if rec.Code != http.StatusNotFound || tape.calls != 0 {
+		t.Fatalf("removed /api/media/weibo status=%d calls=%d, want 404 and 0 calls", rec.Code, tape.calls)
 	}
 }
 
 func TestWeiboHTTPRejectsInvalidSourceWithoutNetwork(t *testing.T) {
-	handler, tape := newWeiboHTTPFixture(t, strings.Repeat("a", 64), weiboSyntheticResponse)
+	handler, tape := newWeiboHTTPFixture(t, weiboSyntheticResponse)
 	query := url.Values{"schema_version": {"1.0"}, "url": {"https://weibo.com/tv/show/not-a-fid"}}
 	req := httptest.NewRequest(http.MethodGet, "/api/parse?"+query.Encode(), nil)
 	rec := httptest.NewRecorder()

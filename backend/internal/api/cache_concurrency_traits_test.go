@@ -197,8 +197,9 @@ func TestUncachedParseAndResolveRecoverPanicsWithoutLeak(t *testing.T) {
 	if snapEnabled.Requests.ByChannel.Anonymous != 6 || snapEnabled.Requests.ByChannel.Owner != 1 {
 		t.Fatalf("unexpected channel breakdown: %+v", snapEnabled.Requests.ByChannel)
 	}
-	if snapEnabled.Cache.Total.Uncacheable != uint64(len(enabledCases)) {
-		t.Fatalf("Cache.Total.Uncacheable = %d, want %d", snapEnabled.Cache.Total.Uncacheable, len(enabledCases))
+	// 2x youtube (YouTubeParseTTL=0) + 2x overlong-x = 4 uncacheable; 3x weibo now enter parseCache.
+	if snapEnabled.Cache.Total.Uncacheable != 4 {
+		t.Fatalf("Cache.Total.Uncacheable = %d, want 4", snapEnabled.Cache.Total.Uncacheable)
 	}
 	logMu.Lock()
 	enabledLogs := append([]string(nil), panicLogs...)
@@ -503,12 +504,10 @@ func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
 
 func TestPlatformTraitsTableConsolidation(t *testing.T) {
 	// 1. Cacheability driven by platformTraits.disableParseCache
-	for _, uncacheable := range []string{"", "weibo"} {
-		if cacheablePlatform(uncacheable) {
-			t.Fatalf("cacheablePlatform(%q) = true, want false", uncacheable)
-		}
+	if cacheablePlatform("") {
+		t.Fatalf("cacheablePlatform(%q) = true, want false", "")
 	}
-	for _, cacheable := range []string{"douyin", "bilibili", "xiaohongshu", "x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
+	for _, cacheable := range []string{"douyin", "bilibili", "weibo", "xiaohongshu", "pinterest", "tiktok", "x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
 		if !cacheablePlatform(cacheable) {
 			t.Fatalf("cacheablePlatform(%q) = false, want true", cacheable)
 		}
@@ -565,11 +564,9 @@ func TestPlatformTraitsTableConsolidation(t *testing.T) {
 
 // TestChannelDependentPublicMediaMustDisableParseCache is a mandatory safety guard
 // preventing any platform whose PublicMedia output varies between anonymous visitors
-// and authenticated owner/agent callers (currently weibo) from ever sharing parseCache.
+// and authenticated owner/agent callers from ever sharing parseCache.
 func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 	const now int64 = 1793448000
-	signingKey := strings.Repeat("k", 64)
-	weiboPrep := weiboplatform.PreparePublicWithOwner(signingKey, IsOwnerRequest)
 	prepareAll := func(ctx context.Context, platform string, payload unified.Object, ts int64) (unified.Object, error) {
 		switch platform {
 		case "douyin":
@@ -584,8 +581,10 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 			return pipixia.PreparePublic(ctx, platform, payload, ts)
 		case "zuiyou":
 			return zuiyou.PreparePublic(ctx, platform, payload, ts)
+		case "weibo":
+			return weiboplatform.PreparePublic(ctx, platform, payload, ts)
 		default:
-			return weiboPrep(ctx, platform, payload, ts)
+			return payload, nil
 		}
 	}
 
@@ -613,7 +612,6 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 
 	anonCtx := context.Background()
 	ownerCtx := WithOwnerRequest(context.Background())
-	weiboVaried := false
 
 	for i := 0; i < numCorePlatforms; i++ {
 		plat := knownPlatforms[i]
@@ -649,15 +647,12 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 		}
 
 		variesByChannel := !bytes.Equal(anonBytes, ownerBytes)
-		if plat == "weibo" {
-			weiboVaried = variesByChannel
-		}
 		if variesByChannel && !traitsForPlatform(plat).disableParseCache {
 			t.Fatalf("SECURITY INVARIANT VIOLATION: platform %q PublicMedia output varies with IsOwnerRequest(ctx), MUST set disableParseCache=true in platformTraits!", plat)
 		}
 	}
-	if !weiboVaried {
-		t.Fatal("regression test sanity check failed: weibo PublicMedia did not differ between anonymous and owner")
+	if traitsForPlatform("weibo").disableParseCache {
+		t.Fatal("weibo now emits channel-invariant direct URLs and must allow parseCache")
 	}
 }
 

@@ -97,12 +97,12 @@ func TestLoadtestProfilesSmokeLoopbackOnly(t *testing.T) {
 			if r.OwnerAgent.OK == 0 || r.Anonymous.OK == 0 {
 				t.Fatalf("expected both owner and anonymous 200 OKs in post-pr5 smoke run, got owner=%d anon=%d", r.OwnerAgent.OK, r.Anonymous.OK)
 			}
-			if r.WeiboOwnerDirect == 0 || r.WeiboAnonRelay == 0 {
-				t.Fatalf("expected Weibo owner direct > 0 and anon relay > 0 in post-pr5, got direct=%d relay=%d", r.WeiboOwnerDirect, r.WeiboAnonRelay)
+			if r.WeiboOwnerDirect == 0 || r.WeiboAnonRelay != 0 {
+				t.Fatalf("expected Weibo direct > 0 and zero legacy relay in post-pr5, got direct=%d relay=%d", r.WeiboOwnerDirect, r.WeiboAnonRelay)
 			}
 		}
-		if profile == "pre-pr5" && r.WeiboOwnerDirect != 0 {
-			t.Fatalf("expected zero Weibo direct URLs in pre-pr5, got %d", r.WeiboOwnerDirect)
+		if profile == "pre-pr5" && r.WeiboAnonRelay != 0 {
+			t.Fatalf("expected zero legacy Weibo relay URLs in pre-pr5, got %d", r.WeiboAnonRelay)
 		}
 	}
 }

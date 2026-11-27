@@ -120,16 +120,19 @@ func TestAdmissionRateAndContracts(t *testing.T) {
 	check("/api/short_videos", 5, "解析请求过于频繁，请稍后重试")
 	now = now.Add(1500 * time.Millisecond)
 	check("/api/parse", 4, "解析请求过于频繁，请稍后重试")
-	if w := call(entry, edgeRequest("/api/media/weibo", "198.51.100.11")); w.Code != 200 {
-		t.Fatalf("public exhausted relay: %d", w.Code)
+	if w := call(entry, edgeRequest(tbvideoOutcomePath, "198.51.100.11")); w.Code != 200 {
+		t.Fatalf("public exhausted telemetry reports: %d", w.Code)
 	}
 	now = now.Add(3500 * time.Millisecond)
 	if w := call(entry, edgeRequest("/api/platforms", "198.51.100.11")); w.Code != 200 {
 		t.Fatal(w.Code)
 	}
-	// Encoded or unknown paths are dispatched as-is, not charged to either pool.
+	// Encoded or unknown paths (including removed /api/media/weibo) are dispatched as-is, not charged to any pool.
 	if w := call(entry, edgeRequest("/api/%70arse", "bad IP")); w.Code != 200 {
 		t.Fatal(w.Code)
+	}
+	if classify("/api/media/weibo") != unknown {
+		t.Fatalf("removed /api/media/weibo must classify as unknown, got %v", classify("/api/media/weibo"))
 	}
 }
 
@@ -140,7 +143,7 @@ func TestAdmissionGlobalRateAndIPGroups(t *testing.T) {
 		step     time.Duration
 		path     string
 	}{
-		{"public", 8, time.Second, "/api/parse"}, {"relay", 24, time.Second / 2, "/api/media/weibo"},
+		{"public", 8, time.Second, "/api/parse"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Unix(1000, 0)
@@ -162,20 +165,20 @@ func TestAdmissionGlobalRateAndIPGroups(t *testing.T) {
 	}
 	entry := protected(t, "caddy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	entry.now = func() time.Time { return time.Unix(1000, 0) }
-	for i := 1; i <= 12; i++ {
-		if w := call(entry, edgeRequest("/api/media/weibo", fmt.Sprintf("2001:db8:1:2::%x", i))); w.Code != 204 {
+	for i := 1; i <= 4; i++ {
+		if w := call(entry, edgeRequest("/api/parse", fmt.Sprintf("2001:db8:1:2::%x", i))); w.Code != 204 {
 			t.Fatal(w.Code)
 		}
 	}
-	req := edgeRequest("/api/media/weibo", "2001:db8:1:2::aa")
-	if w := call(entry, req.Clone(req.Context())); w.Code != 429 || !strings.Contains(w.Body.String(), "媒体请求过于频繁") {
+	req := edgeRequest("/api/parse", "2001:db8:1:2::aa")
+	if w := call(entry, req.Clone(req.Context())); w.Code != 429 || !strings.Contains(w.Body.String(), "解析请求过于频繁") {
 		t.Fatal(w.Body.String())
 	}
 	req.Method = http.MethodHead
-	if w := call(entry, req); w.Code != 429 || w.Body.Len() != 0 || w.Header().Get("Retry-After") != "1" {
-		t.Fatal(w.Code, w.Body.String())
+	if w := call(entry, req); w.Code != 429 || w.Body.Len() != 0 || w.Header().Get("Retry-After") != "5" {
+		t.Fatal(w.Code, w.Body.String(), w.Header().Get("Retry-After"))
 	}
-	if w := call(entry, edgeRequest("/api/media/weibo", "2001:db8:1:3::1")); w.Code != 204 {
+	if w := call(entry, edgeRequest("/api/parse", "2001:db8:1:3::1")); w.Code != 204 {
 		t.Fatal(w.Code)
 	}
 }
@@ -293,17 +296,10 @@ func TestAdmissionFullStreamLeaseAndRelease(t *testing.T) {
 	p2 := hold("/api/parse", "192.0.2.2")
 	defer p2.Body.Close()
 	check("/api/parse", "192.0.2.3", 429)
-	m1 := hold("/api/media/weibo", "192.0.2.1")
-	defer m1.Body.Close()
-	m2 := hold("/api/media/weibo", "192.0.2.1")
-	defer m2.Body.Close()
-	check("/api/media/weibo", "192.0.2.2", 429)
-	stop(m1)
+	check("/api/platforms", "192.0.2.1", 204)
 	stop(p1)
 	check("/api/parse?error", "192.0.2.1", 502)
 	check("/api/parse", "192.0.2.1", 204)
-	check("/api/media/weibo", "192.0.2.1", 204)
-	stop(m2)
 	stop(p2)
 }
 
@@ -381,7 +377,7 @@ func TestPullControlIngressIsolation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("control request did not reach handler")
 	}
-	for _, path := range []string{"/api/parse", "/api/parse", "/api/platforms", "/api/bilibili", "/api/parse", "/api/media/weibo"} {
+	for _, path := range []string{"/api/parse", "/api/parse", "/api/platforms", "/api/bilibili", "/api/parse", tbvideoOutcomePath} {
 		if w := call(h, edgeRequest(path, from)); w.Code != 200 {
 			t.Fatalf("waiting control poll affected %s: %d", path, w.Code)
 		}
@@ -896,8 +892,8 @@ func TestAnonymousQueuedPoolsExtendAndResetWriteDeadline(t *testing.T) {
 		t.Fatalf("unexpected public pool deadlines: %v", inHandlerDeadlines)
 	}
 
-	// (c) Unqueued pools (QueueWait == 0, e.g. catalog and relay) do not call SetWriteDeadline.
-	for _, unqueuedPath := range []string{"/api/platforms?schema_version=1.0", "/api/media/weibo?ticket=abc"} {
+	// (c) Unqueued pools (QueueWait == 0, e.g. catalog and reports) do not call SetWriteDeadline.
+	for _, unqueuedPath := range []string{"/api/platforms?schema_version=1.0", tbvideoOutcomePath} {
 		rw := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
 		entry.ServeHTTP(rw, edgeRequest(unqueuedPath, "198.51.100.4"))
 		if got := rw.snapshot(); len(got) != 0 {

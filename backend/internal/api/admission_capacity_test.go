@@ -219,8 +219,8 @@ func TestAdmissionCatalogIndependentOfBusyParse(t *testing.T) {
 	if w := call(h, edgeRequest("/api/platforms?schema_version=1.0", "192.0.2.1")); w.Code != 204 {
 		t.Fatal("catalog blocked by parsing", w.Code)
 	}
-	if w := call(h, edgeRequest("/api/media/weibo", "192.0.2.1")); w.Code != 204 {
-		t.Fatal("media pool coupled", w.Code)
+	if w := call(h, edgeRequest(tbvideoOutcomePath, "192.0.2.1")); w.Code != 204 {
+		t.Fatal("reports pool coupled", w.Code)
 	}
 	if called != 2 {
 		t.Fatal(called)

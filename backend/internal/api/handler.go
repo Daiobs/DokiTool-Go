@@ -44,7 +44,6 @@ type Handler struct {
 	genericAdapter      Adapter
 	now                 func() time.Time
 	publicMedia         PublicMedia
-	weiboRelay          http.Handler
 	youtubeHelper       YouTubeHelper
 	finalizeReadTimeout time.Duration
 	cache               *parseCache
@@ -73,9 +72,6 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 	for id, adapter := range adapters {
 		if !c.Has(id) || adapter == nil {
 			return nil, fmt.Errorf("invalid adapter registration %q", id)
-		}
-		if id == "weibo" && media == nil {
-			return nil, fmt.Errorf("weibo requires signed-media preparation")
 		}
 		registered[id] = adapter
 	}
@@ -146,10 +142,6 @@ func (h *Handler) Stats() *Stats {
 	}
 	return h.stats
 }
-
-// SetWeiboRelay registers a binary-only handler before server startup.
-// Its response is never passed through the unified JSON encoder.
-func (h *Handler) SetWeiboRelay(relay http.Handler) { h.weiboRelay = relay }
 
 // RegisterRuntimeConfigObserver registers an observer notified on every
 // ApplyRuntimeConfig startup and SIGHUP hot-reload update.
@@ -543,16 +535,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case legacy:
 		sendError(w, 410, "接口已更新，请等待当前下载结束后刷新页面")
-		return
-	case media:
-		if allowed, _ := h.enforcePlatformPolicy(w, r, media, "weibo"); !allowed {
-			return
-		}
-		if h.weiboRelay != nil {
-			h.weiboRelay.ServeHTTP(w, r)
-			return
-		}
-		sendError(w, 503, "微博播放服务尚未配置，请联系站点维护者")
 		return
 	case youtubeHelper:
 		h.serveYouTubeHelper(w, r)

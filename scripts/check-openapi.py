@@ -1439,7 +1439,10 @@ def check_caddy_whitelist() -> int:
         "ops/examples/snap.caddy @default_csp script-src must forbid unsafe-inline and unsafe-eval",
     )
 
-    idx_weibo = caddy.find("handle /api/media/weibo {")
+    require(
+        "handle /api/media/weibo" not in caddy and "/api/media/weibo" not in caddy,
+        "ops/examples/snap.caddy must not expose removed /api/media/weibo relay route",
+    )
     idx_api = caddy.find("handle @api {")
     idx_catchall = caddy.find("handle /api/* {")
     idx_source = caddy.find("handle @source {")
@@ -1449,8 +1452,8 @@ def check_caddy_whitelist() -> int:
     idx_static_handle = caddy.find("\n    handle {", idx_monitor)
     idx_real_404 = caddy.find("respond 404", idx_static_handle) if idx_static_handle > 0 else -1
     require(
-        0 < idx_weibo < idx_api < idx_catchall < idx_source < idx_llms < idx_share < idx_monitor < idx_static_handle < idx_real_404,
-        "ops/examples/snap.caddy handle blocks must order /api/media/weibo -> @api -> /api/* 404 -> @source -> /llms.txt -> share -> @monitor -> static real-404",
+        0 < idx_api < idx_catchall < idx_source < idx_llms < idx_share < idx_monitor < idx_static_handle < idx_real_404,
+        "ops/examples/snap.caddy handle blocks must order @api -> /api/* 404 -> @source -> /llms.txt -> share -> @monitor -> static real-404",
     )
     static_block = caddy[idx_static_handle:]
     require(

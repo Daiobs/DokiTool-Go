@@ -70,10 +70,12 @@ def make_envelope(
         "bilibili": ("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/bili.m4s?e=1", None),
         "xiaohongshu": ("https://sns-web-i10.rednotecdn.com/spectrum/xhs.jpg?sign=xhssecret", "allowed"),
         "toutiao": ("https://v3-tt.ixigua.com/tt/video.mp4?token=ttsecret", None),
-        "weibo": ("/api/media/weibo?ticket=wbsecretticket999", None),
+        "weibo": ("https://f.video.weibocdn.com/o0/wb.mp4?Expires=1900000000&ssig=wbsecret", "blocked"),
         "pipixia": ("https://v3-ppx.ppxvod.com/ppx/video.mp4?br=1000", "allowed"),
         "pipigx": ("https:// video.pipigx.com/pp/video.mp4".replace(" ", ""), None),
         "zuiyou": ("https://tbvideo.ixiaochuan.cn/zy/video.mp4", None),
+        "pinterest": ("https://v1.pinimg.com/videos/mc/720p/aa/bb/pin.mp4", None),
+        "tiktok": ("https://v16-web-newkey.tiktokcdn.com/video/tos/tt.mp4", "blocked"),
         "x": ("https://video.twimg.com/ext_tw_video/1/pu/vid/1280x720/x.mp4?tag=12", None),
         "youtube": ("https://rr1---sn-abc.googlevideo.com/videoplayback?expire=999&sig=ytsig", None),
         "instagram": ("https://scontent.cdninstagram.com/v/t50.2886-16/ig.mp4?_nc_ht=ig", None),
@@ -88,8 +90,6 @@ def make_envelope(
     chosen_bf = default_bf if browser_fetch is None else (
         None if browser_fetch == "__OMIT__" else browser_fetch
     )
-    if platform == "weibo" and media_url is None:
-        access = "relay"
 
     source: dict = {"id": "s-1", "url": chosen_url, "access": access}
     if chosen_bf:
