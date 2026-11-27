@@ -20,13 +20,13 @@ DokiTool 最初为基于 PHP 后端与 Vue 3 + Vite 前端的短视频/图文去
 - 皮皮搞笑（视频）
 - 最右（视频 / 图集）
 
-Go 后端替代完成后，初期线上以「日本 Go 主服务 + 上海 `pull` worker」承载九平台解析与下载（参见 [抖音上海通道说明](go-migration/douyin-shanghai.md) 与 [下载说明](DOWNLOADS.md#production-download-capabilities)），随后在 Go 单栈基础上陆续接入海外平台，并在下线仅提供无 CORS HLS 流的 Dailymotion 后收敛至 14 个可真实落盘保存的平台。
+Go 后端替代完成后，初期线上以「日本 Go 主服务 + 上海 `pull` worker」承载九平台解析与下载（参见 [下载说明](DOWNLOADS.md#production-download-capabilities) 与 [部署指南](DEPLOYMENT.md)，早期抖音上海通道迁移文档已封存于标签 `archive/php-oracle-final`），随后在 Go 单栈基础上陆续接入海外平台，并在下线仅提供无 CORS HLS 流的 Dailymotion 后收敛至 14 个可真实落盘保存的平台。
 
-Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/README.md#当前运行方式)。仓库根目录历史 PHP `api/` 及过渡期对拍基准源码树在迁移阶段曾用于离线基线对照与语法门禁，现已从主干正式移除并归档至附注标签 `archive/php-oracle-final`，完整退役路径清单、快照检出方式与后续常驻黄金夹具守护机制见下文 [已退役 PHP Oracle 源码树正式归档记录](#已退役-php-oracle-源码树正式归档记录)。
+Go 构建、同源启动与当前开发命令见根 [README.md](../README.md) 与 [部署指南](DEPLOYMENT.md)（早期 `docs/go-migration/` 迁移过程档案已随历史 PHP Oracle 一并封存于标签 `archive/php-oracle-final`）。仓库根目录历史 PHP `api/` 及过渡期对拍基准源码树在迁移阶段曾用于离线基线对照与语法门禁，现已从主干正式移除并归档至附注标签 `archive/php-oracle-final`，完整退役路径清单、快照检出方式与后续常驻黄金夹具守护机制见下文 [已退役 PHP Oracle 源码树正式归档记录](#已退役-php-oracle-源码树正式归档记录)。
 
 ### 已退役 PHP Oracle 源码树正式归档记录
 
-- **正式退役时间与批次**：2026-11，`v4.5.0` 发版前减重提速 PR `#77`（分支 `chore/v450-repo-diet-and-dx-simplification`）。
+- **正式退役时间与批次**：2026-11，`v4.5.0` 发版前减重提速 PR `#77`（分支 `chore/v450-repo-diet-and-dx-simplification`）；剩余 29 篇 `docs/go-migration/` 迁移过程文档与孤立中文旧档 `backend/docs/视频解析统一JSON格式3.0.md` 已于封板 PR `#78` 一并清理（同样完整保留于下述归档标签快照中）。
 - **永久可检出 Git 快照标签**：[`archive/php-oracle-final`](https://github.com/Daiobs/DokiTool-Go/tree/archive/php-oracle-final)（指向删除任何 PHP 文件前的完整主干提交 `8b09d4277dfa6406cffc3d7530dc40d6a7f121bf`）。如需追溯或重放历史 PHP 源码，可直接检出：
   ```bash
   git fetch --tags origin
@@ -36,8 +36,21 @@ Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/
   - 历史 PHP 后端源码与入口：`backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`
   - 历史 PHP 测试与校验脚本：`backend/tests/*.php`、`backend/tests/validate.py`
   - 迁移对拍生成与验证脚本：`scripts/go-migration/`（`produce*.php`、`produce*.py`、`verify*.py`、`check.py`、`xhs_transport.py`；其中 `public_projection.py` 与 `test-public-projection.py` 已收敛至 `scripts/public_projection.py` 与 `scripts/tests/test_public_projection.py`）、`scripts/tests/test_weibo_direct_url_oracle.py`、`backend/internal/platform/douyin/testdata/produce_integer.py`
-  - 过渡期 CI 与 PHP-FPM 示例配置：`.github/workflows/php-oracle.yml`、`ops/examples/snap-fpm.conf`
-- **退役后持续回归守护机制**：仓库主干完整保留全部静态 JSON 黄金夹具（`backend/testdata/**/*.json`、`backend/internal/**/testdata/*.json(.gz)`）与 `docs/go-migration/` 冻结历史档案；原需 `-tags=phporacle` 触发的 17 个 Go 黄金基线测试已全部移除构建约束并晋升为日常 `go test -race ./...` 常驻回归门禁，持续以纯 Go 秒级守护历史行为契约。
+  - 过渡期 CI、PHP-FPM 示例配置与迁移过程文档：`.github/workflows/php-oracle.yml`、`ops/examples/snap-fpm.conf`、`docs/go-migration/`（29 篇）、`backend/docs/视频解析统一JSON格式3.0.md`
+- **退役后持续回归守护机制**：仓库主干完整保留全部静态 JSON 黄金夹具（`backend/testdata/**/*.json`、`backend/internal/**/testdata/*.json(.gz)`）；原需 `-tags=phporacle` 触发的 17 个 Go 黄金基线测试已全部移除构建约束并晋升为日常 `go test -race ./...` 常驻回归门禁，持续以纯 Go 秒级守护历史行为契约。
+
+### 已退役 YouTube 油猴用户脚本正式归档记录
+
+- **正式退役时间与批次**：2026-11，`v4.5.0` 终极黄金基线封板 PR `#78`（分支 `chore/v450-final-baseline-polish`）。
+- **永久可检出 Git 快照标签**：[`archive/youtube-userscript-final`](https://github.com/Daiobs/DokiTool-Go/tree/archive/youtube-userscript-final)（指向删除任何油猴脚本文件前的完整主干提交 `ef0baee30e4e0e8f9999be9cb459db4e9389b4ef`）。如需追溯或取回独立 Tampermonkey 油猴用户脚本及构建脚手架，可直接检出：
+  ```bash
+  git fetch --tags origin
+  git checkout archive/youtube-userscript-final -- frontend/public/helper/dokitool-youtube.user.js frontend/scripts/build-youtube-helper.mjs frontend/src/utils/youtubeHelperEntry.js
+  ```
+- **已从主干移除的退役路径清单**：
+  - 独立油猴脚本打包产物、入口与构建脚本：`frontend/public/helper/dokitool-youtube.user.js`、`frontend/src/utils/youtubeHelperEntry.js`、`frontend/scripts/build-youtube-helper.mjs`
+  - Web 主站面向 Tampermonkey 的双轨引导与状态机：`CapabilityUpgradeNotice.vue` 折叠油猴兜底区、`useVideoParser.ts` 油猴刷新等待状态机、`youtubeMux.ts` / `parseHelpers.ts` 油猴直连与解析分支
+- **退役后现役路径与复用边界**：YouTube 4K60/8K 音画无损合流与 VTT/SRT 双语字幕现统一由官方 **Chrome MV3 扩展**原生承载（免油猴依赖、内置 `Mediabunny` MPL-2.0 合流引擎）；扩展直接复用的核心模块 `frontend/src/utils/youtubeHelperCore.js`、`frontend/src/utils/youtube/*`，以及后端 `GET /api/youtube/context`、`POST /api/youtube/finalize` 与 `/monitor` 观测指标均 100% 完整保留。
 
 ### 来源与许可历史记录
 
@@ -46,7 +59,7 @@ Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/
 - 后端解析逻辑来源：[jiuhunwl/short_videos](https://github.com/jiuhunwl/short_videos)
 - 前端界面基础来源：[jiuhunwl/shortvideo-html](https://github.com/jiuhunwl/shortvideo-html)
 
-在此基础上完成了前后端工程化整理、统一返回结构、前端构建链收敛、安全加固、Go 后端重写、下载可靠性改进与自动化测试建设。仓库根目录许可证见 [LICENSE](../LICENSE)，完整第三方许可说明见 [NOTICE](../NOTICE)；历史迁移维护边界见 [维护边界](go-migration/MAINTENANCE.md#来源和许可边界)。
+在此基础上完成了前后端工程化整理、统一返回结构、前端构建链收敛、安全加固、Go 后端重写、下载可靠性改进与自动化测试建设。仓库根目录许可证见 [LICENSE](../LICENSE)，完整第三方许可说明见 [NOTICE](../NOTICE)；当前上游维护与版本对齐流程见 [上游维护指南](UPSTREAM-MAINTENANCE.md)（早期迁移维护文档已归档于标签 `archive/php-oracle-final`）。
 
 ### 迁移过渡期目录结构
 

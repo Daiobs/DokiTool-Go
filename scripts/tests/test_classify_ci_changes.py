@@ -32,7 +32,6 @@ class ClassifyPathsTests(unittest.TestCase):
         cases = [
             ["scripts/prod-smoke/smoke.py", "scripts/prod-smoke/test_smoke.py"],
             ["scripts/check-public-files.py", "scripts/tests/test_public_files.py"],
-            ["scripts/check-go-file-budgets.py", "scripts/tests/test_check_go_file_budgets.py"],
             ["scripts/check-ytdlp-extractors.py", "scripts/tests/test_check_ytdlp_extractors.py"],
             ["docs/openapi.json", "docs/API.md", "docs/CONFIGURATION.md"],
             [
@@ -42,6 +41,7 @@ class ClassifyPathsTests(unittest.TestCase):
                 "tools/dokitool-agent/tests/test_security.py",
             ],
             [
+                "Makefile",
                 "README.md",
                 "LICENSE",
                 "NOTICE",
@@ -111,7 +111,7 @@ class ClassifyPathsTests(unittest.TestCase):
             ["backend/internal/platform/bilibili/parser.go"],
             ["backend/internal/platform/youtube/helper.go"],
             ["backend/internal/api/stats_snapshot.go", "backend/internal/api/cache_test.go"],
-            ["backend/docs/视频解析统一JSON格式3.0.md"],
+            ["backend/docs/Unified-Video-Parsing-JSON-Format-3.0.md"],
             ["ops/examples/runtime.example.json"],
             ["scripts/requirements-validation.txt"],
             ["scripts/validate-unified-schema.py"],
@@ -125,7 +125,7 @@ class ClassifyPathsTests(unittest.TestCase):
 
     def test_cross_layer_contracts_ytengine_golden_fixtures_and_workflows_run_full_suite_with_l2(self) -> None:
         full_triggers = [
-            ".github/workflows/go-migration.yml",
+            ".github/workflows/ci.yml",
             ".github/workflows/gateway-isolation.yml",
             ".gitignore",
             "docs/schema/unified-v1/unified-v1.schema.json",
@@ -200,7 +200,7 @@ class GitIntegrationTests(unittest.TestCase):
             (repo / "backend/docs").mkdir(parents=True)
             (repo / "frontend/src").mkdir(parents=True)
             (repo / "scripts").mkdir(parents=True)
-            (repo / "backend/docs/视频解析统一JSON格式3.0.md").write_text("v1\n", encoding="utf-8")
+            (repo / "backend/docs/示例文档.md").write_text("v1\n", encoding="utf-8")
             (repo / "frontend/src/App.vue").write_text("<template/>\n", encoding="utf-8")
             (repo / "scripts/tool.py").write_text("print(1)\n", encoding="utf-8")
             self._git(repo, "add", ".")
@@ -214,7 +214,7 @@ class GitIntegrationTests(unittest.TestCase):
 
             # Advance main independently with a backend change.
             self._git(repo, "checkout", "main")
-            (repo / "backend/docs/视频解析统一JSON格式3.0.md").write_text("v2\n", encoding="utf-8")
+            (repo / "backend/docs/示例文档.md").write_text("v2\n", encoding="utf-8")
             self._git(repo, "commit", "-am", "main backend doc change")
             main_head = self._git(repo, "rev-parse", "HEAD")
 
@@ -251,13 +251,13 @@ class GitIntegrationTests(unittest.TestCase):
             # Moving a backend file into docs/ must still trigger run_go via --no-renames.
             self._git(repo, "checkout", "-b", "pr-move-backend")
             (repo / "docs").mkdir(exist_ok=True)
-            self._git(repo, "mv", "backend/docs/视频解析统一JSON格式3.0.md", "docs/moved.md")
+            self._git(repo, "mv", "backend/docs/示例文档.md", "docs/moved.md")
             self._git(repo, "commit", "-m", "move backend doc")
             move_head = self._git(repo, "rev-parse", "HEAD")
             paths, err = MOD.changed_files_from_git(repo, main_head, move_head)
             self.assertIsNone(err)
             assert paths is not None
-            self.assertIn("backend/docs/视频解析统一JSON格式3.0.md", paths)
+            self.assertIn("backend/docs/示例文档.md", paths)
             self.assertIn("docs/moved.md", paths)
             res = MOD.classify_paths(paths)
             self.assertTrue(res.run_go)

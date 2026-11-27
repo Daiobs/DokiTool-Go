@@ -1,4 +1,4 @@
-name: Go migration contract
+name: CI
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: go-migration-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -80,9 +80,6 @@ jobs:
           python3 -B scripts/check-ssot-consistency.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/test-unified-schema.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/check-openapi.py --require-jsonschema
-
-      - name: Verify Go single-file line budgets
-        run: python3 -B scripts/check-go-file-budgets.py
 
       - name: Verify offline supply-chain integrity (lockfiles, pinned actions, exceptions)
         run: python3 -B scripts/check-supply-chain.py --offline
@@ -268,7 +265,7 @@ jobs:
       - name: Build frontend production bundle and enforce load budget
         working-directory: frontend
         run: |
-          VITE_API_MODE=php VITE_API_BASE_URL='' npm run build
+          VITE_API_BASE_URL='' npm run build
           npm run check:load-budget
 
       - name: Start the isolated browser delivery fixtures

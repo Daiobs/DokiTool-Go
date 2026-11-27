@@ -38,8 +38,10 @@ function harness(source='https://source.example.test/work?signature=a%2Bb%3D', l
 }
 test('all existing and future platform IDs use one versioned parse endpoint',async()=>{
   assert.equal(config.resolveApiConfig({}).parseUrl,'/api/parse');
+  assert.equal(config.resolveApiConfig({}).mode,'same-origin');
   assert.equal(config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/'}).parseUrl,'https://api.example.test/api/parse');
-  assert.equal(config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/'}).mode,'php');
+  assert.equal(config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/'}).mode,'same-origin');
+  assert.equal(config.resolveApiConfig({VITE_API_MODE:'php'}).mode,'same-origin');
   assert.throws(()=>config.resolveApiConfig({VITE_API_MODE:'typo'}));
   assert.throws(()=>config.resolveApiConfig({VITE_API_BASE_URL:'https://api.example.test/api'}));
   for(const platform of ['all','douyin','kuaishou','bilibili','xiaohongshu','toutiao','weibo','pipixia','pipigx','zuiyou','x','instagram','facebook','tumblr','future_platform']) {
@@ -352,65 +354,36 @@ test('cancelParse aborts in-flight request cleanly without error banner or toast
   assert.equal(spec.store.resultData?.title,'Douyin After Cancel');
 });
 
-test('YouTube mobile & desktop helper detection: mobile UA + helper succeeds identically to desktop; mobile UA without helper shows userscript/desktop prompt; desktop UA without helper keeps install guide',async()=>{
+test('YouTube mobile & desktop extension detection: mobile UA + extension succeeds identically to desktop; mobile UA without extension shows desktop extension prompt; desktop UA without extension keeps install guide',async()=>{
   const origNavDesc=Object.getOwnPropertyDescriptor(globalThis,'navigator');
   const prevWin=globalThis.window;
   try {
-    // 1. 手机 UA + 已检测到助手时不被拦截（与桌面走完全相同的 context -> player -> finalize 路径）
+    // 1. 手机 UA + 已检测到扩展时不被拦截（与桌面走完全相同的扩展解析路径）
     for (const mobileUa of [
       'Mozilla/5.0 (Android 14; Mobile; rv:131.0) Gecko/131.0 Firefox/131.0',
       'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 EdgA/131.0.0.0',
     ]) {
       Object.defineProperty(globalThis,'navigator',{configurable:true,value:{userAgent:mobileUa}});
-      const bus=new EventTarget();
-      bus.setTimeout=setTimeout;
-      bus.clearTimeout=clearTimeout;
-      globalThis.window=bus;
-      const unmount=ytHelperCore.createUserscriptController({
-        eventTarget:bus,
-        version:ytHelperCore.YOUTUBE_HELPER_VERSION,
-        gmXmlhttpRequest(details){
-          if(details.url.includes('sw.js_data')){
-            details.onload({status:200,responseText:'["Cgt0ZXN0VmlzaXRvckRhdGFTdHJpbmc%3D"]'});
-            return;
-          }
-          details.onload({
-            status:200,
-            responseText:JSON.stringify({
-              playabilityStatus:{status:'OK'},
-              videoDetails:{title:'Mobile Firefox Helper Video',author:'Creator',lengthSeconds:'42'},
-              streamingData:{formats:[{itag:18,url:'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18',mimeType:'video/mp4; codecs="avc1.42001E, mp4a.40.2"',width:640,height:360}],adaptiveFormats:[]},
-            }),
-          });
+      const mobileStore=reactive({resultData:null,resultVersion:0,clearResult(){this.resultData=null;this.resultVersion++;},setResult(d){this.resultData=d;this.resultVersion++;}});
+      const mobileInst=parser.useVideoParser({
+        videoStore:mobileStore,
+        locale:ref('zh-CN'),
+        showToast:()=>{},
+        pingExtension:async()=>({connected:true,version:'4.5.0',extensionId:'ihamkldlkdibleacagiejklpfofapkpo',capabilities:['dash_mux','direct_download','youtube_parse','youtube_mux']}),
+        parseYouTubeViaExtension:async(videoId)=>{
+          assert.equal(videoId,'I9JvDaciaFk');
+          return {ok:true,data:{media:good({platform:'youtube',title:'Mobile Extension Video',items:[file('yt-1','https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')]}).data}};
         },
-      }).mount();
-      try {
-        const apiPaths=[];
-        globalThis.fetch=async(url,init)=>{
-          const u=new URL(url,'https://snap.example.test');
-          apiPaths.push(u.pathname);
-          if(u.pathname==='/api/youtube/context'){
-            return Response.json({schema_version:'1.0',code:'OK',data:{player_id:'22f02d3d',signature_timestamp:20760,client:{name:'TVHTML5',version:'7.20260728.13.00'}}});
-          }
-          if(u.pathname==='/api/youtube/finalize'){
-            const body=JSON.parse(init.body);
-            assert.equal(body.video_id,'I9JvDaciaFk');
-            return Response.json(good({platform:'youtube',title:body.title,items:[file('yt-1','https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')]}));
-          }
-          throw new Error(`unexpected request: ${u.pathname}`);
-        };
-        const mobileReady=harness('https://www.youtube.com/watch?v=I9JvDaciaFk');
-        await mobileReady.instance.parseVideo();
-        assert.deepEqual(apiPaths,['/api/youtube/context','/api/youtube/finalize']);
-        assert.equal(mobileReady.instance.parseError.value,'');
-        assert.equal(mobileReady.store.resultData?.title,'Mobile Firefox Helper Video');
-        assert.equal(mobileReady.store.resultData?.extra?.youtube_helper?.status,'ready');
-      } finally {
-        unmount();
-      }
+      });
+      mobileInst.inputUrl.value='https://www.youtube.com/watch?v=I9JvDaciaFk';
+      await mobileInst.parseVideo();
+      assert.equal(mobileInst.parseError.value,'');
+      assert.equal(mobileStore.resultData?.title,'Mobile Extension Video');
+      assert.equal(mobileStore.resultData?.extra?.youtube_helper?.status,'ready');
+      assert.equal(mobileStore.resultData?.extra?.youtube_helper?.provider,'extension');
     }
 
-    // 2. 手机 UA + 未检测到助手时把安装说明换成提示（不发 /api/parse，不弹桌面安装说明）
+    // 2. 手机 UA + 未检测到扩展时提示使用桌面 Chrome/Edge 扩展（不发 /api/parse，不含油猴字样）
     globalThis.window={setTimeout,clearTimeout};
     let fetchCount=0;
     globalThis.fetch=async()=>{fetchCount++;return Response.json(good());};
@@ -419,42 +392,45 @@ test('YouTube mobile & desktop helper detection: mobile UA + helper succeeds ide
       'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
     ]) {
       Object.defineProperty(globalThis,'navigator',{configurable:true,value:{userAgent:ua}});
-      let pingCalls=0;
+      let extPingCalls=0;
       const zhStore=reactive({resultData:null,resultVersion:0,clearResult(){this.resultData=null;this.resultVersion++;},setResult(d){this.resultData=d;this.resultVersion++;}});
       const zhToasts=[];
       const zhInst=parser.useVideoParser({
         videoStore:zhStore,
         locale:ref('zh-CN'),
         showToast:(...a)=>zhToasts.push(a),
-        pingHelper:async()=>{pingCalls++;return {installed:false,version:null,supported:false};},
+        pingExtension:async()=>{extPingCalls++;return {connected:false,version:'',extensionId:'',capabilities:[]};},
       });
       zhInst.inputUrl.value='https://www.youtube.com/watch?v=I9JvDaciaFk';
       await zhInst.parseVideo();
-      assert.equal(pingCalls,1,'must enter parseYouTubeWithHelper and ping helper before deciding');
+      assert.equal(extPingCalls,1,'must enter parseYouTubeWithHelper and ping extension before deciding');
       assert.equal(fetchCount,0);
       assert.equal(zhStore.resultData,null);
-      assert.match(zhInst.parseError.value,/用户脚本管理器/);
+      assert.match(zhInst.parseError.value,/DokiTool 官方扩展/);
       assert.match(zhInst.parseError.value,/电脑/);
+      assert.doesNotMatch(zhInst.parseError.value,/用户脚本管理器|油猴/);
       assert.equal(zhToasts.at(-1)?.[1],'error');
 
       const en=harness('https://youtu.be/I9JvDaciaFk','en');
       await en.instance.parseVideo();
       assert.equal(fetchCount,0);
       assert.equal(en.store.resultData,null);
-      assert.match(en.instance.parseError.value,/userscript manager/i);
+      assert.match(en.instance.parseError.value,/desktop Chrome\/Edge DokiTool extension/i);
+      assert.doesNotMatch(en.instance.parseError.value,/userscript/i);
     }
 
-    // 3. 桌面 UA + 未检测到助手时立即渲染降级引导，绝不调用 /api/parse 白跑服务端 yt-dlp
+    // 3. 桌面 UA + 未检测到扩展时立即渲染降级引导，绝不调用 /api/parse 白跑服务端 yt-dlp
     Object.defineProperty(globalThis,'navigator',{configurable:true,value:{userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'}});
     let desktopMissingParseCalls=0;
     globalThis.fetch=async()=>{desktopMissingParseCalls++;return Response.json(good({platform:'youtube',items:[file('yt-1','https://rr1---sn-test.googlevideo.com/videoplayback?itag=18')]}));};
     const desktopMissing=harness('https://www.youtube.com/watch?v=I9JvDaciaFk');
     await desktopMissing.instance.parseVideo();
-    assert.equal(desktopMissingParseCalls,0,'desktop YouTube parse without extension/helper must make 0 /api/parse requests');
+    assert.equal(desktopMissingParseCalls,0,'desktop YouTube parse without extension must make 0 /api/parse requests');
     assert.equal(desktopMissing.instance.parseError.value,'');
     assert.equal(desktopMissing.store.resultData?.extra?.youtube_helper?.status,'missing');
-    assert.match(desktopMissing.store.resultData?.extra?.youtube_helper?.message || '',/请按说明安装并启用后重试/);
-    assert.doesNotMatch(JSON.stringify(desktopMissing.store.resultData),/googlevideo\.com/);
+    assert.equal(desktopMissing.store.resultData?.extra?.youtube_helper?.provider,'extension');
+    assert.match(desktopMissing.store.resultData?.extra?.youtube_helper?.message || '',/DokiTool Chrome 官方扩展/);
+    assert.doesNotMatch(JSON.stringify(desktopMissing.store.resultData),/googlevideo\.com|dokitool-youtube\.user\.js/);
 
     // 4. Non-YouTube links on mobile still parse normally
     fetchCount=0;
@@ -611,7 +587,6 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
         extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
         capabilities: ['dash_mux', 'direct_download'],
       }),
-      pingHelper: async () => ({ installed: false, version: null, supported: false }),
     });
     zhParser.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await zhParser.parseVideo();
@@ -624,7 +599,7 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
     assert.equal(zhHelper?.min_version, '4.3.0');
     assert.equal(
       zhHelper?.message,
-      '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.3.0+ 即可免油猴解析下载 YouTube',
+      '检测到已连接的扩展版本（v4.1.0）较低，升级至 v4.3.0+ 即可解析下载 YouTube',
     );
     assert.doesNotMatch(JSON.stringify(zhStore.resultData), /googlevideo\.com/);
 
@@ -645,7 +620,6 @@ test('P2: connected outdated extension (v4.1.0 without youtube_parse) sets outda
         extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
         capabilities: ['dash_mux', 'direct_download'],
       }),
-      pingHelper: async () => ({ installed: false, version: null, supported: false }),
     });
     enParser.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await enParser.parseVideo();
@@ -723,144 +697,91 @@ test('Post-#37: runYouTubeHelperParse calls requestStandardParse 0 times when ex
   await assert.rejects(pending, /解析请求超时/);
 });
 
-test('Issue #48 [P1-6]: Web context short-TTL cache, 1x player_id 400 retry, and 3-stage parseStatusText in zh-CN & en', async () => {
-  parseHelpers.clearCachedYouTubeContext();
+test('Issue #48 [P1-6]: 3-stage formatYouTubeParseStageText in zh-CN & en', () => {
   assert.match(parseHelpers.formatYouTubeParseStageText(1, 'zh-CN'), /1\/3/);
   assert.match(parseHelpers.formatYouTubeParseStageText(2, 'zh-CN'), /2\/3/);
   assert.match(parseHelpers.formatYouTubeParseStageText(3, 'zh-CN'), /3\/3/);
   assert.match(parseHelpers.formatYouTubeParseStageText(1, 'en'), /1\/3/);
+  assert.match(parseHelpers.formatYouTubeParseStageText(2, 'en'), /2\/3/);
   assert.match(parseHelpers.formatYouTubeParseStageText(3, 'en'), /3\/3/);
+});
 
-  const prevWin = globalThis.window;
-  const listeners = new Map();
-  globalThis.window = {
-    addEventListener(type, fn) {
-      if (!listeners.has(type)) listeners.set(type, new Set());
-      listeners.get(type).add(fn);
-    },
-    removeEventListener(type, fn) {
-      listeners.get(type)?.delete(fn);
-    },
-    dispatchEvent(ev) {
-      const detail = typeof ev.detail === 'string' ? JSON.parse(ev.detail) : ev.detail;
-      if (ev.type === 'dokitool:youtube-helper:request') {
-        const respond = (payload) => {
-          const resEv = new CustomEvent('dokitool:youtube-helper:response', {
-            detail: JSON.stringify({ requestId: detail.requestId, ...payload }),
-          });
-          for (const fn of listeners.get('dokitool:youtube-helper:response') || []) fn(resEv);
-        };
-        if (detail.action === 'prefetch') {
-          queueMicrotask(() => respond({ ok: true, data: { visitorData: 'CgtnVmlzaXRvckRhdGE%3D', oembed: { title: 'Web Prefetch' } } }));
-        } else if (detail.action === 'player') {
-          queueMicrotask(() =>
-            respond({
-              ok: true,
-              data: {
-                playabilityStatus: { status: 'OK' },
-                videoDetails: { title: 'Web Prefetch' },
-                streamingData: { formats: [], adaptiveFormats: [] },
-              },
-            }),
-          );
-        }
-      }
-      return true;
-    },
-  };
+test('R78-04: connected youtube_parse extension transport failures (BRIDGE_TIMEOUT/BRIDGE_ERROR/EMPTY_RESPONSE) throw clear error without falling back to HELPER_REQUIRED/missing', async () => {
+  const connectedExt = async () => ({
+    connected: true,
+    version: '4.5.0',
+    extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+    capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+  });
 
-  let contextFetches = 0;
-  let failFinalizeOnce = false;
-  const stages = [];
-  const makeFetchJson = () => async (url) => {
-    if (url.includes('/api/youtube/context')) {
-      contextFetches++;
-      return {
-        schema_version: '1.0',
-        code: 'OK',
-        data: {
-          player_id: `web-pl-${contextFetches}`,
-          signature_timestamp: 20200 + contextFetches,
-          client: { name: 'TVHTML5', version: '7.20260101.00.00' },
-          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+  const cases = [
+    { code: 'BRIDGE_TIMEOUT', locale: 'zh-CN', pattern: /超时.*(重试|刷新)/ },
+    { code: 'BRIDGE_TIMEOUT', locale: 'en', pattern: /timed out.*(retry|refresh)/i },
+    { code: 'BRIDGE_ERROR', locale: 'zh-CN', pattern: /通信中断.*(重试|刷新)/ },
+    { code: 'BRIDGE_ERROR', locale: 'en', pattern: /interrupted.*(retry|refresh)/i },
+    { code: 'EMPTY_RESPONSE', locale: 'zh-CN', pattern: /通信中断.*(重试|刷新)/ },
+    { code: 'EMPTY_RESPONSE', locale: 'en', pattern: /interrupted.*(retry|refresh)/i },
+  ];
+
+  for (const { code, locale, pattern } of cases) {
+    let resultSetCalls = 0;
+    await assert.rejects(
+      parseHelpers.runYouTubeHelperParse({
+        videoId: 'I9JvDaciaFk',
+        locale,
+        signal: new AbortController().signal,
+        isCurrent: () => true,
+        pingExtension: connectedExt,
+        parseYouTubeViaExtension: async () => ({
+          ok: false,
+          code,
+          error: `mock ${code}`,
+        }),
+        onHelperReady: () => {
+          throw new Error('onHelperReady must not fire on transport error');
         },
-      };
-    }
-    if (url.includes('/api/youtube/finalize')) {
-      if (failFinalizeOnce) {
-        failFinalizeOnce = false;
-        const err = new Error('player_id 已失效');
-        err.status = 400;
-        err.code = 'INVALID_INPUT';
-        throw err;
-      }
-      return {
-        schema_version: '1.0',
-        code: 'OK',
-        data: {
-          platform: 'youtube',
-          content_id: 'I9JvDaciaFk',
-          title: 'Web Prefetch',
-          items: [
-            {
-              id: 'yt-1',
-              type: 'video',
-              variants: [
-                {
-                  id: 'v360',
-                  label: '360p',
-                  metadata: { width: 640, height: 360, extension: 'mp4', has_audio: true },
-                  delivery: { kind: 'file', sources: [{ id: 's1', url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18' }] },
-                },
-              ],
-              default: { variant_id: 'v360', source_id: 's1', url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=18' },
-            },
-          ],
+        setResult: () => {
+          resultSetCalls += 1;
         },
-      };
-    }
-    throw new Error(`Unexpected URL: ${url}`);
+        setError: () => {},
+      }),
+      pattern,
+      `${code} (${locale}) must reject with localized retry/refresh guidance`,
+    );
+    assert.equal(
+      resultSetCalls,
+      0,
+      `${code} (${locale}) must NOT call setResult with HELPER_REQUIRED/status=missing`,
+    );
+  }
+
+  // End-to-end via useVideoParser: sets parseError + error toast, 0 /api/parse calls, resultData stays null
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json(good({ platform: 'youtube' }));
   };
-
-  try {
-    const runOnce = () => {
-      let result = null;
-      return parseHelpers
-        .runYouTubeHelperParse({
-          videoId: 'I9JvDaciaFk',
-          locale: 'zh-CN',
-          signal: new AbortController().signal,
-          isCurrent: () => true,
-          pingExtension: async () => ({ connected: false, version: '', extensionId: '', capabilities: [] }),
-          pingHelper: async () => ({ installed: true, version: '1.3.2', supported: true }),
-          requestStandardParse: async () => { throw new Error('must not call standard parse'); },
-          fetchJSON: makeFetchJson(),
-          baseUrl: 'https://snap.dokitool.com',
-          onHelperReady: () => {},
-          onStageChange: (stage, text) => stages.push({ stage, text }),
-          setResult: (m) => { result = m; },
-          setError: (e) => { throw new Error(`unexpected setError: ${e}`); },
-        })
-        .then(() => result);
-    };
-
-    const r1 = await runOnce();
-    assert.equal(r1?.title, 'Web Prefetch');
-    assert.equal(contextFetches, 1);
-    assert.deepEqual(stages.map((s) => s.stage), [1, 2, 3]);
-
-    // Second run hits Web short-TTL context cache
-    await runOnce();
-    assert.equal(contextFetches, 1, 'second Web YouTube parse must hit cached context');
-
-    // Third run gets 400 player_id invalid on finalize -> clears cache, re-fetches context once, retries & succeeds
-    failFinalizeOnce = true;
-    const r3 = await runOnce();
-    assert.equal(r3?.title, 'Web Prefetch');
-    assert.equal(contextFetches, 2, '400 player_id must invalidate Web context cache and retry once');
-  } finally {
-    parseHelpers.clearCachedYouTubeContext();
-    globalThis.window = prevWin;
+  for (const code of ['BRIDGE_TIMEOUT', 'BRIDGE_ERROR', 'EMPTY_RESPONSE']) {
+    const store = reactive({
+      resultData: null,
+      resultVersion: 0,
+      clearResult() { this.resultData = null; this.resultVersion++; },
+      setResult(d) { this.resultData = d; this.resultVersion++; },
+    });
+    const toasts = [];
+    const inst = parser.useVideoParser({
+      videoStore: store,
+      locale: ref('zh-CN'),
+      showToast: (...args) => toasts.push(args),
+      pingExtension: connectedExt,
+      parseYouTubeViaExtension: async () => ({ ok: false, code, error: `mock ${code}` }),
+    });
+    inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await inst.parseVideo();
+    assert.equal(fetchCalls, 0, `${code} must make 0 /api/parse requests`);
+    assert.equal(store.resultData, null, `${code} must not set HELPER_REQUIRED/missing fallback result`);
+    assert.match(inst.parseError.value, /(超时|通信中断).*(重试|刷新)/);
+    assert.equal(toasts.at(-1)?.[1], 'error');
   }
 });
 

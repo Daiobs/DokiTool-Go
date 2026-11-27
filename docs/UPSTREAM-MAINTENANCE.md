@@ -58,4 +58,4 @@ python3 -B scripts/bump-runtime-pins.py \
   --fetch-official
 ```
 
-该脚本不会自动提交、推送、发起 PR 或触发部署；生成变更后仍必须由维护者人工审查（含按需核对 `ejs_sandbox.go` 中的 `PinnedEJSVersion`），通过经审查的 PR 合并并通过 PR 门禁（`.github/workflows/go-migration.yml` 与 `scripts/check-ssot-consistency.py`）强制执行的 `python3 -B scripts/check-upstream-updates.py --check-local-pins` 校验，生产变更仍仅通过发布 Issue 执行。更多离线参数（`--ytdlp-sha256`、`--deno-zip`、`--deno-sha256`）、PR 门禁与每日巡检职责切分、通知和安全边界见 [上游运行时版本每日检查](UPSTREAM-WATCH.md)。
+该脚本不会自动提交、推送、发起 PR 或触发部署；生成变更后仍必须由维护者人工审查（含按需核对 `ejs_sandbox.go` 中的 `PinnedEJSVersion`），通过经审查的 PR 合并并通过 PR 门禁（`.github/workflows/ci.yml` 与 `scripts/check-ssot-consistency.py`）强制执行的 `python3 -B scripts/check-upstream-updates.py --check-local-pins` 校验，生产变更仍仅通过发布 Issue 执行。更多离线参数（`--ytdlp-sha256`、`--deno-zip`、`--deno-sha256`）、PR 门禁与每日巡检职责切分、通知和安全边界见 [上游运行时版本每日检查](UPSTREAM-WATCH.md)。

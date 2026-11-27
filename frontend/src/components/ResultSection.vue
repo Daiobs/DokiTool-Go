@@ -53,7 +53,6 @@ const props = defineProps({
   locale: String,
   selection: Object,
   isDownloading: Boolean,
-  needsManualHelperRefresh: Boolean,
   resolvingIds: Object,
   formatNumber: Function,
   formatDuration: Function,
@@ -86,8 +85,6 @@ const emit = defineEmits([
   "download-selected-zip",
   "download-all-zip",
   "refresh-item",
-  "install-youtube-helper",
-  "refresh-youtube-helper-page",
   "prompt-select-quality",
   "open-extension",
   "extension-youtube-ready",
@@ -131,9 +128,6 @@ const isYouTubeHelperInstallRequired = computed(
   () =>
     youtubeHelper.value?.status === "missing" ||
     youtubeHelper.value?.status === "outdated",
-);
-const youtubeHelperScriptUrl = computed(
-  () => youtubeHelper.value?.script_url || "/helper/dokitool-youtube.user.js",
 );
 
 const isClientMounted = ref(false);
@@ -511,8 +505,8 @@ const targetMessage = computed(() => {
       return helperMsg;
     }
     return props.locale === "en"
-      ? "Please install and enable the YouTube helper before downloading"
-      : "请先按说明安装并启用 YouTube 助手脚本后下载";
+      ? "Please install and enable the DokiTool Chrome extension before downloading"
+      : "请先安装并启用 DokiTool Chrome 官方扩展后再下载";
   }
   if (target.value && "message" in target.value && target.value.message) {
     if (props.locale === "en" && hasCjk(target.value.message)) {
@@ -1217,14 +1211,10 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
       :is-client-mounted="isClientMounted"
       mode="client_session"
       :youtube-helper="youtubeHelper"
-      :youtube-helper-script-url="youtubeHelperScriptUrl"
       :latest-extension-version="effectiveLatestExtensionVersion"
-      :needs-manual-helper-refresh="needsManualHelperRefresh"
       :locale="locale"
       @close="closeYtHelperModal"
       @open-extension="emit('open-extension')"
-      @install-youtube-helper="emit('install-youtube-helper')"
-      @refresh-youtube-helper-page="emit('refresh-youtube-helper-page')"
     />
   </section>
 </template>

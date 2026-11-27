@@ -261,15 +261,8 @@ export function useMediaDownload({
     showToast,
     apiContext,
     currentYouTubeHelper,
-    taskFor,
-    ownsTask,
     sourceContexts,
     videoRetries,
-    fileTaskSelections,
-    deliveryTasks,
-    nextMuxDeliveryId: () =>
-      globalThis.crypto?.randomUUID?.() ??
-      `yt-mux-${Date.now()}-${++pageTaskSequence}`,
     snapshotTarget,
     fileSelectionKey,
     selectionInFlight,
@@ -356,7 +349,7 @@ export function useMediaDownload({
       if (ytHelper && ytHelper.status !== "ready") {
         videoStore.removeDownload(downloadId);
         showToast(
-          ytHelper.message || "请先安装并启用 YouTube 下载助手脚本后再下载",
+          ytHelper.message || "请先安装并启用 DokiTool Chrome 官方扩展后再下载",
           "warning",
           5000,
         );
@@ -469,17 +462,6 @@ export function useMediaDownload({
         );
         return;
       }
-      if (ytHelper?.status === "ready" && ytHelper.provider !== "extension") {
-        await ytController.runYouTubeDirectHelperDownload({
-          url,
-          filename,
-          downloadId,
-          deliveryId,
-          controller,
-          startedAt,
-        });
-        return;
-      }
       if (!ytHelper && hasExternalExtensionRuntime()) {
         const ctx = sourceContexts.get(downloadId);
         const whitelistedRoutes = filterWhitelistedExtensionRoutes(
@@ -505,7 +487,6 @@ export function useMediaDownload({
               extensionConnected: extState.connected,
               extensionVersion: extState.version,
               extensionCapabilities: extState.capabilities,
-              userscriptReady: false,
             },
           );
           if (plan.channel === "extension_direct") {
@@ -808,7 +789,6 @@ export function useMediaDownload({
                 extensionConnected: extState.connected,
                 extensionVersion: extState.version,
                 extensionCapabilities: extState.capabilities,
-                userscriptReady: false,
                 swMultiRangeAvailable: false,
               },
             );
@@ -1417,7 +1397,6 @@ export function useMediaDownload({
                 extensionConnected: extState.connected,
                 extensionVersion: extState.version,
                 extensionCapabilities: extState.capabilities,
-                userscriptReady: false,
               },
             );
             if (plan.channel === "extension_direct") {

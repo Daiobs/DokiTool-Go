@@ -165,7 +165,6 @@ class FakeDokiServer:
         self.static_files: dict[str, bytes] = {
             "index.html": b"<!doctype html><title>DokiTool</title>\n",
             "assets/app.js": b"console.log('dokitool');\n",
-            "helper/dokitool-youtube.user.js": b"// ==UserScript==\n// @name DokiTool\n",
         }
         self.platforms: list[str] = list(
             json.loads((SMOKE_DIR / "samples.json").read_text(encoding="utf-8"))[

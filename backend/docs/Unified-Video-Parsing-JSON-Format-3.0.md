@@ -27,7 +27,6 @@ It is not DokiTool's public API. The current contract is
     <a href="#platform-and-media-type-reference">Platforms</a> •
     <a href="#integration-checklist">Checklist</a>
   </p>
-  <p><a href="./视频解析统一JSON格式3.0.md">🌐 中文版本</a></p>
 </div>
 
 ---
@@ -631,5 +630,5 @@ Error responses always keep `code` / `msg` / `data`, with `data` as `[]`. The `m
 ---
 
 <div align="center">
-  <p><a href="../README_EN.md">← Back to main documentation</a> · <a href="./视频解析统一JSON格式3.0.md">中文版本</a></p>
+  <p><a href="../../README.md">← Back to main documentation</a></p>
 </div>

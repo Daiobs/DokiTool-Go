@@ -187,11 +187,10 @@ export interface Attachment {
 }
 export interface YouTubeHelperState {
   status: "ready" | "missing" | "outdated" | "login_required";
-  provider?: "extension" | "userscript";
+  provider?: "extension";
   extensionVersion?: string;
   version?: string | null;
   min_version?: string;
-  script_url?: string;
   message?: string;
 }
 export interface UnifiedMedia {

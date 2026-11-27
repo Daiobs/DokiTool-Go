@@ -10,7 +10,7 @@
 
 - **主支持范围**：**抖音（`douyin`）**、**X（`x`）** 以及快手、哔哩哔哩、小红书、今日头条、皮皮虾、皮皮搞笑、最右图片、Instagram、Facebook、Tumblr 等返回公开 CDN 直链的平台。
 - **不在主批量范围内的平台**：
-  1. **YouTube（`youtube`）**：标准产品方案优先使用 **Chrome MV3 原生扩展（`v4.5.0`，免油猴）** 或桌面浏览器用户脚本（`DokiTool YouTube Helper`，纯 Web 端缺失扩展/脚本时展示 `HELPER_REQUIRED` 状态）；默认未启用服务端提取器时调用 `/api/parse` 返回 `503 SERVICE_NOT_CONFIGURED`，且 `*.googlevideo.com` 流地址通常绑定请求出口 IP，**切勿将 YouTube 链接混入 `/api/parse` 批处理列表**。
+  1. **YouTube（`youtube`）**：标准产品方案统一使用 **Chrome MV3 原生扩展（`v4.5.0`）**（纯 Web 端未安装扩展时展示 `HELPER_REQUIRED` 引导安装）；默认未启用服务端提取器时调用 `/api/parse` 返回 `503 SERVICE_NOT_CONFIGURED`，且 `*.googlevideo.com` 流地址通常绑定请求出口 IP，**切勿将 YouTube 链接混入 `/api/parse` 批处理列表**。
   2. **微博（`weibo`）**：不在主批量范围内（仅支持视频能力 `["video"]`，纯图片微博帖返回 `404 CONTENT_UNAVAILABLE` 或受上游访客风控返回 `403 UPSTREAM_BLOCKED`，且结果不入服务端缓存）。若携带有效 `DOKITOOL_OWNER_TOKEN` 解析公开微博视频，服务端会跳过 `/api/media/weibo?ticket=...` 同源中转票据签发，直接返回 `f.video.weibocdn.com` 与 `*.sinaimg.cn` 原始直链；客户端直连下载此类域名时**必须设置请求头 `Referer: https://weibo.com/`（不带 `Cookie`，严禁带 `Authorization`）**——实测无 `Referer` 时返回 HTTP `403`，附带 `Referer: https://weibo.com/`（无 `Cookie`）时返回 HTTP `206`。
 
 ### 1.2 输入清单预处理建议

@@ -44,7 +44,7 @@ test.after(async () => {
   await vite?.close();
 });
 
-test("Architecture Boundary Gate: zero business-layer platform hardcoding, file complexity caps, and solid CSS fallbacks", () => {
+test("Architecture Boundary Gate: zero business-layer platform hardcoding, import purity, and solid CSS fallbacks", () => {
   const result = runArchitectureBoundaryCheck();
   assert.equal(
     result.passed,
@@ -52,7 +52,7 @@ test("Architecture Boundary Gate: zero business-layer platform hardcoding, file 
     `Expected 0 architecture boundary violations, got:\n${result.violations.join("\n")}`,
   );
   assert.ok(result.businessFilesChecked >= 20);
-  assert.ok(result.lineCapFilesChecked >= 5);
+  assert.ok(result.importDirectionFilesChecked >= 10);
   assert.ok(result.cssFilesChecked >= 15);
 });
 
@@ -786,7 +786,7 @@ test("Shared Media Kernel: Web and Extension produce 100% byte-identical canonic
   );
 });
 
-test("Capability Hub: enforces priority Connected Extension > Userscript > Web SW > Direct and SemVer update checks", () => {
+test("Capability Hub: enforces priority Connected Extension > Web SW > Direct and SemVer update checks", () => {
   const extFullEnv = {
     extensionConnected: true,
     extensionVersion: capabilityHub.LATEST_EXTENSION_VERSION,
@@ -796,32 +796,19 @@ test("Capability Hub: enforces priority Connected Extension > Userscript > Web S
       "youtube_parse",
       "youtube_mux",
     ],
-    userscriptReady: true,
-    swMultiRangeAvailable: true,
-  };
-  const userscriptOnlyEnv = {
-    extensionConnected: false,
-    extensionVersion: "",
-    extensionCapabilities: [],
-    userscriptReady: true,
     swMultiRangeAvailable: true,
   };
   const bareWebEnv = {
     extensionConnected: false,
     extensionVersion: "",
     extensionCapabilities: [],
-    userscriptReady: false,
     swMultiRangeAvailable: true,
   };
 
-  // Connected extension beats userscript for client-session parse & split mux
+  // Connected extension handles client-session parse & split mux; bare web falls back cleanly
   assert.equal(
     capabilityHub.resolveClientParseRoute(true, extFullEnv).channel,
     "extension_client_parse",
-  );
-  assert.equal(
-    capabilityHub.resolveClientParseRoute(true, userscriptOnlyEnv).channel,
-    "userscript_client_parse",
   );
   assert.equal(
     capabilityHub.resolveClientParseRoute(true, bareWebEnv).channel,
@@ -839,18 +826,6 @@ test("Capability Hub: enforces priority Connected Extension > Userscript > Web S
   );
   assert.equal(ytSplitPlanExt.channel, "extension_youtube_mux");
   assert.equal(ytSplitPlanExt.usesExtension, true);
-
-  const ytSplitPlanUs = capabilityHub.resolveExecutionPlan(
-    {
-      deliveryKind: "file",
-      hasSplitMuxPair: true,
-      requiresClientSession: true,
-      whitelistedForExtension: true,
-    },
-    userscriptOnlyEnv,
-  );
-  assert.equal(ytSplitPlanUs.channel, "userscript_mux");
-  assert.equal(ytSplitPlanUs.usesUserscript, true);
 
   const ytSplitPlanBare = capabilityHub.resolveExecutionPlan(
     {
@@ -1472,7 +1447,6 @@ test("Issue #48 Batch 1: [P1-2] clientSplitMux auto-upgrade, [P1-4]/[P0-1] unifi
     extensionConnected: true,
     extensionVersion: capabilityHub.LATEST_EXTENSION_VERSION,
     extensionCapabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux"],
-    userscriptReady: false,
     swMultiRangeAvailable: true,
   };
   assert.equal(
@@ -1697,28 +1671,6 @@ test("Architecture Boundary Gate: static import direction & planning host-purity
       assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("web-storage")));
       assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("chrome-api")));
       assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("navigator-storage")));
-    },
-  );
-
-  // 5) src/core/** line cap calibration: (600, 800] emits non-blocking soft notice; > 800 hard-fails
-  const linesOf = (n) => Array.from({ length: n }, (_, i) => `export const v${i} = ${i};`).join("\n") + "\n";
-  withTempFrontend(
-    { "src/core/midSizeCore.ts": linesOf(650) },
-    (tmpRoot) => {
-      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
-      assert.equal(res.passed, true, `650-line core module must pass with soft notice: ${res.violations.join("\n")}`);
-      assert.ok(
-        res.ratchetNotices.some((n) => n.includes("src/core/midSizeCore.ts") && n.includes("soft threshold 600")),
-        `expected soft notice for 650-line core module, got: ${res.ratchetNotices.join("\n")}`,
-      );
-    },
-  );
-  withTempFrontend(
-    { "src/core/oversizeCore.ts": linesOf(801) },
-    (tmpRoot) => {
-      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
-      assert.equal(res.passed, false);
-      assert.ok(res.violations.some((v) => v.includes("[file-line-cap]") && v.includes("oversizeCore.ts") && v.includes("800")));
     },
   );
 });

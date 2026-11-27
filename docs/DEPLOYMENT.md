@@ -1,6 +1,6 @@
 # 生产发布、静态缓存与本地验证
 
-本文档说明当前线上 Go + 静态前端站点的生产发布标准流程、Caddy 静态与流式转发要求，以及本地验证方法。所有启动参数与环境变量定义见 [CONFIGURATION.md](CONFIGURATION.md)，回滚操作细则见 [go-migration/rollback.md](go-migration/rollback.md)，PHP 时期与早期迁移部署归档见 [HISTORY.md](HISTORY.md)。
+本文档说明当前线上 Go + 静态前端站点的生产发布标准流程、Caddy 静态与流式转发要求，以及本地验证方法。所有启动参数与环境变量定义见 [CONFIGURATION.md](CONFIGURATION.md)，PHP 时期与早期迁移部署归档见 [HISTORY.md](HISTORY.md)（完整旧迁移手册封存于永久标签 `archive/php-oracle-final`）。
 
 > **公开仓库安全声明**：本文档及 `ops/examples/` 仅描述通用架构与流程规范，不包含任何服务器地址、主机名、远程连接细节、入站限制规则或生产密钥。仓库代码合入 `main` 不会自动触发线上变更。
 
@@ -31,7 +31,7 @@
 将干净构建产出的二进制与 `frontend/dist/` 同 CI 生成的 `release-manifest.json` 逐项核对：
 
 - 核对 `frontend_dist_files` 的文件集合无缺失或多余项；
-- 核对 `index.html`、`downloads/worker.js`、`downloads/bridge.html`、公开用户脚本 `helper/dokitool-youtube.user.js`、运行态扩展版本清单 `helper/extension-version.json` 以及 Chrome 扩展安装包 `helper/dokitool-chrome-extension.zip` 的 SHA-256 摘要与预期完全一致；
+- 核对 `index.html`、`downloads/worker.js`、`downloads/bridge.html`、运行态扩展版本清单 `helper/extension-version.json` 以及 Chrome 扩展安装包 `helper/dokitool-chrome-extension.zip` 的 SHA-256 摘要与预期完全一致；
 - 执行 `./dokitool catalog` 离线自检，确认平台目录 JSON 结构合法。
 
 ### 4. 不可变目录落盘与追加哈希静态资源
@@ -45,14 +45,14 @@
    - 若本次发布涉及上海端 `dokitool-sh-pull.service` 的二进制或守护策略更新（如 `Restart=on-failure` drop-in），同样以独立编号 drop-in 更新并执行 `daemon-reload` 与重启。
    - **多密钥鉴权与运行时热配置 `SIGHUP` 热重载（可选）**：若启用 `DOKITOOL_API_KEYS_FILE`（脱敏示例见 `ops/examples/api-keys.example.json`，建议宿主机文件权限设为 `0600`，并通过 `printf '%s' "$TOKEN" | ./dokitool hash-token` 离线从标准输入生成 SHA-256 摘要）或 `DOKITOOL_RUNTIME_CONFIG_FILE`（脱敏示例见 `ops/examples/runtime.example.json`，控制 `yt-dlp` 三舱并发、`YouTubeEJS` 池、快池单平台舱壁、平台熔断与 `disabled_platforms` 秒级止血、YouTube 短缓存与 `stale-if-error` 窗口，完整规范见 [CONFIGURATION.md](CONFIGURATION.md)），可在 systemd unit / drop-in 中配置可选的 `ExecReload=/bin/kill -HUP $MAINPID`。日常调整密钥或动态策略时，执行 `systemctl reload dokitool-go`（或 `kill -HUP <MainPID>`）即可原地无损热重载，不重启主进程、不中断在途请求且不丢失活跃并发租约（若任一新文件校验失败，主进程仅记录脱敏告警并完整保留原内存生效策略）。`GET /api/stats` 与 `/monitor` 保持 100% 纯只读定位，通过 `runtime_policy`、`ytdlp_pools` 与 `circuit_breakers` 只读展示当前生效策略与状态（不暴露任何本地文件路径或密钥）。
 2. **前端软链原子切换**：在同一父目录下创建指向 `<new_release>/frontend/dist` 的临时符号链接，再通过 `ln -sfn <new_dist> <frontend_symlink>.tmp && mv -T <frontend_symlink>.tmp <frontend_symlink>` 原子替换 Caddy 静态根目录软链。整个切换过程不清空站点存储、不强制注销客户端已激活的下载 Service Worker。
-3. 若任一环节异常，立即按 [go-migration/rollback.md](go-migration/rollback.md) 移除新增 drop-in 并原子切回上一版软链。
+3. 若任一环节异常，立即移除新增 drop-in 并原子切回上一版软链（参见 `ops/release/` 回滚脚本与 [RELEASE-RECEIPT.md](RELEASE-RECEIPT.md)）。
 
 ### 6. 冒烟门禁、发布回执与线上复测
 
 1. **切换后即时冒烟**：
    - 本地回环与公网 `GET /api/platforms?schema_version=1.0` 均返回 HTTP `200`、`code: "OK"`，且启用平台数量与列表符合预期（当前为 14 个平台）；
    - 公网首页返回 HTTP `200`，首页引用的全部新 `/assets/*` chunk 及至少一个保留的上一版 `/assets/*` chunk 均返回 HTTP `200`，不存在的 `/assets/*` 路径返回 `404`（不回退 SPA HTML）；
-   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/helper/dokitool-youtube.user.js`、`/helper/extension-version.json` 与 `/helper/dokitool-chrome-extension.zip` 版本/状态码（HTTP `200`）与 SHA-256 摘要正确。
+   - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/helper/extension-version.json` 与 `/helper/dokitool-chrome-extension.zip` 版本/状态码（HTTP `200`）与 SHA-256 摘要正确。
 2. **发布回执与线上复测**：
    - 在发布 Issue 中如实记录切换前后 SHA、二进制与关键静态资源摘要、服务状态与冒烟结果（不含任何敏感环境信息）；
    - 针对本次上线涉及的平台或前端交互在真实线上站点完成端到端复测，验证通过后关闭发布单与对应问题单。

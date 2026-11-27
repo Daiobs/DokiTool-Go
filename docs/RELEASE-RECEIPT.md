@@ -71,7 +71,7 @@ ExecStart=<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool serve -listen 127.0.0.1:<LIS
 
 ### 1.5 可直接执行的回滚命令
 ```bash
-# 日本主站回滚至上一稳定版本 <PREV_SHA>（参见 docs/go-migration/rollback.md）
+# 日本主站回滚至上一稳定版本 <PREV_SHA>（参见 docs/DEPLOYMENT.md 与 ops/release/）
 # 1) 移除本次新增的高序号 ExecStart drop-in，daemon-reload 后确认生效定义恢复为 <PREV_SHA>
 sudo rm -f /etc/systemd/system/dokitool-go.service.d/<NEW_DROPIN>.conf
 sudo systemctl daemon-reload
@@ -130,7 +130,7 @@ sha256sum "<RELEASES_ROOT>/<TARGET_SHA>/bin/dokitool"
 #    sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 #    sudo sha256sum /etc/caddy/snap.caddy
 
-# 3) 若本次包含前端变更：确认 npm run build 产出的 index.html、downloads/*、helper/dokitool-youtube.user.js 摘要与清单一致；
+# 3) 若本次包含前端变更：确认 npm run build 产出的 index.html、downloads/*、helper/extension-version.json、helper/dokitool-chrome-extension.zip 摘要与清单一致；
 #    将上一活动版本的 /assets/* 带哈希 chunk 不覆盖并入新版本目录（防止已打开旧页面的浏览器按需懒加载旧 chunk 时遇到 404），随后原子替换静态软链：
 cp -n "<RELEASES_ROOT>/<PREV_SHA>/frontend/dist/assets/"* "<RELEASES_ROOT>/<TARGET_SHA>/frontend/dist/assets/"
 ln -sfn "<RELEASES_ROOT>/<TARGET_SHA>/frontend/dist" "<FRONTEND_SYMLINK>.tmp"

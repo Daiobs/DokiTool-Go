@@ -21,9 +21,8 @@ the earlier distribution; Swiper is no longer a frontend runtime dependency.
 Other dependency notices are collected in third-party-notices.txt. Preserve
 these notices when distributing built assets.
 
-The standalone YouTube helper userscript (frontend/public/helper/dokitool-youtube.user.js)
-and the Chrome MV3 extension offscreen bundle (built into dokitool-chrome-extension.zip)
-bundle an unmodified release of Mediabunny 1.65.2 (Copyright (c) Vanilagy,
+The Chrome MV3 extension offscreen bundle (built into dokitool-chrome-extension.zip)
+bundles an unmodified release of Mediabunny 1.65.2 (Copyright (c) Vanilagy,
 https://github.com/Vanilagy/mediabunny/tree/v1.65.2), licensed under the Mozilla
 Public License 2.0 (MPL-2.0). The full MPL-2.0 license text is retained in
 frontend/public/licenses/mediabunny-MPL-2.0.txt. Mediabunny is combined into a
@@ -50,7 +49,7 @@ Private Go continuation scope (after public checkpoint
 1eb529f32b45898875008acde9e8b91fc69c5ad9):
 The MIT scope described above remains applicable to the published DokiTool
 adaptation and inherited code. This private continuation does not revoke those
-grants or replace any upstream or dependency license. Separately owned private
-additions after that checkpoint are not automatically offered under a new
-external license. Their scope, and the required preservation of inherited
-notices in mixed changes, are documented in docs/go-migration/MAINTENANCE.md.
+grants or replace any upstream or dependency license. Separately owned private additions after that checkpoint are not automatically
+offered under a new external license. Their scope, and the required preservation
+of inherited notices in mixed changes, are documented in docs/HISTORY.md (and
+preserved verbatim in git tag archive/php-oracle-final).

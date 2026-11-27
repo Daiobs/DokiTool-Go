@@ -186,17 +186,12 @@ const {
   parseStatusText,
   currentPlatform,
   platformMismatchDetected,
-  needsManualHelperRefresh,
   parseButton,
   parseVideo,
   switchToAllAndRetry,
   cancelParse,
   selectPlatform,
   resolveItem,
-  markWaitingForYouTubeHelperInstall,
-  handleYouTubeHelperTabReturn,
-  resumePendingYouTubeHelperInstall,
-  triggerManualHelperRefresh,
 } = useVideoParser({
   videoStore,
   locale,
@@ -475,7 +470,6 @@ const onVisibilityOrFocus = () => {
   ) {
     return;
   }
-  void handleYouTubeHelperTabReturn();
   void extRuntime.probeExtension();
   void extRuntime.refreshLatestExtensionVersion({
     cooldownMs: VISIBILITY_VERSION_CHECK_COOLDOWN_MS,
@@ -536,7 +530,6 @@ onMounted(() => {
   window.addEventListener("vite:preloadError", onVitePreloadError);
   void extRuntime.probeExtension();
   extRuntime.scheduleIdleVersionCheck();
-  void resumePendingYouTubeHelperInstall();
 });
 
 onUnmounted(() => {
@@ -624,7 +617,6 @@ onUnmounted(() => {
           :result-data="videoStore.resultData"
           :result-version="videoStore.resultVersion"
           :is-downloading="isDownloading"
-          :needs-manual-helper-refresh="needsManualHelperRefresh"
           :locale="locale"
           :selection="selectionRef"
           :format-number="formatNumber"
@@ -635,8 +627,6 @@ onUnmounted(() => {
           @refresh-item="resolveSelectedItem"
           @open-extension="openExtensionModal"
           @extension-youtube-ready="handleExtensionYouTubeReady"
-        @install-youtube-helper="markWaitingForYouTubeHelperInstall"
-        @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"
         @prompt-select-quality="promptSelectQuality"
         @download-backup="downloadBackupVideo"

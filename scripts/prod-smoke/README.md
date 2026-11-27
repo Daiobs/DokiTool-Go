@@ -18,7 +18,7 @@
 
 | 检查组 | 默认状态 | 检查内容 |
 | --- | --- | --- |
-| `frontend_hashes` | 传 `--manifest` 时执行，否则 `SKIP` | 对照构建产物 `release-manifest.json` 的 `frontend_dist_files`，逐文件（含 `/`、`index.html`、油猴脚本等）校验线上静态文件原始字节 SHA-256 |
+| `frontend_hashes` | 传 `--manifest` 时执行，否则 `SKIP` | 对照构建产物 `release-manifest.json` 的 `frontend_dist_files`，逐文件（含 `/`、`index.html`、`/helper/extension-version.json`、`/helper/dokitool-chrome-extension.zip` 等）校验线上静态文件原始字节 SHA-256 |
 | `platforms` | 开启 | `GET /api/platforms?schema_version=1.0` 返回 `200 OK`，`data.platforms` 长度为 `14` 且 14 个平台 ID 完整匹配 |
 | `youtube_context` | 开启 | `GET /api/youtube/context?schema_version=1.0` 返回 `200 OK` 与有效 `player_id`/`expires_at`；延迟超过阈值（默认 `2000ms`，可由 `--youtube-context-warn-ms` 覆写）触发 `WARN` 预警，超过失败阈值触发 `FAIL` |
 | `cache` | 开启 | 对缓存样本连续发起 2 次间隔 `>= 8.0s` 的 `/api/parse`，校验两次响应原始字节 SHA-256 与 `generated_at` 完全一致 |
