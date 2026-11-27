@@ -2362,7 +2362,7 @@ test("Batch 1A (v4.4.1): SidePanelHeader silent version check renders upgrade pi
       assert.ok(fullText.includes("下载时询问保存位置"));
       assert.ok(
         fullText.includes(
-          "每次弹出系统“另存为”窗口自选保存目录，同时可避免其他下载插件篡改文件名",
+          "单文件直下时弹出系统“另存为”窗口自选保存目录（合流 / 批量 / ZIP 仍保存至默认下载目录），同时可避免其他下载插件篡改文件名",
         ),
       );
     } finally {

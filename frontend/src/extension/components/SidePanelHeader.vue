@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { PROD_API_ORIGIN } from "../hostWhitelist";
 import type {
   ConnectionCheckResult,
@@ -10,20 +10,29 @@ import { normalizeExtensionThemeMode } from "../storage";
 import { openSafeHttpTab } from "../uiTargetHelpers";
 import {
   checkForExtensionUpdate,
+  resolveAllowedVersionCheckOrigin,
   type ExtensionUpdateInfo,
 } from "../versionCheck";
 
 export type PanelViewMode = "single" | "batch";
 
-const props = defineProps<{
-  settings: ExtensionSettings;
-  connection: ConnectionCheckResult | null;
-  mode: PanelViewMode;
-  batchUrlCount?: number;
-  ownerConfirmed?: boolean;
-  installedVersion?: string;
-  fetchImpl?: typeof fetch;
-}>();
+const VERSION_RECHECK_COOLDOWN_MS = 10 * 60_000;
+
+const props = withDefaults(
+  defineProps<{
+    settings: ExtensionSettings;
+    connection: ConnectionCheckResult | null;
+    mode: PanelViewMode;
+    batchUrlCount?: number;
+    ownerConfirmed?: boolean;
+    installedVersion?: string;
+    fetchImpl?: typeof fetch;
+    initialStateReady?: boolean;
+  }>(),
+  {
+    initialStateReady: true,
+  },
+);
 
 const emit = defineEmits<{
   (e: "update:mode", next: PanelViewMode): void;
@@ -34,6 +43,8 @@ const emit = defineEmits<{
 
 const updateInfo = ref<ExtensionUpdateInfo | null>(null);
 let versionCheckController: AbortController | null = null;
+let lastCheckedAt = 0;
+let lastCheckedOrigin = "";
 
 function resolveInstalledVersion(): string {
   if (props.installedVersion) return props.installedVersion.trim();
@@ -48,7 +59,8 @@ function handleOpenUpdateDownload() {
   openSafeHttpTab(updateInfo.value.downloadUrl);
 }
 
-onMounted(() => {
+function runVersionCheck(force = false) {
+  if (!props.initialStateReady) return;
   const isExtTest = Boolean(
     (globalThis as unknown as { __DOKITOOL_EXT_TEST__?: boolean })
       .__DOKITOOL_EXT_TEST__,
@@ -56,21 +68,72 @@ onMounted(() => {
   if (isExtTest && !props.fetchImpl) return;
   const installedVersion = resolveInstalledVersion();
   if (!installedVersion) return;
+
+  const rawApiBase = props.settings.apiBaseUrl || PROD_API_ORIGIN;
+  const resolvedOrigin = resolveAllowedVersionCheckOrigin(rawApiBase) || "";
+  const now = Date.now();
+  if (
+    !force &&
+    lastCheckedAt > 0 &&
+    resolvedOrigin === lastCheckedOrigin &&
+    now - lastCheckedAt < VERSION_RECHECK_COOLDOWN_MS
+  ) {
+    return;
+  }
+  if (resolvedOrigin !== lastCheckedOrigin) {
+    updateInfo.value = null;
+  }
+  lastCheckedAt = now;
+  lastCheckedOrigin = resolvedOrigin;
+
+  versionCheckController?.abort();
   const controller = new AbortController();
   versionCheckController = controller;
   void checkForExtensionUpdate({
     installedVersion,
-    apiBaseUrl: props.settings.apiBaseUrl || PROD_API_ORIGIN,
+    apiBaseUrl: rawApiBase,
     signal: controller.signal,
     fetchImpl: props.fetchImpl,
   }).then((result) => {
-    if (result && !controller.signal.aborted) {
+    if (!controller.signal.aborted) {
       updateInfo.value = result;
     }
   });
+}
+
+function handleVisibilityChange() {
+  if (
+    typeof document !== "undefined" &&
+    document.visibilityState === "visible"
+  ) {
+    runVersionCheck(false);
+  }
+}
+
+watch(
+  () => [props.initialStateReady, props.settings.apiBaseUrl] as const,
+  ([ready], [prevReady, prevApi]) => {
+    if (!ready) return;
+    const originChanged =
+      resolveAllowedVersionCheckOrigin(props.settings.apiBaseUrl || PROD_API_ORIGIN) !==
+      resolveAllowedVersionCheckOrigin(prevApi || PROD_API_ORIGIN);
+    if (!prevReady || originChanged) {
+      runVersionCheck(true);
+    }
+  },
+);
+
+onMounted(() => {
+  runVersionCheck(true);
+  if (typeof document !== "undefined") {
+    document.addEventListener?.("visibilitychange", handleVisibilityChange);
+  }
 });
 
 onUnmounted(() => {
+  if (typeof document !== "undefined") {
+    document.removeEventListener?.("visibilitychange", handleVisibilityChange);
+  }
   versionCheckController?.abort();
   versionCheckController = null;
 });

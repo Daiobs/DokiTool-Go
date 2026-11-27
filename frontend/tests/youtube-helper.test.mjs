@@ -2348,9 +2348,6 @@ describe("YouTube frontend parser, ResultSection UI states, and download flows",
     DownloadCard = (
       await vite.ssrLoadModule("/src/components/DownloadCard.vue")
     ).default;
-    (
-      await vite.ssrLoadModule("/src/services/operationLogger.js")
-    ).operationLogger.enableConsole = false;
   });
 
   after(async () => {

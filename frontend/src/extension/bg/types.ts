@@ -1,6 +1,7 @@
 import type { ExtensionDnrRule } from "../dnrRules";
 import {
   buildSafeDownloadPath,
+  sanitizeFileExtension,
   sanitizeSubfolderPrefix,
 } from "../filenameSanitizer";
 import type {
@@ -453,7 +454,8 @@ export function sanitizeRelativeDownloadPath(rawPath: string): string {
   if (segments.length === 0) return "download.bin";
   const leaf = segments[segments.length - 1];
   const dotIdx = leaf.lastIndexOf(".");
-  const ext = dotIdx > 0 ? leaf.slice(dotIdx + 1) : "";
+  const rawExt = dotIdx > 0 ? leaf.slice(dotIdx + 1) : "";
+  const ext = rawExt ? sanitizeFileExtension(rawExt, "bin") : "";
   const stem = dotIdx > 0 ? leaf.slice(0, dotIdx) : leaf;
   const folderPrefix = sanitizeSubfolderPrefix(segments.slice(0, -1).join("/"));
   return buildSafeDownloadPath({

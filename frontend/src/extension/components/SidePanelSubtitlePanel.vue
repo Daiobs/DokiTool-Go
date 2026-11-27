@@ -85,6 +85,8 @@ const controller = createSubtitleDownloadController({
       signal,
       maxBytes: MAX_SUBTITLE_TRACK_BYTES,
       routes: allowed,
+      validateFinalUrl: (finalUrl) =>
+        isWhitelistedMediaUrl(finalUrl, effectiveAllowedOrigins.value).allowed,
     });
   },
   formatError: formatSubtitleError,

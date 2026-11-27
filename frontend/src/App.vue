@@ -22,6 +22,11 @@ import FaqSection from "./components/FaqSection.vue";
 import FooterSection from "./components/FooterSection.vue";
 import ParticlesCanvas from "./components/ParticlesCanvas.vue";
 import { useVideoParser } from "./composables/useVideoParser";
+import {
+  MODAL_VERSION_CHECK_COOLDOWN_MS,
+  VISIBILITY_VERSION_CHECK_COOLDOWN_MS,
+  useExtensionRuntime,
+} from "./composables/useExtensionRuntime";
 import { refreshPlatformCatalog } from "./utils/platforms";
 import {
   homeInitialStateKey,
@@ -83,12 +88,80 @@ const ToastContainer = defineAsyncComponent(() =>
 const ProgressModal = defineAsyncComponent(() =>
   import("./components/ProgressModal.vue"),
 );
-const ExtensionDownloadModal = defineAsyncComponent(() =>
-  import("./components/ExtensionDownloadModal.vue"),
-);
+let extensionModalModule;
+const loadExtensionModal = () =>
+  (extensionModalModule ??= import("./components/ExtensionDownloadModal.vue").catch(
+    (error) => {
+      extensionModalModule = undefined;
+      throw error;
+    },
+  ));
+const ExtensionDownloadModal = defineAsyncComponent({
+  loader: loadExtensionModal,
+  errorComponent: {
+    setup: () => () =>
+      h(
+        "div",
+        {
+          role: "dialog",
+          "aria-modal": "true",
+          class:
+            "fixed inset-0 z-[10000] flex items-center justify-center bg-slate-900/60 p-4",
+          onClick: (e) => {
+            if (e.target === e.currentTarget) showExtensionModal.value = false;
+          },
+        },
+        h(
+          "div",
+          {
+            class:
+              "w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 text-center shadow-2xl dark:border-slate-700 dark:bg-slate-900",
+          },
+          [
+            h(
+              "p",
+              { class: "text-sm text-slate-700 dark:text-slate-200" },
+              locale.value === "en"
+                ? "Site assets were updated. Refresh this page or download the extension package directly."
+                : "页面资源已更新，请刷新页面或直接下载 Chrome 扩展包。",
+            ),
+            h("div", { class: "mt-4 flex justify-center gap-2" }, [
+              h(
+                "a",
+                {
+                  href: "/helper/dokitool-chrome-extension.zip",
+                  download: "dokitool-chrome-extension.zip",
+                  class:
+                    "rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-700",
+                },
+                locale.value === "en" ? "Download (.zip)" : "直接下载扩展包 (.zip)",
+              ),
+              h(
+                "button",
+                {
+                  type: "button",
+                  class:
+                    "rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 dark:border-slate-600 dark:text-slate-200",
+                  onClick: () => {
+                    showExtensionModal.value = false;
+                  },
+                },
+                locale.value === "en" ? "Close" : "关闭",
+              ),
+            ]),
+          ],
+        ),
+      ),
+  },
+});
 const showExtensionModal = ref(false);
 const loadDownloadCard = () => import("./components/DownloadCard.vue");
-const DownloadCard = defineAsyncComponent(loadDownloadCard);
+const DownloadCard = defineAsyncComponent({
+  loader: loadDownloadCard,
+  errorComponent: {
+    setup: () => () => null,
+  },
+});
 
 const videoStore = useVideoStore();
 const hasShownToast = ref(false);
@@ -316,32 +389,42 @@ const promptSelectQuality = () => {
   );
 };
 
-const extensionConnected = ref(false);
-const extensionVersion = ref("");
 const resultAnchorRef = ref(null);
-
-const handleExtensionStateChange = (state) => {
-  extensionConnected.value = Boolean(state?.connected);
-  extensionVersion.value = state?.version || "";
-  if (!state || state.useSaveFilePicker !== undefined || !state.connected) {
+const extRuntime = useExtensionRuntime({
+  onStateChange: (state) => {
     void import("./downloads/saveFilePicker")
       .then(({ syncWebSaveFilePickerPreference }) =>
         syncWebSaveFilePickerPreference(
-          Boolean(state?.connected && state?.useSaveFilePicker),
+          Boolean(state.connected && state.useSaveFilePicker),
         ),
       )
       .catch(() => {});
-  }
+  },
+});
+const extensionState = extRuntime.extensionState;
+const latestExtensionVersion = extRuntime.latestExtensionVersion;
+const extensionConnected = computed(() => extensionState.value.connected);
+const extensionVersion = computed(() => extensionState.value.version);
+
+const openExtensionModal = () => {
+  showExtensionModal.value = true;
+  void extRuntime.probeExtension();
+  void extRuntime.refreshLatestExtensionVersion({
+    cooldownMs: MODAL_VERSION_CHECK_COOLDOWN_MS,
+  });
 };
 
-const probeHeaderExtension = async () => {
-  try {
-    const { pingInstalledExtension } = await import("./services/extensionBridge");
-    const state = await pingInstalledExtension();
-    handleExtensionStateChange(state);
-  } catch {
-    handleExtensionStateChange({ connected: false, version: "" });
-  }
+let preloadNoticeShown = false;
+const onVitePreloadError = () => {
+  if (preloadNoticeShown) return;
+  preloadNoticeShown = true;
+  showToast(
+    locale.value === "en"
+      ? "A newer version of DokiTool is available. Please refresh the page."
+      : "检测到站点已发布新版本，请刷新页面以加载最新资源",
+    "info",
+    6000,
+  );
 };
 
 const formatNumber = (num) => {
@@ -393,7 +476,10 @@ const onVisibilityOrFocus = () => {
     return;
   }
   void handleYouTubeHelperTabReturn();
-  void probeHeaderExtension();
+  void extRuntime.probeExtension();
+  void extRuntime.refreshLatestExtensionVersion({
+    cooldownMs: VISIBILITY_VERSION_CHECK_COOLDOWN_MS,
+  });
 };
 
 const handleExtensionYouTubeReady = () => {
@@ -447,13 +533,17 @@ onMounted(() => {
   isReady.value = true;
   document.addEventListener("visibilitychange", onVisibilityOrFocus);
   window.addEventListener("focus", onVisibilityOrFocus);
-  void probeHeaderExtension();
+  window.addEventListener("vite:preloadError", onVitePreloadError);
+  void extRuntime.probeExtension();
+  extRuntime.scheduleIdleVersionCheck();
   void resumePendingYouTubeHelperInstall();
 });
 
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", onVisibilityOrFocus);
   window.removeEventListener("focus", onVisibilityOrFocus);
+  window.removeEventListener("vite:preloadError", onVitePreloadError);
+  extRuntime.dispose();
 });
 </script>
 
@@ -469,6 +559,7 @@ onUnmounted(() => {
       :locale="locale"
       :extension-connected="extensionConnected"
       :extension-version="extensionVersion"
+      :latest-extension-version="latestExtensionVersion"
       @close="showExtensionModal = false"
     />
     <DownloadCard
@@ -501,9 +592,10 @@ onUnmounted(() => {
       :locale="locale"
       :extension-connected="extensionConnected"
       :extension-version="extensionVersion"
+      :latest-extension-version="latestExtensionVersion"
       @toggle-theme="toggleTheme"
       @set-locale="setLocale"
-      @open-extension="showExtensionModal = true"
+      @open-extension="openExtensionModal"
     />
 
     <main class="max-w-7xl mx-auto px-4 pb-8 pt-0 relative z-10">
@@ -538,10 +630,11 @@ onUnmounted(() => {
           :format-number="formatNumber"
           :format-duration="formatDuration"
           :resolving-ids="videoStore.resolvingItems"
+          :extension-state="extensionState"
+          :latest-extension-version="latestExtensionVersion"
           @refresh-item="resolveSelectedItem"
-          @open-extension="showExtensionModal = true"
+          @open-extension="openExtensionModal"
           @extension-youtube-ready="handleExtensionYouTubeReady"
-          @extension-state-change="handleExtensionStateChange"
         @install-youtube-helper="markWaitingForYouTubeHelperInstall"
         @refresh-youtube-helper-page="triggerManualHelperRefresh"
         @download-main="downloadMainVideo"
@@ -580,7 +673,7 @@ onUnmounted(() => {
 
     <FooterSection
       :locale="locale"
-      @open-extension="showExtensionModal = true"
+      @open-extension="openExtensionModal"
     />
   </div>
 </template>

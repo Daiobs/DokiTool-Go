@@ -23,7 +23,6 @@ before(async()=>{
   iconPaths=await vite.ssrLoadModule('/src/utils/iconPaths.ts');
   await vite.ssrLoadModule('/src/services/tbvideo.ts');
   await vite.ssrLoadModule('/src/services/secureApiClient.ts');
-  (await vite.ssrLoadModule('/src/services/operationLogger.js')).operationLogger.enableConsole=false;
   globalThis.window={setTimeout,clearTimeout};
 });
 after(async()=>{globalThis.fetch=originalFetch;globalThis.window=originalWindow;await vite?.close();});

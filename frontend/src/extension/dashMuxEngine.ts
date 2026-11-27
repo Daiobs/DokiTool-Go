@@ -245,7 +245,7 @@ interface MediabunnyLike {
 
 /**
  * Downloads separate DASH video + audio tracks concurrently into 2 OPFS temp files,
- * performs lossless MP4 stream-copy muxing via `mediabunny@1.65.2` (zero re-encoding,
+ * performs lossless MP4 stream-copy muxing via `mediabunny` (zero re-encoding,
  * supports H.264 / HEVC / AV1 + AAC) directly into a 3rd OPFS output sink, and
  * deterministically removes both intermediate OPFS track files in `finally`.
  */
@@ -434,7 +434,7 @@ export async function runDashMuxToOpfs(
       force: true,
     });
 
-    // Phase 2: Lossless MP4 stream copy via mediabunny@1.65.2 (82% - 98%)
+    // Phase 2: Lossless MP4 stream copy via mediabunny (82% - 98%)
     const createInputSource = async (blob: Blob | File): Promise<unknown> => {
       if (
         typeof mb.BlobSource === "function" &&

@@ -3,7 +3,7 @@ import {
   buildExtensionDnrRules,
   type ExtensionDnrRule,
 } from "../dnrRules";
-import { LOOPBACK_HOST_PERMISSIONS, validateApiBaseUrl } from "../hostWhitelist";
+import { validateApiBaseUrl } from "../hostWhitelist";
 import type { ExtensionSettings } from "../protocol";
 import type { ExtensionStorageController } from "../storage";
 import type { ChromeBackgroundApi } from "./types";
@@ -63,33 +63,32 @@ export function createDnrRulesManager(deps: DnrRulesManagerDeps): DnrRulesManage
   const resolveExtraAllowedMediaOrigins = async (
     settings: ExtensionSettings,
   ): Promise<string[]> => {
-    const allowed = new Set<string>();
     const validated = validateApiBaseUrl(settings.apiBaseUrl);
-    if (validated.ok) {
-      allowed.add(validated.origin);
+    if (!validated.ok) {
+      return [];
     }
-
+    if (!validated.isLoopback) {
+      return [validated.origin];
+    }
+    // For loopback settings, scope strictly to the configured single-port origin
+    // (never widen to port-wildcard `http://127.0.0.1/*` / `http://localhost/*`).
+    const hostPattern = `http://${new URL(validated.origin).hostname.toLowerCase()}/*`;
     const manifestHosts =
       chromeApi.runtime.getManifest?.()?.host_permissions ?? [];
-    for (const pattern of LOOPBACK_HOST_PERMISSIONS) {
-      if (manifestHosts.includes(pattern)) {
-        allowed.add(pattern);
-        continue;
-      }
-      if (chromeApi.permissions?.contains) {
-        try {
-          const granted = await chromeApi.permissions.contains({
-            origins: [pattern],
-          });
-          if (granted) {
-            allowed.add(pattern);
-          }
-        } catch {
-          // Ignore permission check errors
-        }
-      }
+    if (manifestHosts.includes(hostPattern)) {
+      return [validated.origin];
     }
-    return Array.from(allowed);
+    if (!chromeApi.permissions?.contains) {
+      return [validated.origin];
+    }
+    try {
+      const granted = await chromeApi.permissions.contains({
+        origins: [hostPattern],
+      });
+      return granted ? [validated.origin] : [];
+    } catch {
+      return [];
+    }
   };
 
   return {

@@ -19,6 +19,23 @@ const outputPath = path.join(
   "dokitool-youtube.user.js",
 );
 
+function resolveMediabunnyVersion() {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(frontendRoot, "package.json"), "utf8"),
+  );
+  const raw =
+    pkg?.dependencies?.mediabunny ?? pkg?.devDependencies?.mediabunny ?? "";
+  const cleaned = String(raw).trim().replace(/^[~^=v]+/, "");
+  if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(cleaned)) {
+    throw new Error(
+      `Invalid or missing mediabunny version in frontend/package.json: ${JSON.stringify(raw)}`,
+    );
+  }
+  return cleaned;
+}
+
+export const MEDIABUNNY_VERSION = resolveMediabunnyVersion();
+
 export function buildUserscriptHeader(version = YOUTUBE_HELPER_VERSION) {
   return [
     "// ==UserScript==",
@@ -39,8 +56,8 @@ export function buildUserscriptHeader(version = YOUTUBE_HELPER_VERSION) {
     "// ==/UserScript==",
     "/*!",
     ` * DokiTool YouTube Helper v${version}`,
-    " * Bundles unmodified Mediabunny v1.65.2 (Mozilla Public License 2.0, Copyright (c) Vanilagy).",
-    " * Mediabunny Source Code Form: https://github.com/Vanilagy/mediabunny/tree/v1.65.2",
+    ` * Bundles unmodified Mediabunny v${MEDIABUNNY_VERSION} (Mozilla Public License 2.0, Copyright (c) Vanilagy).`,
+    ` * Mediabunny Source Code Form: https://github.com/Vanilagy/mediabunny/tree/v${MEDIABUNNY_VERSION}`,
     " * Full MPL-2.0 license text: https://snap.dokitool.com/licenses/mediabunny-MPL-2.0.txt",
     " */",
     "",

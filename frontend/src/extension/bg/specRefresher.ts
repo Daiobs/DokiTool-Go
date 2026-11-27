@@ -766,12 +766,17 @@ export function createSpecRefresher(deps: SpecRefresherDeps): SpecRefresher {
       }
     }
 
-    const extra = await resolveExtraAllowedMediaOrigins(settings);
+    const extra = effectiveSpec.isolateExtraAllowedOrigins
+      ? []
+      : await resolveExtraAllowedMediaOrigins(settings);
+    const mergedExtra = Array.from(
+      new Set([...(effectiveSpec.extraAllowedOrigins ?? []), ...extra]),
+    );
     const enrichedSpec: OffscreenDownloadSpec = {
       ...effectiveSpec,
-      extraAllowedOrigins: Array.from(
-        new Set([...(effectiveSpec.extraAllowedOrigins ?? []), ...extra]),
-      ),
+      ...(mergedExtra.length > 0 || !effectiveSpec.isolateExtraAllowedOrigins
+        ? { extraAllowedOrigins: mergedExtra }
+        : {}),
     };
     const latestTask = tasks.get(taskId);
     if (!latestTask || latestTask.status === "cancelled") {

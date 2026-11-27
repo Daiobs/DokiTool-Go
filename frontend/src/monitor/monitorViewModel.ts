@@ -446,7 +446,7 @@ export function evaluateMonitorHealthAndAlerts(stats: StatsSnapshot | null): Mon
 
   const dualNodeDegraded = shanghai.status === "offline" && primaryNodeStatus !== "online";
   if (dualNodeDegraded) {
-    alerts.unshift({ code: "DUAL_NODE_DEGRADED", severity: "danger", title: "上海 / 东京双节点同时异常", detail: `上海节点离线且主节点状态为 ${primaryNodeStatus}` });
+    alerts.unshift({ code: "DUAL_NODE_DEGRADED", severity: "danger", title: "上海 / 主节点双节点同时异常", detail: `上海节点离线且主节点状态为 ${primaryNodeStatus}` });
   }
 
   const dangerCount = alerts.filter((a) => a.severity === "danger").length;

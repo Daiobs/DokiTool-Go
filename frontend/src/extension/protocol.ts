@@ -1,3 +1,4 @@
+import { EXTENSION_RELEASE_ID } from "../core/capabilityHub";
 import type { UnifiedMedia } from "../types/media";
 import type {
   YouTubeHelperPlayerPayload,
@@ -44,7 +45,7 @@ export type {
 export const SIDEPANEL_PORT_NAME = "dokitool-sidepanel" as const;
 export const OFFSCREEN_PORT_NAME = "dokitool-offscreen" as const;
 export const EXTENSION_OPFS_TEMP_PREFIX = "dokitool-ext-" as const;
-export const DOKITOOL_EXTENSION_ID = "ihamkldlkdibleacagiejklpfofapkpo" as const;
+export const DOKITOOL_EXTENSION_ID: string = EXTENSION_RELEASE_ID;
 
 export const OFFSCREEN_HEARTBEAT_INTERVAL_MS = 20_000 as const;
 export const OFFSCREEN_IDLE_CLOSE_MS = 60_000 as const;
@@ -141,6 +142,8 @@ export interface OffscreenDownloadSpec {
   mimeType?: string;
   sizeBytes?: number;
   extraAllowedOrigins?: string[];
+  /** When true (e.g. external web bridge tasks), never merge settings-level loopback/custom origins. */
+  isolateExtraAllowedOrigins?: boolean;
   segments?: OffscreenSegmentSpec[];
   youtubeMux?: OffscreenYouTubeMuxSpec;
   dashMux?: OffscreenDashMuxSpec;

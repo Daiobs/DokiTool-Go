@@ -40,7 +40,7 @@ const EXTENSION_PARSE_FALLBACK_ERROR_CODES = new Set<string>([
 ]);
 
 const ALIAS_PAIRS =
-  "douyin:iesdouyin.com bilibili:b23.tv xiaohongshu:xhslink.com,rednote.com toutiao:toutiaoimg.com weibo:weibo.cn pipigx:ippzone.com x:twitter.com,t.co youtube:youtu.be instagram:instagr.am facebook:fb.watch";
+  "douyin:iesdouyin.com bilibili:b23.tv xiaohongshu:xhslink.com,rednote.com toutiao:toutiaoimg.com weibo:weibo.cn pipigx:ippzone.com zuiyou:share.xiaochuankeji.cn x:twitter.com,t.co youtube:youtu.be instagram:instagr.am facebook:fb.watch";
 
 export function detectUrlPlatform(rawUrl: string): string | null {
   try {
@@ -427,8 +427,8 @@ export async function runYouTubeHelperParse(ctx: {
     if (!ping.installed && !hasOutdatedExtension && isMobileBrowser()) {
       ctx.setError(
         ctx.locale === "en"
-          ? "YouTube requires a browser with a userscript manager. Using a computer is recommended on mobile."
-          : "YouTube 需要在装有用户脚本管理器的浏览器里使用，手机上建议改用电脑",
+          ? "YouTube requires the desktop Chrome/Edge DokiTool extension (or a browser with a userscript manager). Using a computer is recommended on mobile."
+          : "YouTube 需要桌面端 Chrome/Edge 的 DokiTool 扩展（或装有用户脚本管理器的浏览器），手机上建议改用电脑",
       );
       return;
     }

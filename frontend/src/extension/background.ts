@@ -614,15 +614,50 @@ export function createBackgroundController(
     }
   };
 
+  const isTrustedInternalSender = (
+    sender: unknown,
+    expectedPagePath: "/sidepanel.html" | "/offscreen.html",
+  ): boolean => {
+    if (!sender || typeof sender !== "object") return true;
+    const s = sender as { id?: unknown; url?: unknown; tab?: unknown };
+    const selfId = chromeApi.runtime.id;
+    if (typeof s.id === "string" && s.id && selfId && s.id !== selfId) {
+      return false;
+    }
+    const rawUrl = typeof s.url === "string" ? s.url.trim() : "";
+    if (s.tab !== undefined) {
+      // Offscreen documents never run in browser tabs; a tab sender is only
+      // accepted for sidepanel.html when Chrome reports the exact extension URL.
+      if (expectedPagePath !== "/sidepanel.html" || !rawUrl) {
+        return false;
+      }
+    }
+    if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl);
+        if (parsed.protocol !== "chrome-extension:") return false;
+        if (selfId && parsed.hostname !== selfId) return false;
+        return parsed.pathname === expectedPagePath;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  };
+
   // STRICT MV3 IPC CONTRACT:
   // ONLY return `true` / call `sendResponse` when `isSidePanelRequest(msg)`
-  // or `isOffscreenToBackgroundMessage(msg)`!
+  // or `isOffscreenToBackgroundMessage(msg)` from the matching internal page!
   const handleRuntimeMessage: ChromeRuntimeMessageListener = (
     msg: unknown,
-    _sender: unknown,
+    sender: unknown,
     sendResponse: (response?: unknown) => void,
   ): boolean => {
     if (isSidePanelRequest(msg)) {
+      if (!isTrustedInternalSender(sender, "/sidepanel.html")) {
+        sendResponse(errRpc("拒绝来自非侧边栏上下文的内部调用", { code: "FORBIDDEN_SENDER" }));
+        return false;
+      }
       void handleSidePanelRequest(msg)
         .then((resp) => sendResponse(resp))
         .catch((err: unknown) => {
@@ -646,6 +681,10 @@ export function createBackgroundController(
     }
 
     if (isOffscreenToBackgroundMessage(msg)) {
+      if (!isTrustedInternalSender(sender, "/offscreen.html")) {
+        sendResponse(errRpc("拒绝来自非离屏文档上下文的内部调用", { code: "FORBIDDEN_SENDER" }));
+        return false;
+      }
       void downloadCoordinator
         .handleOffscreenMessage(msg)
         .then((resp) => sendResponse(resp))

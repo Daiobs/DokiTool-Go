@@ -547,6 +547,7 @@ export function createWebExternalBridge(
             routes: vRoutesCheck.routes,
             filename: safeFilename,
             mimeType: "video/mp4",
+            isolateExtraAllowedOrigins: true,
             ...(declaredTotal ? { sizeBytes: declaredTotal } : {}),
             ...(webBridgeExtraOrigins
               ? { extraAllowedOrigins: webBridgeExtraOrigins }
@@ -605,6 +606,7 @@ export function createWebExternalBridge(
             routes: [vCheck.url],
             filename: safeFilename,
             mimeType: outputContainer === "webm" ? "video/webm" : "video/mp4",
+            isolateExtraAllowedOrigins: true,
             ...(declaredTotal ? { sizeBytes: declaredTotal } : {}),
             ...(webBridgeExtraOrigins
               ? { extraAllowedOrigins: webBridgeExtraOrigins }
@@ -642,6 +644,7 @@ export function createWebExternalBridge(
             routes: [urlCheck.url],
             filename: safeFilename,
             mimeType: inferYouTubeDirectMime(safeFilename, safeMimeType),
+            isolateExtraAllowedOrigins: true,
             ...(sizeBytes ? { sizeBytes } : {}),
             ...(webBridgeExtraOrigins
               ? { extraAllowedOrigins: webBridgeExtraOrigins }
@@ -667,6 +670,7 @@ export function createWebExternalBridge(
             apiOrigin,
             routes: routesCheck.routes,
             filename: safeFilename,
+            isolateExtraAllowedOrigins: true,
             ...(safeMimeType ? { mimeType: safeMimeType } : {}),
             ...(sizeBytes ? { sizeBytes } : {}),
             ...(webBridgeExtraOrigins
@@ -722,7 +726,14 @@ export function createWebExternalBridge(
           !/https?:\/\//i.test(task.filenameWarning)
             ? { filenameWarning: task.filenameWarning.trim().slice(0, 160) }
             : {}),
-          ...(task.error ? { error: task.error } : {}),
+          ...(typeof task.error === "string" && task.error.trim()
+            ? {
+                error: task.error
+                  .replace(/https?:\/\/\S+/gi, "[redacted-url]")
+                  .trim()
+                  .slice(0, 160),
+              }
+            : {}),
         });
       }
 

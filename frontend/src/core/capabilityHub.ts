@@ -11,15 +11,41 @@ import extensionReleaseMeta from "./extensionReleaseMeta.json";
  *   4. Native Browser Direct Download / External Link
  */
 
-export const LATEST_EXTENSION_VERSION: string = String(
-  extensionReleaseMeta.version || "4.4.1",
-);
+const STRICT_SEMVER_RE = /^\d+\.\d+\.\d+$/;
+const STRICT_EXTENSION_ID_RE = /^[a-p]{32}$/;
+
+const rawReleaseVersion = String(extensionReleaseMeta.version ?? "").trim();
+if (!STRICT_SEMVER_RE.test(rawReleaseVersion)) {
+  throw new Error(
+    `Invalid extensionReleaseMeta.json version: ${JSON.stringify(extensionReleaseMeta.version)}`,
+  );
+}
+const rawReleaseExtensionId = String(
+  extensionReleaseMeta.extensionId ?? "",
+).trim();
+if (!STRICT_EXTENSION_ID_RE.test(rawReleaseExtensionId)) {
+  throw new Error(
+    `Invalid extensionReleaseMeta.json extensionId: ${JSON.stringify(extensionReleaseMeta.extensionId)}`,
+  );
+}
+
+export const LATEST_EXTENSION_VERSION: string = rawReleaseVersion;
+export const EXTENSION_RELEASE_ID: string = rawReleaseExtensionId;
+export const EXTENSION_VERSION_PATH = "/helper/extension-version.json" as const;
+export const EXTENSION_ZIP_PATH =
+  "/helper/dokitool-chrome-extension.zip" as const;
+
+export interface ParsedExtensionVersionPayload {
+  version: string;
+  downloadUrl: string;
+  sha256?: string;
+}
 
 /**
  * Minimum DokiTool extension version that supports built-in zero-userscript
  * YouTube parsing & lossless muxing (`youtube_parse` / `youtube_mux`).
- * Keeping this at `"4.3.0"` allows v4.3.0 users to parse YouTube seamlessly
- * while still receiving `"有新版 v4.4.1"` update notifications.
+ * Keeping this at `"4.3.0"` allows v4.3.0+ users to parse YouTube seamlessly
+ * while still receiving update notifications when newer releases ship.
  */
 export const MIN_EXTENSION_YOUTUBE_VERSION = "4.3.0" as const;
 
@@ -115,6 +141,68 @@ export function isExtensionVersionOutdated(
 ): boolean {
   if (!installedVersion || !parseSemverTuple(installedVersion)) return false;
   return compareSemver(installedVersion, latestVersion) < 0;
+}
+
+export function isValidSameOriginExtensionDownloadUrl(
+  raw: unknown,
+  origin: string,
+): boolean {
+  if (raw === undefined) return true;
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes("@")) return false;
+  try {
+    const u = new URL(trimmed, origin);
+    return (
+      u.origin === origin &&
+      u.pathname === EXTENSION_ZIP_PATH &&
+      !u.search &&
+      !u.hash &&
+      !u.username &&
+      !u.password
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function parseExtensionVersionPayload(
+  rawBody: unknown,
+  origin: string,
+): ParsedExtensionVersionPayload | null {
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    return null;
+  }
+  const body = rawBody as Record<string, unknown>;
+  const version = typeof body.version === "string" ? body.version.trim() : "";
+  if (!STRICT_SEMVER_RE.test(version)) return null;
+  if (!isValidSameOriginExtensionDownloadUrl(body.download_url, origin)) {
+    return null;
+  }
+  const rawSha = typeof body.sha256 === "string" ? body.sha256.trim() : "";
+  const sha256 = /^[a-f0-9]{64}$/i.test(rawSha) ? rawSha.toLowerCase() : undefined;
+  return {
+    version,
+    downloadUrl: `${origin}${EXTENSION_ZIP_PATH}`,
+    ...(sha256 ? { sha256 } : {}),
+  };
+}
+
+/**
+ * Monotonically raises the runtime latest extension version only when a valid
+ * remote `/helper/extension-version.json` reports a version strictly newer than
+ * the compile-time `compiledVersion` (prevents downgrade or stale-cache flicker).
+ */
+export function resolveEffectiveLatestExtensionVersion(
+  compiledVersion: string,
+  remoteVersion: string | null | undefined,
+): string {
+  const base = STRICT_SEMVER_RE.test(String(compiledVersion || "").trim())
+    ? String(compiledVersion).trim()
+    : LATEST_EXTENSION_VERSION;
+  const candidate = String(remoteVersion || "").trim();
+  if (!STRICT_SEMVER_RE.test(candidate)) return base;
+  return compareSemver(candidate, base) > 0 ? candidate : base;
 }
 
 export function hasClientExtensionCapability(

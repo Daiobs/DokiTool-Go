@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import AppIcon from "../AppIcon.vue";
 import { LATEST_EXTENSION_VERSION } from "../../core/capabilityHub";
+import { MIN_YOUTUBE_HELPER_VERSION } from "../../utils/youtube/helperValidation";
 import { t } from "./resultI18n";
 
 const props = defineProps({
@@ -15,6 +16,10 @@ const props = defineProps({
   youtubeHelperScriptUrl: {
     type: String,
     default: "/helper/dokitool-youtube.user.js",
+  },
+  latestExtensionVersion: {
+    type: String,
+    default: "",
   },
   needsManualHelperRefresh: Boolean,
   locale: {
@@ -57,7 +62,14 @@ const copy = computed(() => {
     .replace(/^v/i, "");
   const extVerText = rawExtVer ? `v${rawExtVer}` : isEn ? "unknown" : "未知";
   const targetExtVer = String(
-    props.youtubeHelper?.min_version || LATEST_EXTENSION_VERSION,
+    props.youtubeHelper?.min_version ||
+      props.latestExtensionVersion ||
+      LATEST_EXTENSION_VERSION,
+  )
+    .trim()
+    .replace(/^v/i, "");
+  const minUserscriptVer = String(
+    props.youtubeHelper?.min_version || MIN_YOUTUBE_HELPER_VERSION,
   )
     .trim()
     .replace(/^v/i, "");
@@ -81,7 +93,7 @@ const copy = computed(() => {
         : "Install DokiTool Extension (YouTube 4K60 & Bilibili 1080P)",
       legacySummary: "Using Firefox or legacy userscript?",
       legacyNote: isOutdatedUserscript.value
-        ? `Your legacy userscript needs an update (current v${props.youtubeHelper?.version || "unknown"}, requires v${props.youtubeHelper?.min_version || "1.3.1"}+). Chrome/Edge users can switch to the extension above, or enable "Allow User Scripts" and update below.`
+        ? `Your legacy userscript needs an update (current v${props.youtubeHelper?.version || "unknown"}, requires v${minUserscriptVer}+). Chrome/Edge users can switch to the extension above, or enable "Allow User Scripts" and update below.`
         : 'Firefox or legacy Tampermonkey users can still install the userscript below (enable "Allow User Scripts" in Chrome/Edge extension details), then return to this tab.',
       legacyLinkLabel: isOutdatedUserscript.value
         ? "Update YouTube Userscript (/helper/dokitool-youtube.user.js)"
@@ -107,7 +119,7 @@ const copy = computed(() => {
       : "安装 DokiTool 扩展（免油猴解锁 YouTube 4K60 & B 站 1080P）",
     legacySummary: "使用 Firefox 或旧版油猴脚本？",
     legacyNote: isOutdatedUserscript.value
-      ? `检测到旧版 YouTube 下载助手脚本需要更新（当前 v${props.youtubeHelper?.version || "未知"}，要求 v${props.youtubeHelper?.min_version || "1.3.1"}+）。Chrome / Edge 用户推荐安装上方扩展替代油猴；如继续使用脚本，请开启「允许用户脚本」后更新。`
+      ? `检测到旧版 YouTube 下载助手脚本需要更新（当前 v${props.youtubeHelper?.version || "未知"}，要求 v${minUserscriptVer}+）。Chrome / Edge 用户推荐安装上方扩展替代油猴；如继续使用脚本，请开启「允许用户脚本」后更新。`
       : "Firefox 或习惯油猴的用户仍需要安装 YouTube 下载助手脚本（Chrome / Edge 需在 Tampermonkey 详情中开启「允许用户脚本」），安装完成后切回本页即可自动识别。",
     legacyLinkLabel: isOutdatedUserscript.value
       ? "更新 YouTube 助手脚本 (/helper/dokitool-youtube.user.js)"

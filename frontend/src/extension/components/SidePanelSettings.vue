@@ -264,6 +264,24 @@ async function handleSaveSettingsClick() {
       return;
     }
 
+    // Revoke previously granted optional loopback host permissions when switching back to a non-loopback backend.
+    if (!validated.isLoopback) {
+      try {
+        const g = globalThis as unknown as {
+          chrome?: {
+            permissions?: {
+              remove?: (p: { origins: string[] }) => Promise<boolean> | void;
+            };
+          };
+        };
+        await g.chrome?.permissions?.remove?.({
+          origins: ["http://127.0.0.1/*", "http://localhost/*"],
+        });
+      } catch {
+        // Ignore permission revocation errors when optional loopback permissions were not granted
+      }
+    }
+
     // Verify connection silently after saving so header status dot stays authoritative
     void sendSidePanelRequest({
       type: "TEST_CONNECTION",
@@ -575,7 +593,7 @@ onUnmounted(() => {
             <div class="sp-switch-row__info">
               <span class="sp-field__label">下载时询问保存位置</span>
               <span class="sp-field__hint">
-                每次弹出系统“另存为”窗口自选保存目录，同时可避免其他下载插件篡改文件名
+                单文件直下时弹出系统“另存为”窗口自选保存目录（合流 / 批量 / ZIP 仍保存至默认下载目录），同时可避免其他下载插件篡改文件名
               </span>
             </div>
             <button

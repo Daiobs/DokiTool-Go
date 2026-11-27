@@ -3343,6 +3343,20 @@ test('#91 PR1 item 5: App.vue renders top open-in-system-browser banner only for
     if (id.startsWith('./components/')) return stubComponent;
     if (id === './stores/video') return storeMod;
     if (id === './composables/useVideoParser') return parser;
+    if (id === './composables/useExtensionRuntime') {
+      return {
+        MODAL_VERSION_CHECK_COOLDOWN_MS: 60_000,
+        VISIBILITY_VERSION_CHECK_COOLDOWN_MS: 300_000,
+        useExtensionRuntime: () => ({
+          extensionState: vueMod.ref({ connected: false, version: '', extensionId: '', capabilities: [], useSaveFilePicker: false }),
+          latestExtensionVersion: vueMod.ref('4.5.0'),
+          probeExtension: async () => ({ connected: false, version: '', extensionId: '', capabilities: [], useSaveFilePicker: false }),
+          refreshLatestExtensionVersion: async () => '4.5.0',
+          scheduleIdleVersionCheck: () => {},
+          dispose: () => {},
+        }),
+      };
+    }
     if (id === './composables/useMediaDownload') return downloads;
     if (id === './composables/useVideoSelection') return selectionModule;
     if (id === './utils/platforms') return platforms;
@@ -3491,6 +3505,20 @@ test('App.vue lazy-loads youtubeHelperCore, useMediaDownload, and DownloadCard w
       if (id.startsWith('./components/')) return stubComponent;
       if (id === './stores/video') return storeMod;
       if (id === './composables/useVideoParser') return parser;
+      if (id === './composables/useExtensionRuntime') {
+        return {
+          MODAL_VERSION_CHECK_COOLDOWN_MS: 60_000,
+          VISIBILITY_VERSION_CHECK_COOLDOWN_MS: 300_000,
+          useExtensionRuntime: () => ({
+            extensionState: vueMod.ref({ connected: false, version: '', extensionId: '', capabilities: [], useSaveFilePicker: false }),
+            latestExtensionVersion: vueMod.ref('4.5.0'),
+            probeExtension: async () => ({ connected: false, version: '', extensionId: '', capabilities: [], useSaveFilePicker: false }),
+            refreshLatestExtensionVersion: async () => '4.5.0',
+            scheduleIdleVersionCheck: () => {},
+            dispose: () => {},
+          }),
+        };
+      }
       if (id === './composables/useVideoSelection') return selectionModule;
       if (id === './composables/useMediaDownload') {
         return {
