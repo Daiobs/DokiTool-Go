@@ -19,6 +19,7 @@ import (
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/ytengine"
 )
 
 func resolveTestDenoBinary(t *testing.T) string {
@@ -1782,4 +1783,54 @@ func TestYouTubeHelperGovernanceWave1Hardening(t *testing.T) {
 	t.Run("midflight-disconnect-records-cooldown-with-bgCtx", func(t *testing.T) {
 		verifyDisconnectRecordsCooldown(t, true)
 	})
+}
+
+func TestFinalizeRejectsOverlongChallengesAndChallengeLRUBounds(t *testing.T) {
+	// 1. Overlong 's' (> MaxChallengeSigBytes) and 'n' (> MaxChallengeNBytes) rejected before solving (NV-03).
+	overlongS := strings.Repeat("A", MaxChallengeSigBytes+1)
+	overlongN := strings.Repeat("b", MaxChallengeNBytes+1)
+	if _, _, _, errObj := resolveFinalizeStreamURL(finalizeFormatInput{
+		Itag:            18,
+		MimeType:        `video/mp4; codecs="avc1.42001E, mp4a.40.2"`,
+		SignatureCipher: "s=" + overlongS + "&sp=sig&url=" + url.QueryEscape("https://rr1---sn-test.googlevideo.com/videoplayback?id=aqz-KE-bpKQ&itag=18"),
+	}); errObj == nil {
+		t.Fatal("expected overlong signatureCipher 's' parameter to be rejected")
+	}
+
+	if _, errObj, status := validateFinalizeStreamEntries([]finalizeFormatInput{{
+		Itag:     18,
+		MimeType: `video/mp4; codecs="avc1.42001E, mp4a.40.2"`,
+		URL:      "https://rr1---sn-test.googlevideo.com/videoplayback?id=aqz-KE-bpKQ&itag=18&n=" + overlongN,
+	}}, "aqz-KE-bpKQ"); errObj == nil || status != http.StatusBadRequest {
+		t.Fatalf("expected overlong 'n' parameter to be rejected with 400, got status=%d err=%v", status, errObj)
+	}
+
+	// 2. challengeLRU enforces cumulative maxBytes, per-entry limits, and TTL expiry.
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	lru := newChallengeLRUWithConfig(100, 300, time.Hour, func() time.Time { return now })
+	lru.Put("12345678", "tv", "dig", "sig", strings.Repeat("x", MaxChallengeSigBytes+1), "val")
+	if lru.Len() != 0 {
+		t.Fatalf("expected oversized input to be rejected by challengeLRU.Put, got len=%d", lru.Len())
+	}
+	for i := 0; i < 10; i++ {
+		lru.Put("12345678", "tv", "dig", "sig", "in-"+strconv.Itoa(i)+strings.Repeat("a", 30), strings.Repeat("v", 30))
+	}
+	if lru.Bytes() > 300 {
+		t.Fatalf("challengeLRU exceeded maxBytes budget: bytes=%d max=300", lru.Bytes())
+	}
+	if lru.Len() == 0 {
+		t.Fatal("expected non-zero entries within byte budget")
+	}
+	now = now.Add(2 * time.Hour)
+	if _, ok := lru.Get("12345678", "tv", "dig", "sig", "in-9"+strings.Repeat("a", 30)); ok {
+		t.Fatal("expected expired challengeLRU entry to miss after TTL")
+	}
+
+	// 3. buildFinalizeEnvelope honors canceled context immediately (NV-04).
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	payload, status := buildFinalizeEnvelope(canceledCtx, nil, ytengine.AdaptOptions{}, nil, now.Unix(), false)
+	if status != http.StatusGatewayTimeout || unified.Str(payload["code"]) != "UPSTREAM_TIMEOUT" {
+		t.Fatalf("expected canceled buildFinalizeEnvelope to return 504 UPSTREAM_TIMEOUT, got %d %v", status, payload)
+	}
 }

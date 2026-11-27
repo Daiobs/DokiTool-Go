@@ -155,6 +155,19 @@ func (p *Parser) parseLegacy(parent context.Context, input string) (unified.Obje
 
 const mobileUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
 
+func isCanonicalPipixiaHost(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "pipix.com", "h5.pipix.com", "www.pipix.com", "m.pipix.com", "s.pipix.com":
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *Parser) request(ctx context.Context, target string, deadline time.Time, clock func() time.Time, purpose string) (fetch.Response, unified.Object) {
 	seconds := math.Ceil(deadline.Sub(clock()).Seconds())
 	if seconds < 1 {
@@ -165,6 +178,10 @@ func (p *Parser) request(ctx context.Context, target string, deadline time.Time,
 	}, Timeout: time.Duration(seconds) * time.Second, MaxBytes: 2 << 20, ReadRedirectBody: purpose == "pipixia-page"}
 	response, err := p.executor.Do(ctx, fetch.Request{URL: target, Method: http.MethodGet, Header: http.Header{"Accept": {"text/html,application/json"}, "Referer": {"https://h5.pipix.com/"}, "User-Agent": {mobileUA}}, Policy: policy})
 	if err != nil || int64(len(response.Body)) > policy.MaxBytes || (response.URL != "" && response.URL != target) {
+		var dnsErr *net.DNSError
+		if purpose == "pipixia-share" && (!isCanonicalPipixiaHost(target) || (errors.As(err, &dnsErr) && dnsErr.IsNotFound)) {
+			unified.MarkCallerScopedFailure(ctx)
+		}
 		code := 502
 		var timeout net.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
@@ -176,6 +193,9 @@ func (p *Parser) request(ctx context.Context, target string, deadline time.Time,
 		return response, failure(502, "皮皮虾暂时限制访问，请稍后重试", "UPSTREAM_RESTRICTED")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 400 {
+		if response.StatusCode == http.StatusNotFound {
+			unified.MarkCallerScopedFailure(ctx)
+		}
 		return response, failure(502, "皮皮虾页面暂时不可用，请检查分享链接或稍后重试", "UPSTREAM_HTTP_ERROR")
 	}
 	return response, nil

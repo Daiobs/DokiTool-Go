@@ -295,13 +295,33 @@ func filterShanghaiURLsAt(urls []string, now int64) []string {
 	return out
 }
 
+func shanghaiMediaObjectPath(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	p := u.EscapedPath()
+	if p == "" || !strings.HasPrefix(p, "/") || strings.Contains(p, "..") || strings.Contains(p, "\\") {
+		return "", false
+	}
+	return p, true
+}
+
 func prependShanghaiSources(shURLs []string, jpSources array, now int64) (array, bool) {
-	if len(shURLs) == 0 {
+	if len(shURLs) == 0 || len(jpSources) == 0 {
 		return jpSources, false
+	}
+	allowedPaths := make(map[string]bool, len(jpSources))
+	for _, rawJS := range jpSources {
+		if p, ok := shanghaiMediaObjectPath(unified.Str(unified.Map(rawJS)["url"])); ok {
+			allowedPaths[p] = true
+		}
 	}
 	shInputs := make(array, 0, len(shURLs))
 	for _, u := range shURLs {
-		shInputs = append(shInputs, u)
+		if p, ok := shanghaiMediaObjectPath(u); ok && allowedPaths[p] {
+			shInputs = append(shInputs, u)
+		}
 	}
 	shSources := unified.Sources(shInputs, now)
 	if len(shSources) == 0 {
@@ -492,6 +512,30 @@ func parseMediaURLDeadline(raw string) (int64, bool) {
 		found = true
 	}
 	return exp, found
+}
+
+// ValidateShanghaiMediaURLForCID verifies ValidateShanghaiMediaURL and binds the
+// UPOS object path strictly to /upgcxcode/... and the expected Bilibili part CID.
+func ValidateShanghaiMediaURLForCID(raw string, cid int64, requireDeadline bool) (int64, bool) {
+	if !ValidCID(cid) {
+		return 0, false
+	}
+	exp, ok := ValidateShanghaiMediaURL(raw, requireDeadline)
+	p, pathOK := shanghaiMediaObjectPath(raw)
+	if !ok || !pathOK || !strings.HasPrefix(p, "/upgcxcode/") || strings.Contains(p, "%") {
+		return 0, false
+	}
+	cidStr := strconv.FormatInt(cid, 10)
+	segs := strings.Split(strings.TrimPrefix(p, "/upgcxcode/"), "/")
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." {
+			return 0, false
+		}
+	}
+	if len(segs) == 0 || !strings.HasPrefix(segs[len(segs)-1], cidStr+"-") || (len(segs) >= 2 && segs[len(segs)-2] != cidStr) {
+		return 0, false
+	}
+	return exp, true
 }
 
 // ValidateShanghaiMediaURL checks that raw is a valid https://upos-*.bilivideo.com URL

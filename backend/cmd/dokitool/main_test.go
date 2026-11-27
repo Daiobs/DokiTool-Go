@@ -2824,3 +2824,17 @@ func TestReloadRuntimeConfigOnceLogsCriticalOnCompartmentRollbackFailure(t *test
 		t.Fatalf("compartment ops = %v, want %v", ops, wantOps)
 	}
 }
+
+func TestConfigureShanghaiDirectModeRejectsTokenCollision(t *testing.T) {
+	shared := strings.Repeat("s", 32)
+	env := map[string]string{
+		"DOKITOOL_SHANGHAI_MODE":     "direct",
+		"DOKITOOL_SHANGHAI_ENDPOINT": "https://sh.example.com/resolve",
+		"DOKITOOL_SHANGHAI_TOKEN":    shared,
+		"DOKITOOL_OWNER_TOKEN":       shared,
+	}
+	_, _, err := configureShanghai(nil, func(k string) string { return env[k] })
+	if err == nil || !strings.Contains(err.Error(), "dedicated Shanghai token") {
+		t.Fatalf("expected direct mode token collision error, got: %v", err)
+	}
+}

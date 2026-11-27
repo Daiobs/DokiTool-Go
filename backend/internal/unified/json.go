@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -188,13 +187,9 @@ func Equal(a, b any) bool {
 		}
 		return true
 	}
-	if av, ok := numberText(a); ok {
-		bv, ok := numberText(b)
-		if !ok {
-			return false
-		}
-		ar, aok := new(big.Rat).SetString(av)
-		br, bok := new(big.Rat).SetString(bv)
+	if _, ok := numberText(a); ok {
+		ar, aok := schemaNumber(a)
+		br, bok := schemaNumber(b)
 		return aok && bok && ar.Cmp(br) == 0
 	}
 	switch av := a.(type) {

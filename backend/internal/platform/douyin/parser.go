@@ -211,10 +211,12 @@ func (p *Parser) fetchDetail(ctx context.Context, id string) (object, string, er
 	}
 	status, _ := unified.PHPInt(payload["status_code"])
 	if status != 0 {
+		unified.MarkCallerScopedFailure(ctx)
 		return nil, fmt.Sprintf("详情接口 status_code=%d", status), nil
 	}
 	detail := unified.Map(payload["aweme_detail"])
 	if len(detail) == 0 {
+		unified.MarkCallerScopedFailure(ctx)
 		return nil, "详情接口未返回 aweme_detail（不能据此断言作品已删除）", nil
 	}
 	if stringValue(detail["aweme_id"]) != id {

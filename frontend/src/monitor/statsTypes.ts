@@ -168,8 +168,6 @@ export function formatCircuitBreakerBadge(
   return { label: "正常", tone: "ok" };
 }
 
-export const YOUTUBE_HELPER_CHALLENGE_LRU_CAPACITY = 4096;
-
 export interface YouTubeHelperBadgeView {
   label: string;
   tone: "ok" | "warn" | "danger" | "muted";

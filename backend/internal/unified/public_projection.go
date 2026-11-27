@@ -47,11 +47,10 @@ func projectPublicSource(source Object) {
 			}
 		}
 	}
-	if text, ok := numberText(source["size_bytes"]); ok {
-		size, valid := new(big.Rat).SetString(text)
+	if size, valid := schemaNumber(source["size_bytes"]); valid {
 		// Keep malformed values for validation to reject. Only an exact
 		// positive integer outside the browser's safe range is omitted.
-		if valid && size.IsInt() && size.Sign() > 0 && size.Num().Cmp(big.NewInt(maxPublicSourceSize)) > 0 {
+		if size.IsInt() && size.Sign() > 0 && size.Num().Cmp(big.NewInt(maxPublicSourceSize)) > 0 {
 			delete(source, "size_bytes")
 		}
 	}

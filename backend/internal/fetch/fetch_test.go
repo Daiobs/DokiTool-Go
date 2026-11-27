@@ -1150,3 +1150,38 @@ func TestRedirectStripsSensitiveHeadersWithoutAutoReferer(t *testing.T) {
 		t.Fatalf("same-host HTTPS redirect dropped headers unexpectedly: %+v", seen)
 	}
 }
+
+func TestRedirect302ToGetStripsContentLengthAndContentType(t *testing.T) {
+	var secondMethod, secondCT, secondCL string
+	tlsSrv, roots, _ := newPoolTestServer(t, true, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/post" {
+			http.Redirect(w, r, "https://api.example.test/done", http.StatusFound)
+			return
+		}
+		secondMethod = r.Method
+		secondCT = r.Header.Get("Content-Type")
+		secondCL = r.Header.Get("Content-Length")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	client := NewWithResolver(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}))
+	t.Cleanup(client.CloseIdleConnections)
+	client.tlsRootCAs = roots
+	client.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, tlsSrv.Listener.Addr().String())
+	}
+	_, err := client.Do(context.Background(), Request{
+		URL:    "https://api.example.test/post",
+		Method: http.MethodPost,
+		Body:   []byte(`{"a":1}`),
+		Header: http.Header{"Content-Type": {"application/json"}, "Content-Length": {"7"}},
+		Policy: Policy{Purpose: "test-302-cl", AllowedURL: AllowHosts("api.example.test"), FollowRedirects: true, MaxRedirects: 3, Timeout: 5 * time.Second, MaxBytes: 1024},
+	})
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	if secondMethod != http.MethodGet || secondCT != "" || secondCL != "" {
+		t.Fatalf("expected GET with stripped Content-Type/Content-Length, got method=%q ct=%q cl=%q", secondMethod, secondCT, secondCL)
+	}
+}

@@ -3,6 +3,7 @@ package unified
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -805,5 +806,93 @@ func TestAttachmentTrackKindContract(t *testing.T) {
 				t.Fatalf("expected invalid subtitle track_kind=%v to be rejected", tc.val)
 			}
 		})
+	}
+}
+
+func TestSelectDefaultAndValidateDimensionlessV256PerformanceAndParity(t *testing.T) {
+	const now = int64(1793361600)
+	variants := make(Array, 0, 256)
+	for i := 0; i < 256; i++ {
+		variants = append(variants, Object{
+			"id": fmt.Sprintf("v-%03d", i),
+			"metadata": Object{
+				"evidence":  "upstream",
+				"mime_type": "video/mp4",
+				"container": "mp4",
+				"extension": "mp4",
+				"has_audio": true,
+			},
+			"delivery": Object{
+				"kind": "file",
+				"sources": Array{
+					Object{
+						"id":     fmt.Sprintf("s-%03d", i),
+						"url":    fmt.Sprintf("https://rr1---sn-test.googlevideo.com/videoplayback?id=abc12345678&itag=%d", i+1),
+						"access": "direct",
+					},
+				},
+			},
+		})
+	}
+	item := Object{"id": "video-1", "type": "video", "index": int64(1), "variants": variants}
+	selected := SelectDefaultForPlatform("youtube", item, now)
+	if Map(selected["default"]) == nil || Str(Map(selected["default"])["variant_id"]) != "v-000" {
+		t.Fatalf("unexpected default for dimensionless V=256: %+v", selected["default"])
+	}
+	env := FinalizeData(Object{
+		"platform":        "youtube",
+		"content_id":      "abc12345678",
+		"source_url":      "https://www.youtube.com/watch?v=abc12345678",
+		"default_item_id": "video-1",
+		"items":           Array{item},
+	}, now)
+	if err := ValidateEnvelopeAt(env, now); err != nil {
+		t.Fatalf("ValidateEnvelopeAt(V=256) failed: %v", err)
+	}
+	// Verify mux explicit-nil metadata overlay parity with VariantVideoMetadata.
+	muxVariant := Object{
+		"id":       "mux-nil-overlay",
+		"metadata": Object{"width": nil, "height": 1080},
+		"delivery": Object{
+			"kind": "mux",
+			"resources": Array{
+				Object{"role": "video", "metadata": Object{"width": 1920, "height": 1080}},
+			},
+		},
+	}
+	g := extractVariantGeometry(muxVariant)
+	if g.known || g.hasDimPair {
+		t.Fatalf("expected explicit nil width overlay to suppress video resource width, got %+v", g)
+	}
+	// Verify Equal & projectPublicSource guard against huge-exponent json.Number without OOM.
+	huge := json.Number("1e9999999")
+	if Equal(huge, huge) {
+		t.Fatalf("expected non-finite huge-exponent json.Number Equal to return false")
+	}
+	src := Object{"url": "https://cdn.example.com/v.mp4", "size_bytes": huge}
+	projectPublicSource(src)
+	if _, exists := src["size_bytes"]; !exists {
+		t.Fatalf("expected malformed non-finite size_bytes to remain for schema validation to reject")
+	}
+}
+
+func BenchmarkSelectDefaultDimensionlessV256(b *testing.B) {
+	const now = int64(1793361600)
+	variants := make(Array, 0, 256)
+	for i := 0; i < 256; i++ {
+		variants = append(variants, Object{
+			"id":       fmt.Sprintf("v-%03d", i),
+			"metadata": Object{"evidence": "upstream", "mime_type": "video/mp4", "has_audio": true},
+			"delivery": Object{
+				"kind":    "file",
+				"sources": Array{Object{"id": fmt.Sprintf("s-%03d", i), "url": fmt.Sprintf("https://cdn.example.com/%d.mp4", i)}},
+			},
+		})
+	}
+	item := Object{"id": "video-1", "type": "video", "variants": variants}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = SelectDefaultForPlatform("youtube", item, now)
 	}
 }

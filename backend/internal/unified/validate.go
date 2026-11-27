@@ -338,13 +338,9 @@ func ValidateEnvelopeAt(payload Object, fallbackNow int64) error {
 			}
 		}
 		platform := Str(data["platform"])
-		expected := SelectDefaultForPlatform(platform, item, now)
 		if item["default"] != nil {
-			if expected["default"] == nil {
-				return fmt.Errorf("no eligible complete file")
-			}
 			projection := Map(item["default"])
-			usableFiles := make([]Object, 0)
+			usableFiles := make([]Object, 0, len(variants))
 			for _, value := range variants {
 				v := Map(value)
 				if readyState(v) && Str(Map(v["delivery"])["kind"]) == "file" && DeliveryUsable(Map(v["delivery"]), now) {
@@ -352,6 +348,9 @@ func ValidateEnvelopeAt(payload Object, fallbackNow int64) error {
 				}
 			}
 			eligibleFiles := defaultEligibleFiles(platform, Str(item["type"]), usableFiles)
+			if len(eligibleFiles) == 0 {
+				return fmt.Errorf("no eligible complete file")
+			}
 			var selected Object
 			for _, variant := range eligibleFiles {
 				if Equal(variant["id"], projection["variant_id"]) {
@@ -386,30 +385,43 @@ func ValidateEnvelopeAt(payload Object, fallbackNow int64) error {
 			if !Equal(source["url"], projection["url"]) || sourceAccess != defaultAccess || !Equal(source["expires_at"], projection["expires_at"]) {
 				return fmt.Errorf("default source projection mismatch")
 			}
-			for _, variant := range eligibleFiles {
-				if cmp, comparable := QualityCompare(variant, selected); comparable && cmp == 1 {
-					return fmt.Errorf("higher complete file omitted from default")
+			selectedGeom := extractVariantGeometry(selected)
+			if selectedGeom.known {
+				for _, variant := range eligibleFiles {
+					if cmp, comparable := compareGeometry(extractVariantGeometry(variant), selectedGeom); comparable && cmp == 1 {
+						return fmt.Errorf("higher complete file omitted from default")
+					}
 				}
+			}
+			if item["default_unavailable_reason"] != nil {
+				return fmt.Errorf("invalid null-default reason")
 			}
 			higher := Array{}
-			for _, value := range variants {
-				variant := Map(value)
-				if cmp, comparable := QualityCompare(variant, selected); !comparable || cmp != 1 || !DeliveryUsable(Map(variant["delivery"]), now) {
-					continue
-				}
-				if required := DeliveryRequires(Map(variant["delivery"])); len(required) > 0 {
-					higher = append(higher, Object{"variant_id": variant["id"], "requires": Slice(required)})
+			if selectedGeom.known {
+				for _, value := range variants {
+					variant := Map(value)
+					if cmp, comparable := compareGeometry(extractVariantGeometry(variant), selectedGeom); !comparable || cmp != 1 || !DeliveryUsable(Map(variant["delivery"]), now) {
+						continue
+					}
+					if required := DeliveryRequires(Map(variant["delivery"])); len(required) > 0 {
+						higher = append(higher, Object{"variant_id": variant["id"], "requires": Slice(required)})
+					}
 				}
 			}
-			expected["higher_quality_variants"] = higher
-		} else if expected["default"] != nil {
-			return fmt.Errorf("eligible complete file has null default")
-		}
-		if !Equal(expected["default_unavailable_reason"], item["default_unavailable_reason"]) {
-			return fmt.Errorf("invalid null-default reason")
-		}
-		if !Equal(normalizeHigher(Slice(expected["higher_quality_variants"])), normalizeHigher(Slice(item["higher_quality_variants"]))) {
-			return fmt.Errorf("higher-quality projection mismatch")
+			if !Equal(normalizeHigher(higher), normalizeHigher(Slice(item["higher_quality_variants"]))) {
+				return fmt.Errorf("higher-quality projection mismatch")
+			}
+		} else {
+			expected := SelectDefaultForPlatform(platform, item, now)
+			if expected["default"] != nil {
+				return fmt.Errorf("eligible complete file has null default")
+			}
+			if !Equal(expected["default_unavailable_reason"], item["default_unavailable_reason"]) {
+				return fmt.Errorf("invalid null-default reason")
+			}
+			if !Equal(normalizeHigher(Slice(expected["higher_quality_variants"])), normalizeHigher(Slice(item["higher_quality_variants"]))) {
+				return fmt.Errorf("higher-quality projection mismatch")
+			}
 		}
 	}
 	if len(ids) != 1 && !nonNullField(data, "default_item_id") {

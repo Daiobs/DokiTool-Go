@@ -2,6 +2,8 @@ package toutiao
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -115,6 +117,19 @@ type requestSession struct {
 	deadline time.Time
 }
 
+func isCanonicalToutiaoHost(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "toutiao.com", "www.toutiao.com", "m.toutiao.com", "so.toutiao.com":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *requestSession) request(ctx context.Context, target, cookie string, registration bool) response {
 	remaining := s.deadline.Sub(s.clock()) / time.Second
 	if remaining < 1 || ctx.Err() != nil {
@@ -142,6 +157,10 @@ func (s *requestSession) request(ctx context.Context, target, cookie string, reg
 	}
 	upstream, err := s.executor.Do(ctx, request)
 	if err != nil || upstream.URL != "" && upstream.URL != target {
+		var dnsErr *net.DNSError
+		if request.Policy.Purpose == "toutiao-share" && (!isCanonicalToutiaoHost(target) || (errors.As(err, &dnsErr) && dnsErr.IsNotFound)) {
+			unified.MarkCallerScopedFailure(ctx)
+		}
 		return response{}
 	}
 	if int64(len(upstream.Body)) > request.Policy.MaxBytes {

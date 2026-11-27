@@ -111,10 +111,10 @@ var contentPaths = []struct {
 	kind    string
 	pattern *regexp.Regexp
 }{
-	{"short-video", regexp.MustCompile(`short-video/([^?]+)`)},
-	{"long-video", regexp.MustCompile(`long-video/([^?]+)`)},
-	{"fw-photo", regexp.MustCompile(`fw/photo/([^?]+)`)},
-	{"photo", regexp.MustCompile(`photo/([^?]+)`)},
+	{"short-video", regexp.MustCompile(`short-video/([^?#]+)`)},
+	{"long-video", regexp.MustCompile(`long-video/([^?#]+)`)},
+	{"fw-photo", regexp.MustCompile(`fw/photo/([^?#]+)`)},
+	{"photo", regexp.MustCompile(`photo/([^?#]+)`)},
 }
 
 func (p *Parser) Parse(ctx context.Context, input string, now int64) (unified.Object, error) {

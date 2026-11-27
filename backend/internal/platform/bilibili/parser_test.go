@@ -1169,3 +1169,47 @@ func TestAdaptDASHModernAudioLessDegradation(t *testing.T) {
 		t.Fatalf("unexpected deferred variant: %v", v)
 	}
 }
+
+func TestPrependShanghaiSourcesRejectsMismatchedUPOSObjectPath(t *testing.T) {
+	const now = int64(1800000000)
+	jpURL := "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200"
+	jpSources := unified.Sources(array{jpURL}, now)
+
+	// 1. Mismatched CID / substituted object path MUST be rejected (NV-07).
+	spoofed := []string{
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/999/999-1-64.mp4?deadline=1800007200",
+		"https://upos-sz-mirrorcos.bilivideo.com/evil.mp4?deadline=1800007200",
+	}
+	merged, matched := prependShanghaiSources(spoofed, jpSources, now)
+	if matched {
+		t.Fatalf("expected mismatched Shanghai UPOS paths to be rejected, got matched=true: %+v", merged)
+	}
+	if len(merged) != 1 || unified.Str(unified.Map(merged[0])["url"]) != jpURL {
+		t.Fatalf("expected original JP source preserved, got %+v", merged)
+	}
+
+	// 2. Exact EscapedPath match from Shanghai domestic UPOS mirror MUST succeed.
+	validSh := []string{
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/101-1-64.mp4?deadline=1800007200",
+	}
+	merged, matched = prependShanghaiSources(validSh, jpSources, now)
+	if !matched || len(merged) != 2 || unified.Str(unified.Map(merged[0])["url"]) != validSh[0] {
+		t.Fatalf("expected exact-path Shanghai UPOS mirror to prepend, got matched=%v merged=%+v", matched, merged)
+	}
+
+	// 3. ValidateShanghaiMediaURLForCID enforces /upgcxcode/ + CID binding.
+	if _, ok := ValidateShanghaiMediaURLForCID(validSh[0], 101, true); !ok {
+		t.Fatalf("expected valid CID 101 UPOS URL to pass")
+	}
+	for _, bad := range []string{
+		"https://upos-sz-mirrorcos.bilivideo.com/good1.mp4?deadline=1800007200",
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/999/999-1-64.mp4?deadline=1800007200",
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/999-1-64.mp4?deadline=1800007200",
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/999/101-1-64.mp4?deadline=1800007200",
+		"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/101/../101-1-64.mp4?deadline=1800007200",
+	} {
+		if _, ok := ValidateShanghaiMediaURLForCID(bad, 101, true); ok {
+			t.Fatalf("expected %q to fail ValidateShanghaiMediaURLForCID(101)", bad)
+		}
+	}
+}

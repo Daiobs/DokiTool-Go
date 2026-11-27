@@ -467,6 +467,7 @@ func (p *GenericParser) ParseWithPlatform(ctx context.Context, source string, no
 			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), PlatformUnmatched, nil
 		}
 		if errors.Is(lookupErr, context.DeadlineExceeded) {
+			unified.MarkCallerScopedFailure(ctx)
 			return unified.ContractError("UPSTREAM_TIMEOUT", "解析超时，请稍后重试", true), PlatformUnmatched, nil
 		}
 		return unified.ContractError("UPSTREAM_BLOCKED", "目标地址解析到受限网络，已拒绝访问", false), PlatformUnmatched, nil

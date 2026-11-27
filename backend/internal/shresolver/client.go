@@ -388,7 +388,7 @@ func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid st
 			if seen[raw] {
 				continue
 			}
-			exp, ok := bilibili.ValidateShanghaiMediaURL(raw, true)
+			exp, ok := bilibili.ValidateShanghaiMediaURLForCID(raw, cid, true)
 			if !ok || exp <= now {
 				continue
 			}

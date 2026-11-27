@@ -251,7 +251,7 @@ func run(args []string) error {
 	if statsSnapshotPath != "" {
 		_ = handler.Stats().LoadSnapshot(statsSnapshotPath, log.Printf)
 	}
-	server := &http.Server{Addr: *listen, Handler: entry, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
+	server := &http.Server{Addr: *listen, Handler: entry, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	sighup := make(chan os.Signal, 1)
@@ -343,7 +343,15 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 		if mode == "" && endpoint == "" {
 			return nil, nil, nil
 		}
-		client, err := shresolver.NewClient(endpoint, getenv("DOKITOOL_SHANGHAI_TOKEN"), executor)
+		token := getenv("DOKITOOL_SHANGHAI_TOKEN")
+		if mode == "direct" && token != "" {
+			for _, key := range []string{"SNAP_INGRESS_KEY", "SNAP_MEDIA_SIGNING_KEY", "DOKITOOL_SHANGHAI_PULL_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
+				if subtle.ConstantTimeCompare([]byte(token), []byte(getenv(key))) == 1 {
+					return nil, nil, errors.New("direct mode requires a dedicated Shanghai token")
+				}
+			}
+		}
+		client, err := shresolver.NewClient(endpoint, token, executor)
 		if err != nil {
 			if mode == "" {
 				// Retain the legacy fail-soft behavior for pre-mode deployments.

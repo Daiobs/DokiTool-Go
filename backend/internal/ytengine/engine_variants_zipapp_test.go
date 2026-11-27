@@ -720,3 +720,43 @@ func TestClassifyStderrUnsupportedURLFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestAdaptInfoCapsAdversarialFormatCardinality(t *testing.T) {
+	const now = int64(1793361600)
+	formats := make([]Format, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		formats = append(formats, Format{
+			FormatID: fmt.Sprintf("f-%04d", i),
+			Ext:      "mp4",
+			Protocol: "https",
+			VCodec:   "avc1",
+			ACodec:   "mp4a",
+			URL:      fmt.Sprintf("https://cdn.example.com/v-%04d.mp4", i),
+		})
+	}
+	info := &Info{
+		ID:         "adversarial-1000",
+		Title:      "Adversarial Format Fanout",
+		WebpageURL: "https://peertube.example.com/w/123",
+		Formats:    formats,
+	}
+	opts := AdaptOptions{
+		PlatformID:                   "peertube",
+		ContentID:                    "adversarial-1000",
+		SourceURL:                    "https://peertube.example.com/w/123",
+		MaxEntries:                   1,
+		AllowCodecLessProgressiveMP4: true,
+	}
+	env := AdaptInfo(info, opts, now)
+	if err := unified.ValidateEnvelopeAt(env, now); err != nil {
+		t.Fatalf("AdaptInfo envelope failed validation: %v", err)
+	}
+	items := unified.Slice(unified.Map(env["data"])["items"])
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	variants := unified.Slice(unified.Map(items[0])["variants"])
+	if len(variants) != maxAdaptedFormatsPerBucket {
+		t.Fatalf("expected variants capped at %d (NV-06), got %d", maxAdaptedFormatsPerBucket, len(variants))
+	}
+}
