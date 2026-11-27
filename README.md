@@ -139,8 +139,8 @@ python3 tools/dokitool-agent/mcp_server.py
 ```bash
 make dev    # 本地并行启动 Go 后端 (127.0.0.1:8081) 与 Vite 前端开发服务器
 make test   # 全量回归：Go -race 单测 + 前端单测 + Python 契约 / Agent / 冒烟单测
-make check  # 安全与契约总检：公开仓凭据守门 + SSOT + 供应链离线 + OpenAPI/Schema + typecheck + go vet
-make build  # 生产构建：Go 静态二进制 + 前端静态资源 + Chrome MV3 扩展 ZIP + 首屏体积预算校验
+make check  # 安全与契约总检：公开仓凭据守门 + SSOT + 供应链离线 + OpenAPI/Schema（默认强校验 jsonschema）+ typecheck + go vet
+make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静态资源 + Chrome MV3 扩展 ZIP + 首屏体积预算校验（正式 Linux + SLSA 发布件由 release-build.yml 产出）
 ```
 
 ---
@@ -235,7 +235,7 @@ make build  # 生产构建：Go 静态二进制 + 前端静态资源 + Chrome MV
 ├── scripts/                   # 公开仓凭据守门、SSOT 一致性门禁、供应链审计、运行时锁同步、OpenAPI 校验、生产冒烟（prod-smoke/）与 L2 浏览器测试
 ├── docs/                      # 接口契约、配置、扩展、下载、发布回执、上游监控、Agent 指南与历史归档文档
 ├── examples/                  # 独立 Python 3.9+ 标准库个人 Agent 批量直连下载参考脚本
-└── Makefile                   # 本地开发、测试、安全契约检查与生产构建统一入口（dev / test / check / build）
+└── Makefile                   # 本地开发、测试、安全契约检查与本地构建统一入口（dev / test / check / build）
 ```
 
 </details>

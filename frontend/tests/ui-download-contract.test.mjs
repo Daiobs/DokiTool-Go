@@ -4438,6 +4438,10 @@ test('P1 (PR-2) Web <-> Extension YouTube single-path parsing: uses WEB_EXT_PARS
             cb({ ok: false, code: 'BRIDGE_TIMEOUT', error: '连接 Chrome 扩展超时' });
             return;
           }
+          if (extParseMode === 'extension_unavailable') {
+            cb({ ok: false, code: 'EXTENSION_UNAVAILABLE', error: 'extension disconnected' });
+            return;
+          }
           cb({ ok: false, code: 'UNAVAILABLE', error: '视频不可播放' });
         }
       },
@@ -4489,7 +4493,7 @@ test('P1 (PR-2) Web <-> Extension YouTube single-path parsing: uses WEB_EXT_PARS
     assert.match(envLogin.inst.parseError.value, /需要验证/);
     assert.equal(envLogin.toasts.at(-1)?.[1], 'error');
 
-    // 3) Extension returns transport error (BRIDGE_TIMEOUT) -> renders extension missing fallback with ZERO /api/parse calls
+    // 3) Extension already connected & capable, but parse returns BRIDGE_TIMEOUT -> reports timeout error instead of false status="missing", with ZERO /api/parse calls
     extParseMode = 'transport_timeout';
     let fallbackStandardParseCalls = 0;
     globalThis.fetch = async () => {
@@ -4500,10 +4504,20 @@ test('P1 (PR-2) Web <-> Extension YouTube single-path parsing: uses WEB_EXT_PARS
         data: makeYouTubeMedia('Server Redacted Preview'),
       });
     };
+    const envTimeout = createParserEnv();
+    envTimeout.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await envTimeout.inst.parseVideo();
+    assert.equal(fallbackStandardParseCalls, 0, 'extension parse timeout must NOT call /api/parse');
+    assert.equal(envTimeout.store.resultData, null, 'extension parse timeout must NOT fabricate HELPER_REQUIRED/missing fallback');
+    assert.match(envTimeout.inst.parseError.value, /扩展解析 YouTube 超时.*重试|刷新/);
+    assert.equal(envTimeout.toasts.at(-1)?.[1], 'error');
+
+    // 4) Extension becomes EXTENSION_UNAVAILABLE after ping -> renders extension missing fallback with ZERO /api/parse calls
+    extParseMode = 'extension_unavailable';
     const envFallback = createParserEnv();
     envFallback.inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
     await envFallback.inst.parseVideo();
-    assert.equal(fallbackStandardParseCalls, 0, 'fallback when extension bridge fails must NOT call /api/parse');
+    assert.equal(fallbackStandardParseCalls, 0, 'fallback when extension disappears must NOT call /api/parse');
     assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.status, 'missing');
     assert.equal(envFallback.store.resultData?.extra?.youtube_helper?.provider, 'extension');
   } finally {

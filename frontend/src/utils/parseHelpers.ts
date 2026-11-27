@@ -18,12 +18,15 @@ import type {
 
 const EXTENSION_PARSE_FALLBACK_ERROR_CODES = new Set<string>([
   "NO_CHROME_RUNTIME",
-  "BRIDGE_TIMEOUT",
   "EXTENSION_UNAVAILABLE",
-  "EMPTY_RESPONSE",
-  "BRIDGE_ERROR",
   "UNSUPPORTED_ACTION",
   "FORBIDDEN_ORIGIN",
+]);
+
+const EXTENSION_PARSE_TRANSPORT_ERROR_CODES = new Set<string>([
+  "BRIDGE_TIMEOUT",
+  "BRIDGE_ERROR",
+  "EMPTY_RESPONSE",
 ]);
 
 const ALIAS_PAIRS =
@@ -328,15 +331,39 @@ export async function runYouTubeHelperParse(ctx: {
     }
 
     if (!resp.ok) {
+      const isEnResp = ctx.locale === "en";
+      if (resp.code === "BRIDGE_TIMEOUT") {
+        throw new Error(
+          isEnResp
+            ? "Chrome extension timed out while parsing YouTube. Please retry or refresh the page."
+            : "Chrome 扩展解析 YouTube 超时，请重试或刷新页面后再试",
+        );
+      }
+      if (resp.code && EXTENSION_PARSE_TRANSPORT_ERROR_CODES.has(resp.code)) {
+        throw new Error(
+          isEnResp
+            ? "Communication with the Chrome extension was interrupted. Please retry or refresh the page."
+            : "与 Chrome 扩展通信中断，请重试或刷新页面后再试",
+        );
+      }
       if (
         !resp.code ||
         !EXTENSION_PARSE_FALLBACK_ERROR_CODES.has(resp.code)
       ) {
-        throw new Error(resp.error || "通过扩展解析 YouTube 失败");
+        throw new Error(
+          resp.error ||
+            (isEnResp
+              ? "Failed to parse YouTube via the Chrome extension"
+              : "通过扩展解析 YouTube 失败"),
+        );
       }
-      // Bridge transport or unsupported action error -> show extension install/reconnect fallback with ZERO /api/parse calls.
+      // Extension became unavailable or unsupported after ping -> show install/reconnect fallback with ZERO /api/parse calls.
     } else {
-      throw new Error("通过扩展解析 YouTube 失败");
+      throw new Error(
+        ctx.locale === "en"
+          ? "Failed to parse YouTube via the Chrome extension"
+          : "通过扩展解析 YouTube 失败",
+      );
     }
   }
 

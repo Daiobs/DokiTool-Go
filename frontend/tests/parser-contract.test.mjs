@@ -706,6 +706,85 @@ test('Issue #48 [P1-6]: 3-stage formatYouTubeParseStageText in zh-CN & en', () =
   assert.match(parseHelpers.formatYouTubeParseStageText(3, 'en'), /3\/3/);
 });
 
+test('R78-04: connected youtube_parse extension transport failures (BRIDGE_TIMEOUT/BRIDGE_ERROR/EMPTY_RESPONSE) throw clear error without falling back to HELPER_REQUIRED/missing', async () => {
+  const connectedExt = async () => ({
+    connected: true,
+    version: '4.5.0',
+    extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+    capabilities: ['dash_mux', 'direct_download', 'youtube_parse', 'youtube_mux'],
+  });
+
+  const cases = [
+    { code: 'BRIDGE_TIMEOUT', locale: 'zh-CN', pattern: /超时.*(重试|刷新)/ },
+    { code: 'BRIDGE_TIMEOUT', locale: 'en', pattern: /timed out.*(retry|refresh)/i },
+    { code: 'BRIDGE_ERROR', locale: 'zh-CN', pattern: /通信中断.*(重试|刷新)/ },
+    { code: 'BRIDGE_ERROR', locale: 'en', pattern: /interrupted.*(retry|refresh)/i },
+    { code: 'EMPTY_RESPONSE', locale: 'zh-CN', pattern: /通信中断.*(重试|刷新)/ },
+    { code: 'EMPTY_RESPONSE', locale: 'en', pattern: /interrupted.*(retry|refresh)/i },
+  ];
+
+  for (const { code, locale, pattern } of cases) {
+    let resultSetCalls = 0;
+    await assert.rejects(
+      parseHelpers.runYouTubeHelperParse({
+        videoId: 'I9JvDaciaFk',
+        locale,
+        signal: new AbortController().signal,
+        isCurrent: () => true,
+        pingExtension: connectedExt,
+        parseYouTubeViaExtension: async () => ({
+          ok: false,
+          code,
+          error: `mock ${code}`,
+        }),
+        onHelperReady: () => {
+          throw new Error('onHelperReady must not fire on transport error');
+        },
+        setResult: () => {
+          resultSetCalls += 1;
+        },
+        setError: () => {},
+      }),
+      pattern,
+      `${code} (${locale}) must reject with localized retry/refresh guidance`,
+    );
+    assert.equal(
+      resultSetCalls,
+      0,
+      `${code} (${locale}) must NOT call setResult with HELPER_REQUIRED/status=missing`,
+    );
+  }
+
+  // End-to-end via useVideoParser: sets parseError + error toast, 0 /api/parse calls, resultData stays null
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json(good({ platform: 'youtube' }));
+  };
+  for (const code of ['BRIDGE_TIMEOUT', 'BRIDGE_ERROR', 'EMPTY_RESPONSE']) {
+    const store = reactive({
+      resultData: null,
+      resultVersion: 0,
+      clearResult() { this.resultData = null; this.resultVersion++; },
+      setResult(d) { this.resultData = d; this.resultVersion++; },
+    });
+    const toasts = [];
+    const inst = parser.useVideoParser({
+      videoStore: store,
+      locale: ref('zh-CN'),
+      showToast: (...args) => toasts.push(args),
+      pingExtension: connectedExt,
+      parseYouTubeViaExtension: async () => ({ ok: false, code, error: `mock ${code}` }),
+    });
+    inst.inputUrl.value = 'https://www.youtube.com/watch?v=I9JvDaciaFk';
+    await inst.parseVideo();
+    assert.equal(fetchCalls, 0, `${code} must make 0 /api/parse requests`);
+    assert.equal(store.resultData, null, `${code} must not set HELPER_REQUIRED/missing fallback result`);
+    assert.match(inst.parseError.value, /(超时|通信中断).*(重试|刷新)/);
+    assert.equal(toasts.at(-1)?.[1], 'error');
+  }
+});
+
 test('PR-B1 [G4]: resolveRefreshApiUrl and resolveItem fall back to data.refresh_url when item.resolve_url is omitted', async () => {
   assert.equal(
     parser.resolveRefreshApiUrl('/api/resolve?item_id=p1'),
