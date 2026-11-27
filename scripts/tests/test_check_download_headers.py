@@ -57,7 +57,7 @@ def _start_mock_server(*, return_304_on: set[str] | None = None, expose_etag: bo
 
             if base_path == "/helper/extension-version.json":
                 body = json.dumps({
-                    "version": "4.5.1",
+                    "version": "4.5.2",
                     "download_url": "/helper/dokitool-chrome-extension.zip",
                     "sha256": "0" * 64,
                 }).encode("utf-8")

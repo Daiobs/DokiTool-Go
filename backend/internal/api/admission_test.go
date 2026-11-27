@@ -1479,3 +1479,116 @@ func TestAdmissionInPlaceHotReloadWaiterAndBulkheadConservation(t *testing.T) {
 		}
 	}
 }
+
+func TestAnonymousCacheBoundaryExpiryFallsBackToRealPoolAndPreservesChannel(t *testing.T) {
+	c := loadCacheTestCatalog(t)
+	baseTime := time.Unix(1793448000, 0).UTC()
+	var nowNs atomic.Int64
+	nowNs.Store(baseTime.UnixNano())
+	var stepOnHasFresh atomic.Bool
+	var upstreamCalls atomic.Int32
+
+	h, err := NewWithCacheConfig(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			upstreamCalls.Add(1)
+			exp := time.Unix(now+1200, 0).UTC().Format(time.RFC3339)
+			return makeSyntheticEnvelope("douyin", src, now, exp), nil
+		}),
+	}, func() time.Time {
+		return time.Unix(0, nowNs.Load()).UTC()
+	}, nil, DefaultCacheConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	cfg.Parse = PoolConfig{
+		ClientBurst:       1,
+		ClientRPS:         0.1,
+		GlobalBurst:       10,
+		GlobalRPS:         10,
+		ClientConcurrency: 1,
+		GlobalConcurrency: 1,
+		QueueWait:         0,
+		QueueSize:         0,
+	}
+	entry, err := WithAdmissionConfig(h, nil, "caddy", testEdgeKey, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := entry.(*admission)
+	adm.now = func() time.Time { return time.Unix(0, nowNs.Load()).UTC() }
+
+	target := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.douyin.com/video/7400000000000000888")
+
+	// 1. Prime cache with IP-1.
+	wPrime := call(entry, edgeRequest(target, "198.51.100.1"))
+	if wPrime.Code != http.StatusOK || upstreamCalls.Load() != 1 {
+		t.Fatalf("prime failed: code=%d calls=%d body=%s", wPrime.Code, upstreamCalls.Load(), wPrime.Body.String())
+	}
+
+	// 2. Saturate adm.public (GlobalConcurrency=1, QueueSize=0).
+	relPub, retry := adm.public.acquire(netip.MustParseAddr("198.51.100.250"), baseTime)
+	if retry != 0 {
+		t.Fatalf("failed to saturate public pool: retry=%d", retry)
+	}
+
+	// 3. Anonymous fresh cache hit succeeds via catalog without touching saturated public pool
+	//    and attributes telemetry strictly to ChannelAnonymous (never ChannelOwner).
+	wHit := call(entry, edgeRequest(target, "198.51.100.2"))
+	if wHit.Code != http.StatusOK || wHit.Header().Get("X-DokiTool-Cache") != "hit" || upstreamCalls.Load() != 1 {
+		t.Fatalf("anonymous cache hit failed: code=%d hdr=%q calls=%d", wHit.Code, wHit.Header().Get("X-DokiTool-Cache"), upstreamCalls.Load())
+	}
+	snapAfterHit := h.Stats().Snapshot()
+	if snapAfterHit.Cache.ByChannel.Anonymous.Hits != 1 || snapAfterHit.Cache.ByChannel.Owner.Hits != 0 {
+		t.Fatalf("anonymous cache hit misattributed channel: anon=%+v owner=%+v", snapAfterHit.Cache.ByChannel.Anonymous, snapAfterHit.Cache.ByChannel.Owner)
+	}
+	if snapAfterHit.Requests.ByChannel.Owner != 0 || snapAfterHit.Requests.ByChannel.Anonymous != 2 {
+		t.Fatalf("anonymous cache hit bled into owner request count: %+v", snapAfterHit.Requests.ByChannel)
+	}
+
+	// 4. Exact nanosecond expiry boundary while public pool is STILL saturated:
+	//    makeSyntheticEnvelope had expires_at=+1200s so freshUntil = baseTime + maxCacheTTL (600s).
+	//    HasFreshCachedParse observes expiresAt - 1ns (fresh!), then getFresh inside
+	//    tryServeFreshCachedParse observes expiresAt (expired!).
+	//    Admission MUST release catalog and fall back into saturated public pool -> 429, 0 upstream calls!
+	expAt := baseTime.Add(maxCacheTTL)
+	nowNs.Store(expAt.Add(-time.Nanosecond).UnixNano())
+	stepOnHasFresh.Store(true)
+	h.now = func() time.Time {
+		cur := nowNs.Load()
+		if stepOnHasFresh.CompareAndSwap(true, false) {
+			nowNs.Store(expAt.UnixNano())
+		}
+		return time.Unix(0, cur).UTC()
+	}
+	wBoundary429 := call(entry, edgeRequest(target, "198.51.100.3"))
+	if wBoundary429.Code != http.StatusTooManyRequests || upstreamCalls.Load() != 1 {
+		t.Fatalf("anonymous expiry boundary bypassed saturated public pool: code=%d calls=%d body=%s", wBoundary429.Code, upstreamCalls.Load(), wBoundary429.Body.String())
+	}
+	adm.catalog.mu.Lock()
+	catActive := adm.catalog.active
+	adm.catalog.mu.Unlock()
+	if catActive != 0 {
+		t.Fatalf("catalog lease leaked after anonymous boundary fallback: active=%d", catActive)
+	}
+
+	// 5. Release public pool and repeat boundary expiry with a fresh IP having ClientBurst=1:
+	//    fallback must NOT double-charge public pool tokens, succeeding with 200 OK and 1 upstream call.
+	relPub()
+	nowNs.Store(expAt.Add(-time.Nanosecond).UnixNano())
+	stepOnHasFresh.Store(true)
+	wBoundaryOK := call(entry, edgeRequest(target, "198.51.100.4"))
+	if wBoundaryOK.Code != http.StatusOK || upstreamCalls.Load() != 2 {
+		t.Fatalf("anonymous boundary fallback with free real pool failed: code=%d calls=%d body=%s", wBoundaryOK.Code, upstreamCalls.Load(), wBoundaryOK.Body.String())
+	}
+	adm.catalog.mu.Lock()
+	catActiveAfter := adm.catalog.active
+	adm.catalog.mu.Unlock()
+	adm.public.mu.Lock()
+	pubActiveAfter := adm.public.active
+	adm.public.mu.Unlock()
+	if catActiveAfter != 0 || pubActiveAfter != 0 {
+		t.Fatalf("pool lease leak after fallback: catalog=%d public=%d", catActiveAfter, pubActiveAfter)
+	}
+}

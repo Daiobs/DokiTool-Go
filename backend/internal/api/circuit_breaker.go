@@ -331,13 +331,21 @@ func (m *circuitBreakerManager) Finish(platform, code string, halfOpenGen uint64
 	if !ok {
 		return
 	}
-	if halfOpenGen > 0 && st.halfOpenGen == halfOpenGen && st.halfOpenInFlight > 0 {
+	isCurrentHalfOpenProbe := halfOpenGen > 0 && st.halfOpenGen == halfOpenGen
+	if isCurrentHalfOpenProbe && st.halfOpenInFlight > 0 {
 		st.halfOpenInFlight--
 	}
 	if !m.cfg.Enabled {
 		return
 	}
 	st.pruneExpired(now, m.sampleMaxAge())
+
+	if st.state == CircuitStateHalfOpen && !isCurrentHalfOpenProbe {
+		// Ignore stale pre-open requests (halfOpenGen == 0) and probes from
+		// superseded half-open generations so they cannot prematurely close or
+		// re-open the active probe wave.
+		return
+	}
 
 	if code == "OK" {
 		st.consecutiveFailures = 0

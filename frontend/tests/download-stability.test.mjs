@@ -216,4 +216,16 @@ test('buffered helper preserves existing request policies; only HLS manifest exp
     return new Response('#EXTM3U\n#EXTINF:1,\nclip.ts\n#EXT-X-ENDLIST');
   };
   assert.deepEqual(await segments.resolveHlsSegments('https://cdn.test/list'), [{ url: 'https://cdn.test/clip.ts' }]);
+
+  // CR-06: Web resolveHlsSegments resolves relative #EXT-X-MAP and segment paths against redirected final response.url
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    const resp = new Response('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2,\nseg.ts\n#EXT-X-ENDLIST');
+    Object.defineProperty(resp, 'url', { value: 'https://cdn.test/final/dir/master.m3u8' });
+    return resp;
+  };
+  assert.deepEqual(await segments.resolveHlsSegments('https://cdn.test/origin/index.m3u8'), [
+    { url: 'https://cdn.test/final/dir/init.mp4' },
+    { url: 'https://cdn.test/final/dir/seg.ts' },
+  ]);
 });

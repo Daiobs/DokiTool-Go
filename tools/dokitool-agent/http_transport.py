@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import socket
 import ssl
+import time
 from typing import Any, Callable, Mapping, Sequence
 import urllib.error
 import urllib.parse
@@ -173,16 +174,65 @@ def _lower_headers(raw_headers: Any) -> dict[str, str]:
     return {k.lower(): v for k, v in (raw_headers.items() if raw_headers else [])}
 
 
+def _remaining_timeout(req_timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return req_timeout
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError("HTTP request exceeded total time budget")
+    return min(req_timeout, rem)
+
+
+def _set_response_socket_timeout(resp: Any, timeout_s: float) -> None:
+    """Dynamically tighten the underlying socket timeout on an open HTTPResponse."""
+    clamped = max(0.001, float(timeout_s))
+    candidates: list[Any] = []
+    fp = getattr(resp, "fp", None)
+    if fp is not None:
+        raw = getattr(fp, "raw", None)
+        if raw is not None:
+            candidates.append(getattr(raw, "_sock", None))
+            candidates.append(raw)
+        candidates.append(fp)
+    candidates.append(getattr(resp, "_sock", None))
+    candidates.append(getattr(resp, "sock", None))
+    for obj in candidates:
+        setter = getattr(obj, "settimeout", None)
+        if callable(setter):
+            try:
+                setter(clamped)
+                return
+            except OSError:
+                return
+
+
 def _stream_bounded(
-    resp: Any, max_bytes: int, sink: Callable[[bytes], Any], *, check_complete: bool = False
+    resp: Any, max_bytes: int, sink: Callable[[bytes], Any], *,
+    check_complete: bool = False,
+    deadline: float | None = None,
+    req_timeout: float | None = None,
 ) -> tuple[int, dict[str, str]]:
     hdrs = _lower_headers(resp.headers)
     cl_raw = hdrs.get("content-length", "").strip()
     if cl_raw.isdigit() and int(cl_raw) > max_bytes:
         raise SizeLimitExceededError(f"Response Content-Length exceeds {max_bytes} byte limit")
+    read_fn = getattr(resp, "read1", None) if deadline is not None else None
+    if not callable(read_fn):
+        read_fn = resp.read
     total = 0
     while True:
-        chunk = resp.read(min(STREAM_CHUNK_BYTES, max_bytes - total + 1))
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("HTTP response exceeded total time budget")
+            effective_timeout = min(req_timeout, rem) if req_timeout is not None else rem
+            _set_response_socket_timeout(resp, effective_timeout)
+        try:
+            chunk = read_fn(min(STREAM_CHUNK_BYTES, max_bytes - total + 1))
+        except (socket.timeout, TimeoutError) as exc:
+            raise TimeoutError("HTTP response read exceeded total time budget") from exc
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("HTTP response exceeded total time budget")
         if not chunk:
             break
         total += len(chunk)
@@ -231,10 +281,12 @@ class SafeHTTPFetcher:
         allow_loopback: bool = False, allow_redirects: bool = True,
         media_mode: bool = True, enforce_standard_ports: bool | None = None,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> tuple[Any, str]:
         current, hops, req_timeout = url, 0, (self.timeout if timeout is None else timeout)
         prev_scheme: str | None = None
         while True:
+            hop_timeout = _remaining_timeout(req_timeout, deadline)
             hop_allow_loopback = (
                 (allow_loopback if hops == 0 else False)
                 if self._allowed_loopback_origin is None
@@ -257,8 +309,13 @@ class SafeHTTPFetcher:
             use_proxy = (not self.no_proxy) and (not is_loopback_host(host)) and has_env_proxy_for(curr_scheme, host, parsed.port)
             bypass = not use_proxy
             opener = self._opener_factory(bypass) if self._opener_factory is not None else build_safe_opener(bypass_proxy=bypass, pinned_ips=pinned_ips if bypass else ())
+            hop_timeout = _remaining_timeout(req_timeout, deadline)
             try:
-                return opener.open(urllib.request.Request(current, headers=req_headers, method="GET"), timeout=req_timeout), current
+                resp = opener.open(urllib.request.Request(current, headers=req_headers, method="GET"), timeout=hop_timeout)
+                if deadline is not None and time.monotonic() >= deadline:
+                    resp.close()
+                    raise TimeoutError("HTTP request exceeded total time budget")
+                return resp, current
             except urllib.error.HTTPError as exc:
                 hdrs = _lower_headers(exc.headers)
                 if exc.code in (301, 302, 303, 307, 308):
@@ -273,6 +330,14 @@ class SafeHTTPFetcher:
                 finally:
                     exc.close()
                 raise HTTPStatusError(exc.code, current, hdrs, err_body) from exc
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, (socket.timeout, TimeoutError)) or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    raise TimeoutError("HTTP request exceeded total time budget") from exc
+                raise
+            except (socket.timeout, TimeoutError) as exc:
+                raise TimeoutError("HTTP request exceeded total time budget") from exc
 
     def open_url(
         self, url: str, *, headers: Mapping[str, str] | None = None,
@@ -280,41 +345,53 @@ class SafeHTTPFetcher:
         allow_loopback: bool = False, allow_redirects: bool = True,
         media_mode: bool = True, enforce_standard_ports: bool | None = None,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> tuple[Any, str]:
         """Open a validated, IP-pinned HTTP(S) response stream with redirect enforcement."""
         return self._open_with_redirects(
             url, headers=headers, headers_fn=headers_fn, allow_loopback=allow_loopback,
             allow_redirects=allow_redirects, media_mode=media_mode,
-            enforce_standard_ports=enforce_standard_ports, timeout=timeout,
+            enforce_standard_ports=enforce_standard_ports, timeout=timeout, deadline=deadline,
         )
 
     def fetch_bytes(
         self, url: str, *, max_bytes: int, headers: Mapping[str, str] | None = None,
-        allow_loopback: bool = False, allow_redirects: bool = True, media_mode: bool = True, timeout: float | None = None,
+        allow_loopback: bool = False, allow_redirects: bool = True, media_mode: bool = True,
+        timeout: float | None = None, deadline: float | None = None,
     ) -> FetchResponse:
+        req_timeout = self.timeout if timeout is None else timeout
         resp, final_url = self._open_with_redirects(
-            url, headers=headers, allow_loopback=allow_loopback, allow_redirects=allow_redirects, media_mode=media_mode, timeout=timeout
+            url, headers=headers, allow_loopback=allow_loopback, allow_redirects=allow_redirects,
+            media_mode=media_mode, timeout=req_timeout, deadline=deadline,
         )
         try:
             chunks: list[bytes] = []
-            _, hdrs = _stream_bounded(resp, max_bytes, chunks.append)
+            _, hdrs = _stream_bounded(
+                resp, max_bytes, chunks.append, deadline=deadline, req_timeout=req_timeout,
+            )
             return FetchResponse(int(getattr(resp, "status", 200)), final_url, hdrs, b"".join(chunks))
         finally:
             resp.close()
 
     def download_to_file(
         self, url: str, dest_part_path: Path, output_dir: Path, *,
-        max_bytes: int = MAX_MEDIA_BYTES, headers: Mapping[str, str] | None = None, timeout: float | None = None,
+        max_bytes: int = MAX_MEDIA_BYTES, headers: Mapping[str, str] | None = None,
+        timeout: float | None = None, deadline: float | None = None,
     ) -> tuple[int, dict[str, str], str]:
         safe_part = resolve_jailed_path(output_dir, dest_part_path.name, allow_subdirs=False)
+        req_timeout = self.timeout if timeout is None else timeout
         resp, final_url = self._open_with_redirects(
-            url, headers=headers, allow_loopback=False, allow_redirects=True, media_mode=True, timeout=timeout
+            url, headers=headers, allow_loopback=False, allow_redirects=True,
+            media_mode=True, timeout=req_timeout, deadline=deadline,
         )
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(safe_part, flags, 0o600)
             with os.fdopen(fd, "wb") as handle:
-                written, hdrs = _stream_bounded(resp, max_bytes, handle.write, check_complete=True)
+                written, hdrs = _stream_bounded(
+                    resp, max_bytes, handle.write, check_complete=True,
+                    deadline=deadline, req_timeout=req_timeout,
+                )
                 handle.flush()
             return written, hdrs, final_url
         except Exception:

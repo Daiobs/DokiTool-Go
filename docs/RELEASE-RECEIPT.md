@@ -303,10 +303,10 @@ node scripts/prod-smoke/stage2_browser.mjs \
 
 | 检查项 (`id`) | 分组 (`group`) | 结论 (`status`) | 耗时 (ms) | 媒体域名 (`media_hostnames`) | 关键核对摘要 (`note`) |
 | --- | --- | --- | ---: | --- | --- |
-| `artifact_extension_zip` | `artifact_verify` | **PASS** | 320 | - | `size=<N>B, sha256[:12]=<hex>, files=13, v4.5.1, id=ihamkldlkdibleacagiejklpfofapkpo, manifestMatch=true, zeroContentScripts=true, zeroCookies=true` |
-| `http_extension_version_json` | `http_security` | **PASS** | 90 | - | `version=4.5.1, id=ihamkldlkdibleacagiejklpfofapkpo, sha256Match=true, cacheControl=no-store` |
+| `artifact_extension_zip` | `artifact_verify` | **PASS** | 320 | - | `size=<N>B, sha256[:12]=<hex>, files=13, v4.5.2, id=ihamkldlkdibleacagiejklpfofapkpo, manifestMatch=true, zeroContentScripts=true, zeroCookies=true` |
+| `http_extension_version_json` | `http_security` | **PASS** | 90 | - | `version=4.5.2, id=ihamkldlkdibleacagiejklpfofapkpo, sha256Match=true, cacheControl=no-store` |
 | `web_home_hydration` | `pure_web_chrome` | **PASS** | 450 | - | `hydrated=true, themeBootstrap=true, colorScheme=light, csp=0, consoleErr=0, pageErr=0` |
 | `web_sw_bridge` | `pure_web_chrome` | **PASS** | 120 | - | `scope=/downloads/, bridgeControlled=true, workerBuild=<BUILD>, admission=true` |
 | `web_monitor_responsive` | `pure_web_chrome` | **PASS** | 280 | - | `desktop(1440x900) overflow=0px, mobile(390x844) overflow=0px, csp=0, consoleErr=0, pageErr=0` |
-| `ext_bridge_handshake` | `official_extension_chrome` | **PASS** | 680 | - | `WEB_EXT_PING ok (v4.5.1, id=ihamkldlkdibleacagiejklpfofapkpo, caps=dash_mux,direct_download,youtube_parse,youtube_mux), noUpdateNotice=true, ytHelperGlobal=false, csp=0, consoleErr=0, pageErr=0` |
+| `ext_bridge_handshake` | `official_extension_chrome` | **PASS** | 680 | - | `WEB_EXT_PING ok (v4.5.2, id=ihamkldlkdibleacagiejklpfofapkpo, caps=dash_mux,direct_download,youtube_parse,youtube_mux), noUpdateNotice=true, ytHelperGlobal=false, csp=0, consoleErr=0, pageErr=0` |
 ````

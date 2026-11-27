@@ -57,6 +57,7 @@ export interface CreateOffscreenControllerOptions {
   heartbeatIntervalMs?: number;
   maxConcurrentTasks?: number;
   progressThrottleMs?: number;
+  stallTimeoutMs?: number;
   mediabunnyImpl?: Record<string, unknown> | null;
   youtubeMuxConfig?: CreateOffscreenDownloadExecutorOptions["youtubeMuxConfig"];
 }
@@ -104,6 +105,7 @@ export function createOffscreenController(
     now: nowFn,
     maxConcurrentTasks: options?.maxConcurrentTasks ?? 3,
     progressThrottleMs: options?.progressThrottleMs,
+    stallTimeoutMs: options?.stallTimeoutMs,
     mediabunnyImpl: options?.mediabunnyImpl,
     youtubeMuxConfig: options?.youtubeMuxConfig,
     async handoffBlobDownload(msg) {

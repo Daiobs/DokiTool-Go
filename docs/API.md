@@ -85,7 +85,7 @@ curl --get 'https://snap.example.com/api/parse' \
 | `hls` | 保留显式清单及作用域（如单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
 | `segments` | 只有具备布局验证证据的 `byte_concat` 才允许拼接；`remux` 明确暂不支持。 |
 | `pair` | 静图与动态片段有明确角色，按实况操作处理。 |
-| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.5.1`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
+| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.5.2`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
 
 variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标签/来源说明和 `reason`，没有媒体地址、规格或交付结构；不能进入默认选择或更高画质可交付引用。它也不代表已经拿到 4K。当前预留没有隐含的抓取器或自动重试入口。
 

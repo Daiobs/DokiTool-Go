@@ -217,7 +217,8 @@ func WithAdmissionWithRegistry(next, pullControl http.Handler, mode, edgeKey str
 }
 
 // ReloadAPIKeys atomically replaces the active APIKeyRegistry on an admission
-// handler while preserving cumulative per-key counters for matching key IDs.
+// handler while preserving cumulative counters and active per-key execution pools
+// (in-flight leases, waiters, and rate buckets) for matching key IDs.
 func ReloadAPIKeys(handler http.Handler, next *APIKeyRegistry) bool {
 	adm, ok := handler.(*admission)
 	if !ok || adm == nil || next == nil {
@@ -246,7 +247,7 @@ func (a *admission) reloadAPIKeys(next *APIKeyRegistry) {
 	a.reloadMu.Lock()
 	defer a.reloadMu.Unlock()
 	prev := a.keys.Load()
-	next.carryOverCountersFrom(prev)
+	next.carryOverStateFrom(prev)
 	a.keys.Store(next)
 }
 
@@ -373,6 +374,35 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Zero-TOCTOU anonymous cache fast-path for fresh GET /api/parse and /api/resolve hits.
+	// Charge the cheap catalog pool only when a fresh entry can actually be served; if it
+	// expires or is evicted at the nanosecond boundary, release catalog immediately and
+	// fall through into the real uncached parse pool.
+	if kind == parser && r.Method == http.MethodGet && a.hasFreshCachedParse(path, r.URL.RawQuery) {
+		catWait := a.catalog.currentQueueWait()
+		if catWait > 0 {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(catWait + serverWriteWindow))
+		}
+		catRelease, catRetry, catCanceled := a.catalog.acquireContextForPlatform(r.Context(), client, a.now(), "")
+		if catCanceled {
+			return
+		}
+		if catRetry > 0 {
+			p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
+			a.stats.RecordParse(admissionStatsPlatform(p, isGeneric), "RATE_LIMITED", ChannelAnonymous, time.Since(wallStart))
+			rejectAdmission(w, r, kind, http.StatusTooManyRequests, catRetry)
+			return
+		}
+		if catWait > 0 {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
+		}
+		served := a.tryServeFreshCachedParse(w, r, nil, wallStart)
+		catRelease()
+		if served {
+			return
+		}
+	}
+
 	budget, fastPlatform := a.selectPool(r, kind, path)
 	qWait := budget.currentQueueWait()
 	if qWait > 0 {
@@ -465,8 +495,9 @@ func (a *admission) serveAuthenticated(
 
 	// 4. Uncached parse / helper / legacy path via isolated per-key execution pool.
 	isSlow := kind == youtubeHelper || (kind == parser && (isGeneric || traitsForPlatform(parsedPlatform).slowEngine))
-	if key.pool.queueWait > 0 {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(key.pool.queueWait + serverWriteWindow))
+	qWait := key.pool.currentQueueWait()
+	if qWait > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(qWait + serverWriteWindow))
 	}
 	release, retry, canceled := key.pool.acquireAt(r.Context(), a.now(), isSlow)
 	if canceled {
@@ -481,7 +512,7 @@ func (a *admission) serveAuthenticated(
 		return
 	}
 	defer release()
-	if key.pool.queueWait > 0 {
+	if qWait > 0 {
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(serverWriteWindow))
 	}
 	if kind == parser {
@@ -494,6 +525,23 @@ func (a *admission) serveAuthenticated(
 		return
 	}
 	a.next.ServeHTTP(w, r)
+}
+
+func (a *admission) selectUncachedParsePool(path, rawQuery string) (*pool, string) {
+	p, isGeneric := a.classifyParseRoute(path, rawQuery)
+	if isGeneric {
+		return a.genericSlow, ""
+	}
+	if p == "youtube" {
+		return a.youtubeSlow, ""
+	}
+	if traitsForPlatform(p).slowEngine {
+		return a.slow, ""
+	}
+	if path == "/api/resolve" {
+		return a.resolve, ""
+	}
+	return a.public, p
 }
 
 func (a *admission) selectPool(r *http.Request, kind route, path string) (*pool, string) {
@@ -513,24 +561,7 @@ func (a *admission) selectPool(r *http.Request, kind route, path string) (*pool,
 		if r.Method != http.MethodGet {
 			return a.public, ""
 		}
-		// Fresh cache hits do no upstream work; charge them like catalog reads.
-		if a.hasFreshCachedParse(path, r.URL.RawQuery) {
-			return a.catalog, ""
-		}
-		p, isGeneric := a.classifyParseRoute(path, r.URL.RawQuery)
-		if isGeneric {
-			return a.genericSlow, ""
-		}
-		if p == "youtube" {
-			return a.youtubeSlow, ""
-		}
-		if traitsForPlatform(p).slowEngine {
-			return a.slow, ""
-		}
-		if path == "/api/resolve" {
-			return a.resolve, ""
-		}
-		return a.public, p
+		return a.selectUncachedParsePool(path, r.URL.RawQuery)
 	default:
 		return a.public, ""
 	}

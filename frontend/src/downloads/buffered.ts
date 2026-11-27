@@ -39,8 +39,13 @@ export interface BufferedReadOptions {
   referrerPolicy?: ReferrerPolicy;
 }
 
-/** Page-side ZIP/segment reads. Each header/read wait is bounded, not total download time. */
-export async function fetchMediaBlob(url: string, options: BufferedReadOptions = {}): Promise<Blob> {
+export interface FetchedMediaBlob {
+  blob: Blob;
+  finalUrl: string;
+}
+
+/** Page-side ZIP/segment reads with validated final redirect URL. Each header/read wait is bounded, not total download time. */
+export async function fetchMediaBlobWithMeta(url: string, options: BufferedReadOptions = {}): Promise<FetchedMediaBlob> {
   const { signal, range, expectedSize = 0, onChunk, maxBytes = Number.MAX_SAFE_INTEGER, maxBytesError } = options;
   if (range && (!Number.isSafeInteger(range.start) || range.start < 0 || !Number.isSafeInteger(range.length) ||
     range.length <= 0 || !Number.isSafeInteger(range.start + range.length))) throw new Error("无效的分片字节范围");
@@ -83,8 +88,20 @@ export async function fetchMediaBlob(url: string, options: BufferedReadOptions =
     if (!loaded || (declared && loaded !== declared) || (expectedSize && loaded !== expectedSize) ||
       (range && loaded !== range.length)) throw new Error("资源下载不完整");
     if (scope.signal.aborted) throw scope.signal.reason;
+    let finalUrl = url;
+    const rawFinal = typeof response.url === "string" ? response.url.trim() : "";
+    if (rawFinal) {
+      try {
+        const parsed = new URL(rawFinal);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          finalUrl = parsed.href;
+        }
+      } catch {
+        // Keep original url if response.url is not an absolute http(s) URL
+      }
+    }
     finished = true;
-    return new Blob(parts, { type });
+    return { blob: new Blob(parts, { type }), finalUrl };
   } finally {
     if (reader) {
       if (!finished) void reader.cancel().catch(() => {});
@@ -92,6 +109,11 @@ export async function fetchMediaBlob(url: string, options: BufferedReadOptions =
     } else if (response?.body) void response.body.cancel().catch(() => {});
     scope.close();
   }
+}
+
+/** Page-side ZIP/segment reads. Each header/read wait is bounded, not total download time. */
+export async function fetchMediaBlob(url: string, options: BufferedReadOptions = {}): Promise<Blob> {
+  return (await fetchMediaBlobWithMeta(url, options)).blob;
 }
 
 /** Optional metadata only. Missing or encoded lengths stay unknown. */

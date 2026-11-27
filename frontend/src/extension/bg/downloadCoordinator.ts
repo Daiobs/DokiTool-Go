@@ -169,8 +169,12 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
         updatedAt: nowFn(),
       });
       updateBadge("failed");
-      await onTaskHistoryChange?.({ immediate: true });
-      await broadcastTasksUpdated();
+      try {
+        await onTaskHistoryChange?.({ immediate: true });
+      } catch {
+        // Non-critical history persistence failure must never block UI update or idle close
+      }
+      await broadcastTasksUpdated().catch(() => {});
     }
     scheduleOffscreenIdleCloseIfIdle();
     if (notifyIdle) notifyIfCompletelyIdle();
@@ -193,66 +197,85 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
     let savedWorkUpdated = false;
     let outcome: "completed" | "failed" | undefined;
 
-    if (state === "complete") {
-      const filenameWarning = await auditCompletedDownloadFilename({
-        downloadId: record.downloadId,
-        expectedFilename: record.filename,
-        deltaFilename: delta.filename?.current,
-        observedFilenames: observedDownloadFilenames,
-        searchDownloads: chromeApi.downloads?.search,
-      });
-      if (task) {
-        tasks.set(record.taskId, {
-          ...task,
-          status: "completed",
-          statusText: "已完成",
-          percent: 100,
-          loaded: task.total > 0 ? task.total : task.loaded,
-          speed: 0,
-          chromeDownloadId: record.downloadId,
-          ...(filenameWarning ? { filenameWarning } : {}),
-          error: undefined,
-          updatedAt: nowFn(),
-        });
-        if (task.workFingerprint) {
-          await storage.recordSavedWork({
-            fingerprint: task.workFingerprint,
-            platform: task.platform,
-            title: task.title,
-            filename: record.filename,
-            savedAt: nowFn(),
+    try {
+      if (state === "complete") {
+        let filenameWarning: string | undefined;
+        try {
+          filenameWarning = await auditCompletedDownloadFilename({
+            downloadId: record.downloadId,
+            expectedFilename: record.filename,
+            deltaFilename: delta.filename?.current,
+            observedFilenames: observedDownloadFilenames,
+            searchDownloads: chromeApi.downloads?.search,
           });
-          savedWorkUpdated = true;
+        } catch {
+          // Best-effort filename audit must never block completion or blob release
         }
+        if (task) {
+          tasks.set(record.taskId, {
+            ...task,
+            status: "completed",
+            statusText: "已完成",
+            percent: 100,
+            loaded: task.total > 0 ? task.total : task.loaded,
+            speed: 0,
+            chromeDownloadId: record.downloadId,
+            ...(filenameWarning ? { filenameWarning } : {}),
+            error: undefined,
+            updatedAt: nowFn(),
+          });
+          if (task.workFingerprint) {
+            try {
+              await storage.recordSavedWork({
+                fingerprint: task.workFingerprint,
+                platform: task.platform,
+                title: task.title,
+                filename: record.filename,
+                savedAt: nowFn(),
+              });
+              savedWorkUpdated = true;
+            } catch {
+              // Storage quota/persistence errors must never rollback completion or leak Blob/OPFS slot
+            }
+          }
+        }
+        outcome = "completed";
+      } else {
+        observedDownloadFilenames.delete(record.downloadId);
+        const errReason = delta.error?.current || "DOWNLOAD_INTERRUPTED";
+        const userCancelled =
+          task?.status === "cancelled" || /USER_CANCELED|USER_SHUTDOWN/i.test(errReason);
+        if (task) {
+          tasks.set(record.taskId, {
+            ...task,
+            status: userCancelled ? "cancelled" : "failed",
+            statusText: userCancelled ? "已取消" : "保存中断",
+            speed: 0,
+            error: userCancelled ? undefined : `浏览器保存中断（${errReason}）`,
+            updatedAt: nowFn(),
+          });
+        }
+        outcome = userCancelled ? undefined : "failed";
       }
-      outcome = "completed";
-    } else {
-      observedDownloadFilenames.delete(record.downloadId);
-      const errReason = delta.error?.current || "DOWNLOAD_INTERRUPTED";
-      const userCancelled =
-        task?.status === "cancelled" || /USER_CANCELED|USER_SHUTDOWN/i.test(errReason);
-      if (task) {
-        tasks.set(record.taskId, {
-          ...task,
-          status: userCancelled ? "cancelled" : "failed",
-          statusText: userCancelled ? "已取消" : "保存中断",
-          speed: 0,
-          error: userCancelled ? undefined : `浏览器保存中断（${errReason}）`,
-          updatedAt: nowFn(),
-        });
+
+      try {
+        await onTaskHistoryChange?.({ immediate: true });
+      } catch {
+        // Non-critical history persistence failure must never block cleanup or UI broadcast
       }
-      outcome = userCancelled ? undefined : "failed";
+    } finally {
+      if (record.blobUrl) {
+        await sendReleaseBlobToOffscreen(record).catch(() => {});
+      }
+      try {
+        updateBadge(outcome);
+      } catch {
+        // Ignore badge failure
+      }
+      await broadcastTasksUpdated(savedWorkUpdated).catch(() => {});
+      scheduleOffscreenIdleCloseIfIdle();
+      notifyIfCompletelyIdle();
     }
-
-    if (record.blobUrl) {
-      await sendReleaseBlobToOffscreen(record);
-    }
-
-    updateBadge(outcome);
-    await onTaskHistoryChange?.({ immediate: true });
-    await broadcastTasksUpdated(savedWorkUpdated);
-    scheduleOffscreenIdleCloseIfIdle();
-    notifyIfCompletelyIdle();
   };
 
   const replayEarlyDownloadDelta = (record: PendingBlobDownloadRecord): void => {
@@ -753,8 +776,12 @@ export function createDownloadCoordinator(deps: DownloadCoordinatorDeps) {
             updatedAt: nowFn(),
           });
           updateBadge(isCancelled ? undefined : "failed");
-          await onTaskHistoryChange?.({ immediate: true });
-          await broadcastTasksUpdated();
+          try {
+            await onTaskHistoryChange?.({ immediate: true });
+          } catch {
+            // Non-critical history persistence failure must never block UI update or idle close
+          }
+          await broadcastTasksUpdated().catch(() => {});
         }
         scheduleOffscreenIdleCloseIfIdle();
         notifyIfCompletelyIdle();

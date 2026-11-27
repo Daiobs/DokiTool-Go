@@ -959,3 +959,143 @@ func TestReloadAPIKeysPreservesCumulativeCountersUnderConcurrentTraffic(t *testi
 		t.Fatalf("unexpected friend-new stats: %+v", friendNewSnap)
 	}
 }
+
+func TestReloadAPIKeysPreservesActiveLeasesWaitersAndRateBuckets(t *testing.T) {
+	ownerTok := randomPrintableToken(t, 48)
+	agentTok := randomPrintableToken(t, 48)
+	edgeKey := randomPrintableToken(t, 48)
+
+	c := makeStatsTestCatalog(t)
+	req1Entered := make(chan struct{})
+	req1Release := make(chan struct{})
+	req2Entered := make(chan struct{})
+	req2Release := make(chan struct{})
+
+	h, err := NewWithCacheConfig(c, map[string]Adapter{
+		"douyin": AdapterFunc(func(_ context.Context, src string, now int64) (unified.Object, error) {
+			switch {
+			case strings.HasSuffix(src, "/lease-1"):
+				close(req1Entered)
+				<-req1Release
+			case strings.HasSuffix(src, "/lease-2"):
+				close(req2Entered)
+				<-req2Release
+			}
+			return makeStatsOKPayload("douyin", src, now), nil
+		}),
+	}, time.Now, nil, CacheConfig{Disabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultAdmissionConfig()
+	ownerAuth, _ := NewOwnerAuth(ownerTok)
+	buildReg := func(conc, burst, qSize int, qWait string) *APIKeyRegistry {
+		manifest := fmt.Sprintf(`{
+			"keys": [{
+				"id": "bot-live",
+				"role": "agent",
+				"token_sha256": %q,
+				"concurrency": %d,
+				"slow_concurrency": 1,
+				"rps": 100,
+				"burst": %d,
+				"queue_size": %d,
+				"queue_wait": %q
+			}]
+		}`, sha256HexOf(agentTok), conc, burst, qSize, qWait)
+		reg, parseErr := ParseAPIKeyRegistry([]byte(manifest), true, ownerAuth, cfg, nil)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		return reg
+	}
+
+	reg1 := buildReg(1, 10, 4, "5s")
+	origPool := reg1.byID["bot-live"].pool
+	router, err := WithAdmissionWithRegistry(h, nil, "caddy", edgeKey, cfg, reg1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fire := func(rawURL string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?schema_version=1.0&url="+url.QueryEscape(rawURL), nil)
+		req.RemoteAddr = "127.0.0.1:49210"
+		req.Header.Set(edgeHeader, edgeKey)
+		req.Header.Set(clientHeader, "198.51.100.120")
+		req.Header.Set("Authorization", "Bearer "+agentTok)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// 1. Occupy the single concurrency=1 slot and enqueue waiter #2.
+	done1 := make(chan int, 1)
+	go func() { done1 <- fire("https://www.douyin.com/video/lease-1") }()
+	<-req1Entered
+
+	done2 := make(chan int, 1)
+	go func() { done2 <- fire("https://www.douyin.com/video/lease-2") }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, snap := fetchStatsSnapshot(t, router, edgeKey, ownerTok, "198.51.100.99", "")
+		ks := lookupAPIKeySnap(t, snap, "bot-live")
+		if ks.Active == 1 && ks.Queued == 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// 2. Reload with same concurrency=1 and queue_size=0: active lease & waiter MUST stay intact,
+	// and a 3rd arrival MUST be rejected with 429 (proving active=1 was NOT reset to 0!).
+	reg2 := buildReg(1, 3, 0, "0s")
+	if !ReloadAPIKeys(router, reg2) {
+		t.Fatal("ReloadAPIKeys reg2 failed")
+	}
+	if reg2.byID["bot-live"].pool != origPool {
+		t.Fatal("ReloadAPIKeys replaced *keyPool instead of reconfiguring in-place")
+	}
+	origPool.mu.Lock()
+	clampedTokens := origPool.parseRate.tokens
+	curBurst := origPool.burst
+	origPool.mu.Unlock()
+	if curBurst != 3 || clampedTokens > 3 {
+		t.Fatalf("expected burst=3 and clamped tokens <= 3, got burst=%v tokens=%v", curBurst, clampedTokens)
+	}
+	if code := fire("https://www.douyin.com/video/lease-3"); code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 while active lease=1 survived reload, got %d", code)
+	}
+	select {
+	case <-req2Entered:
+		t.Fatal("queued waiter #2 woke up prematurely while concurrency remained 1")
+	default:
+	}
+
+	// 3. Reload raising concurrency=2: queued waiter #2 MUST wake immediately while #1 still runs!
+	reg3 := buildReg(2, 10, 4, "5s")
+	if !ReloadAPIKeys(router, reg3) {
+		t.Fatal("ReloadAPIKeys reg3 failed")
+	}
+	select {
+	case <-req2Entered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("raising concurrency via ReloadAPIKeys did not wake queued waiter #2")
+	}
+	_, snapMid := fetchStatsSnapshot(t, router, edgeKey, ownerTok, "198.51.100.99", "")
+	if ks := lookupAPIKeySnap(t, snapMid, "bot-live"); ks.Active != 2 || ks.Queued != 0 || ks.ConcurrencyLimit != 2 {
+		t.Fatalf("unexpected mid-reload pool state: %+v", ks)
+	}
+
+	close(req1Release)
+	close(req2Release)
+	if code := <-done1; code != http.StatusOK {
+		t.Fatalf("req1 status = %d", code)
+	}
+	if code := <-done2; code != http.StatusOK {
+		t.Fatalf("req2 status = %d", code)
+	}
+	_, snapEnd := fetchStatsSnapshot(t, router, edgeKey, ownerTok, "198.51.100.99", "")
+	if ks := lookupAPIKeySnap(t, snapEnd, "bot-live"); ks.Active != 0 || ks.Queued != 0 {
+		t.Fatalf("pool leaked slots after reload: %+v", ks)
+	}
+}

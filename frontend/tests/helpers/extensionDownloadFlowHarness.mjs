@@ -182,10 +182,28 @@ function createMockOpfs({
           activeWriteLocks.add(name);
           const chunks = [];
           let cursor = 0;
+          let logicalSize = 0;
           let closed = false;
+          const applyTruncate = (size) => {
+            const target = Number(size) || 0;
+            for (let i = chunks.length - 1; i >= 0; i--) {
+              const c = chunks[i];
+              if (c.pos >= target) {
+                chunks.splice(i, 1);
+              } else if (c.pos + c.bytes.byteLength > target) {
+                chunks[i] = { pos: c.pos, bytes: c.bytes.slice(0, target - c.pos) };
+              }
+            }
+            logicalSize = target;
+            if (cursor > target) cursor = target;
+          };
           return {
             async write(chunk) {
               if (closed) throw new Error("Writable already closed");
+              if (chunk && typeof chunk === "object" && chunk.type === "truncate") {
+                applyTruncate(chunk.size);
+                return;
+              }
               if (chunk && typeof chunk === "object" && chunk.type === "write") {
                 if (typeof chunk.position === "number") cursor = chunk.position;
                 const bytes =
@@ -194,12 +212,18 @@ function createMockOpfs({
                     : new Uint8Array(chunk.data);
                 chunks.push({ pos: cursor, bytes: bytes.slice() });
                 cursor += bytes.byteLength;
+                if (cursor > logicalSize) logicalSize = cursor;
                 return;
               }
               const bytes =
                 chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
               chunks.push({ pos: cursor, bytes: bytes.slice() });
               cursor += bytes.byteLength;
+              if (cursor > logicalSize) logicalSize = cursor;
+            },
+            async truncate(size) {
+              if (closed) throw new Error("Writable already closed");
+              applyTruncate(size);
             },
             async seek(pos) {
               cursor = Number(pos) || 0;
@@ -208,11 +232,7 @@ function createMockOpfs({
               if (closed) return;
               closed = true;
               activeWriteLocks.delete(name);
-              let maxLen = 0;
-              for (const c of chunks) {
-                maxLen = Math.max(maxLen, c.pos + c.bytes.byteLength);
-              }
-              const out = new Uint8Array(maxLen);
+              const out = new Uint8Array(logicalSize);
               for (const c of chunks) {
                 out.set(c.bytes, c.pos);
               }

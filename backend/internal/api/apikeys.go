@@ -213,12 +213,62 @@ func boundedRetrySeconds(deficitTokens, rate float64) int {
 	return int(waitSec)
 }
 
+func (p *keyPool) currentQueueWait() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	d := p.queueWait
+	p.mu.Unlock()
+	return d
+}
+
+// reconfigure updates quota parameters in-place under p.mu so SIGHUP reloads
+// preserve active concurrency leases, queued FIFO waiters, and rate buckets.
+func (p *keyPool) reconfigure(concurrency, slowConcurrency int, rps float64, burst, queueSize int, queueWait time.Duration) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var fastRPS, fastBurst float64
+	if rps > 0 {
+		fastRPS = max(rps*4, minFastReadRPS)
+		fastBurst = max(float64(burst)*4, minFastReadBurst)
+	}
+	p.concurrency = concurrency
+	p.slowConcurrency = slowConcurrency
+	p.rps = rps
+	p.burst = float64(burst)
+	p.fastRPS = fastRPS
+	p.fastBurst = fastBurst
+	p.queueSize = queueSize
+	p.queueWait = queueWait
+
+	if p.rps <= 0 {
+		p.parseRate = bucket{}
+		p.fastRate = bucket{}
+	} else {
+		if !p.parseRate.at.IsZero() && p.parseRate.tokens > p.burst {
+			p.parseRate.tokens = p.burst
+		}
+		if !p.fastRate.at.IsZero() && p.fastRate.tokens > p.fastBurst {
+			p.fastRate.tokens = p.fastBurst
+		}
+	}
+	p.wakeEligibleWaitersLocked()
+}
+
 func (p *keyPool) chargeFastRead(now time.Time) int {
-	if p == nil || p.rps <= 0 {
+	if p == nil {
 		return 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.rps <= 0 {
+		return 0
+	}
 	if now.Before(p.fastRate.at) {
 		now = p.fastRate.at
 	}
@@ -361,14 +411,9 @@ func (p *keyPool) makeRelease(wasSlow bool) func() {
 	}
 }
 
-func (p *keyPool) releaseSlot(wasSlow bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.active--
-	if wasSlow {
-		p.slowActive--
-	}
-	for e := p.waiters.Front(); e != nil; e = e.Next() {
+func (p *keyPool) wakeEligibleWaitersLocked() {
+	for e := p.waiters.Front(); e != nil; {
+		next := e.Next()
 		w := e.Value.(*keyWaiter)
 		if p.canRunLocked(w.isSlow) {
 			p.waiters.Remove(e)
@@ -378,9 +423,19 @@ func (p *keyPool) releaseSlot(wasSlow bool) {
 				p.slowActive++
 			}
 			w.granted <- struct{}{}
-			return
 		}
+		e = next
 	}
+}
+
+func (p *keyPool) releaseSlot(wasSlow bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active--
+	if wasSlow {
+		p.slowActive--
+	}
+	p.wakeEligibleWaitersLocked()
 }
 
 func (p *keyPool) statsSnapshot() AdmissionPoolSnapshot {
@@ -590,14 +645,35 @@ func (r *APIKeyRegistry) authenticate(values []string) (*apiKeyEntry, bool) {
 	return r.activeKeys[idx], true
 }
 
-func (r *APIKeyRegistry) carryOverCountersFrom(prev *APIKeyRegistry) {
+func (r *APIKeyRegistry) carryOverStateFrom(prev *APIKeyRegistry) {
 	if r == nil || prev == nil {
 		return
 	}
 	for _, entry := range r.allKeys {
-		if old, ok := prev.byID[entry.id]; ok && old != nil && old.counters != nil {
+		old, ok := prev.byID[entry.id]
+		if !ok || old == nil {
+			continue
+		}
+		if old.counters != nil {
 			entry.counters = old.counters
-			entry.pool.counters = old.counters
+		}
+		if old.pool != nil {
+			if entry.pool != nil {
+				old.pool.reconfigure(
+					entry.pool.concurrency,
+					entry.pool.slowConcurrency,
+					entry.pool.rps,
+					int(math.Round(entry.pool.burst)),
+					entry.pool.queueSize,
+					entry.pool.queueWait,
+				)
+			}
+			entry.pool = old.pool
+			if entry.counters == nil && old.pool.counters != nil {
+				entry.counters = old.pool.counters
+			}
+		} else if entry.pool != nil && entry.counters != nil {
+			entry.pool.counters = entry.counters
 		}
 	}
 }

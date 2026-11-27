@@ -175,12 +175,11 @@ def _default_stem(data: dict[str, Any], item: dict[str, Any]) -> str:
     return f"{platform}_{sanitize_filename_stem(raw_cid, 28)}_{sanitize_filename_stem(str(item.get('id') or 'item1'), 24)}"
 
 
-def _download_routes_atomic(
+def _download_routes_to_staged_part(
     client: DokiToolClient, urls: list[str], output_dir: Path, stem: str,
     meta: dict[str, Any] | None, *, explicit_filename: str | None, max_bytes: int,
-    overwrite: bool = False,
-) -> tuple[Path, int, bool]:
-    """Download first succeeding route to a jailed temp file, then atomically commit."""
+) -> tuple[Path, Path, int, bool]:
+    """Download first succeeding route into a jailed hidden temp file without committing yet."""
     part_path = resolve_jailed_path(
         output_dir, f".{sanitize_filename_stem(stem, 52)}.{os.getpid()}.{secrets.token_hex(4)}.part", allow_subdirs=False
     )
@@ -197,8 +196,7 @@ def _download_routes_atomic(
                 final_path = resolve_jailed_path(
                     output_dir, f"{stem}.{_infer_ext(meta, hdrs, final_url, part_path)}", allow_subdirs=False
                 )
-            _commit_atomic_file(part_path, final_path, overwrite=overwrite)
-            return final_path, written, False
+            return part_path, final_path, written, False
         except (SecurityError, DownloadError):
             _unlink_if_regular(part_path)
             raise
@@ -211,8 +209,27 @@ def _download_routes_atomic(
             _unlink_if_regular(part_path)
             last_err = exc
     if saw_expired:
-        return part_path, 0, True
+        return part_path, part_path, 0, True
     raise DownloadError(f"All {len(urls)} CDN routes failed: {redact_sensitive(str(last_err))}")
+
+
+def _download_routes_atomic(
+    client: DokiToolClient, urls: list[str], output_dir: Path, stem: str,
+    meta: dict[str, Any] | None, *, explicit_filename: str | None, max_bytes: int,
+    overwrite: bool = False,
+) -> tuple[Path, int, bool]:
+    """Download first succeeding route to a jailed temp file, then atomically commit."""
+    part_path, final_path, written, expired = _download_routes_to_staged_part(
+        client, urls, output_dir, stem, meta, explicit_filename=explicit_filename, max_bytes=max_bytes,
+    )
+    if expired:
+        return part_path, 0, True
+    try:
+        _commit_atomic_file(part_path, final_path, overwrite=overwrite)
+        return final_path, written, False
+    except Exception:
+        _unlink_if_regular(part_path)
+        raise
 
 
 def _mux_with_ffmpeg(
@@ -314,8 +331,8 @@ def _download_variant_files(
         )
         return ([], True) if expired else ([{"role": "main", "file": path.name, "bytes": nbytes}], False)
     if kind == "pair":
-        saved: list[dict[str, Any]] = []
         pair_stem = sanitize_filename_stem(Path(explicit_filename).stem, 48) if explicit_filename is not None else stem
+        pair_resources: list[tuple[str, list[str], dict[str, Any] | None]] = []
         for res in delivery.get("resources") or []:
             res_del = res.get("delivery") or {}
             if res_del.get("kind") != "file":
@@ -324,14 +341,47 @@ def _download_variant_files(
             urls = _collect_direct_urls(res_del.get("sources") or [])
             if not urls:
                 return [], True
-            path, nbytes, expired = _download_routes_atomic(
-                client, urls, root, f"{pair_stem}_{role}", res.get("metadata"),
-                explicit_filename=None, max_bytes=max_media_bytes, overwrite=overwrite,
-            )
-            if expired:
-                return [], True
-            saved.append({"role": role, "file": path.name, "bytes": nbytes})
-        return saved, False
+            pair_resources.append((role, urls, res.get("metadata")))
+
+        # Two-phase commit: download all pair resources into hidden temp files first,
+        # precheck all destination paths for no-clobber safety, then publish together.
+        staged: list[tuple[str, Path, Path, int]] = []
+        try:
+            for role, urls, res_meta in pair_resources:
+                part_path, final_path, nbytes, expired = _download_routes_to_staged_part(
+                    client, urls, root, f"{pair_stem}_{role}", res_meta,
+                    explicit_filename=None, max_bytes=max_media_bytes,
+                )
+                if expired:
+                    return [], True
+                staged.append((role, part_path, final_path, nbytes))
+
+            seen_targets: set[str] = set()
+            for _role, _part_path, final_path, _nbytes in staged:
+                if final_path.name in seen_targets:
+                    raise DownloadError(f"Duplicate pair output filename: {final_path.name}")
+                seen_targets.add(final_path.name)
+                if not overwrite and (final_path.exists() or final_path.is_symlink()):
+                    raise DownloadError(
+                        f"Target file already exists (no-clobber default): {final_path.name}; pass --overwrite to replace"
+                    )
+
+            saved: list[dict[str, Any]] = []
+            committed: list[Path] = []
+            try:
+                for role, part_path, final_path, nbytes in staged:
+                    _commit_atomic_file(part_path, final_path, overwrite=overwrite)
+                    committed.append(final_path)
+                    saved.append({"role": role, "file": final_path.name, "bytes": nbytes})
+            except Exception:
+                if not overwrite:
+                    for path in committed:
+                        _unlink_if_regular(path)
+                raise
+            return saved, False
+        finally:
+            for _role, part_path, _final_path, _nbytes in staged:
+                _unlink_if_regular(part_path)
     if kind == "mux":
         if not allow_ffmpeg:
             raise DownloadError("Selected variant requires muxing; restart or invoke with --allow-ffmpeg")
