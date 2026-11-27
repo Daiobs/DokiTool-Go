@@ -1,25 +1,6 @@
-import test, { before, after } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { build, stop } from 'esbuild';
-
-let routeProbe;
-
-before(async () => {
-  const bundled = await build({
-    entryPoints: ['src/downloads/routeProbe.ts'],
-    bundle: true,
-    write: false,
-    outdir: 'test-output',
-    platform: 'node',
-    format: 'esm',
-  });
-  const code = bundled.outputFiles.find(file => file.path.endsWith('routeProbe.js')).text;
-  routeProbe = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
-});
-
-after(() => {
-  stop();
-});
+import * as routeProbe from '../src/downloads/routeProbe.ts';
 
 function rangedStreamResponse(size, delayPerChunkMs = 0, chunkSize = 64 * 1024) {
   let sent = 0;

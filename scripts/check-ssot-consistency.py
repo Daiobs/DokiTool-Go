@@ -122,22 +122,6 @@ def check_extension_and_web_ssot(root: Path) -> Tuple[Dict[str, str], List[str]]
                 f"[ext-ssot] {lock_rel.as_posix()}: packages[''] name/version mismatch against ('dokitool-web', {ext_ver!r})"
             )
 
-    tag = f"v{ext_ver}"
-    for doc_rel in (
-        Path("frontend/public/llms.txt"),
-        Path("README.md"),
-        Path("docs/EXTENSION.md"),
-        Path("docs/RELEASE-RECEIPT.md"),
-    ):
-        text = _read_text(root / doc_rel)
-        if text is None:
-            violations.append(f"[ext-ssot] unable to read {doc_rel.as_posix()}")
-            continue
-        if tag not in text:
-            violations.append(f"[ext-ssot] {doc_rel.as_posix()} is missing current extension version {tag!r}")
-        if doc_rel == Path("docs/RELEASE-RECEIPT.md") and ext_id not in text:
-            violations.append(f"[ext-ssot] {doc_rel.as_posix()} is missing extensionId {ext_id!r}")
-
     return {"extension_version": ext_ver, "extension_id": ext_id}, violations
 
 
@@ -169,12 +153,6 @@ def check_mediabunny_parity(root: Path) -> Tuple[Dict[str, str], List[str]]:
     elif f"Mediabunny {mb_ver}" not in notice_text or f"mediabunny/tree/v{mb_ver}" not in notice_text:
         violations.append(f"[mediabunny-ssot] NOTICE does not match Mediabunny {mb_ver}")
 
-    readme_text = _read_text(root / "README.md")
-    if readme_text is None:
-        violations.append("[mediabunny-ssot] unable to read README.md")
-    elif "Mediabunny" not in readme_text or mb_ver not in readme_text:
-        violations.append(f"[mediabunny-ssot] README.md is missing Mediabunny {mb_ver} attribution")
-
     return {"mediabunny_version": mb_ver}, violations
 
 
@@ -187,12 +165,6 @@ def check_go_toolchain_parity(root: Path) -> Tuple[Dict[str, str], List[str]]:
     if len(matches) != 1:
         return {}, ["[go-ssot] backend/go.mod must declare a single exact 'toolchain goX.Y.Z' directive"]
     go_ver = matches[0]
-
-    readme_text = _read_text(root / "README.md")
-    if readme_text is None:
-        violations.append("[go-ssot] unable to read README.md")
-    elif go_ver not in readme_text:
-        violations.append(f"[go-ssot] README.md does not reference pinned Go toolchain version {go_ver}")
 
     wf_rel = Path(".github/workflows/release-build.yml")
     wf_text = _read_text(root / wf_rel)

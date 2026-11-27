@@ -1,7 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fileURLToPath } from 'node:url';
-import { build as bundle } from 'esbuild';
 
 const origin = 'https://snap.example.test';
 const build = 'downloads-20261030.2';
@@ -12,21 +10,28 @@ const state = (status = 'downloading', patch = {}) => ({
   elapsed: 15, transferElapsed: 5, averageSpeed: 2 * 1024 ** 2, ...patch,
 });
 const flush = async () => { for (let index = 0; index < 40; index++) await Promise.resolve(); };
+let isolateSeq = 0;
 
 async function harness(t, respond, options = {}) {
-  // Bundle the real module graph so session/bridge refactors cannot silently use stale mocks.
-  const entry = options.withStore ? { stdin: {
-    contents: `export * from './src/downloads/streaming';
-      export { useMediaDownload } from './src/composables/useMediaDownload';
-      export { useVideoSelection } from './src/composables/useVideoSelection';
-      export { useVideoStore } from './src/stores/video';
-      export { createPinia } from 'pinia';`,
-    resolveDir: fileURLToPath(new URL('../', import.meta.url)),
-  }, define: { 'import.meta.env': '{}', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false' } }
-    : { entryPoints: [fileURLToPath(new URL('../src/downloads/streaming.ts', import.meta.url))] };
-  const { outputFiles } = await bundle({ ...entry, bundle: true, write: false, platform: 'browser', format: 'esm' });
-  const code = outputFiles[0].text;
-  const api = await import('data:text/javascript;base64,' + Buffer.from(code + `\n// ${Math.random()}`).toString('base64'));
+  // Load a fresh isolated module graph via the native TS loader so session/bridge refactors are exercised directly.
+  const iso = `isolate=${++isolateSeq}`;
+  const streamingMod = await import(`../src/downloads/streaming.ts?${iso}`);
+  let api = streamingMod;
+  if (options.withStore) {
+    const [mediaDl, videoSel, videoStore, piniaMod] = await Promise.all([
+      import(`../src/composables/useMediaDownload.ts?${iso}`),
+      import(`../src/composables/useVideoSelection.ts?${iso}`),
+      import(`../src/stores/video.ts?${iso}`),
+      import('pinia'),
+    ]);
+    api = {
+      ...streamingMod,
+      useMediaDownload: mediaDl.useMediaDownload,
+      useVideoSelection: videoSel.useVideoSelection,
+      useVideoStore: videoStore.useVideoStore,
+      createPinia: piniaMod.createPinia,
+    };
+  }
   const originals = new Map(), storage = new Map(), messages = [], frames = [], timers = new Map(), stateListeners = new Set();
   let listener, nextTimer = 0, updates = 0, registrations = 0, now = 1_000_000;
   const originalDate = Date;

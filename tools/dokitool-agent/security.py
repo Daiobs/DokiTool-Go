@@ -197,6 +197,7 @@ def validate_and_resolve_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
     allowed_ports: frozenset[int] | None = None,
+    allowed_loopback_origin: tuple[str, str, int] | None = None,
 ) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
     """Enforce secondary anti-SSRF validation and return (parsed_url, validated_pinned_ips)."""
     parsed = _validate_url_syntax(url)
@@ -205,7 +206,10 @@ def validate_and_resolve_remote_url(
         raise SecurityError("Scoped IPv6 addresses are forbidden")
     effective_port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     if is_loopback_host(host):
-        if not allow_loopback:
+        if allowed_loopback_origin is not None:
+            if (parsed.scheme.lower(), host, effective_port) != allowed_loopback_origin:
+                raise SecurityError("Loopback address does not match allowed origin")
+        elif not allow_loopback:
             raise SecurityError("Loopback address is forbidden for media/subtitle fetch")
         ip = _parse_ip(host)
         if ip is not None:
@@ -232,11 +236,13 @@ def validate_remote_url(
     url: str, *, allow_loopback: bool = False, resolve_dns: bool = True,
     resolver: Callable[..., list[Any]] | None = None,
     allowed_ports: frozenset[int] | None = None,
+    allowed_loopback_origin: tuple[str, str, int] | None = None,
 ) -> urllib.parse.SplitResult:
     """Enforce secondary anti-SSRF validation (scheme, userinfo, suffix, IP literal, DNS)."""
     parsed, _ = validate_and_resolve_remote_url(
         url, allow_loopback=allow_loopback, resolve_dns=resolve_dns,
         resolver=resolver, allowed_ports=allowed_ports,
+        allowed_loopback_origin=allowed_loopback_origin,
     )
     return parsed
 

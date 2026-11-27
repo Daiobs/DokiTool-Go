@@ -1,7 +1,10 @@
-import test, { before, after } from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
+import * as variantSelection from "../src/extension/planning/variantSelection.ts";
+import * as enqueuePlanBuilder from "../src/extension/planning/enqueuePlanBuilder.ts";
+import * as extensionDownloadFacade from "../src/extension/extensionDownload.ts";
+import { collectTransitiveImportGraph } from "./helpers/staticImportGraph.mjs";
 
 const FIXED_NOW = Date.parse("2026-11-25T12:00:00.000Z");
 const FUTURE_EXP = "2026-11-25T14:00:00.000Z";
@@ -9,40 +12,16 @@ const SOONER_EXP = "2026-11-25T13:00:00.000Z";
 const PAST_EXP = "2026-11-25T11:00:00.000Z";
 const API_ORIGIN = "https://snap.dokitool.com";
 
-let variantSelection;
-let enqueuePlanBuilder;
-let extensionDownloadFacade;
-
-before(async () => {
-  const bundlePure = async (rel) => {
-    const absEntry = fileURLToPath(new URL(rel, import.meta.url));
-    const bundled = await build({
-      entryPoints: [absEntry],
-      bundle: true,
-      write: false,
-      platform: "node",
-      format: "esm",
-      metafile: true,
-    });
-    const code = bundled.outputFiles[0].text;
-    const mod = await import(
-      `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-    );
-    return { mod, inputs: Object.keys(bundled.metafile.inputs) };
-  };
-
-  const [vsRes, ebRes, facadeRes] = await Promise.all([
-    bundlePure("../src/extension/planning/variantSelection.ts"),
-    bundlePure("../src/extension/planning/enqueuePlanBuilder.ts"),
-    bundlePure("../src/extension/extensionDownload.ts"),
+before(() => {
+  // Verify transitive dependency graph of planning/* never drags in offscreen/DOM/JSZip modules.
+  const planningInputs = new Set([
+    ...collectTransitiveImportGraph(
+      fileURLToPath(new URL("../src/extension/planning/variantSelection.ts", import.meta.url)),
+    ),
+    ...collectTransitiveImportGraph(
+      fileURLToPath(new URL("../src/extension/planning/enqueuePlanBuilder.ts", import.meta.url)),
+    ),
   ]);
-
-  variantSelection = vsRes.mod;
-  enqueuePlanBuilder = ebRes.mod;
-  extensionDownloadFacade = facadeRes.mod;
-
-  // Verify bundled dependency graph of planning/* never drags in offscreen/DOM/JSZip modules.
-  const planningInputs = new Set([...vsRes.inputs, ...ebRes.inputs]);
   for (const forbidden of [
     "jszip",
     "extensionDownload.ts",
@@ -59,10 +38,6 @@ before(async () => {
       );
     }
   }
-});
-
-after(() => {
-  stop();
 });
 
 function makeSource(url, extra = {}) {

@@ -1,11 +1,11 @@
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { build, stop } from "esbuild";
+import { fileURLToPath } from "node:url";
 import * as vue from "vue";
+import * as statsTypes from "../src/monitor/statsTypes.ts";
+import * as monitorStorage from "../src/monitor/monitorStorage.ts";
 import { loadSfc } from "./helpers/loadSfc.mjs";
 
 const { createRenderer, h, markRaw, nextTick, ref } = vue;
@@ -17,30 +17,7 @@ const VALID_OWNER_TOKEN = "owner_token_1234567890_abcdefghijklmnopqrstuvwxyz";
 const VALID_FRIEND_TOKEN = "friend_token_1234567890_abcdefghijklmnopqrstuvwxyz";
 const STALE_LOCAL_TOKEN = "stale_local_token_1234567890_abcdefghijklmnopqrst";
 
-let tmpBundleDir = "";
-let statsTypes;
-let monitorStorage;
 let MonitorApp;
-
-async function bundleMonitorModules() {
-  tmpBundleDir = mkdtempSync(join(tmpdir(), "dokitool-web-monitor-test-"));
-  const outfile = join(tmpBundleDir, "suite.mjs");
-  await build({
-    stdin: {
-      contents: `
-        export * as statsTypes from "./src/monitor/statsTypes.ts";
-        export * as monitorStorage from "./src/monitor/monitorStorage.ts";
-      `,
-      resolveDir: FRONTEND_DIR,
-      loader: "ts",
-    },
-    bundle: true,
-    outfile,
-    platform: "browser",
-    format: "esm",
-  });
-  return import(pathToFileURL(outfile).href);
-}
 
 const PassthroughTransition = {
   inheritAttrs: false,
@@ -779,9 +756,6 @@ function createRichStatsSnapshot(overrides = {}) {
 let savedGlobals = {};
 
 before(async () => {
-  const suite = await bundleMonitorModules();
-  statsTypes = suite.statsTypes;
-  monitorStorage = suite.monitorStorage;
   MonitorApp = await loadMonitorSfc("../src/monitor/MonitorApp.vue");
 });
 
@@ -800,10 +774,6 @@ beforeEach(() => {
 });
 
 after(() => {
-  stop();
-  if (tmpBundleDir) {
-    rmSync(tmpBundleDir, { recursive: true, force: true });
-  }
   for (const [k, v] of Object.entries(savedGlobals)) {
     if (v === undefined) delete globalThis[k];
     else globalThis[k] = v;

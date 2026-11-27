@@ -27,7 +27,7 @@ func TestCatalogUsesSingleRegistry(t *testing.T) {
 	}
 	oracle, err := unified.Decode(baseline)
 	if err != nil || !unified.Equal(c.Envelope(), oracle["expected"]) {
-		t.Fatal("public catalogue differs from frozen PHP output")
+		t.Fatal("public catalogue differs from baseline output")
 	}
 	rows := unified.Slice(unified.Map(c.Envelope()["data"])["platforms"])
 	if len(rows) != 9 || unified.Map(rows[0])["id"] != "douyin" {
@@ -35,7 +35,7 @@ func TestCatalogUsesSingleRegistry(t *testing.T) {
 	}
 	for _, value := range rows {
 		row := unified.Map(value)
-		if len(row) != 5 || row["file"] != nil || row["adapter"] != nil || row["domains"] != nil {
+		if len(row) != 5 || row["file"] != nil || row["adapter"] != nil || row["domains"] != nil || row["optional"] != nil || row["display_domains"] != nil {
 			t.Fatal("private registry field published")
 		}
 	}
@@ -95,20 +95,15 @@ func TestInputDomainBoundary(t *testing.T) {
 }
 
 func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
-	canonicalExtra, err := os.ReadFile("../../config/platforms_extra.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(canonicalExtra) != string(config.PlatformsExtra()) {
-		t.Fatal("embedded platforms_extra.json differs from canonical file")
-	}
-
 	wantExtraIDs := []string{"x", "youtube", "instagram", "facebook", "tumblr"}
 	if got := ExtraPlatformIDs(); !reflect.DeepEqual(got, wantExtraIDs) {
 		t.Fatalf("ExtraPlatformIDs() = %v, want %v", got, wantExtraIDs)
 	}
 	if _, ok := ExtraPlatform("unknown"); ok {
 		t.Fatal("ExtraPlatform(unknown) must return ok=false")
+	}
+	if _, ok := ExtraPlatform("douyin"); ok {
+		t.Fatal("ExtraPlatform(douyin) must return ok=false for non-optional core platform")
 	}
 
 	// Convenience helpers must stay identical to ExtraPlatform and return defensive copies.
@@ -136,12 +131,18 @@ func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range wantExtraIDs {
+		if c.Has(id) {
+			t.Fatalf("Load() must NOT pre-register optional platform %q", id)
+		}
 		entry, ok := ExtraPlatform(id)
 		if !ok {
 			t.Fatalf("missing extra platform %q", id)
 		}
 		if _, leaked := entry["display_domains"]; leaked {
 			t.Fatalf("ExtraPlatform(%q) must not include frontend-only display_domains in runtime catalog entry", id)
+		}
+		if _, leaked := entry["optional"]; leaked {
+			t.Fatalf("ExtraPlatform(%q) must not include internal optional flag in runtime catalog entry", id)
 		}
 		if err := c.Register(entry); err != nil {
 			t.Fatalf("Register(%q) failed: %v", id, err)
@@ -154,7 +155,7 @@ func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
 	}
 	for _, value := range rows {
 		row := unified.Map(value)
-		if len(row) != 5 || row["domains"] != nil || row["exact_domains"] != nil || row["display_domains"] != nil {
+		if len(row) != 5 || row["domains"] != nil || row["exact_domains"] != nil || row["display_domains"] != nil || row["optional"] != nil {
 			t.Fatalf("private routing field leaked into Envelope(): %+v", row)
 		}
 	}
@@ -189,20 +190,21 @@ func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
 	}
 }
 
-func TestDecodeExtraConfigValidation(t *testing.T) {
+func TestDecodeRegistryValidation(t *testing.T) {
 	invalidConfigs := map[string]string{
-		"unknown-field":       `{"extra_platforms":[],"unexpected":true}`,
-		"empty-extra":         `{"exact_domain_additions":{},"extra_platforms":[]}`,
-		"duplicate-id":        `{"extra_platforms":[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"]},{"id":"x","name":"X2","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["twitter.com"]}]}`,
-		"uppercase-domain":    `{"extra_platforms":[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["X.COM"]}]}`,
-		"missing-all-domains": `{"extra_platforms":[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":[],"exact_domains":[]}]}`,
-		"empty-addition-list": `{"exact_domain_additions":{"zuiyou":[]},"extra_platforms":[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"]}]}`,
-		"trailing-json":       `{"extra_platforms":[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"]}]} {}`,
+		"unknown-field":       `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"],"unexpected":true}]`,
+		"empty-array":         `[]`,
+		"no-core-platforms":   `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"],"optional":true}]`,
+		"duplicate-id":        `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"]},{"id":"x","name":"X2","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["twitter.com"]}]`,
+		"uppercase-domain":    `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["X.COM"]}]`,
+		"duplicate-domain":    `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com","x.com"]}]`,
+		"missing-all-domains": `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":[],"exact_domains":[]}]`,
+		"trailing-json":       `[{"id":"x","name":"X","site_url":"https://x.com/","icon":"x","capabilities":["video"],"domains":["x.com"]}] {}`,
 	}
 	for name, raw := range invalidConfigs {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeExtraConfig([]byte(raw)); err == nil {
-				t.Fatalf("expected decodeExtraConfig(%s) to fail", name)
+			if _, err := decodeRegistry([]byte(raw)); err == nil {
+				t.Fatalf("expected decodeRegistry(%s) to fail", name)
 			}
 		})
 	}

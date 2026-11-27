@@ -1,5 +1,3 @@
-//go:build phporacle
-
 package douyin
 
 import (

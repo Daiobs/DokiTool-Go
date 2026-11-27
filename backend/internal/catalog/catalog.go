@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/url"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,29 +22,30 @@ type Catalog struct {
 	byID map[string]unified.Object
 }
 
-type extraConfig struct {
-	ExactDomainAdditions map[string][]string `json:"exact_domain_additions"`
-	ExtraPlatforms       []extraPlatformSpec `json:"extra_platforms"`
-	byID                 map[string]extraPlatformSpec
-}
-
-type extraPlatformSpec struct {
+type platformEntry struct {
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`
 	SiteURL        string   `json:"site_url"`
 	Icon           string   `json:"icon"`
 	Capabilities   []string `json:"capabilities"`
 	Domains        []string `json:"domains"`
-	ExactDomains   []string `json:"exact_domains"`
+	ExactDomains   []string `json:"exact_domains,omitempty"`
 	DisplayDomains []string `json:"display_domains,omitempty"`
+	Optional       bool     `json:"optional,omitempty"`
+}
+
+type registryConfig struct {
+	core         []platformEntry
+	optional     []platformEntry
+	optionalByID map[string]platformEntry
 }
 
 var (
-	identifier        = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
-	hostName          = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`)
-	embeddedExtraOnce sync.Once
-	embeddedExtraCfg  *extraConfig
-	embeddedExtraErr  error
+	identifier           = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+	hostName             = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`)
+	embeddedRegistryOnce sync.Once
+	embeddedRegistryCfg  *registryConfig
+	embeddedRegistryErr  error
 )
 
 func validateHostList(field, platformID string, hosts []string) error {
@@ -62,72 +62,74 @@ func validateHostList(field, platformID string, hosts []string) error {
 	return nil
 }
 
-func decodeExtraConfig(data []byte) (*extraConfig, error) {
+func decodeRegistry(data []byte) (*registryConfig, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	var cfg extraConfig
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode platforms_extra.json: %w", err)
+	var entries []platformEntry
+	if err := dec.Decode(&entries); err != nil {
+		return nil, fmt.Errorf("decode platforms.json: %w", err)
 	}
 	var tail any
 	if err := dec.Decode(&tail); err != io.EOF {
-		return nil, fmt.Errorf("decode platforms_extra.json: trailing JSON data")
+		return nil, fmt.Errorf("decode platforms.json: trailing JSON data")
 	}
-	for id, domains := range cfg.ExactDomainAdditions {
-		if !identifier.MatchString(id) {
-			return nil, fmt.Errorf("invalid exact_domain_additions platform id %q", id)
-		}
-		if len(domains) == 0 {
-			return nil, fmt.Errorf("exact_domain_additions for %q must be nonempty", id)
-		}
-		if err := validateHostList("exact_domain_additions", id, domains); err != nil {
-			return nil, err
-		}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("platform registry must be a nonempty array")
 	}
-	if len(cfg.ExtraPlatforms) == 0 {
-		return nil, fmt.Errorf("extra_platforms must be a nonempty array")
+
+	cfg := &registryConfig{
+		optionalByID: make(map[string]platformEntry),
 	}
-	cfg.byID = make(map[string]extraPlatformSpec, len(cfg.ExtraPlatforms))
-	for _, spec := range cfg.ExtraPlatforms {
-		if !identifier.MatchString(spec.ID) {
-			return nil, fmt.Errorf("invalid extra platform id %q", spec.ID)
+	seenIDs := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		if !identifier.MatchString(entry.ID) {
+			return nil, fmt.Errorf("invalid platform id %q", entry.ID)
 		}
-		if _, dup := cfg.byID[spec.ID]; dup {
-			return nil, fmt.Errorf("duplicate extra platform id %q", spec.ID)
+		if seenIDs[entry.ID] {
+			return nil, fmt.Errorf("duplicate platform id %q", entry.ID)
 		}
-		if spec.Name == "" || spec.SiteURL == "" || spec.Icon == "" {
-			return nil, fmt.Errorf("extra platform %q lacks required metadata", spec.ID)
+		seenIDs[entry.ID] = true
+		if entry.Name == "" || entry.SiteURL == "" || entry.Icon == "" {
+			return nil, fmt.Errorf("platform %q lacks required metadata", entry.ID)
 		}
-		if len(spec.Capabilities) == 0 {
-			return nil, fmt.Errorf("extra platform %q lacks capabilities", spec.ID)
+		if len(entry.Capabilities) == 0 {
+			return nil, fmt.Errorf("platform %q lacks capabilities", entry.ID)
 		}
-		for _, capName := range spec.Capabilities {
+		for _, capName := range entry.Capabilities {
 			if strings.TrimSpace(capName) == "" {
-				return nil, fmt.Errorf("extra platform %q has empty capability", spec.ID)
+				return nil, fmt.Errorf("platform %q has empty capability", entry.ID)
 			}
 		}
-		if len(spec.Domains) == 0 && len(spec.ExactDomains) == 0 {
-			return nil, fmt.Errorf("extra platform %q lacks domains and exact_domains", spec.ID)
+		if len(entry.Domains) == 0 && len(entry.ExactDomains) == 0 {
+			return nil, fmt.Errorf("platform %q lacks domains and exact_domains", entry.ID)
 		}
-		if err := validateHostList("domains", spec.ID, spec.Domains); err != nil {
+		if err := validateHostList("domains", entry.ID, entry.Domains); err != nil {
 			return nil, err
 		}
-		if err := validateHostList("exact_domains", spec.ID, spec.ExactDomains); err != nil {
+		if err := validateHostList("exact_domains", entry.ID, entry.ExactDomains); err != nil {
 			return nil, err
 		}
-		if err := validateHostList("display_domains", spec.ID, spec.DisplayDomains); err != nil {
+		if err := validateHostList("display_domains", entry.ID, entry.DisplayDomains); err != nil {
 			return nil, err
 		}
-		cfg.byID[spec.ID] = spec
+		if entry.Optional {
+			cfg.optional = append(cfg.optional, entry)
+			cfg.optionalByID[entry.ID] = entry
+		} else {
+			cfg.core = append(cfg.core, entry)
+		}
 	}
-	return &cfg, nil
+	if len(cfg.core) == 0 {
+		return nil, fmt.Errorf("platform registry must define at least one core platform")
+	}
+	return cfg, nil
 }
 
-func loadEmbeddedExtra() (*extraConfig, error) {
-	embeddedExtraOnce.Do(func() {
-		embeddedExtraCfg, embeddedExtraErr = decodeExtraConfig(config.PlatformsExtra())
+func loadEmbeddedRegistry() (*registryConfig, error) {
+	embeddedRegistryOnce.Do(func() {
+		embeddedRegistryCfg, embeddedRegistryErr = decodeRegistry(config.Platforms())
 	})
-	return embeddedExtraCfg, embeddedExtraErr
+	return embeddedRegistryCfg, embeddedRegistryErr
 }
 
 func stringSliceToUnifiedArray(items []string) unified.Array {
@@ -138,72 +140,66 @@ func stringSliceToUnifiedArray(items []string) unified.Array {
 	return out
 }
 
-func (s extraPlatformSpec) toCatalogObject() unified.Object {
+func (e platformEntry) toCatalogObject() unified.Object {
 	obj := unified.Object{
-		"id":           s.ID,
-		"name":         s.Name,
-		"site_url":     s.SiteURL,
-		"icon":         s.Icon,
-		"capabilities": stringSliceToUnifiedArray(s.Capabilities),
-		"domains":      stringSliceToUnifiedArray(s.Domains),
+		"id":           e.ID,
+		"name":         e.Name,
+		"site_url":     e.SiteURL,
+		"icon":         e.Icon,
+		"capabilities": stringSliceToUnifiedArray(e.Capabilities),
+		"domains":      stringSliceToUnifiedArray(e.Domains),
 	}
-	if len(s.ExactDomains) > 0 {
-		obj["exact_domains"] = stringSliceToUnifiedArray(s.ExactDomains)
+	if len(e.ExactDomains) > 0 {
+		obj["exact_domains"] = stringSliceToUnifiedArray(e.ExactDomains)
 	}
 	return obj
 }
 
-func Load() (*Catalog, error) {
-	c, err := Decode(config.Platforms())
-	if err != nil {
-		return nil, err
-	}
-	extra, err := loadEmbeddedExtra()
-	if err != nil {
-		return nil, err
-	}
-	additionIDs := make([]string, 0, len(extra.ExactDomainAdditions))
-	for id := range extra.ExactDomainAdditions {
-		additionIDs = append(additionIDs, id)
-	}
-	sort.Strings(additionIDs)
-	for _, id := range additionIDs {
-		if err := c.AddExactDomains(id, extra.ExactDomainAdditions[id]...); err != nil {
+func buildCoreCatalog(reg *registryConfig) (*Catalog, error) {
+	c := &Catalog{byID: make(map[string]unified.Object, len(reg.core))}
+	for _, entry := range reg.core {
+		if err := c.Register(entry.toCatalogObject()); err != nil {
 			return nil, err
-		}
-	}
-	for _, spec := range extra.ExtraPlatforms {
-		if c.Has(spec.ID) {
-			return nil, fmt.Errorf("extra platform %q duplicates base registry entry", spec.ID)
 		}
 	}
 	return c, nil
 }
 
+// Load returns a fresh runtime catalog pre-populated with the non-optional core
+// platforms from backend/config/platforms.json. Optional platforms are registered
+// explicitly by callers based on runtime flags via ExtraPlatform / XPlatform / etc.
+func Load() (*Catalog, error) {
+	reg, err := loadEmbeddedRegistry()
+	if err != nil {
+		return nil, err
+	}
+	return buildCoreCatalog(reg)
+}
+
 // ExtraPlatform returns a deep copy of the static catalog registration entry for an
-// optional Go-registered platform defined in backend/config/platforms_extra.json.
+// optional Go-registered platform (`"optional": true`) defined in backend/config/platforms.json.
 func ExtraPlatform(id string) (unified.Object, bool) {
-	extra, err := loadEmbeddedExtra()
+	reg, err := loadEmbeddedRegistry()
 	if err != nil {
 		return nil, false
 	}
-	spec, ok := extra.byID[id]
+	entry, ok := reg.optionalByID[id]
 	if !ok {
 		return nil, false
 	}
-	return spec.toCatalogObject(), true
+	return entry.toCatalogObject(), true
 }
 
 // ExtraPlatformIDs returns the canonical ordered IDs of all optional platforms
-// defined in backend/config/platforms_extra.json.
+// (`"optional": true`) defined in backend/config/platforms.json.
 func ExtraPlatformIDs() []string {
-	extra, err := loadEmbeddedExtra()
+	reg, err := loadEmbeddedRegistry()
 	if err != nil {
 		return nil
 	}
-	ids := make([]string, len(extra.ExtraPlatforms))
-	for i, spec := range extra.ExtraPlatforms {
-		ids[i] = spec.ID
+	ids := make([]string, len(reg.optional))
+	for i, entry := range reg.optional {
+		ids[i] = entry.ID
 	}
 	return ids
 }
@@ -211,7 +207,7 @@ func ExtraPlatformIDs() []string {
 func mustExtraPlatform(id string) unified.Object {
 	entry, ok := ExtraPlatform(id)
 	if !ok {
-		panic(fmt.Sprintf("catalog: missing embedded extra platform %q", id))
+		panic(fmt.Sprintf("catalog: missing embedded optional platform %q", id))
 	}
 	return entry
 }
@@ -225,25 +221,17 @@ func YouTubePlatform() unified.Object { return mustExtraPlatform("youtube") }
 // InstagramPlatform returns the optional registry entry for Instagram.
 func InstagramPlatform() unified.Object { return mustExtraPlatform("instagram") }
 
+// Decode parses a platforms.json array and returns a catalog containing its
+// non-optional core entries.
 func Decode(data []byte) (*Catalog, error) {
-	value, err := unified.DecodeValue(data)
+	reg, err := decodeRegistry(data)
 	if err != nil {
 		return nil, err
 	}
-	rows, ok := value.([]any)
-	if !ok || len(rows) == 0 {
-		return nil, fmt.Errorf("platform registry must be a nonempty array")
-	}
-	c := &Catalog{byID: make(map[string]unified.Object)}
-	for _, value := range rows {
-		if err := c.Register(unified.Map(value)); err != nil {
-			return nil, err
-		}
-	}
-	return c, nil
+	return buildCoreCatalog(reg)
 }
 
-// Register validates and appends an optional platform entry to the runtime catalog.
+// Register validates and appends a platform entry to the runtime catalog.
 func (c *Catalog) Register(row unified.Object) error {
 	if c == nil {
 		return fmt.Errorf("missing catalog")
@@ -324,8 +312,8 @@ func parseInputHost(raw string) (string, bool) {
 			return "", false
 		}
 	}
-	// PHP accepts opaque percent bytes in paths. Parse only the already
-	// validated authority for dispatch; retain the complete input for adapters.
+	// Accept opaque percent bytes in paths. Parse only the already validated
+	// authority for dispatch; retain the complete input for adapters.
 	separator := strings.Index(raw, "://")
 	if separator < 0 {
 		return "", false

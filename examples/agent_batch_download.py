@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Minimal standalone batch downloader for the DokiTool Personal Agent API.
+"""Minimal batch downloader for the DokiTool Personal Agent API.
 
-Uses the Python 3.9+ standard library only (zero third-party or repo imports).
+Zero third-party dependencies: uses the Python 3.9+ standard library and reuses
+the repository's pure-stdlib anti-SSRF/IP-pinning transport stack under
+`tools/dokitool-agent/{security,http_transport}.py`.
+
 Reads the API token exclusively from the DOKITOOL_API_TOKEN (or legacy
 DOKITOOL_OWNER_TOKEN) environment variable, sends it only via the
-Authorization: Bearer header (never in URL query parameters, where tokens are
-ignored as anonymous visitor requests without error while leaking into access
-logs and shell history), enforces anti-SSRF IP pinning on CDN downloads and
-redirects, and never forwards Authorization or Cookie headers to media CDNs.
+Authorization: Bearer header (never in URL query parameters), enforces
+anti-SSRF IP pinning, standard media ports, and HTTPS downgrade protection on
+CDN downloads and redirects, and never forwards Authorization or Cookie headers
+to media CDNs.
 """
 from __future__ import annotations
 
@@ -15,48 +18,31 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
-import http.client
-import ipaddress
 import json
 import os
 from pathlib import Path
 import random
 import re
-import socket
-import ssl
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
+
+_AGENT_TOOL_DIR = Path(__file__).resolve().parents[1] / "tools" / "dokitool-agent"
+if str(_AGENT_TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_TOOL_DIR))
+
+import http_transport  # noqa: E402
+import security  # noqa: E402
 
 CHUNK_BYTES = 256 * 1024
 PROBE_BYTES = 256 * 1024
 MAGIC_PEEK_BYTES = 32
 EXPIRY_MARGIN_SECONDS = 30
-MAX_API_JSON_BYTES = 8 * 1024 * 1024
-MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024
-MAX_CDN_REDIRECTS = 5
-STANDARD_HTTP_PORTS = frozenset({80, 443})
-BLOCKED_HOST_SUFFIXES = (
-    "localhost", "local", "internal", "localdomain", "home.arpa",
-    "invalid", "lan", "corp", "intranet", "private",
-)
-_FORBIDDEN_IPV4_NETS = tuple(ipaddress.ip_network(c) for c in (
-    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
-    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-))
-_FORBIDDEN_IPV6_NETS = tuple(ipaddress.ip_network(c) for c in (
-    "::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
-    "2001::/32", "2001:2::/48", "2001:db8::/32", "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
-))
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
-_URL_USERINFO_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://)[^\s/@#\"'<>]+@")
-_URL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9+.-])(https?://[^\s?#\"'<>]+)\?[^\s#\"'<>]+")
-_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_PUBLIC_TLD_RE = re.compile(r"^(?:[a-z]{2,}|xn--[a-z0-9-]{2,})$")
+MAX_API_JSON_BYTES = security.MAX_JSON_BYTES
+MAX_MEDIA_BYTES = security.MAX_MEDIA_BYTES
+MAX_CDN_REDIRECTS = security.MAX_REDIRECTS
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -135,160 +121,11 @@ def is_expired(expires_at: str | None, margin_seconds: int = EXPIRY_MARGIN_SECON
 
 
 def redact_sensitive(text: str) -> str:
-    out = _BEARER_RE.sub("Bearer [REDACTED]", str(text or ""))
-    for env_key in ("DOKITOOL_API_TOKEN", "DOKITOOL_OWNER_TOKEN"):
-        secret = (os.environ.get(env_key) or "").strip()
-        if len(secret) >= 8:
-            out = out.replace(secret, "[REDACTED_TOKEN]")
-    return _URL_QUERY_RE.sub(r"\1?[REDACTED]", _URL_USERINFO_RE.sub(r"\1[REDACTED]@", out))
+    return security.redact_sensitive(text)
 
 
-def _parse_ip(raw_host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    try:
-        return ipaddress.ip_address(raw_host.strip("[]").split("%", 1)[0])
-    except ValueError:
-        return None
-
-
-def _is_loopback_host(host: str) -> bool:
-    norm = (host or "").strip().lower().rstrip(".")
-    if norm == "localhost" or (norm.endswith(".localhost") and all(_DNS_LABEL_RE.match(lbl) for lbl in norm.split("."))):
-        return True
-    ip = _parse_ip(norm)
-    if ip is None:
-        return False
-    return ip.ipv4_mapped.is_loopback if (isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped) else ip.is_loopback
-
-
-def _is_public_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        return _is_public_ip(addr.ipv4_mapped)
-    if (
-        addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast
-        or addr.is_reserved or addr.is_unspecified or getattr(addr, "is_site_local", False) or not addr.is_global
-    ):
-        return False
-    nets = _FORBIDDEN_IPV4_NETS if isinstance(addr, ipaddress.IPv4Address) else _FORBIDDEN_IPV6_NETS
-    return not any(addr in net for net in nets)
-
-
-def _get_env_proxies() -> dict[str, str]:
-    raw = urllib.request.getproxies_environment()
-    return {
-        k.lower(): v
-        for k, v in raw.items()
-        if k.lower() in ("http", "https") and isinstance(v, str) and v.strip()
-    }
-
-
-def _has_env_proxy_for(scheme: str, host: str, port: int | None = None) -> bool:
-    proxies = _get_env_proxies()
-    if not proxies.get(scheme.lower()):
-        return False
-    hostport = f"{host}:{port}" if port is not None else host
-    return not urllib.request.proxy_bypass_environment(hostport)
-
-
-def _connect_pinned_ip(ip_str: str, port: int, timeout: float | None, source_address: tuple[str, int] | None = None) -> socket.socket:
-    addr = ipaddress.ip_address(ip_str)
-    family = socket.AF_INET6 if isinstance(addr, ipaddress.IPv6Address) else socket.AF_INET
-    sockaddr = (ip_str, port, 0, 0) if family == socket.AF_INET6 else (ip_str, port)
-    sock = socket.socket(family, socket.SOCK_STREAM)
-    try:
-        if isinstance(timeout, (int, float)):
-            sock.settimeout(timeout)
-        if source_address:
-            sock.bind(source_address)
-        sock.connect(sockaddr)
-        return sock
-    except OSError:
-        sock.close()
-        raise
-
-
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host: str, *args, pinned_ips: tuple[str, ...] = (), **kwargs) -> None:
-        self._pinned_ips = pinned_ips
-        super().__init__(host, *args, **kwargs)
-
-    def connect(self) -> None:
-        if not self._pinned_ips:
-            super().connect()
-            return
-        last_err: OSError | None = None
-        for ip in self._pinned_ips:
-            try:
-                self.sock = _connect_pinned_ip(ip, self.port, self.timeout, self.source_address)
-                if self._tunnel_host:
-                    self._tunnel()
-                return
-            except OSError as exc:
-                last_err = exc
-        raise last_err or OSError(f"Failed to connect to pinned IP for {self.host}")
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, *args, pinned_ips: tuple[str, ...] = (), **kwargs) -> None:
-        self._pinned_ips = pinned_ips
-        super().__init__(host, *args, **kwargs)
-
-    def connect(self) -> None:
-        if not self._pinned_ips:
-            super().connect()
-            return
-        last_err: OSError | None = None
-        for ip in self._pinned_ips:
-            sock: socket.socket | None = None
-            try:
-                sock = _connect_pinned_ip(ip, self.port, self.timeout, self.source_address)
-                if self._tunnel_host:
-                    self.sock = sock
-                    self._tunnel()
-                self.sock = self._context.wrap_socket(sock, server_hostname=self._tunnel_host or self.host)
-                return
-            except OSError as exc:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
-                self.sock, last_err = None, exc
-        raise last_err or OSError(f"Failed to establish TLS to pinned IP for {self.host}")
-
-
-class _PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, pinned_ips: tuple[str, ...] = ()) -> None:
-        super().__init__()
-        self._pinned_ips = pinned_ips
-
-    def http_open(self, req: urllib.request.Request):
-        return self.do_open(_PinnedHTTPConnection, req, pinned_ips=self._pinned_ips)
-
-
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, context: ssl.SSLContext, pinned_ips: tuple[str, ...] = ()) -> None:
-        super().__init__(context=context)
-        self._pinned_ips = pinned_ips
-
-    def https_open(self, req: urllib.request.Request):
-        return self.do_open(_PinnedHTTPSConnection, req, context=self._context, pinned_ips=self._pinned_ips)
-
-
-def _build_safe_opener(*, bypass_proxy: bool, pinned_ips: tuple[str, ...] = ()) -> urllib.request.OpenerDirector:
-    """OpenerDirector with zero cookies, zero auto-redirects, zero file/ftp handlers, zero OS proxies."""
-    opener = urllib.request.OpenerDirector()
-    ctx = ssl.create_default_context()
-    use_pin = bypass_proxy and bool(pinned_ips)
-    proxy_map = {} if bypass_proxy else _get_env_proxies()
-    for handler in (
-        urllib.request.ProxyHandler(proxy_map),
-        _PinnedHTTPHandler(pinned_ips) if use_pin else urllib.request.HTTPHandler(),
-        _PinnedHTTPSHandler(ctx, pinned_ips) if use_pin else urllib.request.HTTPSHandler(context=ctx),
-        urllib.request.HTTPDefaultErrorHandler(),
-        urllib.request.HTTPErrorProcessor(),
-    ):
-        opener.add_handler(handler)
-    return opener
+def validate_api_base(api_base: str) -> str:
+    return security.validate_api_base(api_base)
 
 
 def validate_remote_url_and_pin(
@@ -297,87 +134,20 @@ def validate_remote_url_and_pin(
     allowed_loopback_origin: tuple[str, str, int] | None = None,
     enforce_standard_ports: bool = True,
 ) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
-    if not isinstance(url, str) or not url or len(url) > 8192:
-        raise ValueError("Invalid remote URL")
-    if any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in ("\\", "#") for ch in url):
-        raise ValueError("URL contains forbidden characters")
-    parsed = urllib.parse.urlsplit(url)
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise ValueError(f"Unsupported URL scheme: {scheme or '<empty>'}")
-    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc or not parsed.hostname:
-        raise ValueError("URL userinfo is forbidden and hostname is required")
-    host = parsed.hostname.lower().rstrip(".")
-    if "%" in host:
-        raise ValueError("Scoped IPv6 addresses are forbidden")
-    port = parsed.port or (443 if scheme == "https" else 80)
-
-    if _is_loopback_host(host):
-        if allowed_loopback_origin is None or (scheme, host, port) != allowed_loopback_origin:
-            raise ValueError("Refusing loopback/local URL for media fetch")
-        ip = _parse_ip(host)
-        if ip is not None:
-            return parsed, (str(ip),)
-        return parsed, ("127.0.0.1", "::1")
-
-    if enforce_standard_ports and port not in STANDARD_HTTP_PORTS:
-        raise ValueError(f"Refusing non-standard media port: {port}")
-    if any(host == s or host.endswith("." + s) for s in BLOCKED_HOST_SUFFIXES):
-        raise ValueError(f"Blocked internal hostname suffix: {host}")
-    ip = _parse_ip(host)
-    if ip is not None:
-        if not _is_public_ip(ip):
-            raise ValueError("Refusing non-public IP literal")
-        return parsed, (str(ip),)
-    labels = host.split(".")
-    if len(labels) < 2 or not _PUBLIC_TLD_RE.match(labels[-1]) or not all(_DNS_LABEL_RE.match(lbl) for lbl in labels):
-        raise ValueError(f"Invalid public DNS hostname: {host}")
-    try:
-        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-    except OSError as exc:
-        raise ValueError(f"DNS resolution failed for {host}") from exc
-    pinned: list[str] = []
-    for entry in infos:
-        resolved = _parse_ip(str(entry[4][0]))
-        if resolved is None or not _is_public_ip(resolved):
-            raise ValueError(f"Host {host} resolved to non-public IP")
-        ip_str = str(resolved)
-        if ip_str not in pinned:
-            pinned.append(ip_str)
-    if not pinned:
-        raise ValueError(f"No public IP addresses resolved for {host}")
-    return parsed, tuple(pinned)
-
-
-def validate_api_base(api_base: str) -> str:
-    cleaned = api_base.strip().rstrip("/")
-    parsed = urllib.parse.urlsplit(cleaned)
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if (
-        scheme not in {"http", "https"} or not host or parsed.query or parsed.fragment
-        or parsed.username is not None or parsed.password is not None or "@" in parsed.netloc
-    ):
-        raise ValueError("Invalid --api-base URL")
-    if _is_loopback_host(host):
-        return cleaned
-    if scheme != "https":
-        raise ValueError("Refusing to send Bearer token over plaintext HTTP to non-loopback host")
-    if any(host == s or host.endswith("." + s) for s in BLOCKED_HOST_SUFFIXES):
-        raise ValueError("Refusing internal hostname for --api-base")
-    ip = _parse_ip(host)
-    if ip is not None and not _is_public_ip(ip):
-        raise ValueError("Refusing non-public IP literal for --api-base")
-    return cleaned
+    return security.validate_and_resolve_remote_url(
+        url,
+        allow_loopback=allowed_loopback_origin is not None,
+        resolve_dns=True,
+        allowed_ports=security.STANDARD_HTTP_PORTS if enforce_standard_ports else None,
+        allowed_loopback_origin=allowed_loopback_origin,
+    )
 
 
 def validate_owner_token(raw: str) -> str:
     token = raw.strip()
     if not token:
         raise ValueError("Environment variable DOKITOOL_API_TOKEN (or legacy DOKITOOL_OWNER_TOKEN) is empty or unset")
-    if len(token) < 32 or len(token) > 512 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
-        raise ValueError("API Bearer token must be 32-512 printable non-whitespace ASCII characters")
-    return token
+    return security.validate_token(token)
 
 
 def sanitize_token(text: str, max_chars: int = 48) -> str:
@@ -468,38 +238,14 @@ def infer_extension(
 
 
 def safe_output_path(output_dir: Path, filename: str) -> Path:
-    if output_dir.is_symlink():
-        raise ValueError("Output directory cannot be a symlink")
-    if (
-        not filename
-        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in filename)
-        or "/" in filename or "\\" in filename or ":" in filename
-        or filename.endswith((".", " "))
-        or filename.split(".", 1)[0].upper() in WINDOWS_RESERVED
-    ):
-        raise ValueError(f"Unsafe output filename rejected: {filename}")
-    root = output_dir.resolve()
-    raw_target = root / filename
-    if raw_target.is_symlink():
-        raise ValueError(f"Symlink target rejected: {filename}")
-    candidate = raw_target.resolve()
-    if candidate.parent != root:
-        raise ValueError(f"Unsafe output filename rejected: {filename}")
-    return candidate
-
-
-def _is_bilibili_akamai_cdn(host: str, path: str) -> bool:
-    if not host.endswith(".akamaized.net"):
-        return False
-    first_label = host.split(".", 1)[0]
-    return host.startswith("upos-") or "bili" in first_label or "/upgcxcode/" in path.lower()
+    return security.resolve_jailed_path(output_dir, filename, allow_subdirs=False)
 
 
 def cdn_headers_for_url(url: str, byte_offset: int = 0, byte_end: int | None = None) -> dict[str, str]:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Refusing non-HTTP(S) media URL")
-    host = parsed.hostname.lower()
+    host = parsed.hostname.lower().rstrip(".")
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; DokiToolAgentExample/1.0)",
         "Accept": "*/*",
@@ -507,16 +253,8 @@ def cdn_headers_for_url(url: str, byte_offset: int = 0, byte_end: int | None = N
     # Weibo raw CDN URLs require Referer: https://weibo.com/ (without Cookie).
     if host == "weibo.com" or host.endswith(".weibocdn.com") or host.endswith(".sinaimg.cn"):
         headers["Referer"] = "https://weibo.com/"
-    # Bilibili media CDNs (incl. overseas Akamai UPOS nodes) require Referer: https://www.bilibili.com/ (without Cookie).
-    elif (
-        host == "bilivideo.com"
-        or host.endswith(".bilivideo.com")
-        or host == "bilivideo.cn"
-        or host.endswith(".bilivideo.cn")
-        or host == "hdslb.com"
-        or host.endswith(".hdslb.com")
-        or _is_bilibili_akamai_cdn(host, parsed.path)
-    ):
+    # Bilibili media CDNs (incl. narrow Akamai UPOS nodes) require Referer: https://www.bilibili.com/ (without Cookie).
+    elif security.is_bilibili_media_host(url):
         headers["Referer"] = "https://www.bilibili.com/"
     if byte_end is not None:
         headers["Range"] = f"bytes={byte_offset}-{byte_end}"
@@ -535,7 +273,12 @@ class AgentClient:
         api_host = (parsed_api.hostname or "").lower().rstrip(".")
         api_port = parsed_api.port or (443 if parsed_api.scheme.lower() == "https" else 80)
         self._allowed_loopback_origin: tuple[str, str, int] | None = (
-            (parsed_api.scheme.lower(), api_host, api_port) if _is_loopback_host(api_host) else None
+            (parsed_api.scheme.lower(), api_host, api_port) if security.is_loopback_host(api_host) else None
+        )
+        self._fetcher = http_transport.SafeHTTPFetcher(
+            timeout=timeout,
+            max_redirects=MAX_CDN_REDIRECTS,
+            allowed_loopback_origin=self._allowed_loopback_origin,
         )
 
     def open_safe_url(
@@ -547,37 +290,16 @@ class AgentClient:
         allow_redirects: bool,
         is_api: bool = False,
     ):
-        """Open HTTP(S) URL with zero cookies, anti-SSRF IP pinning, and manual redirect re-validation."""
-        current = url
-        hops = 0
-        prev_scheme: str | None = None
-        while True:
-            parsed, pinned_ips = validate_remote_url_and_pin(
-                current,
-                allowed_loopback_origin=self._allowed_loopback_origin if (is_api or hops == 0 or self._allowed_loopback_origin is not None) else None,
-                enforce_standard_ports=not is_api,
-            )
-            scheme = parsed.scheme.lower()
-            if hops > 0 and prev_scheme == "https" and scheme != "https":
-                raise ValueError("Refusing HTTPS-to-HTTP redirect downgrade")
-            prev_scheme = scheme
-            host = (parsed.hostname or "").lower().rstrip(".")
-            use_proxy = (not _is_loopback_host(host)) and _has_env_proxy_for(scheme, host, parsed.port)
-            bypass = not use_proxy
-            opener = _build_safe_opener(bypass_proxy=bypass, pinned_ips=pinned_ips if bypass else ())
-            req = urllib.request.Request(current, headers=headers_fn(current, hops), method="GET")
-            try:
-                return opener.open(req, timeout=timeout), current
-            except urllib.error.HTTPError as exc:
-                if exc.code in {301, 302, 303, 307, 308}:
-                    location = (exc.headers.get("Location") or "").strip() if exc.headers else ""
-                    exc.close()
-                    if not allow_redirects or not location or hops >= MAX_CDN_REDIRECTS:
-                        raise ValueError(f"Redirect rejected or exceeded limit ({MAX_CDN_REDIRECTS})") from exc
-                    current = urllib.parse.urljoin(current, location)
-                    hops += 1
-                    continue
-                raise
+        """Open HTTP(S) URL via shared SafeHTTPFetcher (zero cookies, IP pinning, per-hop redirect check)."""
+        return self._fetcher.open_url(
+            url,
+            headers_fn=headers_fn,
+            allow_loopback=is_api or (self._allowed_loopback_origin is not None),
+            allow_redirects=allow_redirects,
+            media_mode=False,
+            enforce_standard_ports=not is_api,
+            timeout=timeout,
+        )
 
     def api_get(self, path_and_query: str) -> dict:
         url = f"{self.api_base}{path_and_query}"
@@ -613,54 +335,53 @@ class AgentClient:
                             redact_sensitive(str(err.get("message") or "Unexpected non-OK response")),
                         )
                     return payload
-            except urllib.error.HTTPError as exc:
-                raw_body = exc.read(64 * 1024).decode("utf-8", errors="replace")
-                exc.close()
+            except security.HTTPStatusError as exc:
+                raw_body = exc.body.decode("utf-8", errors="replace")
                 try:
                     body = json.loads(raw_body)
                 except ValueError:
                     body = {}
                 err = body.get("error") if isinstance(body.get("error"), dict) else {}
-                code = str(err.get("code") or body.get("code") or f"HTTP_{exc.code}")
-                message = redact_sensitive(str(err.get("message") or exc.reason or "HTTP error"))
+                code = str(err.get("code") or body.get("code") or f"HTTP_{exc.status}")
+                message = redact_sensitive(str(err.get("message") or f"HTTP {exc.status}"))
                 retryable = bool(err.get("retryable"))
 
                 # CRITICAL: HTTP 401 returns code="INVALID_INPUT" and charges the anonymous
                 # per-IP burst bucket. Stop the entire batch immediately.
-                if exc.code == 401:
+                if exc.status == 401:
                     self.abort_event.set()
                     raise FatalAuthError(
                         f"HTTP 401 ({code}: {message}) - check DOKITOOL_API_TOKEN / DOKITOOL_OWNER_TOKEN and server config"
                     ) from exc
 
-                if exc.code == 429:
+                if exc.status == 429:
                     rate_limit_attempts += 1
                     if rate_limit_attempts > 3:
-                        raise PermanentAPIError(exc.code, code, f"{message} (retries exhausted)") from exc
+                        raise PermanentAPIError(exc.status, code, f"{message} (retries exhausted)") from exc
                     retry_sec = err.get("retry_after_seconds")
                     if not isinstance(retry_sec, int) or retry_sec < 1:
-                        header_val = exc.headers.get("Retry-After", "1") if exc.headers else "1"
+                        header_val = exc.headers.get("retry-after", "1")
                         retry_sec = int(header_val) if header_val.isdigit() else 1
                     delay = min(60.0, float(max(1, retry_sec))) + random.uniform(0.05, 0.25)
                     self._sleep(delay)
                     continue
 
-                if exc.code == 503 and retryable and transient_attempts < 2:
+                if exc.status == 503 and retryable and transient_attempts < 2:
                     transient_attempts += 1
                     retry_sec = err.get("retry_after_seconds")
                     if not isinstance(retry_sec, int) or retry_sec < 1:
-                        header_val = exc.headers.get("Retry-After", "") if exc.headers else ""
+                        header_val = exc.headers.get("retry-after", "")
                         retry_sec = int(header_val) if header_val.isdigit() else int(2 * transient_attempts)
                     delay = min(60.0, float(max(1, retry_sec))) + random.uniform(0.05, 0.25)
                     self._sleep(delay)
                     continue
 
-                if exc.code in {502, 504} and retryable and transient_attempts < 2:
+                if exc.status in {502, 504} and retryable and transient_attempts < 2:
                     transient_attempts += 1
                     self._sleep(2.0 * transient_attempts + random.uniform(0.05, 0.25))
                     continue
 
-                raise PermanentAPIError(exc.code, code, message) from exc
+                raise PermanentAPIError(exc.status, code, message) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if transient_attempts < 2:
                     transient_attempts += 1
@@ -702,10 +423,9 @@ class AgentClient:
                 scored.append((-1.0, idx, route))
         scored.sort(key=lambda entry: (-entry[0], entry[1]))
         probed_urls = {r["url"] for _, _, r in scored}
-        ordered = [r for _, _, r in scored if _ >= 0] + [r for r in routes if r["url"] not in probed_urls]
+        ordered = [r for rate, _, r in scored if rate >= 0] + [r for r in routes if r["url"] not in probed_urls]
         if not ordered:
             return routes
-        # Keep failed routes at the tail as last-resort fallbacks
         failed = [r for rate, _, r in scored if rate < 0]
         return ordered + [r for r in failed if r not in ordered]
 
@@ -909,7 +629,7 @@ def download_single_route(
             if cl.isdigit():
                 remote_total = int(cl)
         else:
-            raise urllib.error.HTTPError(final_url, status, "Unexpected CDN status", resp.headers, None)
+            raise security.HTTPStatusError(status, final_url, {}, b"")
 
         if remote_total is not None and remote_total > MAX_MEDIA_BYTES:
             raise ValueError(f"CDN Content-Length exceeds {MAX_MEDIA_BYTES} byte limit")
@@ -962,6 +682,11 @@ def download_with_failover(
         try:
             final_path, saved_bytes = download_single_route(client, route, task)
             return final_path, saved_bytes, False
+        except security.HTTPStatusError as exc:
+            last_err = exc
+            if exc.status in {403, 410}:
+                saw_auth_or_gone = True
+            continue
         except urllib.error.HTTPError as exc:
             last_err = exc
             if exc.code in {403, 410}:
@@ -1026,7 +751,6 @@ def process_share_input(
 
         for task in tasks:
             if not task["routes"]:
-                # All routes already expired; refresh once before giving up.
                 final_path = None
                 saw_expired = True
                 nbytes = 0
@@ -1036,7 +760,6 @@ def process_share_input(
                 )
 
             if saw_expired and nbytes == 0:
-                # Single re-parse / re-resolve refresh on 403/410 CDN signature expiry.
                 refreshed_env = (
                     client.resolve_item(resolve_url)
                     if isinstance(resolve_url, str) and resolve_url

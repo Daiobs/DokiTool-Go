@@ -1,35 +1,14 @@
-import test, { before, after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
+import * as model from "../src/extension/sidePanelResultModel.ts";
+import { collectTransitiveImportGraph } from "./helpers/staticImportGraph.mjs";
 
 const MODEL_PATH = fileURLToPath(
   new URL("../src/extension/sidePanelResultModel.ts", import.meta.url),
 );
-
-let model;
-let bundleInputs = [];
-
-before(async () => {
-  const bundled = await build({
-    entryPoints: [MODEL_PATH],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-    metafile: true,
-  });
-  bundleInputs = Object.keys(bundled.metafile.inputs);
-  const code = bundled.outputFiles[0].text;
-  model = await import(
-    `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-  );
-});
-
-after(() => {
-  stop();
-});
+const bundleInputs = collectTransitiveImportGraph(MODEL_PATH);
 
 const CTX = { apiOrigin: "https://snap.dokitool.com" };
 

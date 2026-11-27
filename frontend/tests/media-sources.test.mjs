@@ -1,124 +1,42 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { build as esbuildBuild, stop as esbuildStop } from 'esbuild';
-import { transformWithEsbuild } from 'vite';
 import { createRenderer, h, markRaw, nextTick, reactive, ref } from 'vue';
-import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
-import { loadSfc } from './helpers/loadSfc.mjs';
+import * as contract from '../src/utils/mediaContract.ts';
+import * as labels from '../src/utils/mediaSources.ts';
+import * as coreMediaBarrel from '../src/core/media/index.ts';
+import * as variantDefaultUpgradeMod from '../src/core/media/variantDefaultUpgrade.ts';
+import * as uiTargetHelpers from '../src/extension/uiTargetHelpers.ts';
+import * as parseHelpers from '../src/utils/parseHelpers.ts';
+import { loadSfc, loadSfcModule } from './helpers/loadSfc.mjs';
 
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FRONTEND_DIR = resolve(__dirname, '..');
-let tmpExtBundleDir = '';
-let labels, contract, useVideoSelection, ResultSection, uiTargetHelpers, parseHelpers, SidePanelResult, coreMediaBarrel, variantDefaultUpgradeMod;
+let useVideoSelection, ResultSection, SidePanelResult;
 const originals = { window: globalThis.window, document: globalThis.document };
 before(async () => {
-  const modules = {};
-  async function load(relative, aliases = {}) {
-    const content = await readFile(new URL(relative, import.meta.url), 'utf8');
-    const compiled = await transformWithEsbuild(content, relative, { loader: 'ts', format: 'cjs' });
-    const module = { exports: {} };
-    new Function('require', 'module', 'exports', compiled.code)(id => aliases[id] || modules[id] || require(id), module, module.exports);
-    return module.exports;
-  }
-  contract = modules['../utils/mediaContract'] = modules['../../utils/mediaContract'] = await load('../src/utils/mediaContract.ts');
-  labels = modules['../utils/mediaSources'] = modules['../../utils/mediaSources'] = await load('../src/utils/mediaSources.ts');
-  modules['../utils/youtubeHelperCore'] = youtubeHelperCore;
-  modules['../services/apiConfig'] = { apiConfig: { baseUrl: '' } };
-  const cdnTransportHints = await load('../src/core/media/cdnTransportHints.ts');
-  const variantSort = await load('../src/core/media/variantSort.ts');
-  variantDefaultUpgradeMod = await load('../src/core/media/variantDefaultUpgrade.ts', {
-    './variantSort': variantSort,
-  });
-  const hostWhitelist = await load('../src/extension/hostWhitelist.ts');
-  const dashMuxSpec = await load('../src/extension/dashMuxSpec.ts', {
-    '../utils/mediaContract': contract,
-  });
-  const muxSpec = await load('../src/core/media/muxSpec.ts', {
-    '../../extension/dashMuxSpec': dashMuxSpec,
-    '../../extension/hostWhitelist': hostWhitelist,
-    './cdnTransportHints': cdnTransportHints,
-    './variantSort': variantSort,
-  });
-  const layoutAndFilename = await load('../src/core/media/layoutAndFilename.ts', {
-    './variantSort': variantSort,
-  });
-  const bilingualCueMerger = await load('../src/core/media/bilingualCueMerger.ts');
-  const subtitleEngine = await load('../src/core/media/subtitleEngine.ts', {
-    '../../utils/mediaContract': contract,
-    './bilingualCueMerger': bilingualCueMerger,
-  });
-  const subtitleController = await load('../src/core/media/subtitleController.ts', {
-    './subtitleEngine': subtitleEngine,
-  });
-  coreMediaBarrel = await load('../src/core/media/index.ts', {
-    './cdnTransportHints': cdnTransportHints,
-    './muxSpec': muxSpec,
-    './variantSort': variantSort,
-    './variantDefaultUpgrade': variantDefaultUpgradeMod,
-    './layoutAndFilename': layoutAndFilename,
-    './subtitleEngine': subtitleEngine,
-    './subtitleController': subtitleController,
-    './extensionRoutes': await load('../src/core/media/extensionRoutes.ts', {
-      '../../extension/hostWhitelist': hostWhitelist,
-      './cdnTransportHints': cdnTransportHints,
-    }),
-  });
-  modules['../core/media'] = coreMediaBarrel;
-  ({ useVideoSelection } = await load('../src/composables/useVideoSelection.ts'));
+  ({ useVideoSelection } = await loadSfcModule(
+    new URL('../src/composables/useVideoSelection.ts', import.meta.url),
+    {
+      modules: {
+        '../services/apiConfig': { apiConfig: { baseUrl: '' } },
+      },
+    },
+  ));
   ResultSection = await loadSfc(
     new URL('../src/components/ResultSection.vue', import.meta.url),
     {
       modules: {
-        ...modules,
+        '../services/apiConfig': { apiConfig: { baseUrl: '' } },
         './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
       },
     },
   );
-  tmpExtBundleDir = mkdtempSync(join(tmpdir(), 'dokitool-media-sources-'));
-  const extOutfile = join(tmpExtBundleDir, 'ext-helpers.mjs');
-  await esbuildBuild({
-    stdin: {
-      contents: `
-        export * as uiTargetHelpers from "./src/extension/uiTargetHelpers.ts";
-        export * as parseHelpers from "./src/utils/parseHelpers.ts";
-        export * as mediaContract from "./src/utils/mediaContract.ts";
-      `,
-      resolveDir: FRONTEND_DIR,
-      loader: 'ts',
-    },
-    bundle: true,
-    outfile: extOutfile,
-    platform: 'browser',
-    format: 'esm',
-    define: { 'import.meta.env': '{}' },
-  });
-  const extSuite = await import(pathToFileURL(extOutfile).href);
-  uiTargetHelpers = extSuite.uiTargetHelpers;
-  parseHelpers = extSuite.parseHelpers;
   SidePanelResult = await loadSfc(
     new URL('../src/extension/components/SidePanelResult.vue', import.meta.url),
-    {
-      modules: {
-        '../../utils/mediaContract': extSuite.mediaContract,
-        '../uiTargetHelpers': uiTargetHelpers,
-      },
-    },
   );
   globalThis.window = { addEventListener() {}, removeEventListener() {} };
   globalThis.document = { body: { style: {} } };
 });
 after(() => {
-  esbuildStop();
-  if (tmpExtBundleDir) {
-    rmSync(tmpExtBundleDir, { recursive: true, force: true });
-  }
   Object.assign(globalThis, originals);
 });
 

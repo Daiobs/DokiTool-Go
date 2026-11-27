@@ -1699,4 +1699,26 @@ test("Architecture Boundary Gate: static import direction & planning host-purity
       assert.ok(res.violations.some((v) => v.includes("[view-model-host-side-effect]") && v.includes("navigator-storage")));
     },
   );
+
+  // 5) src/core/** line cap calibration: (600, 800] emits non-blocking soft notice; > 800 hard-fails
+  const linesOf = (n) => Array.from({ length: n }, (_, i) => `export const v${i} = ${i};`).join("\n") + "\n";
+  withTempFrontend(
+    { "src/core/midSizeCore.ts": linesOf(650) },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, true, `650-line core module must pass with soft notice: ${res.violations.join("\n")}`);
+      assert.ok(
+        res.ratchetNotices.some((n) => n.includes("src/core/midSizeCore.ts") && n.includes("soft threshold 600")),
+        `expected soft notice for 650-line core module, got: ${res.ratchetNotices.join("\n")}`,
+      );
+    },
+  );
+  withTempFrontend(
+    { "src/core/oversizeCore.ts": linesOf(801) },
+    (tmpRoot) => {
+      const res = runArchitectureBoundaryCheck({ frontendRoot: tmpRoot, legacyRatchets: {} });
+      assert.equal(res.passed, false);
+      assert.ok(res.violations.some((v) => v.includes("[file-line-cap]") && v.includes("oversizeCore.ts") && v.includes("800")));
+    },
+  );
 });

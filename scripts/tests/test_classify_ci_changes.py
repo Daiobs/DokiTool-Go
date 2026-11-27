@@ -127,8 +127,6 @@ class ClassifyPathsTests(unittest.TestCase):
         full_triggers = [
             ".github/workflows/go-migration.yml",
             ".github/workflows/gateway-isolation.yml",
-            ".github/workflows/php-oracle.yml",
-            "public-files.json",
             ".gitignore",
             "docs/schema/unified-v1/unified-v1.schema.json",
             "docs/schema/unified-v1/examples/01-douyin-quality-and-cdn.json",
@@ -137,7 +135,6 @@ class ClassifyPathsTests(unittest.TestCase):
             "backend/internal/ytengine/engine.go",
             "backend/internal/ytengine/variants.go",
             "backend/config/platforms.json",
-            "backend/config/platforms_extra.json",
             "frontend/src/monitor/statsTypes.generated.ts",
             "frontend/scripts/test-pipixia-representation.mjs",
             "frontend/scripts/test-shanghai-original.mjs",

@@ -1,35 +1,7 @@
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import test, { after, before } from "node:test";
-import { build, stop } from "esbuild";
-
-let subtitleController;
-let subtitleEngine;
-
-before(async () => {
-  const bundleMod = async (rel) => {
-    const absEntry = fileURLToPath(new URL(rel, import.meta.url));
-    const bundled = await build({
-      entryPoints: [absEntry],
-      bundle: true,
-      write: false,
-      platform: "node",
-      format: "esm",
-    });
-    const code = bundled.outputFiles[0].text;
-    return import(
-      `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-    );
-  };
-  [subtitleController, subtitleEngine] = await Promise.all([
-    bundleMod("../src/core/media/subtitleController.ts"),
-    bundleMod("../src/core/media/subtitleEngine.ts"),
-  ]);
-});
-
-after(() => {
-  stop();
-});
+import test from "node:test";
+import * as subtitleController from "../src/core/media/subtitleController.ts";
+import * as subtitleEngine from "../src/core/media/subtitleEngine.ts";
 
 function makeTrack(id, language, url, format = "vtt") {
   return {

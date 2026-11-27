@@ -1,8 +1,7 @@
-"""Unit tests for scripts/check-public-files.py (--sync, --add, and security boundaries)."""
+"""Unit tests for zero-config scripts/check-public-files.py forbidden-file guard."""
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -27,86 +26,81 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
-class PublicFilesSyncTests(unittest.TestCase):
+class PublicFilesGuardTests(unittest.TestCase):
     def _init_repo(self, repo: Path) -> None:
         _git(repo, "init")
         _git(repo, "config", "user.email", "test@example.com")
         _git(repo, "config", "user.name", "Test")
         (repo / "src").mkdir()
         (repo / "src/a.txt").write_text("alpha\n", encoding="utf-8")
-        initial_files = sorted([".gitignore", "public-files.json", "src/a.txt"])
-        (repo / "public-files.json").write_text(
-            json.dumps({"files": initial_files}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        (repo / ".gitignore").write_text(cpf.ignore_text(initial_files), encoding="utf-8")
-        _git(repo, "add", ".gitignore", "public-files.json", "src/a.txt")
+        (repo / ".gitignore").write_text("node_modules/\nfrontend/dist-extension/\n.env.*\n!.env.example\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore", "src/a.txt")
         _git(repo, "commit", "-m", "init")
 
-    def test_add_registers_new_file_and_rewrites_gitignore_without_sweeping_untracked(self) -> None:
+    def test_zero_config_new_source_and_allowed_examples_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             self._init_repo(repo)
-            (repo / "src/b.txt").write_text("beta\n", encoding="utf-8")
-            # Untracked local file must NEVER be swept in automatically.
-            (repo / "local-scratch.txt").write_text("keep ignored\n", encoding="utf-8")
-
-            rc = cpf.run_check(["--add", "src/b.txt"], root=repo)
-            self.assertEqual(rc, 0)
-            manifest = json.loads((repo / "public-files.json").read_text(encoding="utf-8"))
-            self.assertEqual(
-                manifest["files"],
-                [".gitignore", "public-files.json", "src/a.txt", "src/b.txt"],
-            )
-            self.assertNotIn("local-scratch.txt", manifest["files"])
-            gitignore = (repo / ".gitignore").read_text(encoding="utf-8")
-            self.assertIn("!/src/b.txt", gitignore)
-            self.assertNotIn("local-scratch.txt", gitignore)
-
-            _git(repo, "add", ".gitignore", "public-files.json", "src/b.txt")
-            self.assertEqual(cpf.run_check(["--staged"], root=repo), 0)
-
-    def test_sync_prunes_deleted_and_adds_staged_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            self._init_repo(repo)
-            (repo / "src/c.txt").write_text("gamma\n", encoding="utf-8")
-            (repo / "untracked.log").write_text("secret\n", encoding="utf-8")
-            _git(repo, "rm", "src/a.txt")
-            _git(repo, "add", "-f", "src/c.txt")
-
-            rc = cpf.run_check(["--sync"], root=repo)
-            self.assertEqual(rc, 0)
-            manifest = json.loads((repo / "public-files.json").read_text(encoding="utf-8"))
-            self.assertEqual(
-                manifest["files"],
-                [".gitignore", "public-files.json", "src/c.txt"],
-            )
-            _git(repo, "add", ".gitignore", "public-files.json")
-            self.assertEqual(cpf.run_check(["--staged"], root=repo), 0)
-
-    def test_security_rejections_fail_closed_without_mutating_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            self._init_repo(repo)
-            before_manifest = (repo / "public-files.json").read_text(encoding="utf-8")
-            before_ignore = (repo / ".gitignore").read_text(encoding="utf-8")
-
-            (repo / ".env.local").write_text("TOKEN=secret\n", encoding="utf-8")
-            (repo / "dist").mkdir()
-            (repo / "dist/bundle.js").write_text("x\n", encoding="utf-8")
-            (repo / "src/link.txt").symlink_to(repo / "src/a.txt")
-
-            for bad_path in (".env.local", "dist/bundle.js", "src/link.txt", "../outside.txt", "src\\a.txt"):
-                with self.subTest(bad_path=bad_path):
-                    with self.assertRaises(ValueError):
-                        cpf.run_check(["--add", bad_path], root=repo)
-                    self.assertEqual((repo / "public-files.json").read_text(encoding="utf-8"), before_manifest)
-                    self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), before_ignore)
-
-            # .env.example IS permitted.
+            (repo / "src/new_module.ts").write_text("export const ok = true;\n", encoding="utf-8")
             (repo / ".env.example").write_text("DOKITOOL_PORT=8080\n", encoding="utf-8")
-            self.assertEqual(cpf.run_check(["--add", ".env.example"], root=repo), 0)
+            (repo / "ops/examples").mkdir(parents=True)
+            (repo / "ops/examples/api-keys.example.json").write_text('{"keys":[]}\n', encoding="utf-8")
+            # Untracked local scratch file should not affect tracked index guard.
+            (repo / "local-scratch.log").write_text("untracked\n", encoding="utf-8")
+
+            _git(repo, "add", "src/new_module.ts", ".env.example", "ops/examples/api-keys.example.json")
+            self.assertEqual(cpf.run_check([], root=repo), 0)
+            self.assertEqual(cpf.run_check(["--staged"], root=repo), 0)
+
+            # Unstaged modification to a tracked file must fail under --staged.
+            (repo / "src/a.txt").write_text("modified-unstaged\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Tracked working files differ"):
+                cpf.run_check(["--staged"], root=repo)
+
+    def test_forbidden_dirs_secrets_artifacts_symlinks_and_oversized_fail_closed(self) -> None:
+        cases = [
+            ("frontend/dist-extension/manifest.json", b'{"manifest_version":3}\n', "Forbidden directory"),
+            ("node_modules/pkg/index.js", b"module.exports = {};\n", "Forbidden directory"),
+            (".gemini/cache.json", b"{}\n", "Forbidden directory"),
+            ("scratch/tmp.txt", b"x\n", "Forbidden directory"),
+            (".env.production", b"TOKEN=secret\n", "Only .env.example"),
+            ("ops/server.key", b"PRIVATE KEY\n", "Sensitive key/certificate"),
+            ("ops/cert.pem", b"CERT\n", "Sensitive key/certificate"),
+            ("ops/id_ed25519", b"SSH KEY\n", "Private SSH key"),
+            ("ops/api-keys.json", b'{"keys":[]}\n', "Non-example API key"),
+            ("backend/app.test", b"ELF", "Compiled/binary artifact"),
+            ("scripts/mod.pyc", b"PYC", "Compiled/binary artifact"),
+        ]
+        for rel_path, content, err_pattern in cases:
+            with self.subTest(rel_path=rel_path):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp)
+                    self._init_repo(repo)
+                    target = repo / rel_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(content)
+                    _git(repo, "add", "-f", rel_path)
+                    with self.assertRaisesRegex(ValueError, err_pattern):
+                        cpf.run_check(["--staged"], root=repo)
+
+    def test_symlink_and_oversized_binary_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            link = repo / "src/link.txt"
+            link.symlink_to(repo / "src/a.txt")
+            _git(repo, "add", "-f", "src/link.txt")
+            with self.assertRaisesRegex(ValueError, "Symlink is not permitted"):
+                cpf.run_check(["--staged"], root=repo)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            big = repo / "src/huge.bin"
+            big.write_bytes(b"0" * (cpf.MAX_FILE_BYTES + 1))
+            _git(repo, "add", "-f", "src/huge.bin")
+            with self.assertRaisesRegex(ValueError, "Oversized file"):
+                cpf.run_check(["--staged"], root=repo)
 
 
 if __name__ == "__main__":

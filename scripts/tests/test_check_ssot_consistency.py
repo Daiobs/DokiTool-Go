@@ -158,6 +158,12 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
                 "[mediabunny-ssot]",
             ),
             (
+                "mediabunny-notice-drift",
+                "NOTICE",
+                lambda s: s.replace("1.65.2", "1.64.0"),
+                "[mediabunny-ssot]",
+            ),
+            (
                 "release-build-hardcoded-go-version",
                 ".github/workflows/release-build.yml",
                 lambda s: s.replace("go-version-file: backend/go.mod", "go-version: '1.27.4'"),
@@ -206,6 +212,18 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
                     any(expected_tag in v for v in report["violations"]),
                     msg=f"{label}: expected {expected_tag} in {report['violations']}",
                 )
+
+    def test_narrative_docs_without_literal_versions_still_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_valid_repo(repo)
+            # Narrative Markdown prose should NOT be coupled to patch-level literal versions.
+            _write(repo / "README.md", "# DokiTool\nZero-Cookie Media Downloader\n")
+            _write(repo / "docs/EXTENSION.md", "# Chrome MV3 Extension\n")
+            _write(repo / "docs/RELEASE-RECEIPT.md", "# Release Receipt Template\n")
+            _write(repo / "frontend/public/llms.txt", "# DokiTool\n")
+            report = SSOT.run_all_checks(repo)
+            self.assertTrue(report["passed"], msg=report["violations"])
 
     def test_real_repo_passes_ssot_consistency(self) -> None:
         report = SSOT.run_all_checks(ROOT)

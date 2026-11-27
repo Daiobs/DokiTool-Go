@@ -142,7 +142,7 @@ URL 清单 (urls.txt)
 
 ## 8. 参考脚本快速上手（`examples/agent_batch_download.py`）
 
-仓库内置的 [examples/agent_batch_download.py](../examples/agent_batch_download.py) 仅依赖 **Python 3.9+ 标准库**，完整实现了认证急停（支持 `DOKITOOL_API_TOKEN` 优先与 `DOKITOOL_OWNER_TOKEN` 兼容）、`429` `Retry-After` 退避、分集 `/api/resolve`、多线路 `403` 切换与可选测速、独立防 SSRF 公网 IP pinning 与逐跳重定向重验（阻断 `https -> http` 降级）、严格 `KNOWN_MEDIA_EXTENSIONS` 扩展名白名单、8 MiB JSON / 2 GiB 媒体体积上限、`.part` + `Range` 续传、`403`/`410` 单次重解析刷新及 `manifest.jsonl` 幂等断点记录。
+仓库内置的 [examples/agent_batch_download.py](../examples/agent_batch_download.py) 零第三方 `pip` 依赖（仅使用 **Python 3.9+ 标准库** 并直接复用同仓纯标准库防 SSRF / IP pinning 传输模块 `tools/dokitool-agent/{security,http_transport}.py`），完整实现了认证急停（支持 `DOKITOOL_API_TOKEN` 优先与 `DOKITOOL_OWNER_TOKEN` 兼容）、`429` `Retry-After` 退避、分集 `/api/resolve`、多线路 `403` 切换与可选测速、公网 IP pinning 与逐跳重定向重验（阻断 `https -> http` 降级）、严格 `KNOWN_MEDIA_EXTENSIONS` 扩展名白名单、8 MiB JSON / 2 GiB 媒体体积上限、`.part` + `Range` 续传、`403`/`410` 单次重解析刷新及 `manifest.jsonl` 幂等断点记录。
 
 ### 8.1 准备输入文件
 

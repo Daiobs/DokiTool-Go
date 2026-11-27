@@ -1,28 +1,14 @@
 import test, { before } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { transformWithEsbuild } from 'vite';
-import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, createSSRApp, h, markRaw, nextTick, ref } from 'vue';
 import { renderToString } from '@vue/server-renderer';
+import * as icons from '../src/utils/iconPaths.ts';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
-const require = createRequire(import.meta.url);
-let icons, AppIcon;
+let AppIcon;
 before(async () => {
-  const source = await readFile(new URL('../src/utils/iconPaths.ts', import.meta.url), 'utf8');
-  const paths = await transformWithEsbuild(source, 'iconPaths.ts', { loader: 'ts', format: 'cjs' });
-  const dataModule = { exports: {} };
-  new Function('require', 'module', 'exports', paths.code)(require, dataModule, dataModule.exports);
-  icons = dataModule.exports;
-  const { descriptor } = parse(await readFile(new URL('../src/components/AppIcon.vue', import.meta.url), 'utf8'));
-  const script = compileScript(descriptor, { id: 'icon-test', inlineTemplate: true });
-  const code = await transformWithEsbuild(script.content, 'AppIcon.ts', { loader: 'ts', format: 'cjs' });
-  const componentModule = { exports: {} };
-  new Function('require', 'module', 'exports', code.code)(
-    (id) => id === '../utils/iconPaths' ? icons : require(id), componentModule, componentModule.exports,
-  );
-  AppIcon = componentModule.exports.default;
+  AppIcon = await loadSfc(new URL('../src/components/AppIcon.vue', import.meta.url));
 });
 
 test('every icon used by templates and dynamic status/platform maps has a local SVG', async () => {

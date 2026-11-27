@@ -50,6 +50,9 @@ class CheckGoFileBudgetsTests(unittest.TestCase):
             self.assertTrue(res.passed, msg=res.violations)
             self.assertEqual(res.files_checked, 2)
             self.assertEqual(res.ratcheted_checked, 0)
+            self.assertEqual(len(res.notices), 1)
+            self.assertIn("backend/internal/pkg/exact.go", res.notices[0])
+            self.assertIn("soft threshold 600", res.notices[0])
 
     def test_new_file_exceeding_default_limit_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

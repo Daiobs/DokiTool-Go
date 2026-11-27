@@ -10,7 +10,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 DOUYIN = "backend/testdata/php-douyin/cases.json"
 INTEGERS = "backend/internal/platform/douyin/testdata/php-integer-boundaries.json"
 MANIFEST = "backend/internal/testsupport/publicoracle/differences.json"

@@ -1,14 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { transformWithEsbuild } from 'vite';
 
 const origin = 'https://snap.example.test';
 const flush = async () => { for (let index = 0; index < 20; index++) await Promise.resolve(); };
+let isolateSeq = 0;
 
 async function harness(t) {
-  const transformed = await transformWithEsbuild(await readFile(new URL('../src/downloads/bridge.ts', import.meta.url), 'utf8'), 'bridge.ts', { loader: 'ts', format: 'esm' });
-  const api = await import('data:text/javascript;base64,' + Buffer.from(transformed.code + `\n// ${Math.random()}`).toString('base64'));
+  const api = await import(`../src/downloads/bridge.ts?isolate=${++isolateSeq}`);
   const originals = new Map(), frames = [], timers = new Map();
   let nextTimer = 0;
   const setGlobal = (name, value) => {

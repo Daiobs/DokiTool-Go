@@ -1,5 +1,3 @@
-//go:build phporacle
-
 package douyin
 
 import (
@@ -32,18 +30,10 @@ func TestPHPIntegerBoundaryBaseline(t *testing.T) {
 		len(unified.Slice(manifest["direct_cases"])) != 12 || len(unified.Map(manifest["source_sha256"])) != 12 {
 		t.Fatal("incomplete archived PHP integer boundary oracle")
 	}
+	// Producer scripts were retired into tag archive/php-oracle-final; fixture integrity is pinned by SHA-256 above.
 	producers := unified.Map(manifest["producer_sha256"])
 	if len(producers) != 2 {
 		t.Fatal("missing PHP integer oracle producers")
-	}
-	for name, expected := range producers {
-		content, err := os.ReadFile(filepath.Join("..", "..", "..", "..", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fmt.Sprintf("%x", sha256.Sum256(content)) != expected {
-			t.Fatalf("PHP integer oracle producer changed: %s", name)
-		}
 	}
 	seen := make(map[string]bool)
 	for _, group := range []string{"cases", "direct_cases"} {

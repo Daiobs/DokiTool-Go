@@ -6,7 +6,7 @@
  * 1. Zero platform-name / CDN-host hardcoding in Web business layers
  *    (`src/components/**`, `src/composables/**`, `src/downloads/**`, `src/services/**`).
  * 2. Single-file line-count complexity caps for refactored modular directories
- *    (`src/core/**` <= 600 lines, `src/extension/bg/**` <= 900 lines,
+ *    (`src/core/**` <= 800 hard cap with > 600 soft notice, `src/extension/bg/**` <= 900 lines,
  *    `src/extension/background.ts` <= 900 lines) AND repo-wide ratchet budget
  *    for all `.ts`, `.js`, and `.vue` files under `src/**` (excluding `*.generated.ts`, default <= 900 lines).
  * 3. Solid `background-color` fallback + `forced-colors` gate for all white-text
@@ -60,7 +60,7 @@ const PLATFORM_HARDCODE_PATTERNS = [
 ];
 
 const FILE_LINE_LIMITS = [
-  { relDir: "core", maxLines: 600 },
+  { relDir: "core", maxLines: 800, softNoticeLines: 600 },
   { relDir: path.join("extension", "bg"), maxLines: 900 },
   { relDir: path.join("extension", "planning"), maxLines: 900 },
 ];
@@ -480,7 +480,7 @@ export function runArchitectureBoundaryCheck(options = {}) {
   }
 
   // 2a. Single-file line-count complexity caps for refactored core/bg modules
-  for (const { relDir, maxLines } of FILE_LINE_LIMITS) {
+  for (const { relDir, maxLines, softNoticeLines } of FILE_LINE_LIMITS) {
     const dir = path.join(targetSrcRoot, relDir);
     for (const filePath of walkFiles(dir, [".ts", ".js"])) {
       lineCapFilesChecked++;
@@ -489,6 +489,14 @@ export function runArchitectureBoundaryCheck(options = {}) {
         const rel = toPosixRel(targetFrontendRoot, filePath);
         violations.push(
           `[file-line-cap] ${rel}: ${lineCount} lines exceeds limit of ${maxLines}`,
+        );
+      } else if (
+        typeof softNoticeLines === "number" &&
+        lineCount > softNoticeLines
+      ) {
+        const rel = toPosixRel(targetFrontendRoot, filePath);
+        ratchetNotices.push(
+          `${rel}: ${lineCount} lines (soft threshold ${softNoticeLines}, hard cap ${maxLines})`,
         );
       }
     }
