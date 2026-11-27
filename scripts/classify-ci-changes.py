@@ -37,10 +37,8 @@ COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # Paths whose changes can impact both Go and frontend layers or CI gating itself.
 FULL_EXACT_PATHS = frozenset(
     {
-        "public-files.json",
         ".gitignore",
         "backend/config/platforms.json",
-        "backend/config/platforms_extra.json",
         "frontend/src/monitor/statsTypes.generated.ts",
         "frontend/scripts/test-pipixia-representation.mjs",
         "frontend/scripts/test-shanghai-original.mjs",

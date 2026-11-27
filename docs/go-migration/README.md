@@ -1,5 +1,9 @@
 # Go 迁移工作区
 
+> [!NOTE]
+> **冻结历史归档说明**：本目录（`docs/go-migration/`）保留为 Go 迁移阶段的只读历史记录与验收证据，不再随日常迭代改写。
+> 仓库主干内原保留的历史 PHP Oracle 源码树、`.github/workflows/php-oracle.yml`、`ops/examples/snap-fpm.conf` 及 `scripts/go-migration/` 对拍脚本已于 `v4.5.0` 发版前减重 PR（`#77`）正式退役移除，完整历史代码快照永久保留于 Git 附注标签 **`archive/php-oracle-final`**（`8b09d4277dfa6406cffc3d7530dc40d6a7f121bf`）。日常契约回归现由主干保留的 `backend/**/testdata/*.json(.gz)` 静态黄金夹具、17 个常驻 Go 基线单测与 [../HISTORY.md](../HISTORY.md) 承接。
+
 后续 Go 开发在独立仓库 [Brilliant666/DokiTool-Go](https://github.com/Brilliant666/DokiTool-Go) 进行，维护者已将其公开用于开发协作。原 [Brilliant666/DokiTool](https://github.com/Brilliant666/DokiTool) 的 `main` 继续保留 PHP 开源版本，不整体合入 Go 迁移分支，也不以删除公开 PHP 为迁移目标。
 
 维护、选择性同步及许可边界见 [MAINTENANCE.md](MAINTENANCE.md)。行为对照见 [mapping.md](mapping.md)，未来发布或切流前的回滚门槛见 [rollback.md](rollback.md)，各阶段证据见 [acceptance.md](acceptance.md)。抖音和 B 站的实现之后，维护者已授权[持续完成剩余七个平台](remaining-platforms.md)。该迁移阶段只做受控上游测试，不代表真实平台或浏览器保存验收。

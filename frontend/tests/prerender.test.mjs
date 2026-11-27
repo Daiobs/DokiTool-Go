@@ -2,19 +2,12 @@ import test, { before } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, access, readdir, stat } from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import vm from 'node:vm';
-import { transformWithEsbuild } from 'vite';
+import * as state from '../src/ssr/initialState.ts';
 
-const require = createRequire(import.meta.url);
-let html, state;
+let html;
 before(async () => {
   html = await readFile(new URL('../dist/index.html', import.meta.url), 'utf8');
-  const source = await readFile(new URL('../src/ssr/initialState.ts', import.meta.url), 'utf8');
-  const code = await transformWithEsbuild(source, 'initialState.ts', { loader: 'ts', format: 'cjs' });
-  const module = { exports: {} };
-  new Function('require', 'module', 'exports', code.code)(require, module, module.exports);
-  state = module.exports;
 });
 
 test('built homepage contains the actual content, local visuals and honest controls before JavaScript', async () => {

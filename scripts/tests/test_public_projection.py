@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Gate-unit regressions using simulated outputs; not Go product acceptance."""
 import copy
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-import public_projection as gate
+_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "public_projection.py"
+_SPEC = importlib.util.spec_from_file_location("public_projection", _SCRIPT_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+gate = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(gate)
 
 
 class PublicProjectionGateTests(unittest.TestCase):

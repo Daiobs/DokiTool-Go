@@ -1,27 +1,23 @@
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { build, stop } from 'esbuild';
+import * as native from '../src/downloads/native.ts';
+import * as blob from '../src/downloads/blob.ts';
+import * as segments from '../src/utils/segmentDownload.ts';
 
-let native, blob, segments, clicks, saved, revoked, frames;
+let clicks, saved, revoked, frames;
 const original = { fetch: globalThis.fetch, document: globalThis.document, location: globalThis.location, createObjectURL: URL.createObjectURL, revokeObjectURL: URL.revokeObjectURL };
 const request = (changes = {}) => ({ id: 'test-task', url: 'https://cdn.test/video', routes: [], filename: '作品_P1.mp4', ...changes });
 const media = (bytes = [1, 2, 3, 4], headers = {}) => new Response(new Uint8Array(bytes), { headers: { 'content-type': 'video/mp4', 'content-length': String(bytes.length), ...headers } });
 const signal = () => new AbortController().signal;
 
-before(async () => {
-  const bundled = await build({ entryPoints: ['src/downloads/native.ts', 'src/downloads/blob.ts', 'src/utils/segmentDownload.ts'], bundle: true, write: false, outdir: 'test-output', platform: 'node', format: 'esm' });
-  const load = name => import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles.find(file => file.path.endsWith(name + '.js')).text).toString('base64')}`);
-  native = await load('native');
-  blob = await load('blob');
-  segments = await load('segmentDownload');
+before(() => {
   globalThis.document = { body: { appendChild(element) { if (element.tag === 'iframe') frames.push(element); } }, createElement: tag => ({ tag, setAttribute(name, value) { this[name] = value; }, click() { clicks.push({ url: this.href, filename: this.download, target: this.target }); }, remove() { this.removed = true; } }) };
   globalThis.location = { href: 'https://snap.dokitool.com/' };
   URL.createObjectURL = value => { saved.push(value); return `blob:test-${saved.length}`; };
   URL.revokeObjectURL = value => revoked.push(value);
 });
 beforeEach(() => { clicks = []; saved = []; revoked = []; frames = []; globalThis.fetch = async () => media(); });
-after(async () => {
-  stop();
+after(() => {
   Object.assign(globalThis, { fetch: original.fetch, document: original.document, location: original.location });
   URL.createObjectURL = original.createObjectURL; URL.revokeObjectURL = original.revokeObjectURL;
 });

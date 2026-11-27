@@ -202,41 +202,56 @@ class SafeHTTPFetcher:
         resolver: Callable[..., list[Any]] | None = None, url_validator: Callable[..., Any] | None = None,
         opener_factory: Callable[[bool], urllib.request.OpenerDirector] | None = None,
         allowed_media_ports: frozenset[int] | None = STANDARD_HTTP_PORTS,
+        allowed_loopback_origin: tuple[str, str, int] | None = None,
     ) -> None:
         self.timeout, self.max_redirects, self.no_proxy = timeout, max_redirects, bool(no_proxy)
         self._resolver, self._url_validator, self._opener_factory = resolver, url_validator, opener_factory
         self._allowed_media_ports = allowed_media_ports
+        self._allowed_loopback_origin = allowed_loopback_origin
         self._redirects = SafeRedirectHandler(max_redirects=max_redirects)
 
     def _validate_hop(
         self, url: str, *, allow_loopback: bool, media_mode: bool,
+        enforce_standard_ports: bool | None = None,
     ) -> tuple[urllib.parse.SplitResult, tuple[str, ...]]:
         if self._url_validator is None:
-            ports = self._allowed_media_ports if media_mode else None
+            use_std_ports = media_mode if enforce_standard_ports is None else enforce_standard_ports
+            ports = self._allowed_media_ports if use_std_ports else None
             return validate_and_resolve_remote_url(
                 url, allow_loopback=allow_loopback, resolve_dns=True,
                 resolver=self._resolver, allowed_ports=ports,
+                allowed_loopback_origin=self._allowed_loopback_origin,
             )
         res = self._url_validator(url, allow_loopback=allow_loopback, resolve_dns=True, resolver=self._resolver)
         return (res[0], tuple(res[1])) if (isinstance(res, tuple) and len(res) == 2) else (res, ())
 
     def _open_with_redirects(
-        self, url: str, *, headers: Mapping[str, str] | None, allow_loopback: bool,
-        allow_redirects: bool, media_mode: bool, timeout: float | None,
+        self, url: str, *, headers: Mapping[str, str] | None = None,
+        headers_fn: Callable[[str, int], Mapping[str, str]] | None = None,
+        allow_loopback: bool = False, allow_redirects: bool = True,
+        media_mode: bool = True, enforce_standard_ports: bool | None = None,
+        timeout: float | None = None,
     ) -> tuple[Any, str]:
         current, hops, req_timeout = url, 0, (self.timeout if timeout is None else timeout)
         prev_scheme: str | None = None
         while True:
+            hop_allow_loopback = (
+                (allow_loopback if hops == 0 else False)
+                if self._allowed_loopback_origin is None
+                else True
+            )
             parsed, pinned_ips = self._validate_hop(
-                current, allow_loopback=(allow_loopback if hops == 0 else False), media_mode=media_mode,
+                current, allow_loopback=hop_allow_loopback, media_mode=media_mode,
+                enforce_standard_ports=enforce_standard_ports,
             )
             curr_scheme = parsed.scheme.lower()
             if hops > 0 and prev_scheme == "https" and curr_scheme != "https":
                 raise SecurityError("Refusing HTTPS-to-HTTP redirect downgrade")
             prev_scheme = curr_scheme
             stripped = ("cookie", "authorization", "proxy-authorization") if hops > 0 else ("cookie",)
-            req_headers = build_media_headers(current, extra_headers=headers) if media_mode else {
-                k: v for k, v in (headers or {}).items() if k.lower().strip() not in stripped
+            raw_headers = headers_fn(current, hops) if headers_fn is not None else headers
+            req_headers = build_media_headers(current, extra_headers=raw_headers) if media_mode else {
+                k: v for k, v in (raw_headers or {}).items() if k.lower().strip() not in stripped
             }
             host = (parsed.hostname or "").lower().rstrip(".")
             use_proxy = (not self.no_proxy) and (not is_loopback_host(host)) and has_env_proxy_for(curr_scheme, host, parsed.port)
@@ -258,6 +273,20 @@ class SafeHTTPFetcher:
                 finally:
                     exc.close()
                 raise HTTPStatusError(exc.code, current, hdrs, err_body) from exc
+
+    def open_url(
+        self, url: str, *, headers: Mapping[str, str] | None = None,
+        headers_fn: Callable[[str, int], Mapping[str, str]] | None = None,
+        allow_loopback: bool = False, allow_redirects: bool = True,
+        media_mode: bool = True, enforce_standard_ports: bool | None = None,
+        timeout: float | None = None,
+    ) -> tuple[Any, str]:
+        """Open a validated, IP-pinned HTTP(S) response stream with redirect enforcement."""
+        return self._open_with_redirects(
+            url, headers=headers, headers_fn=headers_fn, allow_loopback=allow_loopback,
+            allow_redirects=allow_redirects, media_mode=media_mode,
+            enforce_standard_ports=enforce_standard_ports, timeout=timeout,
+        )
 
     def fetch_bytes(
         self, url: str, *, max_bytes: int, headers: Mapping[str, str] | None = None,

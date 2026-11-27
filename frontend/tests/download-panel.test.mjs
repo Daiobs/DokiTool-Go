@@ -1,37 +1,25 @@
 import test, { before } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { transformWithEsbuild } from 'vite';
-import { parse, compileScript } from '@vue/compiler-sfc';
 import * as vue from 'vue';
 import { renderToString } from '@vue/server-renderer';
+import * as saveFilePicker from '../src/downloads/saveFilePicker.ts';
+import { loadSfc } from './helpers/loadSfc.mjs';
 
 const { createRenderer, createSSRApp, h, markRaw, nextTick, ref } = vue;
-const require = createRequire(import.meta.url);
-let DownloadCard, saveFilePicker;
+let DownloadCard;
 before(async () => {
-  const pickerSource = await readFile(new URL('../src/downloads/saveFilePicker.ts', import.meta.url), 'utf8');
-  const compiledPicker = await transformWithEsbuild(pickerSource, 'saveFilePicker.ts', { loader: 'ts', format: 'cjs' });
-  const pickerModule = { exports: {} };
-  new Function('require', 'module', 'exports', compiledPicker.code)(require, pickerModule, pickerModule.exports);
-  saveFilePicker = pickerModule.exports;
-
-  const source = await readFile(new URL('../src/components/DownloadCard.vue', import.meta.url), 'utf8');
-  const { descriptor } = parse(source);
-  const script = compileScript(descriptor, { id: 'download-panel-test', inlineTemplate: true,
-    templateOptions: { compilerOptions: { hoistStatic: false } } });
-  const compiled = await transformWithEsbuild(script.content, 'DownloadCard.js', { loader: 'js', format: 'cjs' });
-  const componentModule = { exports: {} };
   // Exercise the actual component state/events; CSS transition frames belong to
   // browser acceptance, not this renderer's deterministic interaction checks.
   const transition = { setup: (_, { slots }) => () => slots.default?.() };
-  new Function('require', 'module', 'exports', compiled.code)(id => {
-    if (id === './AppIcon.vue') return { __esModule: true, default: { render: () => h('i') } };
-    if (id === 'vue') return { ...vue, Transition: transition, TransitionGroup: transition };
-    return require(id);
-  }, componentModule, componentModule.exports);
-  DownloadCard = componentModule.exports.default;
+  DownloadCard = await loadSfc(
+    new URL('../src/components/DownloadCard.vue', import.meta.url),
+    {
+      modules: {
+        './AppIcon.vue': { default: { render: () => h('i') } },
+        vue: { ...vue, Transition: transition, TransitionGroup: transition },
+      },
+    },
+  );
 });
 
 const task = (id, status = 'downloading', extra = {}) => ({ id, status, filename: `${id}.mp4`,

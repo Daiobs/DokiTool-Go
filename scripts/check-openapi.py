@@ -5,7 +5,7 @@ Performs zero external network requests. Verifies:
 1. OpenAPI 3.1.0 top-level metadata, paths, parameters, status codes, headers, and BearerAuth security;
 2. Every internal $ref resolves cleanly with zero external/network $refs;
 3. Exact structural & enum parity between docs/openapi.json and docs/schema/unified-v1/unified-v1.schema.json,
-   backend/config/platforms.json + backend/config/platforms_extra.json, and the GET /api/stats StatsSnapshot & APIKeyStatsSnapshot contracts;
+   backend/config/platforms.json, and the GET /api/stats StatsSnapshot & APIKeyStatsSnapshot contracts;
 4. Draft 2020-12 JSON Schema validity and fixture conformance (via jsonschema when installed,
    required when --require-jsonschema is passed in CI);
 5. Caddy example per-path @api whitelist parity and 404 JSON catch-all ordering in ops/examples/snap.caddy,
@@ -41,9 +41,12 @@ API_KEYS_EXAMPLE_PATH = ROOT / "ops/examples/api-keys.example.json"
 RUNTIME_CONFIG_EXAMPLE_PATH = ROOT / "ops/examples/runtime.example.json"
 UNIFIED_SCHEMA_PATH = ROOT / "docs/schema/unified-v1/unified-v1.schema.json"
 PLATFORMS_PATH = ROOT / "backend/config/platforms.json"
-PLATFORMS_EXTRA_PATH = ROOT / "backend/config/platforms_extra.json"
 EXAMPLES_DIR = ROOT / "docs/schema/unified-v1/examples"
 BATCH_EXAMPLE_PATH = ROOT / "examples/agent_batch_download.py"
+AGENT_SHARED_MODULES = {
+    "security": ROOT / "tools/dokitool-agent/security.py",
+    "http_transport": ROOT / "tools/dokitool-agent/http_transport.py",
+}
 
 EXPECTED_CADDY_API_WHITELIST = [
     "/api/downloads/tbvideo-result",
@@ -66,6 +69,7 @@ ALLOWED_EXAMPLE_STDLIB = {
     "argparse",
     "concurrent",
     "concurrent.futures",
+    "dataclasses",
     "datetime",
     "hashlib",
     "json",
@@ -277,33 +281,10 @@ def rewrite_component_refs_to_defs(node):
     return node
 
 
-def load_extra_platforms_config(extra_cfg: dict | None = None) -> tuple[list[dict], list[str]]:
-    if extra_cfg is None:
-        require(PLATFORMS_EXTRA_PATH.is_file(), f"Missing extra platforms config: {PLATFORMS_EXTRA_PATH}")
-        extra_cfg = json.loads(PLATFORMS_EXTRA_PATH.read_text(encoding="utf-8"))
-    require(isinstance(extra_cfg, dict), "backend/config/platforms_extra.json must be a JSON object")
-    extra_entries = extra_cfg.get("extra_platforms")
-    require(
-        isinstance(extra_entries, list) and len(extra_entries) >= 1,
-        "backend/config/platforms_extra.json extra_platforms must be a non-empty array",
-    )
-    extra_ids: list[str] = []
-    seen: set[str] = set()
-    for idx, entry in enumerate(extra_entries):
-        require(isinstance(entry, dict), f"platforms_extra.json extra_platforms[{idx}] must be an object")
-        pid = entry.get("id")
-        require(isinstance(pid, str) and bool(pid), f"platforms_extra.json extra_platforms[{idx}] missing valid id")
-        require(pid not in seen, f"Duplicate extra platform id in platforms_extra.json: {pid!r}")
-        seen.add(pid)
-        extra_ids.append(pid)
-    return extra_entries, extra_ids
-
-
 def check_openapi_structure(
     spec: dict,
     unified_schema: dict,
     platforms_cfg: list[dict],
-    platforms_extra_cfg: dict | None = None,
 ) -> int:
     require(spec.get("openapi") == "3.1.0", "openapi version must be exactly '3.1.0'")
     require(
@@ -444,22 +425,24 @@ def check_openapi_structure(
         "Attachment.properties.track_kind must be string enum ['manual', 'auto'] with additionalProperties=false",
     )
 
-    # Parity check with backend/config/platforms.json + backend/config/platforms_extra.json
-    extra_entries, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
-    platform_ids = [entry["id"] for entry in platforms_cfg] + optional_go_platforms
-    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs across platforms.json + platforms_extra.json")
+    # Parity check with unified backend/config/platforms.json (9 core + 5 optional)
+    require(isinstance(platforms_cfg, list) and len(platforms_cfg) == 14, "Expected 14 entries in backend/config/platforms.json")
+    platform_ids = [entry["id"] for entry in platforms_cfg]
+    optional_go_platforms = {entry["id"] for entry in platforms_cfg if entry.get("optional") is True}
+    require(len(set(platform_ids)) == 14, "Expected 14 distinct platform IDs in backend/config/platforms.json")
+    require(len(optional_go_platforms) == 5, "Expected 5 optional platform IDs in backend/config/platforms.json")
     require(
         comp_schemas["PlatformQuery"]["enum"] == ["all", *platform_ids],
         "PlatformQuery enum does not match the 14 registered platform IDs",
     )
     all_cfg_caps = {
         cap
-        for entry in [*platforms_cfg, *extra_entries]
+        for entry in platforms_cfg
         for cap in entry.get("capabilities", [])
     }
     require(
         all_cfg_caps <= set(comp_schemas["PlatformCapability"]["enum"]),
-        "PlatformCapability enum is missing capability values from backend/config/platforms*.json",
+        "PlatformCapability enum is missing capability values from backend/config/platforms.json",
     )
     stats_platform = comp_schemas.get("StatsPlatform") or {}
     require(
@@ -1309,29 +1292,44 @@ def validate_doc_json_blocks(
     return len(blocks)
 
 
-def check_python_scripts() -> None:
-    require(BATCH_EXAMPLE_PATH.is_file(), f"Missing example script: {BATCH_EXAMPLE_PATH}")
-    with tempfile.TemporaryDirectory(prefix="dokitool-openapi-pyc-") as tmp:
-        for script in (BATCH_EXAMPLE_PATH, Path(__file__).resolve()):
-            cfile = Path(tmp) / (script.stem + ".pyc")
-            py_compile.compile(str(script), cfile=str(cfile), doraise=True)
-
-    source = BATCH_EXAMPLE_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(BATCH_EXAMPLE_PATH))
+def _check_stdlib_only_imports(script_path: Path, allowed_internal: set[str]) -> None:
+    source = script_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(script_path))
     stdlib_names = getattr(sys, "stdlib_module_names", None)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
+                if alias.name in allowed_internal:
+                    continue
                 top = alias.name.split(".")[0]
                 allowed = (top in stdlib_names) if stdlib_names is not None else (alias.name in ALLOWED_EXAMPLE_STDLIB)
-                require(allowed and alias.name in ALLOWED_EXAMPLE_STDLIB, f"Non-stdlib import in example: {alias.name}")
+                require(allowed and alias.name in ALLOWED_EXAMPLE_STDLIB, f"Non-stdlib import in {script_path.name}: {alias.name}")
         elif isinstance(node, ast.ImportFrom):
-            require(node.level == 0 and bool(node.module), "Relative imports are forbidden in standalone example")
+            require(node.level == 0 and bool(node.module), f"Relative imports are forbidden in {script_path.name}")
             mod = node.module or ""
+            if mod in allowed_internal:
+                continue
             top = mod.split(".")[0]
             allowed = (top in stdlib_names) if stdlib_names is not None else (mod in ALLOWED_EXAMPLE_STDLIB)
-            require(allowed and mod in ALLOWED_EXAMPLE_STDLIB, f"Non-stdlib from-import in example: {mod}")
+            require(allowed and mod in ALLOWED_EXAMPLE_STDLIB, f"Non-stdlib from-import in {script_path.name}: {mod}")
+
+
+def check_python_scripts() -> None:
+    require(BATCH_EXAMPLE_PATH.is_file(), f"Missing example script: {BATCH_EXAMPLE_PATH}")
+    for mod_name, mod_path in AGENT_SHARED_MODULES.items():
+        require(mod_path.is_file(), f"Missing shared agent stdlib module {mod_name}: {mod_path}")
+
+    with tempfile.TemporaryDirectory(prefix="dokitool-openapi-pyc-") as tmp:
+        for script in (BATCH_EXAMPLE_PATH, *AGENT_SHARED_MODULES.values(), Path(__file__).resolve()):
+            cfile = Path(tmp) / (script.stem + ".pyc")
+            py_compile.compile(str(script), cfile=str(cfile), doraise=True)
+
+    # Allow examples/agent_batch_download.py to reuse the repo's pure-stdlib agent
+    # transport modules, and verify those modules themselves remain 100% stdlib-only.
+    _check_stdlib_only_imports(BATCH_EXAMPLE_PATH, allowed_internal=set(AGENT_SHARED_MODULES.keys()))
+    for mod_name, mod_path in AGENT_SHARED_MODULES.items():
+        _check_stdlib_only_imports(mod_path, allowed_internal=set(AGENT_SHARED_MODULES.keys()) - {mod_name})
 
 
 def check_caddy_whitelist() -> int:
@@ -1505,7 +1503,7 @@ def check_caddy_whitelist() -> int:
     return len(api_paths)
 
 
-def check_api_keys_example(platforms_cfg: list[dict], platforms_extra_cfg: dict | None = None) -> int:
+def check_api_keys_example(platforms_cfg: list[dict]) -> int:
     require(API_KEYS_EXAMPLE_PATH.is_file(), f"Missing API keys example: {API_KEYS_EXAMPLE_PATH}")
     raw_bytes = API_KEYS_EXAMPLE_PATH.read_bytes()
     require(len(raw_bytes) <= 64 * 1024, "ops/examples/api-keys.example.json must not exceed 64 KiB")
@@ -1520,8 +1518,7 @@ def check_api_keys_example(platforms_cfg: list[dict], platforms_extra_cfg: dict 
         "ops/examples/api-keys.example.json 'keys' must be a non-empty array of <= 64 entries",
     )
 
-    _, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
-    valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms)
+    valid_platforms = {entry["id"] for entry in platforms_cfg}
     require(len(valid_platforms) == 14, "Expected 14 distinct active platform IDs")
     valid_key_platforms = valid_platforms | {"ytdlp_generic"}
 
@@ -1642,7 +1639,7 @@ def _parse_go_duration_seconds(raw: object, field_name: str) -> float:
     return val / 1000.0 if unit == "ms" else (val * 60.0 if unit == "m" else val)
 
 
-def check_runtime_config_example(platforms_cfg: list[dict], platforms_extra_cfg: dict | None = None) -> bool:
+def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
     require(RUNTIME_CONFIG_EXAMPLE_PATH.is_file(), f"Missing runtime config example: {RUNTIME_CONFIG_EXAMPLE_PATH}")
     raw_bytes = RUNTIME_CONFIG_EXAMPLE_PATH.read_bytes()
     require(len(raw_bytes) <= 64 * 1024, "ops/examples/runtime.example.json must not exceed 64 KiB")
@@ -1654,8 +1651,7 @@ def check_runtime_config_example(platforms_cfg: list[dict], platforms_extra_cfg:
     )
     require(doc["schema_version"] == "1.0", "runtime.example.json schema_version must be '1.0'")
 
-    _, optional_go_platforms = load_extra_platforms_config(platforms_extra_cfg)
-    valid_platforms = {entry["id"] for entry in platforms_cfg} | set(optional_go_platforms) | {"ytdlp_generic"}
+    valid_platforms = {entry["id"] for entry in platforms_cfg} | {"ytdlp_generic"}
     require(len(valid_platforms) == 15, "Expected 14 core platforms + ytdlp_generic")
 
     def require_int_range(obj: dict, key: str, lo: int, hi: int, prefix: str) -> int:
@@ -2160,15 +2156,14 @@ def main(argv: list[str] | None = None) -> int:
     spec = json.loads(OPENAPI_PATH.read_text(encoding="utf-8"))
     unified_schema = json.loads(UNIFIED_SCHEMA_PATH.read_text(encoding="utf-8"))
     platforms_cfg = json.loads(PLATFORMS_PATH.read_text(encoding="utf-8"))
-    platforms_extra_cfg = json.loads(PLATFORMS_EXTRA_PATH.read_text(encoding="utf-8"))
 
-    ref_count = check_openapi_structure(spec, unified_schema, platforms_cfg, platforms_extra_cfg)
+    ref_count = check_openapi_structure(spec, unified_schema, platforms_cfg)
     doc_blocks = len(extract_markdown_json_blocks(AGENT_API_DOC_PATH))
     js_report = check_with_jsonschema(spec, require_installed=args.require_jsonschema)
     check_python_scripts()
     caddy_paths = check_caddy_whitelist()
-    api_keys_count = check_api_keys_example(platforms_cfg, platforms_extra_cfg)
-    runtime_cfg_ok = check_runtime_config_example(platforms_cfg, platforms_extra_cfg)
+    api_keys_count = check_api_keys_example(platforms_cfg)
+    runtime_cfg_ok = check_runtime_config_example(platforms_cfg)
     batch_report = check_batch_downloader_behavior()
 
     summary = {

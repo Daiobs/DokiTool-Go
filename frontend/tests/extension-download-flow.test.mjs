@@ -1,12 +1,12 @@
-import test, { before, after, beforeEach } from "node:test";
+import test, { before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { build, stop } from "esbuild";
+import JSZip from "jszip";
+import * as mediabunny from "mediabunny";
 import * as vue from "vue";
 import { loadSfc } from "./helpers/loadSfc.mjs";
 
@@ -16,7 +16,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FRONTEND_DIR = resolve(__dirname, "..");
 const REPO_ROOT_DIR = resolve(FRONTEND_DIR, "..");
 
-let tmpBundleDir = "";
 let protocol;
 let storage;
 let youtubeBridgeMod;
@@ -31,74 +30,44 @@ let specRefresherMod;
 let offscreenMod;
 let backgroundMod;
 let mediaContractMod;
-let mediabunny;
-let JSZip;
-
-async function bundleExtensionSuite() {
-  tmpBundleDir = mkdtempSync(join(tmpdir(), "dokitool-ext-test-"));
-  const outfile = join(tmpBundleDir, "suite.mjs");
-  await build({
-    stdin: {
-      contents: `
-        import JSZipDefault from "jszip";
-        export * as mediabunny from "mediabunny";
-        export const JSZip = JSZipDefault;
-        export * as protocol from "./src/extension/protocol.ts";
-        export * as storage from "./src/extension/storage.ts";
-        export * as youtubeBridgeMod from "./src/extension/youtubeExtensionBridge.ts";
-        export * as dashMuxSpecMod from "./src/extension/dashMuxSpec.ts";
-        export * as opfsStreamTransferMod from "./src/extension/opfsStreamTransfer.ts";
-        export * as dashMuxDownloadMod from "./src/extension/dashMuxDownload.ts";
-        export * as dashMuxEngineMod from "./src/extension/dashMuxEngine.ts";
-        export * as extensionDownloadMod from "./src/extension/extensionDownload.ts";
-        export * as uiTargetHelpersMod from "./src/extension/uiTargetHelpers.ts";
-        export * as targetSpecBuilderMod from "./src/extension/targetSpecBuilder.ts";
-        export * as specRefresherMod from "./src/extension/bg/specRefresher.ts";
-        export * as offscreenMod from "./src/extension/offscreen.ts";
-        export * as backgroundMod from "./src/extension/background.ts";
-        export * as mediaContractMod from "./src/utils/mediaContract.ts";
-      `,
-      resolveDir: FRONTEND_DIR,
-      loader: "ts",
-    },
-    bundle: true,
-    outfile,
-    platform: "browser",
-    format: "esm",
-  });
-  return import(pathToFileURL(outfile).href);
-}
 
 before(async () => {
   globalThis.__DOKITOOL_EXT_TEST__ = true;
-  const suite = await bundleExtensionSuite();
-  protocol = suite.protocol;
-  storage = suite.storage;
-  youtubeBridgeMod = suite.youtubeBridgeMod;
-  dashMuxSpecMod = suite.dashMuxSpecMod;
-  opfsStreamTransferMod = suite.opfsStreamTransferMod;
-  dashMuxDownloadMod = suite.dashMuxDownloadMod;
-  dashMuxEngineMod = suite.dashMuxEngineMod;
-  extensionDownloadMod = suite.extensionDownloadMod;
-  uiTargetHelpersMod = suite.uiTargetHelpersMod;
-  targetSpecBuilderMod = suite.targetSpecBuilderMod;
-  specRefresherMod = suite.specRefresherMod;
-  offscreenMod = suite.offscreenMod;
-  backgroundMod = suite.backgroundMod;
-  mediaContractMod = suite.mediaContractMod;
-  mediabunny = suite.mediabunny;
-  JSZip = suite.JSZip;
+  [
+    protocol,
+    storage,
+    youtubeBridgeMod,
+    dashMuxSpecMod,
+    opfsStreamTransferMod,
+    dashMuxDownloadMod,
+    dashMuxEngineMod,
+    extensionDownloadMod,
+    uiTargetHelpersMod,
+    targetSpecBuilderMod,
+    specRefresherMod,
+    offscreenMod,
+    backgroundMod,
+    mediaContractMod,
+  ] = await Promise.all([
+    import("../src/extension/protocol.ts"),
+    import("../src/extension/storage.ts"),
+    import("../src/extension/youtubeExtensionBridge.ts"),
+    import("../src/extension/dashMuxSpec.ts"),
+    import("../src/extension/opfsStreamTransfer.ts"),
+    import("../src/extension/dashMuxDownload.ts"),
+    import("../src/extension/dashMuxEngine.ts"),
+    import("../src/extension/extensionDownload.ts"),
+    import("../src/extension/uiTargetHelpers.ts"),
+    import("../src/extension/targetSpecBuilder.ts"),
+    import("../src/extension/bg/specRefresher.ts"),
+    import("../src/extension/offscreen.ts"),
+    import("../src/extension/background.ts"),
+    import("../src/utils/mediaContract.ts"),
+  ]);
 });
 
 beforeEach(() => {
   storage.resetInMemoryExtensionStorage();
-});
-
-after(() => {
-  stop();
-  if (tmpBundleDir) {
-    rmSync(tmpBundleDir, { recursive: true, force: true });
-  }
 });
 
 // ============================================================================

@@ -22,7 +22,22 @@ DokiTool 最初为基于 PHP 后端与 Vue 3 + Vite 前端的短视频/图文去
 
 Go 后端替代完成后，初期线上以「日本 Go 主服务 + 上海 `pull` worker」承载九平台解析与下载（参见 [抖音上海通道说明](go-migration/douyin-shanghai.md) 与 [下载说明](DOWNLOADS.md#production-download-capabilities)），随后在 Go 单栈基础上陆续接入海外平台，并在下线仅提供无 CORS HLS 流的 Dailymotion 后收敛至 14 个可真实落盘保存的平台。
 
-Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/README.md#当前运行方式)。仓库根目录历史 PHP `api/` 在迁移过渡期仅保留用于离线基线对照、语法门禁与历史参考，不再作为线上新部署入口；当前仓库内原地保留但已退役的 PHP 对拍代码路径清单、CI 用途与冻结维护约束见 [README.md — 已退役的 PHP 对拍代码](../README.md#已退役的-php-对拍代码)。
+Go 构建、同源启动与早期迁移细节见 [Go 迁移总览](go-migration/README.md#当前运行方式)。仓库根目录历史 PHP `api/` 及过渡期对拍基准源码树在迁移阶段曾用于离线基线对照与语法门禁，现已从主干正式移除并归档至附注标签 `archive/php-oracle-final`，完整退役路径清单、快照检出方式与后续常驻黄金夹具守护机制见下文 [已退役 PHP Oracle 源码树正式归档记录](#已退役-php-oracle-源码树正式归档记录)。
+
+### 已退役 PHP Oracle 源码树正式归档记录
+
+- **正式退役时间与批次**：2026-11，`v4.5.0` 发版前减重提速 PR `#77`（分支 `chore/v450-repo-diet-and-dx-simplification`）。
+- **永久可检出 Git 快照标签**：[`archive/php-oracle-final`](https://github.com/Daiobs/DokiTool-Go/tree/archive/php-oracle-final)（指向删除任何 PHP 文件前的完整主干提交 `8b09d4277dfa6406cffc3d7530dc40d6a7f121bf`）。如需追溯或重放历史 PHP 源码，可直接检出：
+  ```bash
+  git fetch --tags origin
+  git checkout archive/php-oracle-final
+  ```
+- **已从主干移除的退役路径清单**（上述文件均不参与 Go 生产运行，现永久封存于标签快照）：
+  - 历史 PHP 后端源码与入口：`backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`
+  - 历史 PHP 测试与校验脚本：`backend/tests/*.php`、`backend/tests/validate.py`
+  - 迁移对拍生成与验证脚本：`scripts/go-migration/`（`produce*.php`、`produce*.py`、`verify*.py`、`check.py`、`xhs_transport.py`；其中 `public_projection.py` 与 `test-public-projection.py` 已收敛至 `scripts/public_projection.py` 与 `scripts/tests/test_public_projection.py`）、`scripts/tests/test_weibo_direct_url_oracle.py`、`backend/internal/platform/douyin/testdata/produce_integer.py`
+  - 过渡期 CI 与 PHP-FPM 示例配置：`.github/workflows/php-oracle.yml`、`ops/examples/snap-fpm.conf`
+- **退役后持续回归守护机制**：仓库主干完整保留全部静态 JSON 黄金夹具（`backend/testdata/**/*.json`、`backend/internal/**/testdata/*.json(.gz)`）与 `docs/go-migration/` 冻结历史档案；原需 `-tags=phporacle` 触发的 17 个 Go 黄金基线测试已全部移除构建约束并晋升为日常 `go test -race ./...` 常驻回归门禁，持续以纯 Go 秒级守护历史行为契约。
 
 ### 来源与许可历史记录
 

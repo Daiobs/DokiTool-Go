@@ -1,17 +1,8 @@
-import test, { before, after, beforeEach } from "node:test";
+import test, { before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { build, stop } from "esbuild";
 import * as vue from "vue";
 import { loadSfc } from "./helpers/loadSfc.mjs";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FRONTEND_DIR = resolve(__dirname, "..");
-
-let tmpBundleDir = "";
 let protocol;
 let storage;
 let backgroundMod;
@@ -21,54 +12,31 @@ let tabSyncMod;
 let youtubeBridgeMod;
 let offscreenLifecycleMod;
 
-async function bundleSuite() {
-  tmpBundleDir = mkdtempSync(join(tmpdir(), "dokitool-ext-v44-bg-"));
-  const outfile = join(tmpBundleDir, "v44-bg-suite.mjs");
-  await build({
-    stdin: {
-      contents: `
-        export * as protocol from "./src/extension/protocol.ts";
-        export * as storage from "./src/extension/storage.ts";
-        export * as backgroundMod from "./src/extension/background.ts";
-        export * as offscreenMod from "./src/extension/offscreen.ts";
-        export * as taskHistoryMod from "./src/extension/bg/taskHistoryStore.ts";
-        export * as tabSyncMod from "./src/extension/bg/tabSyncPrivacyFirewall.ts";
-        export * as youtubeBridgeMod from "./src/extension/youtubeExtensionBridge.ts";
-        export * as offscreenLifecycleMod from "./src/extension/bg/offscreenLifecycle.ts";
-      `,
-      resolveDir: FRONTEND_DIR,
-      loader: "ts",
-    },
-    bundle: true,
-    outfile,
-    platform: "browser",
-    format: "esm",
-  });
-  return import(pathToFileURL(outfile).href);
-}
-
 before(async () => {
   globalThis.__DOKITOOL_EXT_TEST__ = true;
-  const suite = await bundleSuite();
-  protocol = suite.protocol;
-  storage = suite.storage;
-  backgroundMod = suite.backgroundMod;
-  offscreenMod = suite.offscreenMod;
-  taskHistoryMod = suite.taskHistoryMod;
-  tabSyncMod = suite.tabSyncMod;
-  youtubeBridgeMod = suite.youtubeBridgeMod;
-  offscreenLifecycleMod = suite.offscreenLifecycleMod;
+  [
+    protocol,
+    storage,
+    backgroundMod,
+    offscreenMod,
+    taskHistoryMod,
+    tabSyncMod,
+    youtubeBridgeMod,
+    offscreenLifecycleMod,
+  ] = await Promise.all([
+    import("../src/extension/protocol.ts"),
+    import("../src/extension/storage.ts"),
+    import("../src/extension/background.ts"),
+    import("../src/extension/offscreen.ts"),
+    import("../src/extension/bg/taskHistoryStore.ts"),
+    import("../src/extension/bg/tabSyncPrivacyFirewall.ts"),
+    import("../src/extension/youtubeExtensionBridge.ts"),
+    import("../src/extension/bg/offscreenLifecycle.ts"),
+  ]);
 });
 
 beforeEach(() => {
   storage.resetInMemoryExtensionStorage();
-});
-
-after(() => {
-  stop();
-  if (tmpBundleDir) {
-    rmSync(tmpBundleDir, { recursive: true, force: true });
-  }
 });
 
 function createDeferred() {

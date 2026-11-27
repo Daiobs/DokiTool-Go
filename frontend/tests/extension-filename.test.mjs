@@ -1,35 +1,7 @@
-import test, { before, after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
-
-let sanitizer;
-let uiHelpers;
-
-before(async () => {
-  const bundleMod = async (rel) => {
-    const absEntry = fileURLToPath(new URL(rel, import.meta.url));
-    const bundled = await build({
-      entryPoints: [absEntry],
-      bundle: true,
-      write: false,
-      platform: "node",
-      format: "esm",
-    });
-    const code = bundled.outputFiles[0].text;
-    return import(
-      `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-    );
-  };
-  [sanitizer, uiHelpers] = await Promise.all([
-    bundleMod("../src/extension/filenameSanitizer.ts"),
-    bundleMod("../src/extension/uiTargetHelpers.ts"),
-  ]);
-});
-
-after(() => {
-  stop();
-});
+import * as sanitizer from "../src/extension/filenameSanitizer.ts";
+import * as uiHelpers from "../src/extension/uiTargetHelpers.ts";
 
 function hasLoneSurrogate(str) {
   for (let i = 0; i < str.length; i++) {
@@ -304,17 +276,7 @@ test("single-video resolveItemBaseName prioritizes media.title over raw mmexport
 });
 
 test("Issue #48 [P2-3]: M2 videoFilename and M3 uiTargetHelpers produce aligned quality suffixes and _<N>P.zip archive names", async () => {
-  const absVideoFilename = fileURLToPath(new URL("../src/utils/videoFilename.ts", import.meta.url));
-  const bundled = await build({
-    entryPoints: [absVideoFilename],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-  });
-  const videoFilename = await import(
-    `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
-  );
+  const videoFilename = await import("../src/utils/videoFilename.ts");
 
   // 1) Archive naming parity: `<title>_<N>P.zip` on both M2 and M3
   const m2Zip = videoFilename.buildArchiveFilename({

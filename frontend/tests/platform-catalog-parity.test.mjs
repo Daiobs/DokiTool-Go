@@ -1,16 +1,16 @@
-import test, { after, before } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
 import {
   checkPlatformCatalogSnapshot,
   loadSingleSourcePlatformConfigs,
   resolveDisplayDomains,
 } from "../scripts/generate-platform-catalog.mjs";
+import * as urlMatcher from "../src/extension/urlMatcher.ts";
 
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND_ROOT = path.resolve(TESTS_DIR, "..");
@@ -25,31 +25,6 @@ const GENERATED_CATALOG_PATH = path.join(
   "generated",
   "platform-catalog.json",
 );
-
-let urlMatcher;
-
-async function bundleTsModule(relPath) {
-  const absEntry = fileURLToPath(new URL(relPath, import.meta.url));
-  const bundled = await build({
-    entryPoints: [absEntry],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-  });
-  const code = bundled.outputFiles[0].text;
-  return import(
-    `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-  );
-}
-
-before(async () => {
-  urlMatcher = await bundleTsModule("../src/extension/urlMatcher.ts");
-});
-
-after(() => {
-  stop();
-});
 
 test("generate-platform-catalog.mjs --check passes on committed snapshot and rejects drift", async () => {
   const res = spawnSync(process.execPath, [GENERATOR_SCRIPT, "--check"], {
@@ -89,19 +64,20 @@ test("generate-platform-catalog.mjs --check passes on committed snapshot and rej
   }
 });
 
-test("single-source backend configs match generated platform-catalog.json with zero private field leakage", async () => {
-  const { registry, extraConfig } = await loadSingleSourcePlatformConfigs();
-  assert.equal(registry.length, 9, "frozen platforms.json must contain 9 core platforms");
+test("single-source backend/config/platforms.json matches generated platform-catalog.json with zero private field leakage", async () => {
+  const { registry, corePlatforms, optionalPlatforms } =
+    await loadSingleSourcePlatformConfigs();
+  assert.equal(corePlatforms.length, 9, "platforms.json must contain 9 default core platforms");
   assert.deepEqual(
-    extraConfig.extra_platforms.map((p) => p.id),
+    optionalPlatforms.map((p) => p.id),
     ["x", "youtube", "instagram", "facebook", "tumblr"],
   );
-  assert.deepEqual(extraConfig.exact_domain_additions, {
-    zuiyou: ["share.xiaochuankeji.cn"],
-  });
+  const zuiyouEntry = corePlatforms.find((p) => p.id === "zuiyou");
+  assert.ok(zuiyouEntry);
+  assert.deepEqual(zuiyouEntry.exact_domains, ["share.xiaochuankeji.cn"]);
 
   // Trap 2: facebook must keep exact_domains distinct from display_domains.
-  const fbExtra = extraConfig.extra_platforms.find((p) => p.id === "facebook");
+  const fbExtra = optionalPlatforms.find((p) => p.id === "facebook");
   assert.ok(fbExtra);
   assert.deepEqual(fbExtra.domains, []);
   assert.deepEqual(fbExtra.exact_domains, [
@@ -113,7 +89,7 @@ test("single-source backend configs match generated platform-catalog.json with z
   assert.deepEqual(fbExtra.display_domains, ["facebook.com", "fb.watch"]);
   assert.deepEqual(resolveDisplayDomains(fbExtra), ["facebook.com", "fb.watch"]);
 
-  const xExtra = extraConfig.extra_platforms.find((p) => p.id === "x");
+  const xExtra = optionalPlatforms.find((p) => p.id === "x");
   assert.deepEqual(resolveDisplayDomains(xExtra), [
     "x.com",
     "twitter.com",
@@ -123,11 +99,10 @@ test("single-source backend configs match generated platform-catalog.json with z
   const diskCatalog = JSON.parse(await readFile(GENERATED_CATALOG_PATH, "utf8"));
   assert.equal(diskCatalog.schema_version, "1.0");
   assert.equal(diskCatalog.code, "OK");
-  const expectedAll = [...registry, ...extraConfig.extra_platforms];
   assert.equal(diskCatalog.data.platforms.length, 14);
   assert.deepEqual(
     diskCatalog.data.platforms,
-    expectedAll.map(({ id, name, site_url, icon, capabilities }) => ({
+    registry.map(({ id, name, site_url, icon, capabilities }) => ({
       id,
       name,
       site_url,
@@ -139,33 +114,31 @@ test("single-source backend configs match generated platform-catalog.json with z
     assert.equal("domains" in entry, false);
     assert.equal("exact_domains" in entry, false);
     assert.equal("display_domains" in entry, false);
+    assert.equal("optional" in entry, false);
     assert.equal("file" in entry, false);
     assert.equal("adapter" in entry, false);
   }
 });
 
-test("urlMatcher.ts PLATFORM_DOMAIN_SPECS stays in 100% parity with backend 14-platform configs", async () => {
-  const { registry, extraConfig } = await loadSingleSourcePlatformConfigs();
-  const additions = extraConfig.exact_domain_additions ?? {};
-  const merged = [...registry, ...extraConfig.extra_platforms];
+test("urlMatcher.ts PLATFORM_DOMAIN_SPECS stays in 100% parity with unified backend/config/platforms.json", async () => {
+  const { registry } = await loadSingleSourcePlatformConfigs();
 
   assert.deepEqual(
     [...urlMatcher.SUPPORTED_PLATFORM_IDS],
-    merged.map((p) => p.id),
+    registry.map((p) => p.id),
   );
   assert.equal(urlMatcher.PLATFORM_DOMAIN_SPECS.length, 14);
 
-  for (let i = 0; i < merged.length; i++) {
-    const src = merged[i];
+  for (let i = 0; i < registry.length; i++) {
+    const src = registry[i];
     const spec = urlMatcher.PLATFORM_DOMAIN_SPECS[i];
     assert.equal(spec.id, src.id);
     assert.equal(spec.label, src.name);
 
     const expectedDomains = Array.isArray(src.domains) ? src.domains : [];
-    const expectedExact = [
-      ...(Array.isArray(src.exact_domains) ? src.exact_domains : []),
-      ...(Array.isArray(additions[src.id]) ? additions[src.id] : []),
-    ];
+    const expectedExact = Array.isArray(src.exact_domains)
+      ? src.exact_domains
+      : [];
 
     assert.deepEqual(
       spec.domains ? [...spec.domains] : [],
@@ -219,7 +192,6 @@ test("urlMatcher.ts PLATFORM_DOMAIN_SPECS stays in 100% parity with backend 14-p
 });
 
 test("urlMatcher.ts intentional shortlink/subdomain rules and Facebook exact-host semantics", () => {
-  // Intentional shortlink & subdomain rules across core platforms
   const shortlinkCases = [
     ["https://v.douyin.com/iRNBho6/", "douyin", false],
     ["https://v.kuaishou.com/abc123", "kuaishou", false],
@@ -240,7 +212,6 @@ test("urlMatcher.ts intentional shortlink/subdomain rules and Facebook exact-hos
     assert.equal(matched.isLikelyFeedOrHome, wantFeed);
   }
 
-  // zuiyou exact-host rule: share.xiaochuankeji.cn only, never parent or subdomain
   for (const badZuiyou of [
     "https://xiaochuankeji.cn/hybrid/share/post?pid=163566379",
     "https://www.share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
@@ -253,7 +224,6 @@ test("urlMatcher.ts intentional shortlink/subdomain rules and Facebook exact-hos
     );
   }
 
-  // Trap 2: Facebook exact-host semantics — allowed exact hosts vs rejected subdomains
   for (const okFb of [
     "https://www.facebook.com/watch/?v=647537299265662",
     "https://facebook.com/watch/?v=647537299265662",

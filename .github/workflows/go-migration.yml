@@ -78,7 +78,6 @@ jobs:
           python3 -B -X utf8 -m unittest discover -s scripts/tests -v
           python3 -B scripts/check-upstream-updates.py --check-local-pins
           python3 -B scripts/check-ssot-consistency.py
-          python3 -B scripts/go-migration/test-public-projection.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/test-unified-schema.py
           "$RUNNER_TEMP/dokitool-validation/bin/python" -B -X utf8 scripts/check-openapi.py --require-jsonschema
 
@@ -191,7 +190,7 @@ jobs:
           node frontend/scripts/test-pipixia-representation.mjs "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_SHANGHAI_EXAMPLES"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_PULL_EXAMPLES"
-          (cd frontend && node --test tests/golden-fixtures-l1.test.mjs && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
+          (cd frontend && node --import ./tests/helpers/register-ts.mjs --test tests/golden-fixtures-l1.test.mjs && node --import ./tests/helpers/register-ts.mjs --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
 
       - name: Build Go executables (dokitool and shanghai-resolver)
         working-directory: backend
@@ -258,7 +257,7 @@ jobs:
           node frontend/scripts/test-pipixia-representation.mjs "$DOKITOOL_PIPIXIA_REPRESENTATION_OUTPUT"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_SHANGHAI_EXAMPLES"
           node frontend/scripts/test-shanghai-original.mjs "$DOKITOOL_PULL_EXAMPLES"
-          (cd frontend && node --test tests/golden-fixtures-l1.test.mjs && node --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
+          (cd frontend && node --import ./tests/helpers/register-ts.mjs --test tests/golden-fixtures-l1.test.mjs && node --import ./tests/helpers/register-ts.mjs --test --test-name-pattern='Go public XHS live pairs' tests/ui-download-contract.test.mjs)
 
       - name: Typecheck and test the frontend and download lifecycle
         working-directory: frontend

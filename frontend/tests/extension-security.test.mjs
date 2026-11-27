@@ -1,4 +1,4 @@
-import test, { before, after, beforeEach } from "node:test";
+import test, { before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -7,7 +7,6 @@ import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
 import JSZip from "jszip";
 import {
   DOKITOOL_EXTENSION_ID,
@@ -33,24 +32,8 @@ let extensionDownloadMod;
 let youtubeExtensionBridgeMod;
 let youtubeHelperSource = "";
 
-async function bundleTsModule(relPath) {
-  const absEntry = fileURLToPath(new URL(relPath, import.meta.url));
-  const bundled = await build({
-    entryPoints: [absEntry],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-  });
-  const code = bundled.outputFiles[0].text;
-  return import(
-    `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-  );
-}
-
 before(async () => {
   globalThis.__DOKITOOL_EXT_TEST__ = true;
-  let offscreenBundle;
   [
     hostWhitelist,
     dnrRules,
@@ -59,50 +42,28 @@ before(async () => {
     protocol,
     backgroundMod,
     extensionBridge,
-    offscreenBundle,
+    extensionDownloadMod,
+    youtubeExtensionBridgeMod,
     youtubeHelperSource,
   ] = await Promise.all([
-    bundleTsModule("../src/extension/hostWhitelist.ts"),
-    bundleTsModule("../src/extension/dnrRules.ts"),
-    bundleTsModule("../src/extension/urlMatcher.ts"),
-    bundleTsModule("../src/extension/storage.ts"),
-    bundleTsModule("../src/extension/protocol.ts"),
-    bundleTsModule("../src/extension/background.ts"),
-    bundleTsModule("../src/services/extensionBridge.ts"),
-    (async () => {
-      const bundled = await build({
-        stdin: {
-          contents: `
-            export * as extensionDownloadMod from "./src/extension/extensionDownload.ts";
-            export * as youtubeExtensionBridgeMod from "./src/extension/youtubeExtensionBridge.ts";
-          `,
-          resolveDir: fileURLToPath(new URL("..", import.meta.url)),
-          loader: "ts",
-        },
-        bundle: true,
-        write: false,
-        platform: "node",
-        format: "esm",
-      });
-      return import(
-        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
-      );
-    })(),
+    import("../src/extension/hostWhitelist.ts"),
+    import("../src/extension/dnrRules.ts"),
+    import("../src/extension/urlMatcher.ts"),
+    import("../src/extension/storage.ts"),
+    import("../src/extension/protocol.ts"),
+    import("../src/extension/background.ts"),
+    import("../src/services/extensionBridge.ts"),
+    import("../src/extension/extensionDownload.ts"),
+    import("../src/extension/youtubeExtensionBridge.ts"),
     readFile(
       new URL("../src/utils/youtubeHelperCore.js", import.meta.url),
       "utf8",
     ),
   ]);
-  extensionDownloadMod = offscreenBundle.extensionDownloadMod;
-  youtubeExtensionBridgeMod = offscreenBundle.youtubeExtensionBridgeMod;
 });
 
 beforeEach(() => {
   storage.resetInMemoryExtensionStorage();
-});
-
-after(() => {
-  stop();
 });
 
 test("hostWhitelist: zero wildcards, loopback isolated to optional_host_permissions unless devLoopback=true", () => {
@@ -1432,7 +1393,7 @@ test("build-extension.mjs: deterministic ZIP writer, root manifest.json, byte-fo
   }
 });
 
-test("check-public-files.py: strictly rejects frontend/dist-extension/* from public inventory", async () => {
+test("check-public-files.py: strictly rejects frontend/dist-extension/* from git index", async () => {
   const repoRoot = resolve(
     fileURLToPath(new URL("../..", import.meta.url)),
   );
@@ -1453,15 +1414,15 @@ test("check-public-files.py: strictly rejects frontend/dist-extension/* from pub
       '{"manifest_version":3}\n',
       "utf8",
     );
-    await writeFile(
-      join(tmpRepo, "public-files.json"),
-      JSON.stringify(
-        { files: ["frontend/dist-extension/manifest.json"] },
-        null,
-        2,
-      ) + "\n",
-      "utf8",
-    );
+
+    const runGit = (...args) => {
+      const out = spawnSync("git", args, { cwd: tmpRepo, encoding: "utf8" });
+      assert.equal(out.status, 0, `git ${args.join(" ")} failed: ${out.stderr}`);
+    };
+    runGit("init");
+    runGit("config", "user.email", "test@example.com");
+    runGit("config", "user.name", "Test");
+    runGit("add", "-f", "frontend/dist-extension/manifest.json");
 
     const pythonCandidates = [
       process.env.PYTHON,
@@ -1477,7 +1438,7 @@ test("check-public-files.py: strictly rejects frontend/dist-extension/* from pub
 
     const res = spawnSync(
       pythonBin,
-      ["-B", join(tmpRepo, "scripts", "check-public-files.py"), "--write-ignore"],
+      ["-B", join(tmpRepo, "scripts", "check-public-files.py"), "--staged"],
       {
         cwd: tmpRepo,
         encoding: "utf8",
@@ -1490,7 +1451,7 @@ test("check-public-files.py: strictly rejects frontend/dist-extension/* from pub
     );
     assert.match(
       `${res.stdout || ""}\n${res.stderr || ""}`,
-      /Local\/generated directory in inventory: frontend\/dist-extension\/manifest\.json/,
+      /Forbidden directory in repository index: frontend\/dist-extension\/manifest\.json/,
     );
   } finally {
     await rm(tmpRepo, { recursive: true, force: true });
@@ -3342,8 +3303,8 @@ test("PR-2 Blob URL File wrapper: extensionDownload.ts and youtubeExtensionBridg
 
 test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloadCoordinator + webExternalBridge emit sanitized filenameWarning, and saveFilePicker streams directly", async () => {
   const [filenameAudit, saveFilePicker] = await Promise.all([
-    bundleTsModule("../src/extension/bg/filenameAudit.ts"),
-    bundleTsModule("../src/downloads/saveFilePicker.ts"),
+    import("../src/extension/bg/filenameAudit.ts"),
+    import("../src/downloads/saveFilePicker.ts"),
   ]);
 
   // 1) Pure filename tamper audit cases
@@ -3542,7 +3503,7 @@ test("Issue #48 [P1-1] Spec B.3: filenameAudit detects UUID/stem tamper, downloa
 });
 
 test("Issue #48 PR #50 [F1]: SidePanel saveFilePicker enforces hostWhitelist + redirect validation, full-file 200 checks, anti-HTML/manifest poisoning, truncation abort, and idle timeout", async () => {
-  const saveFilePicker = await bundleTsModule("../src/downloads/saveFilePicker.ts");
+  const saveFilePicker = await import("../src/downloads/saveFilePicker.ts");
   const allowedOrigins = ["https://snap.dokitool.com"];
   const validateWhitelisted = (u) =>
     hostWhitelist.isWhitelistedMediaUrl(u, allowedOrigins).allowed;
@@ -3771,31 +3732,13 @@ test("Issue #48 PR #50 [F1]: SidePanel saveFilePicker enforces hostWhitelist + r
   });
 
 test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json, versionCheck enforces whitelist/no-polling/same-origin download_url, WEB_EXT_PING exposes ONLY useSaveFilePicker, saveFilePicker clears legacy localStorage, and filenameAudit warnings stay < 150 chars", async () => {
-  const [versionCheck, filenameAudit, bridgeAndPicker, capabilityHub] = await Promise.all([
-    bundleTsModule("../src/extension/versionCheck.ts"),
-    bundleTsModule("../src/extension/bg/filenameAudit.ts"),
-    (async () => {
-      const bundled = await build({
-        stdin: {
-          contents: `
-            export * as saveFilePicker from "./src/downloads/saveFilePicker.ts";
-            export * as extensionBridge from "./src/services/extensionBridge.ts";
-          `,
-          resolveDir: fileURLToPath(new URL("..", import.meta.url)),
-          loader: "ts",
-        },
-        bundle: true,
-        write: false,
-        platform: "node",
-        format: "esm",
-      });
-      return import(
-        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
-      );
-    })(),
-    bundleTsModule("../src/core/capabilityHub.ts"),
+  const [versionCheck, filenameAudit, saveFilePicker, sharedBridge, capabilityHub] = await Promise.all([
+    import("../src/extension/versionCheck.ts"),
+    import("../src/extension/bg/filenameAudit.ts"),
+    import("../src/downloads/saveFilePicker.ts"),
+    import("../src/services/extensionBridge.ts"),
+    import("../src/core/capabilityHub.ts"),
   ]);
-  const { saveFilePicker, extensionBridge: sharedBridge } = bridgeAndPicker;
 
   const releaseMeta = JSON.parse(
     await readFile(new URL("../src/core/extensionReleaseMeta.json", import.meta.url), "utf8"),
@@ -4234,7 +4177,7 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
 });
 
 test("R69-B: WEB_EXT_PING isolates storage.getSettings() faults and slowness within <= 200ms without unhandled rejections or dangling timers", async () => {
-  const webExternalBridge = await bundleTsModule("../src/extension/bg/webExternalBridge.ts");
+  const webExternalBridge = await import("../src/extension/bg/webExternalBridge.ts");
   assert.equal(webExternalBridge.WEB_EXT_PING_SETTINGS_TIMEOUT_MS, 200);
 
   const unhandledRejections = [];
@@ -4459,28 +4402,16 @@ test("Post-#71 PR-2 (NV-08, NV-09, P0-1, P1-5 & Hardening): single-port loopback
     extRuntimeMod,
     parseHelpers,
   ] = await Promise.all([
-    bundleTsModule("../src/extension/bg/dnrRules.ts"),
-    bundleTsModule("../src/extension/hostWhitelist.ts"),
-    bundleTsModule("../src/extension/filenameSanitizer.ts"),
-    bundleTsModule("../src/extension/bg/types.ts"),
-    bundleTsModule("../src/extension/background.ts"),
-    bundleTsModule("../src/extension/uiTargetHelpers.ts"),
-    bundleTsModule("../src/extension/planning/variantSelection.ts"),
-    bundleTsModule("../src/core/media/subtitleEngine.ts"),
-    bundleTsModule("../src/composables/useExtensionRuntime.ts"),
-    (async () => {
-      const bundled = await build({
-        entryPoints: [fileURLToPath(new URL("../src/utils/parseHelpers.ts", import.meta.url))],
-        bundle: true,
-        write: false,
-        platform: "node",
-        format: "esm",
-        define: { "import.meta.env": "{}" },
-      });
-      return import(
-        `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString("base64")}`
-      );
-    })(),
+    import("../src/extension/bg/dnrRules.ts"),
+    import("../src/extension/hostWhitelist.ts"),
+    import("../src/extension/filenameSanitizer.ts"),
+    import("../src/extension/bg/types.ts"),
+    import("../src/extension/background.ts"),
+    import("../src/extension/uiTargetHelpers.ts"),
+    import("../src/extension/planning/variantSelection.ts"),
+    import("../src/core/media/subtitleEngine.ts"),
+    import("../src/composables/useExtensionRuntime.ts"),
+    import("../src/utils/parseHelpers.ts"),
   ]);
 
   // 1. NV-08: resolveExtraAllowedMediaOrigins never appends port-wildcard loopback patterns even if chrome.permissions.contains returns true

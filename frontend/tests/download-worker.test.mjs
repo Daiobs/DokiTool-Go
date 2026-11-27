@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { transformWithEsbuild } from 'vite';
 import { build as bundle } from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -781,17 +780,10 @@ test('progress removes subscribers whose browsing context has disappeared', asyn
   await reader.cancel();
 });
 
+let clientIsolateSeq = 0;
+
 async function clientHarness(t, respond) {
-  const types = await transformWithEsbuild(await readFile(new URL('../src/downloads/types.ts', import.meta.url), 'utf8'), 'types.ts', { loader: 'ts', format: 'esm' });
-  const typesUrl = 'data:text/javascript;base64,' + Buffer.from(types.code).toString('base64');
-  const bridge = await transformWithEsbuild(await readFile(new URL('../src/downloads/bridge.ts', import.meta.url), 'utf8'), 'bridge.ts', { loader: 'ts', format: 'esm' });
-  const bridgeUrl = 'data:text/javascript;base64,' + Buffer.from(bridge.code + `\n// ${Math.random()}`).toString('base64');
-  const session = await transformWithEsbuild(await readFile(new URL('../src/downloads/session.ts', import.meta.url), 'utf8'), 'session.ts', { loader: 'ts', format: 'esm' });
-  const sessionCode = session.code.replace('"./types"', JSON.stringify(typesUrl)).replace('"./bridge"', JSON.stringify(bridgeUrl));
-  const sessionUrl = 'data:text/javascript;base64,' + Buffer.from(sessionCode + `\n// ${Math.random()}`).toString('base64');
-  const client = await transformWithEsbuild(await readFile(new URL('../src/downloads/streaming.ts', import.meta.url), 'utf8'), 'streaming.ts', { loader: 'ts', format: 'esm' });
-  const code = client.code.replace('"./types"', JSON.stringify(typesUrl)).replace('"./bridge"', JSON.stringify(bridgeUrl)).replace('"./session"', JSON.stringify(sessionUrl));
-  const api = await import('data:text/javascript;base64,' + Buffer.from(code + `\n// ${Math.random()}`).toString('base64'));
+  const api = await import(`../src/downloads/streaming.ts?isolate=${++clientIsolateSeq}`);
   const originals = new Map(), storage = new Map(), messages = [], frames = [], timers = new Map();
   let listener, nextTimer = 0, registered = 0;
   const setGlobal = (name, value) => { originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name)); Object.defineProperty(globalThis, name, { value, configurable: true, writable: true }); };

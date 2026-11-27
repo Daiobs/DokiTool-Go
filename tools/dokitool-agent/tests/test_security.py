@@ -218,6 +218,17 @@ class SecurityTests(unittest.TestCase):
             with self.assertRaises(security.SecurityError):
                 strict_fetcher.fetch_bytes(f"http://127.0.0.1:{port}/after-redirect", max_bytes=1024)
 
+            # 1b) Exact allowed_loopback_origin permits ONLY matching (scheme, host, port) and rejects other ports.
+            pinned_local_fetcher = security.SafeHTTPFetcher(
+                timeout=5.0,
+                allowed_loopback_origin=("http", "127.0.0.1", port),
+            )
+            ok_local = pinned_local_fetcher.fetch_bytes(f"http://127.0.0.1:{port}/after-redirect", max_bytes=1024)
+            self.assertEqual(ok_local.status, 200)
+            other_port = port + 1 if port < 65535 else port - 1
+            with self.assertRaises(security.SecurityError):
+                pinned_local_fetcher.fetch_bytes(f"http://127.0.0.1:{other_port}/after-redirect", max_bytes=1024)
+
             # 2) Redirect-to-loopback test: allow ONLY hop 1 synthetic host, then enforce real validator on hop 2.
             base = f"http://127.0.0.1:{port}"
             calls = {"n": 0}

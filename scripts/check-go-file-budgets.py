@@ -34,6 +34,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS: Tuple[str, ...] = ("backend/internal", "backend/cmd")
 DEFAULT_MAX_LINES = 800
+SOFT_NOTICE_LINES = 600
 
 # Ceilings set to ceil_to_10(actual_lines + 50) (+50..+59 lines breathing buffer
 # for routine fixes/guards/comments; split cohesively by domain once exceeded).
@@ -91,6 +92,7 @@ def check_go_file_budgets(
     root: Path = DEFAULT_REPO_ROOT,
     *,
     default_max_lines: int = DEFAULT_MAX_LINES,
+    soft_notice_lines: int = SOFT_NOTICE_LINES,
     legacy_ratchets: Optional[Mapping[str, int]] = None,
     scan_dirs: Sequence[str] = SCAN_DIRS,
 ) -> BudgetCheckResult:
@@ -127,6 +129,10 @@ def check_go_file_budgets(
             violations.append(
                 f"[go-file-budget] {rel}: {line_count} lines exceeds default max of "
                 f"{default_max_lines} lines"
+            )
+        elif soft_notice_lines > 0 and line_count > soft_notice_lines:
+            notices.append(
+                f"{rel}: {line_count} lines (soft threshold {soft_notice_lines}, hard max {default_max_lines})"
             )
 
     for rel in sorted(ratchets):

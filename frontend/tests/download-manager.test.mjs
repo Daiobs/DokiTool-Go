@@ -1,15 +1,7 @@
-import test, { before } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { build } from 'esbuild';
-
-let createDownloadManager, StreamingUnavailableError;
-before(async () => {
-  const result = await build({ stdin: {
-    contents: 'export { createDownloadManager } from "./src/downloads/manager"; export { StreamingUnavailableError } from "./src/downloads/types";',
-    resolveDir: process.cwd(), loader: 'ts',
-  }, bundle: true, write: false, platform: 'browser', format: 'esm' });
-  ({ createDownloadManager, StreamingUnavailableError } = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`));
-});
+import { createDownloadManager } from '../src/downloads/manager.ts';
+import { StreamingUnavailableError } from '../src/downloads/types.ts';
 
 const request = (id = 'one') => ({ id, url: 'https://media.test/video.mp4', routes: [], filename: '作品.mp4' });
 const done = (input, transport = 'browser_streaming') => ({ ...input, transport, status: 'completed', loaded: 4, total: 4, speed: 0, elapsed: 1, averageSpeed: 4 });

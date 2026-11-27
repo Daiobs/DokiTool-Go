@@ -1,5 +1,3 @@
-//go:build phporacle
-
 package probe
 
 import (

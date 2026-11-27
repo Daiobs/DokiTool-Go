@@ -6,10 +6,6 @@ const PLATFORMS_PATH = new URL(
   "../../backend/config/platforms.json",
   import.meta.url,
 );
-const PLATFORMS_EXTRA_PATH = new URL(
-  "../../backend/config/platforms_extra.json",
-  import.meta.url,
-);
 const OUTPUT_PATH = new URL(
   "../src/generated/platform-catalog.json",
   import.meta.url,
@@ -26,40 +22,31 @@ export function resolveDisplayDomains(entry) {
 }
 
 export async function loadSingleSourcePlatformConfigs() {
-  const [registryRaw, extraRaw] = await Promise.all([
-    readFile(PLATFORMS_PATH, "utf8"),
-    readFile(PLATFORMS_EXTRA_PATH, "utf8"),
-  ]);
+  const registryRaw = await readFile(PLATFORMS_PATH, "utf8");
   const registry = JSON.parse(registryRaw);
-  const extraConfig = JSON.parse(extraRaw);
 
   if (!Array.isArray(registry) || registry.length === 0) {
     throw new Error("backend/config/platforms.json must be a non-empty array");
   }
-  if (
-    !extraConfig ||
-    typeof extraConfig !== "object" ||
-    !Array.isArray(extraConfig.extra_platforms) ||
-    extraConfig.extra_platforms.length === 0
-  ) {
-    throw new Error(
-      "backend/config/platforms_extra.json must contain a non-empty extra_platforms array",
-    );
+  const corePlatforms = registry.filter((entry) => entry?.optional !== true);
+  const optionalPlatforms = registry.filter((entry) => entry?.optional === true);
+  if (corePlatforms.length === 0) {
+    throw new Error("backend/config/platforms.json must contain non-optional core platforms");
   }
-  return { registry, extraConfig };
+  return { registry, corePlatforms, optionalPlatforms };
 }
 
 export async function renderPlatformCatalogSnapshot() {
-  const { registry, extraConfig } = await loadSingleSourcePlatformConfigs();
+  const { registry } = await loadSingleSourcePlatformConfigs();
   const seenIds = new Set();
   const combined = [];
 
-  for (const entry of [...registry, ...extraConfig.extra_platforms]) {
+  for (const entry of registry) {
     if (!entry || typeof entry.id !== "string" || !entry.id) {
       throw new Error("Platform catalog entry is missing a valid id");
     }
     if (seenIds.has(entry.id)) {
-      throw new Error(`Duplicate platform id across registries: ${entry.id}`);
+      throw new Error(`Duplicate platform id in backend/config/platforms.json: ${entry.id}`);
     }
     const displayDomains = resolveDisplayDomains(entry);
     const exactDomains = Array.isArray(entry.exact_domains)
@@ -105,7 +92,7 @@ export async function checkPlatformCatalogSnapshot(outputPath = OUTPUT_PATH) {
     return {
       ok: false,
       reason:
-        "frontend/src/generated/platform-catalog.json is out of date with backend/config/platforms.json + backend/config/platforms_extra.json; run `node frontend/scripts/generate-platform-catalog.mjs`",
+        "frontend/src/generated/platform-catalog.json is out of date with backend/config/platforms.json; run `node frontend/scripts/generate-platform-catalog.mjs`",
       expected,
     };
   }

@@ -157,7 +157,7 @@ python3 -B scripts/check-supply-chain.py --offline
 
 ## 🌐 平台支持范围（14 核心平台 + 1000+ 长尾站点）
 
-- **核心目录 SSOT**：`backend/config/platforms.json`（同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）与 `backend/config/platforms_extra.json`。
+- **核心目录 SSOT**：`backend/config/platforms.json`（唯一内嵌 14 平台真值表，同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）。
 - **Tier-2 长尾兜底**：启用 `DOKITOOL_YTDLP_GENERIC_ENABLED=true` 后，`GET /api/parse` 在 `platform=all`（或省略）模式下可将合法公网长尾链接路由至独立 `PARSE_GENERIC` 隔离池（覆盖 Vimeo、TikTok、Reddit、SoundCloud 等 1000+ 具名提取器，严格禁用盲抓 `generic`）。
 
 <details>
@@ -237,7 +237,7 @@ python3 -B scripts/check-supply-chain.py --offline
 │   │   ├── shanghai-resolver/ # 上海国内线路辅助解析进程（出站 pull v2 模式）
 │   │   ├── genstatstypes/     # 从 Go 类型与常量生成 frontend/src/monitor/statsTypes.generated.ts（SSOT）
 │   │   └── loadtest/          # 仅限本机回环（127.0.0.1）运行的混合流量压测工具
-│   ├── config/                # 内嵌平台注册目录真值（platforms.json / platforms_extra.json）
+│   ├── config/                # 内嵌平台注册目录唯一真值（platforms.json）
 │   └── internal/              # fetch、urlpolicy、bearer、unified、catalog、probe、ytengine、platform/*、media/*、shresolver、api
 ├── frontend/                  # Vue 3 + Vite SPA（dokitool-web）、/monitor 大盘、SW 流式下载器、Chrome MV3 扩展源码与 YouTube 用户脚本
 ├── tools/dokitool-agent/      # 零第三方依赖 Python 3.9+ CLI、默认只读 Stdio MCP Server、SKILL.md 与安全回归测试
@@ -246,15 +246,6 @@ python3 -B scripts/check-supply-chain.py --offline
 ├── docs/                      # 接口契约、配置、扩展、下载、发布回执、上游监控、Agent 指南与历史归档文档
 └── examples/                  # 独立 Python 3.9+ 标准库个人 Agent 批量直连下载参考脚本
 ```
-
-</details>
-
-<details>
-<summary><strong>点击展开：已退役的 PHP 对拍基准代码（Oracle）边界说明</strong></summary>
-
-仓库内原地保留历史 PHP 代码、导出脚本与配置示例（`backend/api/`、`backend/lib/`、`backend/public/index.php`、`backend/internal/index.php`、`backend/bin/catalog.php`、`backend/tests/*.php`、`scripts/go-migration/produce*.php`、`ops/examples/snap-fpm.conf`）。
-
-上述文件**均已退役，完全不参与线上生产运行**（生产环境不部署 PHP / PHP-FPM，全部流量由 Go 二进制独立承载），原地保留仅用作 Go 实现的冻结行为对拍基准（Oracle），供 [`.github/workflows/php-oracle.yml`](.github/workflows/php-oracle.yml) 与离线门禁 `scripts/go-migration/check.py --check-php-source` 重放和核对固定版本源码摘要。**禁止在这些 PHP 文件中新增功能**，仅允许为维持既有对拍能力所必需的修正。
 
 </details>
 
@@ -272,7 +263,7 @@ python3 -B scripts/check-supply-chain.py --offline
 | [docs/DOWNLOADS.md](docs/DOWNLOADS.md) | 浏览器流式 SW 下载、多线路 Range 测速、ZIP 上限与历史下载验收记录 |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) | 生产发布受控闭环、阶段一/二脱敏回执模板与 [回滚手册](docs/go-migration/rollback.md) |
 | [docs/UPSTREAM-WATCH.md](docs/UPSTREAM-WATCH.md) · [docs/UPSTREAM-CANARY.md](docs/UPSTREAM-CANARY.md) | `yt-dlp` / `Deno` 6 文件锁同步、每日版本巡检与 12 小时低噪 Canary 探针 |
-| [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md) · [docs/HISTORY.md](docs/HISTORY.md) | 上海 `pull` v2 通道设计说明、Go 迁移历程与早期架构归档 |
+| [docs/go-migration/douyin-shanghai.md](docs/go-migration/douyin-shanghai.md) · [docs/HISTORY.md](docs/HISTORY.md) | 上海 `pull` v2 通道设计说明、Go 迁移历程与早期架构归档（含 `archive/php-oracle-final` PHP 对拍源码树退役归档） |
 
 ---
 

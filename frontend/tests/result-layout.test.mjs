@@ -1,13 +1,10 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { transformWithEsbuild } from 'vite';
 import { createRenderer, h, markRaw, nextTick, ref } from 'vue';
-import * as youtubeHelperCore from '../src/utils/youtubeHelperCore.js';
-import { loadSfc } from './helpers/loadSfc.mjs';
+import { validateMediaEnvelope } from '../src/utils/mediaContract.ts';
+import { loadSfc, loadSfcModule } from './helpers/loadSfc.mjs';
 
-const require = createRequire(import.meta.url);
 const EXT_RELEASE_META = JSON.parse(
   await readFile(new URL('../src/core/extensionReleaseMeta.json', import.meta.url), 'utf8'),
 );
@@ -18,64 +15,21 @@ const originalGlobals = {
   document: globalThis.document,
   requestAnimationFrame: globalThis.requestAnimationFrame,
 };
-let ResultSection, ExtensionDownloadModal, useVideoSelection, validateMediaEnvelope;
+let ResultSection, ExtensionDownloadModal, useVideoSelection;
 before(async () => {
-  const modules = {
-    '../services/apiConfig': { apiConfig: { baseUrl: '' } },
-    '../utils/youtubeHelperCore': youtubeHelperCore,
-  };
-  for (const id of [
-    '../utils/mediaSources',
-    '../utils/mediaContract',
-    '../core/media/cdnTransportHints',
-    '../core/media/variantSort',
-    '../core/media/variantDefaultUpgrade',
-    '../core/media/layoutAndFilename',
-    '../extension/hostWhitelist',
-    '../extension/dashMuxSpec',
-    '../core/media/extensionRoutes',
-    '../core/media/muxSpec',
-    '../core/media/bilingualCueMerger',
-    '../core/media/subtitleEngine',
-    '../core/media/subtitleController',
-    '../core/media/index',
-    '../composables/useVideoSelection',
-  ]) {
-    const utilities = await readFile(new URL(`../src/${id.slice(3)}.ts`, import.meta.url), 'utf8');
-    const module = { exports: {} };
-    const compiled = await transformWithEsbuild(utilities, `${id}.ts`, { loader: 'ts', format: 'cjs' });
-    new Function('require', 'module', 'exports', compiled.code)(
-      (reqId) => {
-        if (modules[reqId]) return modules[reqId];
-        if (reqId === '../core/media' && modules['../core/media/index']) return modules['../core/media/index'];
-        if (reqId === './cdnTransportHints') return modules['../core/media/cdnTransportHints'];
-        if (reqId === './extensionRoutes') return modules['../core/media/extensionRoutes'];
-        if (reqId === './variantSort') return modules['../core/media/variantSort'];
-        if (reqId === './variantDefaultUpgrade') return modules['../core/media/variantDefaultUpgrade'];
-        if (reqId === './layoutAndFilename') return modules['../core/media/layoutAndFilename'];
-        if (reqId === './muxSpec') return modules['../core/media/muxSpec'];
-        if (reqId === './bilingualCueMerger') return modules['../core/media/bilingualCueMerger'];
-        if (reqId === './subtitleEngine') return modules['../core/media/subtitleEngine'];
-        if (reqId === './subtitleController') return modules['../core/media/subtitleController'];
-        if (reqId === '../../utils/mediaContract') return modules['../utils/mediaContract'];
-        if (reqId === '../../utils/mediaSources') return modules['../utils/mediaSources'];
-        if (reqId === '../../extension/hostWhitelist') return modules['../extension/hostWhitelist'];
-        if (reqId === '../../extension/dashMuxSpec') return modules['../extension/dashMuxSpec'];
-        return require(reqId);
+  ({ useVideoSelection } = await loadSfcModule(
+    new URL('../src/composables/useVideoSelection.ts', import.meta.url),
+    {
+      modules: {
+        '../services/apiConfig': { apiConfig: { baseUrl: '' } },
       },
-      module,
-      module.exports,
-    );
-    modules[id] = module.exports;
-  }
-  modules['../core/media'] = modules['../core/media/index'];
-  ({ useVideoSelection } = modules['../composables/useVideoSelection']);
-  ({ validateMediaEnvelope } = modules['../utils/mediaContract']);
+    },
+  ));
   ResultSection = await loadSfc(
     new URL('../src/components/ResultSection.vue', import.meta.url),
     {
       modules: {
-        ...modules,
+        '../services/apiConfig': { apiConfig: { baseUrl: '' } },
         './AppIcon.vue': { default: { render: (_, { attrs }) => h('i', attrs) } },
         './VideoPlaylist.vue': { default: { render: () => h('div', { class: 'test-playlist' }) } },
       },

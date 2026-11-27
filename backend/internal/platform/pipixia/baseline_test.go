@@ -1,5 +1,3 @@
-//go:build phporacle
-
 package pipixia
 
 import (

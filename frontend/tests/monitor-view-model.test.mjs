@@ -1,35 +1,14 @@
-import test, { before, after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { build, stop } from "esbuild";
+import * as vm from "../src/monitor/monitorViewModel.ts";
+import { collectTransitiveImportGraph } from "./helpers/staticImportGraph.mjs";
 
 const MODEL_PATH = fileURLToPath(
   new URL("../src/monitor/monitorViewModel.ts", import.meta.url),
 );
-
-let vm;
-let bundleInputs = [];
-
-before(async () => {
-  const bundled = await build({
-    entryPoints: [MODEL_PATH],
-    bundle: true,
-    write: false,
-    platform: "node",
-    format: "esm",
-    metafile: true,
-  });
-  bundleInputs = Object.keys(bundled.metafile.inputs);
-  const code = bundled.outputFiles[0].text;
-  vm = await import(
-    `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`
-  );
-});
-
-after(() => {
-  stop();
-});
+const bundleInputs = collectTransitiveImportGraph(MODEL_PATH);
 
 function makeBaseSnapshot(overrides = {}) {
   return {
