@@ -48,6 +48,15 @@ const copy = computed(() => {
     .replace(/^v/i, "");
 
   if (isEn) {
+    if (props.mode === "extension_direct") {
+      return {
+        ariaLabel: "Extension direct download notice",
+        title: "Install DokiTool Extension for Direct Downloads",
+        description:
+          "Install the official Chrome MV3 extension to unlock zero-relay, zero-cookie direct downloads for referer-protected videos (TikTok, Weibo, and more).",
+        primaryCta: "Install DokiTool Chrome Extension",
+      };
+    }
     return {
       ariaLabel: "Extension capability upgrade notice",
       title:
@@ -62,6 +71,15 @@ const copy = computed(() => {
       primaryCta: isOutdatedExtension.value
         ? `Upgrade DokiTool Extension to v${targetExtVer} (YouTube 4K60 & Bilibili 1080P)`
         : "Install DokiTool Extension (YouTube 4K60 & Bilibili 1080P)",
+    };
+  }
+  if (props.mode === "extension_direct") {
+    return {
+      ariaLabel: "防盗链视频扩展直下提示",
+      title: "安装 DokiTool 扩展解锁防盗链视频直下",
+      description:
+        "安装官方 Chrome 扩展解锁 TikTok / 微博等防盗链视频零中转直下，零 Cookie、无需服务端中转。",
+      primaryCta: "安装 DokiTool Chrome 扩展",
     };
   }
   return {

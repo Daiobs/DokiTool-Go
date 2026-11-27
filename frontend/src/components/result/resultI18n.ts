@@ -104,6 +104,11 @@ const content: Record<string, Record<string, string>> = {
     extAudioConnectedExplain:
       "已连接 DokiTool Chrome 扩展，可直接零 Cookie 保存原声 M4A。",
     extAudioDownloadCta: "通过扩展保存原声 M4A",
+    extDirectReadyOverlay: "Chrome 扩展已就绪 · 点击下方按钮零中转满血直下",
+    extDirectRequiredOverlay:
+      "该视频源受平台防盗链保护，安装 DokiTool Chrome 扩展即可零中转满血直下",
+    downloadViaExtension: "通过扩展下载",
+    installExtensionToDownload: "安装扩展直下",
   },
   en: {
     resultTitle: "Result",
@@ -211,6 +216,12 @@ const content: Record<string, Record<string, string>> = {
     extAudioConnectedExplain:
       "Connected to DokiTool Chrome Extension — save original M4A audio directly without cookies.",
     extAudioDownloadCta: "Save M4A Audio via Extension",
+    extDirectReadyOverlay:
+      "Chrome extension ready · Click below for zero-relay direct download",
+    extDirectRequiredOverlay:
+      "This video source is referer-protected. Install the DokiTool Chrome extension for zero-relay direct download.",
+    downloadViaExtension: "Download via Extension",
+    installExtensionToDownload: "Install Extension to Download",
   },
 };
 

@@ -603,6 +603,7 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 		"zuiyou":      {"https://share.xiaochuankeji.cn/hybrid/share/post?pid=12345", "https://tbvideo.ixiaochuan.cn/zyvd/demo.mp4"},
 		"xiaohongshu": {"https://www.xiaohongshu.com/explore/66a1b2c3d4e5f6a7b8c9d0e1", "http://sns-video-bd.xhscdn.com/stream/demo.mp4"},
 		"pinterest":   {"https://www.pinterest.com/pin/858146903966145191/", "https://v1.pinimg.com/videos/mc/720p/aa/bb/demo.mp4"},
+		"tiktok":      {"https://www.tiktok.com/@demo/video/7345678901234567890", "https://v16-web-newkey.tiktokcdn.com/demo/video.mp4"},
 		"x":           {"https://x.com/user/status/1800000000000000001", "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/demo.mp4"},
 		"youtube":     {"https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?itag=18"},
 		"instagram":   {"https://www.instagram.com/reel/C123456/", "https://scontent.cdninstagram.com/v/demo.mp4"},
@@ -670,6 +671,21 @@ func TestPinterestCacheURLNormalization(t *testing.T) {
 	for _, raw := range variants {
 		if got := normalizeCacheURL("pinterest", raw); got != want {
 			t.Fatalf("normalizeCacheURL(pinterest, %q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestTikTokCacheURLNormalization(t *testing.T) {
+	want := normalizeCacheURL("tiktok", "https://www.tiktok.com/@i/video/7345678901234567890")
+	variants := []string{
+		"https://www.tiktok.com/@creator/video/7345678901234567890?is_from_webapp=1",
+		"https://www.tiktok.com/@creator/photo/7345678901234567890?sender_device=pc",
+		"https://www.tiktok.com/share/video/7345678901234567890",
+		"https://m.tiktok.com/v/7345678901234567890.html",
+	}
+	for _, raw := range variants {
+		if got := normalizeCacheURL("tiktok", raw); got != want {
+			t.Fatalf("normalizeCacheURL(tiktok, %q) = %q, want %q", raw, got, want)
 		}
 	}
 }

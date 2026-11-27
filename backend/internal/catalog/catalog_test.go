@@ -31,7 +31,7 @@ func TestCatalogUsesSingleRegistry(t *testing.T) {
 	}
 	expectedRows := unified.Slice(unified.Map(unified.Map(oracle["expected"])["data"])["platforms"])
 	rows := unified.Slice(unified.Map(c.Envelope()["data"])["platforms"])
-	if len(rows) != 10 || unified.Map(rows[0])["id"] != "douyin" || unified.Map(rows[9])["id"] != "pinterest" {
+	if len(rows) != 11 || unified.Map(rows[0])["id"] != "douyin" || unified.Map(rows[10])["id"] != "tiktok" {
 		t.Fatalf("catalog order/size changed: len=%d", len(rows))
 	}
 	if !unified.Equal(rows[:len(expectedRows)], expectedRows) {
@@ -154,8 +154,8 @@ func TestCatalogExtraRegistryAndFacebookExactHost(t *testing.T) {
 	}
 
 	rows := unified.Slice(unified.Map(c.Envelope()["data"])["platforms"])
-	if len(rows) != 15 {
-		t.Fatalf("expected 15 registered platforms, got %d", len(rows))
+	if len(rows) != 16 {
+		t.Fatalf("expected 16 registered platforms, got %d", len(rows))
 	}
 	for _, value := range rows {
 		row := unified.Map(value)

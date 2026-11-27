@@ -254,8 +254,16 @@ const playableAudibleFallbackVideoUrl = computed(() => {
   );
   return decision.kind === "file" ? decision.url : "";
 });
+const isActiveRefererProtectedVideo = computed(() =>
+  Boolean(
+    target.value?.kind === "file" &&
+      target.value.source?.browser_fetch === "blocked" &&
+      currentItem.value?.type === "video",
+  ),
+);
 const activeVideoUrl = computed(() => {
   if (isYouTubeHelperBlocked.value) return "";
+  if (isActiveRefererProtectedVideo.value) return "";
   if (
     target.value?.kind === "file" &&
     isActiveYouTubeSplitVideo.value &&
@@ -508,6 +516,14 @@ const targetMessage = computed(() => {
       ? "Please install and enable the DokiTool Chrome extension before downloading"
       : "请先安装并启用 DokiTool Chrome 官方扩展后再下载";
   }
+  if (isActiveRefererProtectedVideo.value) {
+    return t(
+      props.locale,
+      isExtensionConnected.value
+        ? "extDirectReadyOverlay"
+        : "extDirectRequiredOverlay",
+    );
+  }
   if (target.value && "message" in target.value && target.value.message) {
     if (props.locale === "en" && hasCjk(target.value.message)) {
       return "This version requires processing before download and cannot play directly here";
@@ -564,6 +580,14 @@ const playerQualityTagText = computed(() =>
   ),
 );
 const primaryDownloadLabel = computed(() => {
+  if (isActiveRefererProtectedVideo.value && !needsQualitySelection.value) {
+    return t(
+      props.locale,
+      isExtensionConnected.value
+        ? "downloadViaExtension"
+        : "installExtensionToDownload",
+    );
+  }
   if (
     !needsQualitySelection.value &&
     currentItem.value?.type === "audio" &&
@@ -867,6 +891,10 @@ const handlePrimaryDownloadClick = () => {
     openQualityPicker(true);
     return;
   }
+  if (isActiveRefererProtectedVideo.value && !isExtensionConnected.value) {
+    emit("open-extension");
+    return;
+  }
   emit("download-main");
 };
 const handleSelectLiveQuality = (item) => {
@@ -1073,6 +1101,8 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           :is-active-you-tube-split-video="isActiveYouTubeSplitVideo"
           :is-active-you-tube-audio-only="isActiveYouTubeAudioOnly"
           :is-active-extension-dash-mux="isActiveExtensionDashMux"
+          :is-active-referer-protected-video="isActiveRefererProtectedVideo"
+          :is-extension-connected="isExtensionConnected"
           :is-you-tube-helper-blocked="isYouTubeHelperBlocked"
           :is-target-blocked="isTargetBlocked"
           :selected-count="selectedCount"
@@ -1091,6 +1121,7 @@ const onBaselineChange = ({ cardHeight, columnHeight }) => {
           @mark-image-broken="markImageBroken"
           @open-quality-picker="openQualityPicker(false)"
           @open-yt-helper-modal="openYtHelperModal"
+          @open-extension="emit('open-extension')"
           @refresh-item="emit('refresh-item', $event)"
           @primary-download="handlePrimaryDownloadClick"
           @download-selected="emit('download-selected')"

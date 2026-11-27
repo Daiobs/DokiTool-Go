@@ -107,7 +107,7 @@ func TestStatsBoundedPlatformCodeChannelMatrix(t *testing.T) {
 	hostilePlatform := "attacker_plat_" + randomPrintableToken(t, 12)
 	hostileURL := "https://evil.example.org/watch?v=" + randomPrintableToken(t, 16)
 
-	if len(KnownPlatforms()) != 16 || len(KnownOutcomeCodes()) != 13 {
+	if len(KnownPlatforms()) != numPlatforms || len(KnownOutcomeCodes()) != 13 {
 		t.Fatalf("unexpected closed vocabulary sizes: platforms=%d codes=%d", len(KnownPlatforms()), len(KnownOutcomeCodes()))
 	}
 	if NormalizePlatform(hostilePlatform) != PlatformUnknown {
@@ -1502,9 +1502,9 @@ func TestStatsShanghaiHitsDeltaSyncAndModeInference(t *testing.T) {
 }
 
 func TestStatsBoundedDynamicPlatformsAndClosedVocabularyPreserved(t *testing.T) {
-	// Verify KnownPlatforms & NormalizePlatform remain strictly unchanged (16 closed elements).
-	if len(KnownPlatforms()) != 16 {
-		t.Fatalf("KnownPlatforms() len = %d, want 16", len(KnownPlatforms()))
+	// Verify KnownPlatforms & NormalizePlatform remain strictly closed-set (16 core + unknown).
+	if len(KnownPlatforms()) != numPlatforms {
+		t.Fatalf("KnownPlatforms() len = %d, want %d", len(KnownPlatforms()), numPlatforms)
 	}
 	if NormalizePlatform("vimeo") != PlatformUnknown || NormalizePlatform(PlatformYTDLPOther) != PlatformUnknown {
 		t.Fatal("NormalizePlatform must remain strictly closed-set (15 core + unknown)")

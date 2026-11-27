@@ -104,6 +104,16 @@
         ]
       },
       {
+        "id": "tiktok",
+        "name": "TikTok",
+        "site_url": "https://www.tiktok.com/",
+        "icon": "tiktok",
+        "capabilities": [
+          "video",
+          "image"
+        ]
+      },
+      {
         "id": "x",
         "name": "X",
         "site_url": "https://x.com/",

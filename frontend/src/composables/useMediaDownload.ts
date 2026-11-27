@@ -21,7 +21,10 @@ import {
   resolveProtectedExtensionAudioRoutes,
   resolveWhitelistedExtensionMuxSpec,
 } from "../core/media";
-import { resolveExecutionPlan } from "../core/capabilityHub";
+import {
+  LATEST_EXTENSION_VERSION,
+  resolveExecutionPlan,
+} from "../core/capabilityHub";
 import type {
   WebExtEnqueuePayload,
   WebExtTaskPhase,
@@ -117,6 +120,7 @@ export function useMediaDownload({
   videoStore,
   showToast,
   selection,
+  onRequireExtension,
   resolveItem,
 }: UseMediaDownloadOptions) {
   const apiContext = { apiOrigin: apiConfig.baseUrl };
@@ -1014,6 +1018,31 @@ export function useMediaDownload({
           ) {
             return await params.onBridgeUnavailable();
           }
+          if (enq.code === "UNWHITELISTED_CDN") {
+            const payloadRoutes: string[] =
+              payload.kind === "direct_download"
+                ? payload.routes
+                : payload.kind === "youtube_direct"
+                  ? [payload.url]
+                  : [];
+            if (
+              payloadRoutes.length > 0 &&
+              filterWhitelistedExtensionRoutes(payloadRoutes, apiContext)
+                .length > 0
+            ) {
+              const upgradeMsg = `扩展版本过旧，请升级至最新版 v${LATEST_EXTENSION_VERSION} 后重试`;
+              videoStore.updateDownload(id, {
+                status: "failed",
+                statusText: "扩展版本过旧，请升级",
+                error: upgradeMsg,
+                speed: 0,
+                abortController: null,
+              });
+              showToast(upgradeMsg, "warning", 6000);
+              onRequireExtension?.();
+              return false;
+            }
+          }
           const errMsg = enq.error || "连接 Chrome 扩展失败，请确认扩展已启用";
           videoStore.updateDownload(id, {
             status: "failed",
@@ -1354,8 +1383,7 @@ export function useMediaDownload({
         if (
           target.kind === "file" &&
           delivery.kind === "file" &&
-          !snapshot.hasClientHelper &&
-          hasExternalExtensionRuntime()
+          !snapshot.hasClientHelper
         ) {
           const allDeliveryRoutes = [
             target.url,
@@ -1375,7 +1403,21 @@ export function useMediaDownload({
             source: target.source,
             context: apiContext,
           });
-          if (traits.wantsProactiveExtensionDirect) {
+          const blockForExtensionRequired = () => {
+            videoStore.removeDownload(id);
+            archiveRetries.delete(id);
+            videoRetries.delete(id);
+            fileTaskSelections.delete(id);
+            sourceContexts.delete(id);
+            showToast(
+              "该视频源受防盗链保护，请安装或启用最新版 DokiTool Chrome 扩展以零中转直下",
+              "warning",
+              6000,
+            );
+            onRequireExtension?.();
+            return false;
+          };
+          if (traits.wantsProactiveExtensionDirect && hasExternalExtensionRuntime()) {
             const bridge = await loadExtensionBridge();
             checkAbort(controller.signal);
             if (!ownsTask(id, controller)) return false;
@@ -1390,6 +1432,7 @@ export function useMediaDownload({
                   traits.preferExtensionDirectAcceleration,
                 corsBlockedDirect: traits.corsBlockedDirect,
                 hasTbvideo: traits.hasTbvideo,
+                browserFetchBlocked: traits.browserFetchBlocked,
                 requiresRefererOrBlockedFetch:
                   traits.requiresRefererOrBlockedFetch,
               },
@@ -1465,11 +1508,21 @@ export function useMediaDownload({
                 return bridgeOk;
               }
               if (!ownsTask(id, controller)) return false;
+              if (traits.browserFetchBlocked) {
+                return blockForExtensionRequired();
+              }
               videoStore.updateDownload(id, {
                 savePath: undefined,
                 savePathLabel: undefined,
               });
+            } else if (
+              plan.channel === "blocked" &&
+              plan.reason === "extension_direct_required"
+            ) {
+              return blockForExtensionRequired();
             }
+          } else if (traits.browserFetchBlocked) {
+            return blockForExtensionRequired();
           }
         }
         if (

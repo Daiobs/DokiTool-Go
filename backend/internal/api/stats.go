@@ -50,9 +50,9 @@ const (
 	chOwnerIdx = 1
 	numCh      = 2
 
-	numCorePlatforms   = 15
-	platformUnknownIdx = 15
-	numPlatforms       = 16
+	numCorePlatforms   = 16
+	platformUnknownIdx = 16
+	numPlatforms       = 17
 
 	outcomeOKIdx          = 0
 	outcomeInternalErrIdx = 11
@@ -72,6 +72,7 @@ var knownPlatforms = [numPlatforms]string{
 	"zuiyou",
 	"xiaohongshu",
 	"pinterest",
+	"tiktok",
 	"x",
 	"youtube",
 	"instagram",
@@ -132,16 +133,18 @@ func corePlatformIndex(raw string) int {
 		return 8
 	case "pinterest":
 		return 9
-	case "x":
+	case "tiktok":
 		return 10
-	case "youtube":
+	case "x":
 		return 11
-	case "instagram":
+	case "youtube":
 		return 12
-	case "facebook":
+	case "instagram":
 		return 13
-	case "tumblr":
+	case "facebook":
 		return 14
+	case "tumblr":
+		return 15
 	default:
 		return -1
 	}
@@ -310,6 +313,7 @@ type Stats struct {
 	ytdlpSocialSrc         YTDLPStatsSource
 	ytdlpGenericCompSrc    YTDLPStatsSource
 	ytHelperSrc            YouTubeHelperStatsSource
+	tiktokRiskSrc          TikTokRiskStatsSource
 	shSrc                  shresolver.StatsProvider
 	shSrcGen               uint64
 	lastSyncedShanghaiHits uint64
@@ -467,6 +471,17 @@ func (s *Stats) SetYouTubeHelperSource(src YouTubeHelperStatsSource) {
 	}
 	s.mu.Lock()
 	s.ytHelperSrc = src
+	s.mu.Unlock()
+}
+
+// SetTikTokRiskSource binds the TikTok risk stats source so GET /api/stats and
+// periodic summary logs expose redacted WAF/302 counters and transport state.
+func (s *Stats) SetTikTokRiskSource(src TikTokRiskStatsSource) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.tiktokRiskSrc = src
 	s.mu.Unlock()
 }
 

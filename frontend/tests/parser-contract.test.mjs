@@ -511,6 +511,7 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
     ['facebook','Facebook','Facebook','fa-facebook'],
     ['tumblr','Tumblr','Tumblr','fa-tumblr'],
     ['pinterest','Pinterest','Pinterest','fa-pinterest'],
+    ['tiktok','TikTok','TikTok','fa-tiktok'],
   ];
   for(const [id,zhLabel,enLabel,expectedIcon] of core14) {
     const zh=platforms.resolvePlatformPresentation(id,'zh-CN');
@@ -521,7 +522,6 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
   }
 
   const longTail=[
-    ['tiktok','TikTok','fa-film'],
     ['vimeo','Vimeo','fa-film'],
     ['reddit','Reddit','fa-film'],
     ['twitch','Twitch','fa-film'],

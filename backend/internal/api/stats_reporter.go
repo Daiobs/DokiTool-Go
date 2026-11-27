@@ -124,6 +124,7 @@ func (r *SummaryReporter) FormatLine() string {
 			"adm_owner_active=%d adm_owner_queued=%d adm_owner_waits=%d adm_owner_timeout=%d adm_owner_full=%d adm_owner_wait_ms=%d "+
 			"ytdlp_active=%d ytdlp_waiting=%d ytdlp_anon_waits=%d ytdlp_anon_wait_ms=%d ytdlp_anon_max_ms=%d ytdlp_owner_waits=%d ytdlp_owner_wait_ms=%d ytdlp_owner_max_ms=%d "+
 			"sh_hits=%d win_sh_hits=%d sh_fallbacks=%d sh_douyin_hits=%d sh_douyin_fallbacks=%d sh_bilibili_hits=%d sh_bilibili_fallbacks=%d sh_queue_waits=%d sh_queue_wait_ms=%d "+
+			"tiktok_waf=%d tiktok_302_fail=%d "+
 			"lat_anon_count=%d lat_anon_p50_le_ms=%s lat_anon_p95_le_ms=%s lat_anon_max_ms=%d "+
 			"lat_owner_count=%d lat_owner_p50_le_ms=%s lat_owner_p95_le_ms=%s lat_owner_max_ms=%d "+
 			"outcomes=%s",
@@ -140,6 +141,7 @@ func (r *SummaryReporter) FormatLine() string {
 		snap.Shanghai.ByPlatform.Douyin.Hits, snap.Shanghai.ByPlatform.Douyin.Fallbacks,
 		snap.Shanghai.ByPlatform.Bilibili.Hits, snap.Shanghai.ByPlatform.Bilibili.Fallbacks,
 		snap.Shanghai.Total.QueueWaits, snap.Shanghai.Total.QueueWaitMSTotal,
+		snap.TikTok.WAFBlocked, snap.TikTok.Play302Failed,
 		latAnon.Count, histogramQuantileUpperBound(latAnon, 50), histogramQuantileUpperBound(latAnon, 95), latAnon.MaxMS,
 		latOwn.Count, histogramQuantileUpperBound(latOwn, 50), histogramQuantileUpperBound(latOwn, 95), latOwn.MaxMS,
 		outcomesField,

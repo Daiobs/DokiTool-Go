@@ -70,6 +70,15 @@ func normalizePinterestCacheURL(source string) (string, string, string, bool, bo
 	return "", "", "", false, false
 }
 
+func normalizeTikTokCacheURL(source string) (string, string, string, bool, bool) {
+	if itemID, canonical, isShortLink, ok := urlpolicy.ExtractTikTokItemTarget(source); ok && !isShortLink && itemID != "" {
+		if cu, parseErr := url.Parse(canonical); parseErr == nil {
+			return "https", "www.tiktok.com", cu.EscapedPath(), true, true
+		}
+	}
+	return "", "", "", false, false
+}
+
 var platformTraits = map[string]platformTrait{
 	"douyin": {
 		shanghaiFallbackShortTTL: true,
@@ -82,6 +91,9 @@ var platformTraits = map[string]platformTrait{
 	},
 	"pinterest": {
 		normalizeCacheURL: normalizePinterestCacheURL,
+	},
+	"tiktok": {
+		normalizeCacheURL: normalizeTikTokCacheURL,
 	},
 	"x": {
 		slowEngine:      true,

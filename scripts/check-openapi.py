@@ -425,15 +425,15 @@ def check_openapi_structure(
         "Attachment.properties.track_kind must be string enum ['manual', 'auto'] with additionalProperties=false",
     )
 
-    # Parity check with unified backend/config/platforms.json (10 core + 5 optional)
-    require(isinstance(platforms_cfg, list) and len(platforms_cfg) == 15, "Expected 15 entries in backend/config/platforms.json")
+    # Parity check with unified backend/config/platforms.json (11 core + 5 optional)
+    require(isinstance(platforms_cfg, list) and len(platforms_cfg) == 16, "Expected 16 entries in backend/config/platforms.json")
     platform_ids = [entry["id"] for entry in platforms_cfg]
     optional_go_platforms = {entry["id"] for entry in platforms_cfg if entry.get("optional") is True}
-    require(len(set(platform_ids)) == 15, "Expected 15 distinct platform IDs in backend/config/platforms.json")
+    require(len(set(platform_ids)) == 16, "Expected 16 distinct platform IDs in backend/config/platforms.json")
     require(len(optional_go_platforms) == 5, "Expected 5 optional platform IDs in backend/config/platforms.json")
     require(
         comp_schemas["PlatformQuery"]["enum"] == ["all", *platform_ids],
-        "PlatformQuery enum does not match the 15 registered platform IDs",
+        "PlatformQuery enum does not match the 16 registered platform IDs",
     )
     all_cfg_caps = {
         cap
@@ -664,7 +664,7 @@ def check_openapi_structure(
     )
     require(
         set(cb_props["platform"].get("enum") or []) == set(platform_ids)
-        and len(cb_props["platform"].get("enum") or []) == 15
+        and len(cb_props["platform"].get("enum") or []) == 16
         and cb_props["state"].get("$ref") == "#/components/schemas/CircuitBreakerState"
         and cb_props["disabled_by_config"].get("type") == "boolean",
         "CircuitBreakerPlatformSnapshot platform/state/disabled_by_config schema mismatch",
@@ -753,13 +753,30 @@ def check_openapi_structure(
         yt_helper_prop.get("$ref") == "#/components/schemas/YouTubeHelperStatsSnapshot",
         "StatsSnapshot.youtube_helper must reference YouTubeHelperStatsSnapshot",
     )
+    tt_risk_prop = comp_schemas["StatsSnapshot"]["properties"].get("tiktok") or {}
+    require(
+        tt_risk_prop.get("$ref") == "#/components/schemas/TikTokRiskStatsSnapshot",
+        "StatsSnapshot.tiktok must reference TikTokRiskStatsSnapshot",
+    )
+    tt_risk_schema = comp_schemas.get("TikTokRiskStatsSnapshot") or {}
+    tt_risk_props = tt_risk_schema.get("properties") or {}
+    require(
+        tt_risk_schema.get("additionalProperties") is False
+        and tt_risk_schema.get("required") == [
+            "proxy_configured", "transport_mode", "hydration_ok",
+            "waf_blocked", "content_not_found", "play_302_ok", "play_302_failed",
+        ]
+        and tt_risk_props.get("proxy_configured", {}).get("type") == "boolean"
+        and tt_risk_props.get("transport_mode", {}).get("enum") == ["standard", "chrome131"],
+        "TikTokRiskStatsSnapshot schema mismatch",
+    )
     cb_list_prop = comp_schemas["StatsSnapshot"]["properties"].get("circuit_breakers") or {}
     require(
         cb_list_prop.get("type") == "array"
-        and cb_list_prop.get("minItems") == 15
-        and cb_list_prop.get("maxItems") == 15
+        and cb_list_prop.get("minItems") == 16
+        and cb_list_prop.get("maxItems") == 16
         and (cb_list_prop.get("items") or {}).get("$ref") == "#/components/schemas/CircuitBreakerPlatformSnapshot",
-        "StatsSnapshot.circuit_breakers must be fixed 15-item array of CircuitBreakerPlatformSnapshot",
+        "StatsSnapshot.circuit_breakers must be fixed 16-item array of CircuitBreakerPlatformSnapshot",
     )
     gcb_prop = comp_schemas["StatsSnapshot"]["properties"].get("generic_circuit_breaker") or {}
     require(
@@ -889,7 +906,7 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
     }
     core_platforms = [
         "douyin", "bilibili", "weibo", "toutiao", "kuaishou", "pipixia", "pipigx",
-        "zuiyou", "xiaohongshu", "pinterest", "x", "youtube", "instagram", "facebook", "tumblr",
+        "zuiyou", "xiaohongshu", "pinterest", "tiktok", "x", "youtube", "instagram", "facebook", "tumblr",
     ]
     sample_circuit_breakers = [
         {
@@ -1071,9 +1088,9 @@ def check_with_jsonschema(spec: dict, require_installed: bool) -> dict:
         "code": "OK",
         "data": {
             **base_stats_data,
-            "circuit_breakers": sample_circuit_breakers[:14],
+            "circuit_breakers": sample_circuit_breakers[:15],
         },
-    }))), "circuit_breakers with fewer than 15 items must be rejected")
+    }))), "circuit_breakers with fewer than 16 items must be rejected")
     sample_generic_cb = {
         "platform": "ytdlp_generic",
         "state": "closed",
@@ -1519,7 +1536,7 @@ def check_api_keys_example(platforms_cfg: list[dict]) -> int:
     )
 
     valid_platforms = {entry["id"] for entry in platforms_cfg}
-    require(len(valid_platforms) == 15, "Expected 15 distinct active platform IDs")
+    require(len(valid_platforms) == 16, "Expected 16 distinct active platform IDs")
     valid_key_platforms = valid_platforms | {"ytdlp_generic"}
 
     allowed_fields = {
@@ -1652,7 +1669,7 @@ def check_runtime_config_example(platforms_cfg: list[dict]) -> bool:
     require(doc["schema_version"] == "1.0", "runtime.example.json schema_version must be '1.0'")
 
     valid_platforms = {entry["id"] for entry in platforms_cfg} | {"ytdlp_generic"}
-    require(len(valid_platforms) == 16, "Expected 15 core platforms + ytdlp_generic")
+    require(len(valid_platforms) == 17, "Expected 16 core platforms + ytdlp_generic")
 
     def require_int_range(obj: dict, key: str, lo: int, hi: int, prefix: str) -> int:
         val = obj.get(key)

@@ -185,9 +185,9 @@ async function waitUntil(predicate) {
 }
 const base = { title: '示例', images: [], live_photo: [], video_backup: [], music: {}, extra: {}, url: 'https://media.test/main.mp4' };
 
-test('all fifteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
+test('all sixteen online catalog platforms are visible in Supported_Platforms while HeroSection renders fixed popular tabs; unsupported platform claims are absent', async () => {
   assert.deepEqual(platforms.supportedPlatforms.value.map((item) => item.id), [
-    'douyin', 'kuaishou', 'bilibili', 'xiaohongshu', 'toutiao', 'weibo', 'pipixia', 'pipigx', 'zuiyou', 'pinterest',
+    'douyin', 'kuaishou', 'bilibili', 'xiaohongshu', 'toutiao', 'weibo', 'pipixia', 'pipigx', 'zuiyou', 'pinterest', 'tiktok',
     'x', 'youtube', 'instagram', 'facebook', 'tumblr',
   ]);
   const heroHtml = await renderToString(createSSRApp({ render: () => h(HeroSection, { locale: 'zh-CN', currentPlatform: 'all' }) }));
@@ -5656,4 +5656,86 @@ test('Post-#68 Batch 1A: WEB_EXT_PING syncs in-memory useSaveFilePicker, disconn
     if (prevChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = prevChrome;
   }
+});
+
+test('Phase 2: pure-contract browser_fetch=blocked video renders extension guide, suppresses <video src>, and retains poster + copy CTA', async () => {
+  const blockedVideoData = {
+    schema_version: '1.0',
+    platform: 'tiktok',
+    title: 'TikTok Blocked Video Demo',
+    default_item_id: 'item-1',
+    items: [
+      {
+        id: 'item-1',
+        type: 'video',
+        title: 'TikTok Blocked Video Demo',
+        cover: { url: 'https://p16-sign-sg.tiktokcdn.com/poster.jpg', browser_fetch: 'blocked' },
+        variants: [
+          {
+            id: 'v-1',
+            label: '1080p',
+            metadata: { width: 1080, height: 1920, extension: 'mp4' },
+            delivery: {
+              kind: 'file',
+              sources: [
+                {
+                  id: 's-1',
+                  url: 'https://v16-webapp-prime.tiktok.com/video/tos/demo.mp4',
+                  access: 'direct',
+                  browser_fetch: 'blocked',
+                  recommended_referer: 'https://www.tiktok.com/',
+                  cors_blocked: true,
+                },
+              ],
+            },
+          },
+        ],
+        default: {
+          variant_id: 'v-1',
+          source_id: 's-1',
+          url: 'https://v16-webapp-prime.tiktok.com/video/tos/demo.mp4',
+          access: 'direct',
+        },
+      },
+    ],
+  };
+
+  // Disconnected: suppresses <video src=...>, renders extension installation stage overlay & CTA, keeps copy-link button & poster
+  const disconnectedHtml = await renderToString(
+    createSSRApp({
+      render: () => h(ResultSection, {
+        ...resultProps(blockedVideoData),
+        extensionState: { connected: false, version: '', extensionId: '', capabilities: [] },
+        locale: 'zh-CN',
+      }),
+    }),
+  );
+  assert.doesNotMatch(disconnectedHtml, /<video[^>]*\ssrc=/);
+  assert.match(disconnectedHtml, /data-ext-direct-install-cta/);
+  assert.match(disconnectedHtml, /data-extension-direct-video="true"/);
+  assert.match(disconnectedHtml, /安装扩展直下/);
+  assert.match(disconnectedHtml, /复制链接/);
+  assert.match(disconnectedHtml, /https:\/\/p16-sign-sg\.tiktokcdn\.com\/poster\.jpg/);
+  assert.doesNotMatch(disconnectedHtml, /data-ext-direct-download-cta/);
+
+  // Connected: still suppresses <video src=...>, renders connected direct-download stage CTA & suppresses install CTA
+  const connectedHtml = await renderToString(
+    createSSRApp({
+      render: () => h(ResultSection, {
+        ...resultProps(blockedVideoData),
+        extensionState: {
+          connected: true,
+          version: '4.6.0',
+          extensionId: 'ihamkldlkdibleacagiejklpfofapkpo',
+          capabilities: ['direct_download'],
+        },
+        locale: 'zh-CN',
+      }),
+    }),
+  );
+  assert.doesNotMatch(connectedHtml, /<video[^>]*\ssrc=/);
+  assert.match(connectedHtml, /data-ext-direct-download-cta/);
+  assert.match(connectedHtml, /data-extension-direct-video="true"/);
+  assert.match(connectedHtml, /通过扩展下载/);
+  assert.doesNotMatch(connectedHtml, /data-ext-direct-install-cta/);
 });

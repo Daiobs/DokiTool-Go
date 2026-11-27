@@ -36,6 +36,7 @@ export interface UseMediaDownloadOptions {
   videoStore: ReturnType<typeof useVideoStore>;
   showToast: (message: string, type?: ToastType, duration?: number) => unknown;
   selection: VideoSelection;
+  onRequireExtension?: () => unknown;
   resolveItem: (
     item: MediaItem,
     signal?: AbortSignal,

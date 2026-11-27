@@ -30,6 +30,17 @@ func TestStatsDTOJSONWireEquivalenceWithSubsystemSnapshots(t *testing.T) {
 	}
 	assertJSONEqual(t, "YouTubeHelperStats", ytIn, toAPIYouTubeHelperStats(ytIn))
 
+	ttIn := apitelemetry.TikTokRiskStats{
+		ProxyConfigured: true,
+		TransportMode:   "chrome131",
+		HydrationOK:     12,
+		WAFBlocked:      3,
+		ContentNotFound: 2,
+		Play302OK:       40,
+		Play302Failed:   1,
+	}
+	assertJSONEqual(t, "TikTokRiskStats", ttIn, toAPITikTokRiskStats(ttIn))
+
 	slotIn := ytengine.SlotStatsSnapshot{
 		Enabled:          true,
 		Active:           2,

@@ -38,6 +38,7 @@ const CORE_PLATFORM_LABEL_MAP = new Map<string, string>([
   ["zuiyou", "最右"],
   ["xiaohongshu", "小红书"],
   ["pinterest", "Pinterest"],
+  ["tiktok", "TikTok"],
   ["x", "X / Twitter"],
   ["youtube", "YouTube"],
   ["instagram", "Instagram"],

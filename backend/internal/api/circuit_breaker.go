@@ -31,6 +31,7 @@ var platformChineseNames = map[string]string{
 	"zuiyou":        "最右",
 	"xiaohongshu":   "小红书",
 	"pinterest":     "Pinterest",
+	"tiktok":        "TikTok",
 	"x":             "X",
 	"youtube":       "YouTube",
 	"instagram":     "Instagram",

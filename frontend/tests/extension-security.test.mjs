@@ -322,11 +322,11 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Ru
 
   assert.deepEqual(
     rules.map((r) => r.id),
-    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009],
   );
   assert.deepEqual(
     Array.from(dnrRules.EXTENSION_DNR_RULE_IDS),
-    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009],
   );
 
   for (const rule of rules) {
@@ -338,7 +338,26 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Ru
     assert.equal(rule.action.type, "modifyHeaders");
   }
 
-  const [r1001, r1002, r1003, r1004, r1005, r1006, r1007, r1008] = rules;
+  const [r1001, r1002, r1003, r1004, r1005, r1006, r1007, r1008, r1009] = rules;
+  assert.equal(r1009.priority, 2);
+  assert.deepEqual(r1009.condition.requestDomains, [
+    "tiktokcdn.com",
+    "tiktokcdn-us.com",
+    "tiktokcdn-eu.com",
+    "tiktokv.com",
+  ]);
+  assert.deepEqual(r1009.action.requestHeaders, [
+    { header: "Referer", operation: "set", value: "https://www.tiktok.com/" },
+    { header: "Origin", operation: "remove" },
+    { header: "Cookie", operation: "remove" },
+  ]);
+  for (const ttDom of r1009.condition.requestDomains) {
+    assert.equal(
+      r1005.condition.requestDomains.includes(ttDom),
+      false,
+      `Rule 1005 must not duplicate specialized TikTok domain ${ttDom}`,
+    );
+  }
 
   // Rule 1001: YouTube TVHTML5 player endpoint
   assert.equal(r1001.priority, 3);
@@ -1704,9 +1723,9 @@ test("PR-C urlMatcher: matchSupportedPlatformUrl stays strict 14-core while matc
   const longTailSamples = [
     ["https://vimeo.com/123456", "vimeo.com", "generic:url:vimeo.com/123456"],
     [
-      "https://www.tiktok.com/@creator/video/7123456789?utm_source=share&is_from_webapp=1#top",
-      "tiktok.com",
-      "generic:url:www.tiktok.com/@creator/video/7123456789",
+      "https://www.dailymotion.com/video/x8abcde?utm_source=share#top",
+      "dailymotion.com",
+      "generic:url:www.dailymotion.com/video/x8abcde",
     ],
     [
       "https://www.reddit.com/r/videos/comments/abc123/demo/",
@@ -1792,12 +1811,12 @@ test("PR-C urlMatcher: matchSupportedPlatformUrl stays strict 14-core while matc
     );
   }
 
-  // Batch extractor mixes core-14 + long-tail, deduplicates tracking variants, and ignores unsafe/plain lines
+  // Batch extractor mixes core + long-tail, deduplicates tracking variants, and ignores unsafe/plain lines
   const mixedBatch = [
     "看看这个 B 站视频 https://www.bilibili.com/video/BV1uv411q7Mv?spm_id_from=333",
     "Vimeo 推荐 https://vimeo.com/123456?utm_source=copy",
     "https://vimeo.com/123456",
-    "TikTok 分享 https://www.tiktok.com/@creator/video/7123456789?is_from_webapp=1",
+    "Dailymotion 分享 https://www.dailymotion.com/video/x8abcde?utm_source=copy",
     "https://soundcloud.com/artist/track-1",
     "纯文字备注，没有链接",
     "chrome://settings/privacy",
@@ -1815,7 +1834,7 @@ test("PR-C urlMatcher: matchSupportedPlatformUrl stays strict 14-core while matc
     [
       "bilibili:B站",
       "generic:vimeo.com",
-      "generic:tiktok.com",
+      "generic:dailymotion.com",
       "generic:soundcloud.com",
     ],
   );
@@ -1831,7 +1850,6 @@ test("PR-C hostWhitelist: PRODUCTION_HOST_PERMISSIONS stays unchanged & isSafeNa
     "http://*/*",
     "https://*/*",
     "vimeocdn",
-    "tiktokcdn",
     "redd.it",
     "sndcdn",
   ]) {

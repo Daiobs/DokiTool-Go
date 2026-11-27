@@ -72,6 +72,8 @@ export interface ExecutionPlanInput {
   whitelistedForExtension?: boolean;
   /** True when upstream requires Referer/Origin header injection or blocks browser fetch */
   requiresRefererOrBlockedFetch?: boolean;
+  /** True when the unified-v1 source explicitly marks `browser_fetch: "blocked"` (hard Referer/anti-hotlink protection) */
+  browserFetchBlocked?: boolean;
   /** True when the item carries `item.tbvideo` browser-only download hints */
   hasTbvideo?: boolean;
   /** True when upstream CDN blocks cross-origin browser fetch (e.g. CORS-blocked direct URL) */
@@ -301,7 +303,8 @@ export function resolveExecutionPlan(
     option.deliveryKind === "file" &&
     extDirect &&
     option.whitelistedForExtension !== false &&
-    (option.requiresRefererOrBlockedFetch ||
+    (option.browserFetchBlocked ||
+      option.requiresRefererOrBlockedFetch ||
       option.preferExtensionDirectAcceleration ||
       option.corsBlockedDirect ||
       option.hasTbvideo ||
@@ -312,6 +315,17 @@ export function resolveExecutionPlan(
       canDownload: true,
       usesExtension: true,
       requiresUpgradeNotice: false,
+    };
+  }
+
+  // 4b. Hard referer-protected (`browser_fetch: "blocked"`) direct files cannot be fetched in a Web tab without the extension
+  if (option.deliveryKind === "file" && option.browserFetchBlocked === true) {
+    return {
+      channel: "blocked",
+      canDownload: false,
+      usesExtension: false,
+      requiresUpgradeNotice: true,
+      reason: "extension_direct_required",
     };
   }
 

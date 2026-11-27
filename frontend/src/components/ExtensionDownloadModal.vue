@@ -52,7 +52,7 @@ const copy = computed(() => {
         : `Chrome MV3 Native Side Panel v${latestVer} · Anonymous Ready`,
       title: "DokiTool Chrome Extension",
       subtitle:
-        "Watermark-free downloads across 14 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
+        "Watermark-free downloads across 16 core platforms + 1,000+ long-tail sites, built-in Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey, zero-relay direct downloads for referer-protected videos, pure-client VTT/SRT bilingual subtitle export, multi-P background streaming & sanitized task history, automatic Web page handshake, background downloads that keep running when the side panel closes, zero cookies & zero page script injection.",
       closeLabel: "Close dialog",
       ctaLabel: upgrade
         ? `Download Latest Extension v${latestVer} (.zip)`
@@ -90,7 +90,7 @@ const copy = computed(() => {
         "Extract the newer ZIP over the original folder and click the refresh icon on the extension card in chrome://extensions — your saved preferences and settings stay intact. If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.",
       privacyLabel: "Privacy:",
       privacyNote:
-        "Zero cookies, zero page script injection, and zero <all_urls> wildcard: auto-sync only matches the 14 core platforms; non-whitelisted long-tail direct links are handed off directly to Chrome's native downloader (the extension does not proxy requests, read response bodies, or attach cookies); Bilibili Referer DNR rules (1004, 1006–1008) are strictly scoped to extension-initiated Bilibili CDN and overseas Akamai UPOS requests without affecting other sites.",
+        "Zero cookies, zero page script injection, and zero <all_urls> wildcard: auto-sync only matches the 16 core platforms; non-whitelisted long-tail direct links are handed off directly to Chrome's native downloader (the extension does not proxy requests, read response bodies, or attach cookies); Referer DNR rules (1003–1004, 1006–1009) are strictly scoped to extension-initiated CDN requests without affecting other sites.",
     };
   }
   return {
@@ -99,7 +99,7 @@ const copy = computed(() => {
       : `Chrome MV3 侧边栏原生扩展 v${latestVer} · 匿名直用`,
     title: "DokiTool Chrome 扩展",
     subtitle:
-      "支持 14 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
+      "支持 16 核心平台 + 1000+ 长尾站点无水印视频、图集与实况照片下载，内置 B 站 1080P & YouTube 4K60 免油猴本地无损合流、防盗链视频零中转直下、纯客户端 VTT/SRT 双语字幕导出、多 P 后台流式队列与脱敏任务历史，支持网页端自动联动与关闭侧边栏后台持续落盘不断流，零 Cookie、零网页脚本注入。",
     closeLabel: "关闭弹窗",
     ctaLabel: upgrade
       ? `下载新版 Chrome 扩展包 v${latestVer}（.zip）`
@@ -131,7 +131,7 @@ const copy = computed(() => {
       "解压覆盖原文件夹，在 chrome://extensions 点击扩展卡片刷新按钮即可（已保存偏好与设置不会丢失）。如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。",
     privacyLabel: "隐私边界：",
     privacyNote:
-      "零 Cookie、零网页脚本注入、零 <all_urls> 通配权限：自动跟随仅匹配 14 核心平台；非白名单长尾渐进直链直接移交浏览器原生下载器（扩展不代理请求、不读取响应体、不附加 Cookie）；B 站防盗链 DNR 规则（1004、1006–1008）仅作用于扩展自身的 B 站及海外 Akamai UPOS 请求，不影响其他站点与正常浏览。",
+      "零 Cookie、零网页脚本注入、零 <all_urls> 通配权限：自动跟随仅匹配 16 核心平台；非白名单长尾渐进直链直接移交浏览器原生下载器（扩展不代理请求、不读取响应体、不附加 Cookie）；防盗链 DNR 规则（1003–1004、1006–1009）仅作用于扩展自身的 CDN 请求，不影响其他站点与正常浏览。",
   };
 });
 

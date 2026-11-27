@@ -32,6 +32,7 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pinterest"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipigx"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/tiktok"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/toutiao"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
@@ -163,6 +164,12 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	tiktokParser := tiktok.New(executor)
+	if rpm, burst, set, rpmErr := parseTikTokDirectRPM(os.Getenv); rpmErr != nil {
+		return rpmErr
+	} else if set {
+		tiktokParser.WithDirectRateLimit(rpm, burst)
+	}
 	adapters := map[string]api.Adapter{
 		"douyin":      douyinParser,
 		"bilibili":    bilibiliParser,
@@ -174,6 +181,7 @@ func run(args []string) error {
 		"zuiyou":      zuiyou.NewWithTBVideo(executor, zuiyouSave),
 		"xiaohongshu": xiaohongshu.New(xhsExecutor),
 		"pinterest":   pinterest.New(executor),
+		"tiktok":      tiktokParser,
 	}
 	runtimeCfg, runtimeFromFile, err := api.LoadRuntimeConfig(os.Getenv)
 	if err != nil {
@@ -195,6 +203,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	handler.Stats().SetTikTokRiskSource(tiktokParser)
 	if ytCfg.genericAdapter != nil {
 		handler.SetGenericAdapter(ytCfg.genericAdapter)
 	}
@@ -314,6 +323,25 @@ func parseBilibiliDASH(getenv func(string) string) (bool, error) {
 		return false, fmt.Errorf("DOKITOOL_BILIBILI_DASH must be a boolean")
 	}
 	return enabled, nil
+}
+
+func parseTikTokDirectRPM(getenv func(string) string) (rpm float64, burst int, set bool, err error) {
+	raw := strings.TrimSpace(getenv("DOKITOOL_TIKTOK_DIRECT_RPM"))
+	if raw == "" {
+		return 0, 0, false, nil
+	}
+	v, parseErr := strconv.ParseFloat(raw, 64)
+	if parseErr != nil || v < 0 || v > 600 {
+		return 0, 0, false, fmt.Errorf("DOKITOOL_TIKTOK_DIRECT_RPM must be a number in 0..600")
+	}
+	b := int(v)
+	if b < 1 {
+		b = 1
+	}
+	if b > 6 {
+		b = 6
+	}
+	return v, b, true, nil
 }
 
 func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai douyin.OriginalResolver, bilibiliDASH bool) (*douyin.Parser, *bilibili.Parser) {

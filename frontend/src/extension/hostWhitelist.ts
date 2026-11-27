@@ -168,6 +168,15 @@ const PLATFORM_CDN_GROUPS: readonly PlatformCdnGroup[] = [
     group: "pinterest",
     httpsHosts: ["*.pinimg.com"],
   },
+  {
+    group: "tiktok",
+    httpsHosts: [
+      "*.tiktokcdn.com",
+      "*.tiktokcdn-us.com",
+      "*.tiktokcdn-eu.com",
+      "*.tiktokv.com",
+    ],
+  },
 ] as const;
 
 function buildProductionHostPermissions(): readonly string[] {

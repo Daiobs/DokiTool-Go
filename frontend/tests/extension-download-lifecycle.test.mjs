@@ -127,8 +127,8 @@ test("Offscreen <-> Background: authoritative RELEASE_BLOB only after downloads.
   });
   await bg.init();
 
-  // Verify dynamic DNR rules synced on init (Rules 1001-1008 including G1 narrow Bilibili Akamai rules)
-  assert.equal(env.dnrRulesState.size, 8);
+  // Verify dynamic DNR rules synced on init (Rules 1001-1009 including G1 narrow Bilibili Akamai & TikTok Referer rules)
+  assert.equal(env.dnrRulesState.size, 9);
 
   // Connect SidePanel Port and verify immediate STATE_SNAPSHOT
   const spMessages = [];
