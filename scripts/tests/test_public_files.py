@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -101,6 +102,96 @@ class PublicFilesGuardTests(unittest.TestCase):
             _git(repo, "add", "-f", "src/huge.bin")
             with self.assertRaisesRegex(ValueError, "Oversized file"):
                 cpf.run_check(["--staged"], root=repo)
+
+    def test_high_confidence_credential_content_and_names_fail_closed(self) -> None:
+        # Build synthetic secret payloads dynamically so no literal secret strings live in source.
+        private_key_payload = (
+            "-----BEGIN " + "OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n"
+            "-----END " + "OPENSSH PRIVATE KEY-----\n"
+        )
+        gh_pat_payload = "token=" + ("ghp_" + "A1b2C3d4E5f6" * 3) + "\n"
+        gh_fine_pat_payload = "token=" + ("github_pat_" + "z9Y8x7W6v5U4" * 2) + "\n"
+        aws_key_payload = "aws_id=" + ("AKIA" + "0123456789ABCDEF") + "\n"
+        bearer_payload = "Authorization: Bearer " + ("live_prod_bearer_" + "9f8e7d6c5b4a3210") + "\n"
+        owner_tok_payload = "DOKITOOL_OWNER_TOKEN=" + ("live_owner_secret_" + "1234567890abcdef") + "\n"
+        api_tok_payload = 'DOKITOOL_API_TOKEN="' + ("live_api_secret_" + "fedcba0987654321") + '"\n'
+
+        cases = [
+            # R77-01 review scenario: ops/production-credentials.txt with simulated key/token
+            ("ops/production-credentials.txt", private_key_payload, "Credential file under ops/"),
+            ("ops/production-credentials.txt", "plain notes\n", "Credential file under ops/"),
+            ("config/prod-secrets.json", '{"k":"v"}\n', "Sensitive credential/secret config file"),
+            # Arbitrary filenames caught purely by high-confidence content signatures
+            ("notes/deploy.txt", private_key_payload, r"High-confidence credential pattern \(private-key\)"),
+            ("notes/ci.txt", gh_pat_payload, r"High-confidence credential pattern \(github-pat\)"),
+            ("notes/ci-fine.txt", gh_fine_pat_payload, r"High-confidence credential pattern \(github-pat\)"),
+            ("notes/cloud.txt", aws_key_payload, r"High-confidence credential pattern \(aws-access-key\)"),
+            ("notes/curl.txt", bearer_payload, r"High-confidence credential pattern \(bearer-token\)"),
+            ("notes/env-backup.txt", owner_tok_payload, r"High-confidence credential pattern \(dokitool-token\)"),
+            ("notes/api-env.txt", api_tok_payload, r"High-confidence credential pattern \(dokitool-token\)"),
+        ]
+        for rel_path, text_content, err_pattern in cases:
+            with self.subTest(rel_path=rel_path, err_pattern=err_pattern):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = Path(tmp)
+                    self._init_repo(repo)
+                    target = repo / rel_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text_content, encoding="utf-8")
+                    _git(repo, "add", "-f", rel_path)
+                    with self.assertRaisesRegex(ValueError, err_pattern):
+                        cpf.run_check(["--staged"], root=repo)
+
+        # CLI subprocess check for the exact review scenario (non-zero exit code).
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            target = repo / "ops/production-credentials.txt"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(private_key_payload, encoding="utf-8")
+            _git(repo, "add", "-f", "ops/production-credentials.txt")
+            # Copy script into temp repo to exercise the CLI entrypoint against repo root.
+            (repo / "scripts").mkdir(parents=True, exist_ok=True)
+            (repo / "scripts/check-public-files.py").write_text(
+                SCRIPT_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            _git(repo, "add", "scripts/check-public-files.py")
+            proc = subprocess.run(
+                [sys.executable, "-B", str(repo / "scripts/check-public-files.py"), "--staged"],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Public file guard failed:", proc.stderr)
+
+    def test_example_templates_placeholders_and_binaries_have_zero_false_positives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            (repo / "ops/examples").mkdir(parents=True)
+            (repo / "ops/examples/credentials.example.json").write_text(
+                '{"token": "<your-token-from-secret-store>"}\n', encoding="utf-8"
+            )
+            (repo / "docs").mkdir(parents=True)
+            (repo / "docs/auth.md").write_text(
+                "Authorization: Bearer <token>\n"
+                "Authorization: Bearer $DOKITOOL_API_TOKEN\n"
+                "Authorization: Bearer EXAMPLE_TOKEN_VALUE_1234567890123456\n"
+                "Authorization: Bearer REDACTED_TOKEN_VALUE_1234567890123456\n"
+                "DOKITOOL_OWNER_TOKEN=<your-owner-token-from-secret-store>\n"
+                "DOKITOOL_API_TOKEN=$DOKITOOL_API_TOKEN\n"
+                "DOKITOOL_OWNER_TOKEN=example_owner_token_value_123456\n"
+                "DOKITOOL_API_TOKEN=test_fixture_token_1234567890\n",
+                encoding="utf-8",
+            )
+            # Binary file with NUL bytes is skipped cleanly by UTF-8 content scan.
+            (repo / "src/logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+            _git(repo, "add", "ops/examples/credentials.example.json", "docs/auth.md", "src/logo.png")
+            self.assertEqual(cpf.run_check(["--staged"], root=repo), 0)
 
 
 if __name__ == "__main__":

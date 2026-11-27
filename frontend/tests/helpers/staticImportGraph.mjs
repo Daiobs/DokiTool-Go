@@ -56,7 +56,8 @@ function extractRuntimeModuleSpecifiers(strippedSource) {
 }
 
 function resolveLocal(fromFile, specifier) {
-  const base = path.resolve(path.dirname(fromFile), specifier);
+  const cleanSpecifier = specifier.split(/[?#]/, 1)[0];
+  const base = path.resolve(path.dirname(fromFile), cleanSpecifier);
   for (const ext of RESOLVE_EXTS) {
     const candidate = base + ext;
     try {
@@ -86,9 +87,12 @@ export function collectTransitiveImportGraph(entryAbsPath) {
     for (const specifier of extractRuntimeModuleSpecifiers(stripped)) {
       if (specifier.startsWith("./") || specifier.startsWith("../")) {
         const resolved = resolveLocal(normalized, specifier);
-        if (resolved) {
-          walk(resolved);
+        if (!resolved) {
+          throw new Error(
+            `Unresolved relative import "${specifier}" in ${normalized}`,
+          );
         }
+        walk(resolved);
       } else {
         barePackages.add(specifier);
       }

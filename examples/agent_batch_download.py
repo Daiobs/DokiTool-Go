@@ -272,6 +272,9 @@ class AgentClient:
         parsed_api = urllib.parse.urlsplit(api_base)
         api_host = (parsed_api.hostname or "").lower().rstrip(".")
         api_port = parsed_api.port or (443 if parsed_api.scheme.lower() == "https" else 80)
+        # Security boundary: only when --api-base is an explicit loopback origin (local dev or
+        # offline E2E harness sharing one loopback server) is that exact (scheme, host, port)
+        # tuple permitted on media fetches; public HTTPS --api-base keeps this None (zero loopback).
         self._allowed_loopback_origin: tuple[str, str, int] | None = (
             (parsed_api.scheme.lower(), api_host, api_port) if security.is_loopback_host(api_host) else None
         )

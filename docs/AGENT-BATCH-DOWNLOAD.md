@@ -144,6 +144,8 @@ URL 清单 (urls.txt)
 
 仓库内置的 [examples/agent_batch_download.py](../examples/agent_batch_download.py) 零第三方 `pip` 依赖（仅使用 **Python 3.9+ 标准库** 并直接复用同仓纯标准库防 SSRF / IP pinning 传输模块 `tools/dokitool-agent/{security,http_transport}.py`），完整实现了认证急停（支持 `DOKITOOL_API_TOKEN` 优先与 `DOKITOOL_OWNER_TOKEN` 兼容）、`429` `Retry-After` 退避、分集 `/api/resolve`、多线路 `403` 切换与可选测速、公网 IP pinning 与逐跳重定向重验（阻断 `https -> http` 降级）、严格 `KNOWN_MEDIA_EXTENSIONS` 扩展名白名单、8 MiB JSON / 2 GiB 媒体体积上限、`.part` + `Range` 续传、`403`/`410` 单次重解析刷新及 `manifest.jsonl` 幂等断点记录。
 
+> **运行目录说明**：该脚本直接复用同仓的 `tools/dokitool-agent/` 模块，**必须在仓库目录结构内运行**（例如在仓库根目录执行下方命令），不可将单个 `examples/agent_batch_download.py` 文件脱离仓库单独复制出去运行。
+
 ### 8.1 准备输入文件
 
 创建 `urls.txt`（每行一条分享链接或分享文本，`#` 开头为注释）：

@@ -6,8 +6,11 @@ Scans all tracked/staged paths from `git ls-files -z` and rejects:
 2. Local/generated/dependency directories (`.git`, `.local`, `.tools`, `.gemini`,
    `node_modules`, `__pycache__`, `artifacts`, `evidence`, `dist`, `dist-extension`, `scratch`);
 3. Sensitive configuration or key material (`.env` / `.env.*` other than `.env.example`,
-   `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, non-example `api-keys.json`);
-4. Compiled artifacts (`*.pyc`, `*.pyo`, `*.so`, `*.dylib`, `*.dll`, `*.exe`, `*.test`)
+   `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, non-example `api-keys.json`,
+   `ops/*credential*`, and non-example credential/secret config files);
+4. High-confidence leaked credentials inside tracked UTF-8 text files (private key headers,
+   GitHub PATs, AWS Access Key IDs, non-placeholder Bearer or DokiTool API/Owner tokens);
+5. Compiled artifacts (`*.pyc`, `*.pyo`, `*.so`, `*.dylib`, `*.dll`, `*.exe`, `*.test`)
    and oversized files (> 5 MiB).
 
 Zero third-party dependencies (Python 3.9+ stdlib only).
@@ -16,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_TESTDATA_JSON_SCAN_BYTES = 256 * 1024
 
 FORBIDDEN_DIR_PARTS = frozenset({
     '.git',
@@ -38,7 +43,40 @@ FORBIDDEN_DIR_PARTS = frozenset({
 })
 
 SENSITIVE_EXTENSIONS = frozenset({'.pem', '.key', '.p12', '.pfx'})
+CREDENTIAL_CONFIG_SUFFIXES = frozenset({'.txt', '.json', '.conf', '.cfg', '.ini', '.yaml', '.yml'})
+SAFE_CREDENTIAL_NAME_DIRS = frozenset({'docs', 'tests', 'testdata'})
 FORBIDDEN_ARTIFACT_EXTENSIONS = frozenset({'.pyc', '.pyo', '.so', '.dylib', '.dll', '.exe', '.test'})
+
+CONTENT_SCAN_EXEMPT_PATHS = frozenset({
+    'scripts/check-public-files.py',
+    'scripts/tests/test_public_files.py',
+    'scripts/check-ssot-consistency.py',
+    'scripts/tests/test_check_ssot_consistency.py',
+})
+
+HIGH_CONFIDENCE_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ('private-key', re.compile(r'-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----')),
+    ('github-pat', re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{22,})\b')),
+    ('aws-access-key', re.compile(r'\bAKIA[0-9A-Z]{16}\b')),
+    (
+        'bearer-token',
+        re.compile(
+            r'Authorization:\s*Bearer\s+'
+            r'(?!<|\$|EXAMPLE|YOUR|TOKEN|REDACTED|PLACEHOLDER|DUMMY|FAKE|TEST[_-])'
+            r'[A-Za-z0-9._~+/=-]{24,}',
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        'dokitool-token',
+        re.compile(
+            r'''\bDOKITOOL_(?:OWNER|API)_TOKEN\s*=\s*['"]?'''
+            r'(?!<|\$|EXAMPLE|YOUR|TOKEN|REDACTED|PLACEHOLDER|CHANGE_ME|REPLACE|DUMMY|FAKE|TEST[_-])'
+            r'[A-Za-z0-9._~+/=-]{16,}',
+            re.IGNORECASE,
+        ),
+    ),
+)
 
 
 def git(*arguments: str, root: Path = ROOT) -> bytes:
@@ -64,6 +102,35 @@ def _check_sensitive_or_artifact_name(relative: PurePosixPath) -> None:
         raise ValueError(f'Sensitive key/certificate file is forbidden: {relative.as_posix()}')
     if suffix in FORBIDDEN_ARTIFACT_EXTENSIONS:
         raise ValueError(f'Compiled/binary artifact is forbidden: {relative.as_posix()}')
+    is_example = '.example.' in lower or lower.endswith('.example')
+    in_safe_dir = any(part in SAFE_CREDENTIAL_NAME_DIRS for part in relative.parts[:-1])
+    if not is_example and not in_safe_dir:
+        if relative.parts[0] == 'ops' and 'credential' in lower:
+            raise ValueError(f'Credential file under ops/ is forbidden: {relative.as_posix()}')
+        if ('secret' in lower or 'credential' in lower) and suffix in CREDENTIAL_CONFIG_SUFFIXES:
+            raise ValueError(f'Sensitive credential/secret config file is forbidden: {relative.as_posix()}')
+
+
+def _check_high_confidence_secrets(relative: PurePosixPath, source: Path, size: int) -> None:
+    rel_posix = relative.as_posix()
+    if rel_posix in CONTENT_SCAN_EXEMPT_PATHS:
+        return
+    if (
+        relative.suffix.lower() == '.json'
+        and 'testdata' in relative.parts[:-1]
+        and size > MAX_TESTDATA_JSON_SCAN_BYTES
+    ):
+        return
+    raw = source.read_bytes()
+    if b'\x00' in raw[:8192]:
+        return
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return
+    for label, pattern in HIGH_CONFIDENCE_SECRET_PATTERNS:
+        if pattern.search(text):
+            raise ValueError(f'High-confidence credential pattern ({label}) detected in {rel_posix}')
 
 
 def validate_paths(paths: Sequence[str], *, root: Path = ROOT) -> None:
@@ -92,6 +159,7 @@ def validate_paths(paths: Sequence[str], *, root: Path = ROOT) -> None:
             raise ValueError(
                 f'Oversized file exceeds {MAX_FILE_BYTES} byte limit ({size} bytes): {name}'
             )
+        _check_high_confidence_secrets(relative, source, size)
 
 
 def run_check(argv: Sequence[str] | None = None, *, root: Path = ROOT) -> int:
