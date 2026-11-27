@@ -56,9 +56,9 @@ func TestExtractTikTokItemTarget(t *testing.T) {
 	}
 
 	shortCases := []struct {
-		raw      string
+		raw       string
 		wantCanon string
-		wantKey  string
+		wantKey   string
 	}{
 		{"https://vm.tiktok.com/ZM8abc123/", "https://vm.tiktok.com/ZM8abc123/", "vm:ZM8abc123"},
 		{"http://vt.tiktok.com/ZS9xyz789?foo=1", "https://vt.tiktok.com/ZS9xyz789/", "vt:ZS9xyz789"},

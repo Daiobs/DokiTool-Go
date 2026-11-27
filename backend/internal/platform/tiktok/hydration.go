@@ -79,26 +79,26 @@ type videoDetailInfo struct {
 }
 
 type tiktokItemStruct struct {
-	ID         string             `json:"id"`
-	Desc       string             `json:"desc"`
-	CreateTime flexInt64          `json:"createTime"`
-	Author     *tiktokAuthor      `json:"author"`
-	Stats      *tiktokStats       `json:"stats"`
-	Video      *tiktokVideo       `json:"video"`
-	ImagePost  *tiktokImagePost   `json:"imagePost"`
-	Music      *tiktokMusic       `json:"music"`
-	Challenges []tiktokChallenge  `json:"challenges"`
-	TextExtra  []tiktokTextExtra  `json:"textExtra"`
+	ID         string            `json:"id"`
+	Desc       string            `json:"desc"`
+	CreateTime flexInt64         `json:"createTime"`
+	Author     *tiktokAuthor     `json:"author"`
+	Stats      *tiktokStats      `json:"stats"`
+	Video      *tiktokVideo      `json:"video"`
+	ImagePost  *tiktokImagePost  `json:"imagePost"`
+	Music      *tiktokMusic      `json:"music"`
+	Challenges []tiktokChallenge `json:"challenges"`
+	TextExtra  []tiktokTextExtra `json:"textExtra"`
 }
 
 type tiktokAuthor struct {
-	ID            string `json:"id"`
-	UniqueID      string `json:"uniqueId"`
-	Nickname      string `json:"nickname"`
-	Signature     string `json:"signature"`
-	AvatarLarger  string `json:"avatarLarger"`
-	AvatarMedium  string `json:"avatarMedium"`
-	AvatarThumb   string `json:"avatarThumb"`
+	ID           string `json:"id"`
+	UniqueID     string `json:"uniqueId"`
+	Nickname     string `json:"nickname"`
+	Signature    string `json:"signature"`
+	AvatarLarger string `json:"avatarLarger"`
+	AvatarMedium string `json:"avatarMedium"`
+	AvatarThumb  string `json:"avatarThumb"`
 }
 
 type tiktokStats struct {
@@ -110,18 +110,18 @@ type tiktokStats struct {
 }
 
 type tiktokVideo struct {
-	ID          string              `json:"id"`
-	Width       flexInt64           `json:"width"`
-	Height      flexInt64           `json:"height"`
-	Duration    flexInt64           `json:"duration"`
-	Ratio       string              `json:"ratio"`
-	Cover       string              `json:"cover"`
-	OriginCover string              `json:"originCover"`
-	DynamicCover string             `json:"dynamicCover"`
-	PlayAddr    string              `json:"playAddr"`
-	Bitrate     flexInt64           `json:"bitrate"`
-	CodecType   string              `json:"codecType"`
-	BitrateInfo []tiktokBitrateInfo `json:"bitrateInfo"`
+	ID           string              `json:"id"`
+	Width        flexInt64           `json:"width"`
+	Height       flexInt64           `json:"height"`
+	Duration     flexInt64           `json:"duration"`
+	Ratio        string              `json:"ratio"`
+	Cover        string              `json:"cover"`
+	OriginCover  string              `json:"originCover"`
+	DynamicCover string              `json:"dynamicCover"`
+	PlayAddr     string              `json:"playAddr"`
+	Bitrate      flexInt64           `json:"bitrate"`
+	CodecType    string              `json:"codecType"`
+	BitrateInfo  []tiktokBitrateInfo `json:"bitrateInfo"`
 }
 
 type tiktokBitrateInfo struct {

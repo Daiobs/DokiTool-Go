@@ -54,16 +54,16 @@ func TestAllowedMediaURL(t *testing.T) {
 
 	rejected := []string{
 		"",
-		"http://v16-web-newkey.tiktokcdn.com/v.mp4",                                         // cleartext
-		"https://v16-webapp-prime.tiktok.com/video/tos/v.mp4",                               // webapp-prime cookie-bound
-		"https://v16-web-newkey.tiktokcdn.com/video/tos/v.mp4?tk=tt_chain_token",            // cookie token
-		"https://v16-web-newkey.tiktokcdn.com:8443/video/tos/v.mp4",                         // non-standard port
-		"https://user:pass@v16-web-newkey.tiktokcdn.com/video/tos/v.mp4",                    // userinfo
-		"https://127.0.0.1/video/tos/v.mp4",                                                 // ip literal
-		"https://10.0.0.1/video/tos/v.mp4",                                                  // private ip
-		"https://evil.example/video/tos/v.mp4",                                              // foreign domain
-		"https://tiktokcdn.com/video/tos/v.mp4",                                             // bare apex (needs subdomain)
-		"https://www.tiktok.com/aweme/v1/play/?video_id=1",                                  // non-CDN host
+		"http://v16-web-newkey.tiktokcdn.com/v.mp4",                              // cleartext
+		"https://v16-webapp-prime.tiktok.com/video/tos/v.mp4",                    // webapp-prime cookie-bound
+		"https://v16-web-newkey.tiktokcdn.com/video/tos/v.mp4?tk=tt_chain_token", // cookie token
+		"https://v16-web-newkey.tiktokcdn.com:8443/video/tos/v.mp4",              // non-standard port
+		"https://user:pass@v16-web-newkey.tiktokcdn.com/video/tos/v.mp4",         // userinfo
+		"https://127.0.0.1/video/tos/v.mp4",                                      // ip literal
+		"https://10.0.0.1/video/tos/v.mp4",                                       // private ip
+		"https://evil.example/video/tos/v.mp4",                                   // foreign domain
+		"https://tiktokcdn.com/video/tos/v.mp4",                                  // bare apex (needs subdomain)
+		"https://www.tiktok.com/aweme/v1/play/?video_id=1",                       // non-CDN host
 	}
 	for _, raw := range rejected {
 		if AllowedMediaURL(raw) {

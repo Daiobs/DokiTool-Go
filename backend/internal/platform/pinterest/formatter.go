@@ -80,12 +80,12 @@ type pinStoryImage struct {
 }
 
 type pinUserNode struct {
-	ID               string `json:"id"`
-	FullName         string `json:"full_name"`
-	Username         string `json:"username"`
-	ImageMediumURL   string `json:"image_medium_url"`
-	ImageSmallURL    string `json:"image_small_url"`
-	ImageLargeURL    string `json:"image_large_url"`
+	ID             string `json:"id"`
+	FullName       string `json:"full_name"`
+	Username       string `json:"username"`
+	ImageMediumURL string `json:"image_medium_url"`
+	ImageSmallURL  string `json:"image_small_url"`
+	ImageLargeURL  string `json:"image_large_url"`
 }
 
 type pinAggregatedData struct {

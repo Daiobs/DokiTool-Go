@@ -18,16 +18,16 @@ import (
 )
 
 const (
-	tiktokBrowserUA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-	hydrationTimeout     = 12 * time.Second
-	hydrationMaxBytes    = 4 << 20
-	shortlinkTimeout     = 6 * time.Second
-	shortlinkMaxHops     = 3
-	shortlinkMaxBytes    = 64 << 10
-	shortlinkCacheMax    = 2048
-	shortlinkCacheTTL    = time.Hour
-	defaultDirectRPM     = 6.0
-	defaultDirectBurst   = 6
+	tiktokBrowserUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	hydrationTimeout   = 12 * time.Second
+	hydrationMaxBytes  = 4 << 20
+	shortlinkTimeout   = 6 * time.Second
+	shortlinkMaxHops   = 3
+	shortlinkMaxBytes  = 64 << 10
+	shortlinkCacheMax  = 2048
+	shortlinkCacheTTL  = time.Hour
+	defaultDirectRPM   = 6.0
+	defaultDirectBurst = 6
 )
 
 var shortlinkAllowedHosts = fetch.AllowHosts(

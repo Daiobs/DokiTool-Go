@@ -13,7 +13,7 @@
 
 ### 1.1 主支持范围（Agent 批量直下目标）
 
-个人 Agent 通道的核心设计目标是**抖音（`douyin`）、X（`x`）及其他返回公开 CDN 直链的平台**（如快手 `kuaishou`、哔哩哔哩 `bilibili`、小红书 `xiaohongshu`、今日头条 `toutiao`、皮皮虾 `pipixia`、皮皮搞笑 `pipigx`、最右图片 `zuiyou`、Instagram `instagram`、Facebook `facebook`、Tumblr `tumblr`）。当服务端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，`GET /api/parse` 在 `platform=all`（或省略 `platform`）模式下还支持第二级通用具名提取器兜底（覆盖 Vimeo、TikTok、Reddit、SoundCloud 等长尾公网站点，严格禁用 `generic` 盲抓提取器，返回规范化动态 `data.platform` 标识）；若密钥配置了非空 `platforms` 白名单，须在白名单中显式包含 `"ytdlp_generic"` 方可访问第二级通用兜底（未配置 `platforms` 的密钥默认允许全部核心平台与第二级通用兜底）。这些平台的媒体字节由客户端直接向平台 CDN 拉取，服务端仅负责解析与统一契约输出，不中转任何媒体流量。
+个人 Agent 通道的核心设计目标是**抖音（`douyin`）、X（`x`）及其他返回公开 CDN 直链的平台**（如快手 `kuaishou`、哔哩哔哩 `bilibili`、小红书 `xiaohongshu`、今日头条 `toutiao`、皮皮虾 `pipixia`、皮皮搞笑 `pipigx`、最右图片 `zuiyou`、Pinterest `pinterest`、TikTok `tiktok`、Instagram `instagram`、Facebook `facebook`、Tumblr `tumblr`）。当服务端启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，`GET /api/parse` 在 `platform=all`（或省略 `platform`）模式下还支持第二级通用具名提取器兜底（覆盖 Vimeo、Reddit、SoundCloud 等长尾公网站点，严格禁用 `generic` 盲抓提取器，返回规范化动态 `data.platform` 标识）；若密钥配置了非空 `platforms` 白名单，须在白名单中显式包含 `"ytdlp_generic"` 方可访问第二级通用兜底（未配置 `platforms` 的密钥默认允许全部核心平台与第二级通用兜底）。这些平台的媒体字节由客户端直接向平台 CDN 拉取，服务端仅负责解析与统一契约输出，不中转任何媒体流量。
 
 ### 1.2 不在主批量范围内的平台
 
@@ -56,7 +56,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 **强制安全约束**：
 - **仅接受 `Authorization` 请求头**：单次请求仅允许携带 1 个 `Authorization` 头，前缀必须精确区分大小写为 `"Bearer "`（后接单个空格与令牌），整行请求头总长度不得超过 **`1024` 字节**。
-- **严禁放入 URL 查询参数**：服务端仅从 `Authorization` 请求头读取令牌。在 `/api/parse`、`/api/resolve`、`/api/platforms` 中，查询参数里的令牌（如 `?token=...`、`?owner_token=...`）会被忽略，请求按**匿名访客**处理（例如未命中缓存的匿名 `/api/parse` 受单 IP `Burst=4`、`0.2/s` 限流，纯 Go 平台的匿名 `/api/resolve` 走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，命中进程内新鲜缓存的 `/api/parse` 与 `/api/resolve` 走轻量的 `Catalog` 池，且微博返回中转票据），**不会报错提醒**（仅 `GET /api/stats` 会在缺少请求头时返回 `401`、在已带有效请求头时拒绝多余的查询参数并返回 `400 INVALID_INPUT`）；同时查询参数里的令牌还会暴露在日志和终端历史里。
+- **严禁放入 URL 查询参数**：服务端仅从 `Authorization` 请求头读取令牌。在 `/api/parse`、`/api/resolve`、`/api/platforms` 中，查询参数里的令牌（如 `?token=...`、`?owner_token=...`）会被忽略，请求按**匿名访客**处理（例如未命中缓存的匿名 `/api/parse` 受单 IP `Burst=4`、`0.2/s` 限流，纯 Go 平台的匿名 `/api/resolve` 走独立的 `Resolve` 池〔单 IP `Burst=12`、`0.5/s`、并发 `2`〕，命中进程内新鲜缓存的 `/api/parse` 与 `/api/resolve` 走轻量的 `Catalog` 池），**不会报错提醒**（仅 `GET /api/stats` 会在缺少请求头时返回 `401`、在已带有效请求头时拒绝多余的查询参数并返回 `400 INVALID_INPUT`）；同时查询参数里的令牌还会暴露在日志和终端历史里。
 - **严禁向第三方 CDN 转发凭据**：`/api/parse` 与 `/api/resolve` 返回的媒体 URL 指向抖音、X 等第三方平台 CDN。下载媒体字节时**绝对禁止携带 `Authorization` 头或任何 `Cookie`**。
 
 ### 2.2 鉴权失败的精确行为（HTTP `401` 与防暴力限流 `429`）
@@ -260,7 +260,7 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
 
 ### 3.4 `GET /api/stats` — 查询进程内只读运行统计快照
 
-提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中与过期兜底命中（`stale_hits`）、`fast` / `slow` / `generic_slow` / `owner` 四池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`ytdlp` 与 `ytdlp_generic` 并发槽位等待直方图、分舱水位 `ytdlp_pools`（`youtube` / `social` / `generic` / `youtube_ejs`）、14 个核心平台熔断状态列表（`circuit_breakers`）、脱敏热配置生效策略摘要（`runtime_policy`）、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关、策略数值与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
+提供当前 `dokitool` 进程自启动以来的请求计数、缓存命中与过期兜底命中（`stale_hits`）、`fast` / `slow` / `generic_slow` / `owner` 四池排队与拒绝计数、按密钥维度的 `api_keys` 池状态与累计计数、`ytdlp` 与 `ytdlp_generic` 并发槽位等待直方图、分舱水位 `ytdlp_pools`（`youtube` / `social` / `generic` / `youtube_ejs`）、16 个核心平台熔断状态列表（`circuit_breakers`）、脱敏热配置生效策略摘要（`runtime_policy`）、抖音与哔哩哔哩上海通道工作状态、端到端解析耗时直方图、只读脱敏运行开关（`runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`daily`）与近 24 小时时桶（`hourly`）。仅统计聚合计数器、运行开关、策略数值与密钥标识，不含任何 URL、IP、宿主机路径、明文令牌或摘要内容。
 
 - **认证**：**严格要求 `owner` 角色 Bearer 凭据**（`DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥）。缺失、错误、已停用（`enabled: false`）、格式畸形、超长（`> 1024` 字节）、重复 `Authorization` 头或未配置任何启用密钥时，均扣减匿名单 IP 配额并返回 HTTP `401`（`code: "INVALID_INPUT"`，连续失败第 5 次起返回 HTTP `429`）；携带合法 `agent` 或 `friend` 角色密钥访问时同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`，计入该密钥 `unauthorized` 计数，不扣减匿名单 IP 配额）。**通过 `owner` 鉴权的 `/api/stats` 请求不占用并发槽位，也不计入 `requests` 解析统计**。
 - **HTTP 方法与查询参数**：
@@ -569,6 +569,8 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
         {"platform": "pipigx", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
         {"platform": "zuiyou", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
         {"platform": "xiaohongshu", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "pinterest", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
+        {"platform": "tiktok", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
         {"platform": "x", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 10, "open_until": "", "disabled_by_config": false},
         {"platform": "youtube", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
         {"platform": "instagram", "state": "closed", "consecutive_failures": 0, "window_failures": 0, "window_total": 0, "open_until": "", "disabled_by_config": false},
@@ -769,12 +771,12 @@ curl --fail-with-body --silent --show-error --get 'https://snap.example.com/api/
   }
   ```
 - **核心统计字段说明**：
-  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 遵循受控规范化模式 `^[a-z0-9][a-z0-9_:-]{0,31}$`（最长 32 字节），覆盖 14 个核心平台 ID、`"unknown"`、上限 64 个动态长尾提取器标识及溢出桶 `"ytdlp_other"`；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
+  - `requests.by_platform_code_channel[*]`：仅输出 `count > 0` 的非零组合，按 `(platform, code, channel)` 稳定排序。`platform` 遵循受控规范化模式 `^[a-z0-9][a-z0-9_:-]{0,31}$`（最长 32 字节），覆盖 16 个核心平台 ID、`"unknown"`、上限 64 个动态长尾提取器标识及溢出桶 `"ytdlp_other"`；`code` 为 `"OK"`、11 个公开契约错误码及内部鉴权拒绝码 `"UNAUTHORIZED"`（共 13 个闭合枚举）；`channel` 为 `"anonymous"` 或 `"owner"`（所有通过鉴权的 Bearer 密钥均汇总至 `"owner"` 渠道）。
   - `admission.{fast,slow,generic_slow,owner}`：`active` 为当前正在执行的请求数，`queued` 为当前在 FIFO 队列等待的请求数，`waited` / `granted` / `timeout` / `full` / `canceled` 为累计入队、获槽、等待超时（`429`）、队列满拒绝（`429`）与客户端中途断开计数（其中 `generic_slow` 独立反映第二级通用具名提取器兜底的 `PARSE_GENERIC` 准入池水位，`owner` 汇总 `owner` 角色池快照并保持向后兼容）。
   - `cache.{total,by_channel.*}.stale_hits`：通过 `stale-if-error` 在熔断打开或上游可重试报错时返回未越界媒体签名过期缓存（`X-DokiTool-Cache: stale`）的累计命中次数。
   - `ytdlp` 与 `ytdlp_generic`：两者采用相同的 `YTDLPStatsSnapshot` 结构，分别反映核心海外提取器共享并发槽位与第二级通用具名提取器独立隔离并发槽位；未启用第二级通用兜底时，`ytdlp_generic.enabled` 为 `false` 且其余字段为 `0`。
   - `ytdlp_pools.{youtube,social,generic,youtube_ejs}`：分舱报告 YouTube 服务端慢池、社交慢池（X / IG / FB / Tumblr）、通用长尾慢池及解耦后的 YouTube EJS 助手池（`/api/youtube/context` 未命中与 `/api/youtube/finalize`）的启用状态、活跃槽位、队列等待与累计排队统计。
-  - `circuit_breakers[*]`：按固定顺序返回 14 个核心平台的熔断器只读状态（`state`: `"closed"` / `"open"` / `"half_open"`、`consecutive_failures`、`window_failures`、`window_total`、`open_until`、`disabled_by_config`）。
+  - `circuit_breakers[*]`：按固定顺序返回 16 个核心平台的熔断器只读状态（`state`: `"closed"` / `"open"` / `"half_open"`、`consecutive_failures`、`window_failures`、`window_total`、`open_until`、`disabled_by_config`）。
   - `runtime_policy`：只读脱敏返回当前生效的运行时热配置策略摘要（`config_file_active`、`reload_count`、`last_reloaded_at`、各分舱并发数、快池单平台上限、熔断开关与手动止血列表 `disabled_platforms`、缓存 TTL 秒数；绝不泄露任何本地文件路径或密钥）。
   - `api_keys[*]`：按配置顺序返回每把已注册 API 密钥（最多 `64` 项，未配置时为空数组 `[]`；已停用密钥仍以 `enabled: false` 保留在列表中，绝不返回令牌或 SHA-256 摘要）的实时并发与累计指标，包含固定 22 个字段：`id`、`role`（`"owner"` / `"agent"` / `"friend"`）、`enabled`、`active`、`slow_active`、`queued`、`concurrency_limit`、`slow_concurrency_limit`、`queue_limit`、`requests_total`、`ok`、`errors`、`cache_hits`（零槽位缓存快路径命中次数）、`rate_limited`、`unauthorized`（角色或平台白名单拦截次数）、`waited`、`granted`、`timeout`、`full`、`canceled`、`wait_ms_total`、`wait_ms_max`。`SIGHUP` 热重载时，相同 `id` 的密钥自动延续累计计数。
   - `shanghai`：`mode` 为 `"off"` / `"direct"` / `"pull"`；`pull` 模式下 `waiting_workers` 反映当前空闲待命的上海 `shanghai-resolver` 工作协程数，`hits` 与 `fallbacks` 反映上海国内线路命中与回退本地解析次数，`by_platform.{douyin,bilibili}` 按平台分别统计抖音与哔哩哔哩的上海通道命中、排队与回退次数（哔哩哔哩上海通道受主后端独立开关 `DOKITOOL_SHANGHAI_BILIBILI` 控制，默认关闭时 `by_platform.bilibili` 各项保持为 `0`）。
@@ -906,7 +908,7 @@ Agent **必须结合 HTTP 状态码与 `error.code` 执行确定性分支处理*
   - 若响应不含 `expires_at`，核心平台成功响应默认缓存 **`300s`**（仍受上述平台上限约束）。
   - **`stale-if-error` 过期兜底**：当实时回源遭遇上游/系统故障（`UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` / `INTERNAL_ERROR` 或可重试 `RATE_LIMITED`）或平台自动熔断打开时，若存在未超过 `cache.stale_if_error_ttl`（默认 `600s`）且严格早于 **`earliest_expires_at - 15s`** 硬顶的历史成功条目，服务端返回该兜底响应并附加 `X-DokiTool-Cache: stale`；人工配置的 `disabled_platforms` 紧急下线不走缓存兜底，直接返回 `503`。
   - 负缓存：`404 CONTENT_UNAVAILABLE` 缓存 **`10s`**，`403 UPSTREAM_BLOCKED` 缓存 `cache.upstream_blocked_neg_ttl`（默认 **`5s`**，置 `0s` 关闭）；负缓存绝不作为 `stale` 兜底返回，其他 `429`/`5xx` 错误不写入缓存。
-  - **`weibo` 永久不缓存且不合并**（在 `/api/stats` 中计入 `cache.by_channel.*.uncacheable`）；`youtube` 仅在 `cache.youtube_parse_ttl = 0s` 时记为 `uncacheable`。
+  - `weibo` 现已统一走零中转 `PreparePublic` 直链并接入进程内解析缓存与 `singleflight` 合并；`youtube` 仅在 `cache.youtube_parse_ttl = 0s` 时记为 `uncacheable`。
 - HTTP 响应头始终保持 `Cache-Control: no-store`，防止反向代理或客户端 HTTP 缓存组件在进程外把签名直链缓存过久。
 
 ### 6.4 CDN 直链有效期（`expires_at`）与即时下载原则
