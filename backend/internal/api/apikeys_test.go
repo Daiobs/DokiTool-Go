@@ -1099,3 +1099,60 @@ func TestReloadAPIKeysPreservesActiveLeasesWaitersAndRateBuckets(t *testing.T) {
 		t.Fatalf("pool leaked slots after reload: %+v", ks)
 	}
 }
+
+func TestKeyPoolConcurrentAcquireChargeFastReadAndReconfigureRace(t *testing.T) {
+	pool := newKeyPool(2, 1, 1.0, 1, 0, 0, &keyCounters{})
+	baseNow := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+
+	// Drain the initial burst token so concurrent acquireAt calls consistently enter avail < 1.
+	rel, retry, canceled := pool.acquireAt(context.Background(), baseNow, false)
+	if canceled || retry != 0 || rel == nil {
+		t.Fatalf("expected initial acquire to succeed, got retry=%d canceled=%v", retry, canceled)
+	}
+	rel()
+
+	var wg sync.WaitGroup
+	// Reconfigure goroutine toggling agent rps (1 <-> 2) and owner unlimited rps (1 <-> 0).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 400; i++ {
+			switch i % 4 {
+			case 0:
+				pool.reconfigure(2, 1, 1.0, 1, 0, 0)
+			case 1:
+				pool.reconfigure(2, 1, 2.0, 1, 0, 0)
+			case 2:
+				pool.reconfigure(2, 0, 0, 0, 0, 0)
+			case 3:
+				pool.reconfigure(2, 1, 1.0, 1, 0, 0)
+			}
+		}
+	}()
+
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if (id+i)%2 == 0 {
+					r, retrySec, c := pool.acquireAt(context.Background(), baseNow, false)
+					if c {
+						t.Errorf("unexpected cancel")
+					}
+					if r != nil {
+						r()
+					} else if retrySec < 1 || retrySec >= 86400 {
+						t.Errorf("invalid retrySeconds under concurrent reconfigure: %d", retrySec)
+					}
+				} else {
+					retrySec := pool.chargeFastRead(baseNow)
+					if retrySec < 0 || retrySec >= 86400 {
+						t.Errorf("invalid fast-read retrySeconds under concurrent reconfigure: %d", retrySec)
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}

@@ -531,6 +531,12 @@ class CLIAndSubtitlesTests(unittest.TestCase):
                         self.send_response(403)
                         self.end_headers()
                         return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(len(vid_bytes)))
+                    self.end_headers()
+                    self.wfile.write(vid_bytes)
+                    return
                 if parsed.path == "/media/pair_vid_ok.mp4":
                     self.send_response(200)
                     self.send_header("Content-Type", "video/mp4")
@@ -564,7 +570,7 @@ class CLIAndSubtitlesTests(unittest.TestCase):
                 out_nc.mkdir(parents=True, exist_ok=True)
                 existing_vid = out_nc / "xiaohongshu_live1234_live-1_video.mp4"
                 existing_vid.write_bytes(b"KEEP_ME")
-                with self.assertRaises(downloader.DownloadError):
+                with self.assertRaisesRegex(downloader.DownloadError, r"no-clobber"):
                     downloader.download_media(
                         client, "https://www.xiaohongshu.com/explore/live1234", out_nc,
                         allow_write=True, overwrite=False,
@@ -572,10 +578,38 @@ class CLIAndSubtitlesTests(unittest.TestCase):
                 self.assertEqual(existing_vid.read_bytes(), b"KEEP_ME")
                 self.assertEqual([p.name for p in out_nc.iterdir()], [existing_vid.name])
 
-                # 3) Hard failure on 2nd resource leaves zero committed or hidden temp files
+                # 3) Rollback inode guard: if an external writer replaces committed file #1 before file #2 fails,
+                #    rollback must NOT unlink the externally replaced inode.
+                out_rb = Path(tmp) / "pair_rollback_inode"
+                out_rb.mkdir(parents=True, exist_ok=True)
+                orig_commit = downloader._commit_atomic_file
+                commit_calls = {"n": 0}
+
+                def _racy_commit(tmp_p: Path, final_p: Path, *, overwrite: bool) -> tuple[int, int]:
+                    commit_calls["n"] += 1
+                    if commit_calls["n"] == 1:
+                        fid = orig_commit(tmp_p, final_p, overwrite=overwrite)
+                        # Simulate external replacement with a distinct inode
+                        ext_tmp = out_rb / "external.tmp"
+                        ext_tmp.write_bytes(b"EXTERNAL_REPLACEMENT")
+                        ext_tmp.replace(final_p)
+                        return fid
+                    raise downloader.DownloadError("simulated second commit collision")
+
+                with mock.patch.object(downloader, "_commit_atomic_file", side_effect=_racy_commit):
+                    with self.assertRaisesRegex(downloader.DownloadError, r"simulated second commit collision"):
+                        downloader.download_media(
+                            client, "https://www.xiaohongshu.com/explore/live1234", out_rb,
+                            allow_write=True, overwrite=False,
+                        )
+                img_target = out_rb / "xiaohongshu_live1234_live-1_image.jpg"
+                self.assertTrue(img_target.is_file())
+                self.assertEqual(img_target.read_bytes(), b"EXTERNAL_REPLACEMENT")
+
+                # 4) Hard failure on 2nd resource leaves zero committed or hidden temp files
                 out_fail = Path(tmp) / "pair_fail"
                 pair_state["video_fail_always"] = True
-                with self.assertRaises(downloader.DownloadError):
+                with self.assertRaisesRegex(downloader.DownloadError, r"500"):
                     downloader.download_media(
                         client, "https://www.xiaohongshu.com/explore/live1234", out_fail,
                         allow_write=True, overwrite=False,
@@ -608,6 +642,30 @@ class CLIAndSubtitlesTests(unittest.TestCase):
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         return
                     return
+                if self.path == "/sub/redir1":
+                    _time.sleep(0.20)
+                    self.send_response(302)
+                    self.send_header("Location", "/sub/redir2")
+                    self.end_headers()
+                    return
+                if self.path == "/sub/redir2":
+                    _time.sleep(0.20)
+                    self.send_response(302)
+                    self.send_header("Location", "/sub/drip.vtt")
+                    self.end_headers()
+                    return
+                if self.path == "/sub/err403-drip":
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    try:
+                        for i in range(15):
+                            _time.sleep(0.15)
+                            self.wfile.write(f"forbidden chunk {i}\n".encode("utf-8"))
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+                    return
                 self.send_response(404)
                 self.end_headers()
 
@@ -616,20 +674,26 @@ class CLIAndSubtitlesTests(unittest.TestCase):
         th.start()
         try:
             origin = f"http://127.0.0.1:{srv.server_port}"
-            data = {
-                "platform": "youtube",
-                "content_id": "drip1",
-                "title": "Slow Drip",
-                "attachments": [
-                    _sub_att("sub-drip", "en", "Drip", "manual", "vtt", "text/vtt", f"{origin}/sub/drip.vtt"),
-                ],
-            }
-            t0 = _time.monotonic()
-            with self.assertRaises(RuntimeError) as ctx:
-                subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="en", total_timeout=0.35)
-            elapsed = _time.monotonic() - t0
-            self.assertIn("budget", str(ctx.exception).lower())
-            self.assertLess(elapsed, 0.9, f"slow-drip subtitle exceeded wall-clock deadline: elapsed={elapsed:.3f}s")
+            for label, sub_path in (
+                ("slow-200-body", "/sub/drip.vtt"),
+                ("multi-hop-redirect", "/sub/redir1"),
+                ("slow-403-error-body", "/sub/err403-drip"),
+            ):
+                with self.subTest(case=label):
+                    data = {
+                        "platform": "youtube",
+                        "content_id": f"drip-{label}",
+                        "title": "Slow Drip",
+                        "attachments": [
+                            _sub_att(f"sub-{label}", "en", "Drip", "manual", "vtt", "text/vtt", f"{origin}{sub_path}"),
+                        ],
+                    }
+                    t0 = _time.monotonic()
+                    with self.assertRaises(RuntimeError) as ctx:
+                        subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="en", total_timeout=0.35)
+                    elapsed = _time.monotonic() - t0
+                    self.assertIn("budget", str(ctx.exception).lower())
+                    self.assertLess(elapsed, 0.9, f"{label} exceeded wall-clock deadline: elapsed={elapsed:.3f}s")
         finally:
             srv.shutdown()
             srv.server_close()

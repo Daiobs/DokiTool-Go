@@ -316,8 +316,9 @@ func (p *keyPool) acquireAt(ctx context.Context, now time.Time, isSlow bool) (re
 		}
 		avail = p.parseRate.available(now, p.burst, p.rps)
 		if avail < 1 {
+			retry := boundedRetrySeconds(1-avail, p.rps)
 			p.mu.Unlock()
-			return nil, boundedRetrySeconds(1-avail, p.rps), false
+			return nil, retry, false
 		}
 	}
 

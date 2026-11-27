@@ -212,7 +212,7 @@ def _stream_bounded(
     deadline: float | None = None,
     req_timeout: float | None = None,
 ) -> tuple[int, dict[str, str]]:
-    hdrs = _lower_headers(resp.headers)
+    hdrs = _lower_headers(getattr(resp, "headers", None))
     cl_raw = hdrs.get("content-length", "").strip()
     if cl_raw.isdigit() and int(cl_raw) > max_bytes:
         raise SizeLimitExceededError(f"Response Content-Length exceeds {max_bytes} byte limit")
@@ -323,12 +323,26 @@ class SafeHTTPFetcher:
                     current = self._redirects.resolve_next_url(current, exc.code, hdrs, hops=hops, allow_redirects=allow_redirects)
                     hops += 1
                     continue
+                err_chunks: list[bytes] = []
+                err_stream = exc.fp if getattr(exc, "fp", None) is not None else exc
                 try:
-                    err_body = exc.read(MAX_ERROR_BODY_BYTES)
+                    _stream_bounded(
+                        err_stream, MAX_ERROR_BODY_BYTES, err_chunks.append,
+                        deadline=deadline, req_timeout=req_timeout,
+                    )
+                except SizeLimitExceededError:
+                    pass
+                except (TimeoutError, socket.timeout) as to_exc:
+                    raise TimeoutError("HTTP request exceeded total time budget") from to_exc
                 except Exception:
-                    err_body = b""
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("HTTP request exceeded total time budget") from None
+                    err_chunks.clear()
                 finally:
                     exc.close()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("HTTP request exceeded total time budget")
+                err_body = b"".join(err_chunks)[:MAX_ERROR_BODY_BYTES]
                 raise HTTPStatusError(exc.code, current, hdrs, err_body) from exc
             except urllib.error.URLError as exc:
                 if isinstance(exc.reason, (socket.timeout, TimeoutError)) or (

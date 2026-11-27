@@ -195,7 +195,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 
 ## 🛡️ 安全与隐私红线
 
-- **零 Cookie 与逐跳防 SSRF**：服务端与三端客户端均不采集或转发平台账号 Cookie；所有服务端出站请求及 `tools/dokitool-agent` / 示例批量下载器均执行逐跳重定向重验、禁止 `https -> http` 降级、禁止非标准端口与公网 IP 绑定拨号（拦截回环、私网、链路本地与云元数据地址）。
+- **零 Cookie 与逐跳防 SSRF**：服务端与三端客户端均不采集或转发平台账号 Cookie；服务端出站请求执行逐跳公网 IP 绑定拨号、标准端口校验与跨站或 `https -> http` 重定向强制剥离敏感头，`tools/dokitool-agent` 与示例批量下载器进一步在逐跳重验与公网 IP 绑定拨号基础上直接阻断 `https -> http` 降级（拦截回环、私网、链路本地与云元数据地址）。
 - **零服务端媒体中转**：音视频、图片与字幕字节由用户端直连拉取；仅匿名网页访客的微博视频例外，使用 30 分钟短期 HMAC-SHA256 签名票据且受慢写超时与响应类型校验保护。
 - **Chrome MV3 最小权限隔离**：零 `content_scripts`、零 `<all_urls>`、零 `cookies` 权限；DNR 规则（含 B 站国内 Rule `1004` 与海外 Akamai UPOS 窄匹配 Rule `1006–1008`）严格限定 `initiatorDomains: [chrome.runtime.id]`；本机调试回环地址采用宿主级可选回环授权 + 应用层单端口精确源站隔离并在切换源站时自动回收；被动落盘执行严格安全后缀白名单。
 - **Agent 与运维脚本边界**：`tools/dokitool-agent` 默认只读 MCP、下载默认 `overwrite=False`（原子 `os.link` 防静默覆盖）、字幕与多轨解析带深度/字节/墙钟上限；阶段二无头验收工具 `stage2_browser.mjs` 强制 `--headless=new`、`--remote-debugging-pipe` 私有管道与 Fail-Closed 脱敏扫描。

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import stat
 import subprocess
 from typing import Any, Callable, Sequence
 import urllib.parse
@@ -42,11 +43,25 @@ def _unlink_if_regular(path: Path | None) -> None:
         path.unlink()
 
 
-def _commit_atomic_file(tmp_path: Path, final_path: Path, *, overwrite: bool) -> None:
+def _unlink_if_same_file(path: Path, expected_id: tuple[int, int]) -> None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == expected_id:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _commit_atomic_file(tmp_path: Path, final_path: Path, *, overwrite: bool) -> tuple[int, int]:
     """Atomically publish tmp_path to final_path; refuse clobber unless overwrite=True."""
+    st = os.lstat(tmp_path)
+    file_id = (st.st_dev, st.st_ino)
     if overwrite:
         os.replace(tmp_path, final_path)
-        return
+        return file_id
     try:
         os.link(tmp_path, final_path)
     except FileExistsError as exc:
@@ -60,10 +75,11 @@ def _commit_atomic_file(tmp_path: Path, final_path: Path, *, overwrite: bool) ->
                     f"Target file already exists (no-clobber default): {final_path.name}; pass --overwrite to replace"
                 ) from exc
             os.replace(tmp_path, final_path)
-            return
+            return file_id
         raise
     else:
         tmp_path.unlink()
+        return file_id
 
 
 def _sniff_magic_ext(path: Path) -> str | None:
@@ -367,16 +383,16 @@ def _download_variant_files(
                     )
 
             saved: list[dict[str, Any]] = []
-            committed: list[Path] = []
+            committed: list[tuple[Path, tuple[int, int]]] = []
             try:
                 for role, part_path, final_path, nbytes in staged:
-                    _commit_atomic_file(part_path, final_path, overwrite=overwrite)
-                    committed.append(final_path)
+                    file_id = _commit_atomic_file(part_path, final_path, overwrite=overwrite)
+                    committed.append((final_path, file_id))
                     saved.append({"role": role, "file": final_path.name, "bytes": nbytes})
             except Exception:
                 if not overwrite:
-                    for path in committed:
-                        _unlink_if_regular(path)
+                    for path, file_id in committed:
+                        _unlink_if_same_file(path, file_id)
                 raise
             return saved, False
         finally:
