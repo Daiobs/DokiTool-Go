@@ -31,10 +31,22 @@ snap.example.com {
     header @not_download_bridge X-Frame-Options DENY
     header @download_bridge Content-Security-Policy "default-src 'none'; script-src 'self'; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
     header @default_csp Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-lU5QEegjpHofhq3MItVD2EtdZznktPh4EX6foieDHns='; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data: blob:; media-src 'self' https: http: blob:; connect-src 'self' https: http:; worker-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-    # A 304 cannot replace Chromium's previously cached X-Frame-Options: DENY.
-    # Return the small bridge document in full without touching Worker caching.
-    request_header @download_bridge -If-None-Match
-    request_header @download_bridge -If-Modified-Since
+    # Deterministic release builds pin tar mtime (2026-01-01); files whose byte size stays
+    # identical across releases (e.g. index.html, /helper/extension-version.json) would
+    # collide on Caddy's default (mtime, size) ETag and serve stale 304 Not Modified responses.
+    # Strip conditional request headers for all non-hashed static entries (including /, /index.html,
+    # /helper/*, /downloads/*, /monitor, SEO files), while preserving immutable caching for /assets/*.
+    @non_hashed_static {
+        not path_regexp ^/assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8}\.(js|css|png|webp|svg|ico|woff2|ttf)(?:\.(?:br|gz))?$
+        not path /api/* /internal/*
+    }
+    request_header @non_hashed_static -If-None-Match
+    request_header @non_hashed_static -If-Modified-Since
+    # Strip file_server-generated ETag/Last-Modified on no-store HTML entrypoints & version metadata
+    # (single-line `-` header deletion in Caddy v2 is automatically deferred after file_server).
+    @no_store_static path / /index.html /helper/extension-version.json /monitor /monitor.html /downloads/bridge.html
+    header @no_store_static -ETag
+    header @no_store_static -Last-Modified
 
     # Exact signed-media endpoint: Go streaming relay, no response buffering/compression.
     handle /api/media/weibo {
@@ -115,8 +127,11 @@ snap.example.com {
     handle {
         root * /srv/dokitool/current/frontend/dist
         route {
-            # HTML and non-versioned files revalidate; API/media routes above are unaffected.
+            # Non-versioned files default to no-cache; entry HTML & extension-version.json are
+            # strictly no-store so fixed-mtime builds never trigger stale 304 responses.
             header Cache-Control "no-cache"
+            @no_store_entry path / /index.html /helper/extension-version.json
+            header @no_store_entry Cache-Control "no-store"
             @versioned {
                 path_regexp hashed ^/assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8}\.(js|css|png|webp|svg|ico|woff2|ttf)(?:\.(?:br|gz))?$
                 file {path}

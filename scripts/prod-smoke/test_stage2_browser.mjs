@@ -1119,7 +1119,7 @@ self.addEventListener("message", (event) => {
       res.writeHead(200, {
         ...baseHeaders,
         "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
         "X-Frame-Options": "DENY",
       });
       res.end(extVersionJson);

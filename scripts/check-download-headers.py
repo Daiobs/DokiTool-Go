@@ -7,9 +7,13 @@ import hashlib
 import ipaddress
 import json
 from pathlib import Path
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
+
+FIXED_BUILD_MTIME_HTTP = "Thu, 01 Jan 2026 00:00:00 GMT"
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -102,6 +106,18 @@ def check(opener, base, path, expected_status, frame_policy, timeout, *,
         if path.startswith("/downloads/bridge.html?") or path == "/downloads/bridge.html":
             if headers.get_content_type() != "text/html" or b'id="dokitool-download-bridge"' not in body:
                 result["failures"].append("Missing real HTML bridge document")
+        if path == "/helper/extension-version.json":
+            if headers.get_content_type() != "application/json":
+                result["failures"].append("Expected application/json Content-Type for extension-version.json")
+            else:
+                try:
+                    parsed = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    result["failures"].append("Invalid JSON body for extension-version.json")
+                else:
+                    ver = parsed.get("version") if isinstance(parsed, dict) else None
+                    if not isinstance(ver, str) or not SEMVER_RE.fullmatch(ver.strip()):
+                        result["failures"].append("Missing or invalid semver version in extension-version.json")
         if all(code >= 400 for code in expected_statuses) and b"<html" in body.lower():
             result["failures"].append("Missing download path returned an HTML document")
     except (OSError, urllib.error.URLError) as error:
@@ -111,18 +127,10 @@ def check(opener, base, path, expected_status, frame_policy, timeout, *,
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True, type=origin)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--timeout", type=float, default=20)
-    parser.add_argument("--previous-etag", help="ETag from the original cached bridge response")
-    parser.add_argument("--previous-last-modified", help="Last-Modified from the original cached bridge response")
-    args = parser.parse_args()
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+def run_checks(base_url, *, timeout=20, previous_etag=None, previous_last_modified=None, proxies=None):
     paths = [
-        ("/", 200, "DENY", None),
+        ("/", 200, "DENY", "no-store"),
+        ("/helper/extension-version.json", 200, "DENY", "no-store"),
         ("/downloads/bridge.html", 200, "SAMEORIGIN", "no-store"),
         ("/downloads/bridge.html?frame-policy-check=1", 200, "SAMEORIGIN", "no-store"),
         ("/downloads/worker.js", 200, "DENY", "no-cache"),
@@ -134,24 +142,56 @@ def main():
         # Caddy may reject a child path beneath a regular file as malformed.
         ("/downloads/bridge.html/missing", (400, 404), "DENY", None),
     ]
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(_env_proxies_without_credentials()), NoRedirect())
-    checks = [check(opener, args.base_url, path, status, policy, args.timeout, expected_cache=cache)
+    proxy_map = _env_proxies_without_credentials() if proxies is None else proxies
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map), NoRedirect())
+    checks = [check(opener, base_url, path, status, policy, timeout, expected_cache=cache)
               for path, status, policy, cache in paths]
-    bridge = checks[1]
+    home, ext_ver, bridge = checks[0], checks[1], checks[2]
+    # Conditional requests against fixed deterministic tar mtime (2026-01-01) and current ETag
+    # MUST return full 200 responses (never 304 Not Modified) for / and /helper/extension-version.json.
+    for entry_path, baseline in (("/", home), ("/helper/extension-version.json", ext_ver)):
+        entry_etag = baseline.get("etag") or "*"
+        for conditions in (
+            {"If-Modified-Since": FIXED_BUILD_MTIME_HTTP},
+            {"If-None-Match": entry_etag, "If-Modified-Since": FIXED_BUILD_MTIME_HTTP},
+        ):
+            checks.append(check(
+                opener, base_url, entry_path, 200, "DENY", timeout,
+                expected_cache="no-store", conditions=conditions,
+                expected_sha256=baseline.get("sha256"),
+            ))
     # The fallback validators also match an existing document on an unfixed server.
-    etag = args.previous_etag or bridge.get("etag") or "*"
-    modified = args.previous_last_modified or bridge.get("last_modified") or "Fri, 31 Dec 9999 23:59:59 GMT"
+    etag = previous_etag or bridge.get("etag") or "*"
+    modified = previous_last_modified or bridge.get("last_modified") or "Fri, 31 Dec 9999 23:59:59 GMT"
     for conditions in ({"If-None-Match": etag}, {"If-Modified-Since": modified},
                        {"If-None-Match": etag, "If-Modified-Since": modified}):
-        checks.append(check(opener, args.base_url, "/downloads/bridge.html", 200, "SAMEORIGIN", args.timeout,
+        checks.append(check(opener, base_url, "/downloads/bridge.html", 200, "SAMEORIGIN", timeout,
                             expected_cache="no-store", conditions=conditions, expected_sha256=bridge.get("sha256")))
-    report = {
+    return {
         "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "base_url": args.base_url, "checks": checks,
+        "base_url": base_url, "checks": checks,
         "passed": all(item["passed"] for item in checks),
         "csp_review_required": any(any(item.get("csp", {}).values()) for item in checks),
-        "scope": "Public GET response framing only; CSP needs review when present. No browser control, Worker handshake or file-save verification.",
+        "scope": "Public GET response framing and non-hashed static 304-collision checks; CSP needs review when present. No browser control, Worker handshake or file-save verification.",
     }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True, type=origin)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--previous-etag", help="ETag from the original cached bridge response")
+    parser.add_argument("--previous-last-modified", help="Last-Modified from the original cached bridge response")
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    report = run_checks(
+        args.base_url,
+        timeout=args.timeout,
+        previous_etag=args.previous_etag,
+        previous_last_modified=args.previous_last_modified,
+    )
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")

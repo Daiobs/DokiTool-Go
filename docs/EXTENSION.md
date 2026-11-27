@@ -1,8 +1,8 @@
-# DokiTool Chrome MV3 侧边栏原生扩展（`v4.5.0` · `sidePanel` + `offscreen`）
+# DokiTool Chrome MV3 侧边栏原生扩展（`v4.5.1` · `sidePanel` + `offscreen`）
 
-DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当前版本 **`v4.5.0`**，固定扩展 ID `ihamkldlkdibleacagiejklpfofapkpo`），基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
+DokiTool 提供面向桌面 Chrome 的原生 Manifest V3 侧边栏扩展（当前版本 **`v4.5.1`**，固定扩展 ID `ihamkldlkdibleacagiejklpfofapkpo`），基于 **`sidePanel` 交互面板 + `background` Service Worker 调度 + `offscreen` 后台下载与无损合流引擎** 三层架构构建。关闭侧边栏不会中断正在进行的大文件下载、多图子目录落盘、YouTube 4K60 无损合流或 B 站 1080P（免登录）DASH 无损合流。
 
-> **v4.5.0 运行态同步与安全加固**：Web 主站与扩展侧边栏统一以运行态 `/helper/extension-version.json`（附带 ZIP `sha256` 元数据）作为更新真相源，长驻未刷新页面打开弹窗或切回前台时实时同步最新版本号；自定义本机回环后端收紧为单端口精确可选权限并在切换源站时自动回收旧端口授权；外部网页桥接拒绝非白名单 `sender.url`，被动落盘执行严格安全后缀白名单，字幕下载在重定向后强制重验白名单域名，且 `task.error` 自动剥离 URL/凭据片段。
+> **v4.5.1 运行态同步与安全加固**：Web 主站与扩展侧边栏统一以 `cache: "no-store"` 请求运行态 `/helper/extension-version.json`（附带 ZIP `sha256` 元数据，边缘网关配合 `Cache-Control: no-store` 与条件头剥离避免固定 `mtime` 引发 `304` 缓存碰撞），长驻未刷新页面打开弹窗或切回前台时实时同步最新版本号；自定义本机回环后端收紧为单端口精确可选权限并在切换源站时自动回收旧端口授权；外部网页桥接拒绝非白名单 `sender.url`，被动落盘执行严格安全后缀白名单，字幕下载在重定向后强制重验白名单域名，且 `task.error` 自动剥离 URL/凭据片段。
 
 ---
 

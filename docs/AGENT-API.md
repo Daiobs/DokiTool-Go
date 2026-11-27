@@ -20,7 +20,7 @@
 以下两个平台**不在 Agent 批量下载主支持范围内**：
 
 1. **YouTube（`youtube`）**：
-   - 线上标准产品路径使用 **Chrome MV3 原生侧边栏扩展（`v4.5.0`）**，由扩展直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与本地 `offscreen` OPFS `Mediabunny` 无损音视频合并（纯 Web 端在未检测到扩展时合成客户端级 `HELPER_REQUIRED` 提示状态引导安装扩展）。
+   - 线上标准产品路径使用 **Chrome MV3 原生侧边栏扩展（`v4.5.1`）**，由扩展直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与本地 `offscreen` OPFS `Mediabunny` 无损音视频合并（纯 Web 端在未检测到扩展时合成客户端级 `HELPER_REQUIRED` 提示状态引导安装扩展）。
    - 在默认未开启 `DOKITOOL_YTDLP_YOUTUBE_ENABLED` 的服务端上，对 YouTube 链接调用 `GET /api/parse` 会直接返回 HTTP `503`（`code: "SERVICE_NOT_CONFIGURED"`）；即便在自建实例上开启服务端提取器，`*.googlevideo.com` 媒体直链通常绑定服务端出口 IP，异地客户端直连下载仍会被拒绝。Agent 批量任务应在输入阶段直接过滤或跳过 YouTube 链接。
 2. **微博（`weibo`）**：
    - 微博不在主批量支持范围内：DokiTool 注册的微博能力仅为 `["video"]`（不支持纯图片微博图文提取；非视频微博状态帖会返回 `404 CONTENT_UNAVAILABLE` 或因上游状态接口访客限制返回 `403 UPSTREAM_BLOCKED`），且微博响应不进入服务端短时解析缓存。

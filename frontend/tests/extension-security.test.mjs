@@ -3816,7 +3816,7 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   assert.equal(customObserved.length, 1);
   assert.equal(customObserved[0].url, "https://snap.dokitool.com/helper/extension-version.json");
   assert.equal(customObserved[0].init.credentials, "omit");
-  assert.equal(customObserved[0].init.cache, "no-cache");
+  assert.equal(customObserved[0].init.cache, "no-store");
   assert.equal(customObserved[0].init.headers, undefined);
   assert.ok(customObserved[0].init.signal instanceof AbortSignal);
 
@@ -3860,12 +3860,12 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
       {
         url: "https://snap.dokitool.com/helper/extension-version.json",
         credentials: "omit",
-        cache: "no-cache",
+        cache: "no-store",
       },
     ]);
   }
 
-  // Allowed official + loopback origins enforce credentials:omit, cache:no-cache, AbortSignal
+  // Allowed official + loopback origins enforce credentials:omit, cache:no-store, AbortSignal
   const observed = [];
   const validProd = await versionCheck.checkForExtensionUpdate({
     installedVersion: "4.4.0",
@@ -3885,7 +3885,7 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
   assert.equal(observed.length, 1);
   assert.equal(observed[0].url, "https://snap.dokitool.com/helper/extension-version.json");
   assert.equal(observed[0].init.credentials, "omit");
-  assert.equal(observed[0].init.cache, "no-cache");
+  assert.equal(observed[0].init.cache, "no-store");
   assert.ok(observed[0].init.signal instanceof AbortSignal);
 
   const loopbackObserved = [];
@@ -3916,7 +3916,7 @@ test("Batch 1A (v4.4.1): build-extension --zip-out emits extension-version.json,
     {
       url: "http://127.0.0.1:18080/helper/extension-version.json",
       credentials: "omit",
-      cache: "no-cache",
+      cache: "no-store",
     },
   ]);
 
@@ -4646,7 +4646,7 @@ test("Post-#71 PR-2 (NV-08, NV-09, P0-1, P1-5 & Hardening): single-port loopback
         fetchCount++;
         assert.equal(url, "/helper/extension-version.json");
         assert.equal(init.credentials, "omit");
-        assert.equal(init.cache, "no-cache");
+        assert.equal(init.cache, "no-store");
         return new Response(
           JSON.stringify({ version: "4.6.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
           { status: 200, headers: { "Content-Type": "application/json" } },
