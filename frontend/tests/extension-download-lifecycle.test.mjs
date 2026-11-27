@@ -3030,6 +3030,563 @@ test("P2-2, P2-3, P2-4 & P2-5: quick-download batchSaveMode=zip, concurrent YouT
 });
 
 // ============================================================================
+// v4.5.2 Resilience & Invariant Regressions (CR-02, CR-06, CR-07, CR-08)
+// ============================================================================
+
+test("v4.5.2 CR-02: per-step stallTimeoutMs aborts hung headers/bodies, triggers Range resume, and frees slots for queued 4th task", async () => {
+  // Part A: 3 concurrent stalled streams (1 hung header + 2 hung bodies) must timeout and free slots for 4th task
+  const opfs = createMockOpfs();
+  const urlApi = createTrackedUrlApi();
+  const errors = [];
+  const handedOff = [];
+  const goodPayload = new Uint8Array([11, 22, 33, 44, 55, 66]);
+
+  const mockFetch = async (url, init) => {
+    if (url.includes("/hang-header")) {
+      return await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    }
+    if (url.includes("/hang-body")) {
+      const stalledStream = new ReadableStream({
+        pull() {
+          return new Promise(() => {});
+        },
+      });
+      return new Response(stalledStream, {
+        status: 200,
+        headers: { "Content-Type": "video/mp4", "Content-Length": "1024" },
+      });
+    }
+    if (url.includes("/good-fourth")) {
+      return new Response(goodPayload, {
+        status: 200,
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Length": String(goodPayload.byteLength),
+        },
+      });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+    fetchImpl: mockFetch,
+    opfsStorage: opfs.storage,
+    webLocks: opfs.locks,
+    urlApi,
+    maxConcurrentTasks: 3,
+    stallTimeoutMs: 60,
+    onError: (e) => errors.push(e),
+    async handoffBlobDownload(msg) {
+      const blob = urlApi.activeBlobs.get(msg.blobUrl);
+      handedOff.push({
+        taskId: msg.taskId,
+        bytes: new Uint8Array(await blob.arrayBuffer()),
+      });
+      queueMicrotask(() => {
+        executor.releaseBlob({
+          taskId: msg.taskId,
+          blobUrl: msg.blobUrl,
+          opfsTempName: msg.opfsTempName,
+        });
+      });
+      return { chromeDownloadId: 901 };
+    },
+  });
+
+  executor.startTask("stall-1", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v3-web.douyinvod.com/hang-header.mp4"],
+    filename: "stall1.mp4",
+    mimeType: "video/mp4",
+  });
+  executor.startTask("stall-2", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v3-web.douyinvod.com/hang-body-a.mp4"],
+    filename: "stall2.mp4",
+    mimeType: "video/mp4",
+  });
+  executor.startTask("stall-3", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v3-web.douyinvod.com/hang-body-b.mp4"],
+    filename: "stall3.mp4",
+    mimeType: "video/mp4",
+  });
+  executor.startTask("good-4", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v3-web.douyinvod.com/good-fourth.mp4"],
+    filename: "good4.mp4",
+    mimeType: "video/mp4",
+  });
+
+  await executor.waitForIdle();
+  assert.equal(errors.length, 3);
+  for (const err of errors) {
+    assert.equal(err.code, "STREAM_STALL_TIMEOUT");
+    assert.notEqual(err.cancelled, true);
+  }
+  assert.equal(handedOff.length, 1);
+  assert.equal(handedOff[0].taskId, "good-4");
+  assert.deepEqual([...handedOff[0].bytes], [...goodPayload]);
+  assert.equal(executor.getActiveTaskCount(), 0);
+  assert.equal(opfs.files.size, 0);
+  executor.dispose();
+
+  // Part B: Mid-stream stall after partial bytes triggers automatic HTTP 206 Range resume
+  const fullData = new Uint8Array(16).map((_, i) => i + 1);
+  const seenRanges = [];
+  let resumeCalls = 0;
+  const opfsResume = createMockOpfs();
+  const urlResume = createTrackedUrlApi();
+  let resumedBytes = null;
+  const resumeExec = extensionDownloadMod.createOffscreenDownloadExecutor({
+    fetchImpl: async (_url, init) => {
+      resumeCalls += 1;
+      const rangeHdr = init?.headers?.Range || null;
+      seenRanges.push(rangeHdr);
+      if (resumeCalls === 1) {
+        let sentFirst = false;
+        const stream = new ReadableStream({
+          pull(controller) {
+            if (!sentFirst) {
+              sentFirst = true;
+              controller.enqueue(fullData.slice(0, 8));
+              return;
+            }
+            return new Promise(() => {});
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(fullData.byteLength),
+          },
+        });
+      }
+      assert.equal(rangeHdr, "bytes=8-");
+      return new Response(fullData.slice(8), {
+        status: 206,
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Range": `bytes 8-15/16`,
+          "Content-Length": "8",
+        },
+      });
+    },
+    opfsStorage: opfsResume.storage,
+    webLocks: opfsResume.locks,
+    urlApi: urlResume,
+    stallTimeoutMs: 60,
+    async handoffBlobDownload(msg) {
+      const blob = urlResume.activeBlobs.get(msg.blobUrl);
+      resumedBytes = new Uint8Array(await blob.arrayBuffer());
+      queueMicrotask(() => {
+        resumeExec.releaseBlob({
+          taskId: msg.taskId,
+          blobUrl: msg.blobUrl,
+          opfsTempName: msg.opfsTempName,
+        });
+      });
+      return { chromeDownloadId: 902 };
+    },
+  });
+
+  resumeExec.startTask("stall-resume", {
+    kind: "direct_file",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v3-web.douyinvod.com/resumable.mp4"],
+    filename: "resumable.mp4",
+    mimeType: "video/mp4",
+    sizeBytes: fullData.byteLength,
+  });
+  await resumeExec.waitForIdle();
+  assert.ok(resumedBytes, "resumed download must complete after mid-stream stall");
+  assert.deepEqual([...resumedBytes], [...fullData]);
+  assert.ok(seenRanges.includes("bytes=8-"));
+  assert.equal(opfsResume.files.size, 0);
+  resumeExec.dispose();
+});
+
+test("v4.5.2 CR-06 & CR-07: HLS resolves relative URIs against redirected final manifest URL, enforces manifest/segment size caps, and streams 8 MiB segments to OPFS with truncate rollback on retry", async () => {
+  const opfs = createMockOpfs();
+  const urlApi = createTrackedUrlApi();
+  const writeEvents = [];
+  const truncateEvents = [];
+
+  // Instrument OPFS writable to prove incremental writes during read + truncate rollback on retry
+  const origGetDirectory = opfs.storage.getDirectory;
+  const instrumentedStorage = {
+    ...opfs.storage,
+    async getDirectory() {
+      const dir = await origGetDirectory();
+      return {
+        ...dir,
+        async getFileHandle(name, opts) {
+          const handle = await dir.getFileHandle(name, opts);
+          return {
+            ...handle,
+            async createWritable() {
+              const writable = await handle.createWritable();
+              return {
+                ...writable,
+                async write(chunk) {
+                  if (chunk && typeof chunk === "object" && chunk.type === "write") {
+                    writeEvents.push({
+                      pos: chunk.position,
+                      len: chunk.data.byteLength,
+                    });
+                  } else if (chunk && typeof chunk === "object" && chunk.type === "truncate") {
+                    truncateEvents.push(chunk.size);
+                  } else if (chunk instanceof Uint8Array) {
+                    writeEvents.push({ pos: null, len: chunk.byteLength });
+                  }
+                  return writable.write(chunk);
+                },
+                async truncate(size) {
+                  truncateEvents.push(size);
+                  return writable.truncate(size);
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  // Part A: Redirected HLS manifest resolves #EXT-X-MAP and relative segments against resp.url
+  const fetchedUrls = [];
+  const handedOff = [];
+  const seg1Bytes = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]);
+  const bigSegLen = 8 * 1024 * 1024;
+  const chunkLen = 64 * 1024;
+  const bigSegBytes = new Uint8Array(bigSegLen);
+  for (let i = 0; i < bigSegBytes.length; i += 4096) {
+    bigSegBytes[i] = (i / 4096) & 0xff;
+  }
+  let bigSegAttempts = 0;
+  let writesObservedBeforeStreamEnd = 0;
+
+  const mockFetch = async (url) => {
+    fetchedUrls.push(url);
+    if (url === "https://v.douyinvod.com/origin/index.m3u8") {
+      const m3u8 = [
+        "#EXTM3U",
+        '#EXT-X-MAP:URI="init.mp4"',
+        "#EXTINF:5,",
+        "seg01.m4s",
+        "#EXT-X-ENDLIST",
+      ].join("\n");
+      const resp = new Response(m3u8, {
+        status: 200,
+        headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+      });
+      Object.defineProperty(resp, "url", {
+        value: "https://v.douyinvod.com/cdn/v2/stream/master.m3u8",
+      });
+      return resp;
+    }
+    if (url === "https://v.douyinvod.com/cdn/v2/stream/init.mp4") {
+      return new Response(seg1Bytes, {
+        status: 200,
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Length": String(seg1Bytes.byteLength),
+        },
+      });
+    }
+    if (url === "https://v.douyinvod.com/cdn/v2/stream/seg01.m4s") {
+      bigSegAttempts += 1;
+      if (bigSegAttempts === 1) {
+        // Attempt 1 writes 3 chunks of poison bytes then fails mid-stream
+        let sent = 0;
+        const poison = new Uint8Array(chunkLen).fill(0xee);
+        const failStream = new ReadableStream({
+          pull(controller) {
+            if (sent < 3) {
+              sent += 1;
+              controller.enqueue(poison.slice());
+              return;
+            }
+            controller.error(new Error("simulated mid-segment drop"));
+          },
+        });
+        return new Response(failStream, {
+          status: 200,
+          headers: { "Content-Type": "video/mp4" },
+        });
+      }
+      // Attempt 2 streams 8 MiB in 64 KiB chunks; verify OPFS writes happen DURING reading!
+      let offset = 0;
+      const okStream = new ReadableStream({
+        pull(controller) {
+          if (offset === chunkLen * 4) {
+            writesObservedBeforeStreamEnd = writeEvents.length;
+          }
+          if (offset >= bigSegBytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const slice = bigSegBytes.subarray(offset, offset + chunkLen);
+          offset += slice.byteLength;
+          controller.enqueue(slice);
+        },
+      });
+      return new Response(okStream, {
+        status: 200,
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Length": String(bigSegBytes.byteLength),
+        },
+      });
+    }
+    if (url === "https://v.douyinvod.com/oversize/manifest.m3u8") {
+      return new Response("x", {
+        status: 200,
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Content-Length": String(2 * 1024 * 1024 + 1),
+        },
+      });
+    }
+    if (url === "https://v.douyinvod.com/oversize/huge-seg.ts") {
+      return new Response("x", {
+        status: 200,
+        headers: {
+          "Content-Type": "video/mp2t",
+          "Content-Length": String(512 * 1024 * 1024 + 1),
+        },
+      });
+    }
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const errors = [];
+  const executor = extensionDownloadMod.createOffscreenDownloadExecutor({
+    fetchImpl: mockFetch,
+    opfsStorage: instrumentedStorage,
+    webLocks: opfs.locks,
+    urlApi,
+    onError: (e) => errors.push(e),
+    async handoffBlobDownload(msg) {
+      const blob = urlApi.activeBlobs.get(msg.blobUrl);
+      handedOff.push(new Uint8Array(await blob.arrayBuffer()));
+      queueMicrotask(() => {
+        executor.releaseBlob({
+          taskId: msg.taskId,
+          blobUrl: msg.blobUrl,
+          opfsTempName: msg.opfsTempName,
+        });
+      });
+      return { chromeDownloadId: 903 };
+    },
+  });
+
+  executor.startTask("hls-redirect-stream", {
+    kind: "hls",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v.douyinvod.com/origin/index.m3u8"],
+    filename: "hls-redirect.mp4",
+    mimeType: "video/mp4",
+  });
+  await executor.waitForIdle();
+
+  assert.equal(errors.length, 0, `unexpected errors: ${JSON.stringify(errors)}`);
+  assert.equal(
+    fetchedUrls.includes("https://v.douyinvod.com/cdn/v2/stream/init.mp4"),
+    true,
+  );
+  assert.equal(
+    fetchedUrls.includes("https://v.douyinvod.com/cdn/v2/stream/seg01.m4s"),
+    true,
+  );
+  assert.equal(
+    fetchedUrls.some((u) => u.includes("/origin/init.mp4") || u.includes("/origin/seg01.m4s")),
+    false,
+    "must resolve relative HLS URIs against redirected final manifest URL",
+  );
+  assert.equal(bigSegAttempts, 2);
+  assert.deepEqual(
+    truncateEvents,
+    [seg1Bytes.byteLength],
+    "failed mid-segment write must truncate OPFS back to committedOffset before retry",
+  );
+  assert.ok(
+    writesObservedBeforeStreamEnd >= 4,
+    `expected incremental OPFS writes during 8 MiB stream read, observed ${writesObservedBeforeStreamEnd}`,
+  );
+  assert.equal(handedOff.length, 1);
+  assert.equal(handedOff[0].byteLength, seg1Bytes.byteLength + bigSegLen);
+  assert.deepEqual([...handedOff[0].subarray(0, 4)], [...seg1Bytes]);
+  // Verify exact byte parity at start, middle, and end (zero 0xee poison residue!)
+  assert.equal(handedOff[0][4], 0);
+  assert.equal(handedOff[0][4 + 4096], 1);
+  assert.equal(handedOff[0][4 + bigSegLen - 4096], ((bigSegLen - 4096) / 4096) & 0xff);
+  assert.equal(opfs.files.size, 0);
+
+  // Part B: Oversized HLS manifest (> 2 MiB) & single segment (> 512 MiB) & total (> 8 GiB) rejected
+  executor.startTask("hls-manifest-cap", {
+    kind: "hls",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v.douyinvod.com/oversize/manifest.m3u8"],
+    filename: "too-big-manifest.mp4",
+  });
+  executor.startTask("seg-single-cap", {
+    kind: "segments",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v.douyinvod.com/oversize/huge-seg.ts"],
+    segments: [{ url: "https://v.douyinvod.com/oversize/huge-seg.ts" }],
+    filename: "too-big-seg.ts",
+  });
+  executor.startTask("seg-total-cap", {
+    kind: "segments",
+    apiOrigin: "https://snap.dokitool.com",
+    routes: ["https://v.douyinvod.com/oversize/huge-seg.ts"],
+    segments: [{ url: "https://v.douyinvod.com/oversize/huge-seg.ts", length: 8 * 1024 * 1024 * 1024 + 1 }],
+    filename: "too-big-total.ts",
+  });
+  await executor.waitForIdle();
+  assert.equal(errors.length, 3);
+  const byTask = new Map(errors.map((e) => [e.taskId, e]));
+  assert.match(byTask.get("hls-manifest-cap")?.error || "", /HLS 清单体积超过安全上限/);
+  assert.match(byTask.get("seg-single-cap")?.error || "", /512 MiB/);
+  assert.match(byTask.get("seg-total-cap")?.error || "", /8 GiB/);
+  assert.equal(opfs.files.size, 0);
+  executor.dispose();
+});
+
+test("v4.5.2 CR-08: storage quota failure in recordSavedWork still dispatches RELEASE_BLOB and frees offscreen concurrency slot", async () => {
+  const opfs = createMockOpfs();
+  const urlApi = createTrackedUrlApi();
+  const payload = new Uint8Array([1, 2, 3, 4, 5]);
+  const mockFetch = async () =>
+    new Response(payload, {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": String(payload.byteLength),
+      },
+    });
+
+  let offscreenCtrl = null;
+  const env = createMockMv3Environment({
+    autoCompleteDownloads: false,
+    async spawnOffscreenHook() {
+      if (!offscreenCtrl) {
+        offscreenCtrl = offscreenMod.createOffscreenController({
+          chrome: env.chrome,
+          fetchImpl: mockFetch,
+          opfsStorage: opfs.storage,
+          webLocks: opfs.locks,
+          urlApi,
+          maxConcurrentTasks: 1,
+          progressThrottleMs: 0,
+        });
+      }
+    },
+  });
+
+  const extStorage = storage.createExtensionStorage();
+  const origRecordSavedWork = extStorage.recordSavedWork.bind(extStorage);
+  let failStorageOnce = true;
+  extStorage.recordSavedWork = async (entry) => {
+    if (failStorageOnce) {
+      failStorageOnce = false;
+      throw new DOMException("QUOTA_BYTES quota exceeded", "QuotaExceededError");
+    }
+    return origRecordSavedWork(entry);
+  };
+
+  const bg = backgroundMod.createBackgroundController({
+    chrome: env.chrome,
+    storage: extStorage,
+    fetchImpl: mockFetch,
+    offscreenIdleCloseMs: 60,
+  });
+  await bg.init();
+
+  // Enqueue 2 tasks against maxConcurrentTasks=1 so Task 2 can ONLY start if Task 1 releases its slot!
+  await env.chrome.runtime.sendMessage({
+    type: "ENQUEUE_DOWNLOADS",
+    items: [
+      {
+        title: "任务1_配额故障",
+        platform: "douyin",
+        workFingerprint: "douyin:quota-fail-1",
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: ["https://v3-web.douyinvod.com/q1.mp4"],
+          filename: "q1.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: payload.byteLength,
+        },
+      },
+      {
+        title: "任务2_排队验证槽位释放",
+        platform: "douyin",
+        workFingerprint: "douyin:quota-ok-2",
+        spec: {
+          kind: "direct_file",
+          apiOrigin: "https://snap.dokitool.com",
+          routes: ["https://v3-web.douyinvod.com/q2.mp4"],
+          filename: "q2.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: payload.byteLength,
+        },
+      },
+    ],
+  });
+
+  for (let i = 0; i < 60 && env.downloadCalls.length < 1; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(env.downloadCalls.length, 1);
+
+  // Complete Task 1 while recordSavedWork throws QuotaExceededError!
+  env.emitDownloadChanged({
+    id: env.downloadCalls[0].id,
+    state: { previous: "in_progress", current: "complete" },
+  });
+
+  // Task 2 MUST start and reach chrome.downloads.download (proving RELEASE_BLOB freed the slot!)
+  for (let i = 0; i < 60 && env.downloadCalls.length < 2; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(
+    env.downloadCalls.length,
+    2,
+    "Task 2 must acquire offscreen concurrency slot after Task 1 RELEASE_BLOB runs in finally",
+  );
+
+  env.emitDownloadChanged({
+    id: env.downloadCalls[1].id,
+    state: { previous: "in_progress", current: "complete" },
+  });
+  await bg.waitForIdle();
+  await offscreenCtrl.executor.waitForIdle();
+
+  assert.equal(urlApi.activeBlobs.size, 0, "zero leaked Blob URLs");
+  assert.equal(opfs.files.size, 0, "zero leaked OPFS temp files");
+  const snap = await bg.getSnapshot();
+  const statuses = snap.tasks.map((t) => t.status);
+  assert.deepEqual(statuses, ["completed", "completed"]);
+
+  offscreenCtrl?.dispose();
+  bg.dispose();
+});
+
+// ============================================================================
 // Theme Persistence, Migration, Zero-Flash Sync & SidePanel UI Controls
 // ============================================================================
 

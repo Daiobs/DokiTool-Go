@@ -31,7 +31,7 @@ Weibo's signed `/api/media/weibo` route remains a server relay when required.
    - Blob 兼容下载（`blob.ts`）、fMP4 HLS / 字节分片拼接（`segmentDownload.ts`）以及 ZIP 打包（`useMediaDownload.ts`）在触发浏览器保存后，统一延迟 **`45 秒`（`45_000 ms`）** 再执行 `URL.revokeObjectURL`，防止系统保存对话框未确认前对象地址失效。
 6. **无跨域与附件头直链的「打开源链接」交付（今日头条、最右视频等）**：
    - 对实测既无 `Access-Control-Allow-Origin` 跨域读取头、又无 `Content-Disposition: attachment` 附件头的 CDN 直链（如今日头条 `*.toutiaovod.com`、线上关闭 `tbvideo` 改写的最右视频），任务卡片不再假报 `已交给浏览器`，而是直接置为 `manual`（「`打开源链接`」），使用隔离的 `noopener noreferrer` + `no-referrer` 打开源视频并提示右键「视频另存为」（手机端长按保存）。
-7. **Chrome MV3 原生侧边栏扩展无损合流通道（`v4.5.1`）**：
+7. **Chrome MV3 原生侧边栏扩展无损合流通道（`v4.5.2`）**：
    - 桌面 Chrome/Edge 用户安装官方 MV3 扩展后，可在独立的 `offscreen` OPFS 沙箱内完成 **YouTube 4K60** 与 **B 站免登录 1080P DASH** `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出及无体积上限的子目录多图/多 P 流式落盘（详见 [docs/EXTENSION.md](EXTENSION.md)；早期独立油猴脚本已于 `v4.5.0` 退役并归档至 `archive/youtube-userscript-final`）。
 
 ---
@@ -842,7 +842,7 @@ HTTP 升级不是可用性证明：实际浏览器仍须通过 TLS、CORS、完�
 
 ### YouTube：Chrome MV3 扩展分块并发拉取与本地无损合并（含早期油猴内存基线归档）
 
-YouTube 下载全程不经过本站服务器中转媒体字节，当前统一由 **Chrome MV3 官方扩展（`v4.5.1`）** 复用 `youtubeHelperCore.js` 在独立 `offscreen` OPFS 沙箱内分块并发拉取并使用 `Mediabunny` 无损封装（早期独立油猴用户脚本 `dokitool-youtube.user.js` 已于 `v4.5.0` 退役并永久归档至 `archive/youtube-userscript-final`，详见 [HISTORY.md](HISTORY.md#已退役-youtube-油猴用户脚本正式归档记录)）：
+YouTube 下载全程不经过本站服务器中转媒体字节，当前统一由 **Chrome MV3 官方扩展（`v4.5.2`）** 复用 `youtubeHelperCore.js` 在独立 `offscreen` OPFS 沙箱内分块并发拉取并使用 `Mediabunny` 无损封装（早期独立油猴用户脚本 `dokitool-youtube.user.js` 已于 `v4.5.0` 退役并永久归档至 `archive/youtube-userscript-final`，详见 [HISTORY.md](HISTORY.md#已退役-youtube-油猴用户脚本正式归档记录)）：
 
 - **自带音频直链（如 `360p`，`itag=18`）**：支持直接交给浏览器原生附件保存，或经脚本拉取保存。
 - **高画质分离音视频（如 `1080p`、`1440p`、`4K` 仅视频轨 + 最优配对音轨）**：点击主下载按钮时，页面通过 `mux_download` 委托用户脚本以 `anonymous: true`（不带 Cookie）分块并发从 `*.googlevideo.com` 拉取视频轨与配对音轨，并在浏览器内使用内嵌的 **Mediabunny**（`1.65.2`）执行无损容器封装，直接输出完整有声 `.mp4` 或 `.webm` 文件：

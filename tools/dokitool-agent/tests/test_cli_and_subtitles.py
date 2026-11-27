@@ -465,6 +465,240 @@ class CLIAndSubtitlesTests(unittest.TestCase):
         with self.assertRaises(security.SizeLimitExceededError):
             subtitles.extract_subtitles_from_data(data, self.local_fetcher, select_all=True, max_tracks=4, max_total_bytes=60)
 
+    def test_v452_cr09_pair_two_phase_commit_and_zero_self_conflict_on_refresh(self) -> None:
+        pair_state = {"video_expired_once": True, "video_fail_always": False}
+        img_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"I" * 32
+        vid_bytes = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"V" * 48
+
+        class PairHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urllib.parse.urlsplit(self.path)
+                origin = f"http://127.0.0.1:{self.server.server_port}"
+                if parsed.path == "/api/parse":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    refreshed = "refreshed" in qs
+                    vid_path = "/media/pair_vid_ok.mp4" if refreshed else "/media/pair_vid_exp.mp4"
+                    payload = json.dumps({
+                        "schema_version": "1.0",
+                        "code": "OK",
+                        "data": {
+                            "platform": "xiaohongshu",
+                            "content_id": "live1234",
+                            "title": "Live Photo",
+                            "source_url": "https://www.xiaohongshu.com/explore/live1234",
+                            "refresh_url": "/api/parse?schema_version=1.0&url=https%3A%2F%2Fwww.xiaohongshu.com%2Fexplore%2Flive1234&refreshed=1",
+                            "items": [{
+                                "id": "live-1",
+                                "type": "live_photo",
+                                "state": "ready",
+                                "variants": [{
+                                    "id": "pair-main",
+                                    "state": "ready",
+                                    "delivery": {
+                                        "kind": "pair",
+                                        "resources": [
+                                            {"id": "img", "role": "image", "metadata": {"extension": "jpg"}, "delivery": {"kind": "file", "sources": [{"url": f"{origin}/media/pair_img.jpg"}]}},
+                                            {"id": "vid", "role": "video", "metadata": {"extension": "mp4"}, "delivery": {"kind": "file", "sources": [{"url": f"{origin}{vid_path}"}]}},
+                                        ],
+                                    },
+                                }],
+                            }],
+                        },
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if parsed.path == "/media/pair_img.jpg":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(img_bytes)))
+                    self.end_headers()
+                    self.wfile.write(img_bytes)
+                    return
+                if parsed.path == "/media/pair_vid_exp.mp4":
+                    if pair_state["video_fail_always"]:
+                        self.send_response(500)
+                        self.end_headers()
+                        return
+                    if pair_state["video_expired_once"]:
+                        pair_state["video_expired_once"] = False
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(len(vid_bytes)))
+                    self.end_headers()
+                    self.wfile.write(vid_bytes)
+                    return
+                if parsed.path == "/media/pair_vid_ok.mp4":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(len(vid_bytes)))
+                    self.end_headers()
+                    self.wfile.write(vid_bytes)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), PairHandler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            origin = f"http://127.0.0.1:{srv.server_port}"
+            client = api_client.DokiToolClient(origin, fetcher=self.local_fetcher)
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp) / "pair_ok"
+                # 1) Image succeeds then video returns 403 -> refresh retries with overwrite=False (zero self-conflict!)
+                res = downloader.download_media(
+                    client, "https://www.xiaohongshu.com/explore/live1234", out_dir,
+                    allow_write=True, overwrite=False,
+                )
+                self.assertEqual(len(res["files"]), 2)
+                self.assertEqual((out_dir / res["files"][0]["file"]).read_bytes(), img_bytes)
+                self.assertEqual((out_dir / res["files"][1]["file"]).read_bytes(), vid_bytes)
+                self.assertEqual([p.name for p in out_dir.iterdir() if p.name.startswith(".")], [])
+
+                # 2) Pre-existing video file with overwrite=False must fail BEFORE committing image (no stray files)
+                out_nc = Path(tmp) / "pair_noclobber"
+                out_nc.mkdir(parents=True, exist_ok=True)
+                existing_vid = out_nc / "xiaohongshu_live1234_live-1_video.mp4"
+                existing_vid.write_bytes(b"KEEP_ME")
+                with self.assertRaisesRegex(downloader.DownloadError, r"no-clobber"):
+                    downloader.download_media(
+                        client, "https://www.xiaohongshu.com/explore/live1234", out_nc,
+                        allow_write=True, overwrite=False,
+                    )
+                self.assertEqual(existing_vid.read_bytes(), b"KEEP_ME")
+                self.assertEqual([p.name for p in out_nc.iterdir()], [existing_vid.name])
+
+                # 3) Rollback inode guard: if an external writer replaces committed file #1 before file #2 fails,
+                #    rollback must NOT unlink the externally replaced inode.
+                out_rb = Path(tmp) / "pair_rollback_inode"
+                out_rb.mkdir(parents=True, exist_ok=True)
+                orig_commit = downloader._commit_atomic_file
+                commit_calls = {"n": 0}
+
+                def _racy_commit(tmp_p: Path, final_p: Path, *, overwrite: bool) -> tuple[int, int]:
+                    commit_calls["n"] += 1
+                    if commit_calls["n"] == 1:
+                        fid = orig_commit(tmp_p, final_p, overwrite=overwrite)
+                        # Simulate external replacement with a distinct inode
+                        ext_tmp = out_rb / "external.tmp"
+                        ext_tmp.write_bytes(b"EXTERNAL_REPLACEMENT")
+                        ext_tmp.replace(final_p)
+                        return fid
+                    raise downloader.DownloadError("simulated second commit collision")
+
+                with mock.patch.object(downloader, "_commit_atomic_file", side_effect=_racy_commit):
+                    with self.assertRaisesRegex(downloader.DownloadError, r"simulated second commit collision"):
+                        downloader.download_media(
+                            client, "https://www.xiaohongshu.com/explore/live1234", out_rb,
+                            allow_write=True, overwrite=False,
+                        )
+                img_target = out_rb / "xiaohongshu_live1234_live-1_image.jpg"
+                self.assertTrue(img_target.is_file())
+                self.assertEqual(img_target.read_bytes(), b"EXTERNAL_REPLACEMENT")
+
+                # 4) Hard failure on 2nd resource leaves zero committed or hidden temp files
+                out_fail = Path(tmp) / "pair_fail"
+                pair_state["video_fail_always"] = True
+                with self.assertRaisesRegex(downloader.DownloadError, r"500"):
+                    downloader.download_media(
+                        client, "https://www.xiaohongshu.com/explore/live1234", out_fail,
+                        allow_write=True, overwrite=False,
+                    )
+                self.assertEqual(list(out_fail.iterdir()), [])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2.0)
+
+    def test_v452_cr10_subtitle_wall_clock_deadline_enforced_on_slow_drip_and_subsecond_budget(self) -> None:
+        import time as _time
+
+        class SlowDripHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/sub/drip.vtt":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/vtt")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(b"WEBVTT\n\n")
+                        self.wfile.flush()
+                        for i in range(15):
+                            _time.sleep(0.15)
+                            self.wfile.write(f"00:00:{i:02d}.000 --> 00:00:{i:02d}.500\nline {i}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+                    return
+                if self.path == "/sub/redir1":
+                    _time.sleep(0.20)
+                    self.send_response(302)
+                    self.send_header("Location", "/sub/redir2")
+                    self.end_headers()
+                    return
+                if self.path == "/sub/redir2":
+                    _time.sleep(0.20)
+                    self.send_response(302)
+                    self.send_header("Location", "/sub/drip.vtt")
+                    self.end_headers()
+                    return
+                if self.path == "/sub/err403-drip":
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    try:
+                        for i in range(15):
+                            _time.sleep(0.15)
+                            self.wfile.write(f"forbidden chunk {i}\n".encode("utf-8"))
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), SlowDripHandler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            origin = f"http://127.0.0.1:{srv.server_port}"
+            for label, sub_path in (
+                ("slow-200-body", "/sub/drip.vtt"),
+                ("multi-hop-redirect", "/sub/redir1"),
+                ("slow-403-error-body", "/sub/err403-drip"),
+            ):
+                with self.subTest(case=label):
+                    data = {
+                        "platform": "youtube",
+                        "content_id": f"drip-{label}",
+                        "title": "Slow Drip",
+                        "attachments": [
+                            _sub_att(f"sub-{label}", "en", "Drip", "manual", "vtt", "text/vtt", f"{origin}{sub_path}"),
+                        ],
+                    }
+                    t0 = _time.monotonic()
+                    with self.assertRaises(RuntimeError) as ctx:
+                        subtitles.extract_subtitles_from_data(data, self.local_fetcher, lang="en", total_timeout=0.35)
+                    elapsed = _time.monotonic() - t0
+                    self.assertIn("budget", str(ctx.exception).lower())
+                    self.assertLess(elapsed, 0.9, f"{label} exceeded wall-clock deadline: elapsed={elapsed:.3f}s")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

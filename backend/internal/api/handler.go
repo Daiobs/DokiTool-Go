@@ -292,13 +292,19 @@ func (h *Handler) HasFreshCachedParse(path, rawQuery string) bool {
 	return h.cache.fresh(ck, h.now())
 }
 
-// tryServeFreshCachedParse serves an authenticated GET /api/parse or /api/resolve
-// directly from parseCache under RLock without acquiring a keyPool concurrency slot.
-// If the entry expired at the exact nanosecond boundary, it returns false without
-// writing to w so admission falls through into keyPool slot acquisition.
+// tryServeFreshCachedParse serves a GET /api/parse or /api/resolve directly
+// from parseCache under RLock without acquiring a real parse concurrency slot.
+// When key is nil, telemetry is attributed to ChannelAnonymous; otherwise to
+// ChannelOwner. If the entry expired at the exact nanosecond boundary, it
+// returns false without writing to w so admission falls through into uncached
+// parse pool acquisition.
 func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Request, key *apiKeyEntry, wallStart time.Time) bool {
 	if r.Method != http.MethodGet {
 		return false
+	}
+	channel := ChannelAnonymous
+	if key != nil {
+		channel = ChannelOwner
 	}
 	snap := h.currentPolicySnapshot()
 	ck, platform, ok := h.deriveCacheableParseKeyWithPolicy(r.URL.EscapedPath(), r.URL.RawQuery, snap)
@@ -313,7 +319,7 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 	}
 	if snap.IsPlatformDisabled(platform) {
 		res := circuitBreakerOpenResponse(platform, disabledPlatformRetryAfterSeconds)
-		h.recordParseTelemetry(platform, res.platform, res.code, ChannelOwner, time.Since(wallStart))
+		h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 		if key != nil {
 			key.recordCachedParseStatus(res.status)
 		}
@@ -324,8 +330,8 @@ func (h *Handler) tryServeFreshCachedParse(w http.ResponseWriter, r *http.Reques
 	if !fresh {
 		return false
 	}
-	h.stats.recordCacheHit(ChannelOwner)
-	h.recordParseTelemetry(platform, res.platform, res.code, ChannelOwner, time.Since(wallStart))
+	h.stats.recordCacheHit(channel)
+	h.recordParseTelemetry(platform, res.platform, res.code, channel, time.Since(wallStart))
 	if key != nil {
 		key.recordCachedParseStatus(res.status)
 	}

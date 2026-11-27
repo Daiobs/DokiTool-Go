@@ -672,3 +672,79 @@ func TestCircuitBreakerIgnoresCallerScopedFailures(t *testing.T) {
 		t.Fatalf("expected real upstream outages to open breaker (503), got HTTP %d", wBlocked.Code)
 	}
 }
+
+func TestCircuitBreakerHalfOpenIgnoresStaleGenerationSuccessAndFailure(t *testing.T) {
+	baseNow := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultRuntimeConfig().CircuitBreaker
+	cfg.ConsecutiveFailures = 2
+	cfg.WindowSize = 5
+	cfg.FailureRateThreshold = 0.8
+	cfg.OpenDuration = 30 * time.Second
+	cfg.HalfOpenMaxProbes = 2
+
+	cb := newCircuitBreakerManager(cfg)
+
+	// 1. Trip breaker to Open (consecutiveFailures=2).
+	cb.Finish("douyin", "UPSTREAM_TIMEOUT", 0, baseNow)
+	cb.Finish("douyin", "UPSTREAM_UNAVAILABLE", 0, baseNow.Add(time.Second))
+	if s := cb.Snapshot(baseNow.Add(time.Second))[0]; s.State != CircuitStateOpen {
+		t.Fatalf("expected Open after 2 failures, got %+v", s)
+	}
+
+	// 2. Enter HalfOpen wave 1 (gen1=1): admit two probes, fail probe A -> re-opens (halfOpenGen becomes 2),
+	//    leaving probe B (gen1=1) still in flight.
+	tWave1 := baseNow.Add(31 * time.Second)
+	okA, _, gen1A := cb.Allow("douyin", tWave1)
+	okB, _, gen1B := cb.Allow("douyin", tWave1)
+	if !okA || !okB || gen1A == 0 || gen1A != gen1B {
+		t.Fatalf("expected two probes in wave 1 with matching gen, got okA=%v okB=%v gen1A=%d gen1B=%d", okA, okB, gen1A, gen1B)
+	}
+	cb.Finish("douyin", "UPSTREAM_TIMEOUT", gen1A, tWave1.Add(time.Second))
+
+	// 3. Enter HalfOpen wave 2 (gen3=3): admit one active probe.
+	tWave2 := tWave1.Add(31 * time.Second)
+	okW2, _, genWave2 := cb.Allow("douyin", tWave2)
+	if !okW2 || genWave2 <= gen1A {
+		t.Fatalf("expected wave 2 probe admission with newer gen > %d, got ok=%v gen=%d", gen1A, okW2, genWave2)
+	}
+	st := cb.states["douyin"]
+	consecBefore := st.consecutiveFailures
+
+	// 4. Stale OK from wave 1 (gen1B) and pre-open slow request (gen=0) MUST NOT close wave 2
+	//    or clear consecutiveFailures or decrement halfOpenInFlight.
+	cb.Finish("douyin", "OK", gen1B, tWave2.Add(time.Second))
+	cb.Finish("douyin", "OK", 0, tWave2.Add(time.Second))
+	if st.state != CircuitStateHalfOpen || st.halfOpenGen != genWave2 || st.halfOpenInFlight != 1 || st.consecutiveFailures != consecBefore {
+		t.Fatalf("stale OK corrupted active HalfOpen wave: state=%s gen=%d inFlight=%d consec=%d (want HalfOpen gen=%d inFlight=1 consec=%d)",
+			st.state, st.halfOpenGen, st.halfOpenInFlight, st.consecutiveFailures, genWave2, consecBefore)
+	}
+
+	// 5. Stale FAILURE from wave 1 (gen1B) and pre-open slow request (gen=0) MUST NOT re-open wave 2
+	//    or increment consecutiveFailures.
+	cb.Finish("douyin", "UPSTREAM_TIMEOUT", gen1B, tWave2.Add(2*time.Second))
+	cb.Finish("douyin", "UPSTREAM_UNAVAILABLE", 0, tWave2.Add(2*time.Second))
+	if st.state != CircuitStateHalfOpen || st.halfOpenGen != genWave2 || st.halfOpenInFlight != 1 || st.consecutiveFailures != consecBefore {
+		t.Fatalf("stale failure corrupted active HalfOpen wave: state=%s gen=%d inFlight=%d consec=%d (want HalfOpen gen=%d inFlight=1 consec=%d)",
+			st.state, st.halfOpenGen, st.halfOpenInFlight, st.consecutiveFailures, genWave2, consecBefore)
+	}
+
+	// 6. Current-generation probe OK cleanly closes circuit and resets window.
+	cb.Finish("douyin", "OK", genWave2, tWave2.Add(3*time.Second))
+	if s := cb.Snapshot(tWave2.Add(3 * time.Second))[0]; s.State != CircuitStateClosed || s.ConsecutiveFailures != 0 || s.WindowFailures != 0 || s.WindowTotal != 1 {
+		t.Fatalf("current-generation probe OK did not close circuit cleanly: %+v", s)
+	}
+
+	// 7. Current-generation probe failure in a subsequent HalfOpen wave cleanly re-opens circuit.
+	tTrip2 := tWave2.Add(10 * time.Second)
+	cb.Finish("douyin", "UPSTREAM_TIMEOUT", 0, tTrip2)
+	cb.Finish("douyin", "UPSTREAM_TIMEOUT", 0, tTrip2.Add(time.Second))
+	tWave3 := tTrip2.Add(31 * time.Second)
+	okW3, _, genWave3 := cb.Allow("douyin", tWave3)
+	if !okW3 || genWave3 == 0 {
+		t.Fatalf("expected wave 3 probe admission, got ok=%v gen=%d", okW3, genWave3)
+	}
+	cb.Finish("douyin", "UPSTREAM_UNAVAILABLE", genWave3, tWave3.Add(time.Second))
+	if s := cb.Snapshot(tWave3.Add(time.Second))[0]; s.State != CircuitStateOpen {
+		t.Fatalf("current-generation probe failure did not re-open circuit: %+v", s)
+	}
+}

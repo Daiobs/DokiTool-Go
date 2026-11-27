@@ -51,6 +51,7 @@ export {
   extractDashMuxSpec as extractFileMuxSpec,
 } from "./dashMuxSpec";
 export {
+  DEFAULT_STREAM_STALL_TIMEOUT_MS,
   ExtensionDownloadError,
   ensureOpfsQuotaAvailable,
   hasIsoBmffBoxHeader,
@@ -75,6 +76,9 @@ export {
 
 export const DEFAULT_OFFSCREEN_CONCURRENCY = 3;
 export const DEFAULT_PROGRESS_THROTTLE_MS = 150;
+export const MAX_HLS_MANIFEST_BYTES = 2 * 1024 * 1024;
+export const MAX_SINGLE_SEGMENT_BYTES = 512 * 1024 * 1024;
+export const MAX_SEGMENTS_TOTAL_BYTES = 8 * 1024 * 1024 * 1024;
 
 // ============================================================================
 // OPFS Cleanup & Streaming Download/Mux Executor
@@ -308,6 +312,7 @@ export interface CreateOffscreenDownloadExecutorOptions {
   now?: () => number;
   maxConcurrentTasks?: number;
   progressThrottleMs?: number;
+  stallTimeoutMs?: number;
   mediabunnyImpl?: Record<string, unknown> | null;
   youtubeMuxConfig?: {
     chunkSize?: number;
@@ -464,6 +469,7 @@ export function createOffscreenDownloadExecutor(
     0,
     options.progressThrottleMs ?? DEFAULT_PROGRESS_THROTTLE_MS,
   );
+  const stallTimeoutMs = options.stallTimeoutMs;
 
   let tempSeq = 0;
   let activeRunningCount = 0;
@@ -529,7 +535,14 @@ export function createOffscreenDownloadExecutor(
     init: RequestInit | undefined,
     signal: AbortSignal,
   ): Promise<Response> =>
-    whitelistedFetch(fetchFn, rawUrl, spec, init, signal);
+    whitelistedFetch(
+      fetchFn,
+      rawUrl,
+      spec,
+      init,
+      signal,
+      stallTimeoutMs !== undefined ? { stallTimeoutMs } : undefined,
+    );
 
   const createProgressReporter = (
     taskId: string,
@@ -669,6 +682,20 @@ export function createOffscreenDownloadExecutor(
               writable!.write({ type: "write", position, data: chunk }),
             );
           },
+          truncate(size: number) {
+            if (!Number.isSafeInteger(size) || size < 0) {
+              return Promise.reject(
+                new ExtensionDownloadError(`无效的 OPFS 截断长度：${size}`),
+              );
+            }
+            return enqueueWrite(async () => {
+              if (typeof writable!.truncate === "function") {
+                await writable!.truncate(size);
+              } else {
+                await writable!.write({ type: "truncate", size });
+              }
+            });
+          },
           markWritableClosed() {
             closed = true;
           },
@@ -750,6 +777,28 @@ export function createOffscreenDownloadExecutor(
           segments.push({ position, data: copy });
           const end = position + copy.byteLength;
           if (end > maxEnd) maxEnd = end;
+        });
+      },
+      truncate(size: number) {
+        if (!Number.isSafeInteger(size) || size < 0) {
+          return Promise.reject(
+            new ExtensionDownloadError(`无效的截断长度：${size}`),
+          );
+        }
+        return enqueueMemWrite(() => {
+          for (let i = segments.length - 1; i >= 0; i--) {
+            const seg = segments[i];
+            if (seg.position >= size) {
+              segments.splice(i, 1);
+            } else if (seg.position + seg.data.byteLength > size) {
+              segments[i] = {
+                position: seg.position,
+                data: seg.data.subarray(0, size - seg.position),
+              };
+            }
+          }
+          maxEnd = size;
+          if (seqCursor > size) seqCursor = size;
         });
       },
       async closeAndGetBlob(): Promise<Blob> {
@@ -908,6 +957,7 @@ export function createOffscreenDownloadExecutor(
       sinkMimeType: spec.mimeType,
       errorLabel: "媒体源",
       maxConcurrency: DEFAULT_DIRECT_FILE_MAX_CONCURRENCY,
+      stallTimeoutMs,
       apiOrigin: spec.apiOrigin,
       onRouteStart({ routeIndex, routeCount, total, isFreshRetry }) {
         reportProgress(
@@ -964,10 +1014,31 @@ export function createOffscreenDownloadExecutor(
       void resp.body?.cancel?.().catch(() => {});
       throw new ExtensionDownloadError(`HLS 清单返回 HTTP ${resp.status}`);
     }
-    const text = await resp.text();
-    if (text.length > 2 * 1024 * 1024) {
-      throw new ExtensionDownloadError("HLS 清单体积超过安全上限");
+    const baseManifestUrl =
+      typeof resp.url === "string" && resp.url.trim()
+        ? resp.url.trim()
+        : manifestUrl;
+
+    const manifestParts: Uint8Array[] = [];
+    let manifestBytes = 0;
+    await streamResponseBodyToWriter({
+      response: resp,
+      write: async (chunk) => {
+        manifestParts.push(chunk.slice());
+        manifestBytes += chunk.byteLength;
+      },
+      signal,
+      stallTimeoutMs,
+      maxBytes: MAX_HLS_MANIFEST_BYTES,
+      maxBytesError: "HLS 清单体积超过安全上限",
+    });
+    const manifestBuf = new Uint8Array(manifestBytes);
+    let manifestOffset = 0;
+    for (const part of manifestParts) {
+      manifestBuf.set(part, manifestOffset);
+      manifestOffset += part.byteLength;
     }
+    const text = new TextDecoder("utf-8").decode(manifestBuf);
     if (
       !text.trimStart().startsWith("#EXTM3U") ||
       !text.includes("#EXT-X-ENDLIST") ||
@@ -993,7 +1064,7 @@ export function createOffscreenDownloadExecutor(
         if (!uri || segments.length > 0) {
           throw new ExtensionDownloadError("HLS 初始化段格式无效");
         }
-        const resolvedUrl = sourceUrl({ url: new URL(uri, manifestUrl).href });
+        const resolvedUrl = sourceUrl({ url: new URL(uri, baseManifestUrl).href });
         assertWhitelisted(resolvedUrl, spec);
         const rawRange = /BYTERANGE="([^"]+)"/.exec(line)?.[1];
         const range = rawRange ? parseByteRangeDirective(rawRange, null) : null;
@@ -1007,7 +1078,7 @@ export function createOffscreenDownloadExecutor(
         }
         pendingRange = line.slice("#EXT-X-BYTERANGE:".length);
       } else if (!line.startsWith("#")) {
-        const resolvedUrl = sourceUrl({ url: new URL(line, manifestUrl).href });
+        const resolvedUrl = sourceUrl({ url: new URL(line, baseManifestUrl).href });
         assertWhitelisted(resolvedUrl, spec);
         if (
           pendingRange &&
@@ -1042,13 +1113,26 @@ export function createOffscreenDownloadExecutor(
     seg: OffscreenSegmentSpec;
     spec: OffscreenDownloadSpec;
     signal: AbortSignal;
-    write: (chunk: Uint8Array) => Promise<void>;
+    write?: (chunk: Uint8Array) => Promise<void>;
+    writeAt?: (offsetInSegment: number, chunk: Uint8Array) => Promise<void>;
+    rollbackAttempt?: () => Promise<void>;
     onChunkBytes?: (bytes: number) => void;
+    onAttemptBytes?: (bytesInAttempt: number) => void;
     maxBytes?: number;
     maxBytesError?: string;
   }): Promise<number> => {
-    const { seg, spec, signal, write, onChunkBytes, maxBytes, maxBytesError } =
-      params;
+    const {
+      seg,
+      spec,
+      signal,
+      write,
+      writeAt,
+      rollbackAttempt,
+      onChunkBytes,
+      onAttemptBytes,
+      maxBytes,
+      maxBytesError,
+    } = params;
     const candidates = Array.from(
       new Set([seg.url, ...(seg.routes ?? [])].map((u) => u.trim()).filter(Boolean)),
     );
@@ -1073,6 +1157,8 @@ export function createOffscreenDownloadExecutor(
       throwIfAborted(signal);
       const url = attempts[i];
       const bufferedChunks: Uint8Array[] = [];
+      let attemptBytes = 0;
+      let sinkWriteFailed = false;
       try {
         const resp = await fetchWhitelisted(
           url,
@@ -1101,35 +1187,52 @@ export function createOffscreenDownloadExecutor(
           );
         }
 
-        // Buffer single segment in memory before committing to sink so a mid-segment
-        // failure on attempt 1 never corrupts the concatenated OPFS file before retry!
         const bytesRead = await streamResponseBodyToWriter({
           response: resp,
-          write: async (chunk) => {
-            bufferedChunks.push(chunk.slice());
-          },
+          write: writeAt
+            ? async (chunk) => {
+                const offsetInSeg = attemptBytes;
+                await writeAt(offsetInSeg, chunk);
+                attemptBytes += chunk.byteLength;
+                onAttemptBytes?.(attemptBytes);
+              }
+            : async (chunk) => {
+                bufferedChunks.push(chunk.slice());
+              },
           signal,
+          stallTimeoutMs,
           maxBytes,
           maxBytesError,
+          onSinkWriteError: () => {
+            sinkWriteFailed = true;
+          },
         });
 
         if (hasRange && bytesRead !== seg.length) {
           throw new ExtensionDownloadError("分片字节长度与声明区间不符");
         }
 
-        for (const chunk of bufferedChunks) {
-          await write(chunk);
-          onChunkBytes?.(chunk.byteLength);
+        if (!writeAt && write) {
+          for (const chunk of bufferedChunks) {
+            await write(chunk);
+            onChunkBytes?.(chunk.byteLength);
+          }
         }
         return bytesRead;
       } catch (err) {
-        if (isAbortLikeError(err, signal)) throw err;
+        if (writeAt && attemptBytes > 0 && rollbackAttempt) {
+          await rollbackAttempt();
+        }
+        if (isAbortLikeError(err, signal) || sinkWriteFailed) throw err;
         if (
           err instanceof ExtensionDownloadError &&
           (err.code === "UNWHITELISTED_CDN" ||
-            err.message === ARCHIVE_LIMIT_ERROR)
+            err.message === ARCHIVE_LIMIT_ERROR ||
+            (maxBytesError && err.message === maxBytesError))
         ) {
-          if (candidates.length === 1) throw err;
+          if (candidates.length === 1 || err.message === ARCHIVE_LIMIT_ERROR) {
+            throw err;
+          }
         }
         lastErr = err;
       }
@@ -1154,34 +1257,65 @@ export function createOffscreenDownloadExecutor(
     const knownTotal = segments.every((s) => typeof s.length === "number" && s.length > 0)
       ? segments.reduce((sum, s) => sum + (s.length || 0), 0)
       : spec.sizeBytes || 0;
+    if (knownTotal > MAX_SEGMENTS_TOTAL_BYTES) {
+      throw new ExtensionDownloadError("分片下载总大小超过 8 GiB 安全上限", {
+        code: "SEGMENTS_SIZE_LIMIT",
+      });
+    }
 
     const sink = await openOpfsSink(taskId, spec.mimeType);
-    let totalLoaded = 0;
+    let committedOffset = 0;
 
     try {
       for (let i = 0; i < segments.length; i++) {
         throwIfAborted(signal);
         const seg = segments[i];
-        await streamSingleSegment({
+        const remainingTaskBytes = MAX_SEGMENTS_TOTAL_BYTES - committedOffset;
+        if (remainingTaskBytes <= 0) {
+          throw new ExtensionDownloadError("分片下载总大小超过 8 GiB 安全上限", {
+            code: "SEGMENTS_SIZE_LIMIT",
+          });
+        }
+        const segMaxBytes = Math.min(MAX_SINGLE_SEGMENT_BYTES, remainingTaskBytes);
+        const segMaxBytesError =
+          segMaxBytes < MAX_SINGLE_SEGMENT_BYTES
+            ? "分片下载总大小超过 8 GiB 安全上限"
+            : "单个分片大小超过 512 MiB 安全上限";
+
+        const segBytes = await streamSingleSegment({
           seg,
           spec,
           signal,
-          write: (chunk) => sink.write(chunk),
-          onChunkBytes: (bytes) => {
-            totalLoaded += bytes;
+          writeAt: async (segOffset, chunk) => {
+            if (sink.writeAt) {
+              await sink.writeAt(committedOffset + segOffset, chunk);
+            } else {
+              await sink.write(chunk);
+            }
+          },
+          rollbackAttempt: async () => {
+            if (sink.truncate) {
+              await sink.truncate(committedOffset);
+            }
+          },
+          onAttemptBytes: (bytesInAttempt) => {
+            const loaded = committedOffset + bytesInAttempt;
             const pct =
               knownTotal > 0
-                ? Math.min(99, Math.floor((totalLoaded / knownTotal) * 100))
+                ? Math.min(99, Math.floor((loaded / knownTotal) * 100))
                 : Math.min(99, Math.floor(((i + 0.5) / segments.length) * 100));
             reportProgress({
               status: "downloading",
               statusText: `正在下载分片 ${i + 1}/${segments.length}...`,
-              loaded: totalLoaded,
+              loaded,
               total: knownTotal,
               percent: pct,
             });
           },
+          maxBytes: segMaxBytes,
+          maxBytesError: segMaxBytesError,
         });
+        committedOffset += segBytes;
         const donePct = Math.min(
           99,
           Math.floor(((i + 1) / segments.length) * 100),
@@ -1190,7 +1324,7 @@ export function createOffscreenDownloadExecutor(
           {
             status: "downloading",
             statusText: `已合并分片 ${i + 1}/${segments.length}...`,
-            loaded: totalLoaded,
+            loaded: committedOffset,
             total: knownTotal,
             percent: donePct,
           },
@@ -1347,6 +1481,7 @@ export function createOffscreenDownloadExecutor(
                 len += chunk.byteLength;
               },
               signal,
+              stallTimeoutMs,
               maxBytes: remaining,
               maxBytesError: ARCHIVE_LIMIT_ERROR,
             });
@@ -1545,6 +1680,7 @@ export function createOffscreenDownloadExecutor(
             reportProgress: createProgressReporter(taskId, "downloading"),
             handoffSinkAndWaitRelease,
             mediabunnyMod: options.mediabunnyImpl,
+            stallTimeoutMs,
             onEnterTask: () => {
               activeDynamicAllowedOriginsByTask.set(
                 taskId,

@@ -2132,6 +2132,141 @@ def check_batch_downloader_behavior() -> dict:
                 and len(observed_cdn_ranges) == cdn_calls_before_run2,
                 f"Expected zero reprocessing on second run, got {run2_summary}",
             )
+
+            # CR-01 regression checks: unsolicited 206, mismatched Content-Range 206, 416 restart,
+            # and Content-Range bytes start-end/* with truncated Content-Length delta.
+            cr01_full = mp4_head + (b"\x42" * 64)
+            cr01_state = {
+                "mismatch_calls": 0,
+                "r416_calls": 0,
+                "unsolicited_calls": 0,
+                "star_calls": 0,
+            }
+
+            class CR01Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, format: str, *args) -> None:  # noqa: A002
+                    pass
+
+                def do_GET(self) -> None:  # noqa: N802
+                    rng = self.headers.get("Range")
+                    if self.path == "/cdn/unsolicited-206":
+                        cr01_state["unsolicited_calls"] += 1
+                        frag = cr01_full[:64]
+                        self.send_response(206)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Range", f"bytes 0-63/{len(cr01_full)}")
+                        self.send_header("Content-Length", str(len(frag)))
+                        self.end_headers()
+                        self.wfile.write(frag)
+                        return
+                    if self.path == "/cdn/mismatch-206":
+                        cr01_state["mismatch_calls"] += 1
+                        if rng is not None:
+                            frag = cr01_full[16:80]
+                            self.send_response(206)
+                            self.send_header("Content-Type", "video/mp4")
+                            self.send_header("Content-Range", f"bytes 16-79/{len(cr01_full)}")
+                            self.send_header("Content-Length", str(len(frag)))
+                            self.end_headers()
+                            self.wfile.write(frag)
+                            return
+                        self.send_response(200)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Length", str(len(cr01_full)))
+                        self.end_headers()
+                        self.wfile.write(cr01_full)
+                        return
+                    if self.path == "/cdn/range-416":
+                        cr01_state["r416_calls"] += 1
+                        if rng is not None:
+                            self.send_response(416)
+                            self.send_header("Content-Range", f"bytes */{len(cr01_full)}")
+                            self.end_headers()
+                            return
+                        self.send_response(200)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Length", str(len(cr01_full)))
+                        self.end_headers()
+                        self.wfile.write(cr01_full)
+                        return
+                    if self.path == "/cdn/star-truncated":
+                        cr01_state["star_calls"] += 1
+                        self.send_response(206)
+                        self.send_header("Content-Type", "video/mp4")
+                        self.send_header("Content-Range", f"bytes 64-{len(cr01_full) - 1}/*")
+                        self.send_header("Content-Length", str(len(cr01_full) - 64))
+                        self.end_headers()
+                        # Deliberately send fewer bytes than declared Content-Length
+                        self.wfile.write(cr01_full[64:84])
+                        return
+                    self.send_response(404)
+                    self.end_headers()
+
+            cr01_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CR01Handler)
+            cr01_thread = threading.Thread(target=cr01_srv.serve_forever, daemon=True)
+            cr01_thread.start()
+            try:
+                cr01_origin = f"http://127.0.0.1:{cr01_srv.server_port}"
+                cr01_client = mod.AgentClient(cr01_origin, test_token, threading.Event())
+                cr01_dir = tmp_dir / "cr01"
+                cr01_dir.mkdir(parents=True, exist_ok=True)
+
+                # 1) offset == 0 receiving 206 must raise (never save 64B fragment)
+                try:
+                    mod.download_single_route(
+                        cr01_client,
+                        {"url": f"{cr01_origin}/cdn/unsolicited-206"},
+                        {"output_dir": cr01_dir, "stem": "unsolicited", "metadata": {}, "result_url": ""},
+                    )
+                    require(False, "CR-01: offset==0 receiving HTTP 206 must fail")
+                except IOError:
+                    pass
+                require(not (cr01_dir / "unsolicited.mp4").exists(), "CR-01: unsolicited 206 must not commit output")
+
+                # 2) offset > 0 receiving mismatched Content-Range 206 (size_bytes absent) cleans .part & retries full 200 GET
+                (cr01_dir / "mismatch.part").write_bytes(cr01_full[:64])
+                m_path, m_bytes = mod.download_single_route(
+                    cr01_client,
+                    {"url": f"{cr01_origin}/cdn/mismatch-206"},
+                    {"output_dir": cr01_dir, "stem": "mismatch", "metadata": {}, "result_url": ""},
+                )
+                require(
+                    cr01_state["mismatch_calls"] == 2
+                    and m_bytes == len(cr01_full)
+                    and m_path.read_bytes() == cr01_full,
+                    f"CR-01: mismatched 206 must restart full 200 GET, got calls={cr01_state['mismatch_calls']} bytes={m_bytes}",
+                )
+
+                # 3) offset > 0 receiving 416 cleans .part & retries full 200 GET
+                (cr01_dir / "r416.part").write_bytes(cr01_full[:64])
+                r_path, r_bytes = mod.download_single_route(
+                    cr01_client,
+                    {"url": f"{cr01_origin}/cdn/range-416"},
+                    {"output_dir": cr01_dir, "stem": "r416", "metadata": {}, "result_url": ""},
+                )
+                require(
+                    cr01_state["r416_calls"] == 2
+                    and r_bytes == len(cr01_full)
+                    and r_path.read_bytes() == cr01_full,
+                    f"CR-01: HTTP 416 must restart full 200 GET, got calls={cr01_state['r416_calls']} bytes={r_bytes}",
+                )
+
+                # 4) offset > 0 with Content-Range bytes 64-N/* & truncated body vs Content-Length must raise
+                (cr01_dir / "star.part").write_bytes(cr01_full[:64])
+                try:
+                    mod.download_single_route(
+                        cr01_client,
+                        {"url": f"{cr01_origin}/cdn/star-truncated"},
+                        {"output_dir": cr01_dir, "stem": "star", "metadata": {}, "result_url": ""},
+                    )
+                    require(False, "CR-01: truncated 206 bytes start-end/* must fail Content-Length delta check")
+                except IOError:
+                    pass
+                require(not (cr01_dir / "star.mp4").exists(), "CR-01: truncated star-range 206 must not commit output")
+            finally:
+                cr01_srv.shutdown()
+                cr01_srv.server_close()
+                cr01_thread.join(timeout=5.0)
     finally:
         if prev_token is None:
             os.environ.pop("DOKITOOL_OWNER_TOKEN", None)

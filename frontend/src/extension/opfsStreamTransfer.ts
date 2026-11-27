@@ -14,6 +14,7 @@ export const DEFAULT_DIRECT_FILE_MAX_CONCURRENCY = 4;
 export const DEFAULT_DASH_VIDEO_MAX_CONCURRENCY = 3;
 export const DEFAULT_DASH_AUDIO_MAX_CONCURRENCY = 2;
 export const DEFAULT_MAX_CHUNK_RETRIES = 3;
+export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 45_000;
 
 export class ExtensionDownloadError extends Error {
   code?: string;
@@ -48,8 +49,14 @@ export interface OpfsWritableChunk {
   position?: number;
 }
 
+export interface OpfsTruncateCommand {
+  type: "truncate";
+  size: number;
+}
+
 export interface OpfsWritableLike {
-  write(chunk: Uint8Array | OpfsWritableChunk): Promise<void>;
+  write(chunk: Uint8Array | OpfsWritableChunk | OpfsTruncateCommand): Promise<void>;
+  truncate?(size: number): Promise<void>;
   close(): Promise<void>;
   abort?(reason?: unknown): Promise<void>;
   getWriter?(): WritableStreamDefaultWriter<unknown>;
@@ -89,6 +96,7 @@ export interface OpfsSinkLike {
   rawWritable?: OpfsWritableLike;
   write(chunk: Uint8Array): Promise<void>;
   writeAt?(position: number, chunk: Uint8Array): Promise<void>;
+  truncate?(size: number): Promise<void>;
   markWritableClosed?(): void;
   closeAndGetBlob(): Promise<Blob | File>;
   cleanup(reason?: unknown): Promise<void>;
@@ -179,23 +187,87 @@ export function assertWhitelistedUrl(
   }
 }
 
+function normalizeStallTimeoutMs(raw?: number): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return Math.max(1, Math.floor(raw));
+  }
+  return DEFAULT_STREAM_STALL_TIMEOUT_MS;
+}
+
 export async function whitelistedFetch(
   fetchFn: typeof fetch,
   rawUrl: string,
   spec: OffscreenDownloadSpec,
   init: RequestInit | undefined,
   signal: AbortSignal,
+  options?: { stallTimeoutMs?: number },
 ): Promise<Response> {
   throwIfAborted(signal);
   assertWhitelistedUrl(rawUrl, spec);
 
-  const resp = await fetchFn(rawUrl, {
-    ...init,
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    signal,
+  const effectiveStallMs = normalizeStallTimeoutMs(options?.stallTimeoutMs);
+  const stepController = new AbortController();
+  const onParentAbort = () => {
+    if (!stepController.signal.aborted) {
+      stepController.abort(signal.reason);
+    }
+  };
+  if (signal.aborted) {
+    stepController.abort(signal.reason);
+  } else {
+    signal.addEventListener("abort", onParentAbort, { once: true });
+  }
+
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      if (!stepController.signal.aborted) {
+        stepController.abort();
+      }
+      reject(
+        new ExtensionDownloadError("连接媒体源响应超时", {
+          code: "STREAM_STALL_TIMEOUT",
+        }),
+      );
+    }, effectiveStallMs);
   });
+  void timeoutPromise.catch(() => {});
+
+  let resp: Response;
+  try {
+    const fetchPromise = fetchFn(rawUrl, {
+      ...init,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      signal: stepController.signal,
+    });
+    // Cancel any late response body if timeout already won the race
+    void fetchPromise.then(
+      (lateResp) => {
+        if (timedOut) {
+          void lateResp?.body?.cancel?.().catch(() => {});
+        }
+      },
+      () => {},
+    );
+    resp = await Promise.race([fetchPromise, timeoutPromise]);
+  } catch (err) {
+    if (signal.aborted) {
+      throwIfAborted(signal);
+    }
+    if (timedOut) {
+      throw new ExtensionDownloadError("连接媒体源响应超时", {
+        code: "STREAM_STALL_TIMEOUT",
+      });
+    }
+    throw err;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    signal.removeEventListener("abort", onParentAbort);
+  }
 
   const finalUrl =
     typeof resp.url === "string" && resp.url.trim()
@@ -432,6 +504,7 @@ export interface StreamResponseBodyParams {
   response: Response;
   write: (chunk: Uint8Array) => Promise<void>;
   signal: AbortSignal;
+  stallTimeoutMs?: number;
   onBytes?: (chunkBytes: number, totalLoadedForStream: number) => void;
   onFirstBytesVerified?: () => void;
   onSinkWriteError?: () => void;
@@ -448,6 +521,7 @@ export async function streamResponseBodyToWriter(
     response,
     write,
     signal,
+    stallTimeoutMs,
     onBytes,
     onFirstBytesVerified,
     onSinkWriteError,
@@ -456,6 +530,7 @@ export async function streamResponseBodyToWriter(
     maxBytesError,
     verifyFirstBytes,
   } = params;
+  const effectiveStallMs = normalizeStallTimeoutMs(stallTimeoutMs);
   const hasContentEncoding = hasNonIdentityContentEncoding(response.headers);
   const headerDeclaredLen = parseContentLengthHeader(
     response.headers,
@@ -483,7 +558,24 @@ export async function streamResponseBodyToWriter(
   };
 
   if (!response.body) {
-    const buf = new Uint8Array(await response.arrayBuffer());
+    let abTimer: ReturnType<typeof setTimeout> | null = null;
+    const abTimeout = new Promise<never>((_resolve, reject) => {
+      abTimer = setTimeout(() => {
+        reject(
+          new ExtensionDownloadError("媒体流接收数据停滞超时", {
+            code: "STREAM_STALL_TIMEOUT",
+          }),
+        );
+      }, effectiveStallMs);
+    });
+    void abTimeout.catch(() => {});
+    let rawAb: ArrayBuffer;
+    try {
+      rawAb = await Promise.race([response.arrayBuffer(), abTimeout]);
+    } finally {
+      if (abTimer !== null) clearTimeout(abTimer);
+    }
+    const buf = new Uint8Array(rawAb);
     throwIfAborted(signal);
     if (maxBytes !== undefined && buf.byteLength > maxBytes) {
       throw new ExtensionDownloadError(maxBytesError || "文件大小超出上限");
@@ -563,7 +655,32 @@ export async function streamResponseBodyToWriter(
   try {
     for (;;) {
       throwIfAborted(signal);
-      const { done, value } = await Promise.race([reader.read(), abortRace]);
+      let stalled = false;
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+      const stallRace = new Promise<never>((_resolve, reject) => {
+        stallTimer = setTimeout(() => {
+          stalled = true;
+          reject(
+            new ExtensionDownloadError("媒体流接收数据停滞超时", {
+              code: "STREAM_STALL_TIMEOUT",
+            }),
+          );
+          void reader.cancel().catch(() => {});
+        }, effectiveStallMs);
+      });
+      void stallRace.catch(() => {});
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await Promise.race([reader.read(), abortRace, stallRace]);
+      } finally {
+        if (stallTimer !== null) clearTimeout(stallTimer);
+      }
+      if (stalled) {
+        throw new ExtensionDownloadError("媒体流接收数据停滞超时", {
+          code: "STREAM_STALL_TIMEOUT",
+        });
+      }
+      const { done, value } = readResult;
       if (done) break;
       if (!value || value.byteLength === 0) continue;
       throwIfAborted(signal);
@@ -644,6 +761,7 @@ export interface StreamResumableRouteToOpfsParams {
   rangeChunkSizeBytes?: number;
   minParallelRangeBytes?: number;
   maxChunkRetries?: number;
+  stallTimeoutMs?: number;
   apiOrigin?: string;
   onRouteStart?: (info: {
     routeIndex: number;
@@ -709,10 +827,12 @@ export async function streamResumableRouteToOpfs(
     rangeChunkSizeBytes,
     minParallelRangeBytes,
     maxChunkRetries,
+    stallTimeoutMs,
     apiOrigin,
     onRouteStart,
     onProgress,
   } = params;
+  const fetchOpts = stallTimeoutMs !== undefined ? { stallTimeoutMs } : undefined;
 
   const cleanRoutes = routes.map((r) => r.trim()).filter(Boolean);
   if (cleanRoutes.length === 0) {
@@ -802,6 +922,7 @@ export async function streamResumableRouteToOpfs(
               response: resp,
               write: (chunk) => sink!.write(chunk),
               signal,
+              stallTimeoutMs,
               onFirstBytesVerified: () => {
                 firstBytesVerified = true;
               },
@@ -885,6 +1006,7 @@ export async function streamResumableRouteToOpfs(
                     headers: { Range: `bytes=${expectedStart}-` },
                   },
                   signal,
+                  fetchOpts,
                 );
 
                 if (resumeResp.status === 200 || resumeResp.status === 416) {
@@ -951,6 +1073,7 @@ export async function streamResumableRouteToOpfs(
                   response: resumeResp,
                   write: (chunk) => sink!.write(chunk),
                   signal,
+                  stallTimeoutMs,
                   expectedBytes: expectedSegmentLen,
                   onSinkWriteError: () => {
                     sinkWriteFailed = true;
@@ -1037,6 +1160,7 @@ export async function streamResumableRouteToOpfs(
             spec,
             { method: "GET" },
             signal,
+            fetchOpts,
           );
           if (resp.status !== 200) {
             void resp.body?.cancel?.().catch(() => {});
@@ -1061,6 +1185,7 @@ export async function streamResumableRouteToOpfs(
             headers: { Range: `bytes=0-${effectiveChunkSize - 1}` },
           },
           signal,
+          fetchOpts,
         );
 
         if (probeResp.status === 403 || probeResp.status === 410) {
@@ -1192,6 +1317,7 @@ export async function streamResumableRouteToOpfs(
               emitMonotonicProgress(false);
             },
             signal,
+            stallTimeoutMs,
             expectedBytes: chunk0ExpectedLen,
             onFirstBytesVerified: () => {
               firstBytesVerified = true;
@@ -1319,6 +1445,7 @@ export async function streamResumableRouteToOpfs(
                   headers: { Range: `bytes=${cursor}-${chunkEnd}` },
                 },
                 poolSignal,
+                fetchOpts,
               );
 
               if (chunkResp.status === 403 || chunkResp.status === 410) {
@@ -1434,6 +1561,7 @@ export async function streamResumableRouteToOpfs(
                   emitMonotonicProgress(retriesUsed > 0);
                 },
                 signal: poolSignal,
+                stallTimeoutMs,
                 expectedBytes: expectedSegLen,
                 onSinkWriteError: () => {
                   sinkWriteFailed = true;

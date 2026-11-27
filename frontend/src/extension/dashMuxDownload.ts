@@ -60,6 +60,7 @@ export interface FetchDashTrackToOpfsParams {
   spec: OffscreenDownloadSpec;
   trackParams: DashMuxTrackFetchParams;
   fetchFn: typeof fetch;
+  stallTimeoutMs?: number;
   openOpfsSink: (
     taskId: string,
     mimeType?: string,
@@ -74,7 +75,7 @@ export interface FetchDashTrackToOpfsParams {
 export async function fetchDashTrackToOpfs(
   params: FetchDashTrackToOpfsParams,
 ): Promise<DashMuxTrackFetchResult> {
-  const { taskId, spec, trackParams, fetchFn, openOpfsSink } = params;
+  const { taskId, spec, trackParams, fetchFn, stallTimeoutMs, openOpfsSink } = params;
   const { role, routes, estimatedSize, signal: trackSignal, onProgress } =
     trackParams;
   const trackLabel = role === "video" ? "视频轨" : "音频轨";
@@ -97,6 +98,7 @@ export async function fetchDashTrackToOpfs(
     sinkTag: trackTag,
     errorLabel: trackLabel,
     maxConcurrency,
+    stallTimeoutMs,
     apiOrigin: spec.apiOrigin,
     onProgress({ loaded, total }) {
       onProgress({ loaded, total });
@@ -151,6 +153,7 @@ export interface ExecuteDashMuxParams {
     reportProgress: DashMuxProgressReporter;
   }) => Promise<void>;
   mediabunnyMod?: Record<string, unknown> | null;
+  stallTimeoutMs?: number;
   onEnterTask?: () => void;
   onExitTask?: () => void;
 }
@@ -177,6 +180,7 @@ export async function executeDashMux(
     reportProgress,
     handoffSinkAndWaitRelease,
     mediabunnyMod,
+    stallTimeoutMs,
     onEnterTask,
     onExitTask,
   } = params;
@@ -210,6 +214,7 @@ export async function executeDashMux(
           spec,
           trackParams,
           fetchFn,
+          stallTimeoutMs,
           openOpfsSink,
         }),
       openOpfsSink: openOpfsSink as (

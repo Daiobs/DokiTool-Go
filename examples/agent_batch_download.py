@@ -547,9 +547,12 @@ def parse_content_range_total(content_range: str, expected_start: int) -> tuple[
     if not match:
         return False, None
     start = int(match.group(1))
-    if start != expected_start:
+    end = int(match.group(2))
+    if start != expected_start or end < start:
         return False, None
     total = int(match.group(3)) if match.group(3) != "*" else None
+    if total is not None and (total <= 0 or end >= total):
+        return False, None
     return True, total
 
 
@@ -605,52 +608,93 @@ def download_single_route(
         part_path.unlink(missing_ok=True)
         offset = 0
 
-    resp, final_url = client.open_safe_url(
-        route["url"],
-        headers_fn=lambda u, _h: cdn_headers_for_url(u, byte_offset=offset),
-        timeout=45.0,
-        allow_redirects=True,
-    )
-    with resp:
-        status = resp.status
-        resp_content_type = resp.headers.get("Content-Type", "") if resp.headers else ""
-        mode = "wb"
-        written = 0
-        remote_total: int | None = None
-
-        if offset > 0 and status == 206:
-            ok_range, cr_total = parse_content_range_total(resp.headers.get("Content-Range", ""), offset)
-            if ok_range:
-                mode = "ab"
-                written = offset
-                remote_total = cr_total
-            else:
+    written = 0
+    resp_content_type = ""
+    final_url = route["url"]
+    for restart in range(2):
+        try:
+            resp, final_url = client.open_safe_url(
+                route["url"],
+                headers_fn=lambda u, _h, off=offset: cdn_headers_for_url(u, byte_offset=off),
+                timeout=45.0,
+                allow_redirects=True,
+            )
+        except security.HTTPStatusError as exc:
+            if exc.status == 416 and offset > 0 and restart == 0:
+                part_path.unlink(missing_ok=True)
                 offset = 0
-        elif status == 200:
+                continue
+            raise
+
+        need_fresh_restart = False
+        bytes_added = 0
+        expected_delta: int | None = None
+        remote_total: int | None = None
+        with resp:
+            status = resp.status
+            resp_content_type = resp.headers.get("Content-Type", "") if resp.headers else ""
+            cl_raw = (resp.headers.get("Content-Length", "") if resp.headers else "").strip()
+            declared_cl = int(cl_raw) if cl_raw.isdigit() else None
+            mode = "wb"
+            written = 0
+
+            if status == 206:
+                if offset == 0:
+                    raise IOError(f"Unexpected HTTP 206 Partial Content without Range request ({final_url})")
+                ok_range, cr_total = parse_content_range_total(resp.headers.get("Content-Range", ""), offset)
+                if not ok_range or (
+                    cr_total is not None and expected_size is not None and cr_total != expected_size
+                ):
+                    if restart == 0:
+                        need_fresh_restart = True
+                    else:
+                        raise IOError(f"Invalid Content-Range on partial response ({final_url})")
+                else:
+                    mode = "ab"
+                    written = offset
+                    remote_total = cr_total
+                    if cr_total is None and declared_cl is not None:
+                        expected_delta = declared_cl
+                        if offset + declared_cl > MAX_MEDIA_BYTES:
+                            raise ValueError(f"CDN partial Content-Length exceeds {MAX_MEDIA_BYTES} byte limit")
+            elif status == 416:
+                if offset > 0 and restart == 0:
+                    need_fresh_restart = True
+                else:
+                    raise security.HTTPStatusError(status, final_url, {}, b"")
+            elif status == 200:
+                offset = 0
+                remote_total = declared_cl
+            else:
+                raise security.HTTPStatusError(status, final_url, {}, b"")
+
+            if not need_fresh_restart:
+                if remote_total is not None and remote_total > MAX_MEDIA_BYTES:
+                    raise ValueError(f"CDN Content-Length exceeds {MAX_MEDIA_BYTES} byte limit")
+
+                with open(part_path, mode) as handle:
+                    while True:
+                        chunk = resp.read(CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        bytes_added += len(chunk)
+                        if written > MAX_MEDIA_BYTES:
+                            raise ValueError(f"Downloaded media exceeded {MAX_MEDIA_BYTES} byte limit")
+                        handle.write(chunk)
+                    handle.flush()
+
+        if need_fresh_restart:
+            part_path.unlink(missing_ok=True)
             offset = 0
-            cl = resp.headers.get("Content-Length", "")
-            if cl.isdigit():
-                remote_total = int(cl)
-        else:
-            raise security.HTTPStatusError(status, final_url, {}, b"")
+            continue
 
-        if remote_total is not None and remote_total > MAX_MEDIA_BYTES:
-            raise ValueError(f"CDN Content-Length exceeds {MAX_MEDIA_BYTES} byte limit")
-
-        with open(part_path, mode) as handle:
-            while True:
-                chunk = resp.read(CHUNK_BYTES)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_MEDIA_BYTES:
-                    raise ValueError(f"Downloaded media exceeded {MAX_MEDIA_BYTES} byte limit")
-                handle.write(chunk)
-            handle.flush()
-
-    target_total = expected_size if expected_size is not None else remote_total
-    if written <= 0 or (target_total is not None and written != target_total):
-        raise IOError(f"Incomplete download ({written} bytes vs expected {target_total})")
+        target_total = expected_size if expected_size is not None else remote_total
+        if written <= 0 or (target_total is not None and written != target_total):
+            raise IOError(f"Incomplete download ({written} bytes vs expected {target_total})")
+        if expected_delta is not None and bytes_added != expected_delta:
+            raise IOError(f"Incomplete partial download ({bytes_added} bytes vs Content-Length {expected_delta})")
+        break
 
     with open(part_path, "rb") as head_handle:
         head_bytes = head_handle.read(MAGIC_PEEK_BYTES)

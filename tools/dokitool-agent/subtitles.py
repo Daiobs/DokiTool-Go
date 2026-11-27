@@ -474,23 +474,27 @@ def fetch_and_extract_track(
     """Directly fetch a subtitle track with anti-SSRF, zero-Cookie, and 5 MiB hard cap."""
     last_err: Exception | None = None
     for url in track.urls[:MAX_URLS_PER_TRACK]:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise RuntimeError("Subtitle extraction exceeded total time budget")
+        remaining_timeout: float | None = None
+        if deadline is not None:
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                raise RuntimeError("Subtitle extraction exceeded total time budget")
         try:
             if url_cache is not None and url in url_cache:
                 body = url_cache[url]
                 if len(body) > max_bytes:
                     raise SizeLimitExceededError(f"Cached subtitle exceeded {max_bytes} byte budget")
             else:
-                remaining_timeout = max(1.0, deadline - time.monotonic()) if deadline is not None else None
-                resp = fetcher.fetch_bytes(
-                    url,
-                    max_bytes=max_bytes,
-                    allow_loopback=False,
-                    allow_redirects=True,
-                    media_mode=True,
-                    timeout=remaining_timeout,
-                )
+                fetch_kwargs: dict[str, Any] = {
+                    "max_bytes": max_bytes,
+                    "allow_loopback": False,
+                    "allow_redirects": True,
+                    "media_mode": True,
+                    "timeout": remaining_timeout,
+                }
+                if deadline is not None:
+                    fetch_kwargs["deadline"] = deadline
+                resp = fetcher.fetch_bytes(url, **fetch_kwargs)
                 body = resp.body
                 if url_cache is not None:
                     url_cache[url] = body
@@ -503,7 +507,13 @@ def fetch_and_extract_track(
             return ExtractedSubtitle(track, output_format, rendered, cue_count, len(body))
         except (SecurityError, SizeLimitExceededError):
             raise
+        except TimeoutError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError("Subtitle extraction exceeded total time budget") from exc
+            last_err = exc
         except (HTTPStatusError, OSError) as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError("Subtitle extraction exceeded total time budget") from exc
             last_err = exc
     raise RuntimeError(f"Failed to fetch subtitle track {track.id}: {redact_sensitive(str(last_err))}")
 
@@ -542,7 +552,10 @@ def extract_subtitles_from_data(
         result["tracks"] = []
         return result
 
-    deadline = time.monotonic() + max(1.0, float(total_timeout))
+    budget_s = float(total_timeout)
+    if budget_s <= 0:
+        raise RuntimeError("Subtitle extraction exceeded total time budget")
+    deadline = time.monotonic() + budget_s
     url_cache: dict[str, bytes] = {}
     extracted: list[dict[str, Any]] = []
     cumulative_bytes = 0

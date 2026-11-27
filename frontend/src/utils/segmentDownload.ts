@@ -13,7 +13,7 @@
  * - 提供按分片打包为 ZIP 的能力（配合 JSZip）。
  */
 
-import { fetchMediaBlob, probeMediaLength, linkAbortSignals } from "../downloads/buffered";
+import { fetchMediaBlob, fetchMediaBlobWithMeta, probeMediaLength, linkAbortSignals } from "../downloads/buffered";
 import {
   availableSources,
   resourceSource,
@@ -183,7 +183,7 @@ export async function resolveHlsSegments(
   signal?: AbortSignal,
 ): Promise<HlsSegment[] | null> {
   try {
-    const manifest = await fetchMediaBlob(url, { signal, maxBytes: 2 * 1024 * 1024, referrerPolicy: "no-referrer" });
+    const { blob: manifest, finalUrl } = await fetchMediaBlobWithMeta(url, { signal, maxBytes: 2 * 1024 * 1024, referrerPolicy: "no-referrer" });
     const text = await manifest.text();
     if (
       !text.trimStart().startsWith("#EXTM3U") ||
@@ -193,8 +193,9 @@ export async function resolveHlsSegments(
       )
     )
       return null;
+    const baseManifestUrl = finalUrl || url;
     const toAbsolute = (uri: string) =>
-      sourceUrl({ url: new URL(uri, url).href });
+      sourceUrl({ url: new URL(uri, baseManifestUrl).href });
     const segments: HlsSegment[] = [];
     let previousEnd: number | null = null,
       previousUrl = "";
