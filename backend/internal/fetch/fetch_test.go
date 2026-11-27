@@ -1185,3 +1185,140 @@ func TestRedirect302ToGetStripsContentLengthAndContentType(t *testing.T) {
 		t.Fatalf("expected GET with stripped Content-Type/Content-Length, got method=%q ct=%q cl=%q", secondMethod, secondCT, secondCL)
 	}
 }
+
+func TestOrderIPv4FirstAndPreferPooledIP(t *testing.T) {
+	v6 := netip.MustParseAddr("2606:4700:4700::1111")
+	v4 := netip.MustParseAddr("93.184.216.34")
+	orig := []netip.Addr{v6, v4}
+	gotOrder := orderIPv4First(orig)
+	if len(gotOrder) != 2 || gotOrder[0] != v4 || gotOrder[1] != v6 {
+		t.Fatalf("orderIPv4First = %v, want [%v %v]", gotOrder, v4, v6)
+	}
+	if orig[0] != v6 || orig[1] != v4 {
+		t.Fatalf("orderIPv4First mutated caller slice: %v", orig)
+	}
+
+	srv, roots, stats := newPoolTestServer(t, true, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+
+	// 1. Cold start with [IPv6, IPv4] must dial IPv4 first.
+	var dialedMu sync.Mutex
+	var dialed []string
+	c := NewWithResolver(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{v6, v4}, nil
+	}))
+	t.Cleanup(c.CloseIdleConnections)
+	c.tlsRootCAs = roots
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialedMu.Lock()
+		dialed = append(dialed, addr)
+		dialedMu.Unlock()
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	if _, err := c.Do(context.Background(), Request{URL: "https://api.example.test/cold", Policy: testPolicy()}); err != nil {
+		t.Fatalf("cold Do failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("cold start dialed %v, want IPv4 first", dialed)
+	}
+
+	// 2. Warm IPv6 pool entry must still be promoted and reused when later DNS returns [IPv6, IPv4].
+	var ipsMu sync.Mutex
+	curIPs := []netip.Addr{v6}
+	var dialed2 []string
+	c2 := NewWithResolver(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+		ipsMu.Lock()
+		defer ipsMu.Unlock()
+		return append([]netip.Addr(nil), curIPs...), nil
+	}))
+	t.Cleanup(c2.CloseIdleConnections)
+	c2.tlsRootCAs = roots
+	c2.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed2 = append(dialed2, addr)
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	if _, err := c2.Do(context.Background(), Request{URL: "https://api.example.test/warm6", Policy: testPolicy()}); err != nil {
+		t.Fatalf("warm IPv6 Do failed: %v", err)
+	}
+	newAfterWarm := stats.stateNew.Load()
+	ipsMu.Lock()
+	curIPs = []netip.Addr{v6, v4}
+	ipsMu.Unlock()
+	if _, err := c2.Do(context.Background(), Request{URL: "https://api.example.test/reuse6", Policy: testPolicy()}); err != nil {
+		t.Fatalf("reuse warm IPv6 Do failed: %v", err)
+	}
+	if len(dialed2) != 1 || dialed2[0] != "[2606:4700:4700::1111]:443" || stats.stateNew.Load() != newAfterWarm {
+		t.Fatalf("expected warm IPv6 connection reuse without dialing IPv4, dialed=%v stateNew=%d->%d", dialed2, newAfterWarm, stats.stateNew.Load())
+	}
+}
+
+func TestMultiIPDialTimeoutConvergencePreservesBodyRead(t *testing.T) {
+	blackholeIP := netip.MustParseAddr("93.184.216.10")
+	healthyIP := netip.MustParseAddr("93.184.216.11")
+
+	for _, strict := range []bool{false, true} {
+		name := "pooled"
+		if strict {
+			name = "strict-unpooled"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv, roots, _ := newPoolTestServer(t, true, []string{"api.example.test"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strict {
+					w.Header().Set("Content-Range", "bytes 0-9/100")
+					w.Header().Set("Content-Type", "video/mp4")
+					w.Header().Set("Content-Length", "10")
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = io.WriteString(w, "01234")
+					w.(http.Flusher).Flush()
+					time.Sleep(400 * time.Millisecond)
+					_, _ = io.WriteString(w, "56789")
+					return
+				}
+				w.Header().Set("Content-Length", "10")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "01234")
+				w.(http.Flusher).Flush()
+				time.Sleep(400 * time.Millisecond)
+				_, _ = io.WriteString(w, "56789")
+			}))
+
+			var dialed []string
+			c := NewWithResolver(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{blackholeIP, healthyIP}, nil
+			}))
+			t.Cleanup(c.CloseIdleConnections)
+			c.tlsRootCAs = roots
+			c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialed = append(dialed, addr)
+				if addr == blackholeIP.String()+":443" {
+					// Simulate blackhole until dial sub-timeout fires.
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+			}
+
+			policy := testPolicy()
+			policy.Timeout = 3 * time.Second
+			if strict {
+				policy.StrictMediaHeaders = true
+				policy.PartialMediaOnly = true
+				policy.FollowRedirects = false
+			}
+
+			start := time.Now()
+			res, err := c.Do(context.Background(), Request{URL: "https://api.example.test/failover", Policy: policy})
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("expected failover to 2nd IP within 3s budget, got err=%v after %v (dialed=%v)", err, elapsed, dialed)
+			}
+			if string(res.Body) != "0123456789" {
+				t.Fatalf("body read was truncated or corrupted: %q", string(res.Body))
+			}
+			if len(dialed) != 2 || dialed[0] != blackholeIP.String()+":443" || dialed[1] != healthyIP.String()+":443" {
+				t.Fatalf("unexpected dial sequence: %v", dialed)
+			}
+		})
+	}
+}

@@ -2,6 +2,7 @@ package shresolver
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -26,9 +27,13 @@ import (
 )
 
 const (
-	clientTimeout      = probe.Timeout + 2*time.Second
-	maxV1ResponseBytes = 32 << 10
-	maxResponseBytes   = 128 << 10
+	clientTimeout                   = probe.Timeout + 2*time.Second
+	maxV1ResponseBytes              = 32 << 10
+	maxResponseBytes                = 128 << 10
+	defaultValidatorDNSCacheTTL     = 60 * time.Second
+	maxValidatorDNSCacheEntries     = 256
+	defaultValidatorHostLookupLimit = 1500 * time.Millisecond
+	maxValidatorDNSConcurrency      = 8
 )
 
 var errUnavailable = errors.New("Shanghai original address unavailable")
@@ -43,14 +48,179 @@ type Client struct {
 	stats           shanghaiCounters
 }
 
+type validatorDNSCacheEntry struct {
+	host      string
+	ips       []netip.Addr
+	expiresAt time.Time
+}
+
+type publicHostDNSCache struct {
+	mu         sync.Mutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[string]*list.Element
+	lru        *list.List
+}
+
+func newPublicHostDNSCache(ttl time.Duration, maxEntries int) *publicHostDNSCache {
+	if maxEntries <= 0 {
+		maxEntries = maxValidatorDNSCacheEntries
+	}
+	return &publicHostDNSCache{
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		entries:    make(map[string]*list.Element),
+		lru:        list.New(),
+	}
+}
+
+func (c *publicHostDNSCache) get(host string, now time.Time) ([]netip.Addr, bool) {
+	if c == nil {
+		return nil, false
+	}
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ttl <= 0 || c.entries == nil {
+		return nil, false
+	}
+	elem, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	entry := elem.Value.(*validatorDNSCacheEntry)
+	if !now.Before(entry.expiresAt) {
+		c.lru.Remove(elem)
+		delete(c.entries, key)
+		return nil, false
+	}
+	c.lru.MoveToFront(elem)
+	return append([]netip.Addr(nil), entry.ips...), true
+}
+
+func (c *publicHostDNSCache) put(host string, ips []netip.Addr, now time.Time) {
+	if c == nil || len(ips) == 0 {
+		return
+	}
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ttl <= 0 {
+		return
+	}
+	if c.entries == nil {
+		c.entries = make(map[string]*list.Element)
+		c.lru = list.New()
+	}
+	if old, ok := c.entries[key]; ok {
+		c.lru.Remove(old)
+		delete(c.entries, key)
+	}
+	limit := c.maxEntries
+	if limit <= 0 {
+		limit = maxValidatorDNSCacheEntries
+	}
+	for c.lru.Len() >= limit {
+		oldest := c.lru.Back()
+		if oldest == nil {
+			break
+		}
+		c.lru.Remove(oldest)
+		delete(c.entries, oldest.Value.(*validatorDNSCacheEntry).host)
+	}
+	elem := c.lru.PushFront(&validatorDNSCacheEntry{
+		host:      key,
+		ips:       append([]netip.Addr(nil), ips...),
+		expiresAt: now.Add(c.ttl),
+	})
+	c.entries[key] = elem
+}
+
+func (c *publicHostDNSCache) evict(host string) {
+	if c == nil {
+		return
+	}
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	c.mu.Lock()
+	if c.entries != nil {
+		if elem, ok := c.entries[key]; ok {
+			c.lru.Remove(elem)
+			delete(c.entries, key)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *publicHostDNSCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.entries = make(map[string]*list.Element)
+	c.lru = list.New()
+	c.mu.Unlock()
+}
+
+func (c *publicHostDNSCache) setTTL(ttl time.Duration) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if ttl <= 0 {
+		c.ttl = 0
+		c.entries = make(map[string]*list.Element)
+		c.lru = list.New()
+	} else {
+		c.ttl = ttl
+		if c.entries == nil {
+			c.entries = make(map[string]*list.Element)
+			c.lru = list.New()
+		}
+	}
+	c.mu.Unlock()
+}
+
 // Both delivery modes validate untrusted wire observations before they reach the formatter.
 type responseValidator struct {
-	lookup func(context.Context, string, string) ([]netip.Addr, error)
-	now    func() time.Time
+	lookup   func(context.Context, string, string) ([]netip.Addr, error)
+	now      func() time.Time
+	dnsCache *publicHostDNSCache
 }
 
 func newResponseValidator() responseValidator {
-	return responseValidator{lookup: net.DefaultResolver.LookupNetIP, now: time.Now}
+	return responseValidator{
+		lookup:   net.DefaultResolver.LookupNetIP,
+		now:      time.Now,
+		dnsCache: newPublicHostDNSCache(defaultValidatorDNSCacheTTL, maxValidatorDNSCacheEntries),
+	}
+}
+
+func (c *responseValidator) currentTime() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *responseValidator) setLookup(fn func(context.Context, string, string) ([]netip.Addr, error)) {
+	if c == nil || fn == nil {
+		return
+	}
+	c.lookup = fn
+	if c.dnsCache != nil {
+		c.dnsCache.clear()
+	}
+}
+
+func (c *responseValidator) setDNSCacheTTL(ttl time.Duration) {
+	if c == nil {
+		return
+	}
+	if c.dnsCache == nil {
+		c.dnsCache = newPublicHostDNSCache(ttl, maxValidatorDNSCacheEntries)
+		return
+	}
+	c.dnsCache.setTTL(ttl)
 }
 
 // NewClient pins the service URL from operator configuration. Only a literal
@@ -80,7 +250,15 @@ func NewClient(endpoint, token string, executor fetch.Executor) (*Client, error)
 // WithLookupNetIP overrides host DNS validation for isolated tests and loopback harnesses.
 func (c *Client) WithLookupNetIP(fn func(context.Context, string, string) ([]netip.Addr, error)) *Client {
 	if c != nil && fn != nil {
-		c.lookup = fn
+		c.setLookup(fn)
+	}
+	return c
+}
+
+// WithDNSCacheTTL overrides the validator public-host DNS cache TTL (<=0 disables caching).
+func (c *Client) WithDNSCacheTTL(ttl time.Duration) *Client {
+	if c != nil {
+		c.setDNSCacheTTL(ttl)
 	}
 	return c
 }
@@ -246,7 +424,7 @@ func (c *Client) PlatformStatsSnapshot() PlatformBreakdown {
 	return c.stats.platformBreakdown()
 }
 
-func (c responseValidator) validateResponse(ctx context.Context, videoID string, payload []byte) ([]unified.Object, error) {
+func (c *responseValidator) validateResponse(ctx context.Context, videoID string, payload []byte) ([]unified.Object, error) {
 	if len(payload) > maxV1ResponseBytes {
 		return nil, errUnavailable
 	}
@@ -257,10 +435,67 @@ func (c responseValidator) validateResponse(ctx context.Context, videoID string,
 	if d.Decode(&result) != nil || d.Decode(&struct{}{}) != io.EOF || result.VideoID != videoID || len(result.Candidates) < 1 || len(result.Candidates) > 2 {
 		return nil, errUnavailable
 	}
-	return c.validateCandidates(ctx, result.Candidates, c.now().Unix(), nil)
+	return c.validateCandidates(ctx, result.Candidates, c.currentTime().Unix(), nil)
 }
 
-func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID string, payload []byte) (*douyin.ShanghaiWork, error) {
+type preparedCandidate struct {
+	url        string
+	route      string
+	object     string
+	prefix     string
+	obtainedAt int64
+	expiresAt  int64
+	metadata   unified.Object
+}
+
+func prepareCandidates(candidates []Candidate, now int64) ([]preparedCandidate, error) {
+	prepared := make([]preparedCandidate, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, v := range candidates {
+		u, err := url.Parse(v.URL)
+		object := unified.DouyinStoragePath(v.URL)
+		if err != nil || object == "" || !validProbeMetadata(v.Metadata) ||
+			v.ObtainedAt < now-60 || v.ObtainedAt > now+30 ||
+			v.ExpiresAt != explicitExpiry(u) || v.ExpiresAt != 0 && v.ExpiresAt <= now {
+			return nil, errUnavailable
+		}
+		if prefix, err := hex.DecodeString(v.PrefixSHA256); err != nil || len(prefix) != 32 {
+			return nil, errUnavailable
+		}
+		route := strings.ToLower(u.Hostname())
+		prefix := strings.ToLower(v.PrefixSHA256)
+		if len(prepared) > 0 && (prepared[0].object != object || prepared[0].prefix != prefix || !unified.Equal(prepared[0].metadata, v.Metadata)) {
+			return nil, errUnavailable
+		}
+		if seen[route] {
+			continue
+		}
+		seen[route] = true
+		prepared = append(prepared, preparedCandidate{
+			url:        v.URL,
+			route:      route,
+			object:     object,
+			prefix:     prefix,
+			obtainedAt: v.ObtainedAt,
+			expiresAt:  v.ExpiresAt,
+			metadata:   v.Metadata,
+		})
+	}
+	return prepared, nil
+}
+
+type preparedRenditionURL struct {
+	normalized string
+	host       string
+	exp        int64
+}
+
+type preparedRenditionGroup struct {
+	key  string
+	urls []preparedRenditionURL
+}
+
+func (c *responseValidator) validateWorkResponse(ctx context.Context, awemeID string, payload []byte) (*douyin.ShanghaiWork, error) {
 	if len(payload) == 0 || len(payload) > maxResponseBytes || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
 		return nil, errUnavailable
 	}
@@ -288,17 +523,30 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 		(len(result.Candidates) > 0 && result.VideoID == "") {
 		return nil, errUnavailable
 	}
-	now := c.now().Unix()
-	dnsOK := map[string]bool{}
-	var candidates []unified.Object
+	now := c.currentTime().Unix()
+
+	// Phase 1: Pure memory syntax/bound validation and unique host collection (zero DNS I/O).
+	var prepCandidates []preparedCandidate
 	if len(result.Candidates) > 0 {
 		var err error
-		candidates, err = c.validateCandidates(ctx, result.Candidates, now, dnsOK)
+		prepCandidates, err = prepareCandidates(result.Candidates, now)
 		if err != nil {
 			return nil, err
 		}
 	}
-	var renditions map[string]unified.Array
+	hostSeen := map[string]bool{}
+	var hosts []string
+	addHost := func(h string) {
+		if h != "" && !hostSeen[h] {
+			hostSeen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	for _, cand := range prepCandidates {
+		addHost(cand.route)
+	}
+
+	var prepRenditions []preparedRenditionGroup
 	for declaredKey, urls := range result.Renditions {
 		if len(urls) > douyin.MaxShanghaiRenditionURLs {
 			return nil, errUnavailable
@@ -306,8 +554,8 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 		if declaredKey == "" {
 			continue
 		}
-		var kept unified.Array
 		seen := map[string]bool{}
+		var items []preparedRenditionURL
 		for _, raw := range urls {
 			normalized, ok := douyin.NormalizeShanghaiRenditionURL(raw)
 			if !ok || unified.DouyinStoragePath(normalized) != declaredKey || seen[normalized] {
@@ -322,21 +570,58 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 				continue
 			}
 			host := strings.ToLower(u.Hostname())
-			publicHost, checked := dnsOK[host]
-			if !checked {
-				publicHost, err = c.checkPublicHost(ctx, host)
-				if err != nil {
-					return nil, err
-				}
-				dnsOK[host] = publicHost
-			}
-			if !publicHost {
+			seen[normalized] = true
+			addHost(host)
+			items = append(items, preparedRenditionURL{
+				normalized: normalized,
+				host:       host,
+				exp:        exp,
+			})
+		}
+		if len(items) > 0 {
+			prepRenditions = append(prepRenditions, preparedRenditionGroup{key: declaredKey, urls: items})
+		}
+	}
+
+	// Phase 2: Bounded concurrent DNS check with per-host timeout isolation and short TTL cache.
+	var dnsOK map[string]bool
+	if len(hosts) > 0 {
+		var err error
+		dnsOK, err = c.checkPublicHosts(ctx, hosts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var candidates []unified.Object
+	for _, cand := range prepCandidates {
+		if !dnsOK[cand.route] {
+			return nil, errUnavailable
+		}
+		row := unified.Object{
+			"url":           cand.url,
+			"metadata":      cand.metadata,
+			"source_key":    cand.route,
+			"object_key":    cand.object,
+			"prefix_sha256": cand.prefix,
+			"obtained_at":   cand.obtainedAt,
+		}
+		if cand.expiresAt > 0 {
+			row["expires_at"] = time.Unix(cand.expiresAt, 0).UTC().Format(time.RFC3339)
+		}
+		candidates = append(candidates, row)
+	}
+
+	var renditions map[string]unified.Array
+	for _, grp := range prepRenditions {
+		var kept unified.Array
+		for _, item := range grp.urls {
+			if !dnsOK[item.host] {
 				continue
 			}
-			seen[normalized] = true
-			entry := unified.Object{"url": normalized}
-			if exp > 0 {
-				entry["expires_at"] = time.Unix(exp, 0).UTC().Format(time.RFC3339)
+			entry := unified.Object{"url": item.normalized}
+			if item.exp > 0 {
+				entry["expires_at"] = time.Unix(item.exp, 0).UTC().Format(time.RFC3339)
 			}
 			kept = append(kept, entry)
 		}
@@ -344,7 +629,7 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 			if renditions == nil {
 				renditions = map[string]unified.Array{}
 			}
-			renditions[declaredKey] = kept
+			renditions[grp.key] = kept
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -357,7 +642,19 @@ func (c responseValidator) validateWorkResponse(ctx context.Context, awemeID str
 	}, nil
 }
 
-func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid string, cid int64, payload []byte) (*bilibili.ShanghaiPlay, error) {
+type preparedBiliURL struct {
+	raw  string
+	host string
+}
+
+type preparedBiliTrack struct {
+	id      int64
+	codecID int64
+	codecs  string
+	urls    []preparedBiliURL
+}
+
+func (c *responseValidator) validateBilibiliResponse(ctx context.Context, bvid string, cid int64, payload []byte) (*bilibili.ShanghaiPlay, error) {
 	if len(payload) == 0 || len(payload) > maxResponseBytes || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
 		return nil, errUnavailable
 	}
@@ -376,13 +673,14 @@ func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid st
 		return nil, errUnavailable
 	}
 
-	now := c.now().Unix()
-	dnsOK := map[string]bool{}
-	filterURLs := func(urls []string) ([]string, error) {
+	now := c.currentTime().Unix()
+
+	// Phase 1: Pure memory syntax/bound validation and unique host collection (zero DNS I/O).
+	prepareURLs := func(urls []string) ([]preparedBiliURL, error) {
 		if len(urls) > bilibili.MaxShanghaiTrackURLs {
 			return nil, errUnavailable
 		}
-		var kept []string
+		var kept []preparedBiliURL
 		seen := map[string]bool{}
 		for _, raw := range urls {
 			if seen[raw] {
@@ -396,35 +694,108 @@ func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid st
 			if err != nil {
 				continue
 			}
-			host := strings.ToLower(u.Hostname())
-			publicHost, checked := dnsOK[host]
-			if !checked {
-				publicHost, err = c.checkPublicHost(ctx, host)
-				if err != nil {
-					return nil, err
-				}
-				dnsOK[host] = publicHost
-			}
-			if !publicHost {
-				continue
-			}
 			seen[raw] = true
-			kept = append(kept, raw)
+			kept = append(kept, preparedBiliURL{
+				raw:  raw,
+				host: strings.ToLower(u.Hostname()),
+			})
 		}
 		return kept, nil
+	}
+
+	var prepDURL [][]preparedBiliURL
+	durlSyntacticallyOK := len(result.DURLPieces) > 0
+	for _, piece := range result.DURLPieces {
+		parsed, err := prepareURLs(piece.URLs)
+		if err != nil {
+			return nil, err
+		}
+		if len(parsed) == 0 {
+			durlSyntacticallyOK = false
+		}
+		prepDURL = append(prepDURL, parsed)
+	}
+
+	prepareTracks := func(tracks []bilibili.ShanghaiDashTrack) ([]preparedBiliTrack, error) {
+		var out []preparedBiliTrack
+		for _, tr := range tracks {
+			if tr.ID <= 0 || tr.CodecID < 0 || !validWireCodecs(tr.Codecs) {
+				return nil, errUnavailable
+			}
+			parsed, err := prepareURLs(tr.URLs)
+			if err != nil {
+				return nil, err
+			}
+			if len(parsed) == 0 {
+				continue
+			}
+			out = append(out, preparedBiliTrack{
+				id:      tr.ID,
+				codecID: tr.CodecID,
+				codecs:  tr.Codecs,
+				urls:    parsed,
+			})
+		}
+		return out, nil
+	}
+
+	prepVideo, err := prepareTracks(result.DashVideo)
+	if err != nil {
+		return nil, err
+	}
+	prepAudio, err := prepareTracks(result.DashAudio)
+	if err != nil {
+		return nil, err
+	}
+
+	hostSeen := map[string]bool{}
+	var hosts []string
+	addHost := func(h string) {
+		if h != "" && !hostSeen[h] {
+			hostSeen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	if durlSyntacticallyOK {
+		for _, piece := range prepDURL {
+			for _, u := range piece {
+				addHost(u.host)
+			}
+		}
+	}
+	for _, tr := range prepVideo {
+		for _, u := range tr.urls {
+			addHost(u.host)
+		}
+	}
+	for _, tr := range prepAudio {
+		for _, u := range tr.urls {
+			addHost(u.host)
+		}
+	}
+	if len(hosts) == 0 {
+		return nil, errUnavailable
+	}
+
+	// Phase 2: Bounded concurrent DNS check with per-host 1.5s timeout isolation and short TTL cache.
+	dnsOK, err := c.checkPublicHosts(ctx, hosts)
+	if err != nil {
+		return nil, err
 	}
 
 	out := &bilibili.ShanghaiPlay{
 		BVID: bvid,
 		CID:  cid,
 	}
-	if len(result.DURLPieces) > 0 {
-		pieces := make([]bilibili.ShanghaiDURLPiece, 0, len(result.DURLPieces))
+	if durlSyntacticallyOK {
+		pieces := make([]bilibili.ShanghaiDURLPiece, 0, len(prepDURL))
 		allOK := true
-		for _, piece := range result.DURLPieces {
-			kept, err := filterURLs(piece.URLs)
-			if err != nil {
-				return nil, err
+		for _, piece := range prepDURL {
+			var kept []string
+			for _, u := range piece {
+				if dnsOK[u.host] {
+					kept = append(kept, u.raw)
+				}
 			}
 			if len(kept) == 0 {
 				allOK = false
@@ -432,42 +803,36 @@ func (c responseValidator) validateBilibiliResponse(ctx context.Context, bvid st
 			}
 			pieces = append(pieces, bilibili.ShanghaiDURLPiece{URLs: kept})
 		}
-		if allOK && len(pieces) == len(result.DURLPieces) {
+		if allOK && len(pieces) == len(prepDURL) {
 			out.DURLQuality = result.DURLQuality
 			out.DURLPieces = pieces
 		}
 	}
 
-	filterTracks := func(tracks []bilibili.ShanghaiDashTrack) ([]bilibili.ShanghaiDashTrack, error) {
+	filterTracks := func(tracks []preparedBiliTrack) []bilibili.ShanghaiDashTrack {
 		var keptTracks []bilibili.ShanghaiDashTrack
 		for _, tr := range tracks {
-			if tr.ID <= 0 || tr.CodecID < 0 || !validWireCodecs(tr.Codecs) {
-				return nil, errUnavailable
-			}
-			kept, err := filterURLs(tr.URLs)
-			if err != nil {
-				return nil, err
+			var kept []string
+			for _, u := range tr.urls {
+				if dnsOK[u.host] {
+					kept = append(kept, u.raw)
+				}
 			}
 			if len(kept) == 0 {
 				continue
 			}
 			keptTracks = append(keptTracks, bilibili.ShanghaiDashTrack{
-				ID:      tr.ID,
-				CodecID: tr.CodecID,
-				Codecs:  tr.Codecs,
+				ID:      tr.id,
+				CodecID: tr.codecID,
+				Codecs:  tr.codecs,
 				URLs:    kept,
 			})
 		}
-		return keptTracks, nil
+		return keptTracks
 	}
 
-	var err error
-	if out.DashVideo, err = filterTracks(result.DashVideo); err != nil {
-		return nil, err
-	}
-	if out.DashAudio, err = filterTracks(result.DashAudio); err != nil {
-		return nil, err
-	}
+	out.DashVideo = filterTracks(prepVideo)
+	out.DashAudio = filterTracks(prepAudio)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -492,63 +857,167 @@ func validWireCodecs(s string) bool {
 	return true
 }
 
-func (c responseValidator) checkPublicHost(ctx context.Context, host string) (bool, error) {
-	ips, err := c.lookup(ctx, "ip", host)
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if err != nil || len(ips) == 0 {
-		return false, nil
+func allPublicIPs(ips []netip.Addr) bool {
+	if len(ips) == 0 {
+		return false
 	}
 	for _, ip := range ips {
 		if !fetch.PublicIP(ip) {
-			return false, nil
+			return false
 		}
 	}
-	return true, nil
+	return true
 }
 
-func (c responseValidator) validateCandidates(ctx context.Context, candidates []Candidate, now int64, dnsOK map[string]bool) ([]unified.Object, error) {
-	var rows []unified.Object
-	seen := map[string]bool{}
-	for _, v := range candidates {
-		u, err := url.Parse(v.URL)
-		object := unified.DouyinStoragePath(v.URL)
-		if err != nil || object == "" || !validProbeMetadata(v.Metadata) ||
-			v.ObtainedAt < now-60 || v.ObtainedAt > now+30 ||
-			v.ExpiresAt != explicitExpiry(u) || v.ExpiresAt != 0 && v.ExpiresAt <= now {
-			return nil, errUnavailable
-		}
-		if prefix, err := hex.DecodeString(v.PrefixSHA256); err != nil || len(prefix) != 32 {
-			return nil, errUnavailable
-		}
-		route := strings.ToLower(u.Hostname())
-		prefix := strings.ToLower(v.PrefixSHA256)
-		if len(rows) > 0 && (rows[0]["object_key"] != object || rows[0]["prefix_sha256"] != prefix || !unified.Equal(rows[0]["metadata"], v.Metadata)) {
-			return nil, errUnavailable
-		}
-		if seen[route] {
+func (c *responseValidator) checkPublicHost(ctx context.Context, host string) (bool, error) {
+	res, err := c.checkPublicHosts(ctx, []string{host})
+	if err != nil {
+		return false, err
+	}
+	return res[strings.ToLower(strings.TrimSuffix(host, "."))], nil
+}
+
+func (c *responseValidator) checkPublicHosts(ctx context.Context, hosts []string) (map[string]bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	unique := make([]string, 0, len(hosts))
+	seen := make(map[string]bool, len(hosts))
+	for _, raw := range hosts {
+		key := strings.ToLower(strings.TrimSuffix(raw, "."))
+		if key == "" || seen[key] {
 			continue
 		}
-		publicHost, checked := dnsOK[route]
-		if !checked {
-			publicHost, err = c.checkPublicHost(ctx, route)
-			if err != nil {
-				return nil, err
-			}
-			if dnsOK != nil {
-				dnsOK[route] = publicHost
+		seen[key] = true
+		unique = append(unique, key)
+	}
+	result := make(map[string]bool, len(unique))
+	if len(unique) == 0 {
+		return result, nil
+	}
+
+	now := c.currentTime()
+	var misses []string
+	for _, host := range unique {
+		if c.dnsCache != nil {
+			if cachedIPs, ok := c.dnsCache.get(host, now); ok {
+				if allPublicIPs(cachedIPs) {
+					result[host] = true
+					continue
+				}
+				c.dnsCache.evict(host)
 			}
 		}
-		if !publicHost {
+		misses = append(misses, host)
+	}
+	if len(misses) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+
+	lookupFn := c.lookup
+	if lookupFn == nil {
+		lookupFn = net.DefaultResolver.LookupNetIP
+	}
+
+	sem := make(chan struct{}, maxValidatorDNSConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, host := range misses {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return nil, ctx.Err()
+		}
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			hostCtx, cancel := context.WithTimeout(ctx, defaultValidatorHostLookupLimit)
+			ips, err := lookupFn(hostCtx, "ip", h)
+			cancel()
+
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil || len(ips) == 0 {
+				mu.Lock()
+				result[h] = false
+				mu.Unlock()
+				return
+			}
+			if !allPublicIPs(ips) {
+				if c.dnsCache != nil {
+					c.dnsCache.evict(h)
+				}
+				mu.Lock()
+				result[h] = false
+				mu.Unlock()
+				return
+			}
+			if c.dnsCache != nil {
+				c.dnsCache.put(h, ips, c.currentTime())
+			}
+			mu.Lock()
+			result[h] = true
+			mu.Unlock()
+		}(host)
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (c *responseValidator) validateCandidates(ctx context.Context, candidates []Candidate, now int64, dnsOK map[string]bool) ([]unified.Object, error) {
+	prep, err := prepareCandidates(candidates, now)
+	if err != nil {
+		return nil, err
+	}
+	var toCheck []string
+	for _, cand := range prep {
+		if dnsOK == nil {
+			toCheck = append(toCheck, cand.route)
+		} else if _, checked := dnsOK[cand.route]; !checked {
+			toCheck = append(toCheck, cand.route)
+		}
+	}
+	if len(toCheck) > 0 {
+		checked, err := c.checkPublicHosts(ctx, toCheck)
+		if err != nil {
+			return nil, err
+		}
+		if dnsOK == nil {
+			dnsOK = checked
+		} else {
+			for k, v := range checked {
+				dnsOK[k] = v
+			}
+		}
+	}
+	rows := make([]unified.Object, 0, len(prep))
+	for _, cand := range prep {
+		if !dnsOK[cand.route] {
 			return nil, errUnavailable
 		}
-		row := unified.Object{"url": v.URL, "metadata": v.Metadata, "source_key": route, "object_key": object, "prefix_sha256": prefix, "obtained_at": v.ObtainedAt}
-		if v.ExpiresAt > 0 {
-			row["expires_at"] = time.Unix(v.ExpiresAt, 0).UTC().Format(time.RFC3339)
+		row := unified.Object{
+			"url":           cand.url,
+			"metadata":      cand.metadata,
+			"source_key":    cand.route,
+			"object_key":    cand.object,
+			"prefix_sha256": cand.prefix,
+			"obtained_at":   cand.obtainedAt,
+		}
+		if cand.expiresAt > 0 {
+			row["expires_at"] = time.Unix(cand.expiresAt, 0).UTC().Format(time.RFC3339)
 		}
 		rows = append(rows, row)
-		seen[route] = true
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
