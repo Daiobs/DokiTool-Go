@@ -573,7 +573,7 @@ onUnmounted(() => {
             <div class="sp-switch-row__info">
               <span class="sp-field__label">自动跟随当前标签页</span>
               <span class="sp-field__hint">
-                仅本地匹配 14 个支持平台作品页时自动解析；其它网站零外发请求
+                仅本地匹配 16 个支持平台作品页时自动解析；其它网站零外发请求
               </span>
             </div>
             <button

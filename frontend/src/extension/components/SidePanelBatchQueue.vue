@@ -192,7 +192,7 @@ function handleRetryFailed() {
         :value="modelValue"
         rows="5"
         class="sp-textarea sp-batch-textarea"
-        placeholder="粘贴整段分享口令或多行链接（支持 14 核心平台及 TikTok/Vimeo/Reddit/SoundCloud 等长尾站点混贴，本地自动去重并忽略无关文字与内网地址）..."
+        placeholder="粘贴整段分享口令或多行链接（支持 16 核心平台及 Vimeo/Reddit/SoundCloud 等长尾站点混贴，本地自动去重并忽略无关文字与内网地址）..."
         @input="onTextInput"
       />
 

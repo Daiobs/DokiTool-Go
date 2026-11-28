@@ -10,6 +10,8 @@
     "pipixia",
     "pipigx",
     "zuiyou",
+    "pinterest",
+    "tiktok",
     "x",
     "youtube",
     "instagram",
@@ -101,6 +103,16 @@
     },
     "zuiyou": {
       "url": "https://share.xiaochuankeji.cn/hybrid/share/post?pid=163566379",
+      "pool": "parse",
+      "tier": "tier_a"
+    },
+    "pinterest": {
+      "url": "https://www.pinterest.com/pin/858146903966145191/",
+      "pool": "parse",
+      "tier": "tier_a"
+    },
+    "tiktok": {
+      "url": "https://www.tiktok.com/@i/video/7671176369300327700",
       "pool": "parse",
       "tier": "tier_a"
     },

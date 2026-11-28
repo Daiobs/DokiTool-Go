@@ -1,7 +1,7 @@
-// Local 14-platform URL matcher & batch text extractor (privacy firewall).
+// Local 16-platform URL matcher & batch text extractor (privacy firewall).
 //
 // Parity contract:
-// Matches ONLY the exact 14 platforms registered in `backend/internal/catalog/catalog.go`
+// Matches ONLY the exact 16 platforms registered in `backend/internal/catalog/catalog.go`
 // (`backend/config/platforms.json` + `zuiyou` exact `share.xiaochuankeji.cn` + `x` +
 // `youtube` + `instagram`) and `backend/internal/platform/ytgeneric/sites.go`
 // (`facebook` exact hosts + `tumblr`).
@@ -1028,7 +1028,7 @@ function cleanCandidateToken(token: string): string {
 }
 
 /**
- * Extracts and deduplicates all supported 14-platform URLs from multi-line text
+ * Extracts and deduplicates all supported 16-platform URLs from multi-line text
  * or mixed Chinese/English share copy for the SidePanel batch queue.
  */
 export function extractSupportedUrlsFromText(

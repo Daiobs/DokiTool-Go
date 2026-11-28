@@ -27,7 +27,7 @@ const PlatformUnmatched = "ytdlp_unmatched"
 // GenericExtractorArgs returns the hardened --use-extractors selector list for
 // Tier-2 generic named extraction: allow all named yt-dlp extractors ("default")
 // while explicitly disabling the catch-all generic HTML scraper ("-generic") and
-// all Tier-1 core-14 extractor families so core platforms never route through Tier-2.
+// all Tier-1 core-16 extractor families so core platforms never route through Tier-2.
 func GenericExtractorArgs() []string {
 	return []string{
 		"default",
@@ -43,6 +43,8 @@ func GenericExtractorArgs() []string {
 		"-zuiyou.*",
 		"-xiaohongshu.*",
 		"-rednote.*",
+		"-pinterest.*",
+		"-tiktok.*",
 		"-twitter.*",
 		"-youtube.*",
 		"-instagram.*",
@@ -234,6 +236,8 @@ var blockedCoreExtractorFamilies = []string{
 	"zuiyou",
 	"xiaohongshu",
 	"rednote",
+	"pinterest",
+	"tiktok",
 	"twitter",
 	"youtube",
 	"instagram",
@@ -260,6 +264,8 @@ var blockedNormalizedPlatforms = map[string]bool{
 	"zuiyou":          true,
 	"xiaohongshu":     true,
 	"rednote":         true,
+	"pinterest":       true,
+	"tiktok":          true,
 	"twitter":         true,
 	"x":               true,
 	"youtube":         true,
@@ -293,7 +299,7 @@ func isBlockedExtractorIdentity(raw string) bool {
 
 // NormalizeExtractorPlatform maps yt-dlp extractor_key / extractor names onto a
 // canonical dynamic platform identifier matching ^[a-z][a-z0-9_]{0,31}$, while
-// rejecting generic fallback and all Tier-1 core-14 extractor families.
+// rejecting generic fallback and all Tier-1 core-16 extractor families.
 func NormalizeExtractorPlatform(extractorKey, extractor string) string {
 	if isBlockedExtractorIdentity(extractorKey) || isBlockedExtractorIdentity(extractor) {
 		return ""

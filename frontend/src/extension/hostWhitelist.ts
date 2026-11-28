@@ -1,4 +1,4 @@
-// Explicit API & 14-platform media CDN host whitelist for the Chrome MV3 extension.
+// Explicit API & 16-platform media CDN host whitelist for the Chrome MV3 extension.
 //
 // Security invariants:
 // - NEVER emit `<all_urls>`, `*://*/*`, `http://*/*`, or `https://*/*`.

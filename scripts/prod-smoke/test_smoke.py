@@ -356,6 +356,9 @@ class FakeDokiServer:
             "pipix.com": "pipixia",
             "pipigx.com": "pipigx",
             "xiaochuankeji.cn": "zuiyou",
+            "pinterest.com": "pinterest",
+            "pin.it": "pinterest",
+            "tiktok.com": "tiktok",
             "x.com": "x",
             "youtube.com": "youtube",
             "instagram.com": "instagram",
@@ -436,8 +439,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(report["summary"]["fail"], 0)
             # tier_b_platforms and rate_limit are SKIP by default under --tier tier-a
             self.assertEqual(report["summary"]["skip"], 2)
-            # 1 frontend + 1 platforms + 1 youtube_context + 1 cache + 1 x + 1 dy_dom + 4 dm + 14 platforms + 2 api_boundary = 26 PASS
-            self.assertEqual(report["summary"]["pass"], 26)
+            # 1 frontend + 1 platforms + 1 youtube_context + 1 cache + 1 x + 1 dy_dom + 4 dm + 16 platforms + 2 api_boundary = 28 PASS
+            self.assertEqual(report["summary"]["pass"], 28)
 
             # Verify api_boundary runs strictly AFTER all parse check groups and BEFORE rate_limit
             groups_in_order = [c["group"] for c in report["checks"]]
@@ -458,8 +461,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "PASS")
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["http_status"], 404)
 
-            # Verify >= 8.0s pacing across all /api/parse calls (15 total: 2 cache + 13 unique platforms)
-            self.assertEqual(len(srv.parse_Requests), 15)
+            # Verify >= 8.0s pacing across all /api/parse calls (17 total: 2 cache + 15 unique platforms)
+            self.assertEqual(len(srv.parse_Requests), 17)
             timestamps = [r["timestamp"] for r in srv.parse_Requests]
             for prev_ts, next_ts in zip(timestamps, timestamps[1:]):
                 self.assertGreaterEqual(next_ts - prev_ts, 8.0)
@@ -1928,7 +1931,7 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(len(all_plat_b), 1)
             self.assertEqual(all_plat_b[0]["status"], "SKIP")
 
-            # --tier all executes BOTH Tier-A 14 core platforms and full Tier-B pool
+            # --tier all executes BOTH Tier-A 16 core platforms and full Tier-B pool
             rc_all, out_all, err_all = self._run_cli(
                 [
                     "--base-url",
@@ -1946,12 +1949,25 @@ class ProdSmokeUnitTests(unittest.TestCase):
             rep_all = json.loads(out_all)
             self.assertEqual(
                 sum(1 for c in rep_all["checks"] if c["group"] == "all_platforms" and c["status"] == "PASS"),
-                14,
+                16,
             )
             self.assertEqual(
                 sum(1 for c in rep_all["checks"] if c["group"] == "tier_b_platforms" and c["status"] == "PASS"),
                 3,
             )
+
+    def test_samples_json_matches_platforms_json_ssot(self) -> None:
+        repo_root = SMOKE_DIR.parents[1]
+        catalog = json.loads((repo_root / "backend/config/platforms.json").read_text(encoding="utf-8"))
+        catalog_ids = [str(entry["id"]) for entry in catalog]
+        samples = json.loads((SMOKE_DIR / "samples.json").read_text(encoding="utf-8"))
+        expected_ids = [str(pid) for pid in samples.get("expected_platforms", [])]
+        sample_platforms = samples.get("platforms", {})
+        self.assertEqual(set(expected_ids), set(catalog_ids))
+        self.assertEqual(len(expected_ids), len(catalog_ids))
+        for pid in expected_ids:
+            self.assertIn(pid, sample_platforms, msg=f"samples.json platforms missing entry for {pid!r}")
+            self.assertTrue(str(sample_platforms[pid].get("url") or "").startswith(("http://", "https://")))
 
     def test_l4_sample_stale_distinguished_from_parser_failure_with_redaction(self) -> None:
         clock = FakeClock()

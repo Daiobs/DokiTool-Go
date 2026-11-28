@@ -169,7 +169,7 @@ const runtimePolicyRows = computed<RuntimePolicyRow[]>(() => {
     aria-label="平台熔断状态与运行时热策略摘要"
     data-testid="section-protection-policy"
   >
-    <!-- Read-Only Circuit Breaker Status Grid (14 Core + Dedicated Tier-2 Generic) -->
+    <!-- Read-Only Circuit Breaker Status Grid (16 Core + Dedicated Tier-2 Generic) -->
     <article
       v-if="circuitBreakerRows.length > 0 || genericBreakerRow !== null"
       class="mon-card"
@@ -179,7 +179,7 @@ const runtimePolicyRows = computed<RuntimePolicyRow[]>(() => {
         <div class="mon-card__title-group">
           <h2 class="mon-card__title">平台熔断状态（只读）</h2>
           <span class="mon-card__subtitle">
-            仅实时展示 14 核心平台及长尾链路的上游故障保护状态，公网零写接口
+            仅实时展示 16 核心平台及长尾链路的上游故障保护状态，公网零写接口
           </span>
         </div>
         <div class="mon-cb-summary">

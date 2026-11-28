@@ -141,7 +141,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 
 ---
 
-## 🌐 平台支持范围（14 核心平台 + 1000+ 长尾站点）
+## 🌐 平台支持范围（16 核心平台 + 1000+ 长尾站点）
 
 - **核心目录 SSOT**：`backend/config/platforms.json`（唯一内嵌 16 平台真值表，同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）。
 - **Tier-2 长尾兜底**：启用 `DOKITOOL_YTDLP_GENERIC_ENABLED=true` 后，`GET /api/parse` 在 `platform=all`（或省略）模式下可将合法公网长尾链接路由至独立 `PARSE_GENERIC` 隔离池（覆盖 Vimeo、Twitch、Reddit、SoundCloud 等 1000+ 具名提取器，严格禁用盲抓 `generic`）。
@@ -180,11 +180,11 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 <details>
 <summary><strong>点击展开：多池准入与限流分舱规则速查</strong></summary>
 
-服务端按可信客户端 IPv4 或 IPv6 `/64` 前缀隔离匿名预算（另保留微博流中转 `DOKITOOL_WEIBO_` 与下载上报 `DOKITOOL_REPORT_` 辅助池；完整参数见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）：
+服务端按可信客户端 IPv4 或 IPv6 `/64` 前缀隔离匿名预算（另保留下载上报 `DOKITOOL_REPORT_` 辅助池及历史兼容保留但已退役零路由消费的 `DOKITOOL_WEIBO_` 前缀；完整参数见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)）：
 
 | 准入池 | 环境变量前缀 | 覆盖请求范围与分流规则 |
 | --- | --- | --- |
-| `fast` | `DOKITOOL_PARSE_` | 未命中缓存的纯 Go 国内平台 `GET /api/parse`（含热配置单平台舱壁 `fast_per_platform_max_concurrency`）及已退役旧路径 |
+| `fast` | `DOKITOOL_PARSE_` | 未命中缓存的纯 Go 快解析平台 `GET /api/parse`（含国内平台与原生零 Cookie 海外平台 Pinterest / TikTok，受热配置单平台舱壁 `fast_per_platform_max_concurrency` 保护）及已退役旧路径 |
 | `resolve` | `DOKITOOL_RESOLVE_` | 未命中缓存的纯 Go 平台按需分集解析 `GET /api/resolve`（如 B 站多 P），拥有更宽的独立单 IP 突发与并发配额 |
 | `slow` | `DOKITOOL_PARSE_SLOW_` | 未命中缓存的海外慢解析平台（`x`、`youtube`、`instagram`、`facebook`、`tumblr`）及未命中缓存的 YouTube EJS 助手端点 |
 | `generic_slow` | `DOKITOOL_PARSE_GENERIC_` | 启用 `DOKITOOL_YTDLP_GENERIC_ENABLED` 时，第二级长尾具名提取器兜底使用的独立隔离准入池与子进程槽位 |
@@ -212,7 +212,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 | **L1 离线契约 & 单测** | Go `-race` 全量包单测、统一 Schema v1、OpenAPI 3.1.0、6 文件运行时锁、SSOT 6 项一致性门禁、供应链离线审计、前端全量单测 & 首屏体积预算 | `make test` · `make check` · `.github/workflows/ci.yml` |
 | **L2 无头浏览器 E2E** | 真实 `--headless=new` Chrome（`--remote-debugging-pipe`）加载扩展与 SW：水合、主题、桥接握手、OPFS 合流、文件名冲突对抗、零残余进程 `RESIDUAL_CHROME=0` | `scripts/test-extension-e2e.mjs` · `scripts/test-download-browser.mjs` · `scripts/prod-smoke/test_stage2_browser.mjs` |
 | **L3 定时线上巡检** | 每日 `yt-dlp` / `Deno` 正式版监控（`upstream-watch.yml`）+ 每 12 小时零权限 Deno/EJS `tv`+`main` 变体与只读接口低噪 Canary（`upstream-canary.yml`） | `scripts/check-upstream-updates.py` · `scripts/check-upstream-canary.py` |
-| **L4 发布后生产验收** | 阶段一服务端/静态全量 SHA-256 + 14 平台 API 冒烟（`smoke.py`）+ 阶段二零修改官方扩展无头 Chrome 复测（`stage2_browser.mjs`） | `scripts/prod-smoke/smoke.py` · `scripts/prod-smoke/stage2_browser.mjs` · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) |
+| **L4 发布后生产验收** | 阶段一服务端/静态全量 SHA-256 + 16 平台 API 冒烟（`smoke.py`）+ 阶段二零修改官方扩展无头 Chrome 复测（`stage2_browser.mjs`） | `scripts/prod-smoke/smoke.py` · `scripts/prod-smoke/stage2_browser.mjs` · [docs/RELEASE-RECEIPT.md](docs/RELEASE-RECEIPT.md) |
 
 <details>
 <summary><strong>点击展开：仓库目录结构</strong></summary>
@@ -245,6 +245,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 | 文档 | 内容摘要 |
 | --- | --- |
 | [docs/API.md](docs/API.md) · [docs/openapi.json](docs/openapi.json) | 统一媒体 v1（`schema_version=1.0`）接口契约、错误码、YouTube 助手接口与 OpenAPI `3.1.0` 规范 |
+| [docs/PLATFORM-ARCHITECTURE.md](docs/PLATFORM-ARCHITECTURE.md) | 多平台能力分级、执行路由六维模型、三层观测体系与新平台准入能力卡规范 |
 | [docs/EXTENSION.md](docs/EXTENSION.md) | Chrome MV3 原生侧边栏扩展 `v4.6.0` 安装、源码构建、凭据配置与安全边界 |
 | [tools/dokitool-agent/README.md](tools/dokitool-agent/README.md) · [SKILL.md](tools/dokitool-agent/SKILL.md) | 零依赖 Python Agent CLI 与默认只读 Stdio MCP Server 使用与集成规范 |
 | [docs/AGENT-API.md](docs/AGENT-API.md) · [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md) | 个人 Agent 通道鉴权、多角色配额、批量直连下载流水线与断点续传实践 |
