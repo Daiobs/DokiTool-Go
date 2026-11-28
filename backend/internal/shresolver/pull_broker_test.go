@@ -1137,3 +1137,52 @@ func TestPullBrokerFinishUsesInjectedClock(t *testing.T) {
 	cancel2()
 	<-doneFuture
 }
+
+func TestPullBrokerWithLookupNetIPClearsDNSCacheAndWithDNSCacheTTL(t *testing.T) {
+	b, err := NewPullBroker(wireToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.WithClock(func() time.Time { return time.Unix(wireNow, 0) })
+
+	var callsA atomic.Int32
+	b.WithLookupNetIP(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		callsA.Add(1)
+		return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+	})
+	raw, _ := json.Marshal(goodResponse())
+	if _, err := b.validateResponse(t.Context(), wireVideo, raw); err != nil {
+		t.Fatalf("1st validateResponse failed: %v", err)
+	}
+	if _, err := b.validateResponse(t.Context(), wireVideo, raw); err != nil {
+		t.Fatalf("2nd validateResponse failed: %v", err)
+	}
+	if callsA.Load() != 1 {
+		t.Fatalf("expected 1 cached DNS lookup across 2 calls, got %d", callsA.Load())
+	}
+
+	// Replacing lookup via WithLookupNetIP must clear cache immediately.
+	var callsB atomic.Int32
+	b.WithLookupNetIP(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		callsB.Add(1)
+		return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+	})
+	if _, err := b.validateResponse(t.Context(), wireVideo, raw); err != nil {
+		t.Fatalf("post-WithLookupNetIP validateResponse failed: %v", err)
+	}
+	if callsB.Load() != 1 {
+		t.Fatalf("WithLookupNetIP did not clear PullBroker DNS cache: callsB=%d", callsB.Load())
+	}
+
+	// Disabling cache via WithDNSCacheTTL(0) forces every call to query lookup.
+	b.WithDNSCacheTTL(0)
+	if _, err := b.validateResponse(t.Context(), wireVideo, raw); err != nil {
+		t.Fatalf("uncached validateResponse #1 failed: %v", err)
+	}
+	if _, err := b.validateResponse(t.Context(), wireVideo, raw); err != nil {
+		t.Fatalf("uncached validateResponse #2 failed: %v", err)
+	}
+	if callsB.Load() != 3 {
+		t.Fatalf("expected callsB=3 with cache disabled, got %d", callsB.Load())
+	}
+}

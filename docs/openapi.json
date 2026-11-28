@@ -4,7 +4,7 @@
   "info": {
     "title": "DokiTool Unified Media & Personal Agent API",
     "summary": "Unified Media v1 (schema_version=1.0) parsing, lazy item resolution, platform catalog, and owner telemetry API.",
-    "description": "Machine-readable contract for DokiTool's public Unified Media v1 endpoints and Bearer API Channels (`Authorization: Bearer <token>`, supporting both `DOKITOOL_OWNER_TOKEN` and named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` across `owner`, `agent`, and `friend` roles). Never pass tokens in query parameters: query-parameter tokens are ignored without error on `/api/parse`, `/api/resolve`, and `/api/platforms` (treating the request as an anonymous visitor while leaking the secret into access logs and shell history), and rejected on `/api/stats`. Never forward `Authorization` or `Cookie` headers to third-party media CDNs. Scope: this OpenAPI document targets general-purpose clients and personal agents, covering the public Unified Media v1 endpoints and owner telemetry endpoint (`/api/platforms`, `/api/parse`, `/api/resolve`, `/api/stats`); same-origin browser helper handshake endpoints (`/api/youtube/context`, `POST /api/youtube/finalize`) and the signed restricted image relay path (`/api/media/weibo`) are internal companion interfaces intentionally omitted from generic OpenAPI client codegen, documented in `docs/API.md`, and continuously reconciled against Caddy routing by `scripts/check-openapi.py`.",
+    "description": "Machine-readable contract for DokiTool's public Unified Media v1 endpoints and Bearer API Channels (`Authorization: Bearer <token>`, supporting both `DOKITOOL_OWNER_TOKEN` and named SHA-256 keys from `DOKITOOL_API_KEYS_FILE` across `owner`, `agent`, and `friend` roles). Never pass tokens in query parameters: query-parameter tokens are ignored without error on `/api/parse`, `/api/resolve`, and `/api/platforms` (treating the request as an anonymous visitor while leaking the secret into access logs and shell history), and rejected on `/api/stats`. Never forward `Authorization` or `Cookie` headers to third-party media CDNs. Scope: this OpenAPI document targets general-purpose clients and personal agents, covering the public Unified Media v1 endpoints and owner telemetry endpoint (`/api/platforms`, `/api/parse`, `/api/resolve`, `/api/stats`); same-origin browser helper handshake endpoints (`/api/youtube/context`, `POST /api/youtube/finalize`) are internal companion interfaces intentionally omitted from generic OpenAPI client codegen, documented in `docs/API.md`, and continuously reconciled against Caddy routing by `scripts/check-openapi.py`. Zero server media proxying is performed across all platforms.",
     "version": "1.0.0",
     "license": {
       "name": "MIT",
@@ -2010,6 +2010,8 @@
           "pipixia",
           "pipigx",
           "zuiyou",
+          "pinterest",
+          "tiktok",
           "x",
           "youtube",
           "instagram",
@@ -2213,7 +2215,7 @@
         "type": "string",
         "pattern": "^[a-z0-9][a-z0-9_:-]{0,31}$",
         "maxLength": 32,
-        "description": "Core 14 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), 'ytdlp_unmatched', or 'ytdlp_other'."
+        "description": "Core 16 platform identifier, 'unknown', bounded normalized long-tail extractor identifier (up to 64 distinct keys), 'ytdlp_unmatched', or 'ytdlp_other'."
       },
       "StatsOutcomeCode": {
         "type": "string",
@@ -3354,6 +3356,58 @@
           }
         }
       },
+      "TikTokRiskStatsSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "proxy_configured",
+          "transport_mode",
+          "hydration_ok",
+          "waf_blocked",
+          "content_not_found",
+          "play_302_ok",
+          "play_302_failed"
+        ],
+        "properties": {
+          "proxy_configured": {
+            "type": "boolean",
+            "description": "Whether DOKITOOL_TIKTOK_PROXY_URL is active (never exposes proxy credentials or host)."
+          },
+          "transport_mode": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "chrome131"
+            ],
+            "description": "Active TikTok metadata hydration TLS transport mode."
+          },
+          "hydration_ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative successful TikTok page hydration parses."
+          },
+          "waf_blocked": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative TikTok Slardar WAF or 403/429 challenge responses."
+          },
+          "content_not_found": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative unavailable/deleted/private TikTok works (e.g. statusCode 10204)."
+          },
+          "play_302_ok": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative successful zero-cookie /aweme/v1/play/ 302 resolutions."
+          },
+          "play_302_failed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Cumulative failed or rejected /aweme/v1/play/ 302 resolutions."
+          }
+        }
+      },
       "CircuitBreakerState": {
         "type": "string",
         "enum": [
@@ -3388,6 +3442,8 @@
               "pipigx",
               "zuiyou",
               "xiaohongshu",
+              "pinterest",
+              "tiktok",
               "x",
               "youtube",
               "instagram",
@@ -3502,6 +3558,8 @@
           "pipigx",
           "zuiyou",
           "xiaohongshu",
+          "pinterest",
+          "tiktok",
           "x",
           "youtube",
           "instagram",
@@ -3736,11 +3794,14 @@
           "youtube_helper": {
             "$ref": "#/components/schemas/YouTubeHelperStatsSnapshot"
           },
+          "tiktok": {
+            "$ref": "#/components/schemas/TikTokRiskStatsSnapshot"
+          },
           "circuit_breakers": {
             "type": "array",
-            "minItems": 14,
-            "maxItems": 14,
-            "description": "Current circuit breaker state for all 14 core platforms in fixed canonical order.",
+            "minItems": 16,
+            "maxItems": 16,
+            "description": "Current circuit breaker state for all 16 core platforms in fixed canonical order.",
             "items": {
               "$ref": "#/components/schemas/CircuitBreakerPlatformSnapshot"
             }

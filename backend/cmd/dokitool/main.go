@@ -24,13 +24,14 @@ import (
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/bearer"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
-	"github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/bilibili"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/douyin"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/instagram"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/kuaishou"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pinterest"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipigx"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/pipixia"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/tiktok"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/toutiao"
 	weiboplatform "github.com/Brilliant666/DokiTool-Go/backend/internal/platform/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/platform/x"
@@ -45,8 +46,7 @@ import (
 )
 
 // preparePublicMedia keeps platform-specific transformations at the public boundary.
-func preparePublicMedia(key string) api.PublicMedia {
-	weibo := weiboplatform.PreparePublicWithOwner(key, api.IsOwnerRequest)
+func preparePublicMedia() api.PublicMedia {
 	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
 		switch platform {
 		case "douyin":
@@ -61,8 +61,10 @@ func preparePublicMedia(key string) api.PublicMedia {
 			return pipixia.PreparePublic(ctx, platform, payload, now)
 		case "zuiyou":
 			return zuiyou.PreparePublic(ctx, platform, payload, now)
+		case "weibo":
+			return weiboplatform.PreparePublic(ctx, platform, payload, now)
 		default:
-			return weibo(ctx, platform, payload, now)
+			return payload, nil
 		}
 	}
 }
@@ -118,6 +120,7 @@ func run(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := flags.String("listen", "127.0.0.1:9082", "loopback API listener; use an authenticated edge for public traffic")
 	xhsTransport := flags.String("xhs-page-transport", "standard", "XHS HTTPS pages only: standard or chrome131")
+	tiktokTransport := flags.String("tiktok-page-transport", "standard", "TikTok HTTPS hydration pages only: standard or chrome131")
 	xTombstoneFallback := flags.String("x-tombstone-fallback", x.TombstoneFallbackOff, "X TweetTombstone metadata fallback: off or fxtwitter")
 	clientIdentity := flags.String("client-identity", "direct", "client identity for admission: direct or authenticated caddy")
 	if err := flags.Parse(args); err != nil {
@@ -133,6 +136,10 @@ func run(args []string) error {
 		return fmt.Errorf("listen must use an explicit loopback IP and port 1024–65535")
 	}
 	xhsExecutor, err := newXHSExecutor(*xhsTransport)
+	if err != nil {
+		return err
+	}
+	tiktokExecutor, tiktokProxyConfigured, err := newTikTokExecutor(*tiktokTransport, os.Getenv("DOKITOOL_TIKTOK_PROXY_URL"))
 	if err != nil {
 		return err
 	}
@@ -162,6 +169,14 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	tiktokParser := tiktok.New(tiktokExecutor).
+		WithProxyConfigured(tiktokProxyConfigured).
+		WithTransportMode(*tiktokTransport)
+	if rpm, burst, set, rpmErr := parseTikTokDirectRPM(os.Getenv); rpmErr != nil {
+		return rpmErr
+	} else if set {
+		tiktokParser.WithDirectRateLimit(rpm, burst)
+	}
 	adapters := map[string]api.Adapter{
 		"douyin":      douyinParser,
 		"bilibili":    bilibiliParser,
@@ -172,6 +187,8 @@ func run(args []string) error {
 		"pipigx":      pipigx.NewWithTBVideo(executor, pipigxSave),
 		"zuiyou":      zuiyou.NewWithTBVideo(executor, zuiyouSave),
 		"xiaohongshu": xiaohongshu.New(xhsExecutor),
+		"pinterest":   pinterest.New(executor),
+		"tiktok":      tiktokParser,
 	}
 	runtimeCfg, runtimeFromFile, err := api.LoadRuntimeConfig(os.Getenv)
 	if err != nil {
@@ -189,10 +206,11 @@ func run(args []string) error {
 		return err
 	}
 	defer func() { _ = ytCfg.Close() }()
-	handler, err := api.NewWithCacheConfig(c, adapters, time.Now, preparePublicMedia(os.Getenv("SNAP_MEDIA_SIGNING_KEY")), cacheCfg)
+	handler, err := api.NewWithCacheConfig(c, adapters, time.Now, preparePublicMedia(), cacheCfg)
 	if err != nil {
 		return err
 	}
+	handler.Stats().SetTikTokRiskSource(tiktokParser)
 	if ytCfg.genericAdapter != nil {
 		handler.SetGenericAdapter(ytCfg.genericAdapter)
 	}
@@ -234,9 +252,6 @@ func run(args []string) error {
 		TBVideoZuiyou:           zuiyouSave,
 		StatsPersistenceEnabled: statsSnapshotPath != "",
 	})
-	// The route is present even without a configured key, where it returns the
-	// PHP-compatible legacy 503 media envelope without issuing network calls.
-	handler.SetWeiboRelay(weibo.NewMediaRelay(os.Getenv("SNAP_MEDIA_SIGNING_KEY")))
 	keyRegistry, err := api.LoadAPIKeyRegistry(os.Getenv, limits)
 	if err != nil {
 		return err
@@ -314,6 +329,25 @@ func parseBilibiliDASH(getenv func(string) string) (bool, error) {
 	return enabled, nil
 }
 
+func parseTikTokDirectRPM(getenv func(string) string) (rpm float64, burst int, set bool, err error) {
+	raw := strings.TrimSpace(getenv("DOKITOOL_TIKTOK_DIRECT_RPM"))
+	if raw == "" {
+		return 0, 0, false, nil
+	}
+	v, parseErr := strconv.ParseFloat(raw, 64)
+	if parseErr != nil || v < 0 || v > 600 {
+		return 0, 0, false, fmt.Errorf("DOKITOOL_TIKTOK_DIRECT_RPM must be a number in 0..600")
+	}
+	b := int(v)
+	if b < 1 {
+		b = 1
+	}
+	if b > 6 {
+		b = 6
+	}
+	return v, b, true, nil
+}
+
 func newShanghaiParsers(executor fetch.Executor, japan *probe.Probe, shanghai douyin.OriginalResolver, bilibiliDASH bool) (*douyin.Parser, *bilibili.Parser) {
 	douyinParser := douyin.New(executor, japan)
 	bilibiliParser := bilibili.New(executor)
@@ -345,7 +379,7 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 		}
 		token := getenv("DOKITOOL_SHANGHAI_TOKEN")
 		if mode == "direct" && token != "" {
-			for _, key := range []string{"SNAP_INGRESS_KEY", "SNAP_MEDIA_SIGNING_KEY", "DOKITOOL_SHANGHAI_PULL_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
+			for _, key := range []string{"SNAP_INGRESS_KEY", "DOKITOOL_SHANGHAI_PULL_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
 				if subtle.ConstantTimeCompare([]byte(token), []byte(getenv(key))) == 1 {
 					return nil, nil, errors.New("direct mode requires a dedicated Shanghai token")
 				}
@@ -367,7 +401,7 @@ func configureShanghai(executor fetch.Executor, getenv func(string) string) (dou
 			return nil, nil, errors.New("remove DOKITOOL_SHANGHAI_ENDPOINT before enabling pull mode")
 		}
 		token := getenv("DOKITOOL_SHANGHAI_PULL_TOKEN")
-		for _, key := range []string{"SNAP_INGRESS_KEY", "SNAP_MEDIA_SIGNING_KEY", "DOKITOOL_SHANGHAI_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
+		for _, key := range []string{"SNAP_INGRESS_KEY", "DOKITOOL_SHANGHAI_TOKEN", "DOKITOOL_OWNER_TOKEN"} {
 			if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(getenv(key))) == 1 {
 				return nil, nil, errors.New("pull mode requires a dedicated control credential")
 			}
@@ -535,6 +569,26 @@ func newXHSExecutor(mode string) (fetch.Executor, error) {
 	default:
 		return nil, fmt.Errorf("xhs-page-transport must be standard or chrome131")
 	}
+}
+
+func newTikTokExecutor(mode, rawProxyURL string) (fetch.Executor, bool, error) {
+	var client *fetch.Client
+	switch mode {
+	case "standard":
+		client = fetch.New()
+	case "chrome131":
+		client = fetch.NewTikTokPages()
+	default:
+		return nil, false, fmt.Errorf("tiktok-page-transport must be standard or chrome131")
+	}
+	provider, err := fetch.NewEnvPlatformProxyProvider(rawProxyURL)
+	if err != nil {
+		return nil, false, err
+	}
+	if provider.Configured() {
+		client.WithProxyProvider(provider)
+	}
+	return client, provider.Configured(), nil
 }
 
 func emit(value any) error {

@@ -71,13 +71,13 @@ Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下
 
 ---
 
-## 微博播放与下载
+## 零服务端媒体中转与防盗链视频直连（微博 / TikTok）
 
-微博部分视频 CDN 校验来源请求头，浏览器直连无法自行附带，因此 `/api/media/weibo` 是全站唯一的短期签名媒体中转入口：
+自 `v4.6.0` 起，历史 `/api/media/weibo` 签名媒体中转路由与 `SNAP_MEDIA_SIGNING_KEY` 已彻底移除，主后端不再执行任何视频流式转发：
 
-1. 主后端解析层与微博中转层共享服务端环境变量 `SNAP_MEDIA_SIGNING_KEY`（高熵随机密钥，仅保存在受保护的服务环境配置中，严禁写入仓库、前端构建变量或日志；参数定义见 [CONFIGURATION.md](CONFIGURATION.md)）。未配置密钥时微博解析明确返回 `503 SERVICE_NOT_CONFIGURED`。
-2. 解析成功后仅对通过域名校验的微博官方视频源签发 30 分钟有效的 HMAC 签名票据；`/api/media/weibo?ticket=...&intent=play|download` 验签后固定上游来源请求头并按流转发（支持 `GET`、`HEAD` 与 `Range`），不接受任意 `url=` 参数、不跟随跨域重定向、连接前校验全部 DNS 结果均为公网地址。
-3. 反向代理转发 `/api/media/weibo` 时须关闭响应压缩与额外缓冲（参考 Caddy [reverse_proxy streaming](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#streaming)），透传准确的 `Content-Length`、`Content-Range` 与 `Accept-Ranges`，使用 `Cache-Control: no-store`，且不在访问日志中记录完整 `ticket` 查询串。该路由受独立的 `WEIBO` 准入限流池保护。
+1. 微博（`*.weibocdn.com`）与 TikTok（`*.tiktokcdn.com` / `*.tiktokcdn-us.com` / `*.tiktokcdn-eu.com` / `*.tiktokv.com`）视频均在公开边界完成官方 CDN 白名单校验后直接输出 `access: "direct"` + `browser_fetch: "blocked"`；
+2. 桌面浏览器通过 Chrome MV3 官方扩展（`v4.6.0`）的隔离 DNR 规则（`RULE 1003` / `RULE 1009`，严格绑定 `initiatorDomains: [extensionId]` 且移除 `Cookie` 与 `Origin`）完成零中转直连下载；
+3. 针对 TikTok 元数据水合页的规模化放量场景，主后端预留了单环境变量 `DOKITOOL_TIKTOK_PROXY_URL`（仅作用于 `tiktok-page` 与 `tiktok-shortlink`，永不承载 `tiktok-play-302` 或任何媒体流）及可选启动参数 `-tiktok-page-transport=standard|chrome131`（默认 `standard`）。
 
 ---
 
@@ -85,8 +85,8 @@ Caddy 站点配置（通用示例见 `ops/examples/snap.caddy`）需满足以下
 
 前后端统一围绕 `schema_version=1.0` 契约协同发布：
 
-- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（严格仅限 `owner` 角色 Bearer 凭据访问；`agent` / `friend` 角色凭据及密钥未授权平台请求均返回 HTTP `401 INVALID_INPUT`，通过鉴权的新鲜缓存命中走零槽位缓存快路径，详见 [API.md](API.md) 与 [AGENT-API.md](AGENT-API.md)）、`/api/media/weibo`、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
-- **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 通过本地回环 `reverse_proxy`（附带 `X-DokiTool-Client-IP` 与 `X-DokiTool-Edge-Key` 边缘认证头；Caddy 直连访客时传 `{remote_host}`，若前置 CDN 或负载均衡器则须在全局 `servers` 块配置 `trusted_proxies` 并改传 `{client_ip}`，避免所有访客共享代理节点限流配额）向 `dokitool` 转发显式白名单路由（流式中转 `/api/media/weibo` 独立前置并启用 `flush_interval -1`，公开接口采用 `@api path ...` 逐条列举，上海拉取控制面 `@shanghai path /internal/shanghai/claim /internal/shanghai/result` 置于 `@source` 拦截 `/internal/*` 之前），未列入白名单的 `/api/*` 路径会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
+- 每次发布或回滚必须同时对齐同一源码提交的后端二进制（内嵌 `backend/config/platforms.json` 目录）与 `frontend/dist/`；公开路由固定为 `/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`（严格仅限 `owner` 角色 Bearer 凭据访问；`agent` / `friend` 角色凭据及密钥未授权平台请求均返回 HTTP `401 INVALID_INPUT`，通过鉴权的新鲜缓存命中走零槽位缓存快路径，详见 [API.md](API.md) 与 [AGENT-API.md](AGENT-API.md)）、`/api/downloads/tbvideo-result` 及可选启用的 `/api/youtube/context`、`/api/youtube/finalize`。
+- **Caddy 路径白名单同步**：线上 Caddy 与仓库示例 `ops/examples/snap.caddy` 通过本地回环 `reverse_proxy`（附带 `X-DokiTool-Client-IP` 与 `X-DokiTool-Edge-Key` 边缘认证头；Caddy 直连访客时传 `{remote_host}`，若前置 CDN 或负载均衡器则须在全局 `servers` 块配置 `trusted_proxies` 并改传 `{client_ip}`，避免所有访客共享代理节点限流配额）向 `dokitool` 转发显式白名单路由（公开接口采用 `@api path ...` 逐条列举，上海拉取控制面 `@shanghai path /internal/shanghai/claim /internal/shanghai/result` 置于 `@source` 拦截 `/internal/*` 之前），未列入白名单的 `/api/*` 路径（包括已退役的 `/api/media/weibo`）会被 Caddy 直接返回 HTTP `404` JSON（`接口不存在`）。**新增接口路径时必须同时修改 Caddy 的路径白名单**，经 `caddy validate` 校验通过后执行 `systemctl reload caddy`。
 - 已退役的旧 `/api/short_videos`、`/api/douyin` 等兼容路径固定返回 JSON 版本提示错误（`410`），不得回退为 SPA HTML。接口契约与 Schema 校验规则详见 [API.md](API.md) 与 [schema/unified-v1/README.md](schema/unified-v1/README.md)。
 
 ---

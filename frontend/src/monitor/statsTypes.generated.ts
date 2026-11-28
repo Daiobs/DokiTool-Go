@@ -174,6 +174,16 @@ export interface YouTubeHelperStatsSnapshot {
   challenge_lru_misses: number;
 }
 
+export interface TikTokRiskStatsSnapshot {
+  proxy_configured: boolean;
+  transport_mode: string;
+  hydration_ok: number;
+  waf_blocked: number;
+  content_not_found: number;
+  play_302_ok: number;
+  play_302_failed: number;
+}
+
 export interface CircuitBreakerPlatformSnapshot {
   platform: string;
   state: CircuitBreakerState;
@@ -301,6 +311,7 @@ export interface StatsSnapshot {
   ytdlp_generic?: YTDLPStatsSnapshot;
   ytdlp_pools?: YTDLPPoolsSnapshot;
   youtube_helper?: YouTubeHelperStatsSnapshot;
+  tiktok?: TikTokRiskStatsSnapshot;
   circuit_breakers?: CircuitBreakerPlatformSnapshot[];
   generic_circuit_breaker?: CircuitBreakerPlatformSnapshot;
   runtime_policy?: RuntimePolicySummary;

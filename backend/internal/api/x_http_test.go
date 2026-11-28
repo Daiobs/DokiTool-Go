@@ -146,8 +146,8 @@ func TestXHTTPParseResolveAndDegradation(t *testing.T) {
 		t.Fatal(err)
 	}
 	platforms := unified.Slice(unified.Map(platformsEnv["data"])["platforms"])
-	if len(platforms) != 10 {
-		t.Fatalf("expected 10 platforms with X registered, got %d", len(platforms))
+	if len(platforms) != 12 {
+		t.Fatalf("expected 12 platforms with X registered, got %d", len(platforms))
 	}
 
 	// 2. /api/parse with X share text returns validated public unified-v1 envelope.

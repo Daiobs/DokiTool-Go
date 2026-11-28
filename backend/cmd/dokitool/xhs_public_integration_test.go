@@ -5,13 +5,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/api"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/catalog"
-	weibomedia "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -69,7 +67,7 @@ func TestXHSPublicMediaIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	adapter := api.AdapterFunc(func(context.Context, string, int64) (unified.Object, error) { return unified.Clone(fixture), nil })
-	h, err := api.New(registry, map[string]api.Adapter{"xiaohongshu": adapter}, func() time.Time { return time.Unix(1793448000, 0) }, preparePublicMedia("01234567890123456789012345678901"))
+	h, err := api.New(registry, map[string]api.Adapter{"xiaohongshu": adapter}, func() time.Time { return time.Unix(1793448000, 0) }, preparePublicMedia())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +142,7 @@ func TestXHSPublicMediaIntegration(t *testing.T) {
 	}
 }
 
-func TestCombinedPublicMediaKeepsWeiboSigning(t *testing.T) {
+func TestCombinedPublicMediaKeepsWeiboDirectBlocked(t *testing.T) {
 	raw, err := os.ReadFile("../../../docs/schema/unified-v1/examples/01-douyin-quality-and-cdn.json")
 	if err != nil {
 		t.Fatal(err)
@@ -168,19 +166,17 @@ func TestCombinedPublicMediaKeepsWeiboSigning(t *testing.T) {
 	const upstream = "https://f.video.weibocdn.com/file.mp4?x=1"
 	unified.Map(sources[0])["url"] = upstream
 	unified.Map(item["default"])["url"] = upstream
-	key := strings.Repeat("k", 64)
-	prepared, err := preparePublicMedia(key)(context.Background(), "weibo", fixture, 1793448000)
+	prepared, err := preparePublicMedia()(context.Background(), "weibo", fixture, 1793448000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	item = unified.Map(unified.Slice(unified.Map(prepared["data"])["items"])[0])
 	d := unified.Map(item["default"])
-	u := unified.Str(d["url"])
-	if d["access"] != "relay" || !strings.HasPrefix(u, "/api/media/weibo?ticket=") {
-		t.Fatal("signed relay missing")
+	if d["access"] != "direct" || unified.Str(d["url"]) != upstream {
+		t.Fatalf("expected direct Weibo default URL %q, got %#v", upstream, d)
 	}
-	ticket, ok := weibomedia.Verify(strings.TrimPrefix(u, "/api/media/weibo?ticket="), key, 1793448000)
-	if !ok || ticket["u"] != upstream {
-		t.Fatal("signed relay invalid")
+	src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(item["variants"])[0])["delivery"])["sources"])[0])
+	if src["access"] != "direct" || src["browser_fetch"] != "blocked" || unified.Str(src["url"]) != upstream {
+		t.Fatalf("expected direct + browser_fetch=blocked Weibo source, got %#v", src)
 	}
 }

@@ -109,6 +109,7 @@ export interface DirectFileExtensionTraits {
   hasTbvideo: boolean;
   corsBlockedDirect: boolean;
   preferExtensionDirectAcceleration: boolean;
+  browserFetchBlocked: boolean;
   requiresRefererOrBlockedFetch: boolean;
   wantsProactiveExtensionDirect: boolean;
 }
@@ -135,8 +136,9 @@ export function inspectDirectFileExtensionTraits(params: {
   const preferExtensionDirectAcceleration = routes.some((url) =>
     prefersExtensionDirectAcceleration(url, source),
   );
+  const browserFetchBlocked = source?.browser_fetch === "blocked";
   const requiresRefererOrBlockedFetch =
-    source?.browser_fetch === "blocked" ||
+    browserFetchBlocked ||
     routes.some((url) => isRefererProtectedMediaRoute(url, source));
   const whitelistedForExtension = whitelistedRoutes.length > 0;
   const wantsProactiveExtensionDirect =
@@ -152,6 +154,7 @@ export function inspectDirectFileExtensionTraits(params: {
     hasTbvideo,
     corsBlockedDirect,
     preferExtensionDirectAcceleration,
+    browserFetchBlocked,
     requiresRefererOrBlockedFetch,
     wantsProactiveExtensionDirect,
   };

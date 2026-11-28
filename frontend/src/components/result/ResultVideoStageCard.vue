@@ -28,6 +28,8 @@ defineProps({
   isActiveYouTubeSplitVideo: Boolean,
   isActiveYouTubeAudioOnly: Boolean,
   isActiveExtensionDashMux: Boolean,
+  isActiveRefererProtectedVideo: Boolean,
+  isExtensionConnected: Boolean,
   isYouTubeHelperBlocked: Boolean,
   isTargetBlocked: Boolean,
   selectedCount: { type: Number, default: 0 },
@@ -49,6 +51,7 @@ const emit = defineEmits([
   "mark-image-broken",
   "open-quality-picker",
   "open-yt-helper-modal",
+  "open-extension",
   "refresh-item",
   "primary-download",
   "download-selected",
@@ -138,6 +141,34 @@ const emit = defineEmits([
           {{ t(locale, "selectQuality") }}</button
         ><button
           v-if="
+            isActiveRefererProtectedVideo &&
+            !isExtensionConnected &&
+            !isResolving
+          "
+          type="button"
+          data-ext-direct-install-cta
+          class="rs-btn rs-btn--primary"
+          @click="emit('open-extension')"
+        >
+          <AppIcon class="fas fa-download" /><span>{{
+            t(locale, "extInstallHintCta")
+          }}</span></button
+        ><button
+          v-if="
+            isActiveRefererProtectedVideo &&
+            isExtensionConnected &&
+            !isResolving
+          "
+          type="button"
+          data-ext-direct-download-cta
+          class="rs-btn rs-btn--primary"
+          @click="emit('primary-download')"
+        >
+          <AppIcon class="fas fa-download" /><span>{{
+            t(locale, "downloadViaExtension")
+          }}</span></button
+        ><button
+          v-if="
             isYouTubeHelperInstallRequired &&
             ytHelperModalDismissed &&
             !isResolving
@@ -165,6 +196,7 @@ const emit = defineEmits([
         :data-youtube-mux-save="isActiveYouTubeSplitVideo || undefined"
         :data-youtube-audio-only-save="isActiveYouTubeAudioOnly || undefined"
         :data-extension-dash-mux-save="isActiveExtensionDashMux || undefined"
+        :data-extension-direct-video="isActiveRefererProtectedVideo || undefined"
         :disabled="
           isYouTubeHelperBlocked ||
           isResolving ||

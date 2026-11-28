@@ -275,13 +275,12 @@ func TestMultiKeyRolesDisabledPlatformScopeWeiboDirectAndStatsSchema(t *testing.
 	friendScopedTok := randomPrintableToken(t, 48)
 	disabledTok := randomPrintableToken(t, 48)
 	edgeKey := randomPrintableToken(t, 48)
-	mediaKey := strings.Repeat("ab", 32)
 
 	const weiboBody = `{"idstr":"1234567890","text_raw":"t","page_info":{"media_info":{"mp4_hd_url":"https://f.video.weibocdn.com/direct-hd.mp4?size=1080","video_title":"v","duration":16}},"user":{"screen_name":"u","idstr":"1"}}`
 	wbAdapter := weiboplatform.New(fakeHTTPExec(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
 		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(weiboBody)}, nil
 	}))
-	weiboPublicMedia := weiboplatform.PreparePublicWithOwner(mediaKey, IsOwnerRequest)
+	weiboPublicMedia := weiboplatform.PreparePublic
 
 	c := makeStatsTestCatalog(t)
 	var kuaishouCalls atomic.Int32
@@ -446,31 +445,27 @@ func TestMultiKeyRolesDisabledPlatformScopeWeiboDirectAndStatsSchema(t *testing.
 		t.Fatalf("friend-scoped allowed douyin got %d", rec.Code)
 	}
 
-	// 4. Weibo IsOwnerRequest=true across ALL authenticated roles (owner, agent, friend -> direct CDN URL, zero relay).
+	// 4. Weibo returns unified direct CDN URL + browser_fetch=blocked across BOTH authenticated roles and anonymous visitors (zero relay).
 	weiboTarget := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://weibo.com/1234567890/AbC")
-	for _, tok := range []string{ownerTok, agentTok, friendScopedTok} {
+	for _, tok := range []string{ownerTok, agentTok, friendScopedTok, ""} {
 		rec := sendReq(http.MethodGet, weiboTarget, "198.51.100.32", tok)
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "https://f.video.weibocdn.com/direct-hd.mp4") || strings.Contains(rec.Body.String(), "/api/media/weibo?ticket=") || strings.Contains(rec.Body.String(), `"direct_url"`) {
-			t.Fatalf("authenticated Weibo response did not return direct URL: code=%d body=%s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "https://f.video.weibocdn.com/direct-hd.mp4") || strings.Contains(rec.Body.String(), "/api/media/weibo") || strings.Contains(rec.Body.String(), `"direct_url"`) {
+			t.Fatalf("Weibo response did not return direct URL: code=%d body=%s", rec.Code, rec.Body.String())
 		}
-	}
-	recAnonWeibo := sendReq(http.MethodGet, weiboTarget, "198.51.100.33", "")
-	if recAnonWeibo.Code != http.StatusOK {
-		t.Fatalf("anonymous Weibo response status=%d body=%s", recAnonWeibo.Code, recAnonWeibo.Body.String())
-	}
-	anonWeiboPayload, err := unified.Decode(recAnonWeibo.Body.Bytes())
-	if err != nil {
-		t.Fatalf("anonymous Weibo invalid JSON: %v", err)
-	}
-	anonWeiboItem := unified.Map(unified.Slice(unified.Map(anonWeiboPayload["data"])["items"])[0])
-	anonWeiboDef := unified.Map(anonWeiboItem["default"])
-	if anonWeiboDef["access"] != "relay" || !strings.HasPrefix(unified.Str(anonWeiboDef["url"]), "/api/media/weibo?ticket=") {
-		t.Fatalf("anonymous Weibo default did not use signed relay: %v", anonWeiboDef)
-	}
-	anonWeiboVariant := unified.Map(unified.Slice(anonWeiboItem["variants"])[0])
-	anonWeiboSrc := unified.Map(unified.Slice(unified.Map(anonWeiboVariant["delivery"])["sources"])[0])
-	if anonWeiboSrc["access"] != "relay" || !strings.HasPrefix(unified.Str(anonWeiboSrc["url"]), "/api/media/weibo?ticket=") || anonWeiboSrc["direct_url"] != "https://f.video.weibocdn.com/direct-hd.mp4?size=1080" {
-		t.Fatalf("anonymous Weibo source did not pair signed relay with direct_url: %v", anonWeiboSrc)
+		wbPayload, err := unified.Decode(rec.Body.Bytes())
+		if err != nil {
+			t.Fatalf("Weibo invalid JSON: %v", err)
+		}
+		wbItem := unified.Map(unified.Slice(unified.Map(wbPayload["data"])["items"])[0])
+		wbDef := unified.Map(wbItem["default"])
+		if wbDef["access"] == "relay" || unified.Str(wbDef["url"]) != "https://f.video.weibocdn.com/direct-hd.mp4?size=1080" {
+			t.Fatalf("Weibo default expected direct URL: %v", wbDef)
+		}
+		wbVariant := unified.Map(unified.Slice(wbItem["variants"])[0])
+		wbSrc := unified.Map(unified.Slice(unified.Map(wbVariant["delivery"])["sources"])[0])
+		if wbSrc["browser_fetch"] != "blocked" || unified.Str(wbSrc["url"]) != "https://f.video.weibocdn.com/direct-hd.mp4?size=1080" {
+			t.Fatalf("Weibo source expected direct + browser_fetch=blocked: %v", wbSrc)
+		}
 	}
 
 	// 5. Inspect /api/stats JSON contract: exact 22 fields per api_keys entry, non-nil slice when empty, zero secrets.
@@ -513,8 +508,8 @@ func TestMultiKeyRolesDisabledPlatformScopeWeiboDirectAndStatsSchema(t *testing.
 		t.Fatalf("Admission.Owner.ConcurrencyLimit = %d, want %d", typedSnap.Admission.Owner.ConcurrencyLimit, DefaultOwnerConcurrency+4)
 	}
 	friendSnap := lookupAPIKeySnap(t, typedSnap, "friend-scoped")
-	// 6x /api/stats 401 + 3x platform-scope 401 = 9 unauthorized; 1x warm douyin cache hit + 1x uncached weibo = 2 ok!
-	if friendSnap.Unauthorized != 9 || friendSnap.OK != 2 || friendSnap.CacheHits != 1 || friendSnap.RequestsTotal != 11 {
+	// 6x /api/stats 401 + 3x platform-scope 401 = 9 unauthorized; 1x warm douyin cache hit + 1x warm weibo cache hit = 2 ok!
+	if friendSnap.Unauthorized != 9 || friendSnap.OK != 2 || friendSnap.CacheHits != 2 || friendSnap.RequestsTotal != 11 {
 		t.Fatalf("unexpected friend-scoped telemetry: %+v", friendSnap)
 	}
 	disabledSnap := lookupAPIKeySnap(t, typedSnap, "disabled-bot")

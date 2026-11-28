@@ -1,0 +1,25 @@
+{
+  "resource_response": {
+    "status": "success",
+    "data": {
+      "id": "858146903966145191",
+      "title": "Minimalist Japanese Architecture",
+      "description": "Calm wood interior photo",
+      "created_at": "Tue, 18 Oct 2022 14:20:00 +0000",
+      "images": {
+        "236x": { "url": "https://i.pinimg.com/236x/aa/bb/cc/aabbcc.jpg", "width": 236, "height": 354 },
+        "orig": { "url": "https://i.pinimg.com/originals/aa/bb/cc/aabbcc.png", "width": 1600, "height": 2400 }
+      },
+      "pinner": {
+        "id": "998877",
+        "full_name": "Studio K",
+        "username": "studiok",
+        "image_medium_url": "https://i.pinimg.com/75x75_RS/11/22/33/avatar.jpg"
+      },
+      "aggregated_pin_data": {
+        "aggregated_stats": { "saves": 420, "done": 12 },
+        "comment_count": 7
+      }
+    }
+  }
+}

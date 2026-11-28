@@ -891,3 +891,198 @@ func TestBilibiliDASHSwitchOnServerAndPullWorker(t *testing.T) {
 		})
 	}
 }
+
+func makeSixHostBilibiliPayload(expUnix int64) []byte {
+	hosts := []string{
+		"upos-sz-mirrorcos.bilivideo.com",
+		"upos-sz-mirrorhw.bilivideo.com",
+		"upos-sz-mirrorali.bilivideo.com",
+		"upos-sz-mirrorbd.bilivideo.com",
+		"upos-sz-mirror08c.bilivideo.com",
+		"upos-sz-mirror08h.bilivideo.com",
+	}
+	urls := make([]string, 0, len(hosts))
+	for i, h := range hosts {
+		urls = append(urls, fmt.Sprintf("https://%s/upgcxcode/00/01/101/101-1-64.mp4?deadline=%010d&upsig=m%d", h, expUnix, i))
+	}
+	play := bilibili.ShanghaiPlay{
+		BVID:        biliTestBVID,
+		CID:         biliTestCID,
+		DURLQuality: 64,
+		DURLPieces:  []bilibili.ShanghaiDURLPiece{{URLs: urls}},
+	}
+	raw, _ := json.Marshal(play)
+	return raw
+}
+
+func TestBilibiliValidatorConcurrentDNSCacheExpiryEvictionAndSlowHostIsolation(t *testing.T) {
+	baseTime := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	expUnix := baseTime.Add(2 * time.Hour).Unix()
+	payload := makeSixHostBilibiliPayload(expUnix)
+
+	t.Run("concurrent-dns-6-hosts", func(t *testing.T) {
+		c, err := NewClient(testEndpoint, wireToken, fetch.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.WithClock(func() time.Time { return baseTime })
+		var calls atomic.Int32
+		c.WithLookupNetIP(func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			calls.Add(1)
+			select {
+			case <-time.After(300 * time.Millisecond):
+				return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+
+		start := time.Now()
+		got, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("validateBilibiliResponse failed: %v", err)
+		}
+		if len(got.DURLPieces) != 1 || len(got.DURLPieces[0].URLs) != 6 {
+			t.Fatalf("expected 6 validated URLs, got %+v", got)
+		}
+		if calls.Load() != 6 {
+			t.Fatalf("expected 6 DNS lookups, got %d", calls.Load())
+		}
+		if elapsed >= 900*time.Millisecond {
+			t.Fatalf("concurrent 6-host DNS validation took %v, want < 900ms (serial would be ~1800ms)", elapsed)
+		}
+	})
+
+	t.Run("cache-hit-expiry-private-eviction-and-setLookup-clear", func(t *testing.T) {
+		nowVal := atomic.Int64{}
+		nowVal.Store(baseTime.UnixNano())
+
+		c, err := NewClient(testEndpoint, wireToken, fetch.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.WithClock(func() time.Time { return time.Unix(0, nowVal.Load()).UTC() })
+
+		var calls atomic.Int32
+		var poisonHost atomic.Bool
+		c.WithLookupNetIP(func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			calls.Add(1)
+			if poisonHost.Load() && host == "upos-sz-mirror08h.bilivideo.com" {
+				return []netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil
+			}
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		})
+
+		// 1st call populates cache (6 lookups).
+		if got, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload); err != nil || len(got.DURLPieces[0].URLs) != 6 {
+			t.Fatalf("1st validate failed: got=%+v err=%v", got, err)
+		}
+		if calls.Load() != 6 {
+			t.Fatalf("after 1st validate: calls=%d want 6", calls.Load())
+		}
+
+		// 2nd call within TTL hits cache (0 lookups).
+		calls.Store(0)
+		if got, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload); err != nil || len(got.DURLPieces[0].URLs) != 6 {
+			t.Fatalf("2nd validate failed: got=%+v err=%v", got, err)
+		}
+		if calls.Load() != 0 {
+			t.Fatalf("2nd validate within TTL made %d lookups, want 0", calls.Load())
+		}
+
+		// Advance clock past TTL (60s) and poison 1 host with a private IP -> re-resolves all 6, drops poisoned host, never caches it.
+		nowVal.Store(baseTime.Add(defaultValidatorDNSCacheTTL + time.Second).UnixNano())
+		poisonHost.Store(true)
+		calls.Store(0)
+		got, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload)
+		if err != nil || len(got.DURLPieces[0].URLs) != 5 {
+			t.Fatalf("post-expiry validate with 1 private host: got=%+v err=%v", got, err)
+		}
+		if calls.Load() != 6 {
+			t.Fatalf("post-expiry validate calls=%d, want 6", calls.Load())
+		}
+
+		// Re-run immediately: the 5 public hosts hit cache, only the uncached private host triggers lookup (1 call).
+		calls.Store(0)
+		got2, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload)
+		if err != nil || len(got2.DURLPieces[0].URLs) != 5 {
+			t.Fatalf("re-run with private host: got=%+v err=%v", got2, err)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("expected only 1 lookup for uncached private host, got %d", calls.Load())
+		}
+
+		// WithLookupNetIP must clear cache immediately.
+		var newCalls atomic.Int32
+		c.WithLookupNetIP(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+			newCalls.Add(1)
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		})
+		if got3, err := c.validateBilibiliResponse(t.Context(), biliTestBVID, biliTestCID, payload); err != nil || len(got3.DURLPieces[0].URLs) != 6 {
+			t.Fatalf("post-WithLookupNetIP validate failed: got=%+v err=%v", got3, err)
+		}
+		if newCalls.Load() != 6 {
+			t.Fatalf("WithLookupNetIP did not clear DNS cache: newCalls=%d, want 6", newCalls.Load())
+		}
+	})
+
+	t.Run("single-slow-host-isolated-and-parent-cancel-propagates", func(t *testing.T) {
+		c, err := NewClient(testEndpoint, wireToken, fetch.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.WithClock(func() time.Time { return baseTime })
+		c.WithLookupNetIP(func(ctx context.Context, _, host string) ([]netip.Addr, error) {
+			delay := 50 * time.Millisecond
+			if host == "upos-sz-mirror08h.bilivideo.com" {
+				delay = 2 * time.Second
+			}
+			select {
+			case <-time.After(delay):
+				return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+
+		parentCtx, cancel := context.WithTimeout(t.Context(), BilibiliTimeout)
+		defer cancel()
+		got, err := c.validateBilibiliResponse(parentCtx, biliTestBVID, biliTestCID, payload)
+		if err != nil {
+			t.Fatalf("expected 5 fast hosts to survive 1 slow host, got err=%v", err)
+		}
+		if len(got.DURLPieces) != 1 || len(got.DURLPieces[0].URLs) != 5 {
+			t.Fatalf("expected 5 kept mirrors after slow-host isolation, got %+v", got.DURLPieces)
+		}
+		for _, u := range got.DURLPieces[0].URLs {
+			if strings.Contains(u, "upos-sz-mirror08h.bilivideo.com") {
+				t.Fatalf("slow host should have been filtered out: %s", u)
+			}
+		}
+
+		// Parent cancellation must propagate immediately as context.Canceled with zero goroutine leaks.
+		c2, err := NewClient(testEndpoint, wireToken, fetch.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2.WithClock(func() time.Time { return baseTime })
+		c2.WithLookupNetIP(func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		cancelCtx, cancelParent := context.WithCancel(t.Context())
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			cancelParent()
+		}()
+		start := time.Now()
+		_, err = c2.validateBilibiliResponse(cancelCtx, biliTestBVID, biliTestCID, payload)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+		if time.Since(start) >= 500*time.Millisecond {
+			t.Fatalf("parent cancellation took %v, want < 500ms", time.Since(start))
+		}
+	})
+}

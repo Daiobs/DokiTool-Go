@@ -1,0 +1,40 @@
+{
+  "resource_response": {
+    "status": "success",
+    "data": {
+      "id": "900000000000000102",
+      "title": "Vertical 1080x1920 MP4 under V_720P key",
+      "created_at": "Wed, 01 Nov 2023 09:00:00 +0000",
+      "images": {
+        "orig": { "url": "https://i.pinimg.com/originals/11/22/33/poster.jpg", "width": 1080, "height": 1920 }
+      },
+      "videos": {
+        "video_list": {
+          "V_720P": {
+            "url": "https://v1.pinimg.com/videos/mc/720p/aa/bb/cc/highres.mp4",
+            "width": 1080,
+            "height": 1920,
+            "duration": 57700
+          },
+          "V_EXP3": {
+            "url": "https://v1.pinimg.com/videos/mc/expMp4/aa/bb/cc/lowres.mp4",
+            "width": 540,
+            "height": 960,
+            "duration": 57700
+          },
+          "V_HLSV4": {
+            "url": "https://v1.pinimg.com/videos/iht/hls/aa/bb/cc/stream.m3u8",
+            "width": 1080,
+            "height": 1920,
+            "duration": 57700
+          }
+        }
+      },
+      "native_creator": {
+        "id": "554433",
+        "full_name": "Creator V",
+        "username": "creatorv"
+      }
+    }
+  }
+}

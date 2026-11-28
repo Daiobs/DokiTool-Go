@@ -601,7 +601,7 @@ func TestPreparePublicMediaMultiRoutePlatforms(t *testing.T) {
 		"kuaishou":    ksAdapter,
 		"pipixia":     ppxAdapter,
 		"zuiyou":      zyAdapter,
-	}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia(strings.Repeat("x", 64)))
+	}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,15 +727,6 @@ func TestOwnerChannelStartupValidationAndNoSecretLeak(t *testing.T) {
 			forbidSub: canaryShared[:12],
 		},
 		{
-			name: "shared-with-media-signing-key",
-			env: map[string]string{
-				"DOKITOOL_OWNER_TOKEN":   canaryShared,
-				"SNAP_MEDIA_SIGNING_KEY": canaryShared,
-			},
-			wantSub:   "DOKITOOL_OWNER_TOKEN requires a dedicated credential",
-			forbidSub: canaryShared[:12],
-		},
-		{
 			name: "shared-with-shanghai-pull-token",
 			env: map[string]string{
 				"DOKITOOL_OWNER_TOKEN":         canaryShared,
@@ -814,13 +805,12 @@ func TestOwnerChannelStartupValidationAndNoSecretLeak(t *testing.T) {
 	}
 }
 
-func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
+func TestPreparePublicMediaWeiboUnifiedDirectBlocked(t *testing.T) {
 	const now int64 = 1730000000
 	const srcURL = "https://weibo.com/1234567890/AbC"
 	const cdnURL = "https://f.video.weibocdn.com/full.mp4?size=1080"
 	const body = `{"idstr":"1234567890","text_raw":"t","page_info":{"media_info":{"mp4_hd_url":"https://f.video.weibocdn.com/full.mp4?size=1080","video_title":"v","duration":16}},"user":{"screen_name":"u","idstr":"1"}}`
 
-	mediaKey := randomHexToken(t, 32)
 	ownerToken := randomHexToken(t, 24)
 	registry, err := catalog.Load()
 	if err != nil {
@@ -829,7 +819,7 @@ func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
 	wb := weiboplatform.New(fakeExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
 		return fetch.Response{StatusCode: http.StatusOK, URL: req.URL, Body: []byte(body)}, nil
 	}))
-	h, err := api.New(registry, map[string]api.Adapter{"weibo": wb}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia(mediaKey))
+	h, err := api.New(registry, map[string]api.Adapter{"weibo": wb}, func() time.Time { return time.Unix(now, 0) }, preparePublicMedia())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -843,34 +833,60 @@ func TestPreparePublicMediaWeiboOwnerDirectVsAnonymousRelay(t *testing.T) {
 	}
 
 	q := url.Values{"schema_version": {"1.0"}, "url": {srcURL}}
-	ownerReq := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
-	ownerReq.RemoteAddr = "127.0.0.1:40001"
-	ownerReq.Header.Set("Authorization", "Bearer "+ownerToken)
-	wOwner := httptest.NewRecorder()
-	entry.ServeHTTP(wOwner, ownerReq)
-	if wOwner.Code != http.StatusOK || !strings.Contains(wOwner.Body.String(), cdnURL) || strings.Contains(wOwner.Body.String(), "/api/media/weibo?ticket=") || strings.Contains(wOwner.Body.String(), `"direct_url"`) {
-		t.Fatalf("owner Weibo response did not return direct CDN URL without relay/direct_url: code=%d body=%s", wOwner.Code, wOwner.Body.String())
+	for _, tc := range []struct {
+		name  string
+		token string
+		addr  string
+	}{
+		{"owner", ownerToken, "127.0.0.1:40001"},
+		{"anonymous", "", "127.0.0.1:40002"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
+		req.RemoteAddr = tc.addr
+		if tc.token != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+		}
+		w := httptest.NewRecorder()
+		entry.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), cdnURL) || strings.Contains(w.Body.String(), "/api/media/weibo") || strings.Contains(w.Body.String(), `"direct_url"`) {
+			t.Fatalf("%s Weibo response did not return direct CDN URL without relay/direct_url: code=%d body=%s", tc.name, w.Code, w.Body.String())
+		}
+		payload, err := unified.Decode(w.Body.Bytes())
+		if err != nil {
+			t.Fatalf("%s Weibo invalid JSON: %v", tc.name, err)
+		}
+		item := unified.Map(unified.Slice(unified.Map(payload["data"])["items"])[0])
+		def := unified.Map(item["default"])
+		if def["access"] == "relay" || unified.Str(def["url"]) != cdnURL {
+			t.Fatalf("%s Weibo default expected direct %q, got %#v", tc.name, cdnURL, def)
+		}
+		src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(item["variants"])[0])["delivery"])["sources"])[0])
+		if src["browser_fetch"] != "blocked" || unified.Str(src["url"]) != cdnURL {
+			t.Fatalf("%s Weibo source expected direct + browser_fetch=blocked, got %#v", tc.name, src)
+		}
 	}
 
-	anonReq := httptest.NewRequest(http.MethodGet, "/api/parse?"+q.Encode(), nil)
-	anonReq.RemoteAddr = "127.0.0.1:40002"
-	wAnon := httptest.NewRecorder()
-	entry.ServeHTTP(wAnon, anonReq)
-	if wAnon.Code != http.StatusOK {
-		t.Fatalf("anonymous Weibo response status=%d body=%s", wAnon.Code, wAnon.Body.String())
+	// Verify /api/media/weibo returns 404 (removed in Phase 3).
+	wRelay := httptest.NewRecorder()
+	relayReq := httptest.NewRequest(http.MethodGet, "/api/media/weibo?ticket=legacy", nil)
+	relayReq.RemoteAddr = "127.0.0.1:40003"
+	entry.ServeHTTP(wRelay, relayReq)
+	if wRelay.Code != http.StatusNotFound {
+		t.Fatalf("removed /api/media/weibo status=%d, want 404 (body=%s)", wRelay.Code, wRelay.Body.String())
 	}
-	anonPayload, err := unified.Decode(wAnon.Body.Bytes())
-	if err != nil {
-		t.Fatalf("anonymous Weibo invalid JSON: %v", err)
+
+	// Verify newTikTokExecutor validates transport mode and DOKITOOL_TIKTOK_PROXY_URL.
+	if _, configured, err := newTikTokExecutor("standard", ""); err != nil || configured {
+		t.Fatalf("standard direct tiktok executor failed: configured=%v err=%v", configured, err)
 	}
-	anonItem := unified.Map(unified.Slice(unified.Map(anonPayload["data"])["items"])[0])
-	anonDef := unified.Map(anonItem["default"])
-	if anonDef["access"] != "relay" || !strings.HasPrefix(unified.Str(anonDef["url"]), "/api/media/weibo?ticket=") || anonDef["direct_url"] != nil {
-		t.Fatalf("anonymous Weibo default did not stay on signed relay: %v", anonDef)
+	if _, configured, err := newTikTokExecutor("chrome131", "http://user:pass@gw.proxy.example:8080"); err != nil || !configured {
+		t.Fatalf("chrome131 proxy tiktok executor failed: configured=%v err=%v", configured, err)
 	}
-	anonSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(anonItem["variants"])[0])["delivery"])["sources"])[0])
-	if anonSrc["access"] != "relay" || !strings.HasPrefix(unified.Str(anonSrc["url"]), "/api/media/weibo?ticket=") || anonSrc["direct_url"] != cdnURL {
-		t.Fatalf("anonymous Weibo source did not pair signed relay with direct_url: %v", anonSrc)
+	if _, _, err := newTikTokExecutor("invalid", ""); err == nil {
+		t.Fatal("invalid tiktok-page-transport should fail")
+	}
+	if _, _, err := newTikTokExecutor("standard", "ftp://bad-proxy.example:21"); err == nil {
+		t.Fatal("invalid DOKITOOL_TIKTOK_PROXY_URL should fail")
 	}
 }
 
@@ -1195,7 +1211,7 @@ func TestShanghaiBilibiliSwitchEndToEndPullAndDouyinIsolation(t *testing.T) {
 			h, err := api.NewWithCacheConfig(c, map[string]api.Adapter{
 				"douyin":   douyinParser,
 				"bilibili": bilibiliParser,
-			}, func() time.Time { return nowTime }, preparePublicMedia(mediaKey), api.DefaultCacheConfig())
+			}, func() time.Time { return nowTime }, preparePublicMedia(), api.DefaultCacheConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1496,11 +1512,6 @@ func TestServeAPIKeysFileStartupValidationAndSIGHUPHotReload(t *testing.T) {
 			name: "collides-with-ingress-key",
 			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
 			env:  map[string]string{"SNAP_INGRESS_KEY": canaryShared},
-		},
-		{
-			name: "collides-with-media-signing-key",
-			file: fmt.Sprintf(`{"keys":[{"id":"agent-a","role":"agent","token_sha256":%q}]}`, sharedDigest),
-			env:  map[string]string{"SNAP_MEDIA_SIGNING_KEY": canaryShared},
 		},
 		{
 			name: "collides-with-shanghai-token",

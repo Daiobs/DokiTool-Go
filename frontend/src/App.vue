@@ -274,6 +274,7 @@ const ensureMediaDownload = () => {
         videoStore,
         showToast,
         selection,
+        onRequireExtension: openExtensionModal,
         resolveItem,
       });
       return downloadCtrl;

@@ -50,9 +50,9 @@ const (
 	chOwnerIdx = 1
 	numCh      = 2
 
-	numCorePlatforms   = 14
-	platformUnknownIdx = 14
-	numPlatforms       = 15
+	numCorePlatforms   = 16
+	platformUnknownIdx = 16
+	numPlatforms       = 17
 
 	outcomeOKIdx          = 0
 	outcomeInternalErrIdx = 11
@@ -71,6 +71,8 @@ var knownPlatforms = [numPlatforms]string{
 	"pipigx",
 	"zuiyou",
 	"xiaohongshu",
+	"pinterest",
+	"tiktok",
 	"x",
 	"youtube",
 	"instagram",
@@ -95,7 +97,7 @@ var knownOutcomeCodes = [numOutcomeCodes]string{
 	OutcomeUnauthorized,
 }
 
-// KnownPlatforms returns a copy of the closed 15-element platform vocabulary (14 platforms + "unknown").
+// KnownPlatforms returns a copy of the closed 16-element platform vocabulary (15 platforms + "unknown").
 func KnownPlatforms() []string {
 	out := make([]string, len(knownPlatforms))
 	copy(out, knownPlatforms[:])
@@ -129,16 +131,20 @@ func corePlatformIndex(raw string) int {
 		return 7
 	case "xiaohongshu":
 		return 8
-	case "x":
+	case "pinterest":
 		return 9
-	case "youtube":
+	case "tiktok":
 		return 10
-	case "instagram":
+	case "x":
 		return 11
-	case "facebook":
+	case "youtube":
 		return 12
-	case "tumblr":
+	case "instagram":
 		return 13
+	case "facebook":
+		return 14
+	case "tumblr":
+		return 15
 	default:
 		return -1
 	}
@@ -307,6 +313,7 @@ type Stats struct {
 	ytdlpSocialSrc         YTDLPStatsSource
 	ytdlpGenericCompSrc    YTDLPStatsSource
 	ytHelperSrc            YouTubeHelperStatsSource
+	tiktokRiskSrc          TikTokRiskStatsSource
 	shSrc                  shresolver.StatsProvider
 	shSrcGen               uint64
 	lastSyncedShanghaiHits uint64
@@ -464,6 +471,17 @@ func (s *Stats) SetYouTubeHelperSource(src YouTubeHelperStatsSource) {
 	}
 	s.mu.Lock()
 	s.ytHelperSrc = src
+	s.mu.Unlock()
+}
+
+// SetTikTokRiskSource binds the TikTok risk stats source so GET /api/stats and
+// periodic summary logs expose redacted WAF/302 counters and transport state.
+func (s *Stats) SetTikTokRiskSource(src TikTokRiskStatsSource) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.tiktokRiskSrc = src
 	s.mu.Unlock()
 }
 

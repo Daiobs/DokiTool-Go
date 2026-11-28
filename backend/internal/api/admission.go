@@ -27,7 +27,6 @@ const (
 	catalogRoute
 	legacy
 	telemetry
-	media
 	youtubeHelper
 	statsRoute
 	routeCount
@@ -48,8 +47,6 @@ func classify(path string) route {
 		return legacy
 	case tbvideoOutcomePath:
 		return telemetry
-	case "/api/media/weibo":
-		return media
 	default:
 		return unknown
 	}
@@ -369,7 +366,7 @@ func (a *admission) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r = r.WithContext(withAuthenticatedKey(r.Context(), key, true))
-		if kind != media && kind != telemetry {
+		if kind != telemetry {
 			a.serveAuthenticated(w, r, key, kind, path, wallStart)
 			return
 		}
@@ -546,8 +543,6 @@ func (a *admission) selectUncachedParsePool(path, rawQuery string) (*pool, strin
 
 func (a *admission) selectPool(r *http.Request, kind route, path string) (*pool, string) {
 	switch kind {
-	case media:
-		return a.relay, ""
 	case telemetry:
 		return a.reports, ""
 	case catalogRoute:
@@ -1162,9 +1157,6 @@ func rejectUnauthorizedWithMessage(w http.ResponseWriter, r *http.Request, kind 
 
 func rejectAdmission(w http.ResponseWriter, r *http.Request, kind route, status, retry int) {
 	label := "解析"
-	if kind == media {
-		label = "媒体"
-	}
 	code, message := "RATE_LIMITED", label+"请求过于频繁，请稍后重试"
 	if status == http.StatusServiceUnavailable {
 		code, message = "SERVICE_NOT_CONFIGURED", label+"服务暂时不可用，请稍后重试"

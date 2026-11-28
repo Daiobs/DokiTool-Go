@@ -510,6 +510,8 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
     ['instagram','Instagram','Instagram','fa-instagram'],
     ['facebook','Facebook','Facebook','fa-facebook'],
     ['tumblr','Tumblr','Tumblr','fa-tumblr'],
+    ['pinterest','Pinterest','Pinterest','fa-pinterest'],
+    ['tiktok','TikTok','TikTok','fa-tiktok'],
   ];
   for(const [id,zhLabel,enLabel,expectedIcon] of core14) {
     const zh=platforms.resolvePlatformPresentation(id,'zh-CN');
@@ -520,7 +522,6 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
   }
 
   const longTail=[
-    ['tiktok','TikTok','fa-film'],
     ['vimeo','Vimeo','fa-film'],
     ['reddit','Reddit','fa-film'],
     ['twitch','Twitch','fa-film'],
@@ -529,7 +530,6 @@ test('PR-C: resolvePlatformPresentation resolves all 14 core built-in icons and 
     ['soundcloud','SoundCloud','fa-headphones'],
     ['bandcamp','Bandcamp','fa-headphones'],
     ['niconico','Niconico','fa-film'],
-    ['pinterest','Pinterest','fa-film'],
     ['dailymotion','Dailymotion','fa-film'],
     ['vk','VK','fa-film'],
     ['streamable','Streamable','fa-film'],

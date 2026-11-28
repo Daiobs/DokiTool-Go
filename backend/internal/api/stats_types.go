@@ -249,6 +249,7 @@ type StatsSnapshot struct {
 	YTDLPGeneric          YTDLPSlotStatsSnapshot           `json:"ytdlp_generic"`
 	YTDLPPools            YTDLPPoolsSnapshot               `json:"ytdlp_pools"`
 	YouTubeHelper         YouTubeHelperStatsSnapshot       `json:"youtube_helper"`
+	TikTok                TikTokRiskStatsSnapshot          `json:"tiktok"`
 	CircuitBreakers       []CircuitBreakerPlatformSnapshot `json:"circuit_breakers"`
 	GenericCircuitBreaker CircuitBreakerPlatformSnapshot   `json:"generic_circuit_breaker"`
 	RuntimePolicy         RuntimePolicySummary             `json:"runtime_policy"`

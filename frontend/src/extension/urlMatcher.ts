@@ -20,6 +20,8 @@ export const SUPPORTED_PLATFORM_IDS = [
   "pipixia",
   "pipigx",
   "zuiyou",
+  "pinterest",
+  "tiktok",
   "x",
   "youtube",
   "instagram",
@@ -82,6 +84,28 @@ export const PLATFORM_DOMAIN_SPECS: readonly PlatformDomainSpec[] = [
     label: "最右",
     domains: ["izuiyou.com"],
     exactDomains: ["share.xiaochuankeji.cn"],
+  },
+  {
+    id: "pinterest",
+    label: "Pinterest",
+    domains: [
+      "pinterest.com",
+      "pin.it",
+      "pinterest.co.uk",
+      "pinterest.ca",
+      "pinterest.jp",
+      "pinterest.de",
+      "pinterest.fr",
+      "pinterest.es",
+      "pinterest.it",
+      "pinterest.com.au",
+      "pinterest.com.mx",
+    ],
+  },
+  {
+    id: "tiktok",
+    label: "TikTok",
+    domains: ["tiktok.com"],
   },
   {
     id: "x",
@@ -829,6 +853,75 @@ function analyzePlatformDetails(
       ) {
         return {
           dedupeKey: `facebook:post:${storyFbid}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      return {
+        dedupeKey: fallbackDedupeKey(platform, url),
+        isLikelyFeedOrHome: true,
+      };
+    }
+
+    case "pinterest": {
+      if (host === "pin.it" || host.endsWith(".pin.it")) {
+        if (segments.length >= 1 && /^[A-Za-z0-9_-]{3,32}$/.test(segments[0])) {
+          return {
+            dedupeKey: `pinterest:short:${segments[0]}`,
+            isLikelyFeedOrHome: false,
+          };
+        }
+        return {
+          dedupeKey: fallbackDedupeKey(platform, url),
+          isLikelyFeedOrHome: true,
+        };
+      }
+      const pinMatch = /^\/pin\/(?:[^/?#]*--)?(\d{5,25})(?:\/|$)/.exec(
+        url.pathname,
+      );
+      if (pinMatch) {
+        return {
+          dedupeKey: `pinterest:pin:${pinMatch[1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      return {
+        dedupeKey: fallbackDedupeKey(platform, url),
+        isLikelyFeedOrHome: true,
+      };
+    }
+
+    case "tiktok": {
+      if (host === "vm.tiktok.com" || host === "vt.tiktok.com") {
+        if (segments.length === 1 && /^[A-Za-z0-9_-]{4,64}$/.test(segments[0])) {
+          return {
+            dedupeKey: `tiktok:short:${host.slice(0, 2)}:${segments[0]}`,
+            isLikelyFeedOrHome: false,
+          };
+        }
+        return {
+          dedupeKey: fallbackDedupeKey(platform, url),
+          isLikelyFeedOrHome: true,
+        };
+      }
+      if (
+        segments.length === 2 &&
+        segments[0].toLowerCase() === "t" &&
+        /^[A-Za-z0-9_-]{4,64}$/.test(segments[1])
+      ) {
+        return {
+          dedupeKey: `tiktok:short:t:${segments[1]}`,
+          isLikelyFeedOrHome: false,
+        };
+      }
+      const cleanPath = url.pathname.replace(/\/+$/, "");
+      const itemMatch =
+        /^\/@[^/?#]+\/(?:video|photo)\/(\d{5,25})$/.exec(cleanPath) ||
+        /^\/share\/(?:video|photo)\/(\d{5,25})$/.exec(cleanPath) ||
+        /^\/(?:embed\/v2|player\/v1)\/(\d{5,25})$/.exec(cleanPath) ||
+        /^\/v\/(\d{5,25})(?:\.html)?$/.exec(cleanPath);
+      if (itemMatch) {
+        return {
+          dedupeKey: `tiktok:item:${itemMatch[1]}`,
           isLikelyFeedOrHome: false,
         };
       }

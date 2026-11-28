@@ -116,6 +116,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 				ByPlatformCodeChannel: make([]PlatformOutcomeCount, 0),
 			},
 			APIKeys:               make([]APIKeyStatsSnapshot, 0),
+			TikTok:                TikTokRiskStatsSnapshot{TransportMode: "standard"},
 			CircuitBreakers:       (*circuitBreakerManager)(nil).Snapshot(nowRaw),
 			GenericCircuitBreaker: (*circuitBreakerManager)(nil).GenericSnapshot(nowRaw),
 			RuntimePolicy:         defaultRuntimePolicySummary(),
@@ -187,6 +188,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	ytdlpSocialSrc := s.ytdlpSocialSrc
 	ytdlpGenericCompSrc := s.ytdlpGenericCompSrc
 	ytHelperSrc := s.ytHelperSrc
+	tiktokRiskSrc := s.tiktokRiskSrc
 	shSrc := s.shSrc
 	shGen := s.shSrcGen
 	s.mu.RUnlock()
@@ -217,6 +219,11 @@ func (s *Stats) Snapshot() StatsSnapshot {
 	var ytHelperSnap YouTubeHelperStatsSnapshot
 	if ytHelperSrc != nil {
 		ytHelperSnap = toAPIYouTubeHelperStats(ytHelperSrc.HelperStatsSnapshot())
+	}
+
+	tiktokSnap := TikTokRiskStatsSnapshot{TransportMode: "standard"}
+	if tiktokRiskSrc != nil {
+		tiktokSnap = toAPITikTokRiskStats(tiktokRiskSrc.TikTokRiskStatsSnapshot())
 	}
 
 	cbSnaps := cbSrc.Snapshot(nowRaw)
@@ -353,6 +360,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		YTDLPGeneric:          toAPIYTDLPSlotStats(ytdlpGenericSnap),
 		YTDLPPools:            ytdlpPools,
 		YouTubeHelper:         ytHelperSnap,
+		TikTok:                tiktokSnap,
 		CircuitBreakers:       cbSnaps,
 		GenericCircuitBreaker: genericCBSnap,
 		RuntimePolicy:         runtimePolicy,

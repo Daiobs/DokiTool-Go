@@ -7,7 +7,7 @@
 <p align="center">
   <a href="#-5-分钟快速上手"><img src="https://img.shields.io/badge/Quick_Start-5_min-4f46e5?style=for-the-badge" alt="Quick Start" /></a>
   <a href="https://snap.dokitool.com"><img src="https://img.shields.io/badge/Live_Demo-snap.dokitool.com-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Live Demo" /></a>
-  <a href="docs/EXTENSION.md"><img src="https://img.shields.io/badge/Chrome_MV3-v4.5.2-10b981?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Chrome MV3 v4.5.2" /></a>
+  <a href="docs/EXTENSION.md"><img src="https://img.shields.io/badge/Chrome_MV3-v4.6.0-10b981?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Chrome MV3 v4.6.0" /></a>
   <a href="tools/dokitool-agent/README.md"><img src="https://img.shields.io/badge/Agent_CLI_%26_MCP-Stdlib_Only-8b5cf6?style=for-the-badge&logo=python&logoColor=white" alt="Agent CLI and MCP" /></a>
   <a href="docs/openapi.json"><img src="https://img.shields.io/badge/OpenAPI-3.1.0-0284c7?style=for-the-badge&logo=openapiinitiative&logoColor=white" alt="OpenAPI 3.1.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-64748b?style=for-the-badge" alt="MIT License" /></a>
@@ -16,7 +16,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Go-1.27.4-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.27.4" />
   <img src="https://img.shields.io/badge/Vue-3_%2B_Vite-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white" alt="Vue 3 + Vite" />
-  <img src="https://img.shields.io/badge/Platforms-14_Core_%2B_1000%2B_Long--Tail-ec4899?style=flat-square" alt="Platforms" />
+  <img src="https://img.shields.io/badge/Platforms-16_Core_%2B_1000%2B_Long--Tail-ec4899?style=flat-square" alt="Platforms" />
   <img src="https://img.shields.io/badge/Privacy-Zero--Cookie-16a34a?style=flat-square" alt="Zero-Cookie" />
   <img src="https://img.shields.io/badge/Supply_Chain-SLSA_v1_%2B_SHA--256-f59e0b?style=flat-square" alt="SLSA v1" />
   <img src="https://img.shields.io/badge/Tests-L1--L4_Regression-6366f1?style=flat-square" alt="L1-L4 Tests" />
@@ -26,7 +26,7 @@
 > **🌐 纯 Web 零安装**：访问 [**snap.dokitool.com**](https://snap.dokitool.com)，粘贴分享链接即可解析并由浏览器无 Cookie 直连上游 CDN 流式保存（基于统一媒体契约 `schema_version=1.0`）。
 
 > [!IMPORTANT]
-> **🧩 [Chrome MV3 侧边栏原生扩展 `v4.5.2`](docs/EXTENSION.md)**：免油猴直接支持 **YouTube 4K60** 与 **B 站免登录 1080P DASH** 本地 `Mediabunny` 无损合流、纯客户端 VTT/SRT 双语字幕导出、后台多 P 流式队列、运行态 `/helper/extension-version.json` 自动同步检测与宿主级可选回环授权 + 应用层单端口精确源站隔离。
+> **🧩 [Chrome MV3 侧边栏原生扩展 `v4.6.0`](docs/EXTENSION.md)**：免油猴直接支持 **YouTube 4K60** 与 **B 站免登录 1080P DASH** 本地 `Mediabunny` 无损合流、TikTok / 微博防盗链视频零中转直下、纯客户端 VTT/SRT 双语字幕导出、后台多 P 流式队列、运行态 `/helper/extension-version.json` 自动同步检测与宿主级可选回环授权 + 应用层单端口精确源站隔离。
 
 > [!NOTE]
 > **🤖 [零依赖 Agent CLI & Stdio MCP Server](tools/dokitool-agent/README.md)**：仅需 Python 3.9+ 标准库（零 `pip`），自带 [`SKILL.md`](tools/dokitool-agent/SKILL.md)，默认 **100% 只读** 接入 Claude Code / Cursor / Codex，内置公网 IP pinning、默认不覆盖落盘（no-clobber）与 `json3`/VTT/SRT 字幕提取。
@@ -35,8 +35,8 @@
 
 ## ✨ 核心亮点
 
-- **🌐 14 个核心平台 + 1000+ Tier-2 长尾站点**：主目录覆盖抖音、快手、B 站、小红书、今日头条、微博、皮皮虾、皮皮搞笑、最右、X、YouTube、Instagram、Facebook、Tumblr；可选开启 `DOKITOOL_YTDLP_GENERIC_ENABLED` 后，未命中核心目录的合法公网链接自动走受控具名提取器隔离池（严禁盲抓 `generic`）。
-- **🎬 免油猴 4K60 & B 站 1080P 无损合流**：Chrome MV3 扩展 `v4.5.2` 采用 `sidePanel` + `background` + `offscreen` OPFS 架构，本地并发拉流并用 `Mediabunny 1.65.2` 无重编码封装完整 `.mp4`，关闭侧边栏不断流，无需安装 Tampermonkey。
+- **🌐 16 个核心平台 + 1000+ Tier-2 长尾站点**：主目录覆盖抖音、快手、B 站、小红书、今日头条、微博、皮皮虾、皮皮搞笑、最右、Pinterest、TikTok、X、YouTube、Instagram、Facebook、Tumblr；可选开启 `DOKITOOL_YTDLP_GENERIC_ENABLED` 后，未命中核心目录的合法公网链接自动走受控具名提取器隔离池（严禁盲抓 `generic`）。
+- **🎬 免油猴 4K60 & B 站 1080P 无损合流**：Chrome MV3 扩展 `v4.6.0` 采用 `sidePanel` + `background` + `offscreen` OPFS 架构，本地并发拉流并用 `Mediabunny 1.65.2` 无重编码封装完整 `.mp4`，关闭侧边栏不断流，无需安装 Tampermonkey。
 - **💬 纯客户端 VTT / SRT / 双语字幕导出**：侧边栏支持单轨 VTT/SRT 转换与双语主副字幕时间轴合并，Agent CLI/MCP 支持多语种轨道筛选导出与 VTT/SRT/`json3` 转换，零服务端字幕代理。
 - **🚀 日本主解析 + 上海国内线路补充**：主后端与上海 `shanghai-resolver` 节点通过出站 `pull` 长轮询（`v2` 协议）协同补充抖音国内 `*.douyinvod.com` 4K 原画及可选 B 站国内线路，前端自动对多条线路并发 Range 测速择优。
 - **📊 `/monitor` 只读运维大盘 + `SIGHUP` 热配置**：原生 SVG + CSS 宽屏监控大盘覆盖 9 大只读观测区块，令牌仅驻留页面内存或单标签页 `sessionStorage`；支持 `SIGHUP` 原地无损热重载多 Key 注册表与分舱/熔断策略。
@@ -46,10 +46,10 @@
 
 ## 🎯 三端能力矩阵
 
-| 能力维度 | 🌐 纯 Web SPA（零安装） | 🧩 Chrome MV3 扩展（`v4.5.2`） | 🤖 Agent CLI & Stdio MCP |
+| 能力维度 | 🌐 纯 Web SPA（零安装） | 🧩 Chrome MV3 扩展（`v4.6.0`） | 🤖 Agent CLI & Stdio MCP |
 | --- | --- | --- | --- |
 | **安装与依赖** | 打开网页即用 | 解压加载 `dokitool-chrome-extension.zip`（Chrome/Edge 116+） | Python 3.9+ 标准库（零第三方 `pip` 依赖） |
-| **14 核心平台 + 长尾站点** | 支持（14 核心 + 服务端开启时支持长尾） | 支持（标签页自动跟随严格限 14 核心，主动输入/右键支持长尾） | 支持（受 Key `platforms` 白名单与预算控制） |
+| **16 核心平台 + 长尾站点** | 支持（16 核心 + 服务端开启时支持长尾） | 支持（标签页自动跟随严格限 16 核心，主动输入/右键支持长尾） | 支持（受 Key `platforms` 白名单与预算控制） |
 | **YouTube HD / 4K60** | 引导安装 Chrome MV3 官方扩展（纯 Web 不内置油猴） | **内置免油猴**（`TVHTML5` + Deno 沙箱解算 + OPFS `Mediabunny` 合流） | 默认跳过（YouTube 流通常绑定出口 IP，优先走扩展） |
 | **B 站 1080P DASH** | 渐进式 MP4 预览与下载 | **免登录 1080P（AVC/HEVC/AV1）+ 30280 AAC 无损合流 & 独立 M4A** | 支持渐进式直链与多 P `/api/resolve` |
 | **字幕提取与双语导出** | 展示字幕附件直链 | **纯客户端 VTT / SRT / 双语合并落盘**（5 MiB 单轨上限） | **CLI/MCP 支持多语种轨道筛选与 VTT / SRT / `json3` 转换导出**（带扇出与字节上限；双语合并为扩展专属） |
@@ -64,7 +64,7 @@
 flowchart LR
     subgraph Clients["客户端（零 Cookie 直连媒体 CDN）"]
         Web["Web SPA (Vue 3 + SW)"]
-        Ext["Chrome MV3 扩展 v4.5.2\n(sidePanel + offscreen OPFS)"]
+        Ext["Chrome MV3 扩展 v4.6.0\n(sidePanel + offscreen OPFS)"]
         Agent["Agent CLI & Stdio MCP\n(Python 3.9+ stdlib)"]
     end
 
@@ -79,7 +79,7 @@ flowchart LR
         SH["上海节点 shanghai-resolver\n(出站 pull v2 补充国内线路)"]
     end
 
-    CDN["上游平台媒体 CDN\n(直连下载 / 仅微博走 HMAC /api/media/weibo 例外)"]
+    CDN["上游平台媒体 CDN\n(全平台零服务端媒体中转直连)"]
 
     Web --> Caddy
     Ext --> Caddy
@@ -93,7 +93,7 @@ flowchart LR
     Agent -. "无 Cookie + IP Pinning 直连" .-> CDN
 ```
 
-- **浏览器/客户端直连 CDN，服务端仅解析**：Go 后端只处理输入校验、平台解析与统一契约 `schema_version=1.0` 输出；音视频与图片字节由用户端直接拉取，**微博视频（`/api/media/weibo` 30 分钟短期 HMAC 票据）是唯一的服务端流式中转例外**。
+- **浏览器/客户端直连 CDN，服务端仅解析**：Go 后端只处理输入校验、平台解析与统一契约 `schema_version=1.0` 输出；音视频与图片字节由用户端或官方扩展直接拉取，**全站 16 核心平台坚持零服务端媒体流中转**（防盗链视频通过扩展隔离 DNR 规则零 Cookie 直下）。
 - **运行态版本单源同步**：前端与扩展共享 `frontend/src/core/extensionReleaseMeta.json` 与线上 `/helper/extension-version.json`（含 `version`、`extensionId` 与 ZIP `sha256`），长驻未刷新的 Web 页面打开下载弹窗或切回前台即可实时感知新版本并准确区分「2 步覆盖升级」与「3 步全新安装」。
 
 ---
@@ -104,7 +104,7 @@ flowchart LR
 
 直接打开 [**https://snap.dokitool.com**](https://snap.dokitool.com)，粘贴任意支持平台的分享口令或链接即可预览画质、切换线路并流式保存到本地。
 
-### 2️⃣ 安装 Chrome MV3 扩展 `v4.5.2`（推荐桌面用户）
+### 2️⃣ 安装 Chrome MV3 扩展 `v4.6.0`（推荐桌面用户）
 
 1. 下载官方预构建包：[`https://snap.dokitool.com/helper/dokitool-chrome-extension.zip`](https://snap.dokitool.com/helper/dokitool-chrome-extension.zip)（根目录直出 `manifest.json`，也可在站点顶部「Chrome 扩展」弹窗下载）；
 2. 解压至本地目录，在 Chrome 打开 `chrome://extensions/` 并开启右上角 **「开发者模式」**；
@@ -143,11 +143,11 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 
 ## 🌐 平台支持范围（14 核心平台 + 1000+ 长尾站点）
 
-- **核心目录 SSOT**：`backend/config/platforms.json`（唯一内嵌 14 平台真值表，同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）。
-- **Tier-2 长尾兜底**：启用 `DOKITOOL_YTDLP_GENERIC_ENABLED=true` 后，`GET /api/parse` 在 `platform=all`（或省略）模式下可将合法公网长尾链接路由至独立 `PARSE_GENERIC` 隔离池（覆盖 Vimeo、TikTok、Reddit、SoundCloud 等 1000+ 具名提取器，严格禁用盲抓 `generic`）。
+- **核心目录 SSOT**：`backend/config/platforms.json`（唯一内嵌 16 平台真值表，同步驱动后端路由、CLI 导出、OpenAPI 与前端平台快照）。
+- **Tier-2 长尾兜底**：启用 `DOKITOOL_YTDLP_GENERIC_ENABLED=true` 后，`GET /api/parse` 在 `platform=all`（或省略）模式下可将合法公网长尾链接路由至独立 `PARSE_GENERIC` 隔离池（覆盖 Vimeo、Twitch、Reddit、SoundCloud 等 1000+ 具名提取器，严格禁用盲抓 `generic`）。
 
 <details>
-<summary><strong>点击展开：14 个核心平台链接形式、交付方式与已知限制明细表</strong></summary>
+<summary><strong>点击展开：16 个核心平台链接形式、交付方式与已知限制明细表</strong></summary>
 
 | 平台 | 支持媒体类型 | 接受的链接形式（含短链与域名归一化） | 交付方式与已知限制 |
 | --- | --- | --- | --- |
@@ -156,12 +156,14 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 | 哔哩哔哩（`bilibili`） | 视频 / 多 P | `bilibili.com`（`www.`、`m.`）、`b23.tv` | Chrome 扩展支持免登录 1080P DASH 合流与独立 M4A；多 P 按需调用 `/api/resolve`；不支持番剧/付费/大会员专享 |
 | 小红书（`xiaohongshu`） | 视频 / 图片 / 实况 | `xiaohongshu.com`、`xhslink.com`、`rednote.com` | 网页直链须含 `xsec_token`，缺失时请从小红书 App 复制分享链接 |
 | 今日头条（`toutiao`） | 视频 | `toutiao.com`（`www.`、`m.` 的 `/video/`、`/group/`、`/i<id>`） | `*.toutiaovod.com` 无 CORS 与附件头，Web 端通过「打开源链接」右键另存为 |
-| 微博（`weibo`） | 视频 | `weibo.com`、`www.weibo.com`、`video.weibo.com/show?fid=...`、`m.weibo.cn` | 匿名网页经 `/api/media/weibo` 30 分钟 HMAC 票据中转；Bearer 通道返回直链（直连需 `Referer: https://weibo.com/`） |
+| 微博（`weibo`） | 视频 | `weibo.com`、`www.weibo.com`、`video.weibo.com/show?fid=...`、`m.weibo.cn` | 统一输出 `*.weibocdn.com` 直链（`browser_fetch: "blocked"`），零服务端中转，桌面扩展通过隔离 DNR Rule `1003` 零 Cookie 直下 |
 | 皮皮虾（`pipixia`） | 视频 / 图片 | `pipix.com`（`h5.pipix.com/item/...`、`/ppx/item/...`） | 仅支持公开分享帖子 |
 | 皮皮搞笑（`pipigx`） | 视频 | `pipigx.com`（`h5.pipigx.com/pp/post/...`）、`ippzone.com` | 优先校验 `tbvideo.ixiaochuan.cn` 无水印 MP4 直下（不支持 ZIP），失败回退手动打开 |
 | 最右（`zuiyou`） | 视频 / 图片 | `izuiyou.com`、`share.xiaochuankeji.cn` | 线上关闭视频 `tbvideo` 改写，视频通过「打开源链接」手动保存；图片支持直下与打包 |
+| Pinterest（`pinterest`） | 视频 / 图片 | `pinterest.com` / 区域子域 `/pin/<id>`、`pin.it/<code>` | 原生 Go 零 Cookie 解析，支持静图、MP4 视频与 Story Pin 图集；`*.pinimg.com` 无 CORS 时有扩展自动直下、无扩展支持新标签页保存 |
+| TikTok（`tiktok`） | 视频 / 图片 | `tiktok.com`（`/@user/video/<id>`、`/@user/photo/<id>`、`/share/`、`m.tiktok.com`）、`vm`/`vt.tiktok.com` | 原生 Go 零 Cookie 水合 + 302 取址；图文与配乐纯 Web 直下，防盗链视频（`browser_fetch: "blocked"`）由扩展 DNR Rule `1009` 零中转直下 |
 | X（`x`） | 视频 / 图片 | `x.com`、`twitter.com`（状态页、`/photo/<N>`、`/video/<N>`）、`t.co`（受控单跳） | 纯文字推文返回 `NO_MEDIA`；受限推文（`TweetTombstone`）需启用 `-x-tombstone-fallback=fxtwitter` |
-| YouTube（`youtube`） | 视频 / 字幕 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | **使用 Chrome MV3 官方扩展 `v4.5.2` 本地解析、4K60 无损合流与双语字幕导出**（独立油猴脚本已归档至 `archive/youtube-userscript-final`） |
+| YouTube（`youtube`） | 视频 / 字幕 | `youtube.com`（`www.`、`m.`、`music.` 的 `/watch`、`/shorts/`、`/live/`、`/embed/`）、`youtu.be` | **使用 Chrome MV3 官方扩展 `v4.6.0` 本地解析、4K60 无损合流与双语字幕导出**（独立油猴脚本已归档至 `archive/youtube-userscript-final`） |
 | Instagram（`instagram`） | 视频 / 图片 | `instagram.com`（`www.`、`m.`）、`instagr.am`（`/p/`、`/reel/`、`/reels/`、`/tv/`） | 不支持 Stories（`/stories/`）及私密/需登录帖（返回 `UPSTREAM_BLOCKED`） |
 | Facebook（`facebook`） | 视频 | `facebook.com`、`www.`、`m.`、`fb.watch` | `fb.watch` 短链需登录展开，接口提示先在浏览器打开并复制完整链接；受限视频返回 `UPSTREAM_BLOCKED` |
 | Tumblr（`tumblr`） | 视频 | `tumblr.com`、`www.tumblr.com`、`*.tumblr.com` | 仅支持公开视频帖（单帖最多提取 4 个视频条目） |
@@ -172,7 +174,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 
 ## 📊 监控大盘与运维热配置
 
-- **宽屏只读监控面板（`/monitor`）**：纯原生 SVG + CSS 渲染（零第三方图表库、严格 `noindex`、零写入端点），需携带 `owner` 角色 Bearer Token 查询 `GET /api/stats`；令牌仅存页面内存或可选单标签页 `sessionStorage`（绝不写入 `localStorage` / Cookie / URL 参数）。集中展示核心指标卡、11 项脱敏运行开关、准入与 `yt-dlp` 分舱水位、14 平台熔断器状态、近 30 天日趋势 / 近 24 小时时趋势、平台健康度排行与多 Key 统计表。
+- **宽屏只读监控面板（`/monitor`）**：纯原生 SVG + CSS 渲染（零第三方图表库、严格 `noindex`、零写入端点），需携带 `owner` 角色 Bearer Token 查询 `GET /api/stats`；令牌仅存页面内存或可选单标签页 `sessionStorage`（绝不写入 `localStorage` / Cookie / URL 参数）。集中展示核心指标卡、11 项脱敏运行开关、准入与 `yt-dlp` 分舱水位、16 平台熔断器状态、TikTok 风控观测、近 30 天日趋势 / 近 24 小时时趋势、平台健康度排行与多 Key 统计表。
 - **`SIGHUP` 无损热重载**：配置 `DOKITOOL_API_KEYS_FILE` 或 `DOKITOOL_RUNTIME_CONFIG_FILE` 后，执行 `kill -HUP <PID>` 或 `systemctl reload dokitool-go` 即可原地热更新多角色密钥、分舱并发、单平台熔断与 `disabled_platforms` 秒级止血策略，新配置校验失败自动回退保留原内存策略。
 
 <details>
@@ -243,7 +245,7 @@ make build  # 本地构建：注入 Commit SHA 的 Go 双二进制 + 前端静�
 | 文档 | 内容摘要 |
 | --- | --- |
 | [docs/API.md](docs/API.md) · [docs/openapi.json](docs/openapi.json) | 统一媒体 v1（`schema_version=1.0`）接口契约、错误码、YouTube 助手接口与 OpenAPI `3.1.0` 规范 |
-| [docs/EXTENSION.md](docs/EXTENSION.md) | Chrome MV3 原生侧边栏扩展 `v4.5.2` 安装、源码构建、凭据配置与安全边界 |
+| [docs/EXTENSION.md](docs/EXTENSION.md) | Chrome MV3 原生侧边栏扩展 `v4.6.0` 安装、源码构建、凭据配置与安全边界 |
 | [tools/dokitool-agent/README.md](tools/dokitool-agent/README.md) · [SKILL.md](tools/dokitool-agent/SKILL.md) | 零依赖 Python Agent CLI 与默认只读 Stdio MCP Server 使用与集成规范 |
 | [docs/AGENT-API.md](docs/AGENT-API.md) · [docs/AGENT-BATCH-DOWNLOAD.md](docs/AGENT-BATCH-DOWNLOAD.md) | 个人 Agent 通道鉴权、多角色配额、批量直连下载流水线与断点续传实践 |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `dokitool` 与 `shanghai-resolver` 启动参数、环境变量、多 Key 与 `SIGHUP` 热配置全量参考 |

@@ -1627,7 +1627,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
   try {
     const zhText = textOf(portal);
     assert.ok(zhText.includes(`v${LATEST_EXT_VER}`), `expected v${LATEST_EXT_VER} badge in zh-CN modal, got: ${zhText}`);
-    assert.ok(zhText.includes('14 核心平台 + 1000+ 长尾站点'));
+    assert.ok(zhText.includes('16 核心平台 + 1000+ 长尾站点'));
     assert.ok(zhText.includes('B 站 1080P & YouTube 4K60 免油猴本地无损合流'));
     assert.ok(zhText.includes('网页端自动联动'));
     assert.ok(zhText.includes('如之前安装过早期随机 ID 测试版，请先在 chrome://extensions 移除旧卡片再拖入一次；此后均可直接覆盖刷新升级。'));
@@ -1637,7 +1637,7 @@ test('P1 PR-2: ExtensionDownloadModal displays v4.2.0 badge, 14+1000+ & Bilibili
     await nextTick();
     const enText = textOf(portal);
     assert.ok(enText.includes(`v${LATEST_EXT_VER}`), `expected v${LATEST_EXT_VER} badge in en modal, got: ${enText}`);
-    assert.ok(enText.includes('14 core platforms + 1,000+ long-tail sites'));
+    assert.ok(enText.includes('16 core platforms + 1,000+ long-tail sites'));
     assert.ok(enText.includes('Bilibili 1080P & YouTube 4K60 lossless local muxing without Tampermonkey'));
     assert.ok(enText.includes('automatic Web page handshake'));
     assert.ok(enText.includes('If you previously installed an early random-ID test build, remove the old card in chrome://extensions once before dragging the new folder; future updates only require overwriting and refreshing.'));
@@ -2385,7 +2385,7 @@ test('PR-B1: adaptive HLS/DASH streamCopyUrl copy button, single-HLS copyVideoUr
     vUnavailStream.app.unmount();
   }
 
-  // 3) ExtensionDownloadModal.vue reflects Q5A native_direct disclosure & G1 DNR rules 1006–1008 in zh-CN & en
+  // 3) ExtensionDownloadModal.vue reflects Q5A native_direct disclosure & G1/Phase 2 DNR rules 1006–1009 in zh-CN & en
   const zhCtx = {};
   await renderToString(
     createSSRApp({ render: () => h(ExtensionDownloadModal, { locale: 'zh-CN' }) }),
@@ -2393,7 +2393,7 @@ test('PR-B1: adaptive HLS/DASH streamCopyUrl copy button, single-HLS copyVideoUr
   );
   const zhModalHtml = String(zhCtx.teleports?.body || '');
   assert.match(zhModalHtml, /浏览器原生下载器/);
-  assert.match(zhModalHtml, /1006–1008/);
+  assert.match(zhModalHtml, /1006–1009/);
   const enCtx = {};
   await renderToString(
     createSSRApp({ render: () => h(ExtensionDownloadModal, { locale: 'en' }) }),
@@ -2401,7 +2401,7 @@ test('PR-B1: adaptive HLS/DASH streamCopyUrl copy button, single-HLS copyVideoUr
   );
   const enModalHtml = String(enCtx.teleports?.body || '');
   assert.match(enModalHtml, /native downloader/i);
-  assert.match(enModalHtml, /1006–1008/);
+  assert.match(enModalHtml, /1006–1009/);
 });
 
 test('Post-#68 Batch 1A: HeaderNav renders 3 states (disconnected, outdated 4.4.0 < 4.4.1 amber desktop+mobile, up-to-date 4.4.1 green dot with zero update notice)', async () => {

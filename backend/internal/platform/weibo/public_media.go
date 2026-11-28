@@ -2,13 +2,56 @@ package weibo
 
 import (
 	"context"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	media "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
+
+// AllowedMediaURL validates fixed-provider Weibo CDN video URLs (`https://*.weibocdn.com`)
+// without userinfo, fragments, control characters, non-standard ports, or IP literals.
+func AllowedMediaURL(raw string) bool {
+	if len(raw) > 4096 || strings.Contains(raw, "#") || unified.MediaURL(raw) == "" {
+		return false
+	}
+	for _, r := range raw {
+		if r <= 0x20 || r >= 0x7f || r == '\\' {
+			return false
+		}
+	}
+	separator := strings.Index(raw, "://")
+	if separator < 0 {
+		return false
+	}
+	path := strings.IndexAny(raw[separator+3:], "/?#")
+	if path < 0 || raw[separator+3+path] != '/' {
+		return false
+	}
+	u, err := url.Parse(raw[:separator+3+path])
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	if !strings.HasSuffix(host, ".weibocdn.com") || len(host) <= len(".weibocdn.com") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n != 443 {
+			return false
+		}
+	}
+	return true
+}
 
 // upgradeWeiboHTTPToHTTPS losslessly upgrades cleartext http://*.weibocdn.com
 // URLs (without explicit ports, userinfo, fragments, or non-ASCII characters)
@@ -33,22 +76,10 @@ func upgradeWeiboHTTPToHTTPS(raw string) string {
 	return "https" + raw[4:]
 }
 
-// PreparePublicWithOwner dispatches authenticated owner requests to PrepareOwner
-// (direct provider URLs without relay ticket minting) while keeping anonymous
-// visitor requests on PreparePublic's signed media-relay boundary.
-func PreparePublicWithOwner(key string, isOwner func(context.Context) bool) func(context.Context, string, unified.Object, int64) (unified.Object, error) {
-	public := PreparePublic(key)
-	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
-		if isOwner != nil && isOwner(ctx) {
-			return PrepareOwner(ctx, platform, payload, now)
-		}
-		return public(ctx, platform, payload, now)
-	}
-}
-
-// PrepareOwner validates fixed-provider Weibo video URLs and reselects defaults
-// without minting signed /api/media/weibo relay tickets.
-func PrepareOwner(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
+// PreparePublic validates fixed-provider Weibo video URLs, upgrades http:// to
+// https://, marks each usable source as direct + browser_fetch=blocked (matching
+// TikTok's zero-relay extension-direct contract), and reselects defaults.
+func PreparePublic(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
 	if platform != "weibo" || payload["code"] != "OK" {
 		return payload, nil
 	}
@@ -65,7 +96,7 @@ func PrepareOwner(ctx context.Context, platform string, payload unified.Object, 
 			if variant["state"] != nil && variant["state"] != "ready" {
 				continue
 			}
-			prepareOwnerDeliverySources(unified.Map(variant["delivery"]), &recognized)
+			prepareDirectDeliverySources(unified.Map(variant["delivery"]), &recognized)
 		}
 		items[index] = unified.SelectDefault(item, now)
 	}
@@ -75,134 +106,41 @@ func PrepareOwner(ctx context.Context, platform string, payload unified.Object, 
 	return result, nil
 }
 
-// PreparePublic signs only fixed-provider sources without altering identity,
-// source order or the full candidate inventory. PublicView remains shared.
-func PreparePublic(key string) func(context.Context, string, unified.Object, int64) (unified.Object, error) {
-	return func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
-		if platform != "weibo" || payload["code"] != "OK" {
-			return payload, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if len(key) < 32 || len(key) > 512 {
-			return unified.ContractError("SERVICE_NOT_CONFIGURED", "微博播放服务尚未配置，请联系站点维护者", false), nil
-		}
-		result := unified.Clone(payload)
-		recognized := 0
-		items := unified.Slice(unified.Map(result["data"])["items"])
-		for index, rawItem := range items {
-			item := unified.Map(rawItem)
-			for _, rawVariant := range unified.Slice(item["variants"]) {
-				variant := unified.Map(rawVariant)
-				if variant["state"] != nil && variant["state"] != "ready" {
-					continue
-				}
-				signDeliverySources(unified.Map(variant["delivery"]), key, now, &recognized)
-			}
-			// The original PHP public boundary reselects defaults after signing.
-			// Without this, the intermediate envelope references stale direct URLs
-			// and fails the unchanged HTTP gateway validation before PublicView.
-			items[index] = unified.SelectDefault(item, now)
-		}
-		if recognized == 0 {
-			return unified.ContractError("UPSTREAM_INVALID_RESPONSE", "微博暂未提供本站支持的视频源，请稍后重试", true), nil
-		}
-		return result, nil
-	}
-}
-
-// Apply to file, segments, mux and pair sources. Every invalid source is marked
-// unavailable, never redirected to an arbitrary fetch proxy.
-func signDeliverySources(delivery unified.Object, key string, now int64, recognized *int) {
+func prepareDirectDeliverySources(delivery unified.Object, recognized *int) {
 	if delivery == nil {
 		return
 	}
 	for _, value := range unified.Slice(delivery["sources"]) {
-		signSource(unified.Map(value), key, now, recognized)
+		prepareDirectSource(unified.Map(value), recognized)
 	}
 	if init := unified.Map(delivery["init"]); init != nil {
 		for _, value := range unified.Slice(init["sources"]) {
-			signSource(unified.Map(value), key, now, recognized)
+			prepareDirectSource(unified.Map(value), recognized)
 		}
 	}
 	for _, rawPiece := range unified.Slice(delivery["pieces"]) {
 		for _, value := range unified.Slice(unified.Map(rawPiece)["sources"]) {
-			signSource(unified.Map(value), key, now, recognized)
+			prepareDirectSource(unified.Map(value), recognized)
 		}
 	}
 	for _, rawResource := range unified.Slice(delivery["resources"]) {
-		signDeliverySources(unified.Map(unified.Map(rawResource)["delivery"]), key, now, recognized)
+		prepareDirectDeliverySources(unified.Map(unified.Map(rawResource)["delivery"]), recognized)
 	}
 }
 
-func signSource(source unified.Object, key string, now int64, recognized *int) {
+func prepareDirectSource(source unified.Object, recognized *int) {
 	if source == nil {
 		return
 	}
 	raw := upgradeWeiboHTTPToHTTPS(unified.Str(source["url"]))
-	if !media.AllowedURL(raw) {
+	if !AllowedMediaURL(raw) {
 		source["availability"] = "unavailable"
-		return
-	}
-	*recognized = *recognized + 1
-	if !unified.SourceUsable(source, now) {
-		return
-	}
-	expiry := now + media.TicketTTL
-	if previous, ok := source["expires_at"]; ok && previous != nil {
-		t, err := time.Parse(time.RFC3339Nano, unified.Str(previous))
-		if err != nil {
-			source["availability"] = "unavailable"
-			return
-		}
-		if t.Unix() < expiry {
-			expiry = t.Unix()
-		}
-	}
-	ticket, ok := media.Sign(raw, key, now, &expiry)
-	if !ok {
-		source["availability"] = "unavailable"
-		return
-	}
-	source["url"] = ticket
-	source["access"] = "relay"
-	source["direct_url"] = raw
-	source["expires_at"] = time.Unix(expiry, 0).UTC().Format(time.RFC3339)
-}
-
-func prepareOwnerDeliverySources(delivery unified.Object, recognized *int) {
-	if delivery == nil {
-		return
-	}
-	for _, value := range unified.Slice(delivery["sources"]) {
-		prepareOwnerSource(unified.Map(value), recognized)
-	}
-	if init := unified.Map(delivery["init"]); init != nil {
-		for _, value := range unified.Slice(init["sources"]) {
-			prepareOwnerSource(unified.Map(value), recognized)
-		}
-	}
-	for _, rawPiece := range unified.Slice(delivery["pieces"]) {
-		for _, value := range unified.Slice(unified.Map(rawPiece)["sources"]) {
-			prepareOwnerSource(unified.Map(value), recognized)
-		}
-	}
-	for _, rawResource := range unified.Slice(delivery["resources"]) {
-		prepareOwnerDeliverySources(unified.Map(unified.Map(rawResource)["delivery"]), recognized)
-	}
-}
-
-func prepareOwnerSource(source unified.Object, recognized *int) {
-	if source == nil {
-		return
-	}
-	raw := upgradeWeiboHTTPToHTTPS(unified.Str(source["url"]))
-	if !media.AllowedURL(raw) {
-		source["availability"] = "unavailable"
+		delete(source, "direct_url")
 		return
 	}
 	source["url"] = raw
+	source["access"] = "direct"
+	source["browser_fetch"] = "blocked"
 	delete(source, "direct_url")
 	*recognized = *recognized + 1
 	if previous, ok := source["expires_at"]; ok && previous != nil {

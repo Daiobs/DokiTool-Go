@@ -50,6 +50,7 @@ var fieldOverrides = map[string]fieldOverride{
 	"StatsSnapshot.ytdlp_generic":           {optional: true},
 	"StatsSnapshot.ytdlp_pools":             {optional: true},
 	"StatsSnapshot.youtube_helper":          {optional: true},
+	"StatsSnapshot.tiktok":                  {optional: true},
 	"StatsSnapshot.circuit_breakers":        {optional: true},
 	"StatsSnapshot.generic_circuit_breaker": {optional: true},
 	"StatsSnapshot.runtime_policy":          {optional: true},

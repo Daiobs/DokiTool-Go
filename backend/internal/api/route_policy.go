@@ -51,11 +51,6 @@ var routePolicies = [routeCount]routePolicy{
 	telemetry: {
 		nonPlatformReason: "anonymous client download telemetry receiver",
 	},
-	media: {
-		staticPlatform:      "weibo",
-		enforceKillSwitch:   true,
-		enforcePlatformAuth: false, // browser <video> playback uses signed tickets without Bearer headers
-	},
 	youtubeHelper: {
 		staticPlatform:      "youtube",
 		enforceKillSwitch:   true,

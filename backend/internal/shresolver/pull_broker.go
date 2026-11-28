@@ -146,7 +146,15 @@ func NewPullBroker(token string) (*PullBroker, error) {
 // WithLookupNetIP overrides host DNS validation for isolated tests and loopback harnesses.
 func (b *PullBroker) WithLookupNetIP(fn func(context.Context, string, string) ([]netip.Addr, error)) *PullBroker {
 	if b != nil && fn != nil {
-		b.lookup = fn
+		b.setLookup(fn)
+	}
+	return b
+}
+
+// WithDNSCacheTTL overrides the validator public-host DNS cache TTL (<=0 disables caching).
+func (b *PullBroker) WithDNSCacheTTL(ttl time.Duration) *PullBroker {
+	if b != nil {
+		b.setDNSCacheTTL(ttl)
 	}
 	return b
 }

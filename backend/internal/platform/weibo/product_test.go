@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	media "github.com/Brilliant666/DokiTool-Go/backend/internal/media/weibo"
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
@@ -50,10 +49,9 @@ func TestWeiboProductAdapterConsumesPHPFormatter(t *testing.T) {
 	}
 }
 
-func TestWeiboSigningKeepsStableSourceAndDefault(t *testing.T) {
+func TestWeiboPreparePublicKeepsStableDirectSourceAndDefault(t *testing.T) {
 	const raw = "https://f.video.weibocdn.com/hd.mp4?token=fixed"
 	now := int64(1730000000)
-	key := strings.Repeat("a", 64)
 	legacy := unified.Object{"code": 200, "data": unified.Object{
 		"type": "video", "url": raw,
 		"video_backup": unified.Array{
@@ -63,7 +61,7 @@ func TestWeiboSigningKeepsStableSourceAndDefault(t *testing.T) {
 	}}
 	original := adaptLegacy(legacy, "https://weibo.com/1234567/AbC", now)
 	snapshot := unified.Clone(original)
-	prepared, err := PreparePublic(key)(context.Background(), "weibo", original, now)
+	prepared, err := PreparePublic(context.Background(), "weibo", original, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,23 +72,24 @@ func TestWeiboSigningKeepsStableSourceAndDefault(t *testing.T) {
 	}
 	first := unified.Map(variants[0])
 	source := unified.Map(unified.Slice(unified.Map(first["delivery"])["sources"])[0])
-	ticket := strings.TrimPrefix(unified.Str(source["url"]), "/api/media/weibo?ticket=")
-	decoded, valid := media.Verify(ticket, key, now)
-	if !valid || decoded["u"] != raw || source["access"] != "relay" || source["direct_url"] != raw {
-		t.Fatal("invalid or unbound ticket or missing direct_url")
+	if source["url"] != raw || source["access"] != "direct" || source["browser_fetch"] != "blocked" {
+		t.Fatalf("unexpected direct source projection: %#v", source)
+	}
+	if _, hasDirect := source["direct_url"]; hasDirect {
+		t.Fatalf("direct Weibo source must not carry redundant direct_url: %#v", source)
 	}
 	oldItem := unified.Map(unified.Slice(unified.Map(snapshot["data"])["items"])[0])
 	oldVariant := unified.Map(unified.Slice(oldItem["variants"])[0])
 	oldSource := unified.Map(unified.Slice(unified.Map(oldVariant["delivery"])["sources"])[0])
 	if source["id"] != oldSource["id"] || first["id"] != oldVariant["id"] {
-		t.Fatal("signing changed identity")
+		t.Fatal("PreparePublic changed identity")
 	}
 	foreign := unified.Map(unified.Slice(unified.Map(unified.Map(variants[1])["delivery"])["sources"])[0])
 	if foreign["availability"] != "unavailable" {
 		t.Fatal("foreign source remained available")
 	}
 	if !unified.Equal(original, snapshot) {
-		t.Fatal("signing mutated private inventory")
+		t.Fatal("PreparePublic mutated private inventory")
 	}
 	view := unified.PublicView(prepared, false, now)
 	if err := unified.ValidateEnvelopeAt(view, now); err != nil {
@@ -98,24 +97,19 @@ func TestWeiboSigningKeepsStableSourceAndDefault(t *testing.T) {
 	}
 	publicItem := unified.Map(unified.Slice(unified.Map(view["data"])["items"])[0])
 	selected := unified.Map(publicItem["default"])
-	if selected["url"] != source["url"] || selected["source_id"] != source["id"] {
-		t.Fatal("default selection lost signed source")
+	if selected["url"] != raw || selected["source_id"] != source["id"] || selected["access"] == "relay" {
+		t.Fatalf("default selection lost direct source: %#v", selected)
 	}
 	if len(unified.Slice(publicItem["variants"])) > len(variants) {
 		t.Fatal("filtered view invented variants")
 	}
-	missing, err := PreparePublic("")(context.Background(), "weibo", original, now)
-	if err != nil || missing["code"] != "SERVICE_NOT_CONFIGURED" {
-		t.Fatal("missing key must fail closed")
-	}
 }
 
 // Two credential generations of a selected rendition must still address the
-// same explicit choice, without ever replacing the signed delivery URL.
+// same explicit choice via renewal.go's AllowedMediaURL check.
 func TestWeiboLPRefreshPreservesExplicitFile(t *testing.T) {
 	const file = "https://f.video.weibocdn.com/ab/object540.mp4?media_id=12345&template=540p&label=video"
 	const now = int64(1730000000)
-	key := strings.Repeat("k", 32)
 	type choice struct{ variant, source string }
 	publicChoices := func(urls ...string) []choice {
 		t.Helper()
@@ -124,7 +118,7 @@ func TestWeiboLPRefreshPreservesExplicitFile(t *testing.T) {
 			candidates = append(candidates, unified.Object{"url": raw, "width": 540, "height": 960, "size": 844977})
 		}
 		legacy := unified.Object{"code": 200, "data": unified.Object{"url": urls[0], "video_backup": candidates}}
-		out, err := PreparePublic(key)(context.Background(), "weibo", adaptLegacy(legacy, "https://weibo.com/tv/show/1034:12345", now), now)
+		out, err := PreparePublic(context.Background(), "weibo", adaptLegacy(legacy, "https://weibo.com/tv/show/1034:12345", now), now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,10 +139,8 @@ func TestWeiboLPRefreshPreservesExplicitFile(t *testing.T) {
 				t.Fatal("unexpected source merge")
 			}
 			source := unified.Map(sources[0])
-			ticket := strings.TrimPrefix(unified.Str(source["url"]), "/api/media/weibo?ticket=")
-			data, ok := media.Verify(ticket, key, now)
-			if !ok || data["u"] != urls[i] {
-				t.Fatal("delivery did not preserve the exact incoming URL or source order")
+			if unified.Str(source["url"]) != urls[i] || source["browser_fetch"] != "blocked" {
+				t.Fatalf("delivery did not preserve exact incoming URL or browser_fetch=blocked: %#v", source)
 			}
 			got = append(got, choice{unified.Str(variant["id"]), unified.Str(source["id"])})
 		}
@@ -198,18 +190,18 @@ func TestWeiboForeignOnlyFailsClosed(t *testing.T) {
 	raw := unified.Object{"code": 200, "data": unified.Object{"type": "video",
 		"video_backup": unified.Array{unified.Object{"url": "https://example.com/video.mp4"}}}}
 	payload := adaptLegacy(raw, "https://weibo.com/1234567/AbC", now)
-	result, err := PreparePublic(strings.Repeat("z", 64))(context.Background(), "weibo", payload, now)
+	result, err := PreparePublic(context.Background(), "weibo", payload, now)
 	if err != nil || result["code"] != "UPSTREAM_INVALID_RESPONSE" {
 		t.Fatal("unsupported provider not rejected")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := PreparePublic(strings.Repeat("z", 64))(ctx, "weibo", payload, now); err == nil {
-		t.Fatal("canceled signing ran")
+	if _, err := PreparePublic(ctx, "weibo", payload, now); err == nil {
+		t.Fatal("canceled PreparePublic ran")
 	}
 }
 
-func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
+func TestWeiboPreparePublicDirectURLUpgradeAndAllowedBoundary(t *testing.T) {
 	const (
 		now        int64 = 1730000000
 		rawHTTP          = "http://f.video.weibocdn.com/hd.mp4?Expires=1900000000&ssig=a%2Bb+c"
@@ -217,7 +209,6 @@ func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
 		badPort          = "http://f.video.weibocdn.com:80/bad.mp4"
 		badForeign       = "https://evil.example.com/bad.mp4"
 	)
-	key := strings.Repeat("d", 64)
 	legacy := unified.Object{"code": 200, "data": unified.Object{
 		"type": "video",
 		"url":  rawHTTP,
@@ -228,7 +219,7 @@ func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
 		},
 	}}
 	original := adaptLegacy(legacy, "https://weibo.com/1234567/AbC", now)
-	prepared, err := PreparePublic(key)(context.Background(), "weibo", original, now)
+	prepared, err := PreparePublic(context.Background(), "weibo", original, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,8 +229,8 @@ func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
 	}
 	item := unified.Map(unified.Slice(unified.Map(view["data"])["items"])[0])
 	def := unified.Map(item["default"])
-	if def["access"] != "relay" || !strings.HasPrefix(unified.Str(def["url"]), "/api/media/weibo?ticket=") {
-		t.Fatalf("item.default must remain signed relay for web compatibility: %#v", def)
+	if def["url"] != wantHTTPS || def["access"] == "relay" {
+		t.Fatalf("item.default must be direct HTTPS %q, got %#v", wantHTTPS, def)
 	}
 	if _, hasDirect := def["direct_url"]; hasDirect {
 		t.Fatalf("item.default must not carry direct_url: %#v", def)
@@ -249,16 +240,11 @@ func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
 		t.Fatalf("expected all 3 variants preserved in PublicView, got %d", len(variants))
 	}
 	src := unified.Map(unified.Slice(unified.Map(unified.Map(variants[0])["delivery"])["sources"])[0])
-	if src["availability"] == "unavailable" || src["access"] != "relay" || !strings.HasPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=") {
-		t.Fatalf("variants[0] source must remain ready signed relay: %#v", src)
+	if src["availability"] == "unavailable" || src["url"] != wantHTTPS || src["browser_fetch"] != "blocked" {
+		t.Fatalf("variants[0] source expected direct HTTPS + browser_fetch=blocked: %#v", src)
 	}
-	if src["direct_url"] != wantHTTPS {
-		t.Fatalf("source.direct_url = %q, want lossless HTTPS %q", src["direct_url"], wantHTTPS)
-	}
-	ticket := strings.TrimPrefix(unified.Str(src["url"]), "/api/media/weibo?ticket=")
-	decoded, ok := media.Verify(ticket, key, now)
-	if !ok || decoded["u"] != wantHTTPS {
-		t.Fatalf("signed relay ticket did not verify against upgraded HTTPS URL: ok=%v decoded=%#v", ok, decoded)
+	if _, hasDirect := src["direct_url"]; hasDirect {
+		t.Fatalf("direct source must not emit redundant direct_url: %#v", src)
 	}
 	for _, idx := range []int{1, 2} {
 		badSrc := unified.Map(unified.Slice(unified.Map(unified.Map(variants[idx])["delivery"])["sources"])[0])
@@ -268,27 +254,22 @@ func TestWeiboPreparePublicDirectURLUpgradeAndRelayBoundary(t *testing.T) {
 		if _, hasDirect := badSrc["direct_url"]; hasDirect {
 			t.Fatalf("variants[%d] rejected source must not carry direct_url: %#v", idx, badSrc)
 		}
-		if badSrc["access"] == "relay" || strings.HasPrefix(unified.Str(badSrc["url"]), "/api/media/weibo?ticket=") {
-			t.Fatalf("variants[%d] rejected source must not mint relay ticket: %#v", idx, badSrc)
-		}
 	}
 
-	// Owner path also upgrades http:// -> https:// directly without minting relay or direct_url.
-	ownerOut, err := PrepareOwner(context.Background(), "weibo", original, now)
-	if err != nil {
-		t.Fatal(err)
+	// AllowedMediaURL boundary checks.
+	if !AllowedMediaURL("https://f.video.weibocdn.com/o0/abc.mp4") || !AllowedMediaURL("https://g.us.sinaimg.weibocdn.com/a.mp4") {
+		t.Fatal("valid *.weibocdn.com URLs rejected")
 	}
-	ownerView := unified.PublicView(ownerOut, false, now)
-	if err := unified.ValidateEnvelopeAt(ownerView, now); err != nil {
-		t.Fatalf("owner PublicView failed validation: %v", err)
-	}
-	ownerItem := unified.Map(unified.Slice(unified.Map(ownerView["data"])["items"])[0])
-	ownerDef := unified.Map(ownerItem["default"])
-	if ownerDef["url"] != wantHTTPS || ownerDef["access"] == "relay" {
-		t.Fatalf("owner default expected direct HTTPS %q, got %#v", wantHTTPS, ownerDef)
-	}
-	ownerSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(ownerItem["variants"])[0])["delivery"])["sources"])[0])
-	if _, hasDirect := ownerSrc["direct_url"]; hasDirect {
-		t.Fatalf("owner direct source must not emit redundant direct_url: %#v", ownerSrc)
+	for _, bad := range []string{
+		"http://f.video.weibocdn.com/o0/abc.mp4",
+		"https://weibocdn.com/o0/abc.mp4",
+		"https://user:pass@f.video.weibocdn.com/o0/abc.mp4",
+		"https://f.video.weibocdn.com:8443/o0/abc.mp4",
+		"https://f.video.weibocdn.com/o0/abc.mp4#frag",
+		"https://evil.example.com/o0/abc.mp4",
+	} {
+		if AllowedMediaURL(bad) {
+			t.Fatalf("disallowed URL accepted: %q", bad)
+		}
 	}
 }

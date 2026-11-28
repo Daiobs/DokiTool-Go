@@ -606,12 +606,12 @@ func TestGenericShortTTLCacheCapAndDynamicTelemetry(t *testing.T) {
 			started <- struct{}{}
 			<-release
 		}
-		return makeGenericOKPayload("tiktok", src, now, time.Unix(now, 0).UTC().Add(5*time.Minute).Format(time.RFC3339)), nil
+		return makeGenericOKPayload("twitch", src, now, time.Unix(now, 0).UTC().Add(5*time.Minute).Format(time.RFC3339)), nil
 	}))
 
-	reqURL := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.tiktok.com/@demo/video/7000000000000000001")
+	reqURL := "/api/parse?schema_version=1.0&url=" + url.QueryEscape("https://www.twitch.tv/videos/7000000001")
 
-	// Two concurrent requests coalesce via singleflight; both record "tiktok" in stats!
+	// Two concurrent requests coalesce via singleflight; both record "twitch" in stats!
 	var wg sync.WaitGroup
 	rec1 := httptest.NewRecorder()
 	rec2 := httptest.NewRecorder()
@@ -651,19 +651,19 @@ func TestGenericShortTTLCacheCapAndDynamicTelemetry(t *testing.T) {
 		t.Fatalf("expected cache expiry after 60s cap: code=%d calls=%d", rec4.Code, calls.Load())
 	}
 
-	// Verify dynamic telemetry recorded all 4 requests under "tiktok" (never "ytdlp_generic").
+	// Verify dynamic telemetry recorded all 4 requests under "twitch" (never "ytdlp_generic").
 	snap := h.Stats().Snapshot()
-	var tiktokCount uint64
+	var twitchCount uint64
 	for _, cell := range snap.Requests.ByPlatformCodeChannel {
 		if cell.Platform == PlatformGeneric {
 			t.Fatalf("internal sentinel %q leaked into stats", PlatformGeneric)
 		}
-		if cell.Platform == "tiktok" && cell.Code == "OK" {
-			tiktokCount += cell.Count
+		if cell.Platform == "twitch" && cell.Code == "OK" {
+			twitchCount += cell.Count
 		}
 	}
-	if tiktokCount != 4 {
-		t.Fatalf("tiktok OK count = %d, want 4 (cells=%+v)", tiktokCount, snap.Requests.ByPlatformCodeChannel)
+	if twitchCount != 4 {
+		t.Fatalf("twitch OK count = %d, want 4 (cells=%+v)", twitchCount, snap.Requests.ByPlatformCodeChannel)
 	}
 }
 
@@ -836,7 +836,7 @@ func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var tiktokCalls atomic.Int32
+	var twitchCalls atomic.Int32
 	parser := ytgeneric.NewGenericNamed(
 		&stubGenericExtractor{
 			extract: func(_ context.Context, rawURL string) (*ytengine.Info, error) {
@@ -847,12 +847,12 @@ func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
 						Message:   "私密视频",
 						Extractor: "Vimeo",
 					}
-				case strings.Contains(rawURL, "tiktok.com/@demo/video/404"):
-					tiktokCalls.Add(1)
+				case strings.Contains(rawURL, "twitch.tv/videos/404"):
+					twitchCalls.Add(1)
 					return nil, &ytengine.Error{
 						Code:      ytengine.CodeContentUnavailable,
 						Message:   "视频已删除",
-						Extractor: "TikTok",
+						Extractor: "Twitch",
 					}
 				case strings.Contains(rawURL, "dailymotion.com/video/timeout"):
 					return nil, &ytengine.Error{
@@ -913,15 +913,15 @@ func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
 	if w := doGet("url=" + url.QueryEscape("https://vimeo.com/blocked")); w.Code != http.StatusForbidden {
 		t.Fatalf("vimeo blocked status=%d body=%s", w.Code, w.Body.String())
 	}
-	// TikTok CONTENT_UNAVAILABLE is cached for 10s; second call hits cache and must STILL attribute to "tiktok"!
-	if w := doGet("url=" + url.QueryEscape("https://www.tiktok.com/@demo/video/404")); w.Code != http.StatusNotFound {
-		t.Fatalf("tiktok 404 #1 status=%d body=%s", w.Code, w.Body.String())
+	// Twitch CONTENT_UNAVAILABLE is cached for 10s; second call hits cache and must STILL attribute to "twitch"!
+	if w := doGet("url=" + url.QueryEscape("https://www.twitch.tv/videos/404")); w.Code != http.StatusNotFound {
+		t.Fatalf("twitch 404 #1 status=%d body=%s", w.Code, w.Body.String())
 	}
-	if w := doGet("url=" + url.QueryEscape("https://www.tiktok.com/@demo/video/404")); w.Code != http.StatusNotFound {
-		t.Fatalf("tiktok 404 #2 (cached) status=%d body=%s", w.Code, w.Body.String())
+	if w := doGet("url=" + url.QueryEscape("https://www.twitch.tv/videos/404")); w.Code != http.StatusNotFound {
+		t.Fatalf("twitch 404 #2 (cached) status=%d body=%s", w.Code, w.Body.String())
 	}
-	if tiktokCalls.Load() != 1 {
-		t.Fatalf("expected 1 tiktok extract call (2nd cached), got %d", tiktokCalls.Load())
+	if twitchCalls.Load() != 1 {
+		t.Fatalf("expected 1 twitch extract call (2nd cached), got %d", twitchCalls.Load())
 	}
 	if w := doGet("url=" + url.QueryEscape("https://www.dailymotion.com/video/timeout")); w.Code != http.StatusGatewayTimeout {
 		t.Fatalf("dailymotion timeout status=%d body=%s", w.Code, w.Body.String())
@@ -963,8 +963,8 @@ func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
 	if got := lookupCellCount(cells, "vimeo", "UPSTREAM_BLOCKED", ChannelAnonymous); got != 1 {
 		t.Fatalf("vimeo UPSTREAM_BLOCKED = %d, want 1", got)
 	}
-	if got := lookupCellCount(cells, "tiktok", "CONTENT_UNAVAILABLE", ChannelAnonymous); got != 2 {
-		t.Fatalf("tiktok CONTENT_UNAVAILABLE (1 miss + 1 cache hit) = %d, want 2", got)
+	if got := lookupCellCount(cells, "twitch", "CONTENT_UNAVAILABLE", ChannelAnonymous); got != 2 {
+		t.Fatalf("twitch CONTENT_UNAVAILABLE (1 miss + 1 cache hit) = %d, want 2", got)
 	}
 	if got := lookupCellCount(cells, "dailymotion", "UPSTREAM_TIMEOUT", ChannelAnonymous); got != 1 {
 		t.Fatalf("dailymotion UPSTREAM_TIMEOUT = %d, want 1", got)
@@ -991,7 +991,7 @@ func TestGenericFailureAttributionDecoupledFromUnknown(t *testing.T) {
 		t.Fatalf("daily ytdlp_unmatched total = %d, want 3 (%+v)", dayPlats[PlatformYTDLPUnmatched].Total, dayPlats[PlatformYTDLPUnmatched])
 	}
 	if dayPlats["vimeo"].ByCode["UPSTREAM_BLOCKED"] != 1 ||
-		dayPlats["tiktok"].ByCode["CONTENT_UNAVAILABLE"] != 2 ||
+		dayPlats["twitch"].ByCode["CONTENT_UNAVAILABLE"] != 2 ||
 		dayPlats["dailymotion"].ByCode["UPSTREAM_TIMEOUT"] != 1 ||
 		dayPlats["soundcloud"].ByCode["NO_MEDIA"] != 1 {
 		t.Fatalf("unexpected daily named Tier-2 platform stats: %+v", dayPlats)

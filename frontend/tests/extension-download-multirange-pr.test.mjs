@@ -1799,10 +1799,10 @@ test("[PR-C 1] Privacy firewall unchanged on browsing/Alt+Shift+D/RESOLVE_LAZY_I
   });
   await bg.init();
 
-  // 1) Privacy firewall: browsing Vimeo, TikTok, or online banking triggers ZERO network calls & redacts rawUrl!
+  // 1) Privacy firewall: browsing Vimeo, Twitch, or online banking triggers ZERO network calls & redacts rawUrl!
   for (const browsedUrl of [
     "https://vimeo.com/123456",
-    "https://www.tiktok.com/@creator/video/7123456789",
+    "https://www.twitch.tv/videos/2123456789",
     "https://online-banking.example.com/secret?token=abc",
   ]) {
     env.emitTabUpdated(
@@ -1977,14 +1977,14 @@ test("[PR-C 2] Zero-<all_urls> native chrome.downloads.download lifecycle (compl
     type: "ENQUEUE_DOWNLOADS",
     items: [
       {
-        title: "TikTok Clip",
-        platform: "tiktok",
-        workFingerprint: "tiktok:7123456789",
+        title: "Twitch Clip",
+        platform: "twitch",
+        workFingerprint: "twitch:2123456789",
         spec: {
           kind: "direct_file",
           apiOrigin: "https://snap.dokitool.com",
-          routes: ["https://v16-webapp.tiktokcdn.com/video/tos/clip.mp4"],
-          filename: "DokiTool/TikTok Clip.mp4",
+          routes: ["https://vod-metro.twitch.tv/video/clip.mp4"],
+          filename: "DokiTool/Twitch Clip.mp4",
           mimeType: "video/mp4",
           sizeBytes: 8_500_000,
         },
@@ -2000,8 +2000,8 @@ test("[PR-C 2] Zero-<all_urls> native chrome.downloads.download lifecycle (compl
   assert.equal(env.getOffscreenCreateCount(), 0, "must NOT launch offscreen.html");
   assert.equal(fetchCalls.length, 0, "must NOT call fetch");
   assert.equal(env.downloadCalls.length, 1);
-  assert.equal(env.downloadCalls[0].url, "https://v16-webapp.tiktokcdn.com/video/tos/clip.mp4");
-  assert.equal(env.downloadCalls[0].filename, "DokiTool/TikTok Clip.mp4");
+  assert.equal(env.downloadCalls[0].url, "https://vod-metro.twitch.tv/video/clip.mp4");
+  assert.equal(env.downloadCalls[0].filename, "DokiTool/Twitch Clip.mp4");
 
   let snap = await bg.getSnapshot();
   assert.equal(snap.tasks[0].status, "downloading");
@@ -2019,7 +2019,7 @@ test("[PR-C 2] Zero-<all_urls> native chrome.downloads.download lifecycle (compl
   assert.equal(snap.tasks[0].status, "completed");
   assert.equal(snap.tasks[0].percent, 100);
   assert.equal(snap.tasks[0].chromeDownloadId, env.downloadCalls[0].id);
-  assert.ok(snap.savedWorkFingerprints.includes("tiktok:7123456789"));
+  assert.ok(snap.savedWorkFingerprints.includes("twitch:2123456789"));
   assert.equal(
     offscreenMessages.some((m) => m.type === "RELEASE_BLOB"),
     false,
@@ -2511,7 +2511,7 @@ test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classific
     modelValue: [
       "https://www.bilibili.com/video/BV1uv411q7Mv",
       "https://vimeo.com/987654",
-      "https://www.tiktok.com/@creator/video/7123456789",
+      "https://www.twitch.tv/videos/2123456789",
       "chrome://extensions",
       "http://localhost/admin",
     ].join("\n"),
@@ -2526,7 +2526,7 @@ test("[PR-C 3] UI & Selection: formatPlatformDisplayName, deliveryMode classific
     assert.ok(text.includes("识别有效链接 3 条"));
     assert.ok(text.includes("B站 ×1"));
     assert.ok(text.includes("vimeo.com ×1"));
-    assert.ok(text.includes("tiktok.com ×1"));
+    assert.ok(text.includes("twitch.tv ×1"));
     assert.ok(text.includes("已忽略 2 行无关内容"));
   } finally {
     batchView.unmount();

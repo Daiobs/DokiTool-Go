@@ -23,12 +23,9 @@ type platformTrait struct {
 	// normalizing or serving overlong inputs from a warm entry.
 	strictInput2048 bool
 	// disableParseCache excludes platforms whose responses carry requester-bound
-	// or channel-dependent artifacts:
-	//   - weibo: mints HMAC-signed /api/media/weibo?ticket=... relay tickets (and
-	//     differs between anonymous visitors and owner-token callers).
-	// Note: youtube is allowed into parseCache with a short, dynamically configurable
-	// TTL (cache.youtube_parse_ttl, default 120s; 0s disables YouTube caching) while
-	// /api/youtube/context and /api/youtube/finalize remain outside parseCache.
+	// or channel-dependent artifacts.
+	// Note: weibo now emits channel-invariant direct URLs (browser_fetch=blocked)
+	// and enters parseCache + singleflight; youtube uses cache.youtube_parse_ttl.
 	disableParseCache bool
 	// shanghaiFallbackShortTTL caps OK parseCache TTL at shanghaiFallbackCacheTTL
 	// (15s) when a Shanghai-enabled platform degraded to overseas fallback so the
@@ -41,9 +38,9 @@ type platformTrait struct {
 	// canonical HTTPS host when building parseCache keys.
 	canonicalHTTPSHosts map[string]string
 	// normalizeCacheURL optionally canonicalizes equivalent post/reel path shapes
-	// (e.g. Instagram shortlinks); when handled is false, canonicalHTTPSHosts
-	// fallback is applied automatically.
-	normalizeCacheURL func(source string) (scheme, host, escapedPath string, handled bool)
+	// (e.g. Instagram shortlinks, Pinterest regional Pin links); when dropQuery is
+	// true, tracking query parameters are dropped on canonical match.
+	normalizeCacheURL func(source string) (scheme, host, escapedPath string, dropQuery, handled bool)
 }
 
 // PlatformGeneric is the internal Tier-2 routing and API-key scope sentinel
@@ -52,13 +49,31 @@ type platformTrait struct {
 // data.platform in unified-v1 responses.
 const PlatformGeneric = "ytdlp_generic"
 
-func normalizeInstagramCacheURL(source string) (string, string, string, bool) {
+func normalizeInstagramCacheURL(source string) (string, string, string, bool, bool) {
 	if _, canonical, ok := urlpolicy.ExtractInstagramPostTarget(source); ok {
 		if cu, parseErr := url.Parse(canonical); parseErr == nil {
-			return "https", "www.instagram.com", cu.EscapedPath(), true
+			return "https", "www.instagram.com", cu.EscapedPath(), false, true
 		}
 	}
-	return "", "", "", false
+	return "", "", "", false, false
+}
+
+func normalizePinterestCacheURL(source string) (string, string, string, bool, bool) {
+	if pinID, canonical, isShortLink, ok := urlpolicy.ExtractPinterestPinTarget(source); ok && !isShortLink && pinID != "" {
+		if cu, parseErr := url.Parse(canonical); parseErr == nil {
+			return "https", "www.pinterest.com", cu.EscapedPath(), true, true
+		}
+	}
+	return "", "", "", false, false
+}
+
+func normalizeTikTokCacheURL(source string) (string, string, string, bool, bool) {
+	if itemID, canonical, isShortLink, ok := urlpolicy.ExtractTikTokItemTarget(source); ok && !isShortLink && itemID != "" {
+		if cu, parseErr := url.Parse(canonical); parseErr == nil {
+			return "https", "www.tiktok.com", cu.EscapedPath(), true, true
+		}
+	}
+	return "", "", "", false, false
 }
 
 var platformTraits = map[string]platformTrait{
@@ -68,8 +83,11 @@ var platformTraits = map[string]platformTrait{
 	"bilibili": {
 		shanghaiFallbackShortTTL: true,
 	},
-	"weibo": {
-		disableParseCache: true,
+	"pinterest": {
+		normalizeCacheURL: normalizePinterestCacheURL,
+	},
+	"tiktok": {
+		normalizeCacheURL: normalizeTikTokCacheURL,
 	},
 	"x": {
 		slowEngine:      true,
@@ -132,15 +150,15 @@ func traitsForPlatform(platform string) platformTrait {
 	return platformTraits[platform]
 }
 
-func normalizePlatformCacheURL(platform, source, scheme, host, escapedPath string) (string, string, string) {
+func normalizePlatformCacheURL(platform, source, scheme, host, escapedPath string) (string, string, string, bool) {
 	traits := traitsForPlatform(platform)
 	if traits.normalizeCacheURL != nil {
-		if s, h, p, ok := traits.normalizeCacheURL(source); ok {
-			return s, h, p
+		if s, h, p, dropQuery, ok := traits.normalizeCacheURL(source); ok {
+			return s, h, p, dropQuery
 		}
 	}
 	if canonicalHost, ok := traits.canonicalHTTPSHosts[host]; ok {
-		return "https", canonicalHost, escapedPath
+		return "https", canonicalHost, escapedPath, false
 	}
-	return scheme, host, escapedPath
+	return scheme, host, escapedPath, false
 }

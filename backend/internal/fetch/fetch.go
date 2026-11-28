@@ -31,6 +31,7 @@ var (
 )
 
 type Policy struct {
+	Platform           string
 	Purpose            string
 	AllowedURL         func(string) bool
 	RewriteRedirect    func(string) string
@@ -102,8 +103,10 @@ type dnsCacheEntry struct {
 }
 
 type Client struct {
-	resolver  Resolver
-	transport roundTrip
+	resolver       Resolver
+	transport      roundTrip
+	proxyProvider  ProxyProvider
+	proxyTransport proxyRoundTripFunc
 
 	dial           func(context.Context, string, string) (net.Conn, error)
 	tlsRootCAs     *x509.CertPool
@@ -395,16 +398,36 @@ func (c *Client) Do(parent context.Context, in Request) (Response, error) {
 		if err != nil || !p.AllowedURL(current) {
 			return Response{}, ErrPolicy
 		}
-		ips, err := c.lookupPublicIPs(ctx, u.Hostname())
+		proxyURL, err := c.resolveProxy(ctx, p)
 		if err != nil {
 			return Response{}, err
+		}
+		var ips []netip.Addr
+		if proxyURL != nil {
+			if p.FollowRedirects || p.StrictMediaHeaders || p.PartialMediaOnly || !isAllowedProxyTargetHost(u.Hostname()) {
+				return Response{}, ErrPolicy
+			}
+		} else {
+			ips, err = c.lookupPublicIPs(ctx, u.Hostname())
+			if err != nil {
+				return Response{}, err
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, current, bytes.NewReader(body))
 		if err != nil {
 			return Response{}, err
 		}
 		req.Header = headers.Clone()
-		response, err := c.transport(req, ips, p)
+		var response *http.Response
+		if proxyURL != nil {
+			pt := c.proxyTransport
+			if pt == nil {
+				pt = c.standardProxyRoundTrip
+			}
+			response, err = pt(req, proxyURL, p)
+		} else {
+			response, err = c.transport(req, ips, p)
+		}
 		if err != nil {
 			return Response{}, err
 		}
@@ -506,6 +529,57 @@ func (c *Client) dialer() func(context.Context, string, string) (net.Conn, error
 	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext
 }
 
+type dialTimeoutKey struct{}
+
+const (
+	defaultSingleIPDialTimeout = 5 * time.Second
+	defaultMultiIPDialTimeout  = 2 * time.Second
+	minMultiIPDialTimeout      = 500 * time.Millisecond
+)
+
+func orderIPv4First(ips []netip.Addr) []netip.Addr {
+	if len(ips) == 0 {
+		return nil
+	}
+	ordered := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		if ip.Is4() {
+			ordered = append(ordered, ip)
+		}
+	}
+	for _, ip := range ips {
+		if !ip.Is4() {
+			ordered = append(ordered, ip)
+		}
+	}
+	return ordered
+}
+
+func perIPDialTimeout(ctx context.Context, ipCount int) time.Duration {
+	if ipCount <= 1 {
+		return defaultSingleIPDialTimeout
+	}
+	limit := defaultMultiIPDialTimeout
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return 0
+			}
+			if rem < minMultiIPDialTimeout {
+				return rem
+			}
+			if half := rem / 2; half < limit {
+				if half < minMultiIPDialTimeout {
+					return minMultiIPDialTimeout
+				}
+				return half
+			}
+		}
+	}
+	return limit
+}
+
 // pooledRoundTrip reuses Keep-Alive connections strictly within the same
 // (lowercaseHost, port, verifiedIP) boundary after Do has resolved DNS and
 // checked PublicIP on every hop. StrictMediaHeaders stays unpooled so raw wire
@@ -546,9 +620,13 @@ func (c *Client) pooledRoundTrip(req *http.Request, ips []netip.Addr, policy Pol
 		if err := req.Context().Err(); err != nil {
 			return nil, err
 		}
-		attempt := req
-		if i > 0 {
-			attempt = req.Clone(req.Context())
+		dialTimeout := perIPDialTimeout(req.Context(), len(orderedIPs)-i)
+		attemptCtx := context.WithValue(req.Context(), dialTimeoutKey{}, dialTimeout)
+		var attempt *http.Request
+		if i == 0 {
+			attempt = req.WithContext(attemptCtx)
+		} else {
+			attempt = req.Clone(attemptCtx)
 			if req.GetBody != nil {
 				bodyCopy, err := req.GetBody()
 				if err != nil {
@@ -575,13 +653,14 @@ func (c *Client) pooledRoundTrip(req *http.Request, ips []netip.Addr, policy Pol
 }
 
 func (c *Client) preferPooledIP(lowerHost, port string, ips []netip.Addr) []netip.Addr {
-	if len(ips) <= 1 {
-		return ips
+	ordered := orderIPv4First(ips)
+	if len(ordered) <= 1 {
+		return ordered
 	}
 	c.poolMu.Lock()
 	hitIdx := -1
 	if c.pool != nil {
-		for i, ip := range ips {
+		for i, ip := range ordered {
 			key := transportKey{host: lowerHost, port: port, ip: ip.String()}
 			if elem, ok := c.pool[key]; ok {
 				c.poolLRU.MoveToFront(elem)
@@ -592,13 +671,13 @@ func (c *Client) preferPooledIP(lowerHost, port string, ips []netip.Addr) []neti
 	}
 	c.poolMu.Unlock()
 	if hitIdx <= 0 {
-		return ips
+		return ordered
 	}
-	ordered := make([]netip.Addr, 0, len(ips))
-	ordered = append(ordered, ips[hitIdx])
-	ordered = append(ordered, ips[:hitIdx]...)
-	ordered = append(ordered, ips[hitIdx+1:]...)
-	return ordered
+	promoted := make([]netip.Addr, 0, len(ordered))
+	promoted = append(promoted, ordered[hitIdx])
+	promoted = append(promoted, ordered[:hitIdx]...)
+	promoted = append(promoted, ordered[hitIdx+1:]...)
+	return promoted
 }
 
 func (c *Client) pooledTransport(lowerHost, port string, ip netip.Addr) *http.Transport {
@@ -652,7 +731,11 @@ func (c *Client) newPooledTransport(lowerHost, port string, verifiedIP netip.Add
 		if err != nil || !strings.EqualFold(dialHost, lowerHost) || dialPort != port {
 			return nil, ErrPolicy
 		}
-		boundCtx, cancel := context.WithTimeout(dialCtx, 5*time.Second)
+		timeout := defaultSingleIPDialTimeout
+		if v, ok := dialCtx.Value(dialTimeoutKey{}).(time.Duration); ok && v >= 0 {
+			timeout = v
+		}
+		boundCtx, cancel := context.WithTimeout(dialCtx, timeout)
 		defer cancel()
 		conn, err := dial(boundCtx, "tcp", pinnedAddr)
 		if err != nil {
@@ -713,16 +796,30 @@ func roundTripWithDialAndRoots(req *http.Request, ips []netip.Addr, policy Polic
 			port = "80"
 		}
 	}
+	orderedIPs := orderIPv4First(ips)
 	dialPinned := func(ctx context.Context, network, address string) (net.Conn, error) {
 		wanted := net.JoinHostPort(host, port)
 		if address != wanted {
 			return nil, ErrPolicy
 		}
 		var last error
-		for _, ip := range ips {
+		for i, ip := range orderedIPs {
+			if err := req.Context().Err(); err != nil {
+				return nil, err
+			}
 			// net/http may detach its dial context for connection reuse. These
 			// per-request transports instead share the original request budget.
-			conn, err := dial(req.Context(), "tcp", net.JoinHostPort(ip.String(), port))
+			// When multiple candidate IPs remain, apply a bounded per-IP dial
+			// sub-timeout so one blackholed IP cannot exhaust the whole budget.
+			dialCtx := req.Context()
+			var cancel context.CancelFunc
+			if remaining := len(orderedIPs) - i; remaining > 1 {
+				dialCtx, cancel = context.WithTimeout(req.Context(), perIPDialTimeout(req.Context(), remaining))
+			}
+			conn, err := dial(dialCtx, "tcp", net.JoinHostPort(ip.String(), port))
+			if cancel != nil {
+				cancel()
+			}
 			if err == nil {
 				return bindRequestConnection(req.Context(), conn), nil
 			}

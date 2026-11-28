@@ -652,10 +652,6 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 	if err != nil {
 		return tierResult{}, err
 	}
-	mediaSigningKey, err := randomHex(32)
-	if err != nil {
-		return tierResult{}, err
-	}
 	runtimeOwnerToken, err := randomHex(32)
 	if err != nil {
 		return tierResult{}, err
@@ -926,17 +922,15 @@ func runTier(cfg config, targetRPS float64) (tierResult, error) {
 		"tumblr":      slowAdapter("tumblr"),
 	}
 
-	var weiboMedia api.PublicMedia
-	if enableOwnerChannel {
-		weiboMedia = weiboplatform.PreparePublicWithOwner(mediaSigningKey, api.IsOwnerRequest)
-	} else {
-		weiboMedia = weiboplatform.PreparePublic(mediaSigningKey)
-	}
 	publicMedia := func(ctx context.Context, platform string, payload unified.Object, now int64) (unified.Object, error) {
-		if platform == "bilibili" {
+		switch platform {
+		case "bilibili":
 			return bilibili.PreparePublic(ctx, platform, payload, now)
+		case "weibo":
+			return weiboplatform.PreparePublic(ctx, platform, payload, now)
+		default:
+			return payload, nil
 		}
-		return weiboMedia(ctx, platform, payload, now)
 	}
 
 	handler, err := api.NewWithCacheConfig(cat, adapters, time.Now, publicMedia, cacheCfg)

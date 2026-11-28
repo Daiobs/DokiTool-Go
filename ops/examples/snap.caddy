@@ -10,7 +10,7 @@
 snap.example.com {
     @api path /api/downloads/tbvideo-result /api/parse /api/resolve /api/platforms /api/short_videos /api/douyin /api/ksjx /api/bilibili /api/xhsjx /api/toutiao /api/youtube/context /api/youtube/finalize /api/stats
     @shanghai path /internal/shanghai/claim /internal/shanghai/result
-    @compress not path /api/media/weibo /internal/shanghai/claim /internal/shanghai/result
+    @compress not path /internal/shanghai/claim /internal/shanghai/result
     @source path *.php /backend/* /internal/* /ops/* /.git/* /.env*
     # Preserve ordering: Caddy otherwise sorts handle before route.
     route {
@@ -48,18 +48,6 @@ snap.example.com {
     header @no_store_static -ETag
     header @no_store_static -Last-Modified
 
-    # Exact signed-media endpoint: Go streaming relay, no response buffering/compression.
-    handle /api/media/weibo {
-        reverse_proxy 127.0.0.1:9080 {
-            flush_interval -1
-            header_up X-DokiTool-Client-IP {remote_host}
-            header_up X-DokiTool-Edge-Key {env.SNAP_INGRESS_KEY}
-            transport http {
-                read_timeout 310s
-                write_timeout 310s
-            }
-        }
-    }
     handle @api {
         reverse_proxy 127.0.0.1:9080 {
             header_up X-DokiTool-Client-IP {remote_host}

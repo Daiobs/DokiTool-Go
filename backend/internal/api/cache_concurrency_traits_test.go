@@ -197,8 +197,9 @@ func TestUncachedParseAndResolveRecoverPanicsWithoutLeak(t *testing.T) {
 	if snapEnabled.Requests.ByChannel.Anonymous != 6 || snapEnabled.Requests.ByChannel.Owner != 1 {
 		t.Fatalf("unexpected channel breakdown: %+v", snapEnabled.Requests.ByChannel)
 	}
-	if snapEnabled.Cache.Total.Uncacheable != uint64(len(enabledCases)) {
-		t.Fatalf("Cache.Total.Uncacheable = %d, want %d", snapEnabled.Cache.Total.Uncacheable, len(enabledCases))
+	// 2x youtube (YouTubeParseTTL=0) + 2x overlong-x = 4 uncacheable; 3x weibo now enter parseCache.
+	if snapEnabled.Cache.Total.Uncacheable != 4 {
+		t.Fatalf("Cache.Total.Uncacheable = %d, want 4", snapEnabled.Cache.Total.Uncacheable)
 	}
 	logMu.Lock()
 	enabledLogs := append([]string(nil), panicLogs...)
@@ -503,12 +504,10 @@ func TestParseCacheTieredTTLAndShanghaiDegradedFallbackCap(t *testing.T) {
 
 func TestPlatformTraitsTableConsolidation(t *testing.T) {
 	// 1. Cacheability driven by platformTraits.disableParseCache
-	for _, uncacheable := range []string{"", "weibo"} {
-		if cacheablePlatform(uncacheable) {
-			t.Fatalf("cacheablePlatform(%q) = true, want false", uncacheable)
-		}
+	if cacheablePlatform("") {
+		t.Fatalf("cacheablePlatform(%q) = true, want false", "")
 	}
-	for _, cacheable := range []string{"douyin", "bilibili", "xiaohongshu", "x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
+	for _, cacheable := range []string{"douyin", "bilibili", "weibo", "xiaohongshu", "pinterest", "tiktok", "x", "youtube", "instagram", "facebook", "tumblr", PlatformGeneric} {
 		if !cacheablePlatform(cacheable) {
 			t.Fatalf("cacheablePlatform(%q) = false, want true", cacheable)
 		}
@@ -565,11 +564,9 @@ func TestPlatformTraitsTableConsolidation(t *testing.T) {
 
 // TestChannelDependentPublicMediaMustDisableParseCache is a mandatory safety guard
 // preventing any platform whose PublicMedia output varies between anonymous visitors
-// and authenticated owner/agent callers (currently weibo) from ever sharing parseCache.
+// and authenticated owner/agent callers from ever sharing parseCache.
 func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 	const now int64 = 1793448000
-	signingKey := strings.Repeat("k", 64)
-	weiboPrep := weiboplatform.PreparePublicWithOwner(signingKey, IsOwnerRequest)
 	prepareAll := func(ctx context.Context, platform string, payload unified.Object, ts int64) (unified.Object, error) {
 		switch platform {
 		case "douyin":
@@ -584,8 +581,10 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 			return pipixia.PreparePublic(ctx, platform, payload, ts)
 		case "zuiyou":
 			return zuiyou.PreparePublic(ctx, platform, payload, ts)
+		case "weibo":
+			return weiboplatform.PreparePublic(ctx, platform, payload, ts)
 		default:
-			return weiboPrep(ctx, platform, payload, ts)
+			return payload, nil
 		}
 	}
 
@@ -602,6 +601,8 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 		"pipigx":      {"https://h5.pipigx.com/pp/post/12345", "https://file.ippzone.com/video/demo.mp4"},
 		"zuiyou":      {"https://share.xiaochuankeji.cn/hybrid/share/post?pid=12345", "https://tbvideo.ixiaochuan.cn/zyvd/demo.mp4"},
 		"xiaohongshu": {"https://www.xiaohongshu.com/explore/66a1b2c3d4e5f6a7b8c9d0e1", "http://sns-video-bd.xhscdn.com/stream/demo.mp4"},
+		"pinterest":   {"https://www.pinterest.com/pin/858146903966145191/", "https://v1.pinimg.com/videos/mc/720p/aa/bb/demo.mp4"},
+		"tiktok":      {"https://www.tiktok.com/@demo/video/7345678901234567890", "https://v16-web-newkey.tiktokcdn.com/demo/video.mp4"},
 		"x":           {"https://x.com/user/status/1800000000000000001", "https://video.twimg.com/ext_tw_video/1/pu/vid/avc1/demo.mp4"},
 		"youtube":     {"https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://rr1---sn-npoe7n7r.googlevideo.com/videoplayback?itag=18"},
 		"instagram":   {"https://www.instagram.com/reel/C123456/", "https://scontent.cdninstagram.com/v/demo.mp4"},
@@ -611,7 +612,6 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 
 	anonCtx := context.Background()
 	ownerCtx := WithOwnerRequest(context.Background())
-	weiboVaried := false
 
 	for i := 0; i < numCorePlatforms; i++ {
 		plat := knownPlatforms[i]
@@ -647,14 +647,40 @@ func TestChannelDependentPublicMediaMustDisableParseCache(t *testing.T) {
 		}
 
 		variesByChannel := !bytes.Equal(anonBytes, ownerBytes)
-		if plat == "weibo" {
-			weiboVaried = variesByChannel
-		}
 		if variesByChannel && !traitsForPlatform(plat).disableParseCache {
 			t.Fatalf("SECURITY INVARIANT VIOLATION: platform %q PublicMedia output varies with IsOwnerRequest(ctx), MUST set disableParseCache=true in platformTraits!", plat)
 		}
 	}
-	if !weiboVaried {
-		t.Fatal("regression test sanity check failed: weibo PublicMedia did not differ between anonymous and owner")
+	if traitsForPlatform("weibo").disableParseCache {
+		t.Fatal("weibo now emits channel-invariant direct URLs and must allow parseCache")
+	}
+}
+
+func TestPinterestCacheURLNormalization(t *testing.T) {
+	want := normalizeCacheURL("pinterest", "https://www.pinterest.com/pin/858146903966145191/")
+	variants := []string{
+		"https://jp.pinterest.com/pin/858146903966145191/sent/?invite_code=abc",
+		"https://www.pinterest.ca/pin/cool-slug--858146903966145191/",
+		"http://pinterest.co.uk/pin/858146903966145191",
+	}
+	for _, raw := range variants {
+		if got := normalizeCacheURL("pinterest", raw); got != want {
+			t.Fatalf("normalizeCacheURL(pinterest, %q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestTikTokCacheURLNormalization(t *testing.T) {
+	want := normalizeCacheURL("tiktok", "https://www.tiktok.com/@i/video/7345678901234567890")
+	variants := []string{
+		"https://www.tiktok.com/@creator/video/7345678901234567890?is_from_webapp=1",
+		"https://www.tiktok.com/@creator/photo/7345678901234567890?sender_device=pc",
+		"https://www.tiktok.com/share/video/7345678901234567890",
+		"https://m.tiktok.com/v/7345678901234567890.html",
+	}
+	for _, raw := range variants {
+		if got := normalizeCacheURL("tiktok", raw); got != want {
+			t.Fatalf("normalizeCacheURL(tiktok, %q) = %q, want %q", raw, got, want)
+		}
 	}
 }

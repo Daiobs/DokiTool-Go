@@ -29,6 +29,23 @@ type YouTubeHelperStatsSource interface {
 	HelperStatsSnapshot() apitelemetry.YouTubeHelperStats
 }
 
+// TikTokRiskStatsSnapshot is the stable HTTP /api/stats DTO for TikTok
+// anti-bot / WAF and play-302 telemetry, decoupled from internal/platform/tiktok.
+type TikTokRiskStatsSnapshot struct {
+	ProxyConfigured bool   `json:"proxy_configured"`
+	TransportMode   string `json:"transport_mode"`
+	HydrationOK     uint64 `json:"hydration_ok"`
+	WAFBlocked      uint64 `json:"waf_blocked"`
+	ContentNotFound uint64 `json:"content_not_found"`
+	Play302OK       uint64 `json:"play_302_ok"`
+	Play302Failed   uint64 `json:"play_302_failed"`
+}
+
+// TikTokRiskStatsSource provides a point-in-time redacted TikTok risk telemetry snapshot.
+type TikTokRiskStatsSource interface {
+	TikTokRiskStatsSnapshot() apitelemetry.TikTokRiskStats
+}
+
 // HistogramBuckets is the stable HTTP /api/stats cumulative millisecond histogram DTO.
 type HistogramBuckets struct {
 	LE10    uint64 `json:"<=10"`
@@ -130,6 +147,22 @@ func toAPIYouTubeHelperStats(in apitelemetry.YouTubeHelperStats) YouTubeHelperSt
 		ChallengeLRUEntries: in.ChallengeLRUEntries,
 		ChallengeLRUHits:    in.ChallengeLRUHits,
 		ChallengeLRUMisses:  in.ChallengeLRUMisses,
+	}
+}
+
+func toAPITikTokRiskStats(in apitelemetry.TikTokRiskStats) TikTokRiskStatsSnapshot {
+	mode := "standard"
+	if in.TransportMode == "chrome131" {
+		mode = "chrome131"
+	}
+	return TikTokRiskStatsSnapshot{
+		ProxyConfigured: in.ProxyConfigured,
+		TransportMode:   mode,
+		HydrationOK:     in.HydrationOK,
+		WAFBlocked:      in.WAFBlocked,
+		ContentNotFound: in.ContentNotFound,
+		Play302OK:       in.Play302OK,
+		Play302Failed:   in.Play302Failed,
 	}
 }
 

@@ -107,7 +107,7 @@ func TestStatsBoundedPlatformCodeChannelMatrix(t *testing.T) {
 	hostilePlatform := "attacker_plat_" + randomPrintableToken(t, 12)
 	hostileURL := "https://evil.example.org/watch?v=" + randomPrintableToken(t, 16)
 
-	if len(KnownPlatforms()) != 15 || len(KnownOutcomeCodes()) != 13 {
+	if len(KnownPlatforms()) != numPlatforms || len(KnownOutcomeCodes()) != 13 {
 		t.Fatalf("unexpected closed vocabulary sizes: platforms=%d codes=%d", len(KnownPlatforms()), len(KnownOutcomeCodes()))
 	}
 	if NormalizePlatform(hostilePlatform) != PlatformUnknown {
@@ -680,9 +680,9 @@ func TestStatsCacheSingleflightShanghaiAndAdmissionQueues(t *testing.T) {
 	if !snap.Cache.Enabled || snap.Cache.Entries == 0 || snap.Cache.Bytes <= 0 {
 		t.Fatalf("expected populated cache occupancy, got %+v", snap.Cache)
 	}
-	if snap.Cache.ByChannel.Anonymous.Hits != 1 || snap.Cache.ByChannel.Owner.Hits != 1 ||
+	if snap.Cache.ByChannel.Anonymous.Hits != 1 || snap.Cache.ByChannel.Owner.Hits != 2 ||
 		snap.Cache.ByChannel.Owner.SingleflightShared != 1 ||
-		snap.Cache.ByChannel.Anonymous.Uncacheable != 1 || snap.Cache.ByChannel.Owner.Uncacheable != 1 {
+		snap.Cache.ByChannel.Anonymous.Uncacheable != 0 || snap.Cache.ByChannel.Owner.Uncacheable != 0 {
 		t.Fatalf("unexpected cache breakdown: %+v", snap.Cache)
 	}
 
@@ -1502,12 +1502,12 @@ func TestStatsShanghaiHitsDeltaSyncAndModeInference(t *testing.T) {
 }
 
 func TestStatsBoundedDynamicPlatformsAndClosedVocabularyPreserved(t *testing.T) {
-	// Verify KnownPlatforms & NormalizePlatform remain strictly unchanged (15 closed elements).
-	if len(KnownPlatforms()) != 15 {
-		t.Fatalf("KnownPlatforms() len = %d, want 15", len(KnownPlatforms()))
+	// Verify KnownPlatforms & NormalizePlatform remain strictly closed-set (16 core + unknown).
+	if len(KnownPlatforms()) != numPlatforms {
+		t.Fatalf("KnownPlatforms() len = %d, want %d", len(KnownPlatforms()), numPlatforms)
 	}
 	if NormalizePlatform("vimeo") != PlatformUnknown || NormalizePlatform(PlatformYTDLPOther) != PlatformUnknown {
-		t.Fatal("NormalizePlatform must remain strictly closed-set (14 core + unknown)")
+		t.Fatal("NormalizePlatform must remain strictly closed-set (15 core + unknown)")
 	}
 
 	// Validate IsValidDynamicPlatformKey edge cases.
@@ -2148,10 +2148,10 @@ func TestStatsSnapshotExtendedPoolsCircuitBreakersAndRuntimePolicy(t *testing.T)
 	// 1. Nil and freshly initialized Stats emit valid non-nil circuit_breakers (14 core platforms),
 	//    runtime_policy (non-nil disabled_platforms []), ytdlp_pools, and cache.stale_hits.
 	nilSnap := (*Stats)(nil).Snapshot()
-	if len(nilSnap.CircuitBreakers) != 14 {
-		t.Fatalf("nil Stats CircuitBreakers len = %d, want 14", len(nilSnap.CircuitBreakers))
+	if len(nilSnap.CircuitBreakers) != numCorePlatforms {
+		t.Fatalf("nil Stats CircuitBreakers len = %d, want %d", len(nilSnap.CircuitBreakers), numCorePlatforms)
 	}
-	for i := 0; i < 14; i++ {
+	for i := 0; i < numCorePlatforms; i++ {
 		if nilSnap.CircuitBreakers[i].Platform != knownPlatforms[i] || nilSnap.CircuitBreakers[i].State != CircuitStateClosed {
 			t.Fatalf("nil Stats CircuitBreakers[%d] = %+v", i, nilSnap.CircuitBreakers[i])
 		}
@@ -2232,8 +2232,8 @@ func TestStatsSnapshotExtendedPoolsCircuitBreakersAndRuntimePolicy(t *testing.T)
 	if !snap.YTDLPPools.YouTubeEJS.Enabled || snap.YTDLPPools.YouTubeEJS.ConcurrencyLimit != 8 {
 		t.Fatalf("unexpected ytdlp_pools.youtube_ejs: %+v", snap.YTDLPPools.YouTubeEJS)
 	}
-	if len(snap.CircuitBreakers) != 14 {
-		t.Fatalf("circuit_breakers len = %d, want 14", len(snap.CircuitBreakers))
+	if len(snap.CircuitBreakers) != numCorePlatforms {
+		t.Fatalf("circuit_breakers len = %d, want %d", len(snap.CircuitBreakers), numCorePlatforms)
 	}
 	igIdx := corePlatformIndex("instagram")
 	if snap.CircuitBreakers[igIdx].Platform != "instagram" ||

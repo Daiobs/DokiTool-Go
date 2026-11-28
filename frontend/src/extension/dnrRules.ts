@@ -15,6 +15,7 @@ export const EXTENSION_DNR_RULE_IDS = [
   1006,
   1007,
   1008,
+  1009,
 ] as const;
 
 export type DnrResourceType = "xmlhttprequest" | "media" | "image";
@@ -63,6 +64,13 @@ const RULE_1004_BILIBILI_DOMAINS = [
   "hdslb.com",
 ] as const;
 
+const RULE_1009_TIKTOK_DOMAINS = [
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "tiktokcdn-eu.com",
+  "tiktokv.com",
+] as const;
+
 /**
  * Narrow Bilibili overseas Akamai UPOS matchers (Guardrail G1).
  * Kept strictly isomorphic with `isBilibiliAkamaiMediaUrl` in
@@ -91,6 +99,7 @@ const SPECIALIZED_RULE_DOMAINS = new Set<string>([
   ...RULE_1002_YOUTUBE_DOMAINS,
   ...RULE_1003_WEIBO_DOMAINS,
   ...RULE_1004_BILIBILI_DOMAINS,
+  ...RULE_1009_TIKTOK_DOMAINS,
 ]);
 
 export interface BuildExtensionDnrRulesOptions {
@@ -261,5 +270,26 @@ export function buildExtensionDnrRules(
         },
       }),
     ),
+    {
+      id: 1009,
+      priority: 2,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          {
+            header: "Referer",
+            operation: "set",
+            value: "https://www.tiktok.com/",
+          },
+          { header: "Origin", operation: "remove" },
+          { header: "Cookie", operation: "remove" },
+        ],
+      },
+      condition: {
+        initiatorDomains: [extensionId],
+        requestDomains: [...RULE_1009_TIKTOK_DOMAINS],
+        resourceTypes: ["xmlhttprequest", "media", "image"],
+      },
+    },
   ];
 }
