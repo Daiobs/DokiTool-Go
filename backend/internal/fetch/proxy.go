@@ -246,7 +246,6 @@ func (c *Client) standardProxyRoundTrip(req *http.Request, proxyURL *url.URL, po
 		MaxResponseHeaderBytes: policy.MaxHeaderBytes,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
-			ServerName: req.URL.Hostname(),
 			RootCAs:    c.tlsRootCAs,
 		},
 		DialContext: c.dialer(),

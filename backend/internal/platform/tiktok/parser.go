@@ -189,6 +189,7 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 		URL:    canonicalURL,
 		Header: headers,
 		Policy: fetch.Policy{
+			Platform:        "tiktok",
 			Purpose:         "tiktok-page",
 			AllowedURL:      fetch.AllowHosts("www.tiktok.com"),
 			Timeout:         hydrationTimeout,
@@ -218,6 +219,9 @@ func (p *Parser) Parse(ctx context.Context, source string, now int64) (unified.O
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 		p.wafBlocked.Add(1)
 		return unified.ContractError("UPSTREAM_BLOCKED", "TikTok 当前触发访问验证，请稍后重试", true), nil
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return unified.ContractError("UPSTREAM_UNAVAILABLE", "TikTok 上游服务暂时不可用，请稍后重试", true), nil
 	}
 
 	detail, found, parseErr := parseVideoDetailFromHTML(resp.Body)
@@ -293,6 +297,7 @@ func (p *Parser) resolveShortLink(ctx context.Context, rawSource, startURL strin
 			URL:    current,
 			Header: headers,
 			Policy: fetch.Policy{
+				Platform:        "tiktok",
 				Purpose:         "tiktok-shortlink",
 				AllowedURL:      shortlinkAllowedHosts,
 				Timeout:         shortlinkTimeout,
@@ -309,6 +314,22 @@ func (p *Parser) resolveShortLink(ctx context.Context, rawSource, startURL strin
 			}
 			return "", "", unified.ContractError("UPSTREAM_UNAVAILABLE", "TikTok 短链解析失败，请稍后重试", true), nil
 		}
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+			unified.MarkCallerScopedFailure(ctx)
+			p.contentNotFound.Add(1)
+			return "", "", unified.ContractError("CONTENT_UNAVAILABLE", "该 TikTok 分享短链已失效或作品不可见", false), nil
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			p.wafBlocked.Add(1)
+			return "", "", unified.ContractError("UPSTREAM_BLOCKED", "TikTok 当前触发访问验证，请稍后重试", true), nil
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			p.wafBlocked.Add(1)
+			return "", "", unified.ContractError("RATE_LIMITED", "TikTok 短链请求过于频繁，请稍后重试", true), nil
+		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			return "", "", unified.ContractError("UPSTREAM_UNAVAILABLE", "TikTok 短链上游服务暂时不可用，请稍后重试", true), nil
+		}
 		if resp.StatusCode != http.StatusMovedPermanently &&
 			resp.StatusCode != http.StatusFound &&
 			resp.StatusCode != http.StatusSeeOther &&
@@ -316,7 +337,11 @@ func (p *Parser) resolveShortLink(ctx context.Context, rawSource, startURL strin
 			resp.StatusCode != http.StatusPermanentRedirect {
 			break
 		}
-		loc := strings.TrimSpace(resp.Header.Get("Location"))
+		locs := resp.Header.Values("Location")
+		if len(locs) != 1 {
+			break
+		}
+		loc := strings.TrimSpace(locs[0])
 		if loc == "" {
 			break
 		}

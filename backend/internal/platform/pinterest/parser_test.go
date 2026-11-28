@@ -237,6 +237,29 @@ func TestPinterestPinItShortLinkResolutionAndCallerScopedFailure(t *testing.T) {
 		}
 	})
 
+	t.Run("shortlink-5xx-is-retryable-upstream-unavailable", func(t *testing.T) {
+		for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+			parser := New(stubExecutor(func(_ context.Context, req fetch.Request) (fetch.Response, error) {
+				return fetch.Response{StatusCode: status}, nil
+			}))
+			ctx, isCallerScoped := unified.WithCallerScopedFailureTracker(t.Context())
+			out, err := parser.Parse(ctx, "https://pin.it/serverErr1", now)
+			if err != nil {
+				t.Fatalf("status %d unexpected error: %v", status, err)
+			}
+			if unified.Str(out["code"]) != "UPSTREAM_UNAVAILABLE" {
+				t.Fatalf("status %d -> code = %v, want UPSTREAM_UNAVAILABLE", status, out["code"])
+			}
+			retry, _ := unified.Map(out["error"])["retryable"].(bool)
+			if !retry {
+				t.Errorf("status %d -> retryable = false, want true", status)
+			}
+			if isCallerScoped() {
+				t.Errorf("status %d -> must NOT mark caller-scoped failure", status)
+			}
+		}
+	})
+
 	t.Run("upstream-status-mapping", func(t *testing.T) {
 		for _, tc := range []struct {
 			status    int

@@ -194,6 +194,9 @@ func (p *Parser) resolveShortLink(ctx context.Context, startURL string) (string,
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return "", "", unified.ContractError("RATE_LIMITED", "Pinterest 请求过于频繁，请稍后重试", true), nil
 		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			return "", "", unified.ContractError("UPSTREAM_UNAVAILABLE", "Pinterest 短链上游服务暂时不可用，请稍后重试", true), nil
+		}
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			locs := resp.Header.Values("Location")
 			if len(locs) != 1 || strings.TrimSpace(locs[0]) == "" {

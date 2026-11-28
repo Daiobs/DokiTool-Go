@@ -9,6 +9,7 @@ import type {
   UnifiedMedia,
 } from "../../types/media";
 import {
+  getDownloadTarget,
   readyItem,
   readyVariant,
   resourceSource,
@@ -385,6 +386,7 @@ export function createPublicDownloadActions(deps: {
   snapshotItem: (item: MediaItem, choice?: MediaSelection | null) => ItemSnapshot;
   snapshotTarget?: (snapshot: ItemSnapshot, item: MediaItem) => DownloadTarget;
   isExtensionConnected?: () => Promise<boolean>;
+  onRequireExtension?: () => void;
   enqueueItem: (
     snapshot: ItemSnapshot,
     retryId?: number,
@@ -405,9 +407,50 @@ export function createPublicDownloadActions(deps: {
     snapshotItem,
     snapshotTarget,
     isExtensionConnected,
+    onRequireExtension,
     enqueueItem,
     archiveItems,
   } = deps;
+
+  function hasWebZipBlockedTarget(snapshots: ItemSnapshot[]): boolean {
+    return snapshots.some((s) => {
+      const t =
+        typeof snapshotTarget === "function"
+          ? snapshotTarget(s, s.item)
+          : getDownloadTarget(s.item, s.choice ?? null, apiContext);
+      if (t.kind !== "file") return false;
+      return (
+        t.source?.browser_fetch === "blocked" ||
+        isCorsBlockedDirectUrl(t.url) ||
+        t.routes.some((route) => isCorsBlockedDirectUrl(route))
+      );
+    });
+  }
+
+  async function handleWebZipBlockedBatch(
+    snapshots: ItemSnapshot[],
+  ): Promise<void> {
+    const extConnected = isExtensionConnected
+      ? await isExtensionConnected()
+      : false;
+    if (extConnected) {
+      showToast(
+        "受浏览器 CORS 或防盗链限制无法打包 ZIP，已改为通过扩展逐项下载",
+        "info",
+        4000,
+      );
+      for (const snapshot of snapshots) {
+        await enqueueItem(snapshot);
+      }
+      return;
+    }
+    showToast(
+      "该站点媒体受浏览器 CORS 或防盗链限制，暂不支持网页打包 ZIP；请逐项打开保存，或安装 DokiTool 扩展一键批量下载",
+      "warning",
+      5000,
+    );
+    onRequireExtension?.();
+  }
 
   async function downloadVideosAsZip(items: MediaItem[], zipName?: string) {
     if (!items.length) {
@@ -415,6 +458,10 @@ export function createPublicDownloadActions(deps: {
       return;
     }
     const snapshots = items.map((item) => snapshotItem(item));
+    if (hasWebZipBlockedTarget(snapshots)) {
+      await handleWebZipBlockedBatch(snapshots);
+      return;
+    }
     await archiveItems(
       snapshots,
       zipName || archiveFilenameFor(videoStore.resultData, snapshots),
@@ -550,31 +597,8 @@ export function createPublicDownloadActions(deps: {
       await enqueueItem(snapshots[0]);
       return;
     }
-    const hasCorsBlockedDirect =
-      typeof snapshotTarget === "function" &&
-      snapshots.some((s) => {
-        const t = snapshotTarget(s, s.item);
-        return (
-          t.kind === "file" &&
-          (isCorsBlockedDirectUrl(t.url) ||
-            t.routes.some((route) => isCorsBlockedDirectUrl(route)))
-        );
-      });
-    if (hasCorsBlockedDirect) {
-      const extConnected = isExtensionConnected
-        ? await isExtensionConnected()
-        : false;
-      if (extConnected) {
-        for (const snapshot of snapshots) {
-          await enqueueItem(snapshot);
-        }
-        return;
-      }
-      showToast(
-        "该站点图片受浏览器 CORS 限制，暂不支持网页打包 ZIP；请单张打开保存，或安装 DokiTool 扩展一键批量下载",
-        "warning",
-        5000,
-      );
+    if (hasWebZipBlockedTarget(snapshots)) {
+      await handleWebZipBlockedBatch(snapshots);
       return;
     }
     await archiveItems(

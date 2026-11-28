@@ -2,13 +2,16 @@ package fetch
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -199,4 +202,86 @@ type staticResolver struct {
 
 func (r staticResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
 	return r.ips, nil
+}
+
+func TestStandardHTTPSProxyConnectVerifiesOuterTLSCert(t *testing.T) {
+	var connectSeen atomic.Int32
+	var seenHost atomic.Value
+	proxySrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			connectSeen.Add(1)
+			seenHost.Store(r.Host)
+			http.Error(w, "connect-reached", http.StatusBadGateway)
+			return
+		}
+		http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+	}))
+	defer proxySrv.Close()
+
+	_, proxyPort, err := net.SplitHostPort(proxySrv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// httptest.NewTLSServer generates a certificate whose SAN includes "example.com"
+	// (distinct from the target "www.tiktok.com"), verifying outer TLS checks proxy host
+	// instead of overriding ServerName with req.URL.Hostname().
+	prov, err := NewEnvPlatformProxyProvider("https://example.com:" + proxyPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(proxySrv.Certificate())
+
+	client := New().WithProxyProvider(prov)
+	client.tlsRootCAs = rootPool
+	client.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, proxySrv.Listener.Addr().String())
+	}
+
+	_, reqErr := client.Do(context.Background(), Request{
+		Method: http.MethodGet,
+		URL:    "https://www.tiktok.com/@i/video/7123456789012345678",
+		Policy: Policy{
+			Platform:        "tiktok",
+			Purpose:         "tiktok-page",
+			AllowedURL:      AllowHosts("www.tiktok.com"),
+			Timeout:         5 * time.Second,
+			MaxBytes:        64 << 10,
+			FollowRedirects: false,
+		},
+	})
+	if reqErr == nil {
+		t.Fatal("expected error after proxy returned 502 on CONNECT")
+	}
+	if connectSeen.Load() != 1 {
+		t.Fatalf("expected outer HTTPS proxy TLS handshake to succeed and reach CONNECT once, got %d (err=%v)", connectSeen.Load(), reqErr)
+	}
+	if gotHost, _ := seenHost.Load().(string); gotHost != "www.tiktok.com:443" {
+		t.Fatalf("CONNECT target = %q, want www.tiktok.com:443", gotHost)
+	}
+
+	// Untrusted proxy certificate must still be rejected before reaching CONNECT.
+	untrustedClient := New().WithProxyProvider(prov)
+	untrustedClient.tlsRootCAs = x509.NewCertPool()
+	untrustedClient.dial = client.dial
+	_, untrustedErr := untrustedClient.Do(context.Background(), Request{
+		Method: http.MethodGet,
+		URL:    "https://www.tiktok.com/@i/video/7123456789012345678",
+		Policy: Policy{
+			Platform:        "tiktok",
+			Purpose:         "tiktok-page",
+			AllowedURL:      AllowHosts("www.tiktok.com"),
+			Timeout:         5 * time.Second,
+			MaxBytes:        64 << 10,
+			FollowRedirects: false,
+		},
+	})
+	if untrustedErr == nil {
+		t.Fatal("expected TLS verification failure for untrusted proxy cert")
+	}
+	if connectSeen.Load() != 1 {
+		t.Fatalf("untrusted proxy cert should fail before CONNECT, connectSeen=%d", connectSeen.Load())
+	}
 }

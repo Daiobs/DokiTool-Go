@@ -383,6 +383,7 @@ func (p *Parser) resolveSinglePlay302(ctx context.Context, playURL string) (stri
 		URL:    playURL,
 		Header: headers,
 		Policy: fetch.Policy{
+			Platform:        "tiktok",
 			Purpose:         "tiktok-play-302",
 			AllowedURL:      fetch.AllowHosts("www.tiktok.com"),
 			Timeout:         play302HopTimeout,
@@ -411,8 +412,11 @@ func (p *Parser) resolveSinglePlay302(ctx context.Context, playURL string) (stri
 
 // parseTikTokURLExpiry extracts RFC3339 expires_at from either:
 //  1. TikTok CDN hex path timestamp `/<32hex>/<8hex>/video/tos/...` when
-//     now+120 < exp < now+7*86400; or
-//  2. decimal `x-expires` query parameter when > now.
+//     now-86400 <= exp < now+7*86400; or
+//  2. decimal `x-expires` query parameter in [1_500_000_000, now+365*86400).
+//
+// Timestamp recognition is decoupled from current validity so expired and
+// near-expiry URLs retain expires_at for unified.SelectDefault and parseCache.
 func parseTikTokURLExpiry(rawURL string, now int64) string {
 	u, err := url.Parse(rawURL)
 	if err != nil || u == nil {
@@ -422,7 +426,8 @@ func parseTikTokURLExpiry(rawURL string, now int64) string {
 		return time.Unix(exp, 0).UTC().Format(time.RFC3339)
 	}
 	if q := u.Query().Get("x-expires"); q != "" {
-		if exp, parseErr := strconv.ParseInt(strings.TrimSpace(q), 10, 64); parseErr == nil && exp > now {
+		if exp, parseErr := strconv.ParseInt(strings.TrimSpace(q), 10, 64); parseErr == nil &&
+			exp >= 1_500_000_000 && exp < now+365*86400 {
 			return time.Unix(exp, 0).UTC().Format(time.RFC3339)
 		}
 	}
@@ -449,7 +454,7 @@ func parseHexPathExpiry(urlPath string, now int64) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	if exp > now+120 && exp < now+7*86400 {
+	if exp >= now-86400 && exp < now+7*86400 {
 		return exp, true
 	}
 	return 0, false

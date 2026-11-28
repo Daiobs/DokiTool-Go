@@ -1643,6 +1643,7 @@ export function useMediaDownload({
         return false;
       }
     },
+    onRequireExtension,
     enqueueItem,
     archiveItems,
   });

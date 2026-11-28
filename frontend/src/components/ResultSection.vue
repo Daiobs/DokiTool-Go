@@ -20,6 +20,7 @@ import {
 } from "../utils/mediaContract";
 import {
   isAudioOnlyVariant,
+  isCorsBlockedDirectUrl,
   isRefererBlockedWebImageUrl,
   isSplitSilentVideoVariant,
   isTbvideoVideoItem,
@@ -389,7 +390,20 @@ const batchZipAvailable = computed(() => {
   const items = selectedCount.value
     ? props.selection.getBatchVideos()
     : props.selection.list.value;
-  return !items.some((item) => isTbvideoVideoItem(item));
+  return !items.some((item) => {
+    if (isTbvideoVideoItem(item)) return true;
+    const itemTarget = getDownloadTarget(
+      item,
+      props.selection?.selectionFor?.(item.id) || null,
+      context,
+    );
+    if (itemTarget?.kind !== "file") return false;
+    return (
+      itemTarget.source?.browser_fetch === "blocked" ||
+      isCorsBlockedDirectUrl(itemTarget.url) ||
+      (itemTarget.routes || []).some((route) => isCorsBlockedDirectUrl(route))
+    );
+  });
 });
 const selectedTotal = computed(() => props.selection?.total.value || 0);
 const isResolving = computed(() =>

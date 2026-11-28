@@ -417,4 +417,191 @@ func TestParseWAFAndUnavailableAndShortlinks(t *testing.T) {
 			t.Fatalf("proxy-configured mode should bypass direct bucket, got %+v err=%v", bypassed, err)
 		}
 	})
+
+	t.Run("ShortlinkUpstreamStatusClassificationAndMultiLocation", func(t *testing.T) {
+		cases := []struct {
+			name            string
+			status          int
+			wantCode        string
+			wantRetry       bool
+			wantCallerScope bool
+			wantWAF         uint64
+			wantNotFound    uint64
+		}{
+			{"403_WAF", http.StatusForbidden, "UPSTREAM_BLOCKED", true, false, 1, 0},
+			{"429_RateLimit", http.StatusTooManyRequests, "RATE_LIMITED", true, false, 1, 0},
+			{"503_UpstreamUnavailable", http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE", true, false, 0, 0},
+			{"404_NotFound", http.StatusNotFound, "CONTENT_UNAVAILABLE", false, true, 0, 1},
+			{"410_Gone", http.StatusGone, "CONTENT_UNAVAILABLE", false, true, 0, 1},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var seenPlatform string
+				exec := &stubExecutor{
+					fn: func(_ context.Context, _ fetch.Request, policy fetch.Policy) (fetch.Response, error) {
+						seenPlatform = policy.Platform
+						return fetch.Response{StatusCode: tc.status}, nil
+					},
+				}
+				p := New(exec)
+				ctx, isCallerScoped := unified.WithCallerScopedFailureTracker(context.Background())
+				payload, err := p.Parse(ctx, "https://vm.tiktok.com/ZM8status/", now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if seenPlatform != "tiktok" {
+					t.Errorf("shortlink policy.Platform = %q, want tiktok", seenPlatform)
+				}
+				if unified.Str(payload["code"]) != tc.wantCode {
+					t.Fatalf("status %d -> code=%v, want %s", tc.status, payload["code"], tc.wantCode)
+				}
+				retry, _ := unified.Map(payload["error"])["retryable"].(bool)
+				if retry != tc.wantRetry {
+					t.Errorf("status %d -> retryable=%v, want %v", tc.status, retry, tc.wantRetry)
+				}
+				if isCallerScoped() != tc.wantCallerScope {
+					t.Errorf("status %d -> callerScoped=%v, want %v", tc.status, isCallerScoped(), tc.wantCallerScope)
+				}
+				st := p.TikTokRiskStatsSnapshot()
+				if st.WAFBlocked != tc.wantWAF || st.ContentNotFound != tc.wantNotFound {
+					t.Errorf("status %d -> stats=%+v, want waf=%d notFound=%d", tc.status, st, tc.wantWAF, tc.wantNotFound)
+				}
+			})
+		}
+
+		// Multiple Location headers on 302 must be rejected.
+		execMulti := &stubExecutor{
+			fn: func(context.Context, fetch.Request, fetch.Policy) (fetch.Response, error) {
+				h := make(http.Header)
+				h.Add("Location", "https://www.tiktok.com/@a/video/7345678901234567890")
+				h.Add("Location", "https://www.tiktok.com/@b/video/7345678901234567891")
+				return fetch.Response{StatusCode: http.StatusFound, Header: h}, nil
+			},
+		}
+		pMulti := New(execMulti)
+		payload, err := pMulti.Parse(context.Background(), "https://vm.tiktok.com/ZM8multiloc/", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unified.Str(payload["code"]) != "CONTENT_UNAVAILABLE" {
+			t.Fatalf("multiple Location headers -> code=%v, want CONTENT_UNAVAILABLE", payload["code"])
+		}
+
+		// Main hydration 503 maps to retryable UPSTREAM_UNAVAILABLE with explicit Platform="tiktok".
+		var pagePlatform string
+		exec503 := &stubExecutor{
+			fn: func(_ context.Context, _ fetch.Request, policy fetch.Policy) (fetch.Response, error) {
+				pagePlatform = policy.Platform
+				return fetch.Response{StatusCode: http.StatusServiceUnavailable, Body: []byte("<html>503</html>")}, nil
+			},
+		}
+		p503 := New(exec503)
+		ctx503, isCallerScoped503 := unified.WithCallerScopedFailureTracker(context.Background())
+		payload503, err := p503.Parse(ctx503, "https://www.tiktok.com/@a/video/7345678901234567890", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pagePlatform != "tiktok" {
+			t.Errorf("page policy.Platform = %q, want tiktok", pagePlatform)
+		}
+		if unified.Str(payload503["code"]) != "UPSTREAM_UNAVAILABLE" {
+			t.Fatalf("hydration 503 -> code=%v, want UPSTREAM_UNAVAILABLE", payload503["code"])
+		}
+		if retry, _ := unified.Map(payload503["error"])["retryable"].(bool); !retry || isCallerScoped503() {
+			t.Errorf("hydration 503 -> retryable=%v callerScoped=%v, want true/false", retry, isCallerScoped503())
+		}
+	})
+
+	t.Run("ExpiryRecognitionDecoupledFromValidityAndAuthorSanitization", func(t *testing.T) {
+		// 1. Expired x-expires image retains expires_at and SelectDefault refuses it as default.
+		expiredImgURL := fmt.Sprintf("https://p16-common-sign.tiktokcdn.com/tos-maliva-i-photomode/img.jpeg?x-expires=%d", now-3600)
+		wantExpiredRFC3339 := time.Unix(now-3600, 0).UTC().Format(time.RFC3339)
+		if got := parseTikTokURLExpiry(expiredImgURL, now); got != wantExpiredRFC3339 {
+			t.Fatalf("expired x-expires -> %q, want %q", got, wantExpiredRFC3339)
+		}
+
+		photoItem := &tiktokItemStruct{
+			ID: "7399999999999999999",
+			Author: &tiktokAuthor{
+				ID:       "123",
+				Nickname: "Bad Handle",
+				UniqueID: "evil/../../path?x=1",
+			},
+			ImagePost: &tiktokImagePost{
+				Images: []tiktokImageEntry{
+					{
+						ImageWidth:  1080,
+						ImageHeight: 1920,
+						ImageURL:    &tiktokURLList{URLList: []string{expiredImgURL}},
+					},
+				},
+			},
+		}
+		photoPayload, ok := formatPhotoPost(photoItem, "https://www.tiktok.com/@i/photo/7399999999999999999", now)
+		if !ok {
+			t.Fatal("formatPhotoPost returned ok=false")
+		}
+		photoData := unified.Map(photoPayload["data"])
+		// R84-06: malformed uniqueId must omit author.url.
+		if author := unified.Map(photoData["author"]); author["url"] != nil {
+			t.Errorf("malformed uniqueId must omit author.url, got %v", author["url"])
+		}
+		firstImg := unified.Map(unified.Slice(photoData["items"])[0])
+		firstSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(firstImg["variants"])[0])["delivery"])["sources"])[0])
+		if unified.Str(firstSrc["expires_at"]) != wantExpiredRFC3339 {
+			t.Fatalf("expired image source expires_at = %q, want %q", firstSrc["expires_at"], wantExpiredRFC3339)
+		}
+		if firstImg["default"] != nil {
+			t.Fatalf("expired image must NOT be selected as default, got %+v", firstImg["default"])
+		}
+
+		// 2. Near-expiry (now+60) and recently-expired (now-60) hex video paths preserve expires_at.
+		nearExp := now + 60
+		nearHexURL := fmt.Sprintf("https://v16m-default.tiktokcdn-us.com/0123456789abcdef0123456789abcdef/%08x/video/tos/useast5/near.mp4", nearExp)
+		wantNearRFC3339 := time.Unix(nearExp, 0).UTC().Format(time.RFC3339)
+		if got := parseTikTokURLExpiry(nearHexURL, now); got != wantNearRFC3339 {
+			t.Fatalf("near-expiry hex URL -> %q, want %q", got, wantNearRFC3339)
+		}
+
+		pastExp := now - 60
+		pastHexURL := fmt.Sprintf("https://v16m-default.tiktokcdn-us.com/0123456789abcdef0123456789abcdef/%08x/video/tos/useast5/past.mp4", pastExp)
+		wantPastRFC3339 := time.Unix(pastExp, 0).UTC().Format(time.RFC3339)
+		if got := parseTikTokURLExpiry(pastHexURL, now); got != wantPastRFC3339 {
+			t.Fatalf("recently-expired hex URL -> %q, want %q", got, wantPastRFC3339)
+		}
+
+		// Expired hex video must not be selected as default by unified.SelectDefault.
+		vidItem := &tiktokItemStruct{ID: "7345678901234567890", Video: &tiktokVideo{Duration: 10}}
+		vidPayload, ok := formatVideoPost(vidItem, []resolvedVideoTier{
+			{
+				candidate: videoTierCandidate{width: 1080, height: 1920, codec: "h265"},
+				directURL: pastHexURL,
+				expiresAt: parseTikTokURLExpiry(pastHexURL, now),
+			},
+		}, "https://www.tiktok.com/@i/video/7345678901234567890", now)
+		if !ok {
+			t.Fatal("formatVideoPost returned ok=false")
+		}
+		vidData := unified.Map(vidPayload["data"])
+		vidEntry := unified.Map(unified.Slice(vidData["items"])[0])
+		vidSrc := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(vidEntry["variants"])[0])["delivery"])["sources"])[0])
+		if unified.Str(vidSrc["expires_at"]) != wantPastRFC3339 {
+			t.Fatalf("expired video source expires_at = %q, want %q", vidSrc["expires_at"], wantPastRFC3339)
+		}
+		if vidEntry["default"] != nil {
+			t.Fatalf("expired hex video must NOT be selected as default, got %+v", vidEntry["default"])
+		}
+
+		// 3. Implausible epochs remain ignored.
+		if got := parseTikTokURLExpiry("https://p16.tiktokcdn.com/i.jpg?x-expires=12345", now); got != "" {
+			t.Errorf("implausible low x-expires should be ignored, got %q", got)
+		}
+		if got := parseTikTokURLExpiry(fmt.Sprintf("https://p16.tiktokcdn.com/i.jpg?x-expires=%d", now+400*86400), now); got != "" {
+			t.Errorf("implausible far-future x-expires should be ignored, got %q", got)
+		}
+		tooOldHex := fmt.Sprintf("https://v16.tiktokcdn.com/0123456789abcdef0123456789abcdef/%08x/video/tos/old.mp4", now-2*86400)
+		if got := parseTikTokURLExpiry(tooOldHex, now); got != "" {
+			t.Errorf("hex older than now-86400 should be ignored, got %q", got)
+		}
+	})
 }
