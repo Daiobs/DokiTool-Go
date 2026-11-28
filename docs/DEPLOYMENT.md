@@ -50,7 +50,7 @@
 ### 6. 冒烟门禁、发布回执与线上复测
 
 1. **切换后即时冒烟**：
-   - 本地回环与公网 `GET /api/platforms?schema_version=1.0` 均返回 HTTP `200`、`code: "OK"`，且启用平台数量与列表符合预期（当前为 14 个平台）；
+   - 本地回环与公网 `GET /api/platforms?schema_version=1.0` 均返回 HTTP `200`、`code: "OK"`，且启用平台数量与列表符合预期（当前为 16 个核心平台）；
    - 公网首页返回 HTTP `200`，首页引用的全部新 `/assets/*` chunk 及至少一个保留的上一版 `/assets/*` chunk 均返回 HTTP `200`，不存在的 `/assets/*` 路径返回 `404`（不回退 SPA HTML）；
    - `/downloads/worker.js` 返回正确 JavaScript MIME 与 `Cache-Control: no-cache`；精确 `/downloads/bridge.html` 返回唯一 `X-Frame-Options: SAMEORIGIN` 与 `Cache-Control: no-store`；`/` 与 `/helper/extension-version.json` 返回 `Cache-Control: no-store`（剥离条件请求头及 `ETag`/`Last-Modified`，携带 `If-Modified-Since: Thu, 01 Jan 2026 00:00:00 GMT` 仍返回完整 `200` 严禁 `304`）；`/helper/dokitool-chrome-extension.zip` 状态码（HTTP `200`）与 SHA-256 摘要正确。
 2. **发布回执与线上复测**：

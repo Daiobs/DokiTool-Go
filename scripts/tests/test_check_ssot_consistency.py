@@ -100,6 +100,33 @@ def _create_valid_repo(repo: Path) -> None:
     _write(repo / "tools/dokitool-agent/security.py", 'AGENT_VERSION = "1.0.0"\n')
     _write(repo / "tools/dokitool-agent/dokitool_agent.py", "from security import AGENT_VERSION\n__version__ = AGENT_VERSION\n")
     _write(repo / "tools/dokitool-agent/mcp_server.py", 'from security import AGENT_VERSION\nINFO = {"version": AGENT_VERSION}\n')
+    _write(
+        repo / "backend/config/platforms.json",
+        json.dumps([{"id": "douyin"}, {"id": "pinterest"}, {"id": "x"}], indent=2) + "\n",
+    )
+    _write(
+        repo / "scripts/prod-smoke/samples.json",
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "expected_platforms": ["douyin", "pinterest", "x"],
+                "platforms": {
+                    "douyin": {"url": "https://www.douyin.com/video/1"},
+                    "pinterest": {"url": "https://www.pinterest.com/pin/1/"},
+                    "x": {"url": "https://x.com/i/status/1"},
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    _write(
+        repo / "backend/internal/platform/ytgeneric/generic_named.go",
+        'package ytgeneric\n'
+        'var args = []string{"-douyin.*", "-pinterest.*", "-twitter.*"}\n'
+        'var blockedCoreExtractorFamilies = []string{"douyin", "pinterest", "twitter",}\n'
+        'var blockedNormalizedPlatforms = map[string]bool{"douyin": true, "pinterest": true, "x": true, "twitter": true}\n',
+    )
 
 
 class CheckSSOTConsistencyTests(unittest.TestCase):
@@ -109,7 +136,8 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
             _create_valid_repo(repo)
             report = SSOT.run_all_checks(repo)
             self.assertTrue(report["passed"], msg=report["violations"])
-            self.assertEqual(report["checks"], 6)
+            self.assertEqual(report["checks"], 7)
+            self.assertEqual(report["summary"]["core_platforms"], 3)
             self.assertEqual(report["summary"]["extension_version"], "4.5.0")
             self.assertEqual(report["summary"]["mediabunny_version"], "1.65.2")
             self.assertEqual(report["summary"]["go_toolchain"], "1.27.4")
@@ -174,6 +202,18 @@ class CheckSSOTConsistencyTests(unittest.TestCase):
                 "README.md",
                 lambda s: s + "\nProxy: http://127.0.0.1:7897\n",
                 "[docs-desensitize]",
+            ),
+            (
+                "samples-expected-platforms-drift",
+                "scripts/prod-smoke/samples.json",
+                lambda s: s.replace('"pinterest", ', "").replace('"pinterest",\n', ""),
+                "[platform-ssot]",
+            ),
+            (
+                "generic-named-missing-core-exclusion",
+                "backend/internal/platform/ytgeneric/generic_named.go",
+                lambda s: s.replace('"-pinterest.*", ', ""),
+                "[platform-ssot]",
             ),
         ]
         for label, rel, mutate, expected_tag in mutations:

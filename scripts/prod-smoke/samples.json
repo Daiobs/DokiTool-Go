@@ -10,6 +10,8 @@
     "pipixia",
     "pipigx",
     "zuiyou",
+    "pinterest",
+    "tiktok",
     "x",
     "youtube",
     "instagram",
@@ -104,6 +106,17 @@
       "pool": "parse",
       "tier": "tier_a"
     },
+    "pinterest": {
+      "url": "https://www.pinterest.com/pin/858146903966145191/",
+      "pool": "parse",
+      "tier": "tier_a"
+    },
+    "tiktok": {
+      "url": "https://www.tiktok.com/@i/video/7671176369300327700",
+      "pool": "parse",
+      "tier": "tier_a",
+      "server_parse": "egress_restricted"
+    },
     "x": {
       "url": "https://x.com/i/status/1575560063510810624",
       "pool": "slow_parse",
@@ -112,7 +125,9 @@
     "youtube": {
       "url": "https://www.youtube.com/watch?v=I9JvDaciaFk",
       "pool": "slow_parse",
-      "tier": "tier_a"
+      "tier": "tier_a",
+      "server_parse": "optional_with_helper",
+      "helper_check": "youtube_context"
     },
     "instagram": {
       "url": "https://www.instagram.com/p/CTApqC8BGWd/",

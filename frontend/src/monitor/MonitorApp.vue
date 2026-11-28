@@ -1466,7 +1466,7 @@ onUnmounted(() => {
             <div class="mon-card__title-group">
               <h2 class="mon-card__title">平台解析健康度总览</h2>
               <span class="mon-card__subtitle">
-                覆盖 14 个核心平台及长尾扩展平台，区分全量成功率与剔除限流/无效输入后的有效成功率
+                覆盖 16 个核心平台及长尾扩展平台，区分全量成功率与剔除限流/无效输入后的有效成功率
               </span>
             </div>
 

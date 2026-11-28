@@ -379,7 +379,7 @@ const authStatus = computed<{
         class="sp-follow-pill"
         :class="{ 'sp-follow-pill--on': settings.autoFollowTab }"
         :aria-pressed="settings.autoFollowTab"
-        title="仅在本地匹配 14 个支持平台作品页时自动同步解析，无关网页零外发请求"
+        title="仅在本地匹配 16 个支持平台作品页时自动同步解析，无关网页零外发请求"
         @click="emit('toggle-auto-follow')"
       >
         <span class="sp-follow-pill__indicator" />

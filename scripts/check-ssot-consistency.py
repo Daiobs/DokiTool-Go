@@ -235,6 +235,77 @@ def check_public_docs_desensitization(root: Path) -> Tuple[Dict[str, int], List[
     return {"docs_scanned": len(targets)}, violations
 
 
+def check_platform_catalog_ssot(root: Path) -> Tuple[Dict[str, Any], List[str]]:
+    violations: List[str] = []
+    catalog_rel = Path("backend/config/platforms.json")
+    catalog, cat_err = _read_json(root / catalog_rel)
+    if cat_err or not isinstance(catalog, list) or not catalog:
+        return {}, [f"[platform-ssot] {cat_err or 'backend/config/platforms.json must be a non-empty JSON array'}"]
+
+    catalog_ids: List[str] = []
+    for entry in catalog:
+        pid = entry.get("id") if isinstance(entry, dict) else None
+        if not isinstance(pid, str) or not pid.strip():
+            violations.append(f"[platform-ssot] {catalog_rel.as_posix()} contains an entry without valid 'id'")
+            continue
+        catalog_ids.append(pid.strip().lower())
+    catalog_set = set(catalog_ids)
+
+    samples_rel = Path("scripts/prod-smoke/samples.json")
+    samples, samples_err = _read_json(root / samples_rel)
+    if samples_err or not isinstance(samples, dict):
+        violations.append(f"[platform-ssot] {samples_err or 'scripts/prod-smoke/samples.json must be a JSON object'}")
+    else:
+        raw_expected = samples.get("expected_platforms")
+        if not isinstance(raw_expected, list):
+            violations.append(f"[platform-ssot] {samples_rel.as_posix()}: expected_platforms must be a JSON array")
+        else:
+            expected_ids = [str(p).strip().lower() for p in raw_expected]
+            if len(expected_ids) != len(set(expected_ids)):
+                violations.append(f"[platform-ssot] {samples_rel.as_posix()}: expected_platforms contains duplicates")
+            expected_set = set(expected_ids)
+            missing_in_samples = sorted(catalog_set - expected_set)
+            extra_in_samples = sorted(expected_set - catalog_set)
+            if missing_in_samples or extra_in_samples:
+                violations.append(
+                    f"[platform-ssot] {samples_rel.as_posix()} expected_platforms drift vs {catalog_rel.as_posix()}: "
+                    f"missing={missing_in_samples} extra={extra_in_samples}"
+                )
+        sample_entries = samples.get("platforms")
+        if not isinstance(sample_entries, dict):
+            violations.append(f"[platform-ssot] {samples_rel.as_posix()}: platforms must be a JSON object")
+        else:
+            for pid in sorted(catalog_set):
+                entry = sample_entries.get(pid)
+                url = entry.get("url") if isinstance(entry, dict) else None
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    violations.append(
+                        f"[platform-ssot] {samples_rel.as_posix()}: missing valid sample url for core platform {pid!r}"
+                    )
+
+    generic_rel = Path("backend/internal/platform/ytgeneric/generic_named.go")
+    generic_text = _read_text(root / generic_rel)
+    if generic_text is None:
+        violations.append(f"[platform-ssot] unable to read {generic_rel.as_posix()}")
+    else:
+        for pid in sorted(catalog_set):
+            yt_family = "twitter" if pid == "x" else pid
+            if f'"-{yt_family}.*"' not in generic_text:
+                violations.append(
+                    f"[platform-ssot] {generic_rel.as_posix()}: GenericExtractorArgs missing exclusion \"-{yt_family}.*\" for {pid!r}"
+                )
+            if f'"{pid}":' not in generic_text:
+                violations.append(
+                    f"[platform-ssot] {generic_rel.as_posix()}: blockedNormalizedPlatforms missing {pid!r}"
+                )
+            if pid != "x" and f'"{yt_family}",' not in generic_text:
+                violations.append(
+                    f"[platform-ssot] {generic_rel.as_posix()}: blockedCoreExtractorFamilies missing {yt_family!r}"
+                )
+
+    return {"core_platforms": len(catalog_set)}, violations
+
+
 def run_all_checks(root: Path = ROOT) -> Dict[str, Any]:
     root = Path(root)
     summary: Dict[str, Any] = {}
@@ -245,6 +316,7 @@ def run_all_checks(root: Path = ROOT) -> Dict[str, Any]:
         check_go_toolchain_parity,
         check_upstream_runtime_pins,
         check_agent_version_ssot,
+        check_platform_catalog_ssot,
         check_public_docs_desensitization,
     ):
         part, errs = fn(root)
@@ -252,7 +324,7 @@ def run_all_checks(root: Path = ROOT) -> Dict[str, Any]:
         violations.extend(errs)
     return {
         "passed": len(violations) == 0,
-        "checks": 6,
+        "checks": 7,
         "summary": summary,
         "violations": violations,
     }

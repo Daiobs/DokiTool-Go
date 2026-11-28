@@ -174,6 +174,7 @@ class FakeDokiServer:
         self.parse_Requests: list[dict] = []
         self.all_requests: list[dict] = []
         self.custom_parse_handler = None
+        self.custom_parse_raw_handler = None
         self.custom_stats_handler = None
         self.custom_unlisted_api_handler = None
         self.custom_youtube_context_handler = None
@@ -225,6 +226,15 @@ class FakeDokiServer:
                     with outer.lock:
                         outer.parse_Requests.append(rec)
                     sample_url = query.get("url", "")
+                    if outer.custom_parse_raw_handler is not None:
+                        status, content_type, raw_body = outer.custom_parse_raw_handler(sample_url, rec)
+                        self.send_response(status)
+                        if content_type is not None:
+                            self.send_header("Content-Type", content_type)
+                        self.send_header("Set-Cookie", "parse_cookie=forbidden; Path=/")
+                        self.end_headers()
+                        self.wfile.write(raw_body)
+                        return
                     if outer.custom_parse_handler is not None:
                         status, payload = outer.custom_parse_handler(sample_url, rec)
                     else:
@@ -356,6 +366,9 @@ class FakeDokiServer:
             "pipix.com": "pipixia",
             "pipigx.com": "pipigx",
             "xiaochuankeji.cn": "zuiyou",
+            "pinterest.com": "pinterest",
+            "pin.it": "pinterest",
+            "tiktok.com": "tiktok",
             "x.com": "x",
             "youtube.com": "youtube",
             "instagram.com": "instagram",
@@ -436,8 +449,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(report["summary"]["fail"], 0)
             # tier_b_platforms and rate_limit are SKIP by default under --tier tier-a
             self.assertEqual(report["summary"]["skip"], 2)
-            # 1 frontend + 1 platforms + 1 youtube_context + 1 cache + 1 x + 1 dy_dom + 4 dm + 14 platforms + 2 api_boundary = 26 PASS
-            self.assertEqual(report["summary"]["pass"], 26)
+            # 1 frontend + 1 platforms + 1 youtube_context + 1 cache + 1 x + 1 dy_dom + 4 dm + 16 platforms + 2 api_boundary = 28 PASS
+            self.assertEqual(report["summary"]["pass"], 28)
 
             # Verify api_boundary runs strictly AFTER all parse check groups and BEFORE rate_limit
             groups_in_order = [c["group"] for c in report["checks"]]
@@ -458,8 +471,8 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["status"], "PASS")
             self.assertEqual(by_id["api_boundary:unlisted_api_404"]["http_status"], 404)
 
-            # Verify >= 8.0s pacing across all /api/parse calls (15 total: 2 cache + 13 unique platforms)
-            self.assertEqual(len(srv.parse_Requests), 15)
+            # Verify >= 8.0s pacing across all /api/parse calls (17 total: 2 cache + 15 unique platforms)
+            self.assertEqual(len(srv.parse_Requests), 17)
             timestamps = [r["timestamp"] for r in srv.parse_Requests]
             for prev_ts, next_ts in zip(timestamps, timestamps[1:]):
                 self.assertGreaterEqual(next_ts - prev_ts, 8.0)
@@ -1928,7 +1941,7 @@ class ProdSmokeUnitTests(unittest.TestCase):
             self.assertEqual(len(all_plat_b), 1)
             self.assertEqual(all_plat_b[0]["status"], "SKIP")
 
-            # --tier all executes BOTH Tier-A 14 core platforms and full Tier-B pool
+            # --tier all executes BOTH Tier-A 16 core platforms and full Tier-B pool
             rc_all, out_all, err_all = self._run_cli(
                 [
                     "--base-url",
@@ -1946,12 +1959,341 @@ class ProdSmokeUnitTests(unittest.TestCase):
             rep_all = json.loads(out_all)
             self.assertEqual(
                 sum(1 for c in rep_all["checks"] if c["group"] == "all_platforms" and c["status"] == "PASS"),
-                14,
+                16,
             )
             self.assertEqual(
                 sum(1 for c in rep_all["checks"] if c["group"] == "tier_b_platforms" and c["status"] == "PASS"),
                 3,
             )
+
+    def test_samples_json_matches_platforms_json_ssot(self) -> None:
+        repo_root = SMOKE_DIR.parents[1]
+        catalog = json.loads((repo_root / "backend/config/platforms.json").read_text(encoding="utf-8"))
+        catalog_ids = [str(entry["id"]) for entry in catalog]
+        samples = smoke.load_samples(SMOKE_DIR / "samples.json")
+        expected_ids = [str(pid) for pid in samples.get("expected_platforms", [])]
+        sample_platforms = samples.get("platforms", {})
+        self.assertEqual(set(expected_ids), set(catalog_ids))
+        self.assertEqual(len(expected_ids), len(catalog_ids))
+        for pid in expected_ids:
+            self.assertIn(pid, sample_platforms, msg=f"samples.json platforms missing entry for {pid!r}")
+            self.assertTrue(str(sample_platforms[pid].get("url") or "").startswith(("http://", "https://")))
+            mode, helper = smoke._validate_sample_server_parse_policy(pid, sample_platforms[pid])
+            if pid == "youtube":
+                self.assertEqual((mode, helper), ("optional_with_helper", "youtube_context"))
+            elif pid == "tiktok":
+                self.assertEqual((mode, helper), ("egress_restricted", None))
+            else:
+                self.assertEqual((mode, helper), ("required", None))
+
+    def test_all_platforms_distinguishes_youtube_switch_and_tiktok_egress_restriction(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            # 1. Production-realistic deployment:
+            #    - /api/platforms exposes all 16 core platforms (catalog contract PASS)
+            #    - /api/youtube/context returns 200 OK (extension cooperative helper active)
+            #    - YouTube /api/parse returns strict 503 SERVICE_NOT_CONFIGURED (DOKITOOL_YTDLP_YOUTUBE_ENABLED=false)
+            #    - TikTok /api/parse returns strict 403 UPSTREAM_BLOCKED (datacenter SlardarWAF)
+            #    - All other 14 core platforms return 200 OK
+            parse_counts: dict[str, int] = {}
+
+            def prod_like_parse(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                parse_counts[plat] = parse_counts.get(plat, 0) + 1
+                if plat == "youtube":
+                    return 503, {
+                        "schema_version": "1.0",
+                        "code": "SERVICE_NOT_CONFIGURED",
+                        "error": {
+                            "code": "SERVICE_NOT_CONFIGURED",
+                            "message": "解析服务未配置完成",
+                        },
+                    }
+                if plat == "tiktok":
+                    return 403, {
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_BLOCKED",
+                        "error": {
+                            "code": "UPSTREAM_BLOCKED",
+                            "message": (
+                                "TikTok 当前触发访问验证 https://www.tiktok.com/@i/video/1?xsec_token=SECRET_TT "
+                                "from 203.0.113.42"
+                            ),
+                            "retryable": True,
+                        },
+                    }
+                return 200, make_envelope(plat)
+
+            srv.custom_parse_handler = prod_like_parse
+            rc, out, err = self._run_cli(
+                [
+                    "--base-url",
+                    srv.base_url,
+                    "--only",
+                    "platforms,youtube_context,all_platforms",
+                    "--format",
+                    "json",
+                ],
+                clock,
+            )
+            self.assertEqual(rc, 0, msg=err or out)
+            rep = json.loads(out)
+            self.assertTrue(rep["passed"])
+            self.assertEqual(rep["summary"]["fail"], 0)
+            self.assertEqual(rep["summary"]["warn"], 1)
+            self.assertEqual(rep["summary"]["skip"], 1)
+            # 1 platforms + 1 youtube_context + 14 required platforms = 16 PASS
+            self.assertEqual(rep["summary"]["pass"], 16)
+
+            by_id = {c["id"]: c for c in rep["checks"]}
+            self.assertEqual(by_id["platforms"]["status"], "PASS")
+            self.assertEqual(by_id["youtube_context"]["status"], "PASS")
+            self.assertEqual(by_id["platform:youtube"]["status"], "SKIP")
+            self.assertEqual(by_id["platform:youtube"]["http_status"], 503)
+            self.assertEqual(by_id["platform:youtube"]["code"], "SERVICE_NOT_CONFIGURED")
+            self.assertEqual(by_id["platform:youtube"]["retry_count"], 0)
+            self.assertIn("youtube_context", by_id["platform:youtube"]["note"])
+            # Deterministic 503 SERVICE_NOT_CONFIGURED did not waste retries and reused youtube_context check
+            self.assertEqual(parse_counts["youtube"], 1)
+            yt_ctx_reqs = [r for r in srv.all_requests if r["path"] == "/api/youtube/context"]
+            self.assertEqual(len(yt_ctx_reqs), 1)
+
+            self.assertEqual(by_id["platform:tiktok"]["status"], "WARN")
+            self.assertEqual(by_id["platform:tiktok"]["http_status"], 403)
+            self.assertEqual(by_id["platform:tiktok"]["code"], "UPSTREAM_BLOCKED")
+            self.assertEqual(by_id["platform:tiktok"]["retry_count"], 2)
+            self.assertEqual(parse_counts["tiktok"], 3)
+            smoke.verify_redacted_output(out)
+            self.assertNotIn("SECRET_TT", out)
+            self.assertNotIn("203.0.113.42", out)
+
+            # 2. Running --only all_platforms (without youtube_context group) probes /api/youtube/context on demand
+            srv.all_requests.clear()
+            parse_counts.clear()
+            rc_only, out_only, err_only = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_only, 0, msg=err_only or out_only)
+            rep_only = json.loads(out_only)
+            by_id_only = {c["id"]: c for c in rep_only["checks"]}
+            self.assertEqual(by_id_only["platform:youtube"]["status"], "SKIP")
+            self.assertEqual(by_id_only["platform:tiktok"]["status"], "WARN")
+            self.assertEqual(
+                len([r for r in srv.all_requests if r["path"] == "/api/youtube/context"]),
+                1,
+            )
+
+            # 3. TikTok transient 403 recovering to 200 OK on retry reports PASS (not WARN)
+            tiktok_attempts = {"n": 0}
+
+            def tiktok_recovers(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                if plat == "tiktok":
+                    tiktok_attempts["n"] += 1
+                    if tiktok_attempts["n"] == 1:
+                        return 403, {
+                            "schema_version": "1.0",
+                            "code": "UPSTREAM_BLOCKED",
+                            "error": {
+                                "code": "UPSTREAM_BLOCKED",
+                                "message": "TikTok 当前触发访问验证",
+                                "retryable": True,
+                            },
+                        }
+                return 200, make_envelope(plat)
+
+            srv.custom_parse_handler = tiktok_recovers
+            rc_rec, out_rec, err_rec = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_rec, 0, msg=err_rec or out_rec)
+            by_id_rec = {c["id"]: c for c in json.loads(out_rec)["checks"]}
+            self.assertEqual(by_id_rec["platform:tiktok"]["status"], "PASS")
+            self.assertEqual(by_id_rec["platform:tiktok"]["retry_count"], 1)
+
+    def test_all_platforms_does_not_blindly_ignore_403_or_503_regressions(self) -> None:
+        clock = FakeClock()
+        with FakeDokiServer(clock) as srv:
+            # Case A: YouTube 503 SERVICE_NOT_CONFIGURED MUST FAIL if /api/youtube/context helper is unavailable (404)
+            srv.custom_youtube_context_handler = lambda _rec: (
+                404,
+                {
+                    "schema_version": "1.0",
+                    "code": "INVALID_INPUT",
+                    "error": {"code": "INVALID_INPUT", "message": "接口不存在"},
+                },
+            )
+            srv.custom_parse_handler = lambda url, _rec: (
+                (
+                    503,
+                    {
+                        "schema_version": "1.0",
+                        "code": "SERVICE_NOT_CONFIGURED",
+                        "error": {"code": "SERVICE_NOT_CONFIGURED", "message": "解析服务未配置完成"},
+                    },
+                )
+                if srv.detect_platform(url) == "youtube"
+                else (200, make_envelope(srv.detect_platform(url)))
+            )
+            rc_a, out_a, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_a, 1)
+            by_id_a = {c["id"]: c for c in json.loads(out_a)["checks"]}
+            self.assertEqual(by_id_a["platform:youtube"]["status"], "FAIL")
+            self.assertEqual(by_id_a["platform:youtube"]["http_status"], 503)
+
+            # Reset healthy youtube_context for remaining negative cases
+            srv.custom_youtube_context_handler = None
+
+            # Case B: Required platforms (douyin=403 UPSTREAM_BLOCKED, pinterest=503 SERVICE_NOT_CONFIGURED),
+            #         YouTube circuit-breaker 503 UPSTREAM_UNAVAILABLE (retryable=true),
+            #         and TikTok 503 SERVICE_NOT_CONFIGURED / 502 UPSTREAM_INVALID_RESPONSE MUST ALL FAIL.
+            def regression_matrix(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                if plat == "douyin":
+                    return 403, {
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_BLOCKED",
+                        "error": {"code": "UPSTREAM_BLOCKED", "message": "上游拒绝访问", "retryable": True},
+                    }
+                if plat == "pinterest":
+                    return 503, {
+                        "schema_version": "1.0",
+                        "code": "SERVICE_NOT_CONFIGURED",
+                        "error": {"code": "SERVICE_NOT_CONFIGURED", "message": "解析服务未配置完成"},
+                    }
+                if plat == "youtube":
+                    return 503, {
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_UNAVAILABLE",
+                        "error": {
+                            "code": "UPSTREAM_UNAVAILABLE",
+                            "message": "YouTube上游服务暂时响应异常，已触发快速保护",
+                            "retryable": True,
+                        },
+                    }
+                if plat == "tiktok":
+                    return 503, {
+                        "schema_version": "1.0",
+                        "code": "SERVICE_NOT_CONFIGURED",
+                        "error": {"code": "SERVICE_NOT_CONFIGURED", "message": "TikTok 解析器尚未配置"},
+                    }
+                return 200, make_envelope(plat)
+
+            srv.custom_parse_handler = regression_matrix
+            rc_b, out_b, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_b, 1)
+            by_id_b = {c["id"]: c for c in json.loads(out_b)["checks"]}
+            for failed_plat in ("douyin", "pinterest", "youtube", "tiktok"):
+                self.assertEqual(
+                    by_id_b[f"platform:{failed_plat}"]["status"],
+                    "FAIL",
+                    msg=f"{failed_plat} must FAIL on regression",
+                )
+
+            # Case C: Non-JSON HTML gateway 403 on TikTok and HTML 503 on YouTube MUST FAIL
+            def html_gateway_errors(sample_url: str, _rec: dict):
+                plat = srv.detect_platform(sample_url)
+                if plat == "tiktok":
+                    return 403, "text/html; charset=utf-8", b"<html><body>403 Forbidden</body></html>"
+                if plat == "youtube":
+                    return 503, "text/html; charset=utf-8", b"<html><body>503 Service Unavailable</body></html>"
+                body = json.dumps(make_envelope(plat), separators=(",", ":")).encode("utf-8")
+                return 200, "application/json; charset=utf-8", body
+
+            srv.custom_parse_handler = None
+            srv.custom_parse_raw_handler = html_gateway_errors
+            rc_c, out_c, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_c, 1)
+            by_id_c = {c["id"]: c for c in json.loads(out_c)["checks"]}
+            self.assertEqual(by_id_c["platform:tiktok"]["status"], "FAIL")
+            self.assertEqual(by_id_c["platform:youtube"]["status"], "FAIL")
+
+            # Case D: TikTok 502 UPSTREAM_INVALID_RESPONSE (parser breakage) and YouTube 403 UPSTREAM_BLOCKED
+            #         MUST FAIL, while TikTok 404 CONTENT_UNAVAILABLE classifies as SAMPLE_STALE.
+            srv.custom_parse_raw_handler = None
+            srv.custom_parse_handler = lambda url, _rec: (
+                (
+                    502,
+                    {
+                        "schema_version": "1.0",
+                        "code": "UPSTREAM_INVALID_RESPONSE",
+                        "error": {"code": "UPSTREAM_INVALID_RESPONSE", "message": "TikTok 页面数据格式异常"},
+                    },
+                )
+                if srv.detect_platform(url) == "tiktok"
+                else (
+                    (
+                        403,
+                        {
+                            "schema_version": "1.0",
+                            "code": "UPSTREAM_BLOCKED",
+                            "error": {"code": "UPSTREAM_BLOCKED", "message": "YouTube 上游风控"},
+                        },
+                    )
+                    if srv.detect_platform(url) == "youtube"
+                    else (200, make_envelope(srv.detect_platform(url)))
+                )
+            )
+            rc_d, out_d, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_d, 1)
+            by_id_d = {c["id"]: c for c in json.loads(out_d)["checks"]}
+            self.assertEqual(by_id_d["platform:tiktok"]["status"], "FAIL")
+            self.assertEqual(by_id_d["platform:tiktok"]["code"], "UPSTREAM_INVALID_RESPONSE")
+            self.assertEqual(by_id_d["platform:youtube"]["status"], "FAIL")
+            self.assertEqual(by_id_d["platform:youtube"]["code"], "UPSTREAM_BLOCKED")
+
+            srv.custom_parse_handler = lambda url, _rec: (
+                (
+                    404,
+                    {
+                        "schema_version": "1.0",
+                        "code": "CONTENT_UNAVAILABLE",
+                        "error": {"code": "CONTENT_UNAVAILABLE", "message": "该 TikTok 作品已删除"},
+                    },
+                )
+                if srv.detect_platform(url) == "tiktok"
+                else (200, make_envelope(srv.detect_platform(url)))
+            )
+            rc_stale, out_stale, _ = self._run_cli(
+                ["--base-url", srv.base_url, "--only", "all_platforms", "--format", "json"],
+                clock,
+            )
+            self.assertEqual(rc_stale, 0)
+            by_id_stale = {c["id"]: c for c in json.loads(out_stale)["checks"]}
+            self.assertEqual(by_id_stale["platform:tiktok"]["status"], "SAMPLE_STALE")
+            self.assertEqual(by_id_stale["platform:tiktok"]["code"], "SAMPLE_STALE")
+
+            # Case E: Invalid server_parse / helper_check values in samples.json fail closed
+            with tempfile.TemporaryDirectory() as tmp:
+                bad_cases = [
+                    ("invalid-mode", {"url": "https://www.tiktok.com/@i/video/1", "server_parse": "ignore_all"}),
+                    ("missing-helper", {"url": "https://www.youtube.com/watch?v=1", "server_parse": "optional_with_helper"}),
+                    ("unknown-helper", {"url": "https://www.youtube.com/watch?v=1", "server_parse": "optional_with_helper", "helper_check": "unknown"}),
+                    ("stray-helper", {"url": "https://www.tiktok.com/@i/video/1", "server_parse": "egress_restricted", "helper_check": "youtube_context"}),
+                ]
+                for label, entry in bad_cases:
+                    with self.subTest(bad_policy=label):
+                        bad_path = Path(tmp) / f"{label}.json"
+                        bad_path.write_text(
+                            json.dumps({"expected_platforms": ["demo"], "platforms": {"demo": entry}}),
+                            encoding="utf-8",
+                        )
+                        with self.assertRaises(smoke.SmokeError):
+                            smoke.load_samples(bad_path)
 
     def test_l4_sample_stale_distinguished_from_parser_failure_with_redaction(self) -> None:
         clock = FakeClock()

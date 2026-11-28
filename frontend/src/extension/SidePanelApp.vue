@@ -341,7 +341,7 @@ async function runParseUrl(
     parseErrorStatus.value = undefined;
     parseError.value =
       origin === "tab"
-        ? "未识别到支持的 14 个核心平台链接（本地隐私保护：未向后端发送任何请求）"
+        ? "未识别到支持的 16 个核心平台链接（本地隐私保护：未向后端发送任何请求）"
         : "未识别到有效的公开媒体链接（已本地拦截内网、IP 与浏览器内部地址）";
     return;
   }
@@ -1096,7 +1096,7 @@ onUnmounted(() => {
               spellcheck="false"
               autocomplete="off"
               class="sp-input sp-url-bar__input"
-              placeholder="粘贴作品链接或分享口令（支持 14 核心及长尾站点）"
+              placeholder="粘贴作品链接或分享口令（支持 16 核心及长尾站点）"
             />
             <button
               v-if="urlInput"
@@ -1183,7 +1183,7 @@ onUnmounted(() => {
         >
           <div class="sp-empty-guide__title">极速素材收集已就绪</div>
           <ul class="sp-empty-guide__list">
-            <li>支持抖音、小红书、B站、微博、YouTube 4K60、X、IG 等 14 核心平台，并支持主动粘贴解析 TikTok、Vimeo、Reddit、SoundCloud 等长尾站点</li>
+            <li>支持抖音、小红书、B站、微博、Pinterest、TikTok、YouTube 4K60、X、IG 等 16 核心平台，并支持主动粘贴解析 Vimeo、Reddit、SoundCloud 等长尾站点</li>
             <li>网页任意卡片右键可「极速下载」或按 <kbd>Alt+Shift+D</kbd> 呼出本面板</li>
             <li>后台独立 Offscreen 引擎写盘，随时关掉侧边栏下载不断流</li>
           </ul>

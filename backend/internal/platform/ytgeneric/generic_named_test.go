@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"os"
@@ -63,6 +64,8 @@ func TestGenericExtractorArgs(t *testing.T) {
 		"-zuiyou.*",
 		"-xiaohongshu.*",
 		"-rednote.*",
+		"-pinterest.*",
+		"-tiktok.*",
 		"-twitter.*",
 		"-youtube.*",
 		"-instagram.*",
@@ -77,6 +80,54 @@ func TestGenericExtractorArgs(t *testing.T) {
 	got[0] = "tampered"
 	if !reflect.DeepEqual(GenericExtractorArgs(), want) {
 		t.Fatal("GenericExtractorArgs() shared backing slice across calls")
+	}
+}
+
+func TestGenericExcludesAllCoreCatalogPlatforms(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	catalogPath := filepath.Join(filepath.Dir(file), "..", "..", "..", "config", "platforms.json")
+	raw, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("read platforms.json: %v", err)
+	}
+	var entries []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		t.Fatalf("unmarshal platforms.json: %v", err)
+	}
+	if len(entries) < 16 {
+		t.Fatalf("expected >= 16 core platforms in platforms.json, got %d", len(entries))
+	}
+
+	args := GenericExtractorArgs()
+	argSet := make(map[string]bool, len(args))
+	for _, a := range args {
+		argSet[a] = true
+	}
+
+	for _, entry := range entries {
+		id := strings.ToLower(strings.TrimSpace(entry.ID))
+		if id == "" {
+			t.Fatal("empty platform id in platforms.json")
+		}
+		ytFamily := id
+		if id == "x" {
+			ytFamily = "twitter"
+		}
+		wantArg := "-" + ytFamily + ".*"
+		if !argSet[wantArg] {
+			t.Errorf("core platform %q missing %q in GenericExtractorArgs()", id, wantArg)
+		}
+		if got := NormalizeExtractorPlatform(id, id); got != "" {
+			t.Errorf("core platform %q was not rejected by NormalizeExtractorPlatform: got %q", id, got)
+		}
+		if got := NormalizeExtractorPlatform(ytFamily+"Sub", ytFamily+":sub"); got != "" {
+			t.Errorf("core platform %q sub-extractor was not rejected by NormalizeExtractorPlatform: got %q", id, got)
+		}
 	}
 }
 
@@ -306,8 +357,6 @@ func TestNormalizeExtractorPlatform(t *testing.T) {
 		key, ext string
 		want     string
 	}{
-		{"TikTok", "tiktok", "tiktok"},
-		{"TikTokUser", "tiktok:user", "tiktokuser"},
 		{"Vimeo", "vimeo", "vimeo"},
 		{"Vimeo:Album", "vimeo:album", "vimeo_album"},
 		{"Reddit", "Reddit", "reddit"},
@@ -316,7 +365,6 @@ func TestNormalizeExtractorPlatform(t *testing.T) {
 		{"", "twitch:clips", "twitch_clips"},
 		{"Soundcloud", "soundcloud", "soundcloud"},
 		{"Niconico", "niconico", "niconico"},
-		{"Pinterest", "pinterest", "pinterest"},
 		{"Dailymotion", "dailymotion", "dailymotion"},
 		{"VK", "vk", "vk"},
 		{"Streamable", "streamable", "streamable"},
@@ -362,6 +410,11 @@ func TestNormalizeExtractorPlatform(t *testing.T) {
 		{"Zuiyou", "zuiyou"},
 		{"XiaoHongShu", "xiaohongshu"},
 		{"RedNote", "rednote"},
+		{"Pinterest", "pinterest"},
+		{"PinterestCollection", "pinterest:collection"},
+		{"TikTok", "tiktok"},
+		{"TikTokSound", "tiktok:sound"},
+		{"TikTokUser", "tiktok:user"},
 		{"Twitter", "twitter"},
 		{"TwitterCard", "twitter:card"},
 		{"X", "x"},
@@ -530,8 +583,8 @@ func TestGenericParserErrorsAndSSRF(t *testing.T) {
 		t.Fatalf("expected retry_after_seconds=30, got %+v", rlPayload["error"])
 	}
 
-	// 8. Generic or core-14 extractor_key returned by yt-dlp -> UNSUPPORTED_PLATFORM.
-	for _, extKey := range []string{"Generic", "Youtube", "Twitter", "BiliBili"} {
+	// 8. Generic or core-16 extractor_key returned by yt-dlp -> UNSUPPORTED_PLATFORM.
+	for _, extKey := range []string{"Generic", "Youtube", "Twitter", "BiliBili", "Pinterest", "PinterestCollection", "TikTok", "TikTokSound"} {
 		blockedExtParser := NewGenericNamed(&stubExtractor{
 			enabled: true,
 			extract: func(context.Context, string) (*ytengine.Info, error) {
@@ -573,22 +626,22 @@ func TestGenericParserUnifiedContractPlatforms(t *testing.T) {
 		},
 	}
 
-	t.Run("tiktok-progressive-mp4-with-size-prober", func(t *testing.T) {
+	t.Run("streamable-progressive-mp4-with-size-prober", func(t *testing.T) {
 		probed := false
 		parser := NewGenericNamed(&stubExtractor{
 			enabled: true,
 			extract: func(context.Context, string) (*ytengine.Info, error) {
 				return &ytengine.Info{
-					ID:           "7300000000000000001",
-					Title:        "TikTok Dance Clip",
+					ID:           "abc123def",
+					Title:        "Streamable Clip",
 					Uploader:     "creator1",
-					ExtractorKey: "TikTok",
-					Extractor:    "tiktok",
-					Thumbnail:    "https://p16-sign.tiktokcdn.com/cover.jpg",
+					ExtractorKey: "Streamable",
+					Extractor:    "streamable",
+					Thumbnail:    "https://cdn-cf-east.streamable.com/image/cover.jpg",
 					Formats: []ytengine.Format{
 						{
 							FormatID: "download",
-							URL:      "https://v16-webapp.tiktokcdn.com/video/clip.mp4",
+							URL:      "https://cdn-cf-east.streamable.com/video/mp4/clip.mp4",
 							Ext:      "mp4",
 							Protocol: "https",
 							Width:    genInt64Ptr(1080),
@@ -600,24 +653,24 @@ func TestGenericParserUnifiedContractPlatforms(t *testing.T) {
 				}, nil
 			},
 		}, func(_ context.Context, rawURL string) (int64, bool) {
-			if rawURL == "https://v16-webapp.tiktokcdn.com/video/clip.mp4" {
+			if rawURL == "https://cdn-cf-east.streamable.com/video/mp4/clip.mp4" {
 				probed = true
 				return 9876543, true
 			}
 			return 0, false
 		}, resolver)
 
-		payload, err := parser.Parse(context.Background(), "https://www.tiktok.com/@creator1/video/7300000000000000001", now)
+		payload, err := parser.Parse(context.Background(), "https://streamable.com/abc123def", now)
 		if err != nil {
 			t.Fatalf("Parse failed: %v", err)
 		}
 		assertGenericEnvelopeValid(t, payload, now, "OK")
 		if !probed {
-			t.Fatal("expected SizeProber to populate missing TikTok MP4 size")
+			t.Fatal("expected SizeProber to populate missing Streamable MP4 size")
 		}
 		data := unified.Map(payload["data"])
-		if unified.Str(data["platform"]) != "tiktok" || unified.Str(data["content_id"]) != "7300000000000000001" {
-			t.Fatalf("unexpected TikTok platform/content_id: %+v", data)
+		if unified.Str(data["platform"]) != "streamable" || unified.Str(data["content_id"]) != "abc123def" {
+			t.Fatalf("unexpected Streamable platform/content_id: %+v", data)
 		}
 		item := unified.Map(unified.Slice(data["items"])[0])
 		src := unified.Map(unified.Slice(unified.Map(unified.Map(unified.Slice(item["variants"])[0])["delivery"])["sources"])[0])
@@ -983,7 +1036,10 @@ func TestAttributeGenericFailurePlatformAndParseWithPlatform(t *testing.T) {
 	}{
 		{"nil-error", nil, PlatformUnmatched},
 		{"vimeo-structured", &ytengine.Error{Code: ytengine.CodeUpstreamBlocked, Extractor: "Vimeo"}, "vimeo"},
-		{"tiktok-structured", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "TikTok"}, "tiktok"},
+		{"core-tiktok-rejected", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "TikTok"}, PlatformUnmatched},
+		{"core-tiktok-sub-rejected", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "TikTokSound"}, PlatformUnmatched},
+		{"core-pinterest-rejected", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "Pinterest"}, PlatformUnmatched},
+		{"core-pinterest-sub-rejected", &ytengine.Error{Code: ytengine.CodeContentUnavailable, Extractor: "PinterestCollection"}, PlatformUnmatched},
 		{"dailymotion-structured", &ytengine.Error{Code: ytengine.CodeUpstreamTimeout, Extractor: "dailymotion"}, "dailymotion"},
 		{"soundcloud-structured", &ytengine.Error{Code: ytengine.CodeRateLimited, Extractor: "SoundCloud"}, "soundcloud"},
 		{"sub-extractor-normalized", &ytengine.Error{Code: ytengine.CodeUpstreamUnavailable, Extractor: "vimeo:album"}, "vimeo_album"},

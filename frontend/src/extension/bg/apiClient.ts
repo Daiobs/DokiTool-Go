@@ -739,7 +739,7 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
     const params = new URLSearchParams(queryPart);
     const innerSourceUrl = params.get("url") || "";
     if (!matchSupportedPlatformUrl(innerSourceUrl)) {
-      throw new Error("条目源链接不在受支持的 14 个平台白名单内");
+      throw new Error("条目源链接不在受支持的 16 个平台白名单内");
     }
 
     const validated = validateApiBaseUrl(settings.apiBaseUrl);

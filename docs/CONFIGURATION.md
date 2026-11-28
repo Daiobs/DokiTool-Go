@@ -25,7 +25,8 @@
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
 | `-listen` | 指定主后端本地回环 HTTP 监听地址与端口 | 否 |
-| `-xhs-page-transport` | 选择小红书分享页与笔记页的 HTTPS 抓取传输实现（标准库传输或指定浏览器 TLS 指纹传输） | 否 |
+| `-xhs-page-transport` | 选择小红书分享页与笔记页的 HTTPS 抓取传输实现（`standard` 或 `chrome131`） | 否 |
+| `-tiktok-page-transport` | 选择 TikTok 水合页（`tiktok-page`）的 HTTPS 抓取传输实现（`standard` 或 `chrome131`，默认 `standard`） | 否 |
 | `-x-tombstone-fallback` | 控制 X 受限推文（墓碑页）的回退行为（直接返回受限错误，或向公开第三方元数据接口查询） | 否 |
 | `-client-identity` | 指定准入控制识别客户端地址的方式（仅接受本地回环直连对端，或校验前置反向代理转发的身份头） | 否 |
 
@@ -37,8 +38,8 @@
 
 | 名称 | 作用 | 是否敏感 |
 | --- | --- | --- |
-| `-pull-origin` | 出站拉取模式下连接主后端领取抖音任务与回传结果的 HTTPS 源站地址（与入站监听类参数互斥） | 否 |
-| `-workers` | 出站拉取模式下并发运行的抖音任务认领与原画探测工作协程数量（仅在指定 `-pull-origin` 时生效） | 否 |
+| `-pull-origin` | 出站拉取模式下连接主后端领取国内解析任务（抖音 / B 站）与回传结果的 HTTPS 源站地址（与入站监听类参数互斥） | 否 |
+| `-workers` | 出站拉取模式下并发运行的国内解析任务认领工作协程数量（仅在指定 `-pull-origin` 时生效） | 否 |
 | `-listen` | 历史入站直连模式下的本地监听地址与端口 | 否 |
 | `-tls-cert` | 历史入站直连 HTTPS 模式下的服务端证书链文件路径 | 否 |
 | `-tls-key` | 历史入站直连 HTTPS 模式下的服务端私钥文件路径 | 是 |
@@ -174,12 +175,12 @@
 | `DOKITOOL_CATALOG_GLOBAL_BURST` | 目录池全局令牌桶突发容量 | 否 |
 | `DOKITOOL_CATALOG_GLOBAL_RPS` | 目录池全局每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_CATALOG_GLOBAL_CONCURRENCY` | 目录池全局允许同时在途的最大请求数 | 否 |
-| `DOKITOOL_WEIBO_CLIENT_BURST` | 微博媒体中转池单客户端令牌桶突发容量 | 否 |
-| `DOKITOOL_WEIBO_CLIENT_RPS` | 微博媒体中转池单客户端每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_WEIBO_CLIENT_CONCURRENCY` | 微博媒体中转池单客户端允许同时在途的最大请求数 | 否 |
-| `DOKITOOL_WEIBO_GLOBAL_BURST` | 微博媒体中转池全局令牌桶突发容量 | 否 |
-| `DOKITOOL_WEIBO_GLOBAL_RPS` | 微博媒体中转池全局每秒补充的请求令牌速率 | 否 |
-| `DOKITOOL_WEIBO_GLOBAL_CONCURRENCY` | 微博媒体中转池全局允许同时在途的最大请求数 | 否 |
+| `DOKITOOL_WEIBO_CLIENT_BURST` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
+| `DOKITOOL_WEIBO_CLIENT_RPS` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
+| `DOKITOOL_WEIBO_CLIENT_CONCURRENCY` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
+| `DOKITOOL_WEIBO_GLOBAL_BURST` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
+| `DOKITOOL_WEIBO_GLOBAL_RPS` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
+| `DOKITOOL_WEIBO_GLOBAL_CONCURRENCY` | 历史微博媒体中转池兼容保留参数（`v4.6.0` 起 `/api/media/weibo` 已退役，当前零路由消费） | 否 |
 | `DOKITOOL_REPORT_CLIENT_BURST` | 下载校验上报池单客户端令牌桶突发容量 | 否 |
 | `DOKITOOL_REPORT_CLIENT_RPS` | 下载校验上报池单客户端每秒补充的请求令牌速率 | 否 |
 | `DOKITOOL_REPORT_CLIENT_CONCURRENCY` | 下载校验上报池单客户端允许同时在途的最大请求数 | 否 |
@@ -309,14 +310,14 @@
 | `ytdlp.*_queue_size` | `32` / `32` / `16` / `64` | `0..1024` | 各慢舱与 `youtube_ejs` 的 FIFO 等待队列上限 |
 | `ytdlp.*_queue_wait` | `20s` / `20s` / `15s` / `10s` | `0s..30s` | 各慢舱与 `youtube_ejs` 的最大排队等待时长 |
 | `ytdlp.youtube_ejs_concurrency` | `6` | `1..16` | YouTube 助手接口（未命中 `/api/youtube/context` 与 `POST /api/youtube/finalize`）独立池并发上限 |
-| `fast_pool.per_platform_max_concurrency` | `24` | `2..256` | 快解析池内单个核心平台允许同时占用的最大并发槽位（超限时仅限流该平台返回 `429`，保护其余 8 个快平台） |
+| `fast_pool.per_platform_max_concurrency` | `24` | `2..256` | 快解析池内单个核心平台允许同时占用的最大并发槽位（超限时仅限流该平台返回 `429`，保护其余 10 个快平台） |
 | `circuit_breaker.enabled` | `true` | `true` / `false` | 是否启用自动平台级熔断（仅统计 `UPSTREAM_TIMEOUT` / `UPSTREAM_UNAVAILABLE` / `UPSTREAM_INVALID_RESPONSE` / `INTERNAL_ERROR`，绝不误判用户输入错误或内容状态） |
 | `circuit_breaker.consecutive_failures` | `5` | `1..100` | 触发熔断打开的连续真实上游失败阈值 |
 | `circuit_breaker.window_size` | `10` | `1..200` | 滑动窗口最小样本数与容量 |
 | `circuit_breaker.failure_rate_threshold` | `0.6` | `(0.0, 1.0]` | 滑动窗口失败率熔断阈值 |
 | `circuit_breaker.open_duration` | `"30s"` | `5s..600s` | 熔断打开后进入 `half_open` 探活前的冷却时长 |
 | `circuit_breaker.half_open_max_probes` | `2` | `1..16` | `half_open` 状态下允许并发放行的探活请求上限 |
-| `circuit_breaker.disabled_platforms` | `[]` | 14 核心平台 ID 或 `"ytdlp_generic"` | 手动强制紧急下线列表（自动去重；即使 `enabled: false` 也生效；热重载时立即清理该平台存量缓存，并在查缓存前直接拦截返回 `503` 快速失败，绝不返回 `fresh` 或 `stale` 缓存） |
+| `circuit_breaker.disabled_platforms` | `[]` | 16 核心平台 ID 或 `"ytdlp_generic"` | 手动强制紧急下线列表（自动去重；即使 `enabled: false` 也生效；热重载时立即清理该平台存量缓存，并在查缓存前直接拦截返回 `503` 快速失败，绝不返回 `fresh` 或 `stale` 缓存） |
 | `cache.youtube_parse_ttl` | `"120s"` | `0s..600s` | YouTube 服务端 `/api/parse` 缓存上限（受 `earliest_expires_at - 60s` 收缩；`"0s"` 可一键停用 YouTube 服务端缓存） |
 | `cache.stale_if_error_ttl` | `"600s"` | `0s..3600s` | `stale-if-error` 过期兜底窗口（铁律：含 `expires_at` 的响应硬顶绝不超过 `earliest_expires_at - 15s`；`"0s"` 关闭） |
 | `cache.upstream_blocked_neg_ttl` | `"5s"` | `0s..60s` | `UPSTREAM_BLOCKED` 短负缓存时长（`"0s"` 关闭；负缓存绝不作为过期兜底返回） |
