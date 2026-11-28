@@ -14,8 +14,9 @@
 | `GET /api/stats` | 可选 `schema_version=1.0`；仅限 `owner` 角色 Bearer 凭据访问（`DOKITOOL_OWNER_TOKEN` 或 `DOKITOOL_API_KEYS_FILE` 中的 `role: "owner"` 密钥），返回进程内请求、缓存、准入池（`admission.{fast,slow,generic_slow,owner}`）、`ytdlp` 与 `ytdlp_generic` 并发槽位、各 API 密钥池（`data.api_keys`）、只读脱敏运行开关（`data.runtime`）以及按 `Asia/Shanghai`（UTC+8）统计的近 30 天日桶（`data.daily`）与近 24 小时时桶（`data.hourly`）快照；`agent` / `friend` 角色密钥访问时返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。 |
 | `GET /api/youtube/context` | `schema_version=1.0`（必填）；在启用 `DOKITOOL_YOUTUBE_HELPER` 时返回当前缓存的 YouTube `player_id`、`signature_timestamp` 与固定客户端参数，供官方 Chrome MV3 扩展在浏览器端请求播放清单。未启用时返回 `404`。 |
 | `POST /api/youtube/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收官方 Chrome MV3 扩展提交的流清单载荷（`<= 512 KiB`），在无权限 Deno `ejs` 沙箱内完成签名解算并返回标准统一媒体 v1 结果。未启用时返回 `404`。 |
+| `POST /api/tiktok/finalize` | `schema_version=1.0`（必填），可选 `debug=1`；接收官方 Chrome MV3 扩展（`v4.7.0+` `tiktok_parse`）提交的已展开 `source_url`、`webapp.video-detail` 水合数据与客户端解析出的 `resolved_tiers`（`<= 512 KiB`），在服务端以**纯 CPU、零出站网络请求**完成严格白名单校验与标准统一媒体 v1 格式化（不写入共享解析缓存）。 |
 
-> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；Chrome MV3 官方扩展内部握手端点（`/api/youtube/context`、`POST /api/youtube/finalize`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。全站所有平台均坚持零服务端媒体流中转。
+> **OpenAPI 契约覆盖范围**：[docs/openapi.json](openapi.json) 面向通用客户端与个人 Agent，覆盖统一媒体 v1 公开接口与 Owner 统计接口（`/api/platforms`、`/api/parse`、`/api/resolve`、`/api/stats`）；Chrome MV3 官方扩展内部协作端点（`/api/youtube/context`、`POST /api/youtube/finalize`、`POST /api/tiktok/finalize`）属于内部专用配套接口，不在通用 OpenAPI 客户端生成契约内暴露，其协议规范见本文档并由 `scripts/check-openapi.py` 的 Caddy 路由对账门禁持续校验。全站所有平台均坚持零服务端媒体流中转。
 
 ```sh
 curl --get 'https://snap.example.com/api/parse' \
@@ -25,7 +26,7 @@ curl --get 'https://snap.example.com/api/parse' \
 
 上面是格式示例，不是有效平台样本。分享 token、签名参数必须保持完整；不要把实际 token 或返回的签名 URL 写进公开日志、Issue 和夹具。
 
-**Bearer 多密钥角色隔离与鉴权后零槽位缓存快路径**：`/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube 助手接口可选携带 `Authorization: Bearer <token>`（支持 `DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥及 `DOKITOOL_API_KEYS_FILE` 中的 `owner` / `agent` / `friend` 角色密钥，每把密钥拥有独立的并发池、慢解析子并发上限 `slow_concurrency`、速率桶与 FIFO 队列；配置与 `SIGHUP` 热重载见 [CONFIGURATION.md](CONFIGURATION.md)）：
+**Bearer 多密钥角色隔离与鉴权后零槽位缓存快路径**：`/api/parse`、`/api/resolve`、`/api/platforms` 及 YouTube / TikTok 扩展协作接口可选携带 `Authorization: Bearer <token>`（支持 `DOKITOOL_OWNER_TOKEN` 隐式 `owner` 密钥及 `DOKITOOL_API_KEYS_FILE` 中的 `owner` / `agent` / `friend` 角色密钥，每把密钥拥有独立的并发池、慢解析子并发上限 `slow_concurrency`、速率桶与 FIFO 队列；配置与 `SIGHUP` 热重载见 [CONFIGURATION.md](CONFIGURATION.md)）：
 - **角色与平台白名单边界**：`/api/stats` 严格仅允许 `owner` 角色访问（`agent` / `friend` 密钥访问返回 HTTP `401`）；若密钥配置了非空 `platforms` 平台白名单，请求白名单外的平台（以及未在白名单中显式声明 `"ytdlp_generic"` 时触发的第二级通用具名提取器兜底，无论缓存命中与否）同样返回 HTTP `401`（`code: "INVALID_INPUT"`，`retryable: false`）。
 - **两级解析路由与独立长尾隔离池（`DOKITOOL_YTDLP_GENERIC_ENABLED`）**：
   - **第一级（核心目录优先）**：命中 `/api/platforms` 已注册核心平台的链接始终走各自专用解析器与快/慢池，行为与配额完全不变；
@@ -85,7 +86,7 @@ curl --get 'https://snap.example.com/api/parse' \
 | `hls` | 保留显式清单及作用域（如单流 fMP4 HLS 清单），由浏览器按序下载初始化段与媒体分片拼接保存；不作为完整 `file` 默认。 |
 | `segments` | 只有具备布局验证证据的 `byte_concat` 才允许拼接；`remux` 明确暂不支持。 |
 | `pair` | 静图与动态片段有明确角色，按实况操作处理。 |
-| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.6.0`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
+| `dash`、`mux` | 服务端不执行音视频合流；纯 Web 端保留结构与能力识别，Chrome MV3 扩展（`v4.7.0`，运行态元数据位于 `/helper/extension-version.json`）在客户端 `offscreen` OPFS 中支持 YouTube 与 B 站免登录 1080P DASH `Mediabunny` 本地无损合流。 |
 
 variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标签/来源说明和 `reason`，没有媒体地址、规格或交付结构；不能进入默认选择或更高画质可交付引用。它也不代表已经拿到 4K。当前预留没有隐含的抓取器或自动重试入口。
 
@@ -126,6 +127,17 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
    - 请求 JSON 字段：`video_id`（11 位视频 ID）、`player_id`（8 位十六进制播放器 ID）、可选元数据（`title`、`author`、`duration_seconds`、`thumbnail`）、客户端从 `www.youtube.com` 取回的 `formats` / `adaptiveFormats` 数组，以及可选的 `captions`（含 `playerCaptionsTracklistRenderer.captionTracks`；服务端仅白名单校验 `https://www.youtube.com/api/timedtext` 元数据直链，绝不在服务端拉取字幕正文）。
    - 服务端在零权限 Deno 沙箱中批量解算 `s` / `n` 挑战参数，严格校验生成的直链必须为 `https://*.googlevideo.com/videoplayback`（无凭据、无自定义端口、无片段锚点），最终返回标准统一媒体 v1 响应（`extra.youtube_helper.status = "ready"`）。
 
+## TikTok 扩展协同定型接口
+
+当后端注册了 `tiktok` 平台适配器时，开放 **`POST /api/tiktok/finalize?schema_version=1.0`**（可选 `&debug=1`），供官方 Chrome MV3 扩展（`v4.7.0+` 声明 `tiktok_parse` 能力）执行 Route C+ 零 Cookie 协同解析；现有服务端 `GET /api/parse` 原生 TikTok 解析通道及其可选配置完整保留。
+
+- **治理与准入边界**：走 `fast` 快解析准入池（单平台舱壁 `"tiktok"`），受运行时 `circuit_breaker.disabled_platforms: ["tiktok"]` 秒级停用与 Bearer 密钥 `platforms` 白名单统一管控；**全程零出站网络请求、零外部进程，不读写共享 `parseCache`**，杜绝客户端提交内容污染服务端缓存或伪造服务端直连风控统计。
+- **不可信输入强校验（Fail-Closed）**：
+  - 请求体上限 **`512 KiB`**、读超时 `5s`、`DisallowUnknownFields` 且拒绝尾随 JSON；
+  - `source_url` 必须为已展开的合法 TikTok 作品长链（拒绝短链、主页/用户页与非 TikTok 域），并与 `video_detail.itemInfo.itemStruct.id` 一致性交叉校验；
+  - `resolved_tiers`（上限 `16` 项，禁止重复 `play_url`）每项均须满足 `play_url` 为 `https://www.tiktok.com/aweme/v1/play/...` 且严格属于当前作品的候选视频档位（Photo Mode 拒绝非空 `resolved_tiers`），`direct_url` 须通过 `AllowedMediaURL` 校验（仅限 4 个无 Cookie TikTok CDN 后缀，拒绝 `*-webapp-prime.tiktok.com`、`tk=tt_chain_token`、明文 HTTP、非 443 端口、凭据、片段与 IP 字面量）；
+  - 输出与原生 Go `GET /api/parse` 完全一致的 `unified-v1` 契约（视频 `browser_fetch: "blocked"` 交由扩展 DNR `1009` 零 Cookie 直下；图文/封面/配乐 `browser_fetch: "allowed"`）。
+
 ## 错误码、限流退避与分 P 语义
 
 条目状态分为可用（`ready`）、`deferred` 和 `unavailable`。分 P/合集顺序由 `groups[].item_ids` 表达；未解析条目带明确 `resolve_url`，失效条目保留身份与错误。切换、下载时解析对应条目，不能用 P1 直链填补失败的 P2。部分失败可以随其他成功项返回，整体无可用媒体则返回业务错误。
@@ -147,7 +159,7 @@ variant 的 `state:"deferred"` 是待解析能力预留，只有 ID、可选标�
 
 自 `v4.6.0` 起，历史 `/api/media/weibo` 签名媒体中转路由已全面退役（请求返回 `404`），全站 16 个核心平台全部坚持**零服务端媒体中转**：
 - 微博与 TikTok 等校验 `Referer` 防盗链的视频 CDN 源统一由公开层校验域名白名单并标注 `access: "direct"` 与 `browser_fetch: "blocked"`（微博接入进程内 `parseCache` 与 `singleflight`）；
-- 桌面 Chrome MV3 官方扩展（`v4.6.0`）通过仅绑定扩展自身（`initiatorDomains: [chrome.runtime.id]`）的零 Cookie 动态 DNR 规则（微博 `RULE 1003`、TikTok `RULE 1009`）在浏览器本地完成满血直下；未安装扩展的纯 Web 页面展示封面蒙层与一键安装扩展引导，不再向 `<video>` 喂入必然 `403` 的防盗链链接。
+- 桌面 Chrome MV3 官方扩展（`v4.7.0`）通过仅绑定扩展自身（`initiatorDomains: [chrome.runtime.id]`）的零 Cookie 动态 DNR 规则（微博 `RULE 1003`、TikTok 媒体下载 `RULE 1009` 及协同解析 `RULE 1010/1011`）在浏览器本地完成协同解析与满血直下；未安装扩展的纯 Web 页面展示封面蒙层与一键安装扩展引导，不再向 `<video>` 喂入必然 `403` 的防盗链链接。
 
 紫色下载按钮按原生附件、同源 Service Worker 流式下载、Chrome MV3 扩展后台直下/无损合流、以及分片拼接/ZIP 打包处理媒体交付。选源、命名和任务快照在交付前固定；具体下载策略、多线路测速、打包上限与调试开关见 [下载说明](DOWNLOADS.md)。
 

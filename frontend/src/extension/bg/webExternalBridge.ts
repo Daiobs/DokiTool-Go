@@ -18,7 +18,12 @@ import {
   type WebToExtensionRequest,
 } from "../protocol";
 import type { ExtensionStorageController } from "../storage";
-import { HttpStatusError, type ParseYouTubeViaOffscreenParams } from "./apiClient";
+import { extractTikTokTarget } from "../tiktokExtensionParser";
+import {
+  HttpStatusError,
+  type ParseTikTokViaOffscreenParams,
+  type ParseYouTubeViaOffscreenParams,
+} from "./apiClient";
 import type {
   ChromeBackgroundApi,
   ChromeRuntimeMessageListener,
@@ -32,6 +37,7 @@ const WEB_BRIDGE_CAPABILITIES: readonly WebBridgeCapability[] = [
   "direct_download",
   "youtube_parse",
   "youtube_mux",
+  "tiktok_parse",
 ];
 
 const ALLOWED_WEB_BRIDGE_EXTENSIONS = new Set([
@@ -398,6 +404,9 @@ export interface WebExternalBridgeDeps {
   parseYouTubeViaOffscreen: (
     params: ParseYouTubeViaOffscreenParams,
   ) => Promise<UnifiedMedia>;
+  parseTikTokViaOffscreen?: (
+    params: ParseTikTokViaOffscreenParams,
+  ) => Promise<UnifiedMedia>;
   enqueueDownloadItems: (
     items: EnqueueDownloadItem[],
     groupBatchId?: string,
@@ -420,6 +429,7 @@ export function createWebExternalBridge(
     tasks,
     webBridgeTaskIds,
     parseYouTubeViaOffscreen,
+    parseTikTokViaOffscreen,
     enqueueDownloadItems,
     cancelTaskById,
   } = deps;
@@ -457,6 +467,34 @@ export function createWebExternalBridge(
           authSettings: { bearerToken: "" },
           helperVersion: manifestVersion,
           extensionVersion: manifestVersion,
+        });
+        return okRpc({ media });
+      }
+
+      case "WEB_EXT_PARSE_TIKTOK": {
+        if (!parseTikTokViaOffscreen) {
+          return errRpc("当前扩展未启用 TikTok 协同解析", {
+            code: "UNSUPPORTED_ACTION",
+          });
+        }
+        const rawUrl = typeof req.url === "string" ? req.url.trim() : "";
+        if (!extractTikTokTarget(rawUrl)) {
+          return errRpc("请输入有效的 TikTok 视频或图文链接", {
+            code: "INVALID_INPUT",
+            status: 400,
+          });
+        }
+        const apiOrigin = senderCheck.isLoopback
+          ? senderCheck.origin
+          : PROD_API_ORIGIN;
+        const media = await parseTikTokViaOffscreen({
+          url: rawUrl,
+          apiOrigin,
+          // Strictly zero-secret: NEVER attach owner's stored bearerToken for external web bridge!
+          authSettings: { bearerToken: "" },
+          ...(senderCheck.isLoopback
+            ? { extraAllowedOrigins: [senderCheck.origin] }
+            : {}),
         });
         return okRpc({ media });
       }

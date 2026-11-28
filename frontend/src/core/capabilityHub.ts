@@ -48,11 +48,18 @@ export interface ParsedExtensionVersionPayload {
  */
 export const MIN_EXTENSION_YOUTUBE_VERSION = "4.3.0" as const;
 
+/**
+ * Minimum DokiTool extension version that supports client-assisted zero-cookie
+ * TikTok page hydration & /aweme/v1/play/ 302 resolution (`tiktok_parse`).
+ */
+export const MIN_EXTENSION_TIKTOK_VERSION = "4.7.0" as const;
+
 export type KnownExtensionCapability =
   | "dash_mux"
   | "direct_download"
   | "youtube_parse"
-  | "youtube_mux";
+  | "youtube_mux"
+  | "tiktok_parse";
 
 export interface ClientCapabilityEnvironment {
   extensionConnected: boolean;
@@ -212,16 +219,17 @@ export function hasClientExtensionCapability(
 
 /**
  * Decides how a client-session-required URL should be parsed:
- * Priority: Connected Extension (`youtube_parse`) > Server API.
+ * Priority: Connected Extension (`requiredCapability`, default `youtube_parse`) > Server API.
  */
 export function resolveClientParseRoute(
   requiresClientSession: boolean,
   env: ClientCapabilityEnvironment,
+  requiredCapability: "youtube_parse" | "tiktok_parse" = "youtube_parse",
 ): ClientParseRoute {
   if (!requiresClientSession) {
     return { channel: "server_api" };
   }
-  if (hasClientExtensionCapability(env, "youtube_parse")) {
+  if (hasClientExtensionCapability(env, requiredCapability)) {
     return { channel: "extension_client_parse" };
   }
   return { channel: "server_api" };

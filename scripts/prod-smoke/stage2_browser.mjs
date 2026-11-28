@@ -63,6 +63,7 @@ export const EXPECTED_BRIDGE_CAPABILITIES = Object.freeze([
   "direct_download",
   "youtube_parse",
   "youtube_mux",
+  "tiktok_parse",
 ]);
 
 export const MANDATORY_HEADLESS_FLAGS = Object.freeze([

@@ -46,6 +46,7 @@ func TestRoutePoliciesCoverEveryRouteExhaustively(t *testing.T) {
 		{"/api/resolve", true, ""},
 		{"/api/youtube/context", true, "youtube"},
 		{"/api/youtube/finalize", true, "youtube"},
+		{"/api/tiktok/finalize", true, "tiktok"},
 		{"/api/media/weibo", false, ""},
 		{"/api/platforms", false, ""},
 		{"/api/stats", false, ""},

@@ -403,7 +403,7 @@ func ExtractExtractorFromStderr(stderr string) string {
 //   - If a named yt-dlp extractor is identifiable (via structured ytengine.Error.Extractor
 //     or stderr "ERROR: [<extractor>]" / "WARNING: [<extractor>]") and passes
 //     NormalizeExtractorPlatform, returns that normalized platform ID (e.g. "vimeo", "tiktok").
-//   - Otherwise (Unsupported URL, [generic], core-14 extractor, empty/unrecognized stderr,
+//   - Otherwise (Unsupported URL, [generic], core-16 extractor, empty/unrecognized stderr,
 //     or DNS/SSRF/outbound-host rejections), returns PlatformUnmatched ("ytdlp_unmatched").
 func AttributeGenericFailurePlatform(err error) string {
 	if err == nil {

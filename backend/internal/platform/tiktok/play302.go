@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Brilliant666/DokiTool-Go/backend/internal/fetch"
+	"github.com/Brilliant666/DokiTool-Go/backend/internal/unified"
 )
 
 const (
@@ -38,9 +39,15 @@ func AllowedMediaURL(raw string) bool {
 		return false
 	}
 	for _, r := range trimmed {
-		if r <= 0x20 || r == 0x7f || r == '\\' || r == '#' {
+		if r <= 0x20 || r >= 0x7f || r == '\\' || r == '#' {
 			return false
 		}
+	}
+	// Ensure every accepted CDN URL is a strict subset of unified.MediaURL
+	// (printable ASCII, valid DNS labels, no userinfo) so valid client/upstream
+	// media URLs can never trigger 502 contract failures during envelope validation.
+	if unified.MediaURL(trimmed) != trimmed {
+		return false
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil || u == nil || u.Opaque != "" || u.User != nil {
@@ -76,17 +83,41 @@ func AllowedMediaURL(raw string) bool {
 	if !matched {
 		return false
 	}
-	// Reject cookie-bound tt_chain_token query parameter.
-	if u.RawQuery != "" {
-		if q, qErr := url.ParseQuery(u.RawQuery); qErr == nil {
-			for _, v := range q["tk"] {
-				if strings.EqualFold(strings.TrimSpace(v), "tt_chain_token") {
-					return false
-				}
-			}
-		}
+	// Fail-closed rejection of cookie-bound tt_chain_token query parameter across
+	// both '&' and ';' separators, malformed percent escapes, and case variants.
+	if u.RawQuery != "" && hasChainTokenQueryParam(u.RawQuery) {
+		return false
 	}
 	return true
+}
+
+func hasChainTokenQueryParam(rawQuery string) bool {
+	for _, pair := range strings.FieldsFunc(rawQuery, func(r rune) bool {
+		return r == '&' || r == ';'
+	}) {
+		if pair == "" {
+			continue
+		}
+		rawKey, rawVal, hasEq := strings.Cut(pair, "=")
+		if !hasEq {
+			continue
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		if !strings.EqualFold(strings.TrimSpace(key), "tk") {
+			continue
+		}
+		val, err := url.QueryUnescape(rawVal)
+		if err != nil {
+			val = rawVal
+		}
+		if strings.EqualFold(strings.TrimSpace(val), "tt_chain_token") {
+			return true
+		}
+	}
+	return false
 }
 
 func isPlayRedirectSourceURL(raw string) bool {

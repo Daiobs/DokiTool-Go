@@ -243,7 +243,7 @@ sudo sha256sum "/proc/${PID}/exe"
 
 | 阶段 | 标准工具 | 负责范围（唯一验收源） | 避免重复约定 |
 | --- | --- | --- | --- |
-| **阶段一（A4 / A5）** | `scripts/prod-smoke/smoke.py` + `scripts/check-download-headers.py` | 服务端进程/热重载、全量 `frontend_dist_files` 静态字节 SHA-256、14 核心平台 API 解析与缓存/快路径/直连标记、`/api/stats` 匿名 `401` 与未白名单 `404`、下载桥接及 `/` 与 `/helper/extension-version.json` 固定 `mtime` 防 `304` 条件请求共 18 项安全头校验 | 不启动浏览器；负责全部纯 HTTP 静态哈希与后端接口回归 |
+| **阶段一（A4 / A5）** | `scripts/prod-smoke/smoke.py` + `scripts/check-download-headers.py` | 服务端进程/热重载、全量 `frontend_dist_files` 静态字节 SHA-256、16 核心平台目录与 API 冒烟（区分目录契约、部署开关与已知出口受限）、缓存/快路径/直连标记、`/api/stats` 匿名 `401` 与未白名单 `404`、下载桥接及 `/` 与 `/helper/extension-version.json` 固定 `mtime` 防 `304` 条件请求共 18 项安全头校验 | 不启动浏览器；负责全部纯 HTTP 静态哈希与后端接口回归 |
 | **阶段二（Section D）** | `scripts/prod-smoke/stage2_browser.mjs` | **浏览器专属实测**：① 官方扩展 ZIP 安全边界验签（`manifest.json` 版本、`externally_connectable` 仅含线上主站、零 `content_scripts`/`cookies`/`<all_urls>`）；② 纯网页无头 Chrome 真实水合、主题防闪烁、`/downloads/` 模块 Service Worker 注册与 `/downloads/bridge.html` iframe `MessageChannel` `ping` 握手、`/monitor` 桌面 + `390×844` 移动端零横向溢出与 `0` CSP/控制台/页面报错；③ 零修改官方扩展无头 Chrome `WEB_EXT_PING`、无「有新版」误报与零油猴全局；④ `full` 档追加线上 B 站 + YouTube 零油猴真实解析与可选 Mediabunny 双轨落盘 | 阶段一已完整通过 `smoke.py` + `check-download-headers.py` 时，阶段二可追加 `--skip-http-checks` 跳过重复的纯 HTTP 响应头子项（仍强制下载并验签官方扩展 ZIP） |
 
 ### 3.2 强制运行与安全红线

@@ -1,6 +1,7 @@
 import { computed, ref, shallowRef, watch, type Ref } from "vue";
 import { apiConfig } from "../services/apiConfig";
 import type {
+  parseTikTokViaExtension as parseTikTokViaExtensionFn,
   parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
   pingInstalledExtension,
 } from "../services/extensionBridge";
@@ -158,6 +159,7 @@ export function useVideoParser(options: {
   showToast: (message: string, type?: ToastType, duration?: number) => unknown;
   pingExtension?: typeof pingInstalledExtension;
   parseYouTubeViaExtension?: typeof parseYouTubeViaExtensionFn;
+  parseTikTokViaExtension?: typeof parseTikTokViaExtensionFn;
 }) {
   const { videoStore, showToast } = options;
   const pingExtension: typeof pingInstalledExtension =
@@ -176,12 +178,21 @@ export function useVideoParser(options: {
       );
       return parse(...args);
     });
+  const parseTikTokViaExtension: typeof parseTikTokViaExtensionFn =
+    options.parseTikTokViaExtension ??
+    (async (...args) => {
+      const { parseTikTokViaExtension: parse } = await import(
+        "../services/extensionBridge"
+      );
+      return parse(...args);
+    });
 
   const inputUrl = shallowRef(""),
     parseError = shallowRef(""),
     parseStatusText = shallowRef(""),
     currentPlatform = shallowRef("all"),
-    platformMismatchDetected = shallowRef(false);
+    platformMismatchDetected = shallowRef(false),
+    extensionErrorAction = shallowRef<"" | "install" | "upgrade">("");
   const parseButtonState = ref<string>("idle");
   const parseButtonError = ref<Error | null>(null);
   const parseButton = {
@@ -215,6 +226,7 @@ export function useVideoParser(options: {
     parseError.value = "";
     parseStatusText.value = "";
     platformMismatchDetected.value = false;
+    extensionErrorAction.value = "";
     videoStore.clearResult();
   };
   watch([inputUrl, currentPlatform], invalidate, { flush: "sync" });
@@ -278,6 +290,39 @@ export function useVideoParser(options: {
     });
   }
 
+  async function parseTikTokWithHelper(
+    url: string,
+    run: number,
+    controller: AbortController,
+  ): Promise<void> {
+    const { runTikTokHelperParse } = await import("../utils/parseHelpers");
+    if (run !== generation || controller.signal.aborted) return;
+    await runTikTokHelperParse({
+      url,
+      locale: options.locale.value,
+      signal: controller.signal,
+      isCurrent: () => run === generation && !controller.signal.aborted,
+      pingExtension,
+      parseTikTokViaExtension,
+      requestStandardParse,
+      onStageChange: (_stage, statusText) => {
+        if (run === generation && !controller.signal.aborted) {
+          parseStatusText.value = statusText;
+        }
+      },
+      onExtensionAction: (action) => {
+        if (run === generation && !controller.signal.aborted) {
+          extensionErrorAction.value = action;
+        }
+      },
+      setResult: (media) => videoStore.setResult(media),
+      setError: (msg, duration) => {
+        parseError.value = msg;
+        showToast(msg, "error", duration);
+      },
+    });
+  }
+
   async function parseVideo() {
     if (active) return;
     const extracted = (
@@ -291,10 +336,12 @@ export function useVideoParser(options: {
     const url = (hashIdx >= 0 ? extracted.slice(0, hashIdx) : extracted)
       .replace(/[.,;!?]+$/, "")
       .trim();
+    let parsedHost = "";
     try {
       const parsed = new URL(url);
       if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname)
         throw new Error();
+      parsedHost = parsed.hostname.toLowerCase().replace(/\.+$/, "");
     } catch {
       invalidate();
       parseError.value = "请输入有效分享链接";
@@ -312,6 +359,7 @@ export function useVideoParser(options: {
     parseError.value = "";
     parseStatusText.value = "";
     platformMismatchDetected.value = false;
+    extensionErrorAction.value = "";
     parseButton.setLoading(true);
     try {
       if (currentPlatform.value !== "all") {
@@ -340,6 +388,12 @@ export function useVideoParser(options: {
       }
       if (youtubeVideoId) {
         await parseYouTubeWithHelper(url, youtubeVideoId, run, controller);
+      } else if (
+        (currentPlatform.value === "all" ||
+          currentPlatform.value === "tiktok") &&
+        (parsedHost === "tiktok.com" || parsedHost.endsWith(".tiktok.com"))
+      ) {
+        await parseTikTokWithHelper(url, run, controller);
       } else {
         const data = await requestStandardParse(url, controller.signal);
         if (run === generation && !controller.signal.aborted)
@@ -430,6 +484,7 @@ export function useVideoParser(options: {
     parseStatusText,
     currentPlatform,
     platformMismatchDetected,
+    extensionErrorAction,
     parseButton,
     parseVideo,
     switchToAllAndRetry,

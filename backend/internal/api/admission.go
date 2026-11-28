@@ -28,6 +28,7 @@ const (
 	legacy
 	telemetry
 	youtubeHelper
+	tiktokHelper
 	statsRoute
 	routeCount
 )
@@ -39,6 +40,8 @@ func classify(path string) route {
 		return parser
 	case "/api/youtube/context", "/api/youtube/finalize":
 		return youtubeHelper
+	case "/api/tiktok/finalize":
+		return tiktokHelper
 	case "/api/platforms":
 		return catalogRoute
 	case "/api/stats":
@@ -436,7 +439,7 @@ func (a *admission) serveAuthenticated(
 	wallStart time.Time,
 ) {
 	// 1. Enforce optional per-key platform allowlist before fast-path or pool slot acquisition.
-	if kind == youtubeHelper && !key.AllowsPlatform("youtube") {
+	if pol := policyForRoute(kind); pol.enforcePlatformAuth && pol.staticPlatform != "" && !key.AllowsPlatform(pol.staticPlatform) {
 		if retry := key.pool.chargeFastRead(a.now()); retry > 0 {
 			key.recordRateLimited()
 			rejectAdmission(w, r, kind, http.StatusTooManyRequests, retry)
@@ -552,6 +555,8 @@ func (a *admission) selectPool(r *http.Request, kind route, path string) (*pool,
 			return a.catalog, ""
 		}
 		return a.youtubeEJS, ""
+	case tiktokHelper:
+		return a.public, "tiktok"
 	case parser:
 		if r.Method != http.MethodGet {
 			return a.public, ""
@@ -1142,7 +1147,7 @@ func rejectUnauthorized(w http.ResponseWriter, r *http.Request, kind route) {
 
 func rejectUnauthorizedWithMessage(w http.ResponseWriter, r *http.Request, kind route, message string) {
 	payload := unified.Object{"code": http.StatusUnauthorized, "msg": message, "data": nil}
-	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == statsRoute {
+	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == tiktokHelper || kind == statsRoute {
 		payload = contractErrorForStatus(http.StatusUnauthorized, message)
 	}
 	if r.Method == http.MethodHead {
@@ -1163,7 +1168,7 @@ func rejectAdmission(w http.ResponseWriter, r *http.Request, kind route, status,
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	payload := unified.Object{"code": status, "msg": message, "data": nil}
-	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == statsRoute {
+	if kind == parser || kind == catalogRoute || kind == youtubeHelper || kind == tiktokHelper || kind == statsRoute {
 		payload = unified.ContractError(code, message, status == 429)
 		if status == 429 {
 			unified.Map(payload["error"])["retry_after_seconds"] = retry

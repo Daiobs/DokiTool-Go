@@ -81,6 +81,7 @@ test("hostWhitelist: zero wildcards, loopback isolated to optional_host_permissi
 
   for (const list of [
     hostWhitelist.PRODUCTION_HOST_PERMISSIONS,
+    hostWhitelist.CLIENT_PARSE_PAGE_HOST_PERMISSIONS,
     hostWhitelist.LOOPBACK_HOST_PERMISSIONS,
     prodManifest.host_permissions,
     prodManifest.optional_host_permissions,
@@ -322,11 +323,11 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Ru
 
   assert.deepEqual(
     rules.map((r) => r.id),
-    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009],
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011],
   );
   assert.deepEqual(
     Array.from(dnrRules.EXTENSION_DNR_RULE_IDS),
-    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009],
+    [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011],
   );
 
   for (const rule of rules) {
@@ -338,7 +339,7 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Ru
     assert.equal(rule.action.type, "modifyHeaders");
   }
 
-  const [r1001, r1002, r1003, r1004, r1005, r1006, r1007, r1008, r1009] = rules;
+  const [r1001, r1002, r1003, r1004, r1005, r1006, r1007, r1008, r1009, r1010, r1011] = rules;
   assert.equal(r1009.priority, 2);
   assert.deepEqual(r1009.condition.requestDomains, [
     "tiktokcdn.com",
@@ -358,6 +359,26 @@ test("dnrRules: pins initiatorDomains=[extensionId] on every rule, configures Ru
       `Rule 1005 must not duplicate specialized TikTok domain ${ttDom}`,
     );
   }
+  assert.equal(r1010.priority, 3);
+  assert.equal(r1010.condition.urlFilter, "||www.tiktok.com/aweme/v1/play/");
+  assert.deepEqual(r1010.condition.resourceTypes, ["xmlhttprequest"]);
+  assert.deepEqual(r1010.action.requestHeaders, [
+    { header: "Referer", operation: "set", value: "https://www.tiktok.com/" },
+    { header: "Origin", operation: "remove" },
+    { header: "Cookie", operation: "remove" },
+  ]);
+  assert.equal(r1011.priority, 2);
+  assert.deepEqual(r1011.condition.requestDomains, [
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+    "m.tiktok.com",
+  ]);
+  assert.deepEqual(r1011.condition.resourceTypes, ["xmlhttprequest"]);
+  assert.deepEqual(r1011.action.requestHeaders, [
+    { header: "Origin", operation: "remove" },
+    { header: "Cookie", operation: "remove" },
+  ]);
 
   // Rule 1001: YouTube TVHTML5 player endpoint
   assert.equal(r1001.priority, 3);
@@ -2235,6 +2256,7 @@ test("PR 1 Web <-> Extension external bridge security: strict origin gate, zero 
           "direct_download",
           "youtube_parse",
           "youtube_mux",
+          "tiktok_parse",
         ],
         useSaveFilePicker: false,
       },
@@ -4668,7 +4690,7 @@ test("Post-#71 PR-2 (NV-08, NV-09, P0-1, P1-5 & Hardening): single-port loopback
         assert.equal(init.credentials, "omit");
         assert.equal(init.cache, "no-store");
         return new Response(
-          JSON.stringify({ version: "4.6.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
+          JSON.stringify({ version: "4.8.0", download_url: "/helper/dokitool-chrome-extension.zip" }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       },
@@ -4681,8 +4703,8 @@ test("Post-#71 PR-2 (NV-08, NV-09, P0-1, P1-5 & Hardening): single-port loopback
 
       // Remote version strictly higher monotonically raises latestExtensionVersion
       const ver = await runtime.refreshLatestExtensionVersion({ cooldownMs: 60_000 });
-      assert.equal(ver, "4.6.0");
-      assert.equal(runtime.latestExtensionVersion.value, "4.6.0");
+      assert.equal(ver, "4.8.0");
+      assert.equal(runtime.latestExtensionVersion.value, "4.8.0");
       // Within cooldown -> no duplicate fetch
       await runtime.refreshLatestExtensionVersion({ cooldownMs: 60_000 });
       assert.equal(fetchCount, 1);

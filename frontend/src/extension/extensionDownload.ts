@@ -45,6 +45,11 @@ import {
   createYouTubeExtensionBridge,
   type UrlObjectApiLike,
 } from "./youtubeExtensionBridge";
+import {
+  fetchTikTokClientPayload,
+  type TikTokClientFetchPayload,
+  type TikTokClientFetchResult,
+} from "./tiktokExtensionParser";
 
 export {
   extractDashMuxSpec,
@@ -358,6 +363,10 @@ export interface OffscreenDownloadExecutor {
     payload: YouTubeHelperPlayerPayload,
     options?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<YouTubeHelperPlayerResult>;
+  requestTikTokFetch(
+    payload: TikTokClientFetchPayload,
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<TikTokClientFetchResult>;
   getHelperVersion(): string;
   getActiveTaskCount(): number;
   getPendingBlobCount(): number;
@@ -1851,6 +1860,17 @@ export function createOffscreenDownloadExecutor(
       reqOpts?: { timeoutMs?: number; signal?: AbortSignal },
     ): Promise<YouTubeHelperPlayerResult> {
       return youtubeBridge.requestPlayer(payload, reqOpts);
+    },
+
+    requestTikTokFetch(
+      payload: TikTokClientFetchPayload,
+      reqOpts?: { timeoutMs?: number; signal?: AbortSignal },
+    ): Promise<TikTokClientFetchResult> {
+      return fetchTikTokClientPayload(payload, {
+        fetchImpl: fetchFn,
+        timeoutMs: reqOpts?.timeoutMs,
+        signal: reqOpts?.signal,
+      });
     },
 
     getHelperVersion(): string {

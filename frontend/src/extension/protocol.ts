@@ -7,6 +7,10 @@ import type {
   YouTubeHelperPrefetchResult,
 } from "../utils/youtubeHelperCore";
 import type {
+  TikTokClientFetchPayload,
+  TikTokClientFetchResult,
+} from "./tiktokExtensionParser";
+import type {
   BatchSaveMode,
   ExtensionSettings,
   ExtensionSettingsPatch,
@@ -414,6 +418,11 @@ export type BackgroundToOffscreenRequest =
       timeoutMs?: number;
     }
   | {
+      type: "OFFSCREEN_TIKTOK_FETCH";
+      payload: TikTokClientFetchPayload;
+      timeoutMs?: number;
+    }
+  | {
       type: "OFFSCREEN_START_TASK";
       taskId: string;
       spec: OffscreenDownloadSpec;
@@ -435,6 +444,7 @@ export interface OffscreenResponseMap {
   };
   OFFSCREEN_YOUTUBE_PREFETCH: { prefetch: YouTubeHelperPrefetchResult };
   OFFSCREEN_YOUTUBE_PLAYER: { player: YouTubeHelperPlayerResult };
+  OFFSCREEN_TIKTOK_FETCH: { result: TikTokClientFetchResult };
   OFFSCREEN_START_TASK: { accepted: boolean };
   OFFSCREEN_CANCEL_TASK: { cancelled: boolean };
   RELEASE_BLOB: { released: boolean };
@@ -493,7 +503,8 @@ export type WebBridgeCapability =
   | "dash_mux"
   | "direct_download"
   | "youtube_parse"
-  | "youtube_mux";
+  | "youtube_mux"
+  | "tiktok_parse";
 
 export interface WebExtDashMuxPayload {
   videoRoutes: string[];
@@ -557,6 +568,11 @@ export type WebToExtensionRequest =
       locale?: "zh-CN" | "en";
     }
   | {
+      type: "WEB_EXT_PARSE_TIKTOK";
+      url: string;
+      locale?: "zh-CN" | "en";
+    }
+  | {
       type: "WEB_EXT_ENQUEUE_MEDIA";
       payload: WebExtEnqueuePayload;
     }
@@ -577,6 +593,10 @@ export interface WebExtPingData {
 }
 
 export interface WebExtParseYouTubeData {
+  media: UnifiedMedia;
+}
+
+export interface WebExtParseTikTokData {
   media: UnifiedMedia;
 }
 
@@ -616,6 +636,7 @@ export interface WebExtTaskStatusData {
 export interface WebToExtensionResponseMap {
   WEB_EXT_PING: WebExtPingData;
   WEB_EXT_PARSE_YOUTUBE: WebExtParseYouTubeData;
+  WEB_EXT_PARSE_TIKTOK: WebExtParseTikTokData;
   WEB_EXT_ENQUEUE_MEDIA: WebExtEnqueueMediaData;
   WEB_EXT_GET_TASK_STATUS: WebExtTaskStatusData;
   WEB_EXT_CANCEL_TASK: WebExtCancelTaskData;
@@ -628,6 +649,7 @@ export type AnyExtensionRuntimeMessage =
 const WEB_TO_EXTENSION_REQUEST_TYPES = new Set<WebToExtensionRequest["type"]>([
   "WEB_EXT_PING",
   "WEB_EXT_PARSE_YOUTUBE",
+  "WEB_EXT_PARSE_TIKTOK",
   "WEB_EXT_ENQUEUE_MEDIA",
   "WEB_EXT_GET_TASK_STATUS",
   "WEB_EXT_CANCEL_TASK",
@@ -664,6 +686,7 @@ const BG_TO_OFFSCREEN_TYPES = new Set<BackgroundToOffscreenRequest["type"]>([
   "OFFSCREEN_PING",
   "OFFSCREEN_YOUTUBE_PREFETCH",
   "OFFSCREEN_YOUTUBE_PLAYER",
+  "OFFSCREEN_TIKTOK_FETCH",
   "OFFSCREEN_START_TASK",
   "OFFSCREEN_CANCEL_TASK",
   "RELEASE_BLOB",

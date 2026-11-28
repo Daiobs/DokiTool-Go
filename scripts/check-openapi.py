@@ -61,6 +61,7 @@ EXPECTED_CADDY_API_WHITELIST = [
     "/api/toutiao",
     "/api/youtube/context",
     "/api/youtube/finalize",
+    "/api/tiktok/finalize",
     "/api/stats",
 ]
 

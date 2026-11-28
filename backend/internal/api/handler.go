@@ -45,6 +45,7 @@ type Handler struct {
 	now                 func() time.Time
 	publicMedia         PublicMedia
 	youtubeHelper       YouTubeHelper
+	tiktokFinalizer     TikTokFinalizer
 	finalizeReadTimeout time.Duration
 	cache               *parseCache
 	cb                  *circuitBreakerManager
@@ -93,6 +94,9 @@ func NewWithCacheConfig(c *catalog.Catalog, adapters map[string]Adapter, now fun
 		cb:                  cb,
 		stats:               stats,
 		panicLogf:           log.Printf,
+	}
+	if tf, ok := registered["tiktok"].(TikTokFinalizer); ok {
+		h.tiktokFinalizer = tf
 	}
 	h.policy.Store(newRuntimePolicySnapshot(defaultRT, 0))
 	return h, nil
@@ -538,6 +542,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case youtubeHelper:
 		h.serveYouTubeHelper(w, r)
+		return
+	case tiktokHelper:
+		h.serveTikTokHelper(w, r)
 		return
 	case parser, catalogRoute:
 	default:

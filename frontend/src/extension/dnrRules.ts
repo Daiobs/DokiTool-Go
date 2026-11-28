@@ -16,6 +16,8 @@ export const EXTENSION_DNR_RULE_IDS = [
   1007,
   1008,
   1009,
+  1010,
+  1011,
 ] as const;
 
 export type DnrResourceType = "xmlhttprequest" | "media" | "image";
@@ -69,6 +71,13 @@ const RULE_1009_TIKTOK_DOMAINS = [
   "tiktokcdn-us.com",
   "tiktokcdn-eu.com",
   "tiktokv.com",
+] as const;
+
+const RULE_1011_TIKTOK_PARSE_DOMAINS = [
+  "www.tiktok.com",
+  "vm.tiktok.com",
+  "vt.tiktok.com",
+  "m.tiktok.com",
 ] as const;
 
 /**
@@ -289,6 +298,44 @@ export function buildExtensionDnrRules(
         initiatorDomains: [extensionId],
         requestDomains: [...RULE_1009_TIKTOK_DOMAINS],
         resourceTypes: ["xmlhttprequest", "media", "image"],
+      },
+    },
+    {
+      id: 1010,
+      priority: 3,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          {
+            header: "Referer",
+            operation: "set",
+            value: "https://www.tiktok.com/",
+          },
+          { header: "Origin", operation: "remove" },
+          { header: "Cookie", operation: "remove" },
+        ],
+      },
+      condition: {
+        initiatorDomains: [extensionId],
+        requestDomains: ["www.tiktok.com"],
+        urlFilter: "||www.tiktok.com/aweme/v1/play/",
+        resourceTypes: ["xmlhttprequest"],
+      },
+    },
+    {
+      id: 1011,
+      priority: 2,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "Origin", operation: "remove" },
+          { header: "Cookie", operation: "remove" },
+        ],
+      },
+      condition: {
+        initiatorDomains: [extensionId],
+        requestDomains: [...RULE_1011_TIKTOK_PARSE_DOMAINS],
+        resourceTypes: ["xmlhttprequest"],
       },
     },
   ];
