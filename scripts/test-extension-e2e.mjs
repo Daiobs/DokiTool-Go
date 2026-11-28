@@ -1117,6 +1117,7 @@ export async function runExtensionE2E({
     assert.ok(extPing.capabilities.includes("youtube_mux"));
     assert.ok(extPing.capabilities.includes("dash_mux"));
     assert.ok(extPing.capabilities.includes("direct_download"));
+    assert.ok(extPing.capabilities.includes("tiktok_parse"));
     report.extensionVersion = extPing.version;
 
     const webExtRpc = (req) =>

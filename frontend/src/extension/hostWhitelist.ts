@@ -21,6 +21,21 @@ export const LOOPBACK_HOST_PERMISSIONS = [
   "http://localhost/*",
 ] as const;
 
+/**
+ * Exact non-wildcard page-parse host permissions strictly isolated from
+ * `PRODUCTION_HOST_PERMISSIONS` / `isWhitelistedMediaUrl` / `CDN_REQUEST_DOMAINS`.
+ *
+ * Used solely by client-assisted zero-cookie page hydration & shortlink /
+ * `/aweme/v1/play/` resolution (e.g. TikTok). Media downloads MUST NEVER pass
+ * `isWhitelistedMediaUrl()` via these parse-page hosts.
+ */
+export const CLIENT_PARSE_PAGE_HOST_PERMISSIONS = [
+  "https://www.tiktok.com/*",
+  "https://vm.tiktok.com/*",
+  "https://vt.tiktok.com/*",
+  "https://m.tiktok.com/*",
+] as const;
+
 interface PlatformCdnGroup {
   readonly group: string;
   readonly httpsHosts: readonly string[];
@@ -248,13 +263,17 @@ export function buildManifestHostPermissions(options?: {
     return {
       host_permissions: [
         ...PRODUCTION_HOST_PERMISSIONS,
+        ...CLIENT_PARSE_PAGE_HOST_PERMISSIONS,
         ...LOOPBACK_HOST_PERMISSIONS,
       ],
       optional_host_permissions: [],
     };
   }
   return {
-    host_permissions: [...PRODUCTION_HOST_PERMISSIONS],
+    host_permissions: [
+      ...PRODUCTION_HOST_PERMISSIONS,
+      ...CLIENT_PARSE_PAGE_HOST_PERMISSIONS,
+    ],
     optional_host_permissions: [...LOOPBACK_HOST_PERMISSIONS],
   };
 }

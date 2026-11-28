@@ -1,11 +1,13 @@
 import { supportedPlatforms } from "./platforms";
 import { withTbvideoItems } from "../services/tbvideo";
 import {
+  MIN_EXTENSION_TIKTOK_VERSION,
   MIN_EXTENSION_YOUTUBE_VERSION,
   resolveClientParseRoute,
   type ClientCapabilityEnvironment,
 } from "../core/capabilityHub";
 import type {
+  parseTikTokViaExtension as parseTikTokViaExtensionFn,
   parseYouTubeViaExtension as parseYouTubeViaExtensionFn,
   pingInstalledExtension,
 } from "../services/extensionBridge";
@@ -408,5 +410,218 @@ export async function runYouTubeHelperParse(ctx: {
       };
   if (isCurrent()) {
     ctx.setResult(buildFallbackYouTubeMedia(videoId, helperState));
+  }
+}
+
+export function isTikTokUrl(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return host === "tiktok.com" || host.endsWith(".tiktok.com");
+  } catch {
+    return false;
+  }
+}
+
+export function formatTikTokParseStageText(
+  stage: 1 | 2,
+  locale = "zh-CN",
+): string {
+  const isEn = locale === "en";
+  if (stage === 1) {
+    return isEn
+      ? "Fetching TikTok post via extension (1/2)…"
+      : "正在通过扩展获取 TikTok 作品数据 (1/2)…";
+  }
+  return isEn
+    ? "Validating media formats (2/2)…"
+    : "正在校验并生成下载方案 (2/2)…";
+}
+
+function isServerBlockedOrUnconfigured(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const rec = err as { status?: unknown; code?: unknown };
+  return (
+    rec.code === "UPSTREAM_BLOCKED" ||
+    rec.code === "SERVICE_NOT_CONFIGURED" ||
+    rec.status === 403 ||
+    rec.status === 503
+  );
+}
+
+/**
+ * TikTok cooperative parse orchestrator for Web SPA:
+ * 1. When a connected extension advertises `tiktok_parse` (v4.7.0+), parses
+ *    cooperatively via Offscreen hydration + POST /api/tiktok/finalize (zero
+ *    `/api/parse` calls). Real upstream/content/input errors are surfaced
+ *    directly without blaming missing extensions.
+ * 2. Without `tiktok_parse` (no extension or outdated extension), tries the
+ *    standard server `GET /api/parse` first to preserve proxy-enabled server
+ *    deployments. Only when the server returns `UPSTREAM_BLOCKED` (403) or
+ *    `SERVICE_NOT_CONFIGURED` (503) does it guide the user accurately by
+ *    client state (outdated extension upgrade vs desktop install vs mobile).
+ */
+export async function runTikTokHelperParse(ctx: {
+  url: string;
+  locale: string;
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+  pingExtension?: typeof pingInstalledExtension;
+  parseTikTokViaExtension?: typeof parseTikTokViaExtensionFn;
+  requestStandardParse: (
+    url: string,
+    signal: AbortSignal,
+  ) => Promise<UnifiedMedia>;
+  onStageChange?: (stage: 1 | 2, statusText: string) => void;
+  onExtensionAction?: (action: "" | "install" | "upgrade") => void;
+  setResult: (media: UnifiedMedia) => void;
+  setError: (message: string, duration?: number) => void;
+}): Promise<void> {
+  const { url, isCurrent } = ctx;
+  const isEn = ctx.locale === "en";
+  const emitStage = (stage: 1 | 2) => {
+    ctx.onStageChange?.(stage, formatTikTokParseStageText(stage, ctx.locale));
+  };
+
+  let bridgeMod: typeof import("../services/extensionBridge") | null = null;
+  const loadBridge = async () => {
+    if (!bridgeMod) {
+      bridgeMod = await import("../services/extensionBridge");
+    }
+    return bridgeMod;
+  };
+  const pingExt: typeof pingInstalledExtension =
+    ctx.pingExtension ??
+    (async (...args) => (await loadBridge()).pingInstalledExtension(...args));
+  const parseViaExt: typeof parseTikTokViaExtensionFn =
+    ctx.parseTikTokViaExtension ??
+    (async (...args) => (await loadBridge()).parseTikTokViaExtension(...args));
+
+  let extState: Awaited<ReturnType<typeof pingInstalledExtension>> | null =
+    null;
+  try {
+    extState = await pingExt();
+  } catch {
+    extState = null;
+  }
+  if (!isCurrent()) return;
+
+  const extEnv: ClientCapabilityEnvironment = {
+    extensionConnected: Boolean(extState?.connected),
+    extensionVersion: extState?.version || "",
+    extensionCapabilities: extState?.capabilities ?? [],
+  };
+  const parseRoute = resolveClientParseRoute(true, extEnv, "tiktok_parse");
+
+  if (parseRoute.channel === "extension_client_parse") {
+    emitStage(1);
+    const stage2Timer = setTimeout(() => {
+      if (isCurrent()) emitStage(2);
+    }, 900);
+    let resp: Awaited<ReturnType<typeof parseViaExt>>;
+    try {
+      resp = await parseViaExt(url, {
+        locale: isEn ? "en" : "zh-CN",
+      });
+    } finally {
+      clearTimeout(stage2Timer);
+    }
+    if (!isCurrent()) return;
+
+    if (resp.ok && resp.data?.media) {
+      ctx.onExtensionAction?.("");
+      ctx.setResult(withTbvideoItems(resp.data.media));
+      return;
+    }
+
+    if (!resp.ok) {
+      if (resp.code === "BRIDGE_TIMEOUT") {
+        throw new Error(
+          isEn
+            ? "Chrome extension timed out while parsing TikTok. Please retry or refresh the page."
+            : "Chrome 扩展解析 TikTok 超时，请重试或刷新页面后再试",
+        );
+      }
+      if (resp.code && EXTENSION_PARSE_TRANSPORT_ERROR_CODES.has(resp.code)) {
+        throw new Error(
+          isEn
+            ? "Communication with the Chrome extension was interrupted. Please retry or refresh the page."
+            : "与 Chrome 扩展通信中断，请重试或刷新页面后再试",
+        );
+      }
+      const isFinalizeMissingOnOlderServer =
+        resp.status === 404 &&
+        resp.code === "INVALID_INPUT" &&
+        /接口不存在/.test(resp.error || "");
+      const shouldFallbackToServer =
+        isFinalizeMissingOnOlderServer ||
+        (Boolean(resp.code) && EXTENSION_PARSE_FALLBACK_ERROR_CODES.has(resp.code!));
+      if (!shouldFallbackToServer) {
+        throw new Error(
+          resp.error ||
+            (isEn
+              ? "Failed to parse TikTok via the Chrome extension"
+              : "通过扩展解析 TikTok 失败"),
+        );
+      }
+    } else {
+      throw new Error(
+        isEn
+          ? "Failed to parse TikTok via the Chrome extension"
+          : "通过扩展解析 TikTok 失败",
+      );
+    }
+  }
+
+  // Fallback / no-extension / outdated-extension path: try standard server API first.
+  try {
+    const data = await ctx.requestStandardParse(url, ctx.signal);
+    if (isCurrent()) {
+      ctx.onExtensionAction?.("");
+      ctx.setResult(data);
+    }
+    return;
+  } catch (err) {
+    if (!isCurrent()) return;
+    if (!isServerBlockedOrUnconfigured(err)) {
+      throw err;
+    }
+
+    const hasOutdatedExtension =
+      Boolean(extState?.connected) &&
+      !extEnv.extensionCapabilities.includes("tiktok_parse");
+    if (hasOutdatedExtension) {
+      const normalizedExtVer = (extState?.version || "")
+        .trim()
+        .replace(/^v/i, "");
+      const extVerDisplay = normalizedExtVer
+        ? `v${normalizedExtVer}`
+        : isEn
+          ? "unknown"
+          : "未知";
+      ctx.onExtensionAction?.("upgrade");
+      ctx.setError(
+        isEn
+          ? `Server-side TikTok access is currently restricted, and your DokiTool extension (${extVerDisplay}) is outdated. Upgrade to v${MIN_EXTENSION_TIKTOK_VERSION}+ for cooperative TikTok parsing.`
+          : `TikTok 当前服务端访问受限，已连接的扩展版本（${extVerDisplay}）暂不支持 TikTok 协同解析，升级至 v${MIN_EXTENSION_TIKTOK_VERSION}+ 即可解析下载`,
+      );
+      return;
+    }
+
+    if (isMobileBrowser()) {
+      ctx.onExtensionAction?.("");
+      ctx.setError(
+        isEn
+          ? "Server-side TikTok access is currently restricted. Cooperative TikTok parsing requires the desktop Chrome/Edge DokiTool extension."
+          : "TikTok 当前服务端访问受限，协同解析需要桌面端 Chrome/Edge 的 DokiTool 官方扩展，手机上建议改用电脑",
+      );
+      return;
+    }
+
+    ctx.onExtensionAction?.("install");
+    ctx.setError(
+      isEn
+        ? `Server-side TikTok access is currently restricted. Install and enable the official DokiTool Chrome extension (v${MIN_EXTENSION_TIKTOK_VERSION}+) for cooperative TikTok parsing and download.`
+        : `TikTok 当前服务端访问受限，安装并启用 DokiTool Chrome 官方扩展（v${MIN_EXTENSION_TIKTOK_VERSION}+）即可协同解析与下载`,
+    );
   }
 }

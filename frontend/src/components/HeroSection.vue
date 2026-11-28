@@ -11,11 +11,12 @@ const props = defineProps({
   parseError: String,
   parseStatusText: { type: String, default: '' },
   platformMismatch: { type: Boolean, default: false },
+  extensionAction: { type: String, default: '' },
   locale: String,
   currentPlatform: String
 })
 
-const emit = defineEmits(['update:inputUrl', 'parse', 'cancel', 'select-platform', 'switch-all-retry'])
+const emit = defineEmits(['update:inputUrl', 'parse', 'cancel', 'select-platform', 'switch-all-retry', 'open-extension'])
 
 const content = {
   'zh-CN': {
@@ -35,6 +36,8 @@ const content = {
     errorTitle: '解析没有完成',
     errorHint: '请检查作品是否公开可访问，或切换平台后再试一次。',
     switchAllRetry: '切回「所有平台」并重新解析',
+    installExtension: '安装 Chrome 官方扩展',
+    upgradeExtension: '升级 Chrome 官方扩展',
     features: [
       { icon: 'fa-check-circle', color: 'text-emerald-500', label: '无水印' },
       { icon: 'fa-bolt', color: 'text-amber-500', label: '高速解析' },
@@ -58,6 +61,8 @@ const content = {
     errorTitle: 'Parsing did not finish',
     errorHint: 'Check that the post is public, or switch platform and try again.',
     switchAllRetry: 'Switch to "All" & Retry',
+    installExtension: 'Install Chrome Extension',
+    upgradeExtension: 'Upgrade Chrome Extension',
     features: [
       { icon: 'fa-check-circle', color: 'text-emerald-500', label: 'No Watermark' },
       { icon: 'fa-bolt', color: 'text-amber-500', label: 'Fast Parse' },
@@ -220,6 +225,17 @@ const selectPlatform = (tab) => {
               >
                 <AppIcon class="fas fa-redo text-xs"></AppIcon>
                 <span>{{ getContent(locale).switchAllRetry }}</span>
+              </button>
+              <button
+                v-else-if="extensionAction === 'install' || extensionAction === 'upgrade'"
+                type="button"
+                data-testid="parse-error-extension-btn"
+                :disabled="!isReady || isLoading"
+                class="theme-colors parse-error-action"
+                @click="emit('open-extension')"
+              >
+                <AppIcon class="fas fa-download text-xs"></AppIcon>
+                <span>{{ extensionAction === 'upgrade' ? getContent(locale).upgradeExtension : getContent(locale).installExtension }}</span>
               </button>
             </div>
           </div>

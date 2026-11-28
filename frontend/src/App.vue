@@ -186,6 +186,7 @@ const {
   parseStatusText,
   currentPlatform,
   platformMismatchDetected,
+  extensionErrorAction,
   parseButton,
   parseVideo,
   switchToAllAndRetry,
@@ -601,12 +602,14 @@ onUnmounted(() => {
         :parse-error="parseError"
         :parse-status-text="parseStatusText"
         :platform-mismatch="platformMismatchDetected"
+        :extension-action="extensionErrorAction"
         :locale="locale"
         :current-platform="currentPlatform"
         @parse="parseVideo"
         @cancel="cancelParse"
         @select-platform="selectPlatform"
         @switch-all-retry="switchToAllAndRetry"
+        @open-extension="openExtensionModal"
       />
 
       <div

@@ -3,7 +3,7 @@
 本文档定义 DokiTool 的多平台长期架构基线、六维解耦模型、16 核心平台与 Tier-2 静态能力档案、三层平台观测体系，以及未来新增平台的统一准入流程与能力卡规范。
 
 > **文档边界说明**：
-> - 本文档既沉淀**当前已实现基线（`v4.6.0`）**，也明确保留**远期可演进方向**（如多区域拉取节点、可选网络出口与定期跨出口观测）。
+> - 本文档既沉淀**当前已实现基线（`v4.7.0`）**，也明确保留**远期可演进方向**（如多区域拉取节点、可选网络出口与定期跨出口观测）。
 > - 远期备选方向不自动构成当前开发任务，也不会因暂不实施而从长期架构规划中删除；任何进入实施阶段的新增能力均须通过独立证据验证与决策后推进。
 
 ---
@@ -41,7 +41,7 @@ flowchart TB
     Catalog --> HostYT
     Catalog --> RegionW
     HostGo -.->|"按平台目的精确放行"| OptProxy
-    Entry -.->|"按平台能力协同 (如 YouTube)"| ClientCoop
+    Entry -.->|"按平台能力协同 (如 YouTube / TikTok)"| ClientCoop
 
     HostGo --> SourceSel["媒体源选择与规范化 (unified-v1: browser_fetch / delivery.kind / expires_at)"]
     HostYT --> SourceSel
@@ -69,13 +69,13 @@ flowchart TB
 | **零服务端媒体中转** | 项目核心红线 | 自 `v4.6.0` 彻底移除 `/api/media/weibo` 后，服务端不代理任何完整媒体下载流；仅保留受控的容器头/体积有限 Range 探测（`probe.go` 上限 `1 MiB`、前缀 `64 KiB`、`<= 12` 请求）。 |
 | **绝不借用用户浏览器登录态** | 项目核心红线 | 扩展禁止申请 `cookies` 权限，全部 16 核心平台白名单下载与协同请求在 `offscreen` 内强制 `credentials: "omit"` 并由隔离 DNR 规则剥离 `Cookie`/`Origin`。服务端独立内存匿名访客票据（微博 `SUB/SUBP`、头条即弃 `ttwid`）仅由服务端匿名生成，与用户账号完全隔离。 |
 | **Tier-2 非白名单原生移交边界** | 权限权衡边界 | 为坚持不申请 `<all_urls>`，不在 16 核心平台白名单内的 Tier-2 长尾渐进式单文件直链交由 `chrome.downloads.download` 原生下载（扩展不代理请求、不读响应体；原生 HTTP(S) 下载遵循 Chrome 自身下载会话行为）。 |
-| **扩展最小显式权限与白名单隔离** | 商店规范 + 构建门禁 | `frontend/scripts/build-extension.mjs` 强制锁死 7 项权限并禁用 `cookies`/`webRequest`/`webRequestBlocking`/`scripting`/`debugger`/全局 `declarativeNetRequest`/`<all_urls>`/`content_scripts`。**演进规则**：未来若为客户端解析新增页面主域权限，必须将其与媒体下载白名单（`isWhitelistedMediaUrl`）物理拆分，防止解析域污染媒体直下白名单。 |
-| **MV3 静态合规（无远程代码执行）** | 浏览器与商店硬约束 | 禁止 `eval`、`new Function` 与拉取远程 JS 执行；若需降低平台改版发版频率，优先采用「客户端取数 → 服务端 `finalize` 规范化」协同架构，避免双端维护完整解析器。 |
-| **浏览器 Fetch 沙箱限制** | WHATWG Fetch 规范硬约束 | ① `fetch(..., { redirect: "manual" })` 跨源返回 `opaqueredirect`，JS 不可读 `Location`；② `Set-Cookie` 为 forbidden response-header，扩展零 Cookie `fetch` 无法构建类似 Go 的隔离匿名 `CookieJar`（这是微博不宜迁入零 Cookie 扩展解析的底层原因）；③ 扩展 `fetch()` 固定发送 `Sec-Fetch-Mode: cors`/`Sec-Fetch-Dest: empty`，无法伪造浏览器顶级导航头。 |
+| **扩展最小显式权限与白名单隔离** | 商店规范 + 构建门禁 | `frontend/scripts/build-extension.mjs` 强制锁死 7 项权限并禁用 `cookies`/`webRequest`/`webRequestBlocking`/`scripting`/`debugger`/全局 `declarativeNetRequest`/`<all_urls>`/`content_scripts`。**白名单物理隔离（`v4.7.0` 已落地）**：客户端解析域权限声明在独立的 `CLIENT_PARSE_PAGE_HOST_PERMISSIONS`（`www/vm/vt/m.tiktok.com`），仅并入 `manifest.host_permissions`，与媒体下载白名单（`PRODUCTION_HOST_PERMISSIONS` / `isWhitelistedMediaUrl` / `CDN_REQUEST_DOMAINS`）完全物理隔离，防止解析域污染媒体直下白名单。 |
+| **MV3 静态合规（无远程代码执行）** | 浏览器与商店硬约束 | 禁止 `eval`、`new Function` 与拉取远程 JS 执行；采用「客户端零 Cookie 取数 → 服务端 `finalize` 校验与规范化」协同架构，避免双端维护完整解析器。 |
+| **浏览器 Fetch 沙箱限制** | WHATWG Fetch 规范硬约束 | ① `fetch(..., { redirect: "manual" })` 跨源返回 `opaqueredirect`，JS 不可读 `Location`——因此扩展短链与 `/aweme/v1/play/` 使用 `redirect: "follow"` 并在落点后严格校验 `response.url` 域名白名单，但**明确不宣称事后落点检查等价于服务端逐跳事前 SSRF 校验**；② `Set-Cookie` 为 forbidden response-header，扩展零 Cookie `fetch` 无法构建类似 Go 的隔离匿名 `CookieJar`（这是微博不宜迁入零 Cookie 扩展解析的底层原因）；③ 扩展 `fetch()` 固定发送 `Sec-Fetch-Mode: cors`/`Sec-Fetch-Dest: empty`，无法伪造浏览器顶级导航头。 |
 
 ---
 
-## 三、静态能力档案：16 核心平台 + Tier-2 基线（`v4.6.0`）
+## 三、静态能力档案：16 核心平台 + Tier-2 基线（`v4.7.0`）
 
 唯一目录真值表：`backend/config/platforms.json`（11 默认 + 5 `optional` = 16 核心平台）；准入分池真值：`backend/internal/api/platform_traits.go`。
 
@@ -91,7 +91,7 @@ flowchart TB
 | `pipigx` | 默认 / `fast` | Go 原生（单 POST，仅视频） | 零 Cookie | 可选 `tbvideo` 改写，不打包 ZIP | 仅视频 |
 | `zuiyou` | 默认 / `fast` | Go 原生（视频/图片）；`PreparePublic` 升 HTTPS | 零 Cookie | 图片 `allowed`；视频可选 `tbvideo` 或新标签页保存 | 仅公开分享帖 |
 | `pinterest` | 默认 / `fast` | Go 原生；`pin.it` `<= 3` 跳 + 免鉴权 `PinResource/get/` | 零 Cookie | `*.pinimg.com` 无 CORS：Web 单项可播放/保存、禁网页打包 ZIP，扩展逐项直下 | 静图、MP4 视频、Story Pin（HLS-only 保留告警） |
-| `tiktok` | 默认 / `fast` | Go 原生；短链（5 域白名单 + 1h LRU）→ 水合页（`<= 4 MiB`）→ Photo 零 302 / Video `play302`（`<= 4` 档、禁 `Range`） | 零 Cookie；可选单代理 `DOKITOOL_TIKTOK_PROXY_URL`（仅 `tiktok-page`/`tiktok-shortlink`）+ `-tiktok-page-transport` + 无代理 6 RPM 护栏 | 图/封面/配乐 `allowed`；视频 `blocked`（扩展 DNR `1009`，拒 `webapp-prime`/`tt_chain_token`） | 云机房直连易触发 `SlardarWAF`（`403 UPSTREAM_BLOCKED`）；扩展驱动解析已列为重点实证评估方向 |
+| `tiktok` | 默认 / `fast` | **双路径并存**：① **扩展协同主路（`v4.7.0+` `tiktok_parse`，Route C+）**：扩展 Offscreen 零 Cookie 展短链 + 水合（`<= 4 MiB`）+ Photo 零 302 / Video 并发 `play302`（`<= 4` 档，DNR `1010`/`1011`）→ `POST /api/tiktok/finalize`（服务端纯 CPU 零出站校验与 `unified-v1` 规范化，不入缓存）；<br>② **保留服务端原生 Go 解析（`GET /api/parse`）**：短链（5 域白名单 + 1h LRU）→ 水合页 → Photo 零 302 / Video `play302` | 零 Cookie；扩展独立解析域权限（`CLIENT_PARSE_PAGE_HOST_PERMISSIONS`，与媒体下载白名单物理隔离）；服务端可选 `DOKITOOL_TIKTOK_PROXY_URL` + `-tiktok-page-transport` + 6 RPM 护栏 | 图/封面/配乐 `allowed`；视频 `blocked`（扩展 DNR `1009`，拒 `webapp-prime`/`tt_chain_token`） | 云机房直连 `GET /api/parse` 易遇 `SlardarWAF`（`403 UPSTREAM_BLOCKED`）；无扩展或旧版扩展（`< v4.7.0`）先试服务端，仅在 `403`/`503` 时精准引导安装/升级扩展，不误归因无效链接或已删作品；扩展协同依赖用户本机可访问 TikTok 的网络出口，不构成全出口可用性承诺 |
 | `x` | 可选 / `slow` | Stage 1 官方免登录 Syndication → Stage 2 `yt-dlp`（5 提取器）→ 可选 `-x-tombstone-fallback=fxtwitter`（默认 `off`） | 零 Cookie；`t.co` 受控单跳 | `*.twimg.com` 直链，Web/扩展均可 | 纯文推文返回 `NO_MEDIA` |
 | `youtube` | 可选 / `slow` + `ejs` | **扩展有限协同主路**：3 路并发预取（`/api/youtube/context` + `sw.js_data` + `oembed`）→ 零 Cookie `TVHTML5` `player`（DNR `1001`）→ `POST /api/youtube/finalize`（服务端无权限 Deno+EJS 解算，不入缓存）；`DOKITOOL_YTDLP_YOUTUBE_ENABLED` 默认 `false` | 零 Cookie；DNR `1001/1002` | 分离高画质扩展 OPFS 本地合流；纯客户端 VTT/SRT/双语字幕 | 生产标准配置下外部直调 `GET /api/parse` 返回 `503 SERVICE_NOT_CONFIGURED`，已明确作为扩展优先协同范例 |
 | `instagram` | 可选 / `slow` | 3 级引擎：`yt-dlp` + 零 Cookie 原生 Embed（非 Reel 并发补图集）+ 零 Cookie 原生 GraphQL | 零 Cookie | `*.cdninstagram.com` / `*.fbcdn.net`（含 DASH `mux`） | Stories 与私密帖返回 `UPSTREAM_BLOCKED` |
@@ -121,9 +121,9 @@ flowchart TB
 2. **可选受控出口 / 代理池（低优先级，暂不采购与建设）**：
    - 现状：仓库仅保留单平台极薄 `ProxyProvider` 抽象（`DOKITOOL_TIKTOK_PROXY_URL`，严格限定 `tiktok-page`/`tiktok-shortlink`，不覆盖 `tiktok-play-302` 与任何媒体流）；`ytengine` 在启用 SSRF 目标策略时无条件禁止代理。
    - 演进方向：付费代理池维持低优先级，仅当实证确认存在高价值不可替代缺口且成本/合规边界成立时再评估。
-3. **当前处于实证验证阶段的专项方向**：
-   - **TikTok 扩展驱动解析**：认可扩展驱动解析的产品方向，但先通过真实无头 Chrome MV3 扩展实测（`Sec-Fetch-*` 头下 WAF 通过率、`/aweme/v1/play/` 覆盖率与跨出口 302 放行表现），再凭证据决定协同边界（如客户端水合后 `POST /api/tiktok/finalize` 或附加客户端 302 展开）；保留现有服务端解析能力，不提前锁死具体端点与实现。
-   - **微博国内出口评估**：通过小规模固定下载端冷解析对照，综合评估画质、成功率、可用性、下载速率与维护成本后再决定是否变更，不因大陆平台身份自动迁往上海。
+3. **本轮已落地实证与现阶段结论**：
+   - **TikTok 扩展协同解析（`v4.7.0` 已落地 Route C+）**：基于无头 Chrome MV3 实证结果，已在正式官方扩展与 Go 后端完成协同解析（客户端零 Cookie 取数与 `play302` + `POST /api/tiktok/finalize` 纯 CPU 零出站校验与规范化），同时完整保留服务端 `GET /api/parse` 与可选配置；需注意实验样本与本地海外出口验收不构成生产全覆盖 SLA 承诺，客户端网络若被 TikTok 拦截仍会按实返回 `UPSTREAM_BLOCKED`。
+   - **微博国内出口评估（现阶段维持现状）**：基于受控小样本冷解析对照结果，维持当前主站解析 + 扩展零 Cookie DNR `1003` 直下架构，暂不新增上海微博任务，保留未来重新评估空间。
 
 ---
 

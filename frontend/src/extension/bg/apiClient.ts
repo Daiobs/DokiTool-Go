@@ -165,6 +165,15 @@ export interface ParseYouTubeViaOffscreenParams {
   onContextNotFound?: () => Promise<UnifiedMedia>;
 }
 
+export interface ParseTikTokViaOffscreenParams {
+  url: string;
+  apiOrigin: string;
+  authSettings: Pick<ExtensionSettings, "bearerToken">;
+  extraAllowedOrigins?: string[];
+  signal?: AbortSignal;
+  onFinalizeNotFound?: () => Promise<UnifiedMedia>;
+}
+
 export interface ApiClientDeps {
   chromeApi: ChromeBackgroundApi;
   storage: ExtensionStorageController;
@@ -193,6 +202,9 @@ export interface BackgroundApiClient {
   fetchOwnerStats(): Promise<ExtensionRpcResponse<OwnerStatsResult>>;
   parseYouTubeViaOffscreen(
     params: ParseYouTubeViaOffscreenParams,
+  ): Promise<UnifiedMedia>;
+  parseTikTokViaOffscreen(
+    params: ParseTikTokViaOffscreenParams,
   ): Promise<UnifiedMedia>;
   parseSupportedUrlInternal(
     matched: MatchedPlatformUrl,
@@ -685,6 +697,65 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
     return runAttempt(true);
   };
 
+  const isTikTokFinalizeRouteNotFound = (err: unknown): boolean =>
+    err instanceof HttpStatusError &&
+    err.status === 404 &&
+    err.code === "INVALID_INPUT" &&
+    /接口不存在/.test(err.message);
+
+  const parseTikTokViaOffscreen = async (
+    params: ParseTikTokViaOffscreenParams,
+  ): Promise<UnifiedMedia> => {
+    const {
+      url,
+      apiOrigin,
+      authSettings,
+      extraAllowedOrigins,
+      signal,
+      onFinalizeNotFound,
+    } = params;
+
+    await syncDynamicDnrRules();
+
+    onParseProgress?.(1, "正在获取 TikTok 作品数据 (1/2)…");
+    const { result } = await sendToOffscreen({
+      type: "OFFSCREEN_TIKTOK_FETCH",
+      payload: {
+        url,
+        ...(extraAllowedOrigins?.length ? { extraAllowedOrigins } : {}),
+      },
+      timeoutMs: 25_000,
+    });
+
+    onParseProgress?.(2, "正在校验并生成下载方案 (2/2)…");
+    let finalizePayload: unknown;
+    try {
+      finalizePayload = await withRateLimitRetry(
+        () =>
+          fetchApiJson(
+            `${apiOrigin}/api/tiktok/finalize?schema_version=1.0`,
+            authSettings,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(result),
+            },
+            signal,
+          ),
+        signal,
+      );
+    } catch (err) {
+      if (isTikTokFinalizeRouteNotFound(err) && onFinalizeNotFound) {
+        return onFinalizeNotFound();
+      }
+      throw err;
+    }
+
+    return withTbvideoItems(
+      validateMediaEnvelope(finalizePayload, { apiOrigin }),
+    );
+  };
+
   const parseSupportedUrlInternal = async (
     matched: MatchedPlatformUrl,
     settings: ExtensionSettings,
@@ -716,6 +787,17 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
         ...(manifestVersion ? { extensionVersion: manifestVersion } : {}),
         signal,
         onContextNotFound: requestStandardParse,
+      });
+    }
+
+    if (matched.platform === "tiktok") {
+      return parseTikTokViaOffscreen({
+        url: matched.url,
+        apiOrigin,
+        authSettings: settings,
+        ...(validated.isLoopback ? { extraAllowedOrigins: [apiOrigin] } : {}),
+        signal,
+        onFinalizeNotFound: requestStandardParse,
       });
     }
 
@@ -825,6 +907,7 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
     runTestConnection,
     fetchOwnerStats,
     parseYouTubeViaOffscreen,
+    parseTikTokViaOffscreen,
     parseSupportedUrlInternal,
     resolveLazyItemInternal,
     hydrateDeferredMediaItems,

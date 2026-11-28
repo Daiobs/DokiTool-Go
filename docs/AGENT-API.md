@@ -20,9 +20,11 @@
 以下两个平台**不在 Agent 批量下载主支持范围内**：
 
 1. **YouTube（`youtube`）**：
-   - 线上标准产品路径使用 **Chrome MV3 原生侧边栏扩展（`v4.6.0`）**，由扩展直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与本地 `offscreen` OPFS `Mediabunny` 无损音视频合并（纯 Web 端在未检测到扩展时合成客户端级 `HELPER_REQUIRED` 提示状态引导安装扩展）。
+   - 线上标准产品路径使用 **Chrome MV3 原生侧边栏扩展（`v4.7.0`）**，由扩展直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与本地 `offscreen` OPFS `Mediabunny` 无损音视频合并（纯 Web 端在未检测到扩展时合成客户端级 `HELPER_REQUIRED` 提示状态引导安装扩展）。
    - 在默认未开启 `DOKITOOL_YTDLP_YOUTUBE_ENABLED` 的服务端上，对 YouTube 链接调用 `GET /api/parse` 会直接返回 HTTP `503`（`code: "SERVICE_NOT_CONFIGURED"`）；即便在自建实例上开启服务端提取器，`*.googlevideo.com` 媒体直链通常绑定服务端出口 IP，异地客户端直连下载仍会被拒绝。Agent 批量任务应在输入阶段直接过滤或跳过 YouTube 链接。
-2. **微博（`weibo`）**：
+2. **TikTok（`tiktok`）出口边界说明**：
+   - 独立 Agent API 调用 `GET /api/parse` 时完整保留服务端原生 Go 解析能力（自建配置 `DOKITOOL_TIKTOK_PROXY_URL` 或出口未被风控时可正常返回）；在普通云机房直连部署下，TikTok 上游可能触发 `SlardarWAF` 并返回 `403 UPSTREAM_BLOCKED`，且返回的公开视频直链标注 `browser_fetch: "blocked"`（直连下载须附带 `Referer: https://www.tiktok.com/`、零 `Cookie`）。桌面交互使用场景建议通过 Chrome MV3 官方扩展（`v4.7.0+` `tiktok_parse`）走客户端协同解析与 DNR `1009` 直下，不要求独立 Agent API 提供同等覆盖。
+3. **微博（`weibo`）**：
    - 微博不在主批量支持范围内：DokiTool 注册的微博能力仅为 `["video"]`（不支持纯图片微博图文提取；非视频微博状态帖会返回 `404 CONTENT_UNAVAILABLE` 或因上游状态接口访客限制返回 `403 UPSTREAM_BLOCKED`）。
    - **统一零中转直链服务端行为（`v4.6.0+`）**：无论匿名访客还是携带有效 Bearer 密钥（`owner`、`agent`、`friend`），调用 `/api/parse` 解析公开微博视频（例如 `https://weibo.com/tv/show/1034:...`）时，服务端均走统一 `PreparePublic` 分支，**不签发任何本站中转票据**（历史 `/api/media/weibo` 已退役），直接返回原始 CDN 直链（视频流位于 `*.weibocdn.com` 并标注 `browser_fetch: "blocked"`，封面与头像位于 `*.sinaimg.cn`）并接入服务端进程内解析缓存。
    - **直连下载微博原始 CDN 链接的 `Referer` 实测要求**：微博音视频与图片 CDN 均校验 `Referer` 防盗链。若客户端确需直连下载返回的 `*.weibocdn.com` 或 `*.sinaimg.cn` 原始直链，**必须附带请求头 `Referer: https://weibo.com/`（无需且不应携带任何 `Cookie`，严禁转发 `Authorization` 头）**。对公开微博视频帖与图片帖原始 CDN 直链执行只读 `Range: bytes=0-1023` 的实测结果如下：

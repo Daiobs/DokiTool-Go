@@ -56,6 +56,11 @@ var routePolicies = [routeCount]routePolicy{
 		enforceKillSwitch:   true,
 		enforcePlatformAuth: true,
 	},
+	tiktokHelper: {
+		staticPlatform:      "tiktok",
+		enforceKillSwitch:   true,
+		enforcePlatformAuth: true,
+	},
 	statsRoute: {
 		nonPlatformReason: "owner-only operational telemetry endpoint",
 	},

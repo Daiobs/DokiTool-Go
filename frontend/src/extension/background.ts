@@ -369,6 +369,7 @@ export function createBackgroundController(
     tasks,
     webBridgeTaskIds,
     parseYouTubeViaOffscreen: apiClient.parseYouTubeViaOffscreen,
+    parseTikTokViaOffscreen: apiClient.parseTikTokViaOffscreen,
     enqueueDownloadItems: downloadCoordinator.enqueueDownloadItems,
     cancelTaskById: downloadCoordinator.cancelTaskById,
   });

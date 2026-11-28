@@ -220,6 +220,13 @@ export function createOffscreenController(
         return okRpc({ player });
       }
 
+      case "OFFSCREEN_TIKTOK_FETCH": {
+        const result = await executor.requestTikTokFetch(req.payload, {
+          timeoutMs: req.timeoutMs,
+        });
+        return okRpc({ result });
+      }
+
       case "OFFSCREEN_START_TASK": {
         ensureKeepalivePort();
         const res = executor.startTask(req.taskId, req.spec);
@@ -264,11 +271,17 @@ export function createOffscreenController(
           typeof (err as { code?: unknown }).code === "string"
             ? (err as { code: string }).code
             : undefined;
+        const status =
+          err &&
+          typeof err === "object" &&
+          typeof (err as { status?: unknown }).status === "number"
+            ? (err as { status: number }).status
+            : undefined;
         const message =
           err instanceof Error && err.message
             ? err.message
             : "Offscreen 执行失败";
-        sendResponse(errRpc(message, { code }));
+        sendResponse(errRpc(message, { code, status }));
       });
 
     return true;

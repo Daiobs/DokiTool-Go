@@ -157,7 +157,10 @@ export function createOffscreenLifecycle(
   ): Promise<OffscreenResponseMap[T]> => {
     clearOffscreenIdleTimer();
     const isNonTaskRpc =
-      req.type === "OFFSCREEN_YOUTUBE_PLAYER" || req.type === "OFFSCREEN_PING";
+      req.type === "OFFSCREEN_YOUTUBE_PLAYER" ||
+      req.type === "OFFSCREEN_YOUTUBE_PREFETCH" ||
+      req.type === "OFFSCREEN_TIKTOK_FETCH" ||
+      req.type === "OFFSCREEN_PING";
     if (isNonTaskRpc) inFlightOffscreenRpcs += 1;
     try {
       if (!options?.skipEnsure) await ensureOffscreenDocument();

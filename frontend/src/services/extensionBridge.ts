@@ -7,6 +7,7 @@ import {
   type WebExtCancelTaskData,
   type WebExtEnqueueMediaData,
   type WebExtEnqueuePayload,
+  type WebExtParseTikTokData,
   type WebExtParseYouTubeData,
   type WebExtPingData,
   type WebExtTaskStatusData,
@@ -19,12 +20,14 @@ export { DOKITOOL_EXTENSION_ID };
 export const EXTENSION_BRIDGE_PING_TIMEOUT_MS = 800 as const;
 export const EXTENSION_BRIDGE_RPC_TIMEOUT_MS = 5000 as const;
 export const EXTENSION_BRIDGE_YOUTUBE_PARSE_TIMEOUT_MS = 30000 as const;
+export const EXTENSION_BRIDGE_TIKTOK_PARSE_TIMEOUT_MS = 35000 as const;
 
 const KNOWN_WEB_BRIDGE_CAPABILITIES = new Set<string>([
   "dash_mux",
   "direct_download",
   "youtube_parse",
   "youtube_mux",
+  "tiktok_parse",
 ]);
 
 export interface ExtensionBridgeState {
@@ -216,6 +219,27 @@ export async function parseYouTubeViaExtension(
     },
     {
       timeoutMs: options?.timeoutMs ?? EXTENSION_BRIDGE_YOUTUBE_PARSE_TIMEOUT_MS,
+      extensionId: options?.extensionId,
+    },
+  );
+}
+
+export async function parseTikTokViaExtension(
+  url: string,
+  options?: {
+    locale?: "zh-CN" | "en";
+    timeoutMs?: number;
+    extensionId?: string;
+  },
+): Promise<ExtensionRpcResponse<WebExtParseTikTokData>> {
+  return sendExternalExtensionMessage(
+    {
+      type: "WEB_EXT_PARSE_TIKTOK",
+      url,
+      ...(options?.locale ? { locale: options.locale } : {}),
+    },
+    {
+      timeoutMs: options?.timeoutMs ?? EXTENSION_BRIDGE_TIKTOK_PARSE_TIMEOUT_MS,
       extensionId: options?.extensionId,
     },
   );
