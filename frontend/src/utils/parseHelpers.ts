@@ -443,13 +443,16 @@ export function formatTikTokParseStageText(
 
 function isServerBlockedOrUnconfigured(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
-  const rec = err as { status?: unknown; code?: unknown };
-  return (
-    rec.code === "UPSTREAM_BLOCKED" ||
-    rec.code === "SERVICE_NOT_CONFIGURED" ||
-    rec.status === 403 ||
-    rec.status === 503
-  );
+  const rec = err as { code?: unknown; message?: unknown };
+  if (rec.code === "UPSTREAM_BLOCKED") return true;
+  if (
+    rec.code === "SERVICE_NOT_CONFIGURED" &&
+    typeof rec.message === "string" &&
+    /tiktok/i.test(rec.message)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -460,9 +463,10 @@ function isServerBlockedOrUnconfigured(err: unknown): boolean {
  *    directly without blaming missing extensions.
  * 2. Without `tiktok_parse` (no extension or outdated extension), tries the
  *    standard server `GET /api/parse` first to preserve proxy-enabled server
- *    deployments. Only when the server returns `UPSTREAM_BLOCKED` (403) or
- *    `SERVICE_NOT_CONFIGURED` (503) does it guide the user accurately by
- *    client state (outdated extension upgrade vs desktop install vs mobile).
+ *    deployments. Only when the server returns structured `UPSTREAM_BLOCKED` or
+ *    TikTok-specific `SERVICE_NOT_CONFIGURED` does it guide the user accurately
+ *    by client state (server not yet upgraded vs outdated extension upgrade vs
+ *    desktop install vs mobile).
  */
 export async function runTikTokHelperParse(ctx: {
   url: string;
@@ -515,6 +519,8 @@ export async function runTikTokHelperParse(ctx: {
     extensionCapabilities: extState?.capabilities ?? [],
   };
   const parseRoute = resolveClientParseRoute(true, extEnv, "tiktok_parse");
+  let finalizeMissingOnOlderServer = false;
+  let extensionActionUnsupported = false;
 
   if (parseRoute.channel === "extension_client_parse") {
     emitStage(1);
@@ -539,6 +545,7 @@ export async function runTikTokHelperParse(ctx: {
 
     if (!resp.ok) {
       if (resp.code === "BRIDGE_TIMEOUT") {
+        ctx.onExtensionAction?.("");
         throw new Error(
           isEn
             ? "Chrome extension timed out while parsing TikTok. Please retry or refresh the page."
@@ -546,6 +553,7 @@ export async function runTikTokHelperParse(ctx: {
         );
       }
       if (resp.code && EXTENSION_PARSE_TRANSPORT_ERROR_CODES.has(resp.code)) {
+        ctx.onExtensionAction?.("");
         throw new Error(
           isEn
             ? "Communication with the Chrome extension was interrupted. Please retry or refresh the page."
@@ -556,10 +564,12 @@ export async function runTikTokHelperParse(ctx: {
         resp.status === 404 &&
         resp.code === "INVALID_INPUT" &&
         /接口不存在/.test(resp.error || "");
+      const isUnsupportedActionFallback =
+        Boolean(resp.code) && EXTENSION_PARSE_FALLBACK_ERROR_CODES.has(resp.code!);
       const shouldFallbackToServer =
-        isFinalizeMissingOnOlderServer ||
-        (Boolean(resp.code) && EXTENSION_PARSE_FALLBACK_ERROR_CODES.has(resp.code!));
+        isFinalizeMissingOnOlderServer || isUnsupportedActionFallback;
       if (!shouldFallbackToServer) {
+        ctx.onExtensionAction?.("");
         throw new Error(
           resp.error ||
             (isEn
@@ -567,7 +577,10 @@ export async function runTikTokHelperParse(ctx: {
               : "通过扩展解析 TikTok 失败"),
         );
       }
+      finalizeMissingOnOlderServer = isFinalizeMissingOnOlderServer;
+      extensionActionUnsupported = isUnsupportedActionFallback;
     } else {
+      ctx.onExtensionAction?.("");
       throw new Error(
         isEn
           ? "Failed to parse TikTok via the Chrome extension"
@@ -587,12 +600,24 @@ export async function runTikTokHelperParse(ctx: {
   } catch (err) {
     if (!isCurrent()) return;
     if (!isServerBlockedOrUnconfigured(err)) {
+      ctx.onExtensionAction?.("");
       throw err;
+    }
+
+    if (finalizeMissingOnOlderServer) {
+      ctx.onExtensionAction?.("");
+      ctx.setError(
+        isEn
+          ? "The server has not enabled the TikTok cooperative finalize endpoint yet, and direct server access is currently restricted. Please try again shortly."
+          : "当前服务端尚未启用 TikTok 协同解析接口，且服务端直连访问受限，请稍后重试",
+      );
+      return;
     }
 
     const hasOutdatedExtension =
       Boolean(extState?.connected) &&
-      !extEnv.extensionCapabilities.includes("tiktok_parse");
+      (!extEnv.extensionCapabilities.includes("tiktok_parse") ||
+        extensionActionUnsupported);
     if (hasOutdatedExtension) {
       const normalizedExtVer = (extState?.version || "")
         .trim()

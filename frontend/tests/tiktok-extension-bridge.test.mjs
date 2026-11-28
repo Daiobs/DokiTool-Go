@@ -979,6 +979,151 @@ test("useVideoParser TikTok routing: with v4.7.0+ extension, without extension, 
       assert.equal(standardParseUrls.length, 1, `Expected standard /api/parse for ${nonTtUrl}`);
       assert.equal(parserG.parseError.value, "");
     }
+
+    // Case H1 (R87-01): Platform kill-switch / circuit-breaker open (503 UPSTREAM_UNAVAILABLE) -> exact message, NO extension CTA
+    const cbMsg = "TikTok上游服务暂时响应异常，已触发快速保护，请稍后重试";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "UPSTREAM_UNAVAILABLE",
+          error: { code: "UPSTREAM_UNAVAILABLE", message: cbMsg, retryable: true },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    const parserH1 = useVideoParser({
+      videoStore: makeStore(),
+      locale: ref("zh-CN"),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: false,
+        version: "",
+        extensionId: "",
+        capabilities: [],
+        useSaveFilePicker: false,
+      }),
+    });
+    parserH1.inputUrl.value = "https://www.tiktok.com/@a/video/7345678901234567890";
+    await parserH1.parseVideo();
+    assert.equal(parserH1.parseError.value, cbMsg);
+    assert.equal(parserH1.extensionErrorAction.value, "");
+
+    // Case H2 (R87-01): Non-JSON gateway 503/403 (no code) and global ingress 503 SERVICE_NOT_CONFIGURED -> exact message, NO extension CTA
+    for (const gwResp of [
+      () => new Response("<html>503 Service Temporarily Unavailable</html>", { status: 503, headers: { "Content-Type": "text/html" } }),
+      () => new Response("<html>403 Forbidden</html>", { status: 403, headers: { "Content-Type": "text/html" } }),
+      () =>
+        new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "SERVICE_NOT_CONFIGURED",
+            error: { code: "SERVICE_NOT_CONFIGURED", message: "解析服务暂时不可用，请稍后重试" },
+          }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        ),
+    ]) {
+      globalThis.fetch = async () => gwResp();
+      const parserH2 = useVideoParser({
+        videoStore: makeStore(),
+        locale: ref("zh-CN"),
+        showToast: () => {},
+        pingExtension: async () => ({
+          connected: false,
+          version: "",
+          extensionId: "",
+          capabilities: [],
+          useSaveFilePicker: false,
+        }),
+      });
+      parserH2.inputUrl.value = "https://www.tiktok.com/@a/video/7345678901234567890";
+      await parserH2.parseVideo();
+      assert.ok(parserH2.parseError.value.length > 0);
+      assert.equal(parserH2.extensionErrorAction.value, "");
+      assert.doesNotMatch(parserH2.parseError.value, /安装并启用/);
+    }
+
+    // Case H3 (R87-01): Connected v4.7.0 extension hits older server/Caddy 404 接口不存在 on /api/tiktok/finalize,
+    // falls back to /api/parse which returns 403 UPSTREAM_BLOCKED -> accurate server-not-upgraded copy, NO install/upgrade CTA!
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "UPSTREAM_BLOCKED",
+          error: { code: "UPSTREAM_BLOCKED", message: "blocked by tiktok waf" },
+        }),
+        { status: 403, headers: { "Content-Type": "application/json" } },
+      );
+    const parserH3 = useVideoParser({
+      videoStore: makeStore(),
+      locale: ref("zh-CN"),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: true,
+        version: "4.7.0",
+        extensionId: "ihamkldlkdibleacagiejklpfofapkpo",
+        capabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux", "tiktok_parse"],
+        useSaveFilePicker: false,
+      }),
+      parseTikTokViaExtension: async () => ({
+        ok: false,
+        status: 404,
+        code: "INVALID_INPUT",
+        error: "接口不存在",
+      }),
+    });
+    parserH3.inputUrl.value = "https://www.tiktok.com/@a/video/7345678901234567890";
+    await parserH3.parseVideo();
+    assert.match(parserH3.parseError.value, /尚未启用 TikTok 协同解析接口/);
+    assert.equal(parserH3.extensionErrorAction.value, "");
+
+    // Case H3b (R87-01): Connected extension claiming tiktok_parse but returning UNSUPPORTED_ACTION -> upgrade CTA
+    const parserH3b = useVideoParser({
+      videoStore: makeStore(),
+      locale: ref("zh-CN"),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: true,
+        version: "4.6.9",
+        extensionId: "ihamkldlkdibleacagiejklpfofapkpo",
+        capabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux", "tiktok_parse"],
+        useSaveFilePicker: false,
+      }),
+      parseTikTokViaExtension: async () => ({
+        ok: false,
+        code: "UNSUPPORTED_ACTION",
+        error: "不支持的动作",
+      }),
+    });
+    parserH3b.inputUrl.value = "https://www.tiktok.com/@a/video/7345678901234567890";
+    await parserH3b.parseVideo();
+    assert.equal(parserH3b.extensionErrorAction.value, "upgrade");
+
+    // Case H4 (R87-01): No extension + TikTok-specific 503 SERVICE_NOT_CONFIGURED ("TikTok 解析器尚未配置") -> install CTA
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          schema_version: "1.0",
+          code: "SERVICE_NOT_CONFIGURED",
+          error: { code: "SERVICE_NOT_CONFIGURED", message: "TikTok 解析器尚未配置" },
+        }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    const parserH4 = useVideoParser({
+      videoStore: makeStore(),
+      locale: ref("zh-CN"),
+      showToast: () => {},
+      pingExtension: async () => ({
+        connected: false,
+        version: "",
+        extensionId: "",
+        capabilities: [],
+        useSaveFilePicker: false,
+      }),
+    });
+    parserH4.inputUrl.value = "https://www.tiktok.com/@a/video/7345678901234567890";
+    await parserH4.parseVideo();
+    assert.equal(parserH4.extensionErrorAction.value, "install");
+    assert.match(parserH4.parseError.value, /v4\.7\.0\+/);
   } finally {
     globalThis.fetch = origFetch;
   }
