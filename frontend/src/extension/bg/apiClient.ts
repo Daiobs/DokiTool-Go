@@ -703,6 +703,13 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
     err.code === "INVALID_INPUT" &&
     /接口不存在/.test(err.message);
 
+  const throwIfAborted = (signal?: AbortSignal): void => {
+    if (!signal?.aborted) return;
+    const err = new Error("已取消解析");
+    err.name = "AbortError";
+    throw err;
+  };
+
   const parseTikTokViaOffscreen = async (
     params: ParseTikTokViaOffscreenParams,
   ): Promise<UnifiedMedia> => {
@@ -715,7 +722,9 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
       onFinalizeNotFound,
     } = params;
 
+    throwIfAborted(signal);
     await syncDynamicDnrRules();
+    throwIfAborted(signal);
 
     onParseProgress?.(1, "正在获取 TikTok 作品数据 (1/2)…");
     const { result } = await sendToOffscreen({
@@ -726,6 +735,7 @@ export function createApiClient(deps: ApiClientDeps): BackgroundApiClient {
       },
       timeoutMs: 25_000,
     });
+    throwIfAborted(signal);
 
     onParseProgress?.(2, "正在校验并生成下载方案 (2/2)…");
     let finalizePayload: unknown;

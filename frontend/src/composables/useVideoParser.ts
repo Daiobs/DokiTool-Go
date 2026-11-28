@@ -336,10 +336,12 @@ export function useVideoParser(options: {
     const url = (hashIdx >= 0 ? extracted.slice(0, hashIdx) : extracted)
       .replace(/[.,;!?]+$/, "")
       .trim();
+    let parsedHost = "";
     try {
       const parsed = new URL(url);
       if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname)
         throw new Error();
+      parsedHost = parsed.hostname.toLowerCase().replace(/\.+$/, "");
     } catch {
       invalidate();
       parseError.value = "请输入有效分享链接";
@@ -389,7 +391,7 @@ export function useVideoParser(options: {
       } else if (
         (currentPlatform.value === "all" ||
           currentPlatform.value === "tiktok") &&
-        /(?:^|[/.])tiktok\.com(?:[/:?#]|$)/i.test(url)
+        (parsedHost === "tiktok.com" || parsedHost.endsWith(".tiktok.com"))
       ) {
         await parseTikTokWithHelper(url, run, controller);
       } else {

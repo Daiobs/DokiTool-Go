@@ -17,7 +17,7 @@
 
 ### 1.2 不在主批量范围内的平台
 
-以下两个平台**不在 Agent 批量下载主支持范围内**：
+以下三个平台**不在 Agent 批量下载主支持范围内**：
 
 1. **YouTube（`youtube`）**：
    - 线上标准产品路径使用 **Chrome MV3 原生侧边栏扩展（`v4.7.0`）**，由扩展直接请求 `www.youtube.com` 获取流清单并通过 `/api/youtube/context` + `/api/youtube/finalize` 完成签名解算与本地 `offscreen` OPFS `Mediabunny` 无损音视频合并（纯 Web 端在未检测到扩展时合成客户端级 `HELPER_REQUIRED` 提示状态引导安装扩展）。

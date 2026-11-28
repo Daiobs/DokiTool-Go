@@ -28,6 +28,7 @@ import {
   extractTikTokVideoDetailFromHtml,
   fetchTikTokClientPayload,
   isAllowedTikTokMediaCdnUrl,
+  isAllowedTikTokParsePageUrl,
   selectTikTokVideoPlayUrls,
 } from "../src/extension/tiktokExtensionParser.ts";
 import { createApiClient } from "../src/extension/bg/apiClient.ts";
@@ -934,7 +935,195 @@ test("useVideoParser TikTok routing: with v4.7.0+ extension, without extension, 
     await parserF.parseVideo();
     assert.equal(storeF.resultData?.platform, "tiktok");
     assert.equal(parserF.parseError.value, "");
+
+    // Case G (P1-3 regression): Non-TikTok URLs containing "tiktok.com" in query or path MUST NOT be hijacked to TikTok helper!
+    const nonTikTokUrls = [
+      "https://x.com/user/status/123456789?ref=https://www.tiktok.com/@a/video/7345678901234567890",
+      "https://vimeo.com/tiktok.com",
+      "https://weibo.com/12345/abc?from=tiktok.com",
+    ];
+    for (const nonTtUrl of nonTikTokUrls) {
+      let extTikTokCalled = false;
+      let standardParseUrls = [];
+      globalThis.fetch = async (u) => {
+        standardParseUrls.push(String(u));
+        return new Response(
+          JSON.stringify({
+            schema_version: "1.0",
+            code: "OK",
+            data: { ...sampleMedia, platform: "x", source_url: nonTtUrl },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+      const storeG = makeStore();
+      const parserG = useVideoParser({
+        videoStore: storeG,
+        locale: ref("zh-CN"),
+        showToast: () => {},
+        pingExtension: async () => ({
+          connected: true,
+          version: "4.7.0",
+          extensionId: "ihamkldlkdibleacagiejklpfofapkpo",
+          capabilities: ["dash_mux", "direct_download", "youtube_parse", "youtube_mux", "tiktok_parse"],
+          useSaveFilePicker: false,
+        }),
+        parseTikTokViaExtension: async () => {
+          extTikTokCalled = true;
+          return { ok: false, code: "INVALID_INPUT", error: "should never be called" };
+        },
+      });
+      parserG.inputUrl.value = nonTtUrl;
+      await parserG.parseVideo();
+      assert.equal(extTikTokCalled, false, `Non-TikTok URL must not route to TikTok helper: ${nonTtUrl}`);
+      assert.equal(standardParseUrls.length, 1, `Expected standard /api/parse for ${nonTtUrl}`);
+      assert.equal(parserG.parseError.value, "");
+    }
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test("Internal review P1/P2 regressions: CDN/host parity, isTikTokUrl, abort/timeout in Offscreen fetch & apiClient", async () => {
+  // 1. isTikTokUrl protocol & trailing-dot hardening
+  const { isTikTokUrl } = await import("../src/utils/parseHelpers.ts");
+  assert.equal(isTikTokUrl("https://www.tiktok.com./@i/video/7345678901234567890"), true);
+  assert.equal(isTikTokUrl("javascript://tiktok.com/%0aalert(1)"), false);
+  assert.equal(isTikTokUrl("https://x.com/i/status/1?ref=https://www.tiktok.com/@i/video/12345"), false);
+
+  // 2. P2-6: TIKTOK_PARSE_ALLOWED_HOSTS excludes bare tiktok.com (aligned with manifest + DNR 1011)
+  assert.equal(isAllowedTikTokParsePageUrl("https://tiktok.com/@i/video/7345678901234567890"), false);
+  assert.equal(isAllowedTikTokParsePageUrl("https://www.tiktok.com/@i/video/7345678901234567890"), true);
+
+  // 3. P1-1 & P2-6: isAllowedTikTokMediaCdnUrl rejects case/semicolon/malformed-percent chain token bypasses, bad DNS labels, non-ASCII
+  for (const badCdn of [
+    "https://v16-web-newkey.tiktokcdn.com/v.mp4?TK=tt_chain_token",
+    "https://v16-web-newkey.tiktokcdn.com/v.mp4?a=1;b=2&tk=tt_chain_token",
+    "https://v16-web-newkey.tiktokcdn.com/v.mp4?bad=%ZZ&tk=TT_CHAIN_TOKEN",
+    "https://_bad.tiktokcdn.com/v.mp4",
+    "https://..tiktokcdn.com/v.mp4",
+    "https://v16-web-newkey.tiktokcdn.com/café.mp4",
+  ]) {
+    assert.equal(isAllowedTikTokMediaCdnUrl(badCdn), false, `Expected rejected CDN URL: ${badCdn}`);
+  }
+
+  // 4. P2-4: Mid-stream body read abort -> USER_CANCELLED, and play302 timeout -> UPSTREAM_TIMEOUT (504)
+  const videoHtml = await readFile(
+    new URL("../../backend/internal/platform/tiktok/testdata/video_post.html", import.meta.url),
+    "utf8",
+  );
+  const bodyAbortCtrl = new AbortController();
+  await assert.rejects(
+    () =>
+      fetchTikTokClientPayload(
+        { url: "https://www.tiktok.com/@i/video/7345678901234567890" },
+        {
+          signal: bodyAbortCtrl.signal,
+          fetchImpl: async (u) => {
+            const stream = new ReadableStream({
+              pull() {
+                bodyAbortCtrl.abort();
+                return Promise.reject(new DOMException("Aborted", "AbortError"));
+              },
+            });
+            const r = new Response(stream, { status: 200 });
+            Object.defineProperty(r, "url", { value: String(u), configurable: true });
+            return r;
+          },
+        },
+      ),
+    (err) => err instanceof TikTokClientParseError && err.code === "USER_CANCELLED",
+  );
+
+  // play302 phase parent abort after first tier resolves must still throw USER_CANCELLED instead of returning partial tiers
+  const playAbortCtrl = new AbortController();
+  let playCalls = 0;
+  await assert.rejects(
+    () =>
+      fetchTikTokClientPayload(
+        { url: "https://www.tiktok.com/@i/video/7345678901234567890" },
+        {
+          signal: playAbortCtrl.signal,
+          fetchImpl: async (u) => {
+            const s = String(u);
+            if (s.includes("/@i/video/")) {
+              const r = new Response(videoHtml, { status: 200 });
+              Object.defineProperty(r, "url", { value: s, configurable: true });
+              return r;
+            }
+            playCalls += 1;
+            if (playCalls === 1) {
+              playAbortCtrl.abort();
+              const r = new Response("MP4", { status: 200 });
+              Object.defineProperty(r, "url", {
+                value: "https://v16m-default.tiktokcdn-us.com/a/b/video/tos/1080.mp4",
+                configurable: true,
+              });
+              return r;
+            }
+            throw new DOMException("Aborted", "AbortError");
+          },
+        },
+      ),
+    (err) => err instanceof TikTokClientParseError && err.code === "USER_CANCELLED",
+  );
+
+  // 5. P2-5: parseTikTokViaOffscreen checks signal?.aborted before and after OFFSCREEN_TIKTOK_FETCH
+  resetInMemoryExtensionStorage();
+  const storage = createExtensionStorage();
+  let offscreenCalled = 0;
+  let stage2Emitted = false;
+  const apiClient = createApiClient({
+    chromeApi: {
+      runtime: {
+        id: "ihamkldlkdibleacagiejklpfofapkpo",
+        getManifest: () => ({ version: LATEST_EXTENSION_VERSION }),
+      },
+    },
+    storage,
+    fetchFn: async () => new Response("{}", { status: 200 }),
+    nowFn: () => Date.now(),
+    syncDynamicDnrRules: async () => [],
+    sendToOffscreen: async () => {
+      offscreenCalled += 1;
+      midAbort.abort();
+      return {
+        result: {
+          source_url: "https://www.tiktok.com/@i/video/7399999999999999999",
+          video_detail: {},
+          resolved_tiers: [],
+        },
+      };
+    },
+    onParseProgress: (stage) => {
+      if (stage === 2) stage2Emitted = true;
+    },
+  });
+  const preAbort = new AbortController();
+  preAbort.abort();
+  await assert.rejects(
+    () =>
+      apiClient.parseTikTokViaOffscreen({
+        url: "https://www.tiktok.com/@i/video/7399999999999999999",
+        apiOrigin: "https://snap.dokitool.com",
+        authSettings: { bearerToken: "" },
+        signal: preAbort.signal,
+      }),
+    (err) => err instanceof Error && err.name === "AbortError",
+  );
+  assert.equal(offscreenCalled, 0, "pre-aborted signal must not invoke OFFSCREEN_TIKTOK_FETCH");
+
+  const midAbort = new AbortController();
+  await assert.rejects(
+    () =>
+      apiClient.parseTikTokViaOffscreen({
+        url: "https://www.tiktok.com/@i/video/7399999999999999999",
+        apiOrigin: "https://snap.dokitool.com",
+        authSettings: { bearerToken: "" },
+        signal: midAbort.signal,
+      }),
+    (err) => err instanceof Error && err.name === "AbortError",
+  );
+  assert.equal(offscreenCalled, 1);
+  assert.equal(stage2Emitted, false, "mid-aborted signal must not emit stage-2 progress or POST finalize");
 });

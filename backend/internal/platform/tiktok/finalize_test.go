@@ -434,4 +434,82 @@ func TestFinalizeUntrustedInputSecurityAndErrors(t *testing.T) {
 			t.Errorf("unsafe uniqueId should omit author.url, got %v", author["url"])
 		}
 	})
+
+	t.Run("P1_RejectsChainTokenBypassAndNonAsciiOrInvalidDnsCdnUrls", func(t *testing.T) {
+		badDirectURLs := []string{
+			"https://v16-web-newkey.tiktokcdn.com/video/tos/a.mp4?a=1;b=2&tk=tt_chain_token",
+			"https://v16-web-newkey.tiktokcdn.com/video/tos/a.mp4?bad=%ZZ&tk=tt_chain_token",
+			"https://v16-web-newkey.tiktokcdn.com/video/tos/a.mp4?TK=tt_chain_token",
+			"https://v16-web-newkey.tiktokcdn.com/video/tos/a.mp4?tk=TT_CHAIN_TOKEN",
+			"https://..tiktokcdn.com/video/tos/a.mp4",
+			"https://_bad.tiktokcdn.com/video/tos/a.mp4",
+			"https://v16-web-newkey.tiktokcdn.com/video/tos/café.mp4",
+		}
+		for _, badURL := range badDirectURLs {
+			if AllowedMediaURL(badURL) {
+				t.Errorf("AllowedMediaURL(%q) = true, want false", badURL)
+			}
+			body := mustMarshal(map[string]any{
+				"source_url":   "https://www.tiktok.com/@i/video/7345678901234567890",
+				"video_detail": videoDetail,
+				"resolved_tiers": []map[string]string{{
+					"play_url":   "https://www.tiktok.com/aweme/v1/play/?video_id=tier_1080_hevc",
+					"direct_url": badURL,
+				}},
+			})
+			payload, status := FinalizePayload(context.Background(), body, now, false)
+			if status != http.StatusBadRequest || unified.Str(payload["code"]) != "INVALID_INPUT" {
+				t.Errorf("direct_url=%q: got (status=%d, code=%q), want (400, INVALID_INPUT)",
+					badURL, status, unified.Str(payload["code"]))
+			}
+		}
+	})
+
+	t.Run("P1_NonAsciiOrNbspAuthorUniqueIdAndMalformedOptionalAssetNever502", func(t *testing.T) {
+		for _, uid := range []string{"用户_1", "café_creator", "nbsp\u00a0user"} {
+			body := mustMarshal(map[string]any{
+				"source_url": "https://www.tiktok.com/@i/photo/7399999999999999999",
+				"video_detail": map[string]any{
+					"statusCode": 0,
+					"itemInfo": map[string]any{
+						"itemStruct": map[string]any{
+							"id":   "7399999999999999999",
+							"desc": "Unicode handle safety",
+							"author": map[string]any{
+								"id":           "6900000000000000002",
+								"uniqueId":     uid,
+								"nickname":     "Creator",
+								"avatarLarger": "https://_bad.tiktokcdn.com/avatar.jpeg",
+							},
+							"imagePost": map[string]any{
+								"images": []map[string]any{{
+									"imageWidth":  1080,
+									"imageHeight": 1440,
+									"imageURL": map[string]any{
+										"urlList": []string{
+											"https://v16.tiktokcdn.com/tos/café.jpeg",
+											"https://p16-common-sign.tiktokcdn-us.com/tos-useast5/img.jpeg?x-expires=1800000000",
+										},
+									},
+								}},
+							},
+						},
+					},
+				},
+				"resolved_tiers": []any{},
+			})
+			payload, status := FinalizePayload(context.Background(), body, now, false)
+			if status != http.StatusOK || unified.Str(payload["code"]) != "OK" {
+				t.Fatalf("uniqueId=%q: got (status=%d, code=%q), want (200, OK); payload=%+v",
+					uid, status, unified.Str(payload["code"]), payload)
+			}
+			author := unified.Map(unified.Map(payload["data"])["author"])
+			if author["url"] != nil {
+				t.Errorf("non-ASCII/NBSP uniqueId=%q should omit author.url, got %v", uid, author["url"])
+			}
+			if author["avatar"] != nil {
+				t.Errorf("malformed _bad.tiktokcdn.com avatar should be skipped, got %v", author["avatar"])
+			}
+		}
+	})
 }

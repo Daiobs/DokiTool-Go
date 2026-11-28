@@ -415,7 +415,11 @@ export async function runYouTubeHelperParse(ctx: {
 
 export function isTikTokUrl(rawUrl: string): boolean {
   try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
     return host === "tiktok.com" || host.endsWith(".tiktok.com");
   } catch {
     return false;

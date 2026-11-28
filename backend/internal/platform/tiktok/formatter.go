@@ -245,7 +245,10 @@ func buildAuthor(a *tiktokAuthor, now int64) unified.Object {
 		out["description"] = sig
 	}
 	if uid := strings.TrimSpace(a.UniqueID); uid != "" && !strings.ContainsAny(uid, " \t\r\n/?#\\") {
-		out["url"] = "https://www.tiktok.com/@" + uid
+		profileURL := "https://www.tiktok.com/@" + uid
+		if unified.MediaURL(profileURL) == profileURL {
+			out["url"] = profileURL
+		}
 	}
 	for _, candidate := range []string{a.AvatarLarger, a.AvatarMedium, a.AvatarThumb} {
 		if AllowedMediaURL(candidate) {

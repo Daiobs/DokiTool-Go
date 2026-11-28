@@ -40,8 +40,9 @@ const TIKTOK_PARSE_ALLOWED_HOSTS = new Set([
   "vm.tiktok.com",
   "vt.tiktok.com",
   "m.tiktok.com",
-  "tiktok.com",
 ]);
+
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 const ALLOWED_TIKTOK_CDN_SUFFIXES = [
   ".tiktokcdn.com",
@@ -290,6 +291,45 @@ export function isTikTokPlayRedirectSourceUrl(
   );
 }
 
+function hasNonAsciiPrintableUrlChars(raw: string): boolean {
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code <= 0x20 || code >= 0x7f || code === 0x5c || code === 0x23) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isValidDnsHostname(host: string): boolean {
+  if (!host || host.length > 253) return false;
+  const labels = host.split(".");
+  return labels.length >= 2 && labels.every((label) => DNS_LABEL_RE.test(label));
+}
+
+function safeQueryDecode(raw: string): string {
+  try {
+    return decodeURIComponent(raw.replace(/\+/g, " "));
+  } catch {
+    return raw;
+  }
+}
+
+function hasChainTokenQueryParam(rawSearch: string): boolean {
+  const query = rawSearch.startsWith("?") ? rawSearch.slice(1) : rawSearch;
+  if (!query) return false;
+  for (const pair of query.split(/[&;]/)) {
+    if (!pair) continue;
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx < 0) continue;
+    const key = safeQueryDecode(pair.slice(0, eqIdx)).trim().toLowerCase();
+    if (key !== "tk") continue;
+    const val = safeQueryDecode(pair.slice(eqIdx + 1)).trim().toLowerCase();
+    if (val === "tt_chain_token") return true;
+  }
+  return false;
+}
+
 /**
  * Strictly mirrors `backend/internal/platform/tiktok/play302.go#AllowedMediaURL`.
  */
@@ -302,9 +342,8 @@ export function isAllowedTikTokMediaCdnUrl(
   if (
     !trimmed ||
     trimmed.length > 4096 ||
-    hasUnsafeUrlChars(trimmed) ||
-    hasRawEmptyPort(trimmed) ||
-    trimmed.includes("#")
+    hasNonAsciiPrintableUrlChars(trimmed) ||
+    hasRawEmptyPort(trimmed)
   ) {
     return false;
   }
@@ -320,7 +359,7 @@ export function isAllowedTikTokMediaCdnUrl(
   }
   if (parsed.protocol !== "https:" || parsed.port !== "") return false;
   const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
-  if (!host || isIpLiteralHost(host)) return false;
+  if (!host || isIpLiteralHost(host) || !isValidDnsHostname(host)) return false;
   if (
     host === "tiktok.com" ||
     host.endsWith(".tiktok.com") ||
@@ -333,10 +372,8 @@ export function isAllowedTikTokMediaCdnUrl(
   );
   if (!matchedSuffix) return false;
 
-  for (const val of parsed.searchParams.getAll("tk")) {
-    if (val.trim().toLowerCase() === "tt_chain_token") {
-      return false;
-    }
+  if (hasChainTokenQueryParam(parsed.search)) {
+    return false;
   }
   return true;
 }
@@ -593,7 +630,7 @@ export function selectTikTokVideoPlayUrls(
 }
 
 /**
- * Projects `webapp.video-detail` to the exact subset of fields consumed by
+ * Projects top-level `webapp.video-detail` / `itemStruct` fields consumed by
  * `backend/internal/platform/tiktok/hydration.go` so extraneous TikTok page
  * telemetry blobs never inflate the POST /api/tiktok/finalize body.
  */
@@ -1006,10 +1043,15 @@ export async function fetchTikTokClientPayload(
       }
     }
 
-    const html = await readBoundedResponseText(
-      hydrationResp!,
-      TIKTOK_HYDRATION_MAX_BYTES,
-    );
+    let html: string;
+    try {
+      html = await readBoundedResponseText(
+        hydrationResp!,
+        TIKTOK_HYDRATION_MAX_BYTES,
+      );
+    } catch (err) {
+      throw buildFetchError(err, "TikTok 页面数据读取失败，请稍后重试");
+    }
     const extracted = extractTikTokVideoDetailFromHtml(html);
     if (!extracted.found) {
       if (isSlardarWafPage(hydrationResp!.status, html)) {
@@ -1094,6 +1136,12 @@ export async function fetchTikTokClientPayload(
         controller.signal,
         extraAllowedOrigins,
       );
+      if (controller.signal.aborted) {
+        throw buildFetchError(
+          controller.signal.reason,
+          "TikTok 视频直链解析失败，请稍后重试",
+        );
+      }
       if (resolvedTiers.length === 0) {
         throw new TikTokClientParseError(
           "UPSTREAM_UNAVAILABLE",
