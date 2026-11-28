@@ -25,7 +25,7 @@
 | `x_fast_path` | 开启 | 校验 X 视频样本返回 `200 OK` 且包含 `https://video.twimg.com` MP4 `file` 直链规格 |
 | `douyin_domestic` | 开启 | 校验抖音样本媒体域名包含 `*.douyinvod.com`（确认上海 `pull` 解析通道生效） |
 | `direct_markers` | 开启 | 校验 `douyin`、`xiaohongshu`（同时要求全部媒体源 `100%` 为 `https://`，`0` 个 `http://`）、`kuaishou`、`pipixia` 已验证 HTTPS CDN 源带 `browser_fetch: "allowed"` |
-| `all_platforms` | 开启（`--tier tier-a` / `all`） | 校验 Tier-A 全部 16 个核心平台均返回合法的 `200 OK` 统一协议响应、非空且非占位符 `title`（拒绝 `P1`/`未知标题`）与可用媒体源；上游作品下架/删除（`CONTENT_UNAVAILABLE` / 404 下架）归类为 `SAMPLE_STALE` 与真实解析器故障 `FAIL` 隔离 |
+| `all_platforms` | 开启（`--tier tier-a` / `all`） | 按 `samples.json` 中每平台的 `server_parse` 能力策略校验 16 个核心平台（严格区分目录契约、部署服务端解析能力与扩展协同能力）：默认 `required` 平台（14 个）必须返回合法 `200 OK` 统一协议响应、非空且非占位符 `title` 与可用媒体源；`youtube`（`optional_with_helper`）返回 `200 OK` 记 `PASS`，若因部署开关关闭返回严格契约 `503 SERVICE_NOT_CONFIGURED`（非可重试），则联动核验 `/api/youtube/context` 协同助手可用后记 `SKIP`（助手异常或非契约 503 仍记 `FAIL`）；`tiktok`（`egress_restricted`）返回 `200 OK` 记 `PASS`，已知机房出口受限返回严格 JSON 契约 `403 UPSTREAM_BLOCKED` 记 `WARN` 而非误报解析器回归（`503`/`502`/`500` 或非 JSON `403` 仍记 `FAIL`）；所有平台作品下架/删除归类为 `SAMPLE_STALE` |
 | `tier_b_platforms` | 默认 `SKIP`（传 `--tier tier-b` / `all` 或 `--only tier_b_platforms` 开启） | 校验 Tier-B 长尾站点轮询池（支持 `--tier-b-limit <N>` 按 UTC 日序轮转抽样） |
 | `api_boundary` | 开启（排在全部解析检查之后） | 校验接口鉴权与网关白名单边界（不触发 `/api/parse` 8s 间隔）：① `GET /api/stats?schema_version=1.0` 不带头返回 `401` JSON（`code: "INVALID_INPUT"`）；② 随机未白名单路径 `GET /api/<random>` 返回 `404` JSON（`code: "INVALID_INPUT"`，拒绝 HTML/纯文本兜底） |
 | `rate_limit` | **默认关闭**（需传 `--enable-rate-limit`） | 在最后阶段先等待限流桶补满，再连续快速发送 6 个不同 URL 的 `/api/parse`，校验前序 `200 OK`、超额返回 `429 RATE_LIMITED` 且 `retry_after_seconds > 0` |

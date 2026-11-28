@@ -49,6 +49,12 @@ DEFAULT_YOUTUBE_CONTEXT_FAIL_MS = 15000
 MAX_HTTP_RESPONSE_BYTES = 16 * 1024 * 1024
 
 VALID_TIERS: tuple[str, ...] = ("tier-a", "tier-b", "all")
+VALID_SERVER_PARSE_MODES: tuple[str, ...] = (
+    "required",
+    "optional_with_helper",
+    "egress_restricted",
+)
+VALID_HELPER_CHECKS: tuple[str, ...] = ("youtube_context",)
 
 PARSE_GROUPS: tuple[str, ...] = (
     "cache",
@@ -1091,6 +1097,78 @@ def validate_parse_envelope(
     return payload, hosts
 
 
+def _validate_sample_server_parse_policy(
+    sample_key: str,
+    entry: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Validate optional per-platform server_parse / helper_check policy in samples.json."""
+    raw_mode = entry.get("server_parse")
+    if raw_mode is None:
+        mode = "required"
+    elif isinstance(raw_mode, str) and raw_mode in VALID_SERVER_PARSE_MODES:
+        mode = raw_mode
+    else:
+        raise SmokeError(
+            f"invalid server_parse mode for '{sanitize_text(sample_key)}': "
+            f"{sanitize_text(str(raw_mode))!r}; valid: {', '.join(VALID_SERVER_PARSE_MODES)}"
+        )
+
+    raw_helper = entry.get("helper_check")
+    if mode == "optional_with_helper":
+        if not isinstance(raw_helper, str) or raw_helper not in VALID_HELPER_CHECKS:
+            raise SmokeError(
+                f"server_parse='optional_with_helper' for '{sanitize_text(sample_key)}' "
+                f"requires valid helper_check ({', '.join(VALID_HELPER_CHECKS)})"
+            )
+        return mode, raw_helper
+
+    if raw_helper is not None:
+        raise SmokeError(
+            f"helper_check is only valid when server_parse='optional_with_helper' "
+            f"(got on '{sanitize_text(sample_key)}')"
+        )
+    return mode, None
+
+
+def _matches_parse_error_contract(
+    resp: RawHttpResponse | None,
+    *,
+    expected_status: int,
+    expected_code: str,
+    forbid_retryable: bool = False,
+) -> tuple[bool, str]:
+    """Strictly validate an expected unified-v1 JSON error response on /api/parse.
+
+    Rejects non-JSON/HTML gateway errors, wrong schema_version, mismatched error
+    codes, or missing messages so arbitrary 403/503 failures are never ignored.
+    """
+    if resp is None or resp.status != expected_status:
+        return False, ""
+    raw_ct = str(resp.headers.get("content-type") or "").strip()
+    media_type = raw_ct.split(";", 1)[0].strip().lower()
+    if media_type != "application/json":
+        return False, ""
+    try:
+        payload = resp.json_object()
+    except ValueError:
+        return False, ""
+    err_obj = payload.get("error")
+    err_msg = err_obj.get("message") if isinstance(err_obj, dict) else None
+    if (
+        payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("code") != expected_code
+        or not isinstance(err_obj, dict)
+        or err_obj.get("code") != expected_code
+        or not isinstance(err_msg, str)
+        or not err_msg.strip()
+    ):
+        return False, ""
+    retryable = err_obj.get("retryable")
+    if forbid_retryable and retryable is not None and retryable is not False:
+        return False, ""
+    return True, sanitize_text(err_msg)[:160]
+
+
 def load_samples(samples_path: Path, overrides: Iterable[str] = ()) -> dict[str, Any]:
     """Load samples.json and apply any --set-sample <key>=<url> overrides."""
     try:
@@ -1103,6 +1181,13 @@ def load_samples(samples_path: Path, overrides: Iterable[str] = ()) -> dict[str,
     if not isinstance(raw, dict) or not isinstance(raw.get("platforms"), dict):
         raise SmokeError("samples file must define a 'platforms' object")
     config = copy.deepcopy(raw)
+
+    for bucket_name in ("platforms", "tier_b_platforms"):
+        bucket = config.get(bucket_name)
+        if isinstance(bucket, dict):
+            for plat_key, entry in bucket.items():
+                if isinstance(entry, dict):
+                    _validate_sample_server_parse_policy(str(plat_key), entry)
 
     for entry in overrides:
         if "=" not in entry:
@@ -1266,6 +1351,7 @@ class SmokeRunner:
             )
         self.frontend_concurrency = concurrency
         self.shared_parses: dict[str, SharedParseEntry] = {}
+        self._helper_check_results: dict[str, CheckResult] = {}
 
     def _sample_entry(self, sample_key: str, *, tier_b: bool = False) -> tuple[str, str]:
         bucket = "tier_b_platforms" if tier_b else "platforms"
@@ -1274,6 +1360,27 @@ class SmokeRunner:
         if not isinstance(entry, dict) or not isinstance(entry.get("url"), str):
             raise SmokeError(f"missing sample configuration for '{sanitize_text(sample_key)}'")
         return entry["url"], str(entry.get("pool") or ("slow_parse" if tier_b else "parse"))
+
+    def _sample_server_parse_policy(
+        self,
+        sample_key: str,
+        *,
+        tier_b: bool = False,
+    ) -> tuple[str, str | None]:
+        bucket = "tier_b_platforms" if tier_b else "platforms"
+        platforms = self.samples.get(bucket, {})
+        entry = platforms.get(sample_key)
+        if not isinstance(entry, dict):
+            return "required", None
+        return _validate_sample_server_parse_policy(sample_key, entry)
+
+    def _verify_helper_check(self, helper_check: str) -> CheckResult:
+        cached = self._helper_check_results.get(helper_check)
+        if cached is not None:
+            return cached
+        if helper_check == "youtube_context":
+            return self.check_youtube_context()
+        raise SmokeError(f"unsupported helper_check: {sanitize_text(helper_check)}")
 
     def _extract_status_code(self, resp: RawHttpResponse | None) -> tuple[int | None, str]:
         if resp is None:
@@ -1296,8 +1403,14 @@ class SmokeRunner:
         expected_platform: str | None,
         extra_assertion: Callable[[dict[str, Any], list[str]], str] | None = None,
         tier_b: bool = False,
+        respect_server_parse_policy: bool = False,
     ) -> CheckResult:
         sample_url, pool = self._sample_entry(sample_key, tier_b=tier_b)
+        server_parse_mode, helper_check = (
+            self._sample_server_parse_policy(sample_key, tier_b=tier_b)
+            if respect_server_parse_policy
+            else ("required", None)
+        )
 
         # Reuse an already-validated 200 OK response for the exact same sample URL if it
         # also satisfies this check's derived assertion; otherwise fall back to fresh retries.
@@ -1342,6 +1455,46 @@ class SmokeRunner:
                 resp = self.client.get_parse(sample_url, paced=True, pool=pool)
                 last_resp = resp
                 total_elapsed_ms = resp.elapsed_ms
+                if server_parse_mode == "optional_with_helper":
+                    matched_disabled, _disabled_msg = _matches_parse_error_contract(
+                        resp,
+                        expected_status=503,
+                        expected_code="SERVICE_NOT_CONFIGURED",
+                        forbid_retryable=True,
+                    )
+                    if matched_disabled:
+                        assert helper_check is not None
+                        helper_res = self._verify_helper_check(helper_check)
+                        if helper_res.status in ("PASS", "WARN"):
+                            return CheckResult(
+                                id=check_id,
+                                group=group,
+                                status="SKIP",
+                                http_status=resp.status,
+                                code="SERVICE_NOT_CONFIGURED",
+                                elapsed_ms=total_elapsed_ms,
+                                retry_count=attempt - 1,
+                                media_hostnames=[],
+                                note=(
+                                    "standalone /api/parse disabled by deployment switch "
+                                    "(503 SERVICE_NOT_CONFIGURED); extension cooperative helper "
+                                    f"verified via {helper_check} ({helper_res.status}: {helper_res.note})"
+                                ),
+                            )
+                        return CheckResult(
+                            id=check_id,
+                            group=group,
+                            status="FAIL",
+                            http_status=resp.status,
+                            code="SERVICE_NOT_CONFIGURED",
+                            elapsed_ms=total_elapsed_ms,
+                            retry_count=attempt - 1,
+                            media_hostnames=[],
+                            note=(
+                                "standalone /api/parse returned 503 SERVICE_NOT_CONFIGURED and "
+                                f"cooperative helper {helper_check} failed ({helper_res.code}: {helper_res.note})"
+                            ),
+                        )
                 payload, hosts = validate_parse_envelope(
                     resp,
                     expected_platform,
@@ -1390,6 +1543,28 @@ class SmokeRunner:
                 media_hostnames=last_hosts,
                 note=f"upstream sample stale/removed (backend_code={sanitize_text(orig_code)}; refresh sample URL){suffix}",
             )
+        if server_parse_mode == "egress_restricted":
+            matched_blocked, blocked_reason = _matches_parse_error_contract(
+                last_resp,
+                expected_status=403,
+                expected_code="UPSTREAM_BLOCKED",
+            )
+            if matched_blocked:
+                suffix = f": {blocked_reason}" if blocked_reason else ""
+                return CheckResult(
+                    id=check_id,
+                    group=group,
+                    status="WARN",
+                    http_status=403,
+                    code="UPSTREAM_BLOCKED",
+                    elapsed_ms=total_elapsed_ms,
+                    retry_count=self.max_attempts - 1,
+                    media_hostnames=last_hosts,
+                    note=(
+                        "known server-side egress restriction (403 UPSTREAM_BLOCKED; "
+                        f"degraded server parse, not classified as parser regression){suffix}"
+                    ),
+                )
         return CheckResult(
             id=check_id,
             group=group,
@@ -1589,6 +1764,11 @@ class SmokeRunner:
         )
 
     def check_youtube_context(self) -> CheckResult:
+        result = self._probe_youtube_context()
+        self._helper_check_results["youtube_context"] = result
+        return result
+
+    def _probe_youtube_context(self) -> CheckResult:
         try:
             resp = self.client.get_raw(
                 f"/api/youtube/context?schema_version={SCHEMA_VERSION}",
@@ -1898,6 +2078,7 @@ class SmokeRunner:
                     group="all_platforms",
                     sample_key=plat,
                     expected_platform=plat,
+                    respect_server_parse_policy=True,
                 )
             )
         return results
@@ -2398,7 +2579,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tier",
         choices=VALID_TIERS,
         default="tier-a",
-        help="Platform tier selection: tier-a (14 core release platforms, default), tier-b (long-tail pool), or all",
+        help="Platform tier selection: tier-a (16 core release platforms, default), tier-b (long-tail pool), or all",
     )
     parser.add_argument(
         "--tier-b-limit",

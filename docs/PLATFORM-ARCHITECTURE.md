@@ -108,7 +108,7 @@ flowchart TB
 | 观测层次 | 定位与职责 | 当前承载机制 | 边界与未来扩展方向 |
 | --- | --- | --- | --- |
 | **Layer 1：静态能力档案** | 记录相对稳定的平台协议、执行路径、支持媒体类型、交付条件与已知限制 | `backend/config/platforms.json` + 本文档（`docs/PLATFORM-ARCHITECTURE.md`）+ 仓库 SSOT 单测 | **不把每日瞬时探测值或测速数字写进静态文档**；任何核心平台增删必须同步更新目录与测试 |
-| **Layer 2：常规可用性巡检** | 低噪发现线上核心契约退化、上游 Canary 漂移与关键路径故障 | ① **被动只读展示**：`/monitor` 与 `GET /api/stats` 严格保持 100% 只读被动统计（无定时器、无探测库、无写接口）；<br>② **外置定时巡检**：GitHub Actions 每 12h 运行 `.github/workflows/upstream-canary.yml`（Deno/EJS YouTube Canary + `smoke.py --only platforms,youtube_context,api_boundary`，连续 2 次失败防抖建单）；<br>③ **发版/按需巡检**：`scripts/prod-smoke/smoke.py`（`>= 8s` 自限速、`SAMPLE_STALE` 隔离、零凭据脱敏）与 `stage2_browser.mjs` | 可按需在 Actions 增加低频（如每周 1 次）只读 `smoke.py` 核心平台解析冒烟；绝不在主后端进程内嵌定时探针或复杂持久化数据库 |
+| **Layer 2：常规可用性巡检** | 低噪发现线上核心契约退化、上游 Canary 漂移与关键路径故障 | ① **被动只读展示**：`/monitor` 与 `GET /api/stats` 严格保持 100% 只读被动统计（无定时器、无探测库、无写接口）；<br>② **外置定时巡检**：GitHub Actions 每 12h 运行 `.github/workflows/upstream-canary.yml`（Deno/EJS YouTube Canary + `smoke.py --only platforms,youtube_context,api_boundary`，连续 2 次失败防抖建单）；<br>③ **发版/按需巡检**：`scripts/prod-smoke/smoke.py`（`>= 8s` 自限速、`SAMPLE_STALE` 隔离、区分目录契约 / 部署服务端开关 / 已知出口受限、零凭据脱敏）与 `stage2_browser.mjs` | 可按需在 Actions 增加低频（如每周 1 次）只读 `smoke.py` 核心平台解析冒烟；绝不在主后端进程内嵌定时探针或复杂持久化数据库 |
 | **Layer 3：跨地域受控对照实验** | 评估新增/调整区域出口、客户端协同或代理策略的真实业务收益 | 按需执行的脱敏受控实验（如微博东京 vs 国内出口对照、TikTok 扩展解析实证） | **实验铁律**：严格拆分「解析出口」与「下载网络」（同一固定代表性下载端 + 冷解析绕开缓存 + 同等画质），综合评估**画质上限、解析成功率、媒体可用性、下载速率与维护成本**（不设单一教条倍数门槛）。**架构保留远期扩展空间**：未来若确有必要，可在外置任务层引入低频定期跨出口对照并输出脱敏摘要，继续与 `/monitor` 保持解耦 |
 
 ---
